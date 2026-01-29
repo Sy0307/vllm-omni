@@ -178,6 +178,21 @@ def try_recv_via_connector(
             # We'll return None to let caller handle error if strictly required.
             return None, None
 
+def checkcheck_payload_finished(payload_data: Any) -> bool:
+    """Return True if payload_data indicates stream finished (best-effort)."""
+    if not isinstance(payload_data, dict):
+        return False
+    flag = payload_data.get("finished")
+    if flag is None:
+        return False
+    try:
+        # torch scalar tensor / numpy scalar
+        if hasattr(flag, "item"):
+            return bool(flag.item())
+        return bool(flag)
+    except Exception:
+        return False
+
 
 def get_chunk(
     connector: "OmniConnectorBase",
@@ -206,7 +221,7 @@ def get_chunk(
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
             new_req_data.additional_information = payload_data
-            if payload_data.get("finished"):
+            if checkcheck_payload_finished(payload_data):
                 connector.finished_requests.add(req_id)
 
     # Handle cached/running requests
@@ -223,8 +238,24 @@ def get_chunk(
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
             cached_reqs.additional_information[cached_req_id] = payload_data
-            if payload_data.get("finished"):
+            if checkcheck_payload_finished(payload_data):
                 connector.finished_requests.add(req_id)
+
+    # When the *local* stage finishes a request, it is safe to cleanup all
+    # per-request connector state (including finished marker from upstream).
+    finished_req_ids = getattr(scheduler_output, "finished_req_ids", None)
+    if finished_req_ids:
+        for internal_req_id in finished_req_ids:
+            external_req_id = connector.request_ids_mapping.get(internal_req_id, internal_req_id)
+            try:
+                connector.cleanup(external_req_id)
+            except Exception as e:
+                logger.warning(
+                    "[Stage-%s] connector.cleanup failed for finished request %s: %s",
+                    stage_id,
+                    external_req_id,
+                    e,
+                )
 
 
 def get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key):
@@ -268,6 +299,9 @@ def get_chunk_for_generation(
     target_stage_id = stage_id - 1
     request_id = request.external_req_id
 
+    if getattr(request, "status", None) == RequestStatus.FINISHED_STOPPED:
+        return
+
     if request_id in connector.finished_requests:
         return
 
@@ -277,9 +311,13 @@ def get_chunk_for_generation(
     if not payload_data:
         return
 
-    if payload_data.get("finished"):
+    if checkcheck_payload_finished(payload_data):
         connector.finished_requests.add(request_id)
         request.status = RequestStatus.FINISHED_STOPPED
+        try:
+            connector.cleanup(request_id)
+        except Exception as e:
+            logger.warning("[Stage-%s] connector.cleanup failed for request %s: %s", stage_id, request_id, e)
 
     # TODO: remove special handling for prompt token ids ?
     if chunk_id == 0:
@@ -330,7 +368,7 @@ def put_chunk(
 
         if stage_id == 0 and chunk_id == 0:
             if connector.request_payload.get(request_id) is None:
-                if not payload_data.get("finished"):
+                if not checkcheck_payload_finished(payload_data):
                     connector.request_payload[request_id] = payload_data
                     return
             else:
@@ -349,7 +387,7 @@ def put_chunk(
             connector.code_prompt_token_ids[request_id].append(payload_data.get("code_predictor_codes", []))
             length = len(connector.code_prompt_token_ids[request_id])
             chunk_length = length % chunk_size
-            if chunk_length != 0 and not payload_data.get("finished"):
+            if chunk_length != 0 and not checkcheck_payload_finished(payload_data):
                 return
 
             context_length = chunk_length if chunk_length != 0 else chunk_size
@@ -368,6 +406,11 @@ def put_chunk(
         if success:
             connector.put_requests[request_id] += 1
             logger.info(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            if checkcheck_payload_finished(payload_data):
+                try:
+                    connector.cleanup(request_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] connector.cleanup failed for request %s: %s", stage_id, request_id, e)
 
 
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:

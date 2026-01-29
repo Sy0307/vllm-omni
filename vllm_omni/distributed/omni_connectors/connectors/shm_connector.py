@@ -106,12 +106,33 @@ class SharedMemoryConnector(OmniConnectorBase):
         # TODO: update another read method
 
     def cleanup(self, request_id: str) -> None:
-        # SHM segments are automatically unlinked during 'get' (shm_read_bytes).
-        # If 'get' is never called (e.g. error flow), the SHM segment might leak.
-        # A robust implementation might track created segments and unlink them here
-        # if they haven't been consumed.
-        # For now, we rely on the consumer to read and unlink.
-        pass
+        """Best-effort, idempotent cleanup of per-request in-memory state.
+
+        Note: SHM segments created by `put` are unlinked by the consumer in
+        `shm_read_bytes`. We intentionally do NOT attempt to unlink SHM by
+        request_id here, because (a) the connector currently doesn't track
+        created SHM keys per request, and (b) unlinking from the sender side
+        before the receiver reads would cause hangs.
+        """
+        try:
+            # Counters / markers
+            self.put_requests.pop(request_id, None)
+            self.get_requests.pop(request_id, None)
+            self.finished_requests.discard(request_id)
+
+            # Streaming caches
+            self.request_payload.pop(request_id, None)
+            self.request_prompt_token_ids.pop(request_id, None)
+            self.code_prompt_token_ids.pop(request_id, None)
+
+            # Mapping can contain request_id as key or value.
+            # Example: {internal_req_id -> external_req_id}
+            self.request_ids_mapping.pop(request_id, None)
+            keys_to_delete = [k for k, v in self.request_ids_mapping.items() if v == request_id]
+            for k in keys_to_delete:
+                self.request_ids_mapping.pop(k, None)
+        except Exception as e:
+            logger.warning("SharedMemoryConnector cleanup failed for request_id=%s: %s", request_id, e)
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", "threshold": self.threshold, **self._metrics}
