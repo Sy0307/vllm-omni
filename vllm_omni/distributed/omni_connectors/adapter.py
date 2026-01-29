@@ -178,7 +178,7 @@ def try_recv_via_connector(
             # We'll return None to let caller handle error if strictly required.
             return None, None
 
-def checkcheck_payload_finished(payload_data: Any) -> bool:
+def check_payload_finished(payload_data: Any) -> bool:
     """Return True if payload_data indicates stream finished (best-effort)."""
     if not isinstance(payload_data, dict):
         return False
@@ -221,7 +221,7 @@ def get_chunk(
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
             new_req_data.additional_information = payload_data
-            if checkcheck_payload_finished(payload_data):
+            if check_payload_finished(payload_data):
                 connector.finished_requests.add(req_id)
 
     # Handle cached/running requests
@@ -238,7 +238,7 @@ def get_chunk(
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
             cached_reqs.additional_information[cached_req_id] = payload_data
-            if checkcheck_payload_finished(payload_data):
+            if check_payload_finished(payload_data):
                 connector.finished_requests.add(req_id)
 
     # When the *local* stage finishes a request, it is safe to cleanup all
@@ -311,7 +311,7 @@ def get_chunk_for_generation(
     if not payload_data:
         return
 
-    if checkcheck_payload_finished(payload_data):
+    if check_payload_finished(payload_data):
         connector.finished_requests.add(request_id)
         request.status = RequestStatus.FINISHED_STOPPED
         try:
@@ -368,7 +368,7 @@ def put_chunk(
 
         if stage_id == 0 and chunk_id == 0:
             if connector.request_payload.get(request_id) is None:
-                if not checkcheck_payload_finished(payload_data):
+                if not check_payload_finished(payload_data):
                     connector.request_payload[request_id] = payload_data
                     return
             else:
@@ -387,7 +387,7 @@ def put_chunk(
             connector.code_prompt_token_ids[request_id].append(payload_data.get("code_predictor_codes", []))
             length = len(connector.code_prompt_token_ids[request_id])
             chunk_length = length % chunk_size
-            if chunk_length != 0 and not checkcheck_payload_finished(payload_data):
+            if chunk_length != 0 and not check_payload_finished(payload_data):
                 return
 
             context_length = chunk_length if chunk_length != 0 else chunk_size
@@ -406,7 +406,7 @@ def put_chunk(
         if success:
             connector.put_requests[request_id] += 1
             logger.info(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            if checkcheck_payload_finished(payload_data):
+            if check_payload_finished(payload_data):
                 try:
                     connector.cleanup(request_id)
                 except Exception as e:
