@@ -73,6 +73,8 @@ class OmniModelConfig(ModelConfig):
         }
     )
     omni_kv_config: dict | None = None
+    # Codec frame rate (frames/sec) for prompt length estimation.
+    codec_frame_rate_hz: float | None = None
 
     @property
     def registry(self):
@@ -173,6 +175,22 @@ class OmniModelConfig(ModelConfig):
         self.hf_config = hf_config
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
+
+        # Qwen3-TTS: infer codec frame rate from the model config for online serving.
+        if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":
+            talker_cfg = getattr(self.hf_config, "talker_config", None)
+            if isinstance(talker_cfg, dict):
+                pos_per_sec = talker_cfg.get("position_id_per_seconds")
+            else:
+                pos_per_sec = getattr(talker_cfg, "position_id_per_seconds", None)
+            if pos_per_sec is not None:
+                try:
+                    fps = float(pos_per_sec)
+                except Exception:
+                    fps = None
+                if fps is not None and fps > 0:
+                    self.codec_frame_rate_hz = fps
+
         self.hf_text_config = self.draw_hf_text_config()
         self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
         self.encoder_config = self._get_encoder_config()

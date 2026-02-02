@@ -1,8 +1,4 @@
-"""Code2Wav GPU Model Runner for vLLM-Omni.
-
-Handles direct conversion from codec codes to audio waveforms for Qwen3 Omni MoE Code2Wav.
-This is a non-autoregressive model that doesn't require sampling or logits computation.
-"""
+"""Code2Wav GPU Model Runner for vLLM-Omni (non-autoregressive codec->waveform)."""
 
 from __future__ import annotations
 
@@ -43,12 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner):
-    """Generation model runner for vLLM-Omni (non-autoregressive).
-
-    - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
-    - Does not compute logits or perform token sampling.
-    - Executes generation process and returns tensors via `pooler_output`.
-    """
+    """Non-autoregressive generation runner that skips logits/sampling and returns waveforms via pooler_output."""
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -59,7 +50,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             self.input_batch.remove_request(req_id)
             # update the request state in self.input_batch
             self.input_batch.add_request(req_state)
-            self._init_mrope_positions(req_state)
+            if self.uses_mrope:
+                self._init_mrope_positions(req_state)
 
     @torch.inference_mode()
     def execute_model(
@@ -363,15 +355,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         model_kwargs: dict,
         logits_indices: torch.Tensor,
     ) -> torch.Tensor | list[torch.Tensor]:
-        """Run generation from codec codes to waveforms.
-
-        Args:
-            scheduler_output: Contains codec codes in input_ids or additional info
-            intermediate_tensors: PP intermediate tensors if applicable
-
-        Returns:
-            Audio waveforms: [batch, 1, waveform_len] or list of tensors
-        """
+        """Run codec->waveform generation and return waveforms (tensor or list)."""
         # Keep inputs identical to AR runner
         kwargs = dict(
             input_ids=input_ids,

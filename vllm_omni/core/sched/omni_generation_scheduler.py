@@ -34,12 +34,8 @@ class OmniGenerationScheduler(VLLMScheduler):
         self.stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
 
     def schedule(self) -> SchedulerOutput:
-        """Diffusion fast path:
-        - Feed all input tokens of the request at once
-          (if 0, allocate 1 placeholder token).
-        - If the token budget cannot be satisfied at once, fall back to the
-          default vLLM scheduling.
-        """
+        """Diffusion fast path: schedule all prompt tokens at once (use 1 placeholder if empty).
+        Fall back to vLLM scheduling if the token budget cannot be satisfied."""
 
         token_budget = self.max_num_scheduled_tokens
         scheduled_timestamp = time.monotonic()
@@ -53,15 +49,40 @@ class OmniGenerationScheduler(VLLMScheduler):
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         cached_prompt_token_ids: dict[str, list[int]] = {}
 
-        # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
+        # Temporary queue to preserve waiting order for non-diffusion requests.
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if self.omni_connector is not None:
-                get_chunk_for_generation(self.omni_connector, request)
             num_computed_tokens = request.num_computed_tokens
-            required_tokens = max(len(request.prompt_token_ids) - num_computed_tokens, 1)
+            required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            # async_chunk: only pull the next chunk after consuming the previous one (keeps metadata aligned).
+            if (
+                self.omni_connector is not None
+                and required_tokens <= 0
+                and request.external_req_id not in self.omni_connector.finished_requests
+            ):
+                get_chunk_for_generation(self.omni_connector, request)
+                num_computed_tokens = request.num_computed_tokens
+                required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            # async_chunk: don't schedule placeholder tokens when no new chunk is available.
+            if required_tokens <= 0:
+                if (
+                    self.omni_connector is not None
+                    and request.external_req_id in self.omni_connector.finished_requests
+                ):
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
+                    if len(request.prompt_token_ids) <= num_computed_tokens:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+                else:
+                    req_index += 1
+                    continue
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -89,11 +110,21 @@ class OmniGenerationScheduler(VLLMScheduler):
             request = self.waiting.peek_request()
             if self.omni_connector is not None:
                 get_chunk_for_generation(self.omni_connector, request)
-            # Uniformly treat as diffusion. A feature flag can be added later
-            # via config or request tag.
+            # async_chunk: wait for the first upstream chunk (don't start with placeholders).
+            if self.omni_connector is not None and len(request.prompt_token_ids) == 0:
+                if request.external_req_id in self.omni_connector.finished_requests:
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.prompt_token_ids.append(0)
+                    try:
+                        request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                else:
+                    break
 
-            # Allocate all input tokens for the request in one shot
-            # (allocate 1 placeholder if zero)
+            # Treat all requests as diffusion here (feature flag can be added later).
+
+            # Allocate all prompt tokens at once (use 1 placeholder if empty).
             required_tokens = max(len(request.prompt_token_ids), 1)
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
@@ -168,6 +199,17 @@ class OmniGenerationScheduler(VLLMScheduler):
             num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
         )
+        # async_chunk: forward per-step additional_information updates for cached requests.
+        try:
+            cached_ai: dict[str, object] = {}
+            for req in scheduled_running_reqs:
+                ai = getattr(req, "additional_information", None)
+                if isinstance(ai, dict) and ai:
+                    cached_ai[req.request_id] = ai
+            if cached_ai:
+                setattr(cached_reqs_data, "additional_information", cached_ai)
+        except Exception:
+            pass
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         scheduler_output = SchedulerOutput(
@@ -201,8 +243,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         self._update_after_schedule(scheduler_output)
 
         try:
-            # Rewrap base NewRequestData entries with OmniNewRequestData,
-            # enriching with request-level payloads
+            # Wrap base NewRequestData as OmniNewRequestData and attach request-level payloads.
             new_list = []
             for nr in scheduler_output.scheduled_new_reqs:
                 req_id = getattr(nr, "req_id", None)
@@ -230,25 +271,14 @@ class OmniGenerationScheduler(VLLMScheduler):
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
 
         return scheduler_output
-
-    """
-    Scheduler for the diffusion model.
-    This scheduler is modified to stop the request immediately for the diffusion model.
-    This is because the diffusion model can generate the final image/audio in one step.
-    Note: This is just a minimal modification to the original scheduler,
-    and there should be some further efforts to optimize the scheduler.
-    The original scheduler is still used for the AR model.
-    """
+    # Diffusion scheduler: stop requests immediately after one step (AR uses the original vLLM scheduler).
 
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: OmniModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        """Update the scheduler state based on the model runner output.
-
-        This method is modified to stop the request immediately for the diffusion model.
-        """
+        """Update scheduler state from model_runner_output (diffusion requests stop immediately)."""
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -270,9 +300,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         if kv_connector_output and getattr(kv_connector_output, "invalid_block_ids", None):
             failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
 
-        # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
-        # the below loop can be a performance bottleneck. We should do our best
-        # to avoid expensive operations inside the loop.
+        # NOTE: keep loop body cheap (len(num_scheduled_tokens) can be 1K+).
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
@@ -282,9 +310,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                 continue
             request = self.requests.get(req_id)
             if request is None:
-                # The request is already finished. This can happen if the
-                # request is aborted while the model is executing it (e.g.,
-                # in pipeline parallelism).
+                # Request may already be finished (e.g., aborted during execution / pipeline parallelism).
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -331,9 +357,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
-                # NOTE: structured_output_request should not be None if
-                # use_structured_output, we have check above, so safe to ignore
-                # type warning
+                # NOTE: structured_output_request is guaranteed when structured output is enabled (ignore type warning).
                 request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]  # noqa: E501
                     req_id, new_token_ids
                 )

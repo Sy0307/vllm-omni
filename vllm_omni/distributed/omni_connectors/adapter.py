@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# temporary for compatibility with vllm_omni.entrypoints.omni_stage.py
-# and vllm_omni.entrypoints.omni_llm.py
+# Temporary compatibility shim for vllm_omni.entrypoints.omni_stage.py / omni_llm.py.
 
 import time
 from collections.abc import Callable
@@ -9,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 
 if TYPE_CHECKING:
     from .connectors.base import OmniConnectorBase
@@ -32,12 +31,7 @@ def try_send_via_connector(
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: Any,
 ) -> bool:
-    """
-    Attempts to send data via OmniConnector.
-    Returns True if successful, False otherwise.
-    Encapsulates the logic of preparing payload, sending via connector,
-    sending notification, and recording metrics.
-    """
+    """Send payload via OmniConnector and enqueue notification/metrics; return True on success."""
     try:
         t0 = time.time()
 
@@ -102,10 +96,7 @@ def try_recv_via_connector(
     connectors: dict[Any, Any],
     stage_id: int,
 ) -> tuple[Any, dict[str, Any] | None]:
-    """
-    Attempts to resolve input data from either connector or IPC.
-    Returns (engine_inputs, rx_metrics) or (None, None) if failed/skipped.
-    """
+    """Resolve engine_inputs from connector/IPC payload; returns (engine_inputs, rx_metrics) or (None, None)."""
     rid = task["request_id"]
 
     if task.get("from_connector"):
@@ -160,10 +151,7 @@ def try_recv_via_connector(
             )
             return None, None
     else:
-        # Data comes from queue as usual (e.g. seed request for Stage-0)
-        # Since fallback logic is deprecated, we assume this is a direct inputs payload.
-        # We still need to decode it if it used SHM (via legacy stage_utils logic, or new shm_connector format)
-        # For Stage-0 specifically, 'engine_inputs' is often directly in the task dict.
+        # Queue path (e.g. Stage-0 seed): task should carry direct inputs, but still decode SHM/IPC if present.
 
         # Try to use the new stage_utils which uses OmniSerializer
         from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc_with_metrics
@@ -183,15 +171,7 @@ def get_chunk(
     connector: "OmniConnectorBase",
     scheduler_output: SchedulerOutput,
 ) -> None:
-    """Retrieve a chunk of pooling output.
-
-    Args:
-        connector: OmniConnectorBase instance
-        scheduler_output: Partial scheduler output dictionary
-
-    Returns:
-        None: This function modifies scheduler_output in place
-    """
+    """Fetch connector chunks and populate scheduler_output.additional_information (in-place)."""
     stage_id = connector.stage_id
     if stage_id == 0:
         return
@@ -232,7 +212,11 @@ def get_through_connector(connector, target_stage_id, stage_id, req_id, connecto
     import time
 
     # TODO: add correct check mechanism for the payload_data
-    max_wait = 300
+    try:
+        chunk_id = int(str(connector_get_key).rsplit("_", 1)[1])
+    except Exception:
+        chunk_id = 0
+    max_wait = 3000 if chunk_id == 0 else 300
     for _ in range(max_wait):
         result = connector.get(
             from_stage=str(target_stage_id),
@@ -255,15 +239,7 @@ def get_chunk_for_generation(
     connector: "OmniConnectorBase",
     request: Request,
 ) -> None:
-    """Retrieve a chunk of pooling output.
-
-    Args:
-        connector: OmniConnectorBase instance
-        request: Request object
-
-    Returns:
-        None: This function modifies request in place
-    """
+    """Fetch one connector chunk and update request metadata + prompt_token_ids (in-place)."""
     stage_id = connector.stage_id
     target_stage_id = stage_id - 1
     request_id = request.external_req_id
@@ -277,15 +253,56 @@ def get_chunk_for_generation(
     if not payload_data:
         return
 
+    # Persist codec streaming metadata on request.additional_information (survives scheduler->worker serialization).
+    if isinstance(payload_data, dict):
+        ai = request.additional_information
+        if not isinstance(ai, dict):
+            ai = {}
+            request.additional_information = ai
+        for k in (
+            "codec_context_frames",
+            "codec_context_codes",
+            "codec_total_frames",
+            "codec_chunk_frames",
+            "codec_num_code_groups",
+            "codec_layout",
+            "codec_streaming",
+        ):
+            if k in payload_data:
+                ai[k] = payload_data[k]
+
+    try:
+        if isinstance(payload_data, dict):
+            codes = payload_data.get("code_predictor_codes", None)
+            clen = len(codes) if isinstance(codes, list) else None
+            logger.info(
+                "[Stage-%d] recv chunk=%s finished=%s chunk_len=%s ctx_len=%s codec_streaming=%s ctx_frames=%s",
+                stage_id,
+                connector_get_key,
+                bool(payload_data.get("finished")),
+                clen,
+                (
+                    len(payload_data.get("codec_context_codes", []))
+                    if isinstance(payload_data.get("codec_context_codes"), list)
+                    else None
+                ),
+                payload_data.get("codec_streaming"),
+                payload_data.get("codec_context_frames"),
+            )
+    except Exception:
+        pass
+
+    # Upstream finished producing chunks; don't force request.status (stage still needs to consume tokens).
     if payload_data.get("finished"):
         connector.finished_requests.add(request_id)
-        request.status = RequestStatus.FINISHED_STOPPED
 
-    # TODO: remove special handling for prompt token ids ?
-    if chunk_id == 0:
-        request.prompt_token_ids = payload_data.get("code_predictor_codes", [])
-    else:
-        request.prompt_token_ids += payload_data.get("code_predictor_codes", [])
+    # async_chunk: prompt_token_ids must be append-only; ignore empty terminal chunks.
+    codes = payload_data.get("code_predictor_codes", None)
+    if isinstance(codes, list) and codes:
+        if chunk_id == 0 and request.num_computed_tokens == 0:
+            request.prompt_token_ids = codes
+        else:
+            request.prompt_token_ids += codes
 
 
 def put_chunk(
@@ -294,17 +311,7 @@ def put_chunk(
     request: Request,
     custom_process_input_func: Callable[[dict[str, Any], Request], dict[str, Any] | None] | None = None,
 ) -> None:
-    """Store a chunk of pooling output.
-
-    Args:
-        connector: OmniConnectorBase instance
-        pooling_output: Partial pooling output dictionary
-        request: Request object
-        custom_process_input_func: Optional custom function to process input
-
-    Returns:
-        None: This function sends data via connector
-    """
+    """Send one pooling_output chunk to next stage via connector (optionally processed)."""
     stage_id = connector.stage_id
     next_stage_id = stage_id + 1
     request_id = request.external_req_id
@@ -325,41 +332,122 @@ def put_chunk(
             logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
-            logger.warning("[Stage-%d] No payload data to send for request %s", stage_id, request_id)
             return
 
-        if stage_id == 0 and chunk_id == 0:
+        # Qwen3-Omni thinker->talker: merge split payload parts on the first chunk only.
+        if (
+            stage_id == 0
+            and chunk_id == 0
+            and (("thinker_embeddings" in payload_data) or ("thinker_hidden_states" in payload_data))
+        ):
             if connector.request_payload.get(request_id) is None:
                 if not payload_data.get("finished"):
                     connector.request_payload[request_id] = payload_data
                     return
             else:
                 save_payload = connector.request_payload.pop(request_id)
-                payload_data["thinker_embeddings"] = torch.cat(
-                    (save_payload.get("thinker_embeddings"), payload_data.get("thinker_embeddings")), dim=0
-                )
-                payload_data["thinker_hidden_states"] = torch.cat(
-                    (save_payload.get("thinker_hidden_states"), payload_data.get("thinker_hidden_states")), dim=0
-                )
+                if (
+                    isinstance(save_payload, dict)
+                    and isinstance(save_payload.get("thinker_embeddings"), torch.Tensor)
+                    and isinstance(payload_data.get("thinker_embeddings"), torch.Tensor)
+                ):
+                    payload_data["thinker_embeddings"] = torch.cat(
+                        (save_payload.get("thinker_embeddings"), payload_data.get("thinker_embeddings")), dim=0
+                    )
+                if (
+                    isinstance(save_payload, dict)
+                    and isinstance(save_payload.get("thinker_hidden_states"), torch.Tensor)
+                    and isinstance(payload_data.get("thinker_hidden_states"), torch.Tensor)
+                ):
+                    payload_data["thinker_hidden_states"] = torch.cat(
+                        (save_payload.get("thinker_hidden_states"), payload_data.get("thinker_hidden_states")), dim=0
+                    )
                 logger.debug("[Stage-%d] Merged embeddings and hidden states for request %s", stage_id, request_id)
 
-        if stage_id == 1:
-            # TODO: Make parameters configurable and optimize algorithms
-            chunk_size = left_context_size = 25
-            connector.code_prompt_token_ids[request_id].append(payload_data.get("code_predictor_codes", []))
-            length = len(connector.code_prompt_token_ids[request_id])
-            chunk_length = length % chunk_size
-            if chunk_length != 0 and not payload_data.get("finished"):
-                return
+        # Frame-aligned codec streaming: repack per-frame codes into (left_context + chunk) windows.
+        if isinstance(payload_data, dict) and "code_predictor_codes" in payload_data and stage_id in (0, 1):
+            raw_cfg = getattr(connector, "config", {}) or {}
+            # Connector config commonly nests user options under {"extra": {...}}.
+            cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+            if stage_id == 1 or bool(cfg.get("codec_streaming", False)):
+                # async_chunk requires streaming windows; disallow explicit codec_streaming=False.
+                req_streaming = payload_data.get("codec_streaming")
+                if isinstance(req_streaming, torch.Tensor):
+                    try:
+                        req_streaming = bool(req_streaming.item())
+                    except Exception:
+                        req_streaming = None
+                if req_streaming is False:
+                    raise ValueError(
+                        "codec_streaming=False is not supported for async_chunk code2wav pipelines. "
+                        "Enable codec_streaming or switch to a non-streaming stage config."
+                    )
 
-            context_length = chunk_length if chunk_length != 0 else chunk_size
-            end_index = min(length, left_context_size + context_length)
-            payload_data["code_predictor_codes"] = (
-                torch.tensor(connector.code_prompt_token_ids[request_id][-end_index:])
-                .transpose(0, 1)
-                .reshape(-1)
-                .tolist()
-            )
+                chunk_size = int(cfg.get("codec_chunk_frames", 25))
+                left_context_size = int(cfg.get("codec_left_context_frames", 25))
+                if chunk_size <= 0 or left_context_size < 0:
+                    raise ValueError(
+                        f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
+                        f"codec_left_context_frames={left_context_size}"
+                    )
+
+                frame_codes = payload_data.get("code_predictor_codes", [])
+                appended_frame = False
+                if isinstance(frame_codes, list) and len(frame_codes) > 0:
+                    connector.code_prompt_token_ids[request_id].append(frame_codes)
+                    appended_frame = True
+                elif not payload_data.get("finished"):
+                    # For non-finished steps we require one frame per payload.
+                    return
+
+                length = len(connector.code_prompt_token_ids[request_id])
+                chunk_length = length % chunk_size
+                if chunk_length != 0 and not payload_data.get("finished"):
+                    return
+
+                # On finished: flush remainder (if any).
+                context_length = chunk_length if chunk_length != 0 else chunk_size
+                if payload_data.get("finished") and (not appended_frame) and chunk_length == 0:
+                    # No remainder to flush; avoid resending the last full chunk.
+                    payload_data["code_predictor_codes"] = []
+                    payload_data["codec_context_codes"] = []
+                    payload_data["codec_context_frames"] = 0
+                    payload_data["codec_total_frames"] = 0
+                    payload_data["codec_chunk_frames"] = 0
+                    payload_data["codec_num_code_groups"] = 0
+                    payload_data["codec_layout"] = "codebook_major"
+                elif length <= 0:
+                    # No codes to decode; still forward finished marker.
+                    payload_data["code_predictor_codes"] = []
+                    payload_data["codec_context_codes"] = []
+                    payload_data["codec_context_frames"] = 0
+                    payload_data["codec_total_frames"] = 0
+                    payload_data["codec_chunk_frames"] = 0
+                    payload_data["codec_num_code_groups"] = 0
+                    payload_data["codec_layout"] = "codebook_major"
+                else:
+                    end_index = min(length, left_context_size + context_length)
+                    ctx_frames = max(0, int(end_index - context_length))
+                    window_frames = connector.code_prompt_token_ids[request_id][-end_index:]
+                    # Send chunk tokens via prompt_token_ids; send left-context separately via codec_context_codes.
+                    if ctx_frames > 0:
+                        ctx_part = window_frames[:ctx_frames]
+                        payload_data["codec_context_codes"] = (
+                            torch.tensor(ctx_part).transpose(0, 1).reshape(-1).tolist()
+                        )
+                    else:
+                        payload_data["codec_context_codes"] = []
+                    chunk_part = window_frames[ctx_frames:]
+                    payload_data["code_predictor_codes"] = torch.tensor(chunk_part).transpose(0, 1).reshape(-1).tolist()
+                    payload_data["codec_context_frames"] = int(ctx_frames)
+                    payload_data["codec_total_frames"] = int(end_index)
+                    payload_data["codec_chunk_frames"] = int(context_length)
+                    payload_data["codec_num_code_groups"] = int(
+                        len(connector.code_prompt_token_ids[request_id][-1])
+                        if connector.code_prompt_token_ids[request_id]
+                        else 0
+                    )
+                    payload_data["codec_layout"] = "codebook_major"
 
         success, size, metadata = connector.put(
             from_stage=str(stage_id), to_stage=str(next_stage_id), put_key=connector_put_key, data=payload_data
@@ -371,14 +459,7 @@ def put_chunk(
 
 
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
-    """Compute the length of the talker prompt ids.
-
-    Args:
-        prompt_ids: The prompt ids tensor.
-
-    Returns:
-        The length of the talker prompt ids.
-    """
+    """Compute talker prompt length for chat-style prompt ids (system/user/assistant)."""
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872
