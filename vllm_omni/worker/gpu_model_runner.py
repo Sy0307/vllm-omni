@@ -8,7 +8,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.models.interfaces import supports_mm_encoder_only, supports_mrope
+from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
 from vllm.utils.import_utils import LazyLoader
@@ -445,7 +445,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
-        if supports_mm_encoder_only(self.model):
+        mm_config = self.vllm_config.model_config.multimodal_config
+        if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
@@ -549,6 +550,13 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+        )
+
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
@@ -574,6 +582,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
+                slot_mappings=slot_mappings_by_group,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -638,6 +647,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
                 ),
             ):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
@@ -685,6 +695,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
+                    slot_mappings=slot_mappings,
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
@@ -865,13 +876,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
-                    if self.model_config.async_chunk:
-                        req_infos = self._get_additional_information(scheduler_output, req_id)
-                    else:
-                        req_state = self.requests.get(req_id)
-                        req_infos = (
-                            getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-                        )
+                    req_state = self.requests.get(req_id)
+                    req_infos = (
+                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                    )
                     start_offset = int(self.query_start_loc.cpu[req_index])
                     sched_tokens = int(num_scheduled_tokens_np[req_index])
                     s, e = start_offset, start_offset + sched_tokens
@@ -912,68 +920,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
 
-    def _get_additional_information(self, scheduler_output: "SchedulerOutput", req_id: str) -> dict:
-        req_infos = None
-        req_state = self.requests.get(req_id)
-        additional_information_cpu = getattr(req_state, "additional_information_cpu", None)
+    def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
-            if new_req.req_id == req_id:
-                payload_info = getattr(new_req, "additional_information", None)
-                if payload_info is not None:
-                    if isinstance(payload_info, dict):
-                        return payload_info
-                    try:
-                        from vllm_omni.engine import AdditionalInformationPayload
-
-                        if isinstance(payload_info, AdditionalInformationPayload):
-                            # Decode on the fly for newly scheduled requests (request state may not be populated yet).
-                            entries = getattr(payload_info, "entries", None)
-                            if isinstance(entries, dict):
-                                decoded: dict = {}
-                                for k, entry in entries.items():
-                                    tensor_data = getattr(entry, "tensor_data", None)
-                                    if tensor_data is not None:
-                                        dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
-                                        arr = np.frombuffer(tensor_data, dtype=dt)
-                                        arr = arr.reshape(getattr(entry, "tensor_shape", ()))
-                                        decoded[k] = torch.from_numpy(arr.copy())
-                                    else:
-                                        decoded[k] = getattr(entry, "list_data", None)
-                                return decoded
-                            return {}
-                    except Exception:
-                        pass
-                    return additional_information_cpu or {}
+            payload_info = getattr(new_req, "additional_information", None)
+            self._merge_additional_information_update(new_req.req_id, payload_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
-            if isinstance(cached_infos, dict) and req_id in cached_infos:
-                req_infos = cached_infos[req_id]
-                if not isinstance(req_infos, dict):
-                    try:
-                        from vllm_omni.engine import AdditionalInformationPayload
-
-                        if isinstance(req_infos, AdditionalInformationPayload):
-                            req_infos = additional_information_cpu
-                    except Exception:
-                        req_infos = None
-
-        if req_infos is None or req_infos.get("last_talker_hidden", None) is None:
-            if req_infos is None:
-                additional_information_cpu.pop("thinker_embeddings", None)
-                req_infos = additional_information_cpu
-            else:
-                req_infos["last_talker_hidden"] = additional_information_cpu.get("last_talker_hidden", None)
-                req_infos["num_processed_thinker_tokens"] = additional_information_cpu.get(
-                    "num_processed_thinker_tokens", 0
-                )
-            if not isinstance(req_infos, dict):
-                req_infos = None
-
-        if req_infos is None:
-            logger.warning(f"No additional_information found for req_id: {req_id}")
-
-        return req_infos
+            if isinstance(cached_infos, dict):
+                for req_id, req_infos in cached_infos.items():
+                    self._merge_additional_information_update(req_id, req_infos)
 
     def _preprocess(
         self,
@@ -1092,15 +1048,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+            if self.vllm_config.model_config.async_chunk:
+                self._update_additional_information(scheduler_output)
             for req_index, req_id in enumerate(self.input_batch.req_ids):
-                # Try to get additional_information from multiple sources
-                if self.vllm_config.model_config.async_chunk:
-                    req_infos = self._get_additional_information(scheduler_output, req_id)
-                else:
-                    req_state = self.requests.get(req_id)
-                    req_infos = (
-                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-                    )
+                req_state = self.requests.get(req_id)
+                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
                 s, e = start_offset, start_offset + sched_tokens

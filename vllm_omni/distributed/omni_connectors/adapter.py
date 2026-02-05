@@ -167,6 +167,27 @@ def try_recv_via_connector(
             return None, None
 
 
+def update_request_payload(connector: "OmniConnectorBase", req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
+    """Update the payload data for a request in the connector.
+
+    Args:
+        connector: OmniConnectorBase instance
+        req_id: Request ID to update
+        payload_data: New payload data to store
+    """
+    origin_payload = connector.request_payload[req_id]
+    for key, value in payload_data.items():
+        if key == "finished":
+            continue
+        elif isinstance(value, torch.Tensor) and key in origin_payload:
+            payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
+        elif isinstance(value, list) and key in origin_payload:
+            payload_data[key] = origin_payload[key] + value
+
+    connector.request_payload[req_id] = payload_data
+    return payload_data
+
+
 def get_chunk(
     connector: "OmniConnectorBase",
     scheduler_output: SchedulerOutput,
@@ -186,6 +207,7 @@ def get_chunk(
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
             new_req_data.additional_information = payload_data
+            connector.request_payload[req_id] = payload_data
             if payload_data.get("finished"):
                 connector.finished_requests.add(req_id)
 
@@ -202,15 +224,13 @@ def get_chunk(
         connector_get_key = f"{req_id}_{target_stage_id}_{chunk_id}"
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
+            payload_data = update_request_payload(connector, req_id, payload_data)
             cached_reqs.additional_information[cached_req_id] = payload_data
             if payload_data.get("finished"):
                 connector.finished_requests.add(req_id)
 
 
 def get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key):
-    # Wait for data from previous stage
-    import time
-
     # TODO: add correct check mechanism for the payload_data
     try:
         chunk_id = int(str(connector_get_key).rsplit("_", 1)[1])
@@ -295,14 +315,9 @@ def get_chunk_for_generation(
     # Upstream finished producing chunks; don't force request.status (stage still needs to consume tokens).
     if payload_data.get("finished"):
         connector.finished_requests.add(request_id)
-
-    # async_chunk: prompt_token_ids must be append-only; ignore empty terminal chunks.
-    codes = payload_data.get("code_predictor_codes", None)
-    if isinstance(codes, list) and codes:
-        if chunk_id == 0 and request.num_computed_tokens == 0:
-            request.prompt_token_ids = codes
-        else:
-            request.prompt_token_ids += codes
+        request.status = RequestStatus.FINISHED_STOPPED
+    request.prompt_token_ids = payload_data.get("code_predictor_codes", [])
+    request.num_computed_tokens = 0
 
 
 def put_chunk(
@@ -315,8 +330,6 @@ def put_chunk(
     stage_id = connector.stage_id
     next_stage_id = stage_id + 1
     request_id = request.external_req_id
-    prompt_token_ids = request.prompt_token_ids
-    connector.request_prompt_token_ids[request_id] = prompt_token_ids
     chunk_id = connector.put_requests[request_id]
     connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
     payload_data = None
@@ -325,6 +338,7 @@ def put_chunk(
     if custom_process_input_func:
         try:
             payload_data = custom_process_input_func(
+                connector=connector,
                 pooling_output=pooling_output,
                 request=request,
             )
@@ -448,7 +462,6 @@ def put_chunk(
                         else 0
                     )
                     payload_data["codec_layout"] = "codebook_major"
-
         success, size, metadata = connector.put(
             from_stage=str(stage_id), to_stage=str(next_stage_id), put_key=connector_put_key, data=payload_data
         )
