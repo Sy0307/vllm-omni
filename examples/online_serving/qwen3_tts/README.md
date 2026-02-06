@@ -80,22 +80,6 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 curl http://localhost:8000/v1/audio/voices
 ```
 
-### 4. Manual Smoke Test
-
-```bash
-cat > /tmp/qwen3tts_customvoice_req.json <<'JSON'
-{"input":"你好，世界。","task_type":"CustomVoice","voice":"Vivian","response_format":"wav","max_new_tokens":256}
-JSON
-
-curl -sS -o /tmp/qwen3tts_customvoice.wav \
-  -H "Content-Type: application/json" \
-  -d @/tmp/qwen3tts_customvoice_req.json \
-  http://127.0.0.1:8000/v1/audio/speech
-
-ls -lah /tmp/qwen3tts_customvoice.wav
-file /tmp/qwen3tts_customvoice.wav
-```
-
 ## API Reference
 
 ### Endpoint
