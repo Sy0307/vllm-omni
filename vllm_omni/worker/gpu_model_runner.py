@@ -1161,15 +1161,38 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_last_model_output = model_output
         return model_output
 
-    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
+    def _merge_additional_information_update(self, req_id: str, upd: object) -> None:
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
+        if upd is None:
+            return
+
+        upd_dict: dict[str, object]
+        if isinstance(upd, dict):
+            upd_dict = upd
+        else:
+            from vllm_omni.engine import AdditionalInformationPayload
+
+            if not isinstance(upd, AdditionalInformationPayload):
+                raise TypeError(f"Unsupported additional_information type: {type(upd)!r}")
+            upd_dict = {}
+            for key, entry in upd.entries.items():
+                if entry.tensor_data is not None:
+                    if entry.tensor_shape is None or entry.tensor_dtype is None:
+                        raise ValueError(f"Invalid tensor payload for key={key}")
+                    arr = np.frombuffer(entry.tensor_data, dtype=np.dtype(entry.tensor_dtype)).reshape(
+                        entry.tensor_shape
+                    )
+                    upd_dict[key] = torch.from_numpy(arr.copy())
+                else:
+                    upd_dict[key] = entry.list_data
+
         existing = getattr(req_state, "additional_information_cpu", {})
         if not isinstance(existing, dict):
             existing = {}
         merged = dict(existing)
-        for k, v in upd.items():
+        for k, v in upd_dict.items():
             if isinstance(v, torch.Tensor):
                 merged[k] = v.detach().to("cpu").contiguous()
             elif isinstance(v, list):
