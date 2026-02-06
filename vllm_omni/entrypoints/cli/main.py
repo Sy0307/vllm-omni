@@ -6,6 +6,14 @@ import importlib.metadata
 import sys
 
 
+def _get_vllm_omni_version() -> str:
+    try:
+        return importlib.metadata.version("vllm_omni")
+    except importlib.metadata.PackageNotFoundError:
+        # Running from source (PYTHONPATH) without installed package metadata.
+        return "dev"
+
+
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
     # Check if --omni flag is present
@@ -36,7 +44,7 @@ def main():
             "-v",
             "--version",
             action="version",
-            version=importlib.metadata.version("vllm_omni"),
+            version=_get_vllm_omni_version(),
         )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}

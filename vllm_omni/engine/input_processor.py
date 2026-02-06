@@ -87,6 +87,30 @@ class OmniInputProcessor(InputProcessor):
             mm_processor_cache=self.mm_processor_cache,
         )
 
+    def _validate_model_inputs(self, encoder_inputs: Any, decoder_inputs: Any) -> None:  # noqa: ANN401
+        """Allow empty decoder prompt for downstream async_chunk stages.
+
+        In `async_chunk` pipelines, downstream stages may be created before the
+        upstream stage has produced the first chunk. In that case, the decoder
+        prompt can be temporarily empty and will be filled by the connector
+        once a chunk arrives.
+        """
+        try:
+            stage_id = int(getattr(self.model_config, "stage_id", 0) or 0)
+        except Exception:
+            stage_id = 0
+        if stage_id > 0 and bool(getattr(self.model_config, "async_chunk", False)):
+            try:
+                if isinstance(decoder_inputs, dict) and decoder_inputs.get("type") != "embeds":
+                    prompt_ids = decoder_inputs.get("prompt_token_ids")
+                    if isinstance(prompt_ids, list) and len(prompt_ids) == 0:
+                        if encoder_inputs is not None:
+                            self._validate_model_input(encoder_inputs, prompt_type="encoder")
+                        return
+            except Exception:
+                pass
+        super()._validate_model_inputs(encoder_inputs, decoder_inputs)
+
     def process_inputs(
         self,
         request_id: str,

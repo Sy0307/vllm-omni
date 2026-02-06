@@ -81,8 +81,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         except Exception as e:
             raise RuntimeError(f"Failed to move SpeechTokenizer to device={device}: {e}") from e
 
-        # Derive codec group count and rates from tokenizer config if possible.
-        num_q = None
+        # Derive codec group count and rates from tokenizer config.
+        num_q: int | None = None
         try:
             dec_cfg = getattr(tok.model.config, "decoder_config", None)
             if dec_cfg is not None:
@@ -90,8 +90,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         except Exception:
             num_q = None
         if num_q is None:
-            # Fallback: many code2wav stages use 16 quantizers.
-            num_q = 16
+            raise ValueError(
+                "Missing speech_tokenizer decoder_config.num_quantizers; "
+                "please ensure the checkpoint contains a valid SpeechTokenizer config."
+            )
         num_q = int(num_q)
         if num_q <= 0:
             raise ValueError(f"Invalid speech_tokenizer num_quantizers={num_q}")
@@ -105,8 +107,10 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         try:
             out_sr = int(tok.get_output_sample_rate())
-        except Exception:
-            out_sr = 24000
+        except Exception as e:
+            raise ValueError(f"Failed to get output sample rate: {e}") from e
+        if out_sr <= 0:
+            raise ValueError(f"Invalid output sample rate: {out_sr}")
 
         self._speech_tokenizer = tok
         self._num_quantizers = num_q
@@ -129,7 +133,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         chunk_ids: torch.Tensor,
         q: int,
         chunk_frames: int,
-        codec_streaming: bool,
         ctx_frames: int,
         ctx_codes: list[int] | None,
     ) -> torch.Tensor:
@@ -144,10 +147,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 "Invalid chunk_ids length for Qwen3TTSCode2Wav: "
                 f"got={int(chunk_ids.numel())} expected={int(q) * int(chunk_frames)} "
                 f"(q={q} chunk_frames={chunk_frames})."
-            )
+        )
 
         chunk_qf = chunk_ids.reshape(int(q), int(chunk_frames))
-        if codec_streaming and ctx_frames > 0:
+        if ctx_frames > 0:
             if ctx_codes is None:
                 raise ValueError("Missing ctx_codes for streaming decode window reconstruction.")
             expected_ctx_tokens = int(q) * int(ctx_frames)
@@ -172,7 +175,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, int]:
         # ModelOutput is (audio_tensor, sr_tensor).
         tok = self._ensure_speech_tokenizer_loaded()
         assert self._num_quantizers is not None
@@ -181,29 +184,25 @@ class Qwen3TTSCode2Wav(nn.Module):
         if input_ids is None:
             # Profile run / placeholder schedule: return empty audio.
             empty = torch.zeros((0,), dtype=torch.float32)
-            return empty, torch.tensor(self._output_sample_rate, dtype=torch.int32)
+            return empty, int(self._output_sample_rate)
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         q = int(self._num_quantizers)
 
         if ids.numel() == 0 or ids.numel() < q:
             empty = torch.zeros((0,), dtype=torch.float32)
-            return empty, torch.tensor(self._output_sample_rate, dtype=torch.int32)
+            return empty, int(self._output_sample_rate)
 
-        # Contract: connector provides codec_streaming + codec_context_frames (left-context frames to trim).
+        # Contract (Omni async_chunk):
+        # - connector/adapter provides codec_context_frames/codes and codec_chunk_frames
+        # - vLLM provides a padded `input_ids` tensor; we must slice the exact chunk
+        #   tokens (chunk_frames * q) and ignore padding.
         # Assumes max_batch_size=1 for code2wav (vLLM provides a flattened per-step token stream).
         ctx_frames: int | None = None
-        codec_streaming: bool | None = None
         ctx_codes: list[int] | None = None
         chunk_frames: int | None = None
         rt_info = kwargs.get("runtime_additional_information")
         if isinstance(rt_info, list) and len(rt_info) == 1 and isinstance(rt_info[0], dict):
-            v = rt_info[0].get("codec_streaming")
-            if v is not None:
-                try:
-                    codec_streaming = bool(v) if not isinstance(v, torch.Tensor) else bool(v.item())
-                except Exception:
-                    codec_streaming = None
             v = rt_info[0].get("codec_context_frames")
             if v is not None:
                 try:
@@ -223,22 +222,13 @@ class Qwen3TTSCode2Wav(nn.Module):
                 except Exception as e:
                     raise ValueError(f"Invalid codec_chunk_frames={v!r}: {e}") from e
 
-        if codec_streaming is None:
+        if ctx_frames is None:
             raise ValueError(
-                "Missing codec_streaming in runtime_additional_information for Qwen3TTSCode2Wav. "
+                "Missing codec_context_frames in runtime_additional_information for Qwen3TTSCode2Wav. "
                 "This indicates the async_chunk connector/adapter contract was not applied."
             )
-
-        if codec_streaming is False:
-            ctx_frames = 0
-        else:
-            if ctx_frames is None:
-                raise ValueError(
-                    "Missing codec_context_frames in runtime_additional_information for streaming Qwen3TTSCode2Wav. "
-                    "This indicates the async_chunk connector/adapter contract was not applied."
-                )
-            if ctx_frames < 0:
-                raise ValueError(f"Invalid codec_context_frames={ctx_frames} (must be >=0).")
+        if ctx_frames < 0:
+            raise ValueError(f"Invalid codec_context_frames={ctx_frames} (must be >=0).")
 
         # input_ids may be padded; use codec_chunk_frames to slice the exact chunk (chunk_frames * q) and ignore padding.
         if chunk_frames is None:
@@ -251,7 +241,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         expected_chunk_tokens = int(chunk_frames) * q
         if expected_chunk_tokens == 0:
             empty = torch.zeros((0,), dtype=torch.float32)
-            return empty, torch.tensor(self._output_sample_rate, dtype=torch.int32)
+            return empty, int(self._output_sample_rate)
         if ids.numel() < expected_chunk_tokens:
             raise ValueError(
                 "Code2Wav received fewer tokens than expected for this chunk: "
@@ -274,13 +264,12 @@ class Qwen3TTSCode2Wav(nn.Module):
             ids = ids[:expected_chunk_tokens]
 
         chunk_ids = ids
-        ctx_frames_i = int(ctx_frames or 0)
-        frames = int((ctx_frames_i if codec_streaming else 0) + int(chunk_frames))
+        ctx_frames_i = int(ctx_frames)
+        frames = int(ctx_frames_i + int(chunk_frames))
         codes_fq = self._reconstruct_window_codes_fq(
             chunk_ids=chunk_ids,
             q=q,
             chunk_frames=int(chunk_frames),
-            codec_streaming=bool(codec_streaming),
             ctx_frames=ctx_frames_i,
             ctx_codes=ctx_codes,
         )
@@ -306,21 +295,22 @@ class Qwen3TTSCode2Wav(nn.Module):
         wavs, sr = tok.decode({"audio_codes": codes_fq})
         if not wavs:
             raise ValueError("SpeechTokenizer code2wav produced empty waveform list.")
-        audio_np = wavs[0].astype(np.float32, copy=False)
+        # Ensure the returned numpy array is contiguous; some implementations may
+        # return a strided/broadcast view which would create a stride-0 torch
+        # tensor and crash vLLM's tensor serializer.
+        audio_np = np.ascontiguousarray(wavs[0], dtype=np.float32)
 
-        if ctx_frames > 0:
+        if ctx_frames_i > 0:
+            if ctx_codes is None:
+                raise ValueError(
+                    "Missing codec_context_codes in runtime_additional_information for streaming Qwen3TTSCode2Wav. "
+                    "This indicates the async_chunk connector/adapter contract was not applied."
+                )
             # Trim waveform samples corresponding to left-context frames in the sliding window.
             upsample = self._decode_upsample_rate
             if upsample is None:
-                try:
-                    upsample = int(tok.get_decode_upsample_rate())
-                except Exception as e:
-                    raise ValueError(f"Failed to get decode upsample rate: {e}") from e
-                if upsample <= 0:
-                    raise ValueError(f"Invalid decode upsample rate: {upsample}")
-                self._decode_upsample_rate = upsample
+                raise ValueError("Missing decode upsample rate (speech_tokenizer init did not populate it).")
 
-            ctx_frames_i = int(ctx_frames)
             if ctx_frames_i > frames:
                 raise ValueError(f"codec_context_frames={ctx_frames_i} exceeds frames={frames}")
 
@@ -332,12 +322,15 @@ class Qwen3TTSCode2Wav(nn.Module):
                     f"cut={cut} decoded={decoded} ctx_frames={ctx_frames_i} frames={frames}"
                 )
             audio_np = audio_np[cut:]
+            # Keep contiguous after slicing for stable torch serialization.
+            audio_np = np.ascontiguousarray(audio_np, dtype=np.float32)
 
         # Return 1D waveform per chunk so the output processor can concatenate along time.
         # Returning [1, T] would stack chunks as channels.
-        audio_tensor = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1)
-        sr_tensor = torch.tensor(int(sr), dtype=torch.int32)
-        return audio_tensor, sr_tensor
+        audio_tensor = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1).contiguous()
+        # Return sample rate as a Python int to avoid scalar-tensor serialization issues
+        # across multiprocessing boundaries.
+        return audio_tensor, int(sr)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -351,7 +344,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             text_hidden_states=None,
             multimodal_outputs={
                 "model_outputs": audio_tensor,
-                "sr": sr,
+                "sr": int(sr) if not isinstance(sr, torch.Tensor) else int(sr.item()),
             },
         )
 

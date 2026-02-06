@@ -87,8 +87,21 @@ class OmniGenerationScheduler(VLLMScheduler):
                     self.omni_connector is not None
                     and request.external_req_id in self.omni_connector.finished_requests
                 ):
+                    # Finalize async_chunk requests without scheduling placeholder prefill.
+                    #
+                    # For code2wav-style generation, vLLM still needs one last
+                    # scheduled step to propagate FINISHED_STOPPED through
+                    # update_from_output(). We schedule a single no-op token,
+                    # and mark this step as an empty chunk (codec_chunk_frames=0)
+                    # so the model returns an empty audio tensor instead of
+                    # interpreting the placeholder token as a real codec id.
                     request.status = RequestStatus.FINISHED_STOPPED
-                    # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
+                    ai = request.additional_information
+                    if isinstance(ai, dict):
+                        ai["codec_chunk_frames"] = 0
+                        ai["codec_context_frames"] = 0
+                        ai["codec_context_codes"] = []
+                    # Upstream may finish with no terminal tokens; append one placeholder token.
                     if len(request.prompt_token_ids) <= num_computed_tokens:
                         request.prompt_token_ids.append(0)
                         try:

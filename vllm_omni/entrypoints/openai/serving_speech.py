@@ -3,6 +3,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import Response
+from transformers import AutoTokenizer
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
@@ -43,6 +44,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+        self._tts_text_tokenizer = None
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -62,8 +64,56 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return set()
 
+    def _get_tts_text_tokenizer(self):
+        if self._tts_text_tokenizer is None:
+            self._tts_text_tokenizer = AutoTokenizer.from_pretrained(
+                self.engine_client.model_config.model,
+                trust_remote_code=True,
+                fix_mistral_regex=True,
+                use_fast=True,
+            )
+            self._tts_text_tokenizer.padding_side = "left"
+        return self._tts_text_tokenizer
+
+    def _build_tts_placeholder_prompt_token_ids(self, tts_params: dict[str, Any]) -> list[int]:
+        # Stage-0 (talker AR) uses a small codec vocab (e.g. 3072). The input
+        # ids passed to vLLM must stay in-vocab; the *real* text conditioning is
+        # carried by additional_information and turned into prompt_embeds inside
+        # the talker model preprocess.
+        from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker_ar import (
+            Qwen3TTSTalkerForConditionalGenerationARVLLM,
+        )
+
+        talker_cfg = self.engine_client.model_config.hf_config.talker_config
+        codec_pad_id = int(getattr(talker_cfg, "codec_pad_id", 0) or 0)
+        task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+
+        tok = self._get_tts_text_tokenizer()
+
+        def _tokenize_len(s: str) -> list[int]:
+            return tok(s, return_tensors=None, padding=False)["input_ids"]
+
+        prompt_len = Qwen3TTSTalkerForConditionalGenerationARVLLM.estimate_prompt_len_from_additional_information(
+            tts_params,
+            task_type=str(task_type),
+            tokenize_prompt=_tokenize_len,
+            codec_language_id=getattr(talker_cfg, "codec_language_id", None),
+            spk_is_dialect=getattr(talker_cfg, "spk_is_dialect", None),
+            estimate_ref_code_len=None,
+        )
+        if prompt_len <= 0:
+            raise ValueError(f"Invalid talker prompt_len={prompt_len} for task_type={task_type!r}.")
+
+        return [codec_pad_id] * int(prompt_len)
+
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
+        try:
+            hf_cfg = getattr(self.engine_client.model_config, "hf_config", None)
+            if getattr(hf_cfg, "model_type", None) == "qwen3_tts":
+                return True
+        except Exception:
+            pass
         stage_list = getattr(self.engine_client, "stage_list", None)
         if stage_list:
             for stage in stage_list:
@@ -223,11 +273,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 # Build TTS parameters and prompt
                 tts_params = self._build_tts_params(request)
-                prompt_text = self._build_tts_prompt(request.input)
-                prompt = {
-                    "prompt": prompt_text,
-                    "additional_information": tts_params,
-                }
+                prompt_token_ids = self._build_tts_placeholder_prompt_token_ids(tts_params)
+                prompt = {"prompt_token_ids": prompt_token_ids, "additional_information": tts_params}
             else:
                 # Fallback for unsupported models
                 tts_params = {}

@@ -117,9 +117,14 @@ class OmniRequestState(RequestState):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
                         if k == "audio":
-                            # When the audio tensor shape is inconsistent, torch.cat will fail.
-                            # We need to use torch.cat in -1 dimension.
-                            continue
+                            # Audio chunks may arrive as tensors with varying shapes
+                            # (e.g. [T], [1, T], [C, T]). Normalize to 1-D waveform
+                            # and concatenate along time.
+                            audio_chunks = [t.reshape(-1) for t in v]
+                            self.mm_accumulated[k] = torch.cat(audio_chunks, dim=0)
+                        elif k == "sr":
+                            # Sample rate is a scalar; keep the last seen value.
+                            self.mm_accumulated[k] = v[-1]
                         else:
                             self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:
