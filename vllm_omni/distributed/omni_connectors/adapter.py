@@ -315,7 +315,6 @@ def get_chunk_for_generation(
     # Upstream finished producing chunks; don't force request.status (stage still needs to consume tokens).
     if payload_data.get("finished"):
         connector.finished_requests.add(request_id)
-        request.status = RequestStatus.FINISHED_STOPPED
     request.prompt_token_ids = payload_data.get("code_predictor_codes", [])
     request.num_computed_tokens = 0
 
@@ -338,7 +337,6 @@ def put_chunk(
     if custom_process_input_func:
         try:
             payload_data = custom_process_input_func(
-                connector=connector,
                 pooling_output=pooling_output,
                 request=request,
             )
