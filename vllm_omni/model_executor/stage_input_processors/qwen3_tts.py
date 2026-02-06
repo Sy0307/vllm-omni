@@ -8,6 +8,7 @@ import torch
 def talker2speech_tokenizer_async_chunk(
     pooling_output: dict[str, Any],
     request: Any,
+    connector: Any | None = None,
 ) -> dict[str, Any] | None:
     """Async-chunk payload extractor for Qwen3-TTS Talker → SpeechTokenizer.
 
