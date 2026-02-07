@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 class GPUGenerationModelRunner(OmniGPUModelRunner):
     """Non-autoregressive generation runner that skips logits/sampling and returns waveforms via pooler_output."""
 
+    def _maybe_disable_mrope_for_code2wav(self) -> None:
+        model_arch = getattr(self.model_config, "model_arch", None) or getattr(
+            self.vllm_config.model_config, "model_arch", None
+        )
+        if model_arch == "Qwen3TTSCode2Wav" and self.uses_mrope:
+            self.uses_mrope = False
+
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for _, req_id in enumerate(cached_reqs.req_ids):
@@ -59,6 +66,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors:
+        self._maybe_disable_mrope_for_code2wav()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -316,30 +324,41 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         ) = self.execute_model_state
         self.execute_model_state = None
 
-        pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
+        # Omni generation stages (e.g. code2wav) emit multimodal payloads. In
+        # vLLM-Omni we forward those payloads through ModelRunnerOutput.pooler_output
+        # as a per-request `dict[str, Tensor]`. This matches the omni driver-side
+        # decoding (OmniEngineCoreOutput.pooling_output) and allows the serving
+        # layer to retrieve both waveform and sample-rate.
+        #
+        # IMPORTANT: All dict values MUST be torch.Tensors; otherwise msgspec
+        # will fail decoding the EngineCoreOutputs in the driver process.
+        def _to_cpu_contig(x: object) -> object:
+            if isinstance(x, torch.Tensor):
+                return x.detach().to("cpu").contiguous()
+            return x
+
+        pooler_output: list[dict[str, object]] = []
+        if isinstance(multimodal_outputs, dict):
+            payload: dict[str, object] = {k: _to_cpu_contig(v) for k, v in multimodal_outputs.items()}
+            for _ in range(self.input_batch.num_reqs):
+                pooler_output.append(payload)
+        elif isinstance(multimodal_outputs, torch.Tensor):
             assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
+                pooler_output.append({"model_outputs": _to_cpu_contig(multimodal_outputs[i])})
         elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
+            assert len(multimodal_outputs) == self.input_batch.num_reqs, (
+                "model should return one entry per request in list form"
             )
             for out in multimodal_outputs:
-                pooler_output.append(
-                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
-                )
-        elif isinstance(multimodal_outputs, dict):
-            mm_payload = {}
-            for key, out in multimodal_outputs.items():
-                if out is not None and isinstance(out, torch.Tensor):
-                    mm_payload[key] = out.detach().to("cpu").contiguous()
-            pooler_output.append(mm_payload)
+                if isinstance(out, dict):
+                    pooler_output.append({k: _to_cpu_contig(v) for k, v in out.items()})
+                elif isinstance(out, torch.Tensor):
+                    pooler_output.append({"model_outputs": _to_cpu_contig(out)})
+                else:
+                    raise RuntimeError(f"Unsupported per-request multimodal output type: {type(out)}")
         else:
-            raise RuntimeError("Unsupported diffusion output type")
+            raise RuntimeError(f"Unsupported multimodal output type: {type(multimodal_outputs)}")
         output = OmniModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
