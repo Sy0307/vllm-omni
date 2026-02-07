@@ -1,4 +1,5 @@
 import torch
+from types import SimpleNamespace
 
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 
@@ -73,3 +74,40 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.pooler_output[0]
     assert "unused" not in output.pooler_output[0]
     assert output.pooler_output[0]["audio"].shape == (1, 4)
+
+
+def _make_stage_runner(model_stage=None, model_arch=None, cls_name="DummyModel", uses_mrope=True):
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.uses_mrope = uses_mrope
+    runner.model_config = SimpleNamespace(
+        model_stage=model_stage,
+        model_arch=model_arch,
+        hf_config=SimpleNamespace(architectures=None),
+    )
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model_stage=model_stage,
+            model_arch=model_arch,
+        )
+    )
+    model_cls = type(cls_name, (), {})
+    runner.model = model_cls()
+    return runner
+
+
+def test_disable_mrope_for_code2wav_by_model_stage():
+    runner = _make_stage_runner(model_stage="code2wav", model_arch=None, uses_mrope=True)
+    runner._maybe_disable_mrope_for_code2wav()
+    assert runner.uses_mrope is False
+
+
+def test_disable_mrope_for_code2wav_by_model_arch():
+    runner = _make_stage_runner(model_stage=None, model_arch="Qwen3TTSCode2Wav", uses_mrope=True)
+    runner._maybe_disable_mrope_for_code2wav()
+    assert runner.uses_mrope is False
+
+
+def test_disable_mrope_for_code2wav_by_model_class_name():
+    runner = _make_stage_runner(model_stage=None, model_arch=None, cls_name="Qwen3TTSCode2Wav", uses_mrope=True)
+    runner._maybe_disable_mrope_for_code2wav()
+    assert runner.uses_mrope is False

@@ -40,11 +40,27 @@ logger = logging.getLogger(__name__)
 class GPUGenerationModelRunner(OmniGPUModelRunner):
     """Non-autoregressive generation runner that skips logits/sampling and returns waveforms via pooler_output."""
 
+    def _is_code2wav_stage(self) -> bool:
+        model_cfg = self.model_config
+        vllm_model_cfg = self.vllm_config.model_config
+        model_stage = getattr(model_cfg, "model_stage", None) or getattr(vllm_model_cfg, "model_stage", None)
+        if isinstance(model_stage, str) and model_stage.lower() == "code2wav":
+            return True
+
+        model_arch = getattr(model_cfg, "model_arch", None) or getattr(vllm_model_cfg, "model_arch", None)
+        if isinstance(model_arch, str) and "code2wav" in model_arch.lower():
+            return True
+
+        hf_arches = getattr(getattr(model_cfg, "hf_config", None), "architectures", None)
+        if isinstance(hf_arches, list) and any(isinstance(a, str) and "code2wav" in a.lower() for a in hf_arches):
+            return True
+
+        model_cls = getattr(getattr(self, "model", None), "__class__", None)
+        model_cls_name = getattr(model_cls, "__name__", "")
+        return isinstance(model_cls_name, str) and "code2wav" in model_cls_name.lower()
+
     def _maybe_disable_mrope_for_code2wav(self) -> None:
-        model_arch = getattr(self.model_config, "model_arch", None) or getattr(
-            self.vllm_config.model_config, "model_arch", None
-        )
-        if model_arch == "Qwen3TTSCode2Wav" and self.uses_mrope:
+        if self.uses_mrope and self._is_code2wav_stage():
             self.uses_mrope = False
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
