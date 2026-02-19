@@ -1,0 +1,545 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Offline inference with async_chunk enabled via AsyncOmni.
+
+This script uses AsyncOmni (the async orchestrator) to run offline inference
+with async_chunk semantics: downstream stages (Talker, Code2Wav) start
+*before* upstream stages finish, consuming chunks as they arrive via
+the in-worker OmniChunkTransferAdapter / connector.
+
+Compared to the synchronous ``end2end.py`` (which uses ``Omni``), this
+entry point achieves true stage-level concurrency -- stage-1/2 are
+actively processing while stage-0 is still generating.
+
+Usage
+-----
+    python end2end_async_chunk.py --query-type use_audio \
+        --stage-configs-path <path-to-async-chunk-yaml>
+
+See ``--help`` for all options.
+"""
+
+import asyncio
+import logging
+import os
+import time
+import uuid
+from typing import NamedTuple
+
+import numpy as np
+import soundfile as sf
+import torch
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+import librosa
+from PIL import Image
+from vllm import SamplingParams
+from vllm.assets.audio import AudioAsset
+from vllm.assets.image import ImageAsset
+from vllm.assets.video import VideoAsset, video_to_ndarrays
+from vllm.multimodal.image import convert_image_mode
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+logger = logging.getLogger(__name__)
+
+SEED = 42
+
+# ---------------------------------------------------------------------------
+# Query builders (reuse the patterns from end2end.py)
+# ---------------------------------------------------------------------------
+
+default_system = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
+    "Group, capable of perceiving auditory and visual inputs, as well as "
+    "generating text and speech."
+)
+
+
+class QueryResult(NamedTuple):
+    inputs: dict
+    limit_mm_per_prompt: dict[str, int]
+
+
+def get_text_query(question: str = None) -> QueryResult:
+    if question is None:
+        question = (
+            "Explain the system architecture for a scalable audio "
+            "generation pipeline. Answer in 15 words."
+        )
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    return QueryResult(inputs={"prompt": prompt}, limit_mm_per_prompt={})
+
+
+def get_audio_query(
+    question: str = None,
+    audio_path: str | None = None,
+    sampling_rate: int = 16000,
+) -> QueryResult:
+    if question is None:
+        question = "What is the content of this audio?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+        f"{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {"audio": audio_data},
+        },
+        limit_mm_per_prompt={"audio": 1},
+    )
+
+
+def get_image_query(
+    question: str = None, image_path: str | None = None
+) -> QueryResult:
+    if question is None:
+        question = "What is the content of this image?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(
+            ImageAsset("cherry_blossom").pil_image, "RGB"
+        )
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {"image": image_data},
+        },
+        limit_mm_per_prompt={"image": 1},
+    )
+
+
+def get_video_query(
+    question: str = None,
+    video_path: str | None = None,
+    num_frames: int = 16,
+) -> QueryResult:
+    if question is None:
+        question = "Why is this video funny?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(
+            name="baby_reading", num_frames=num_frames
+        ).np_ndarrays
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {"video": video_frames},
+        },
+        limit_mm_per_prompt={"video": 1},
+    )
+
+
+query_map = {
+    "text": get_text_query,
+    "use_audio": get_audio_query,
+    "use_image": get_image_query,
+    "use_video": get_video_query,
+}
+
+# ---------------------------------------------------------------------------
+# Core async routine
+# ---------------------------------------------------------------------------
+
+def _default_async_chunk_stage_configs_path() -> str | None:
+    """Best-effort default stage config for running Qwen3-Omni with async_chunk.
+
+    When this example is executed from within the repository, we resolve the
+    default YAML path relative to this file. When installed elsewhere, the
+    file may not exist and callers should pass --stage-configs-path explicitly.
+    """
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    candidate = os.path.join(
+        repo_root,
+        "vllm_omni",
+        "model_executor",
+        "stage_configs",
+        "qwen3_omni_moe_async_chunk.yaml",
+    )
+    return candidate if os.path.exists(candidate) else None
+
+
+async def run_single_request(
+    async_omni: AsyncOmni,
+    prompt: dict,
+    request_id: str,
+    sampling_params_list: list[SamplingParams] | None,
+    output_dir: str,
+    output_modalities: list[str] | None = None,
+) -> dict:
+    """Run one request through AsyncOmni and collect outputs.
+
+    Returns a dict with timing information and saved file paths.
+    """
+    t_start = time.perf_counter()
+    text_parts: list[str] = []
+    audio_chunks: list[torch.Tensor] = []
+    audio_sr: int | None = None
+    first_audio_ts: float | None = None
+    audio_list_consumed: int = 0
+    audio_last_tensor: torch.Tensor | None = None
+    audio_last_numel: int = -1
+    stage_0_first_output_ts: float | None = None
+
+    async for omni_output in async_omni.generate(
+        prompt=prompt,
+        request_id=request_id,
+        sampling_params_list=sampling_params_list,
+        output_modalities=output_modalities,
+    ):
+        if not isinstance(omni_output.request_output, list):
+            outputs_list = [omni_output.request_output]
+        else:
+            outputs_list = omni_output.request_output
+
+        for output in outputs_list:
+            if omni_output.final_output_type == "text":
+                if stage_0_first_output_ts is None:
+                    stage_0_first_output_ts = time.perf_counter()
+                text_output = output.outputs[0].text
+                if output.finished:
+                    text_parts.append(text_output)
+            elif omni_output.final_output_type == "audio":
+                mm_out = output.outputs[0].multimodal_output
+                if mm_out and "audio" in mm_out:
+                    if first_audio_ts is None:
+                        first_audio_ts = time.perf_counter()
+                    audio_data = mm_out["audio"]
+                    if isinstance(audio_data, list):
+                        # The output processor attaches the *accumulated* list
+                        # on every intermediate output. Only consume the new tail.
+                        if len(audio_data) < audio_list_consumed:
+                            audio_list_consumed = 0
+                        new_chunks = audio_data[audio_list_consumed:]
+                        audio_list_consumed = len(audio_data)
+                        audio_chunks.extend(new_chunks)
+                    else:
+                        # Best-effort handling for tensor-only audio: decide whether
+                        # it's cumulative (replace) or delta (append).
+                        if isinstance(audio_data, torch.Tensor):
+                            numel = int(audio_data.numel())
+                            if numel >= audio_last_numel:
+                                audio_last_tensor = audio_data
+                                audio_last_numel = numel
+                            else:
+                                audio_chunks.append(audio_data)
+                        else:
+                            audio_chunks.append(audio_data)
+                    if audio_sr is None and "sr" in mm_out:
+                        sr_val = mm_out["sr"]
+                        audio_sr = (
+                            sr_val.item()
+                            if hasattr(sr_val, "item")
+                            else int(sr_val)
+                        )
+
+    t_end = time.perf_counter()
+    result = {
+        "request_id": request_id,
+        "e2e_latency_s": t_end - t_start,
+        "saved_files": [],
+    }
+
+    # Save text output
+    if text_parts:
+        text_file = os.path.join(output_dir, f"{request_id}.txt")
+        with open(text_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(text_parts))
+        result["saved_files"].append(text_file)
+        print(
+            f"[Request {request_id}] Text saved to {text_file} "
+            f"(stage-0 first output at {stage_0_first_output_ts - t_start:.3f}s)"
+        )
+
+    # Save audio output
+    if audio_chunks or audio_last_tensor is not None:
+        if audio_chunks:
+            if len(audio_chunks) > 1:
+                audio_tensor = torch.cat(audio_chunks, dim=-1)
+            else:
+                audio_tensor = audio_chunks[0]
+        else:
+            audio_tensor = audio_last_tensor
+        audio_numpy = audio_tensor.float().detach().cpu().numpy()
+        if audio_numpy.ndim > 1:
+            audio_numpy = audio_numpy.flatten()
+        samplerate = audio_sr if audio_sr else 24000
+        wav_file = os.path.join(output_dir, f"output_{request_id}.wav")
+        sf.write(wav_file, audio_numpy, samplerate=samplerate, format="WAV")
+        result["saved_files"].append(wav_file)
+        result["audio_duration_s"] = len(audio_numpy) / samplerate
+        result["num_audio_chunks"] = len(audio_chunks)
+        ttfa = (
+            (first_audio_ts - t_start) if first_audio_ts else None
+        )
+        result["time_to_first_audio_s"] = ttfa
+        ttfa_str = f"{ttfa:.3f}s" if ttfa is not None else "N/A"
+        print(
+            f"[Request {request_id}] Audio saved to {wav_file} "
+            f"({len(audio_chunks)} chunks, "
+            f"duration={result['audio_duration_s']:.2f}s, "
+            f"TTFA={ttfa_str}, "
+            f"e2e={result['e2e_latency_s']:.3f}s)"
+        )
+
+    return result
+
+
+async def run_all(args):
+    """Main async entry: build prompts, create AsyncOmni, run requests."""
+    # Build query
+    query_func = query_map[args.query_type]
+    if args.query_type == "use_video":
+        query_result = query_func(
+            video_path=getattr(args, "video_path", None),
+            num_frames=getattr(args, "num_frames", 16),
+        )
+    elif args.query_type == "use_image":
+        query_result = query_func(image_path=getattr(args, "image_path", None))
+    elif args.query_type == "use_audio":
+        query_result = query_func(
+            audio_path=getattr(args, "audio_path", None),
+            sampling_rate=getattr(args, "sampling_rate", 16000),
+        )
+    else:
+        query_result = query_func()
+
+    # Build prompt list
+    if args.txt_prompts is not None:
+        assert args.query_type == "text", (
+            "txt-prompts is only supported for text query type"
+        )
+        with open(args.txt_prompts, encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        prompts = [get_text_query(ln).inputs for ln in lines]
+        print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
+    else:
+        prompts = [query_result.inputs for _ in range(args.num_prompts)]
+
+    # Inject output modalities if specified
+    output_modalities = None
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+        for prompt in prompts:
+            prompt["modalities"] = output_modalities
+
+    # Create AsyncOmni
+    print(f"[Info] Creating AsyncOmni with stage_configs_path={args.stage_configs_path}")
+    async_omni = AsyncOmni(
+        model=args.model,
+        stage_configs_path=args.stage_configs_path,
+        log_stats=args.log_stats,
+        stage_init_timeout=args.stage_init_timeout,
+    )
+
+    # Use default sampling params from stage config (they are pre-configured
+    # in the YAML for each stage).
+    sampling_params_list = None
+
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Run requests with concurrency control
+    semaphore = asyncio.Semaphore(args.max_in_flight)
+    all_results: list[dict] = []
+
+    async def _run_one(idx: int, prompt: dict):
+        async with semaphore:
+            request_id = f"req_{idx}_{uuid.uuid4().hex[:8]}"
+            result = await run_single_request(
+                async_omni=async_omni,
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_dir=output_dir,
+                output_modalities=output_modalities,
+            )
+            return result
+
+    wall_start = time.perf_counter()
+    tasks = [_run_one(i, p) for i, p in enumerate(prompts)]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+    wall_end = time.perf_counter()
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("Summary")
+    print("=" * 60)
+    success_count = 0
+    total_audio_dur = 0.0
+    for r in all_results:
+        if isinstance(r, Exception):
+            print(f"  [ERROR] {r}")
+        else:
+            success_count += 1
+            total_audio_dur += r.get("audio_duration_s", 0.0)
+            print(
+                f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  "
+                f"files={r['saved_files']}"
+            )
+    wall_time = wall_end - wall_start
+    print(f"\nTotal: {success_count}/{len(prompts)} succeeded")
+    print(f"Wall time: {wall_time:.3f}s")
+    if total_audio_dur > 0:
+        print(f"Total audio duration: {total_audio_dur:.2f}s")
+        print(f"Real-time factor: {total_audio_dur / wall_time:.2f}x")
+    print("=" * 60)
+
+    # Cleanup
+    async_omni.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args():
+    parser = FlexibleArgumentParser(
+        description=(
+            "Offline inference with async_chunk enabled via AsyncOmni. "
+            "Downstream stages start before upstream stages finish, "
+            "achieving true stage-level concurrency."
+        )
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        help="Model name or path.",
+    )
+    parser.add_argument(
+        "--query-type",
+        "-q",
+        type=str,
+        default="use_audio",
+        choices=query_map.keys(),
+        help="Query type.",
+    )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=_default_async_chunk_stage_configs_path(),
+        help=(
+            "Path to an async_chunk stage config YAML. "
+            "If not set, uses the model's default config "
+            "(make sure it has async_chunk: true)."
+        ),
+    )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        default=False,
+        help="Enable writing detailed statistics.",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=300,
+        help="Timeout for initializing a single stage (seconds).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="output_audio_async_chunk",
+        help="Directory to save output files.",
+    )
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=1,
+        help="Number of prompts to generate (duplicated from query).",
+    )
+    parser.add_argument(
+        "--txt-prompts",
+        type=str,
+        default=None,
+        help="Path to a .txt file with one prompt per line.",
+    )
+    parser.add_argument(
+        "--max-in-flight",
+        type=int,
+        default=1,
+        help="Maximum concurrent requests (default: 1).",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Comma-separated output modalities filter (e.g. 'text', 'audio', 'text,audio').",
+    )
+    parser.add_argument(
+        "--audio-path",
+        "-a",
+        type=str,
+        default=None,
+        help="Path to local audio file.",
+    )
+    parser.add_argument(
+        "--image-path",
+        "-i",
+        type=str,
+        default=None,
+        help="Path to local image file.",
+    )
+    parser.add_argument(
+        "--video-path",
+        "-v",
+        type=str,
+        default=None,
+        help="Path to local video file.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=16,
+        help="Number of frames to extract from video.",
+    )
+    parser.add_argument(
+        "--sampling-rate",
+        type=int,
+        default=16000,
+        help="Sampling rate for audio loading.",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    asyncio.run(run_all(args))
