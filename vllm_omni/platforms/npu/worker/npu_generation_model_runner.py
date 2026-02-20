@@ -238,6 +238,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
+        # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         output = OmniModelRunnerOutput(
