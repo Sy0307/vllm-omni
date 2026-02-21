@@ -416,6 +416,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    if self.chunk_transfer_adapter is not None:
+                        self.chunk_transfer_adapter.cleanup(
+                            request.request_id,
+                            getattr(request, "external_req_id", None),
+                        )
                 if status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
                     stopped_running_reqs.add(request)
                     stopped_preempted_reqs.add(request)
@@ -486,6 +491,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.cleanup(
+                        request.request_id,
+                        getattr(request, "external_req_id", None),
+                    )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

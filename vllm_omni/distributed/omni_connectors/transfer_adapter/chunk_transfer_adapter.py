@@ -223,6 +223,40 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
 
     ########################################################################
+    # Cleanup
+    ########################################################################
+
+    def cleanup(
+        self,
+        request_id: str,
+        external_req_id: str | None = None,
+    ) -> None:
+        """Reclaim all per-request state after a request finishes.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+
+        Args:
+            request_id: Internal request id (receive / scheduler side key).
+            external_req_id: External request id (send / payload side key).
+                When *None*, looked up from ``request_ids_mapping``.
+        """
+        if external_req_id is None:
+            external_req_id = self.request_ids_mapping.get(request_id, request_id)
+
+        self.finished_requests.discard(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.request_ids_mapping.pop(request_id, None)
+
+        with self.lock:
+            self._pending_load_reqs.pop(request_id, None)
+            self._finished_load_reqs.discard(request_id)
+
+        self.put_req_chunk.pop(external_req_id, None)
+        self.request_payload.pop(external_req_id, None)
+        self.code_prompt_token_ids.pop(external_req_id, None)
+
+    ########################################################################
     # Schedule Helper
     ########################################################################
 
