@@ -45,8 +45,6 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 logger = logging.getLogger(__name__)
 
-SEED = 42
-
 # ---------------------------------------------------------------------------
 # Query builders (reuse the patterns from end2end.py)
 # ---------------------------------------------------------------------------
@@ -177,6 +175,18 @@ query_map = {
 # Core async routine
 # ---------------------------------------------------------------------------
 
+def clone_prompt_for_request(template: dict) -> dict:
+    """Shallow-clone prompt dict so concurrent requests own independent containers."""
+    cloned = dict(template)
+    for key in ("multi_modal_data", "mm_processor_kwargs", "additional_information"):
+        value = template.get(key)
+        if isinstance(value, dict):
+            cloned[key] = dict(value)
+        elif isinstance(value, list):
+            cloned[key] = list(value)
+    return cloned
+
+
 def _default_async_chunk_stage_configs_path() -> str | None:
     """Best-effort default stage config for running Qwen3-Omni with async_chunk.
 
@@ -214,7 +224,6 @@ async def run_single_request(
     first_audio_ts: float | None = None
     audio_list_consumed: int = 0
     audio_last_tensor: torch.Tensor | None = None
-    audio_last_numel: int = -1
     stage_0_first_output_ts: float | None = None
 
     async for omni_output in async_omni.generate(
@@ -242,25 +251,11 @@ async def run_single_request(
                         first_audio_ts = time.perf_counter()
                     audio_data = mm_out["audio"]
                     if isinstance(audio_data, list):
-                        # The output processor attaches the *accumulated* list
-                        # on every intermediate output. Only consume the new tail.
-                        if len(audio_data) < audio_list_consumed:
-                            audio_list_consumed = 0
                         new_chunks = audio_data[audio_list_consumed:]
                         audio_list_consumed = len(audio_data)
                         audio_chunks.extend(new_chunks)
-                    else:
-                        # Best-effort handling for tensor-only audio: decide whether
-                        # it's cumulative (replace) or delta (append).
-                        if isinstance(audio_data, torch.Tensor):
-                            numel = int(audio_data.numel())
-                            if numel >= audio_last_numel:
-                                audio_last_tensor = audio_data
-                                audio_last_numel = numel
-                            else:
-                                audio_chunks.append(audio_data)
-                        else:
-                            audio_chunks.append(audio_data)
+                    elif isinstance(audio_data, torch.Tensor):
+                        audio_last_tensor = audio_data
                     if audio_sr is None and "sr" in mm_out:
                         sr_val = mm_out["sr"]
                         audio_sr = (
@@ -350,7 +345,7 @@ async def run_all(args):
         prompts = [get_text_query(ln).inputs for ln in lines]
         print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
     else:
-        prompts = [query_result.inputs for _ in range(args.num_prompts)]
+        prompts = [clone_prompt_for_request(query_result.inputs) for _ in range(args.num_prompts)]
 
     # Inject output modalities if specified
     output_modalities = None
