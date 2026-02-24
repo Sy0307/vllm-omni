@@ -63,10 +63,7 @@ class QueryResult(NamedTuple):
 
 def get_text_query(question: str = None) -> QueryResult:
     if question is None:
-        question = (
-            "Explain the system architecture for a scalable audio "
-            "generation pipeline. Answer in 15 words."
-        )
+        question = "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
         "<|im_start|>user\n"
@@ -105,9 +102,7 @@ def get_audio_query(
     )
 
 
-def get_image_query(
-    question: str = None, image_path: str | None = None
-) -> QueryResult:
+def get_image_query(question: str = None, image_path: str | None = None) -> QueryResult:
     if question is None:
         question = "What is the content of this image?"
     prompt = (
@@ -122,9 +117,7 @@ def get_image_query(
         pil_image = Image.open(image_path)
         image_data = convert_image_mode(pil_image, "RGB")
     else:
-        image_data = convert_image_mode(
-            ImageAsset("cherry_blossom").pil_image, "RGB"
-        )
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
     return QueryResult(
         inputs={
             "prompt": prompt,
@@ -152,9 +145,7 @@ def get_video_query(
             raise FileNotFoundError(f"Video file not found: {video_path}")
         video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
     else:
-        video_frames = VideoAsset(
-            name="baby_reading", num_frames=num_frames
-        ).np_ndarrays
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
     return QueryResult(
         inputs={
             "prompt": prompt,
@@ -174,6 +165,7 @@ query_map = {
 # ---------------------------------------------------------------------------
 # Core async routine
 # ---------------------------------------------------------------------------
+
 
 def clone_prompt_for_request(template: dict) -> dict:
     """Shallow-clone prompt dict so concurrent requests own independent containers."""
@@ -258,11 +250,7 @@ async def run_single_request(
                         audio_last_tensor = audio_data
                     if audio_sr is None and "sr" in mm_out:
                         sr_val = mm_out["sr"]
-                        audio_sr = (
-                            sr_val.item()
-                            if hasattr(sr_val, "item")
-                            else int(sr_val)
-                        )
+                        audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
     t_end = time.perf_counter()
     result = {
@@ -300,9 +288,7 @@ async def run_single_request(
         result["saved_files"].append(wav_file)
         result["audio_duration_s"] = len(audio_numpy) / samplerate
         result["num_audio_chunks"] = len(audio_chunks)
-        ttfa = (
-            (first_audio_ts - t_start) if first_audio_ts else None
-        )
+        ttfa = (first_audio_ts - t_start) if first_audio_ts else None
         result["time_to_first_audio_s"] = ttfa
         ttfa_str = f"{ttfa:.3f}s" if ttfa is not None else "N/A"
         print(
@@ -337,9 +323,7 @@ async def run_all(args):
 
     # Build prompt list
     if args.txt_prompts is not None:
-        assert args.query_type == "text", (
-            "txt-prompts is only supported for text query type"
-        )
+        assert args.query_type == "text", "txt-prompts is only supported for text query type"
         with open(args.txt_prompts, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
         prompts = [get_text_query(ln).inputs for ln in lines]
@@ -404,10 +388,7 @@ async def run_all(args):
         else:
             success_count += 1
             total_audio_dur += r.get("audio_duration_s", 0.0)
-            print(
-                f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  "
-                f"files={r['saved_files']}"
-            )
+            print(f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  files={r['saved_files']}")
     wall_time = wall_end - wall_start
     print(f"\nTotal: {success_count}/{len(prompts)} succeeded")
     print(f"Wall time: {wall_time:.3f}s")
