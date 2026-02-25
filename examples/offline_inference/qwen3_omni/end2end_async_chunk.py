@@ -204,6 +204,7 @@ async def run_single_request(
     sampling_params_list: list[SamplingParams] | None,
     output_dir: str,
     output_modalities: list[str] | None = None,
+    stream_audio_to_disk: bool = False,
 ) -> dict:
     """Run one request through AsyncOmni and collect outputs.
 
@@ -217,6 +218,11 @@ async def run_single_request(
     audio_list_consumed: int = 0
     audio_last_tensor: torch.Tensor | None = None
     stage_0_first_output_ts: float | None = None
+
+    samplerate = 24000
+    wav_file = os.path.join(output_dir, f"output_{request_id}.wav")
+    sf_writer: sf.SoundFile | None = None
+    audio_samples_written: int = 0
 
     async for omni_output in async_omni.generate(
         prompt=prompt,
@@ -241,16 +247,36 @@ async def run_single_request(
                 if mm_out and "audio" in mm_out:
                     if first_audio_ts is None:
                         first_audio_ts = time.perf_counter()
+                    if audio_sr is None and "sr" in mm_out:
+                        sr_val = mm_out["sr"]
+                        audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                        samplerate = audio_sr
                     audio_data = mm_out["audio"]
                     if isinstance(audio_data, list):
                         new_chunks = audio_data[audio_list_consumed:]
                         audio_list_consumed = len(audio_data)
-                        audio_chunks.extend(new_chunks)
                     elif isinstance(audio_data, torch.Tensor):
+                        new_chunks = [audio_data]
                         audio_last_tensor = audio_data
-                    if audio_sr is None and "sr" in mm_out:
-                        sr_val = mm_out["sr"]
-                        audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                    else:
+                        new_chunks = []
+
+                    if stream_audio_to_disk and new_chunks:
+                        if sf_writer is None:
+                            sf_writer = sf.SoundFile(
+                                wav_file, mode="w",
+                                samplerate=samplerate,
+                                channels=1, subtype="FLOAT",
+                            )
+                        for chunk in new_chunks:
+                            chunk_np = chunk.float().detach().cpu().numpy().flatten()
+                            sf_writer.write(chunk_np)
+                            audio_samples_written += len(chunk_np)
+                    else:
+                        audio_chunks.extend(new_chunks)
+
+    if sf_writer is not None:
+        sf_writer.close()
 
     t_end = time.perf_counter()
     result = {
@@ -271,7 +297,20 @@ async def run_single_request(
         )
 
     # Save audio output
-    if audio_chunks or audio_last_tensor is not None:
+    if stream_audio_to_disk and audio_samples_written > 0:
+        result["saved_files"].append(wav_file)
+        result["audio_duration_s"] = audio_samples_written / samplerate
+        result["num_audio_chunks"] = audio_list_consumed
+        ttfa = (first_audio_ts - t_start) if first_audio_ts else None
+        result["time_to_first_audio_s"] = ttfa
+        ttfa_str = f"{ttfa:.3f}s" if ttfa is not None else "N/A"
+        print(
+            f"[Request {request_id}] Audio streamed to {wav_file} "
+            f"(duration={result['audio_duration_s']:.2f}s, "
+            f"TTFA={ttfa_str}, "
+            f"e2e={result['e2e_latency_s']:.3f}s)"
+        )
+    elif audio_chunks or audio_last_tensor is not None:
         if audio_chunks:
             if len(audio_chunks) > 1:
                 audio_tensor = torch.cat(audio_chunks, dim=-1)
@@ -282,8 +321,6 @@ async def run_single_request(
         audio_numpy = audio_tensor.float().detach().cpu().numpy()
         if audio_numpy.ndim > 1:
             audio_numpy = audio_numpy.flatten()
-        samplerate = audio_sr if audio_sr else 24000
-        wav_file = os.path.join(output_dir, f"output_{request_id}.wav")
         sf.write(wav_file, audio_numpy, samplerate=samplerate, format="WAV")
         result["saved_files"].append(wav_file)
         result["audio_duration_s"] = len(audio_numpy) / samplerate
@@ -356,49 +393,53 @@ async def run_all(args):
 
     # Run requests with concurrency control
     semaphore = asyncio.Semaphore(args.max_in_flight)
-    all_results: list[dict] = []
+    request_timeout = getattr(args, "request_timeout_s", None)
+    stream_audio = getattr(args, "stream_audio_to_disk", False)
 
     async def _run_one(idx: int, prompt: dict):
         async with semaphore:
             request_id = f"req_{idx}_{uuid.uuid4().hex[:8]}"
-            result = await run_single_request(
+            coro = run_single_request(
                 async_omni=async_omni,
                 prompt=prompt,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
                 output_dir=output_dir,
                 output_modalities=output_modalities,
+                stream_audio_to_disk=stream_audio,
             )
-            return result
+            if request_timeout and request_timeout > 0:
+                return await asyncio.wait_for(coro, timeout=request_timeout)
+            return await coro
 
-    wall_start = time.perf_counter()
-    tasks = [_run_one(i, p) for i, p in enumerate(prompts)]
-    all_results = await asyncio.gather(*tasks, return_exceptions=True)
-    wall_end = time.perf_counter()
+    try:
+        wall_start = time.perf_counter()
+        tasks = [_run_one(i, p) for i, p in enumerate(prompts)]
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+        wall_end = time.perf_counter()
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
-    success_count = 0
-    total_audio_dur = 0.0
-    for r in all_results:
-        if isinstance(r, Exception):
-            print(f"  [ERROR] {r}")
-        else:
-            success_count += 1
-            total_audio_dur += r.get("audio_duration_s", 0.0)
-            print(f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  files={r['saved_files']}")
-    wall_time = wall_end - wall_start
-    print(f"\nTotal: {success_count}/{len(prompts)} succeeded")
-    print(f"Wall time: {wall_time:.3f}s")
-    if total_audio_dur > 0:
-        print(f"Total audio duration: {total_audio_dur:.2f}s")
-        print(f"Real-time factor: {total_audio_dur / wall_time:.2f}x")
-    print("=" * 60)
-
-    # Cleanup
-    async_omni.shutdown()
+        # Print summary
+        print("\n" + "=" * 60)
+        print("Summary")
+        print("=" * 60)
+        success_count = 0
+        total_audio_dur = 0.0
+        for r in all_results:
+            if isinstance(r, Exception):
+                print(f"  [ERROR] {type(r).__name__}: {r}")
+            else:
+                success_count += 1
+                total_audio_dur += r.get("audio_duration_s", 0.0)
+                print(f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  files={r['saved_files']}")
+        wall_time = wall_end - wall_start
+        print(f"\nTotal: {success_count}/{len(prompts)} succeeded")
+        print(f"Wall time: {wall_time:.3f}s")
+        if total_audio_dur > 0:
+            print(f"Total audio duration: {total_audio_dur:.2f}s")
+            print(f"Real-time factor: {total_audio_dur / wall_time:.2f}x")
+        print("=" * 60)
+    finally:
+        async_omni.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +516,26 @@ def parse_args():
         help="Maximum concurrent requests (default: 1).",
     )
     parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Per-request timeout in seconds. When set, a request that "
+            "exceeds this duration is cancelled and reported as an error. "
+            "Default: None (no timeout)."
+        ),
+    )
+    parser.add_argument(
+        "--stream-audio-to-disk",
+        action="store_true",
+        default=False,
+        help=(
+            "Write audio chunks to WAV incrementally instead of "
+            "accumulating in memory. Useful for very long audio or "
+            "high --max-in-flight to reduce memory footprint."
+        ),
+    )
+    parser.add_argument(
         "--modalities",
         type=str,
         default=None,
@@ -518,4 +579,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(run_all(args))
+    try:
+        asyncio.run(run_all(args))
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. AsyncOmni shutdown was handled by finally block.")
