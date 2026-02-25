@@ -377,42 +377,43 @@ async def run_all(args):
 
     # Create AsyncOmni
     print(f"[Info] Creating AsyncOmni with stage_configs_path={args.stage_configs_path}")
-    async_omni = AsyncOmni(
-        model=args.model,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-    )
-
-    # Use default sampling params from stage config (they are pre-configured
-    # in the YAML for each stage).
-    sampling_params_list = None
-
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Run requests with concurrency control
-    semaphore = asyncio.Semaphore(args.max_in_flight)
-    request_timeout = getattr(args, "request_timeout_s", None)
-    stream_audio = getattr(args, "stream_audio_to_disk", False)
-
-    async def _run_one(idx: int, prompt: dict):
-        async with semaphore:
-            request_id = f"req_{idx}_{uuid.uuid4().hex[:8]}"
-            coro = run_single_request(
-                async_omni=async_omni,
-                prompt=prompt,
-                request_id=request_id,
-                sampling_params_list=sampling_params_list,
-                output_dir=output_dir,
-                output_modalities=output_modalities,
-                stream_audio_to_disk=stream_audio,
-            )
-            if request_timeout and request_timeout > 0:
-                return await asyncio.wait_for(coro, timeout=request_timeout)
-            return await coro
-
+    async_omni = None
     try:
+        async_omni = AsyncOmni(
+            model=args.model,
+            stage_configs_path=args.stage_configs_path,
+            log_stats=args.log_stats,
+            stage_init_timeout=args.stage_init_timeout,
+        )
+
+        # Use default sampling params from stage config (they are pre-configured
+        # in the YAML for each stage).
+        sampling_params_list = None
+
+        output_dir = args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Run requests with concurrency control
+        semaphore = asyncio.Semaphore(args.max_in_flight)
+        request_timeout = getattr(args, "request_timeout_s", None)
+        stream_audio = getattr(args, "stream_audio_to_disk", False)
+
+        async def _run_one(idx: int, prompt: dict):
+            async with semaphore:
+                request_id = f"req_{idx}_{uuid.uuid4().hex[:8]}"
+                coro = run_single_request(
+                    async_omni=async_omni,
+                    prompt=prompt,
+                    request_id=request_id,
+                    sampling_params_list=sampling_params_list,
+                    output_dir=output_dir,
+                    output_modalities=output_modalities,
+                    stream_audio_to_disk=stream_audio,
+                )
+                if request_timeout and request_timeout > 0:
+                    return await asyncio.wait_for(coro, timeout=request_timeout)
+                return await coro
+
         wall_start = time.perf_counter()
         tasks = [_run_one(i, p) for i, p in enumerate(prompts)]
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -439,7 +440,8 @@ async def run_all(args):
             print(f"Real-time factor: {total_audio_dur / wall_time:.2f}x")
         print("=" * 60)
     finally:
-        async_omni.shutdown()
+        if async_omni is not None:
+            async_omni.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +528,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--batch-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Global timeout for the entire batch in seconds. When set, "
+            "the whole run_all() is cancelled if it exceeds this duration. "
+            "Default: None (no global timeout)."
+        ),
+    )
+    parser.add_argument(
         "--stream-audio-to-disk",
         action="store_true",
         default=False,
@@ -579,7 +591,21 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+
+    async def _main():
+        batch_timeout = getattr(args, "batch_timeout_s", None)
+        if batch_timeout and batch_timeout > 0:
+            await asyncio.wait_for(run_all(args), timeout=batch_timeout)
+        else:
+            await run_all(args)
+
     try:
-        asyncio.run(run_all(args))
+        asyncio.run(_main())
+    except asyncio.TimeoutError:
+        print(
+            f"\n[TIMEOUT] Batch exceeded --batch-timeout-s="
+            f"{args.batch_timeout_s}s. AsyncOmni shutdown was handled "
+            f"by finally block."
+        )
     except KeyboardInterrupt:
         print("\nInterrupted by user. AsyncOmni shutdown was handled by finally block.")
