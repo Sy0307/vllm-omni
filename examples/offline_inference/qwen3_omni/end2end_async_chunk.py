@@ -264,9 +264,11 @@ async def run_single_request(
                     if stream_audio_to_disk and new_chunks:
                         if sf_writer is None:
                             sf_writer = sf.SoundFile(
-                                wav_file, mode="w",
+                                wav_file,
+                                mode="w",
                                 samplerate=samplerate,
-                                channels=1, subtype="FLOAT",
+                                channels=1,
+                                subtype="FLOAT",
                             )
                         for chunk in new_chunks:
                             chunk_np = chunk.float().detach().cpu().numpy().flatten()
