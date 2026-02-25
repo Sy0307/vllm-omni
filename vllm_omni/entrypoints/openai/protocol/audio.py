@@ -72,3 +72,26 @@ class CreateAudio(BaseModel):
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+
+
+class StreamingSpeechSessionConfig(BaseModel):
+    """Configuration sent as the first WebSocket message for streaming TTS."""
+
+    model: str | None = None
+    voice: str | None = None
+    task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
+    language: str | None = None
+    instructions: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
+    max_new_tokens: int | None = Field(default=None, ge=1)
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    split_granularity: Literal["sentence", "clause"] = Field(
+        default="sentence",
+        description=(
+            "Text splitting granularity: 'sentence' splits on .!?。！？, "
+            "'clause' also splits on CJK commas ， and semicolons ；."
+        ),
+    )
