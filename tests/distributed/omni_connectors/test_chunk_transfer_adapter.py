@@ -331,28 +331,28 @@ class _HashableRequest(SimpleNamespace):
         return getattr(other, "request_id", None) == self.request_id
 
 
-def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch):
+def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: MockerFixture):
     """OmniGenerationScheduler must call adapter.cleanup when request finishes."""
     cleanup_calls = []
 
-    adapter_mock = MagicMock()
+    adapter_mock = mocker.MagicMock()
     adapter_mock.finished_requests = {"req-s1"}
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
-    scheduler = MagicMock()
+    scheduler = mocker.MagicMock()
     scheduler.chunk_transfer_adapter = adapter_mock
     scheduler.connector = None
     scheduler.ec_connector = None
     scheduler.perf_metrics = None
     scheduler.log_stats = False
     scheduler.recompute_kv_load_failures = False
-    scheduler.structured_output_manager = MagicMock()
+    scheduler.structured_output_manager = mocker.MagicMock()
     scheduler.structured_output_manager.should_advance.return_value = False
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager.take_events.return_value = None
-    scheduler.kv_event_publisher = MagicMock()
+    scheduler.kv_event_publisher = mocker.MagicMock()
 
     request = _HashableRequest(
         request_id="req-s1",
@@ -376,13 +376,13 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch):
     )
     scheduler.requests = {"req-s1": request}
 
-    scheduler._handle_stopped_request = MagicMock(return_value=True)
-    scheduler._free_request = MagicMock(return_value=None)
-    scheduler._get_routed_experts = MagicMock(return_value=None)
+    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
+    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = [request]
-    scheduler.waiting = MagicMock()
-    scheduler.waiting.remove_requests = MagicMock()
-    scheduler.make_stats = MagicMock(return_value=None)
+    scheduler.waiting = mocker.MagicMock()
+    scheduler.waiting.remove_requests = mocker.MagicMock()
+    scheduler.make_stats = mocker.MagicMock(return_value=None)
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"req-s1": 10},
