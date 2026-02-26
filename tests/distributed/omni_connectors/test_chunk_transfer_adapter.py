@@ -54,7 +54,6 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
             self.stop_event = threading.Event()
-            self.lock = threading.Lock()
 
         monkeypatch.setattr(OmniTransferAdapterBase, "__init__", _fake_base_init)
         monkeypatch.setattr(
@@ -191,7 +190,7 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
     adapter.request_ids_mapping[req_id] = ext_id
-    adapter._pending_load_reqs[req_id] = "placeholder"
+    adapter._pending_load_reqs.append(SimpleNamespace(request_id=req_id))
     adapter._finished_load_reqs.add(req_id)
 
     adapter.put_req_chunk[ext_id] = 5
@@ -211,7 +210,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
-    assert req_id not in adapter._pending_load_reqs
+    assert all(getattr(r, "request_id", None) != req_id for r in adapter._pending_load_reqs)
     assert req_id not in adapter._finished_load_reqs
 
     assert ext_id not in adapter.put_req_chunk
@@ -270,12 +269,11 @@ def test_cleanup_preserves_pending_save(build_adapter):
     _populate_adapter_state(adapter, req_id, ext_id)
 
     pending_task = {"put_key": f"{ext_id}_1_0", "data": {"x": 1}}
-    adapter._pending_save_reqs[ext_id] = deque([pending_task])
+    adapter._pending_save_reqs.append(pending_task)
 
     adapter.cleanup(req_id, ext_id)
 
-    assert ext_id in adapter._pending_save_reqs
-    assert len(adapter._pending_save_reqs[ext_id]) == 1
+    assert len(adapter._pending_save_reqs) == 1
 
 
 def test_cleanup_only_affects_target_request(build_adapter):
@@ -300,9 +298,11 @@ def test_cleanup_after_poll_flow(build_adapter):
     request = _req("req-flow", RequestStatus.WAITING, external_req_id="ext-flow")
 
     adapter.load_async(request)
+
+    adapter.request_ids_mapping["req-flow"] = "ext-flow"
     payload = {"hidden_states": torch.tensor([[1.0]]), "finished": True}
     connector.get.return_value = (payload, 8)
-    adapter._poll_single_request("req-flow")
+    adapter._poll_single_request(request)
 
     assert "req-flow" in adapter.finished_requests
     assert adapter.get_req_chunk["req-flow"] == 1

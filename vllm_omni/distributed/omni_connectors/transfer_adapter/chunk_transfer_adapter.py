@@ -96,20 +96,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.additional_information = None
         self._pending_load_reqs.append(request)
 
-    def save_async(self, pooling_output: torch.Tensor | None = None, request: Request | None = None):
+    def save_async(
+        self,
+        pooling_output: torch.Tensor | None = None,
+        request: Request | None = None,
+        defer_cleanup: bool = False,
+    ):
         """Build and enqueue one chunk for asynchronous sending.
 
-        Payload extraction is executed in the caller thread via
-        ``custom_process_next_stage_input_func``
+        Payload extraction happens in ``_send_single_request`` on the
+        background save_loop thread.
 
         Args:
             pooling_output: Partial pooling output dictionary
             request: Request object
+            defer_cleanup: If True, run cleanup() after the send completes
+                so per-request state stays valid for the background thread.
         """
         task = {
             "pooling_output": pooling_output,
             "request": request,
             "is_finished": request.is_finished(),
+            "defer_cleanup": defer_cleanup,
         }
         self._pending_save_reqs.append(task)
 
@@ -194,7 +202,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request_id = request.external_req_id
         chunk_id = self.put_req_chunk[request_id]
         connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
-        # Process payload in main thread to avoid race conditions on request state
+        # Process payload in save_loop thread
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
@@ -209,6 +217,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
+            if task.get("defer_cleanup"):
+                self.cleanup(request.request_id, request_id)
             return
 
         success, size, metadata = self.connector.put(
@@ -221,6 +231,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+
+        if task.get("defer_cleanup"):
+            self.cleanup(request.request_id, request_id)
 
     ########################################################################
     # Cleanup
@@ -248,9 +261,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
 
-        with self.lock:
-            self._pending_load_reqs.pop(request_id, None)
-            self._finished_load_reqs.discard(request_id)
+        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
+        self._pending_load_reqs = remaining
+        self._finished_load_reqs.discard(request_id)
 
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)

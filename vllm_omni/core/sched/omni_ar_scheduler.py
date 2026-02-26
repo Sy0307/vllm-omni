@@ -270,7 +270,7 @@ class OmniARScheduler(VLLMScheduler):
                 )
 
             stopped = False
-            need_cleanup = False
+            defer_cleanup = False
             new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
@@ -302,7 +302,7 @@ class OmniARScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
-                    need_cleanup = self.chunk_transfer_adapter is not None
+                    defer_cleanup = self.chunk_transfer_adapter is not None
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
@@ -355,18 +355,14 @@ class OmniARScheduler(VLLMScheduler):
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(pooler_output, request)
+                    self.chunk_transfer_adapter.save_async(
+                        pooler_output,
+                        request,
+                        defer_cleanup=defer_cleanup,
+                    )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
-
-            # Deferred cleanup: run AFTER save_async() so the final chunk
-            # can still read put_req_chunk / code_prompt_token_ids.
-            if need_cleanup:
-                self.chunk_transfer_adapter.cleanup(
-                    request.request_id,
-                    getattr(request, "external_req_id", None),
-                )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
