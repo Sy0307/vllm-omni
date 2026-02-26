@@ -70,4 +70,3 @@ def test_talker2code2wav_async_chunk_emits_eof_marker_when_finished_with_no_fram
         "code_predictor_codes": [],
         "finished": torch.tensor(True, dtype=torch.bool),
     }
-
