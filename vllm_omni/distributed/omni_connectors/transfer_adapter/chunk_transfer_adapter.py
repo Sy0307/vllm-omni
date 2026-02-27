@@ -100,7 +100,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         pooling_output: torch.Tensor | None = None,
         request: Request | None = None,
-        defer_cleanup: bool = False,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -110,14 +109,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Args:
             pooling_output: Partial pooling output dictionary
             request: Request object
-            defer_cleanup: If True, run cleanup() after the send completes
-                so per-request state stays valid for the background thread.
         """
         task = {
             "pooling_output": pooling_output,
             "request": request,
             "is_finished": request.is_finished(),
-            "defer_cleanup": defer_cleanup,
         }
         self._pending_save_reqs.append(task)
 
@@ -217,8 +213,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
-            if task.get("defer_cleanup"):
-                self.cleanup(request.request_id, request_id)
             return
 
         success, size, metadata = self.connector.put(
@@ -231,9 +225,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-
-        if task.get("defer_cleanup"):
-            self.cleanup(request.request_id, request_id)
 
     ########################################################################
     # Cleanup
