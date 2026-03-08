@@ -446,12 +446,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         audio_codes_list: list[torch.Tensor] = []
+        ref_code_prompt_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
         codec_streaming_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
+                ref_code_prompt_list.append(torch.empty((0, 0), dtype=torch.int32))
                 continue
             ac = info.get("audio_codes")
+            ref_code_prompt = info.get("ref_code")
+            ref_code_prompt_list.append(
+                ref_code_prompt if isinstance(ref_code_prompt, torch.Tensor) else torch.empty((0, 0), dtype=torch.int32)
+            )
             if isinstance(ac, torch.Tensor):
                 audio_codes_list.append(ac)
                 cs = info.get("codec_streaming")
@@ -484,7 +490,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         audio_codes = torch.cat(audio_codes_list, dim=0)
         span_len = int(audio_codes.shape[0])
         hidden = hidden[:span_len]
-        mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}
+        mm: dict[str, Any] = {"audio_codes": audio_codes}
+        if any(ref_code.numel() > 0 for ref_code in ref_code_prompt_list):
+            mm["ref_code"] = ref_code_prompt_list
         if ref_code_len_list:
             mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
         if codec_streaming_list:
@@ -538,8 +546,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first_prefill:
-                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len = self._build_prompt_embeds(
-                    task_type=task_type, info_dict=info_dict
+                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
+                    self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
                 # Store full prompt embeddings + trailing queue on CPU for later chunks/steps.
                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
@@ -552,6 +560,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 }
                 if ref_code_len is not None:
                     info_update["ref_code_len"] = int(ref_code_len)
+                if isinstance(ref_code, torch.Tensor):
+                    info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
                 # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
                 # This preserves placeholder/embedding alignment.
                 offset = 0
@@ -773,7 +783,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
                 if ref_code_len is None and estimate_ref_code_len is not None:
                     ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
-
                 if ref_code_len is None:
                     raise ValueError(
                         "Base in-context voice cloning requires either `voice_clone_prompt.ref_code` "
@@ -1174,7 +1183,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         *,
         task_type: str,
         info_dict: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
         non_streaming_mode_val = info_dict.get("non_streaming_mode")
@@ -1259,6 +1268,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Speaker embedding/token (task-dependent)
         speaker_embed = None
         ref_code_len: int | None = None
+        ref_code_prompt: torch.Tensor | None = None
 
         def _as_singleton(x: object) -> object:
             if isinstance(x, list):
@@ -1324,6 +1334,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
                 ref_code_len = int(ref_code_t.shape[0])
+            if isinstance(ref_code_t, torch.Tensor):
+                ref_code_prompt = ref_code_t
 
             # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
             spk = None
@@ -1512,6 +1524,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             trailing_text_hidden.squeeze(0),  # [T, H]
             tts_pad_embed.squeeze(0),  # [1, H]
             ref_code_len,
+            ref_code_prompt.contiguous() if isinstance(ref_code_prompt, torch.Tensor) else None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
