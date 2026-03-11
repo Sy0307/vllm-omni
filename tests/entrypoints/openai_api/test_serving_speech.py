@@ -1086,4 +1086,3 @@ def test_api_server_create_speech_wraps_error_response_status():
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
-        assert "speech" in tasks
