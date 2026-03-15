@@ -250,3 +250,45 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def test_slice_multimodal_output_value_uses_request_local_list_entry():
+    ref_code_1 = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    ref_code_2 = torch.tensor([[5, 6], [7, 8]], dtype=torch.long)
+
+    found_1, sliced_1 = OmniGPUModelRunner._slice_multimodal_output_value(
+        [ref_code_1, ref_code_2],
+        req_index=0,
+        start=0,
+        end=2,
+        total_tokens=4,
+        num_reqs=2,
+    )
+    found_2, sliced_2 = OmniGPUModelRunner._slice_multimodal_output_value(
+        [ref_code_1, ref_code_2],
+        req_index=1,
+        start=2,
+        end=4,
+        total_tokens=4,
+        num_reqs=2,
+    )
+
+    assert found_1 is True and found_2 is True
+    assert torch.equal(sliced_1, ref_code_1)
+    assert torch.equal(sliced_2, ref_code_2)
+
+
+def test_slice_multimodal_output_value_keeps_batch_global_singleton_list():
+    marker = {"shared": True}
+
+    found, sliced = OmniGPUModelRunner._slice_multimodal_output_value(
+        [marker],
+        req_index=1,
+        start=2,
+        end=4,
+        total_tokens=4,
+        num_reqs=2,
+    )
+
+    assert found is True
+    assert sliced is marker

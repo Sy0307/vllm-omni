@@ -447,7 +447,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
-        ref_code_tensor: torch.Tensor | None = None
+        ref_code_list: list[torch.Tensor | None] = []
         codec_streaming_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
@@ -461,8 +461,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
                     )
             ref_code = info.get("ref_code")
-            if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                ref_code_tensor = ref_code
+            if isinstance(ac, torch.Tensor):
+                if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+                    ref_code_list.append(ref_code)
+                else:
+                    ref_code_list.append(None)
             ref_len = info.get("ref_code_len")
             if ref_len is None:
                 continue
@@ -491,8 +494,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}
         if ref_code_len_list:
             mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
-        if ref_code_tensor is not None:
-            mm["ref_code"] = [ref_code_tensor]
+        if ref_code_list and any(code is not None for code in ref_code_list):
+            mm["ref_code"] = ref_code_list
         if codec_streaming_list:
             mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)

@@ -518,6 +518,45 @@ class OmniGPUModelRunner(GPUModelRunner):
             raise ValueError(f"Invalid hidden states type: {type(hidden_states)}")
         return text_hidden_states, multimodal_outputs
 
+    @staticmethod
+    def _slice_multimodal_output_value(
+        value: object,
+        *,
+        req_index: int,
+        start: int,
+        end: int,
+        total_tokens: int,
+        num_reqs: int,
+    ) -> tuple[bool, object]:
+        """Extract a request-local multimodal payload from a batched model output."""
+        if isinstance(value, torch.Tensor):
+            if value.shape[0] != total_tokens:
+                return False, None
+            return True, value.detach().to("cpu")[start:end].contiguous()
+
+        if isinstance(value, dict):
+            sliced: dict[str, torch.Tensor] = {}
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, torch.Tensor) and sub_value.shape[0] == total_tokens:
+                    sliced[str(sub_key)] = sub_value.detach().to("cpu")[start:end].contiguous()
+            return (True, sliced) if sliced else (False, None)
+
+        if isinstance(value, list):
+            if len(value) == num_reqs:
+                element = value[req_index]
+            elif len(value) == 1:
+                # Backward compatible path for batch-global payloads.
+                element = value[0]
+            else:
+                raise ValueError(
+                    f"Multimodal output list has length {len(value)} but expected 1 or {num_reqs} entries."
+                )
+            if isinstance(element, torch.Tensor):
+                element = element.detach().to("cpu").contiguous()
+            return True, element
+
+        return False, None
+
     @torch.inference_mode()
     def _dummy_run(
         self,
