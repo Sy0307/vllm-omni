@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.parametrize import remove_parametrizations
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -58,6 +59,56 @@ class FishSpeechDACDecoder(nn.Module):
         self._hop_length: int = DAC_HOP_LENGTH
         self._logged_codec_stats = False
 
+    def _bake_weight_norm(self, codec: nn.Module) -> None:
+        baked = 0
+        for module in codec.modules():
+            parametrizations = getattr(module, "parametrizations", None)
+            if not parametrizations:
+                continue
+            for name in list(parametrizations.keys()):
+                remove_parametrizations(module, name, leave_parametrized=True)
+                baked += 1
+        if baked > 0:
+            logger.info("Baked %d DAC parametrized weights for inference", baked)
+
+    def _cache_attention_masks(self, codec: nn.Module) -> None:
+        for module in codec.modules():
+            if not hasattr(module, "make_mask") or not hasattr(module, "make_window_limited_mask"):
+                continue
+
+            base_make_mask = module.make_mask
+            base_make_window_mask = module.make_window_limited_mask
+            mask_cache: dict[int, torch.Tensor] = {}
+            window_mask_cache: dict[int, torch.Tensor] = {}
+
+            def make_mask_cached(max_length: int, x_lens: torch.Tensor | None = None, *, _orig=base_make_mask):
+                if x_lens is not None:
+                    return _orig(max_length, x_lens)
+                key = int(max_length)
+                cached = mask_cache.get(key)
+                if cached is None:
+                    cached = _orig(max_length, x_lens)
+                    mask_cache[key] = cached
+                return cached
+
+            def make_window_mask_cached(
+                max_length: int,
+                x_lens: torch.Tensor | None = None,
+                *,
+                _orig=base_make_window_mask,
+            ):
+                if x_lens is not None:
+                    return _orig(max_length, x_lens)
+                key = int(max_length)
+                cached = window_mask_cache.get(key)
+                if cached is None:
+                    cached = _orig(max_length, x_lens)
+                    window_mask_cache[key] = cached
+                return cached
+
+            module.make_mask = make_mask_cached
+            module.make_window_limited_mask = make_window_mask_cached
+
     def _ensure_codec_loaded(self) -> None:
         if self._codec is not None:
             return
@@ -87,6 +138,8 @@ class FishSpeechDACDecoder(nn.Module):
         if "generator" in state_dict:
             state_dict = state_dict["generator"]
         codec.load_state_dict(state_dict, strict=False)
+        self._bake_weight_norm(codec)
+        self._cache_attention_masks(codec)
 
         device = self.vllm_config.device_config.device
         codec = codec.to(device=device, dtype=torch.float32)
@@ -236,7 +289,7 @@ class FishSpeechDACDecoder(nn.Module):
             frame_count = int(feature_lengths[i].item())
             codes_bqf[i, :, :frame_count] = codes_qf
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             wav_batch, audio_lengths = self._codec.decode(codes_bqf, feature_lengths)
 
         audios: list[torch.Tensor] = [empty] * num_req
