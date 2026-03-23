@@ -1043,9 +1043,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
         if isinstance(audio_tensor, list):
-            import torch
-
-            audio_tensor = torch.cat(audio_tensor, dim=-1)
+            audio_history = audio_tensor
+            audio_tensor = np.zeros((0,), dtype=np.float32)
+            # Non-streaming Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
+            for candidate in reversed(audio_history):
+                if candidate.numel() > 0:
+                    audio_tensor = candidate
+                    break
         if hasattr(audio_tensor, "float"):
             audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
