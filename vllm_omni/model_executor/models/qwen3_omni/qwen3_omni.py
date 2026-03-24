@@ -608,6 +608,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
             update_dict["code_predictor_codes"] = code_predictor_codes
+            update_dict["num_processed_tokens_delta"] = span_len
         else:
             # decode
             if not info_dict.get("decode_flag", False):
@@ -619,22 +620,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                     raise RuntimeError("Missing prefill_consumed_text_tokens for talker decode handoff.")
                 info_dict["num_processed_tokens"] = prefill_consumed_text_tokens
                 update_dict["decode_flag"] = True
-                update_dict["prefill_consumed_text_tokens"] = prefill_consumed_text_tokens
 
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
                 input_ids, input_embeds, update_dict, **info_dict
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
-            if "run_talker_mtp" not in update_dict:
-                update_dict["run_talker_mtp"] = True
-            if not update_dict["run_talker_mtp"]:
-                update_dict["code_predictor_codes"] = torch.zeros(
-                    (1, self.talker.num_code_groups),
-                    device=self._module_device(self.talker),
-                    dtype=torch.long,
-                )
 
-        processed_delta = update_dict.pop("num_processed_tokens_delta", span_len)
+        processed_delta = update_dict.pop("num_processed_tokens_delta")
         update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + processed_delta
         return input_ids, input_embeds, update_dict
 
@@ -924,31 +916,23 @@ class Qwen3OmniMoeForConditionalGeneration(
         if start_index >= len(thinker_output_token_ids) - 1:
             update_dict["num_processed_tokens_delta"] = 0
             if info_dict.get("finished_flag"):
-                update_dict["run_talker_mtp"] = False
                 return self.tts_pad_embed.to(device)
-            update_dict["run_talker_mtp"] = True
             update_dict["finished_flag"] = True
             return self.tts_eos_embed.to(device)
 
-        cached_len = 0
-        if cached_thinker_decode_embeds is not None:
-            if cached_thinker_decode_embeds.device != device:
-                cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            cached_len = cached_thinker_decode_embeds.shape[0]
-
-        if cached_thinker_decode_embeds is not None and start_index < cached_len:
+        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
+            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
             thinker_embed = cached_thinker_decode_embeds[start_index]
+            if thinker_decode_embed is not None:
+                thinker_decode_embed = thinker_decode_embed.to(device)
+                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
+                update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
         else:
-            if thinker_decode_embed is None:
-                update_dict["run_talker_mtp"] = False
-                update_dict["num_processed_tokens_delta"] = 0
-                return self.tts_pad_embed.to(device)
             thinker_embed = thinker_decode_embed
             if thinker_embed.device != device:
                 thinker_embed = thinker_embed.to(device)
 
         update_dict["thinker_decode_embeddings"] = None
-        update_dict["run_talker_mtp"] = True
         update_dict["num_processed_tokens_delta"] = 1
         return self.talker.text_projection(thinker_embed).to(device)
 
