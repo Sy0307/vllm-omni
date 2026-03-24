@@ -15,7 +15,6 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
-import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -528,10 +527,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             raise ValueError("Fish Speech structured voice clone requires integer ref_audio_sr")
 
         ref_audio_wav = np.load(ref_audio_path)
-        try:
-            os.remove(ref_audio_path)
-        except OSError:
-            pass
+        os.remove(ref_audio_path)
 
         semantic_token_ids = encode_reference_audio(
             self.model_path,
@@ -737,21 +733,12 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         except Exception as exc:
             logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
 
-        try:
-            codec_device = self.codebook_embeddings.weight.device
-            codec_dtype = torch.bfloat16 if codec_device.type == "cuda" else torch.float32
-            t0 = time.perf_counter()
-            _load_dac_codec(
-                self.model_path,
-                device=codec_device,
-                dtype=codec_dtype,
-            )
-            logger.info(
-                "Fish Speech structured voice clone DAC encoder preloaded on %s in %.2fs",
-                codec_device,
-                time.perf_counter() - t0,
-            )
-        except Exception as exc:
-            logger.warning("Fish Speech structured voice clone DAC encoder preload failed: %s", exc)
+        codec_device = self.codebook_embeddings.weight.device
+        codec_dtype = torch.bfloat16 if codec_device.type == "cuda" else torch.float32
+        _load_dac_codec(
+            self.model_path,
+            device=codec_device,
+            dtype=codec_dtype,
+        )
 
         return loaded_params

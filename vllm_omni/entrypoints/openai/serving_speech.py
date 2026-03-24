@@ -343,36 +343,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate Fish Speech semantic token length from raw reference audio."""
-        try:
-            from vllm_omni.model_executor.models.fish_speech.dac_utils import (
-                DAC_HOP_LENGTH,
-                DAC_SAMPLE_RATE,
-            )
+        from vllm_omni.model_executor.models.fish_speech.dac_utils import (
+            DAC_HOP_LENGTH,
+            DAC_SAMPLE_RATE,
+        )
 
-            item = ref_audio
-            while isinstance(item, list) and item:
-                if len(item) == 2 and isinstance(item[1], (int, float)):
-                    break
-                item = item[0]
-            if isinstance(item, list) and len(item) == 2:
-                wav, sr = item
-            elif isinstance(item, tuple) and len(item) == 2:
-                wav, sr = item
-            else:
-                return None
-            sr = int(sr)
-            if hasattr(wav, "__len__"):
-                n_samples = len(wav)
-            elif hasattr(wav, "shape"):
-                n_samples = wav.shape[-1] if wav.ndim > 1 else wav.shape[0]
-            else:
-                return None
-            if sr <= 0 or n_samples <= 0:
-                return None
-            resampled_len = max(1, math.ceil(n_samples * DAC_SAMPLE_RATE / sr))
-            return max(1, math.ceil(resampled_len / DAC_HOP_LENGTH))
-        except Exception:
+        if not isinstance(ref_audio, (list, tuple)) or len(ref_audio) != 2:
             return None
+        wav, sr = ref_audio
+        sr = int(sr)
+        n_samples = len(wav)
+        if sr <= 0 or n_samples <= 0:
+            return None
+        resampled_len = max(1, math.ceil(n_samples * DAC_SAMPLE_RATE / sr))
+        return max(1, math.ceil(resampled_len / DAC_HOP_LENGTH))
 
     def _estimate_fish_prompt_len(
         self,
