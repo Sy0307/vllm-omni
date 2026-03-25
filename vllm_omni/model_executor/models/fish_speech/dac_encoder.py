@@ -99,7 +99,7 @@ def encode_reference_audio(
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     else:
         device = torch.device(device)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.float32
     codec = _load_dac_codec(model_path, device=device, dtype=dtype)
 
     if isinstance(wav_samples, torch.Tensor):
@@ -126,7 +126,7 @@ def encode_reference_audio(
             DAC_SAMPLE_RATE,
             device.type,
             device.index,
-            "bfloat16" if dtype == torch.bfloat16 else "float32",
+            "float32",
         )
         wav_tensor = resampler(wav_tensor.unsqueeze(0)).squeeze(0)
 

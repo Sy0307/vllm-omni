@@ -737,7 +737,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         _load_dac_codec(
             self.model_path,
             device=codec_device,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
 
         return loaded_params
