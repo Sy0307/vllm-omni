@@ -734,11 +734,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
 
         codec_device = self.codebook_embeddings.weight.device
-        codec_dtype = torch.bfloat16 if codec_device.type == "cuda" else torch.float32
         _load_dac_codec(
             self.model_path,
             device=codec_device,
-            dtype=codec_dtype,
+            dtype=torch.bfloat16,
         )
 
         return loaded_params
