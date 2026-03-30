@@ -11,7 +11,10 @@ Extends ``DefaultModelState`` with:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.utils import AttentionGroup
 
 import torch
 import torch.nn as nn
@@ -70,29 +73,29 @@ class OmniModelState(DefaultModelState):
         # The patch is applied via a class-level lock to prevent
         # concurrent OmniModelState instances (e.g. different stages
         # in a thread pool) from overwriting each other's patch.
-        import threading, types
-        from vllm.v1.worker.gpu.model_states import default as _default_mod
+        import threading
+        import types
+
         from vllm.v1.worker.gpu.mm.rope import RopeState
+        from vllm.v1.worker.gpu.model_states import default as _default_mod
 
         if not hasattr(OmniModelState, "_rope_patch_lock"):
             OmniModelState._rope_patch_lock = threading.Lock()
 
-        def _safe_get_rope(
-            model_config: Any, mdl: Any, **kwargs: Any
-        ) -> Any:
+        def _safe_get_rope(model_config: Any, mdl: Any, **kwargs: Any) -> Any:
             try:
                 return _orig_get_rope(model_config, mdl, **kwargs)
             except (AssertionError, TypeError):
                 if not model_config.uses_mrope:
                     return None
                 logger.info(
-                    "Model uses M-RoPE (config) but does not implement "
-                    "SupportsMRoPE; creating RopeState(num_dims=3)."
+                    "Model uses M-RoPE (config) but does not implement SupportsMRoPE; creating RopeState(num_dims=3)."
                 )
                 # Add get_mrope_input_positions if missing.
                 # Returns 3D sequential positions with delta=0
                 # (pure text, no vision token offsets).
                 if not hasattr(mdl, "get_mrope_input_positions"):
+
                     def _default_mrope_positions(
                         self_model: Any,
                         input_tokens: list[int],
@@ -110,9 +113,7 @@ class OmniModelState(DefaultModelState):
                         pos = torch.arange(n, dtype=torch.long)
                         return pos.unsqueeze(0).expand(3, -1), 0
 
-                    mdl.get_mrope_input_positions = types.MethodType(
-                        _default_mrope_positions, mdl
-                    )
+                    mdl.get_mrope_input_positions = types.MethodType(_default_mrope_positions, mdl)
                 # has_delta=True is required so init_prefill_positions
                 # calls get_mrope_input_positions (not the XD-RoPE
                 # path).  delta=0 (returned above) means no offset is
@@ -157,18 +158,10 @@ class OmniModelState(DefaultModelState):
         if self.has_preprocess and hasattr(model, "talker_mtp"):
             max_bs = max_num_reqs
             hidden_size = self.inputs_embeds_size
-            self._mtp_input_ids = torch.zeros(
-                max_bs, dtype=torch.long, device=device
-            )
-            self._mtp_input_embeds = torch.zeros(
-                (max_bs, hidden_size), dtype=self.dtype, device=device
-            )
-            self._mtp_hidden = torch.zeros(
-                (max_bs, hidden_size), dtype=self.dtype, device=device
-            )
-            self._mtp_text_step = torch.zeros(
-                (max_bs, hidden_size), dtype=self.dtype, device=device
-            )
+            self._mtp_input_ids = torch.zeros(max_bs, dtype=torch.long, device=device)
+            self._mtp_input_embeds = torch.zeros((max_bs, hidden_size), dtype=self.dtype, device=device)
+            self._mtp_hidden = torch.zeros((max_bs, hidden_size), dtype=self.dtype, device=device)
+            self._mtp_text_step = torch.zeros((max_bs, hidden_size), dtype=self.dtype, device=device)
 
         if hasattr(model, "get_omni_plugins"):
             for plugin in model.get_omni_plugins():
@@ -269,9 +262,7 @@ class OmniModelState(DefaultModelState):
         # Return static inputs_embeds so FULL graph replay uses the same
         # tensor address that was captured.  Preprocess fills it in-place.
         if self._static_inputs_embeds is not None:
-            base["inputs_embeds"] = self._static_inputs_embeds[
-                : input_batch.num_tokens_after_padding
-            ]
+            base["inputs_embeds"] = self._static_inputs_embeds[: input_batch.num_tokens_after_padding]
         for plugin in self.plugins:
             base.update(plugin.prepare_extra_inputs(input_batch, req_states))
         return base
@@ -305,15 +296,19 @@ class OmniModelState(DefaultModelState):
         Modifies ``model_inputs["input_ids"]`` and ``model_inputs["inputs_embeds"]``
         in-place.  Collects decode-step MTP inputs and runs a single batched MTP
         forward at the end.
+
+        Skipped when the model declares ``preprocess_in_forward = True``,
+        meaning it handles preprocess internally inside forward().
         """
         if not self.has_preprocess:
+            return
+        # Model does preprocess+MTP inside forward() — skip external preprocess.
+        if getattr(self.model, "preprocess_in_forward", False):
             return
 
         embeds = model_inputs.get("inputs_embeds")
         if embeds is None:
-            embeds = self.model.embed_input_ids(
-                input_batch.input_ids[: input_batch.num_tokens]
-            )
+            embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens])
             model_inputs["inputs_embeds"] = embeds
 
         input_ids = model_inputs.get("input_ids")
@@ -340,13 +335,10 @@ class OmniModelState(DefaultModelState):
             emb_slice = embeds[start : start + n_tok]
 
             try:
-                new_ids, new_emb, updates = self.model.preprocess(
-                    ids_slice, emb_slice, **buf
-                )
+                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **buf)
             except Exception:
                 logger.warning(
-                    "preprocess failed for req_idx=%d (req_id=%s); "
-                    "skipping preprocess for this request",
+                    "preprocess failed for req_idx=%d (req_id=%s); skipping preprocess for this request",
                     req_idx,
                     buf.get("req_id", "?"),
                     exc_info=True,
@@ -386,21 +378,12 @@ class OmniModelState(DefaultModelState):
         bsz = len(mtp_batches)
 
         # Fill static buffers via .copy_() — no allocation.
-        if (
-            self._mtp_input_ids is not None
-            and bsz <= self._mtp_input_ids.shape[0]
-        ):
-            for j, (_i, start, (past_hidden, text_step)) in enumerate(
-                mtp_batches
-            ):
+        if self._mtp_input_ids is not None and bsz <= self._mtp_input_ids.shape[0]:
+            for j, (_i, start, (past_hidden, text_step)) in enumerate(mtp_batches):
                 self._mtp_input_ids[j] = input_ids[start]
                 self._mtp_input_embeds[j].copy_(embeds[start])
-                self._mtp_hidden[j].copy_(
-                    past_hidden.reshape(-1)[: self._mtp_hidden.shape[1]]
-                )
-                self._mtp_text_step[j].copy_(
-                    text_step.reshape(-1)[: self._mtp_text_step.shape[1]]
-                )
+                self._mtp_hidden[j].copy_(past_hidden.reshape(-1)[: self._mtp_hidden.shape[1]])
+                self._mtp_text_step[j].copy_(text_step.reshape(-1)[: self._mtp_text_step.shape[1]])
             batch_ids = self._mtp_input_ids[:bsz]
             batch_emb = self._mtp_input_embeds[:bsz]
             batch_hidden = self._mtp_hidden[:bsz]
@@ -424,30 +407,36 @@ class OmniModelState(DefaultModelState):
             num_tokens=bsz,
         ):
             new_emb, codes = self.model.talker_mtp(
-                batch_ids, batch_emb, batch_hidden, batch_step,
+                batch_ids,
+                batch_emb,
+                batch_hidden,
+                batch_step,
             )
 
         audio_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
         for j, (i, start, _) in enumerate(mtp_batches):
             embeds[start : start + 1] = new_emb[j : j + 1]
             req_idx = int(input_batch.idx_mapping_np[i])
-            self.intermediate_buffer.update(
-                req_idx, {audio_key: codes[j : j + 1]}, gpu_keys
-            )
+            self.intermediate_buffer.update(req_idx, {audio_key: codes[j : j + 1]}, gpu_keys)
 
     # ------------------------------------------------------------------
     # Post-forward: per-request postprocess
     # ------------------------------------------------------------------
 
-    def run_postprocess(
-        self, hidden_states: torch.Tensor, input_batch: InputBatch
-    ) -> None:
+    def run_postprocess(self, hidden_states: torch.Tensor, input_batch: InputBatch) -> None:
         """Per-request postprocess after model forward.
 
         Extracts per-request updates from hidden_states and writes them
         back to the intermediate buffer (e.g. ``last_talker_hidden``).
+
+        Skipped when the model declares ``preprocess_in_forward = True``
+        (the flag covers both pre- and post-processing — both run inside
+        the model's forward()).
         """
         if not self.has_postprocess:
+            return
+        # preprocess_in_forward also covers postprocess — both run inside forward()
+        if getattr(self.model, "preprocess_in_forward", False):
             return
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
         for i in range(input_batch.num_reqs):
@@ -491,8 +480,7 @@ class OmniModelState(DefaultModelState):
                     if isinstance(model_output, (list, tuple)):
                         _desc += f"(len={len(model_output)})"
                     logger.warning(
-                        "make_omni_output failed for %s; "
-                        "multimodal outputs will be empty",
+                        "make_omni_output failed for %s; multimodal outputs will be empty",
                         _desc,
                         exc_info=True,
                     )

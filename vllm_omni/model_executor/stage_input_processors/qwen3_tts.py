@@ -13,15 +13,15 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
 logger = init_logger(__name__)
 
 # Valid codec codebook range.  All codec code values flowing into Code2Wav
-# must lie in [0, _CODEBOOK_SIZE).  Values outside this range come from
+# must lie in [0, CODEBOOK_SIZE).  Values outside this range come from
 # code_predictor edge cases (e.g. 2^32 overflow) and will crash the V2
 # model runner which stores token IDs as int32.
-_CODEBOOK_SIZE = 2048
+CODEBOOK_SIZE = 2048
 
 
-def _sanitize_codec_codes(codes: torch.Tensor) -> torch.Tensor:
-    """Clamp codec codes to [0, _CODEBOOK_SIZE)."""
-    return codes.clamp(0, _CODEBOOK_SIZE - 1)
+def sanitize_codec_codes(codes: torch.Tensor) -> torch.Tensor:
+    """Clamp codec codes to [0, CODEBOOK_SIZE)."""
+    return codes.clamp(0, CODEBOOK_SIZE - 1)
 
 
 def talker2code2wav(
@@ -42,7 +42,7 @@ def talker2code2wav(
         audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
         # Filter invalid frames: zero-padded (EOS) and frames containing
         # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size).
-        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < CODEBOOK_SIZE)
         # Also filter frames with negative values.
         valid_mask = valid_mask & (audio_codes.min(dim=1).values >= 0)
         audio_codes = audio_codes[valid_mask]
@@ -50,7 +50,7 @@ def talker2code2wav(
         if isinstance(ref_code, list):
             ref_code = ref_code[0] if ref_code else None
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-            ref_code = _sanitize_codec_codes(ref_code.to(torch.long)).cpu().contiguous()
+            ref_code = sanitize_codec_codes(ref_code.to(torch.long)).cpu().contiguous()
             ref_code_len = int(ref_code.shape[0])
             audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
         else:
@@ -82,7 +82,7 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
         frame = audio_codes.to(torch.long).reshape(-1)
     else:
         raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
-    return _sanitize_codec_codes(frame)
+    return sanitize_codec_codes(frame)
 
 
 def talker2code2wav_async_chunk(
@@ -105,9 +105,7 @@ def talker2code2wav_async_chunk(
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
-            request_payload[request_id] = _sanitize_codec_codes(
-                ref_code.to(torch.long)
-            ).cpu().contiguous()
+            request_payload[request_id] = sanitize_codec_codes(ref_code.to(torch.long)).cpu().contiguous()
     elif not finished:
         return None
 

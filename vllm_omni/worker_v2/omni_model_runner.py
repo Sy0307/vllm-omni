@@ -3,8 +3,8 @@
 Injects ``OmniModelState`` via ``load_model`` and adds:
 
 * ``execute_model`` override with pre-forward (preprocess + MTP) and
-  post-forward (postprocess) hooks, plus optional tuple-return interception
-  for Omni models that return ``(hidden_states, aux_dict)``
+  post-forward (postprocess) hooks, plus generic tuple-return interception
+  support (not used by current Omni models)
 * ``finish_requests`` hook to clean up the intermediate buffer
 * ``capture_model`` override to conditionally exclude FULL CUDA graph mode
   (only when the model forward returns a tuple that requires Python-level
@@ -44,10 +44,13 @@ class OmniGPUModelRunner(GPUModelRunner):
     # Whether the model.forward returns (hidden_states, aux_dict) tuple.
     # If False, FULL CUDA graph mode is allowed since no Python-level
     # tuple interception is needed.
+    # NOTE: No current Omni model sets _returns_tuple (thinker uses
+    # _last_captured_layers instead).  Kept for future model support.
     _model_returns_tuple: bool
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         import vllm.v1.worker.gpu.model_runner as _mr_module
+
         _orig = _mr_module.init_model_state
         _mr_module.init_model_state = init_omni_model_state
         try:
@@ -56,44 +59,32 @@ class OmniGPUModelRunner(GPUModelRunner):
             _mr_module.init_model_state = _orig
         self._last_aux_output = None
         # Detect whether model.forward returns a tuple.
-        self._model_returns_tuple = getattr(
-            self.model, "_returns_tuple", False
-        )
-        # Preprocess with static inputs_embeds buffer is FULL-graph
-        # compatible: OmniModelState allocates a static GPU buffer
-        # returned by both prepare_dummy_inputs (capture) and
-        # prepare_inputs (runtime), so preprocess writes in-place
-        # and FULL graph replay reads the same address.
-        #
-        # Only tuple return requires excluding FULL graph (Python-level
-        # interception can't run during graph replay).
-        self._exclude_full_graph = self._model_returns_tuple
+        self._model_returns_tuple = getattr(self.model, "_returns_tuple", False)
+        # Exclude FULL graph when any per-step Python-level post-forward
+        # logic must run (tuple intercept, _last_captured_layers, etc.).
+        # FULL graph replay bypasses Python entirely — only PIECEWISE
+        # is safe for these models.
+        self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
 
     # ------------------------------------------------------------------
     # CUDA Graph: conditionally exclude FULL mode
     # ------------------------------------------------------------------
 
     def capture_model(self) -> int:
-        """Exclude FULL CUDA graph capture only for tuple-returning models.
+        """Handle CUDA graph capture for Omni models.
 
-        Models with preprocess are FULL-graph compatible because
-        OmniModelState provides a static inputs_embeds buffer that is
-        captured by the graph and filled in-place by preprocess before
-        each replay.
+        Exclude FULL mode for tuple-returning models because
+        ``run_fullgraph`` bypasses Python-level tuple intercept.
+        PIECEWISE graphs still work since the forward_fn output is
+        handled by the graph runtime (not by empty_like).
         """
         if self._exclude_full_graph:
             mgr = self.cudagraph_manager
             if CUDAGraphMode.FULL in mgr._capture_descs:
                 del mgr._capture_descs[CUDAGraphMode.FULL]
                 for i, descs in enumerate(mgr._candidates):
-                    mgr._candidates[i] = [
-                        d for d in descs if d.cg_mode != CUDAGraphMode.FULL
-                    ]
-                logger.info(
-                    "Excluded FULL CUDA graph capture for Omni model "
-                    "(tuple return not compatible with graph replay). "
-                    "PIECEWISE graphs will still be captured."
-                )
+                    mgr._candidates[i] = [d for d in descs if d.cg_mode != CUDAGraphMode.FULL]
+                logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
         return super().capture_model()
 
     # ------------------------------------------------------------------
@@ -121,12 +112,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(
-            num_reqs, num_toks, max_query_len
-        )
-        batch_desc = self.cudagraph_manager.dispatch(
-            num_reqs, num_toks, uniform_tok_count
-        )
+        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
 
         # Encoder-decoder models: disable compilation when encoder inputs
         # are scheduled (dynamic cross-attention cache updates).
@@ -143,6 +130,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = None
         if self.dp_size > 1:
             from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
+
             batch_desc, num_tokens_across_dp = sync_cudagraph_and_dp_padding(
                 self.cudagraph_manager,
                 batch_desc,
@@ -171,15 +159,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._set_active_loras(*lora_inputs)
         else:
             from vllm.v1.worker.gpu.input_batch import InputBatch
+
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
                 self.input_buffers,
             )
             if not skip_attn_for_dummy_run:
-                block_tables, slot_mappings = self.prepare_dummy_attn(
-                    input_batch
-                )
+                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
             else:
                 block_tables = None
                 slot_mappings = None
@@ -189,9 +176,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
-            )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config)
             assert block_tables is not None
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
@@ -259,15 +244,19 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
 
-            # ★ TUPLE INTERCEPT: only for models that return (hidden, aux_dict)
-            if (
-                self._model_returns_tuple
-                and isinstance(model_output, tuple)
-                and len(model_output) == 2
-            ):
+            # ★ TUPLE INTERCEPT: handle models that return (hidden, aux_dict).
+            # torch.compile may prevent in-model side-effects like
+            # self._last_captured_layers = ... from taking effect,
+            # so the tuple may surface here even when the model tries to
+            # store captured layers internally.
+            if isinstance(model_output, tuple) and len(model_output) == 2:
                 first, second = model_output
                 if isinstance(first, torch.Tensor):
                     self._last_aux_output = second
+                    # Store captured layers on the model so
+                    # make_omni_output can retrieve them.
+                    if hasattr(self.model, "_last_captured_layers"):
+                        self.model._last_captured_layers = second
                     hidden_states = first
                 else:
                     self._last_aux_output = None

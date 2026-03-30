@@ -263,7 +263,7 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    model_name = getattr(args, "model", None) or "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     print("=" * 20, "\n", f"vllm version: {vllm.__version__}", "\n", "=" * 20)
 
     # Get paths from args
@@ -331,6 +331,7 @@ def main(args):
         seed=SEED,
         detokenize=True,
         repetition_penalty=1.1,
+        stop_token_ids=[0],
     )
 
     sampling_params_list = [
@@ -416,6 +417,12 @@ def main(args):
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model name or local path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct).",
+    )
+    parser.add_argument(
         "--query-type",
         "-q",
         type=str,
@@ -452,6 +459,12 @@ def parse_args():
         type=int,
         default=65536,
         help="Threshold for using shared memory in bytes (default: 65536)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for generated audio files.",
     )
     parser.add_argument(
         "--output-wav",

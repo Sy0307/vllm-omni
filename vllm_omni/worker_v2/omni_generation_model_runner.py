@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.model_runner import (
     get_uniform_token_count,
 )
 
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
@@ -42,6 +43,105 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         self._gen_model_output: Any = None
         self._gen_input_batch: Any = None
         self._gen_kv_connector_output: Any = None
+        # Placeholder for ExecuteModelState.hidden_states — allocated
+        # once and reused every step to avoid per-forward allocation.
+        self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
+
+    # ------------------------------------------------------------------
+    # Async-chunk support: replace prompt_token_ids for cached requests
+    # ------------------------------------------------------------------
+
+    def _handle_async_chunk_updates(self, scheduler_output: SchedulerOutput) -> None:
+        """Re-initialize cached requests whose prompt_token_ids changed.
+
+        In async_chunk mode, the ``ChunkTransferAdapter`` replaces
+        ``Request.prompt_token_ids`` with new codec frames for each
+        chunk and resets ``num_computed_tokens`` to 0.  The scheduler
+        propagates the new ``prompt_token_ids`` via
+        ``OmniCachedRequestData``.
+
+        Upstream V2 ``update_requests`` only handles block allocation
+        and does **not** replace token state.  This method removes the
+        stale request from ``req_states`` and re-adds it with the
+        updated tokens, mirroring V1's ``_update_request_states``.
+
+        Note: ``finish_requests`` / ``free_states`` (called before us)
+        already handle unscheduled request cleanup, so we only need to
+        process requests with new prompt_token_ids here.
+        """
+        cached = scheduler_output.scheduled_cached_reqs
+        if not cached.req_ids:
+            return
+
+        if not isinstance(cached, OmniCachedRequestData):
+            return
+
+        new_prompt_ids = cached.prompt_token_ids
+        if not new_prompt_ids:
+            return
+
+        addl_info = cached.additional_information
+
+        # Phase 1: remove all stale states, collecting re-add data.
+        updates: list[tuple[str, list[int], Any]] = []
+        for req_id in cached.req_ids:
+            new_ids = new_prompt_ids.get(req_id)
+            if new_ids is None:
+                continue
+
+            if req_id not in self.req_states.req_id_to_index:
+                continue
+
+            old_index = self.req_states.req_id_to_index[req_id]
+
+            self.req_states.remove_request(req_id)
+            self.model_state.remove_request(old_index)
+
+            updates.append((req_id, new_ids, addl_info.get(req_id)))
+
+        if not updates:
+            return
+
+        # Phase 2: re-add all requests with new tokens, then batch-apply.
+        for req_id, new_ids, info in updates:
+            # req_id_to_index is updated eagerly by add_request() (not
+            # staged), so new_index is valid before apply_staged_writes().
+            self.req_states.add_request(
+                req_id=req_id,
+                prompt_len=len(new_ids),
+                all_token_ids=new_ids,
+                num_computed_tokens=0,
+            )
+
+            new_index = self.req_states.req_id_to_index[req_id]
+
+            # Build a synthetic NewRequestData so model_state.add_request
+            # can run _resolve_additional_information and notify plugins.
+            # sampling_params is None because the generation runner does
+            # not sample tokens — Code2Wav output goes directly to
+            # pooler_output.  block_ids is empty because generation
+            # models have no KV cache.
+            synthetic = OmniNewRequestData(
+                req_id=req_id,
+                prompt_token_ids=new_ids,
+                mm_features=None,
+                sampling_params=None,
+                pooling_params=None,
+                block_ids=([],),
+                num_computed_tokens=0,
+                lora_request=None,
+                prefill_token_ids=new_ids,
+                additional_information=info,
+            )
+            # model_state.add_request calls super().add_request()
+            # (DefaultModelState) internally.  This is safe for Code2Wav
+            # because generation models have no attention/rope state to
+            # initialize — the super() call only touches intermediate
+            # buffer and encoder cache, both of which are idempotent
+            # overwrites on the same slot.
+            self.model_state.add_request(new_index, synthetic)
+
+        self.req_states.apply_staged_writes()
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
@@ -49,14 +149,14 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
-        """Generation models have no KV cache — skip full dummy forward.
+        """Generation models have no KV cache — skip profiling.
 
-        Only allocate a small dummy tensor to measure baseline memory.
-        Running the real model with random input_ids causes out-of-bounds
-        indexing in codec lookup tables.
+        Code2Wav shares GPU memory with the Talker stage (same device);
+        its memory footprint is managed via ``gpu_memory_utilization``
+        config, not profiled dynamically.  Running the real model with
+        random input_ids causes out-of-bounds indexing in codec lookup
+        tables.
         """
-        dummy = torch.empty(1, device=self.device, dtype=self.dtype)
-        del dummy
         torch.accelerator.synchronize()
 
     # ------------------------------------------------------------------
@@ -74,6 +174,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         if not dummy_run:
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
+            # Handle async_chunk prompt_token_ids replacement for cached
+            # requests BEFORE add/update — so the stale request state is
+            # removed and re-created with the new chunk's tokens.
+            self._handle_async_chunk_updates(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
@@ -136,8 +240,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
 
-        # Convert via make_omni_output if available
-        if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
+        # Convert raw model output to OmniOutput.
+        if not isinstance(model_output, OmniOutput):
             buffer_list = self.model_state.intermediate_buffer.gather(input_batch)
             try:
                 model_output = self.model.make_omni_output(
@@ -147,28 +251,33 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 )
             except Exception:
                 logger.error(
-                    "make_omni_output failed for generation output; "
-                    "raw output will be used as multimodal_outputs",
+                    "make_omni_output failed; returning empty output",
                     exc_info=True,
                 )
+                self._gen_model_output = None
+                self.execute_model_state = ExecuteModelState(
+                    input_batch=input_batch,
+                    attn_metadata=None,
+                    slot_mappings_by_layer=None,
+                    hidden_states=self._dummy_hidden,
+                    aux_hidden_states=None,
+                    kv_connector_output=kv_connector_output,
+                    num_tokens_across_dp=None,
+                )
+                return None
 
         self._gen_model_output = model_output
         self._gen_input_batch = input_batch
         self._gen_kv_connector_output = kv_connector_output
 
-        # Set execute_model_state so _dummy_run (profile/warmup) doesn't
-        # trip on the assertion.  hidden_states is a dummy tensor because
-        # generation stages don't go through the normal sampling path.
-        dummy_hidden = torch.zeros(
-            1,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        # ExecuteModelState is required by the upstream engine loop
+        # (EngineCore checks execute_model_state is not None before
+        # calling sample_tokens).
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
-            attn_metadata=attn_metadata,
-            slot_mappings_by_layer=slot_mappings_by_layer,
-            hidden_states=dummy_hidden,
+            attn_metadata=None,
+            slot_mappings_by_layer=None,
+            hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
             kv_connector_output=kv_connector_output,
             num_tokens_across_dp=None,
@@ -194,92 +303,82 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         num_reqs = input_batch.num_reqs
 
-        # Resolve the EOS token once.  Used both for postprocess
-        # (advancing num_computed_tokens) and for the returned
-        # sampled_token_ids (triggering scheduler's check_stop).
-        # OmniModelConfig may not expose eos_token_id directly;
-        # fall back through hf_text_config, then default to 0.
-        eos_id = getattr(self.model_config, "eos_token_id", None)
-        if eos_id is None:
-            eos_id = getattr(
-                getattr(self.model_config, "hf_text_config", None),
-                "eos_token_id",
-                None,
-            )
-        if eos_id is None:
-            eos_id = 0
+        # Mark all scheduled tokens as computed so the scheduler does
+        # not re-schedule them.  Unlike AR stages we do NOT call
+        # self.postprocess() — that kernel advances num_computed_tokens
+        # by 1 and emits sampled tokens, which would cause check_stop
+        # to fire.  Instead, set num_computed_tokens = prompt_len
+        # directly, matching V1's behavior.
+        for i in range(num_reqs):
+            req_idx = int(input_batch.idx_mapping_np[i])
+            prompt_len = int(self.req_states.prompt_len.np[req_idx])
+            self.req_states.num_computed_tokens.stage_write_elem(req_idx, prompt_len)
+        self.req_states.num_computed_tokens.apply_write()
 
-        # Advance num_computed_tokens via the upstream postprocess
-        # kernel.  Without this the scheduler re-schedules the same
-        # tokens every step (infinite loop).
-        dummy_sampled = torch.full(
-            (num_reqs, 1), eos_id, dtype=torch.long, device=self.device
-        )
-        dummy_num_sampled = torch.ones(
-            num_reqs, dtype=torch.int32, device=self.device
-        )
-        dummy_num_rejected = torch.zeros(
-            num_reqs, dtype=torch.int32, device=self.device
-        )
-        self.postprocess(
-            input_batch, dummy_sampled, dummy_num_sampled, dummy_num_rejected
-        )
+        # Build pooler_output from OmniOutput.multimodal_outputs (dict).
+        pooler_output = self._build_pooler_output(model_output, num_reqs)
 
-        # Build pooler_output from multimodal model outputs.
-        multimodal_outputs: dict | list | torch.Tensor | None = None
-        if isinstance(model_output, OmniOutput):
-            multimodal_outputs = model_output.multimodal_outputs
-        else:
-            multimodal_outputs = model_output
+        req_ids = input_batch.req_ids
 
-        pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            for i in range(num_reqs):
-                pooler_output.append(
-                    {"model_outputs": multimodal_outputs[i].detach().cpu().contiguous()}
-                )
-        elif isinstance(multimodal_outputs, list):
-            for out in multimodal_outputs:
-                pooler_output.append(
-                    {"model_outputs": out.detach().cpu().contiguous() if out is not None else None}
-                )
-        elif isinstance(multimodal_outputs, dict):
-            for i in range(num_reqs):
-                mm_payload: dict[str, Any] = {}
-                for key, val in multimodal_outputs.items():
-                    if isinstance(val, torch.Tensor):
-                        if val.dim() > 0 and val.shape[0] == num_reqs:
-                            mm_payload[key] = val[i].detach().cpu().contiguous()
-                        else:
-                            mm_payload[key] = val.detach().cpu().contiguous()
-                    elif isinstance(val, list) and len(val) == num_reqs:
-                        out = val[i]
-                        mm_payload[key] = (
-                            out.detach().cpu().contiguous()
-                            if isinstance(out, torch.Tensor) else out
-                        )
-                    else:
-                        mm_payload[key] = val
-                pooler_output.append(mm_payload)
-        else:
-            pooler_output = [None] * num_reqs
+        # Generation models don't do token sampling.  Return one empty
+        # list per request so the scheduler does NOT trigger check_stop
+        # (which would prematurely finish the request).  The request
+        # stays RUNNING until the orchestrator marks it done via
+        # chunk_transfer_adapter.finished_requests.
+        sampled_token_ids: list[list[int]] = [[] for _ in range(len(req_ids))]
 
-        req_ids = input_batch.req_ids[:]
-
-        # Generation models don't do token sampling, but V2's scheduler
-        # relies on sampled_token_ids to detect request completion via
-        # check_stop().  Emit one EOS token per request so the scheduler
-        # marks them FINISHED_STOPPED and frees the request slot.
-        sampled_token_ids: list[list[int]] = [[eos_id]] * len(req_ids)
+        # model_output is guaranteed to be OmniOutput here — the
+        # make_omni_output failure path sets _gen_model_output = None
+        # and we return None at the top of this method.
+        multimodal_outputs = model_output.multimodal_outputs or {}
 
         return OmniModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
             sampled_token_ids=sampled_token_ids,
             pooler_output=pooler_output,
-            multimodal_outputs=(
-                multimodal_outputs if isinstance(multimodal_outputs, dict)
-                else {"model_outputs": multimodal_outputs}
-            ),
+            multimodal_outputs=multimodal_outputs,
             kv_connector_output=kv_connector_output,
         )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_pooler_output(
+        model_output: OmniOutput,
+        num_reqs: int,
+    ) -> list[dict[str, Any] | None]:
+        """Extract per-request pooler payloads from model output.
+
+        Code2Wav's ``make_omni_output`` returns
+        ``{"model_outputs": [tensor_per_req, ...], "sr": [...]}``,
+        so each value is a ``list`` with ``len == num_reqs``.
+        """
+        mm = model_output.multimodal_outputs
+        if not isinstance(mm, dict):
+            logger.warning(
+                "Unexpected multimodal_outputs type: %s; returning empty pooler_output",
+                type(mm).__name__ if mm is not None else "None",
+            )
+            return [None] * num_reqs
+
+        pooler: list[dict[str, Any] | None] = []
+        for i in range(num_reqs):
+            payload: dict[str, Any] = {}
+            for key, val in mm.items():
+                # Primary path: val is list[Tensor] with len == num_reqs
+                # (Code2Wav make_omni_output format).
+                if isinstance(val, list) and len(val) == num_reqs:
+                    out = val[i]
+                    payload[key] = out.detach().cpu().contiguous() if isinstance(out, torch.Tensor) else out
+                elif isinstance(val, torch.Tensor):
+                    if val.dim() > 0 and val.shape[0] == num_reqs:
+                        payload[key] = val[i].detach().cpu().contiguous()
+                    else:
+                        payload[key] = val.detach().cpu().contiguous()
+                else:
+                    payload[key] = val
+            pooler.append(payload)
+        return pooler

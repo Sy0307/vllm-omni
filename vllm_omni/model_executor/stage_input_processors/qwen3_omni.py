@@ -11,6 +11,9 @@ from vllm.platforms import current_platform
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+    sanitize_codec_codes,
+)
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -252,7 +255,9 @@ def talker2code2wav_async_chunk(
         if not code_tensor.any():
             return None
 
-    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
+    codec_codes = sanitize_codec_codes(code_predictor_codes.to(torch.long)).transpose(0, 1).cpu().reshape(-1).tolist()
+    # Post-clamp check: values that were out-of-range get clamped to 0,
+    # so an all-zero result after sanitization indicates a fully invalid frame.
     if sum(codec_codes) == 0:
         return None
 
@@ -315,11 +320,9 @@ def talker2code2wav(
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (
-            output.multimodal_output["code_predictor_codes"][-seq_len:]
-            .to(torch.long)
+            sanitize_codec_codes(output.multimodal_output["code_predictor_codes"][-seq_len:].to(torch.long))
             .transpose(0, 1)
             .cpu()
-            .to(torch.long)
             .reshape(-1)
             .tolist()
         )  # 16, seq_len
