@@ -21,6 +21,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _DummyInputBatch:
     def __init__(self, indices):
         self.idx_mapping_np = indices
+        self.num_reqs = len(indices)
+        self.num_scheduled_tokens = [1] * len(indices)
 
 
 class _DummyReqState:
@@ -79,6 +81,7 @@ def _make_state(
     )
 
     state.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
+    state._static_inputs_embeds = None
     return state
 
 
