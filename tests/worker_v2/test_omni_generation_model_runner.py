@@ -9,9 +9,8 @@ Covers the core pooler_output construction paths:
   - sampled_token_ids always emits [[eos_id]] per request
 """
 
-import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 

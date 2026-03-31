@@ -13,7 +13,6 @@ only the first chunk, producing truncated audio.
 """
 
 import unittest
-from unittest.mock import MagicMock
 
 from vllm.v1.request import RequestStatus
 
@@ -65,8 +64,7 @@ def _evaluate_finish_condition(request, chunk_transfer_adapter):
     """Extract the three-way finish logic from update_from_output."""
     _all_computed = request.num_computed_tokens >= len(request.prompt_token_ids)
     _adapter_done = (
-        chunk_transfer_adapter is not None
-        and request.request_id in chunk_transfer_adapter.finished_requests
+        chunk_transfer_adapter is not None and request.request_id in chunk_transfer_adapter.finished_requests
     )
     return (
         request.status == RequestStatus.FINISHED_STOPPED

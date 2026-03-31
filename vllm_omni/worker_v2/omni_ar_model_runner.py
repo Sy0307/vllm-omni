@@ -99,16 +99,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
 
         # --- Standard v2 sampling ---
-        sampler_output, num_sampled, num_rejected = self.sample(
-            text_hidden, input_batch, grammar_output
-        )
+        sampler_output, num_sampled, num_rejected = self.sample(text_hidden, input_batch, grammar_output)
 
         if self.use_pp:
             from vllm.v1.worker.gpu.pp_utils import pp_broadcast
 
-            pp_broadcast(
-                sampler_output.sampled_token_ids, num_sampled, num_rejected
-            )
+            pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
 
         # --- Omni: prompt logprobs ---
         assert self.prompt_logprobs_worker is not None
@@ -124,17 +120,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
 
         # --- Omni: pooler_output ---
-        engine_output_type = getattr(
-            self.vllm_config.model_config, "engine_output_type", "text"
-        )
+        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
         need_pooler = engine_output_type != "text"
 
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
             req_ids=input_batch.req_ids,
-            req_id_to_index={
-                rid: i for i, rid in enumerate(input_batch.req_ids)
-            },
+            req_id_to_index={rid: i for i, rid in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,
             kv_connector_output=kv_connector_output,
@@ -190,9 +182,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 if isinstance(v, torch.Tensor) and v.shape[0] == total:
                     payload[k] = v[start:end].contiguous()
                 elif isinstance(v, dict):
-                    payload[k] = {
-                        sk: sv[start:end].contiguous() for sk, sv in v.items()
-                    }
+                    payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                 elif isinstance(v, list):
                     elem = v[i] if i < len(v) else v[0]
                     if isinstance(elem, torch.Tensor):
@@ -253,9 +243,7 @@ def _async_copy_tensor(x: torch.Tensor) -> torch.Tensor:
     return x.to("cpu", non_blocking=True)
 
 
-def _async_copy_mm(
-    mm_outputs: dict | None, total_tokens: int
-) -> dict[str, Any]:
+def _async_copy_mm(mm_outputs: dict | None, total_tokens: int) -> dict[str, Any]:
     """Non-blocking D2H copy of multimodal output tensors."""
     if not mm_outputs:
         return {}
@@ -272,10 +260,7 @@ def _async_copy_mm(
                 if sub:
                     cpu[k] = sub
             elif isinstance(v, list) and v:
-                cpu[k] = [
-                    (_async_copy_tensor(el) if isinstance(el, torch.Tensor) else el)
-                    for el in v
-                ]
+                cpu[k] = [(_async_copy_tensor(el) if isinstance(el, torch.Tensor) else el) for el in v]
         except Exception:
             logger.exception("Error async-copying multimodal output %s", k)
     return cpu
@@ -313,9 +298,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._num_reqs: int = 0
         if self._need_pooler and input_batch is not None:
             self._query_start_loc_np = input_batch.query_start_loc_np.copy()
-            self._num_scheduled_tokens = np.array(
-                input_batch.num_scheduled_tokens, dtype=np.int32
-            )
+            self._num_scheduled_tokens = np.array(input_batch.num_scheduled_tokens, dtype=np.int32)
             self._num_reqs = input_batch.num_reqs
 
         # Perform all D2H copies on the copy stream (non-blocking).
@@ -333,17 +316,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             copy_stream.wait_stream(main_stream)
 
             # Sampled token ids
-            self.sampled_token_ids_np = _async_copy_to_np(
-                sampler_output.sampled_token_ids
-            )
+            self.sampled_token_ids_np = _async_copy_to_np(sampler_output.sampled_token_ids)
             self.num_sampled_tokens_np = _async_copy_to_np(num_sampled_tokens)
 
             # Logprobs
             self.logprobs_tensors = None
             if sampler_output.logprobs_tensors is not None:
-                self.logprobs_tensors = (
-                    sampler_output.logprobs_tensors.to_cpu_nonblocking()
-                )
+                self.logprobs_tensors = sampler_output.logprobs_tensors.to_cpu_nonblocking()
             self.num_nans: np.ndarray | None = None
             if sampler_output.num_nans is not None:
                 self.num_nans = _async_copy_to_np(sampler_output.num_nans)
@@ -385,14 +364,12 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
 
         # Pooler output
         if self._need_pooler and self._hidden_cpu is not None:
-            self.model_runner_output.pooler_output = (
-                OmniARModelRunner._build_pooler_output_from_cpu(
-                    self._hidden_cpu,
-                    self._mm_cpu,
-                    self._query_start_loc_np,
-                    self._num_scheduled_tokens,
-                    self._num_reqs,
-                )
+            self.model_runner_output.pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(
+                self._hidden_cpu,
+                self._mm_cpu,
+                self._query_start_loc_np,
+                self._num_scheduled_tokens,
+                self._num_reqs,
             )
 
         return self.model_runner_output

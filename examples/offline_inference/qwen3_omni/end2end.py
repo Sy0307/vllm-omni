@@ -263,7 +263,7 @@ query_map = {
 
 
 def main(args):
-    model_name = getattr(args, "model", None) or "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    model_name = args.model
     print("=" * 20, "\n", f"vllm version: {vllm.__version__}", "\n", "=" * 20)
 
     # Get paths from args
@@ -296,10 +296,11 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        dtype=args.dtype,
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        init_timeout=args.init_timeout,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -334,11 +335,14 @@ def main(args):
         stop_token_ids=[0],
     )
 
-    sampling_params_list = [
+    all_sampling_params = [
         thinker_sampling_params,
         talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
         code2wav_sampling_params,
     ]
+    # Match sampling params to the number of configured stages
+    num_stages = omni.num_stages
+    sampling_params_list = all_sampling_params[:num_stages]
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
@@ -354,9 +358,9 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.enable_profiler
     if profiler_enabled:
-        omni.start_profile(stages=[0])
+        omni.start_profile(stages=args.profiler_stages)
     omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
@@ -406,7 +410,7 @@ def main(args):
         if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
-            omni.stop_profile()
+            omni.stop_profile(stages=args.profiler_stages)
 
             print("[Info] Waiting 30s for workers to write trace files to disk...")
             time.sleep(30)
@@ -419,8 +423,8 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default=None,
-        help="Model name or local path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct).",
+        default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        help="Model name or path.",
     )
     parser.add_argument(
         "--query-type",
@@ -541,9 +545,23 @@ def parse_args():
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
+        "--enable-profiler",
         action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        default=False,
+        help="Enables profiling when set.",
+    )
+    parser.add_argument(
+        "--profiler-stages",
+        type=int,
+        nargs="*",
+        default=None,
+        help="List of stage IDs to profile. If not set, profiles all stages.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
     return parser.parse_args()

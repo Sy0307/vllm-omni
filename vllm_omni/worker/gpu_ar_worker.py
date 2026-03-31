@@ -132,11 +132,16 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         # Must patch both the module attribute AND the local name in
         # gpu_worker (from-import creates a local binding).
         import vllm.v1.worker.gpu_worker as _gw
+
         _orig = _gw.warmup_kernels
-        _noop = lambda *a, **kw: None
+
+        def _noop(*a, **kw):
+            None
+
         _gw.warmup_kernels = _noop
         # Also patch the module where it was originally defined
         import vllm.v1.worker.gpu.warmup as _wm
+
         _orig_wm = _wm.warmup_kernels
         _wm.warmup_kernels = _noop
         try:
@@ -144,7 +149,5 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         finally:
             _gw.warmup_kernels = _orig
             _wm.warmup_kernels = _orig_wm
-        logger.info(
-            "compile_or_warm_up_model: skipped warmup_kernels for Omni AR V2"
-        )
+        logger.info("compile_or_warm_up_model: skipped warmup_kernels for Omni AR V2")
         return result
