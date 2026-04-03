@@ -20,15 +20,6 @@ class _FakeCodec:
         return wav, audio_lengths
 
 
-class _FakeFastAR:
-    def __init__(self, codes: torch.Tensor):
-        self._codes = codes
-
-    def __call__(self, **kwargs):
-        del kwargs
-        return self._codes.clone()
-
-
 class _FakeTokenizer:
     def __init__(self, mapping, unk_token_id=-1):
         self._mapping = mapping

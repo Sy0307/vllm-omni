@@ -570,7 +570,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         q = min(int(ref_codes_fq.shape[1]), self._num_codebooks)
         offsets = (torch.arange(q, device=embeds.device, dtype=torch.long) * self._codebook_size).unsqueeze(0)
-        code_with_offset = ref_codes_fq[:frames, :q].clamp(min=0) + offsets
+        ref_codes_slice = ref_codes_fq[:frames, :q]
+        if bool((ref_codes_slice < 0).any().item()):
+            logger.warning("Fish Speech structured clone saw negative DAC codes; clamping them to zero")
+        code_with_offset = ref_codes_slice.clamp(min=0) + offsets
         codebook_sum = self.codebook_embeddings(code_with_offset).sum(dim=1).to(dtype=embeds.dtype)
 
         result = embeds.clone()

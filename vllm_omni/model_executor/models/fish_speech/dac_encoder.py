@@ -71,6 +71,7 @@ def _get_resample_kernel(
 ):
     import torchaudio
 
+    # lru_cache requires hashable key parts; torch.device and torch.dtype are.
     return torchaudio.transforms.Resample(source_sr, target_sr).to(device=device, dtype=dtype)
 
 
