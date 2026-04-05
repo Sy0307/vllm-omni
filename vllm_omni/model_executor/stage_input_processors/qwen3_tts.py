@@ -19,6 +19,12 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 
 logger = init_logger(__name__)
 
+# Qwen3-TTS decoder uses a sliding attention window of 72 codec frames (12Hz).
+# In streaming mode, if we carry fewer than 72 frames of left-context across
+# chunks, the first part of each chunk may fall outside the model's effective
+# attention window, which has shown up as subtle chunk-boundary artifacts/noise.
+# Therefore we enforce codec_left_context_frames >= 72 by default, while keeping
+# an escape hatch for controlled ablation/tests.
 _QWEN3_TTS_DECODER_SLIDING_WINDOW_FRAMES = 72
 
 
