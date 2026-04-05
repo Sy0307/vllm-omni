@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import os
 from typing import Any
 
 import torch
@@ -17,6 +18,8 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = init_logger(__name__)
+
+_QWEN3_TTS_DECODER_SLIDING_WINDOW_FRAMES = 72
 
 
 def talker2code2wav(
@@ -117,6 +120,17 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    if os.environ.get("VLLM_OMNI_DISABLE_QWEN3_TTS_LEFT_CONTEXT_GUARD", "0") != "1":
+        if 0 <= left_context_size_config < _QWEN3_TTS_DECODER_SLIDING_WINDOW_FRAMES:
+            logger.warning(
+                "Qwen3-TTS streaming codec_left_context_frames=%d is smaller than "
+                "decoder sliding_window=%d; overriding to %d. "
+                "Set VLLM_OMNI_DISABLE_QWEN3_TTS_LEFT_CONTEXT_GUARD=1 to bypass (testing only).",
+                left_context_size_config,
+                _QWEN3_TTS_DECODER_SLIDING_WINDOW_FRAMES,
+                _QWEN3_TTS_DECODER_SLIDING_WINDOW_FRAMES,
+            )
+            left_context_size_config = _QWEN3_TTS_DECODER_SLIDING_WINDOW_FRAMES
 
     # Per-request override takes priority over dynamic IC.
     per_request_override = False
