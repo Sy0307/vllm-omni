@@ -41,6 +41,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers: int | None = None
         self._output_sample_rate: int | None = None
         self._total_upsample: int | None = None
+        self._decoder_sliding_window: int | None = None
         self._logged_codec_stats = False
 
     @staticmethod
@@ -106,6 +107,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers = num_q
         self._output_sample_rate = out_sr
         self._total_upsample = int(decoder.total_upsample)
+        self._decoder_sliding_window = int(getattr(dec_cfg, "sliding_window", 0) or 0)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(decoder, "precompute_snake_caches"):
@@ -284,24 +286,17 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            if ctx_frames > 0:
-                # Proportional trim matching the official HF implementation:
-                # the decoder output length may not be exactly frames * upsample
-                # so compute cut as a proportion of total decoded length.
-                cut = int(ctx_frames / max(actual_frames, 1) * wav.shape[0])
-                if cut < wav.shape[0]:
-                    wav = wav[cut:]
-                else:
-                    logger.warning(
-                        "Context trim %d >= decoded length %d; returning empty audio.",
-                        cut,
-                        wav.shape[0],
-                    )
-                    continue
-            else:
-                expected_len = actual_frames * upsample
-                if wav.shape[0] > expected_len:
-                    wav = wav[:expected_len]
+            # Slice on exact codec-frame boundaries instead of proportionally.
+            start = max(0, ctx_frames * upsample)
+            end = max(start, actual_frames * upsample)
+            if start >= wav.shape[0]:
+                logger.warning(
+                    "Context trim start %d >= decoded length %d; returning empty audio.",
+                    start,
+                    wav.shape[0],
+                )
+                continue
+            wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
