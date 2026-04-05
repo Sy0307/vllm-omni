@@ -109,6 +109,33 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._total_upsample = int(decoder.total_upsample)
         self._decoder_sliding_window = int(getattr(dec_cfg, "sliding_window", 0) or 0)
 
+        chunk_frames = 0
+        left_frames = 0
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        extra_cfg = (
+            connector_cfg.get("extra", connector_cfg)
+            if isinstance(connector_cfg, dict)
+            else getattr(connector_cfg, "extra", None)
+        )
+        if isinstance(extra_cfg, dict):
+            chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+            left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            if (
+                chunk_frames > 0
+                and left_frames > 0
+                and self._decoder_sliding_window
+                and left_frames < self._decoder_sliding_window
+            ):
+                logger.warning(
+                    "Qwen3-TTS streaming codec_left_context_frames=%d is smaller than "
+                    "decoder sliding_window=%d; chunk-boundary distortion may occur. "
+                    "Increase codec_left_context_frames to at least %d for streaming.",
+                    left_frames,
+                    self._decoder_sliding_window,
+                    self._decoder_sliding_window,
+                )
+
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(decoder, "precompute_snake_caches"):
             decoder.precompute_snake_caches()
@@ -117,20 +144,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             device = self._module_device(decoder)
             if device.type == "cuda":
                 try:
-                    chunk_frames = 0
-                    left_frames = 0
-
-                    model_cfg = getattr(self.vllm_config, "model_config", None)
-                    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
-                    extra_cfg = (
-                        connector_cfg.get("extra", connector_cfg)
-                        if isinstance(connector_cfg, dict)
-                        else getattr(connector_cfg, "extra", None)
-                    )
-                    if isinstance(extra_cfg, dict):
-                        chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-                        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
-
                     decoder.enable_cudagraph(
                         device=device,
                         codec_chunk_frames=chunk_frames,
