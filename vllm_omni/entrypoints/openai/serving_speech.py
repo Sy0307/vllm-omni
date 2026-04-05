@@ -48,12 +48,14 @@ _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
+_STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
+    | _STEP_AUDIO2_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -274,6 +276,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "cosyvoice3"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
+        if model_stage in _STEP_AUDIO2_TTS_MODEL_STAGES:
+            return "step_audio2"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -723,6 +727,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        if self._tts_model_type == "step_audio2":
+            # StepAudio2 only requires non-empty input text
+            if not request.input or not request.input.strip():
+                return "Input text cannot be empty"
+            return None
         if self._tts_model_type == "voxtral_tts":
             return self._validate_voxtral_tts_request(request)
         if self._tts_model_type == "fish_tts":
@@ -1179,6 +1188,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
             }
 
+    # ---- Step-Audio2 helpers ----
+
+    def _build_step_audio2_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build prompt for Step-Audio2 TTS.
+
+        Constructs the chat prompt with ``<tts_start>`` as the last token
+        of the assistant turn (without ``<|im_end|>``), so the thinker
+        continues generating audio tokens.
+
+        Prompt format::
+            <|im_start|>system\\n{system_prompt}<|im_end|>\\n
+            <|im_start|>user\\n{input_text}<|im_end|>\\n
+            <|im_start|>assistant\\n<tts_start>
+        """
+        system_prompt = getattr(request, "instructions", None) or "You are a voice assistant. Read the text aloud."
+        text = request.input
+
+        raw_prompt = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{text}<|im_end|>\n"
+            f"<|im_start|>assistant\n<tts_start>"
+        )
+        return {"prompt": raw_prompt}
+
     # ---- Fish Speech helpers ----
 
     def _build_fish_speech_prompt(
@@ -1281,7 +1317,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        if self._is_fish_speech:
+        if self._tts_model_type == "step_audio2":
+            if not request.input or not request.input.strip():
+                raise ValueError("Input text cannot be empty")
+            prompt = self._build_step_audio2_prompt(request)
+            tts_params = {}
+        elif self._is_fish_speech:
             validation_error = self._validate_fish_tts_request(request)
             if validation_error:
                 raise ValueError(validation_error)
@@ -1324,7 +1365,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt = {"prompt": request.input}
 
         request_id = f"speech-{random_uuid()}"
-        if self._is_fish_speech:
+        if self._tts_model_type == "step_audio2":
+            model_type = "step_audio2"
+        elif self._is_fish_speech:
             model_type = "fish_speech"
         elif self._tts_model_type == "voxtral_tts":
             model_type = "voxtral_tts"
