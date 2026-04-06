@@ -811,6 +811,14 @@ async def omni_init_app_state(
         request_logger=request_logger,
     )
 
+    from vllm_omni.entrypoints.openai.serving_video_stream import (
+        OmniStreamingVideoHandler,
+    )
+
+    state.openai_streaming_video = OmniStreamingVideoHandler(
+        chat_service=state.openai_serving_chat,
+    )
+
     state.openai_serving_video = OmniOpenAIServingVideo(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
@@ -1168,17 +1176,26 @@ async def streaming_speech(websocket: WebSocket):
     await handler.handle_session(websocket)
 
 
-@router.websocket("/v1/realtime")
-async def realtime_websocket(websocket: WebSocket):
-    """WebSocket endpoint for OpenAI-style realtime interactions."""
-    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
-    if serving is None:
+@router.websocket("/v1/video/chat/stream")
+async def streaming_video_chat(websocket: WebSocket):
+    """WebSocket endpoint for streaming video input understanding.
+
+    Accepts video frames incrementally, buffers them, and generates
+    text + audio responses via the Qwen3-Omni pipeline.
+    See serving_video_stream.py for protocol details.
+    """
+    handler = getattr(websocket.app.state, "openai_streaming_video", None)
+    if handler is None:
         await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming video chat is not available",
+            }
+        )
         await websocket.close()
         return
-    connection = RealtimeConnection(websocket, serving)
-    await connection.handle_connection()
+    await handler.handle_session(websocket)
 
 
 # Health and Model endpoints for diffusion mode
