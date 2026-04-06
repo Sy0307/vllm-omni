@@ -332,14 +332,16 @@ class OmniStreamingVideoHandler:
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
-        # Always use chat_service SSE path. In async_chunk mode,
-        # engine_client.generate() only yields 1 audio output with
-        # partial audio. The SSE path via create_chat_completion()
-        # returns complete audio as base64 in the final text delta.
-        await self._process_query_chat(
-            websocket, config, frame_buffer, audio_buffer,
-            message_history, query_text,
-        )
+        if self._engine_client is not None:
+            await self._process_query_engine(
+                websocket, config, frame_buffer, audio_buffer,
+                message_history, query_text, request_id, interrupt_event,
+            )
+        else:
+            await self._process_query_chat(
+                websocket, config, frame_buffer, audio_buffer,
+                message_history, query_text,
+            )
 
     # ------------------------------------------------------------------
     # Engine-client path (async_chunk audio streaming)
@@ -401,6 +403,7 @@ class OmniStreamingVideoHandler:
             result_gen = self._engine_client.generate(
                 prompt=engine_prompt,
                 request_id=request_id,
+                output_modalities=config.modalities,
             )
 
             async for output in result_gen:
