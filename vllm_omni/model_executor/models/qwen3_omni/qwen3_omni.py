@@ -921,7 +921,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Talker takes word embeddings for tokens and hidden state from `accept_hidden_layer` for multimodal inputs
             elif (role_token == self.config.user_token_id).item():
                 talker_user_part = self._get_talker_user_parts(
-                    im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
+                    im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed,
+                    tts_pad_embed=tts_pad_embed,
                 )
                 talker_input_embeds.append(talker_user_part)
                 talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
@@ -1027,7 +1028,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         return last_talker_hidden, text_step, update_dict
 
-    def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
+    def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed, *, tts_pad_embed=None):
         seg_len = segment_end_index - im_start_index
         hidden_len = thinker_hidden.shape[0]
         embed_len = thinker_embed.shape[0]
@@ -1035,11 +1036,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         effective_start = min(im_start_index, effective_end)
         avail = effective_end - effective_start
 
-        user_talker_part = torch.zeros(
-            (seg_len, self.config.talker_config.text_config.hidden_size),
-            device=thinker_hidden.device,
-            dtype=torch.bfloat16,
-        )
+        talker_hidden_size = self.config.talker_config.text_config.hidden_size
+        # Fill with tts_pad_embed (trained neutral token) instead of zeros.
+        # Zeros cause garbled audio when passed through talker attention.
+        if tts_pad_embed is not None:
+            user_talker_part = tts_pad_embed.expand(seg_len, -1).clone().to(
+                device=thinker_hidden.device, dtype=torch.bfloat16,
+            )
+        else:
+            user_talker_part = torch.zeros(
+                (seg_len, talker_hidden_size),
+                device=thinker_hidden.device,
+                dtype=torch.bfloat16,
+            )
 
         if avail <= 0:
             return user_talker_part
@@ -1076,12 +1085,12 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # Pad assistant_hidden to at least 4 tokens if needed.
         # Expected layout: [3 header tokens] + [1 first text token] + [trailing]
-        # When embed is incomplete (multimodal scheduling), pad with zeros.
+        # Use tts_pad_embed (trained neutral token) for padding.
         if assistant_hidden.shape[0] < 4:
             pad_len = 4 - assistant_hidden.shape[0]
             assistant_hidden = torch.cat([
                 assistant_hidden,
-                torch.zeros((pad_len, hidden_size), device=device, dtype=torch.bfloat16),
+                tts_pad_embed.expand(pad_len, -1).to(dtype=torch.bfloat16),
             ], dim=0)
 
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens

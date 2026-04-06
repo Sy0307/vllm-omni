@@ -143,25 +143,28 @@ def thinker2talker_async_chunk(
 
         # When chunked prefill splits multimodal encoder tokens into a
         # separate step, the pooling output is shorter than prompt.
-        # Pad embeddings/hidden to match prompt length so talker receives
-        # consistent data with correct prewarm alignment.
+        # Pad embeddings/hidden to match prompt length so talker
+        # receives data aligned with prewarm KV allocation.
+        # The pad values here don't matter for audio quality because
+        # _get_talker_user_parts uses tts_pad_embed for out-of-range
+        # positions (skipping projection of these pad values).
         embed_len = talker_additional_info["thinker_prefill_embeddings"].shape[0]
         prompt_len = len(prompt_token_ids)
         if embed_len < prompt_len:
             pad_len = prompt_len - embed_len
-            embed_dim = talker_additional_info["thinker_prefill_embeddings"].shape[1]
-            hidden_dim = talker_additional_info["thinker_hidden_states"].shape[1]
-            # Use the mean of existing embeddings as padding value
-            # (neutral context rather than zeros which cause garbled audio).
-            embed_mean = talker_additional_info["thinker_prefill_embeddings"].mean(dim=0, keepdim=True)
-            hidden_mean = talker_additional_info["thinker_hidden_states"].mean(dim=0, keepdim=True)
             talker_additional_info["thinker_prefill_embeddings"] = torch.cat([
                 talker_additional_info["thinker_prefill_embeddings"],
-                embed_mean.expand(pad_len, embed_dim),
+                torch.zeros(
+                    (pad_len, talker_additional_info["thinker_prefill_embeddings"].shape[1]),
+                    dtype=talker_additional_info["thinker_prefill_embeddings"].dtype,
+                ),
             ], dim=0)
             talker_additional_info["thinker_hidden_states"] = torch.cat([
                 talker_additional_info["thinker_hidden_states"],
-                hidden_mean.expand(pad_len, hidden_dim),
+                torch.zeros(
+                    (pad_len, talker_additional_info["thinker_hidden_states"].shape[1]),
+                    dtype=talker_additional_info["thinker_hidden_states"].dtype,
+                ),
             ], dim=0)
 
         if transfer_manager.request_payload.get(request_id) is None and not is_finished:
