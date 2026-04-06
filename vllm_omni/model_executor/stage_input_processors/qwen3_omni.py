@@ -141,16 +141,28 @@ def thinker2talker_async_chunk(
                 dim=0,
             )
 
-        # Trim thinker_sequences and thinker_input_ids to match actual
-        # embed length.  When chunked prefill splits multimodal encoder
-        # tokens into a separate step, the pooling output only covers
-        # the text portion.  By trimming the token IDs to match, the
-        # talker receives consistent data and produces correct audio.
+        # When chunked prefill splits multimodal encoder tokens into a
+        # separate step, the pooling output is shorter than prompt.
+        # Pad embeddings/hidden to match prompt length so talker receives
+        # consistent data with correct prewarm alignment.
         embed_len = talker_additional_info["thinker_prefill_embeddings"].shape[0]
-        if embed_len < len(prompt_token_ids):
-            talker_additional_info["thinker_input_ids"] = prompt_token_ids[:embed_len]
-        if embed_len < len(all_token_ids):
-            talker_additional_info["thinker_sequences"] = all_token_ids[:embed_len]
+        prompt_len = len(prompt_token_ids)
+        if embed_len < prompt_len:
+            pad_len = prompt_len - embed_len
+            embed_dim = talker_additional_info["thinker_prefill_embeddings"].shape[1]
+            hidden_dim = talker_additional_info["thinker_hidden_states"].shape[1]
+            # Use the mean of existing embeddings as padding value
+            # (neutral context rather than zeros which cause garbled audio).
+            embed_mean = talker_additional_info["thinker_prefill_embeddings"].mean(dim=0, keepdim=True)
+            hidden_mean = talker_additional_info["thinker_hidden_states"].mean(dim=0, keepdim=True)
+            talker_additional_info["thinker_prefill_embeddings"] = torch.cat([
+                talker_additional_info["thinker_prefill_embeddings"],
+                embed_mean.expand(pad_len, embed_dim),
+            ], dim=0)
+            talker_additional_info["thinker_hidden_states"] = torch.cat([
+                talker_additional_info["thinker_hidden_states"],
+                hidden_mean.expand(pad_len, hidden_dim),
+            ], dim=0)
 
         if transfer_manager.request_payload.get(request_id) is None and not is_finished:
             transfer_manager.request_payload[request_id] = talker_additional_info
