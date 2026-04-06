@@ -603,8 +603,14 @@ class OmniStreamingVideoHandler:
         if config.system_prompt:
             messages.append({"role": "system", "content": config.system_prompt})
 
-        # Add text-only history (strip images/audio from old turns)
-        for hist_msg in message_history:
+        # Add text-only history (strip images/audio from old turns).
+        # Keep only the last turn (2 messages) to keep prompt short
+        # enough for single-step mm_encoder scheduling.  When prompt
+        # exceeds ~50 tokens, the V1 scheduler splits mm_encoder and
+        # text prefill, causing incomplete thinker embeddings and
+        # garbled audio.
+        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
+        for hist_msg in recent_history:
             messages.append(self._text_only_message(hist_msg))
 
         messages.append(user_message)
