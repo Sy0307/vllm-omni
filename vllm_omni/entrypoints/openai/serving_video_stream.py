@@ -168,7 +168,7 @@ class OmniStreamingVideoHandler:
 
             async def _processor() -> None:
                 """Process enqueued messages."""
-                nonlocal active_request_id
+                nonlocal active_request_id, prev_request_id
 
                 while True:
                     msg = await msg_queue.get()
@@ -257,6 +257,13 @@ class OmniStreamingVideoHandler:
                                 pass
                         await websocket.send_json({"type": "session.done"})
                         return
+
+                    elif msg_type == "ping":
+                        # Heartbeat — respond with pong
+                        try:
+                            await websocket.send_json({"type": "pong"})
+                        except Exception:
+                            pass
 
                     else:
                         await self._send_error(websocket, f"Unknown type: {msg_type}")
