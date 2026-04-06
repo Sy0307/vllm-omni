@@ -1028,21 +1028,31 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
-        user_talker_part = torch.empty(
-            (segment_end_index - im_start_index, self.config.talker_config.text_config.hidden_size),
+        seg_len = segment_end_index - im_start_index
+        hidden_len = thinker_hidden.shape[0]
+        embed_len = thinker_embed.shape[0]
+        effective_end = min(segment_end_index, hidden_len, embed_len)
+        effective_start = min(im_start_index, effective_end)
+        avail = effective_end - effective_start
+
+        user_talker_part = torch.zeros(
+            (seg_len, self.config.talker_config.text_config.hidden_size),
             device=thinker_hidden.device,
             dtype=torch.bfloat16,
         )
 
-        user_mm_mask = multimodal_mask[im_start_index:segment_end_index]
-        # Multimodal data exists
+        if avail <= 0:
+            return user_talker_part
+
+        user_mm_mask = multimodal_mask[im_start_index:im_start_index + avail]
         if user_mm_mask.any():
-            user_thinker_hidden_mm = thinker_hidden[im_start_index:segment_end_index][user_mm_mask]
+            user_thinker_hidden_mm = thinker_hidden[effective_start:effective_end][user_mm_mask]
             mm_hidden = self.talker.hidden_projection(user_thinker_hidden_mm).to(thinker_hidden.device)
-            user_talker_part[user_mm_mask] = mm_hidden
-        user_thinker_embed = thinker_embed[im_start_index:segment_end_index][~user_mm_mask]
-        user_text_hidden = self.talker.text_projection(user_thinker_embed).to(thinker_hidden.device)
-        user_talker_part[~user_mm_mask] = user_text_hidden
+            user_talker_part[:avail][user_mm_mask] = mm_hidden
+        if (~user_mm_mask).any():
+            user_thinker_embed = thinker_embed[effective_start:effective_end][~user_mm_mask]
+            user_text_hidden = self.talker.text_projection(user_thinker_embed).to(thinker_hidden.device)
+            user_talker_part[:avail][~user_mm_mask] = user_text_hidden
         return user_talker_part
 
     def _get_talker_assistant_parts(
