@@ -25,6 +25,8 @@ def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda")
     user_token_id = 872
     assistant_token_id = 77091
 
+    # thinker_sequences and thinker_input_ids may already have encoder
+    # tokens filtered out by thinker2talker_async_chunk.
     thinker_sequences = torch.tensor(info["thinker_sequences"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
     input_ids = torch.tensor(info["thinker_input_ids"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
@@ -141,31 +143,25 @@ def thinker2talker_async_chunk(
                 dim=0,
             )
 
-        # When chunked prefill splits multimodal encoder tokens into a
-        # separate step, the pooling output is shorter than prompt.
-        # Pad embeddings/hidden to match prompt length so talker
-        # receives data aligned with prewarm KV allocation.
-        # The pad values here don't matter for audio quality because
-        # _get_talker_user_parts uses tts_pad_embed for out-of-range
-        # positions (skipping projection of these pad values).
+        # V1 scheduler processes multimodal encoder tokens separately,
+        # so pooling output only covers non-encoder tokens (text).
+        # Remove image/audio/video placeholder positions from the token
+        # ID sequences so they match the embedding length exactly.
+        # The talker doesn't need image token embeddings — it only uses
+        # text_projection for text tokens and hidden_projection for
+        # multimodal tokens.  With encoder tokens removed, the talker
+        # processes only what the thinker decoder actually computed.
         embed_len = talker_additional_info["thinker_prefill_embeddings"].shape[0]
-        prompt_len = len(prompt_token_ids)
-        if embed_len < prompt_len:
-            pad_len = prompt_len - embed_len
-            talker_additional_info["thinker_prefill_embeddings"] = torch.cat([
-                talker_additional_info["thinker_prefill_embeddings"],
-                torch.zeros(
-                    (pad_len, talker_additional_info["thinker_prefill_embeddings"].shape[1]),
-                    dtype=talker_additional_info["thinker_prefill_embeddings"].dtype,
-                ),
-            ], dim=0)
-            talker_additional_info["thinker_hidden_states"] = torch.cat([
-                talker_additional_info["thinker_hidden_states"],
-                torch.zeros(
-                    (pad_len, talker_additional_info["thinker_hidden_states"].shape[1]),
-                    dtype=talker_additional_info["thinker_hidden_states"].dtype,
-                ),
-            ], dim=0)
+        if embed_len < len(prompt_token_ids):
+            # Build a mask of non-encoder-token positions
+            image_token_id = 151655  # Qwen3-Omni image token
+            audio_token_id = 151646  # Qwen3-Omni audio token
+            video_token_id = 151656  # Qwen3-Omni video token
+            encoder_ids = {image_token_id, audio_token_id, video_token_id}
+            filtered_prompt = [t for t in prompt_token_ids if t not in encoder_ids]
+            filtered_all = [t for t in all_token_ids if t not in encoder_ids]
+            talker_additional_info["thinker_input_ids"] = filtered_prompt
+            talker_additional_info["thinker_sequences"] = filtered_all
 
         if transfer_manager.request_payload.get(request_id) is None and not is_finished:
             transfer_manager.request_payload[request_id] = talker_additional_info

@@ -921,8 +921,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Talker takes word embeddings for tokens and hidden state from `accept_hidden_layer` for multimodal inputs
             elif (role_token == self.config.user_token_id).item():
                 talker_user_part = self._get_talker_user_parts(
-                    im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed,
-                    tts_pad_embed=tts_pad_embed,
+                    im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
                 )
                 talker_input_embeds.append(talker_user_part)
                 talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])

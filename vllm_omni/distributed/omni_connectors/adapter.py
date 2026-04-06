@@ -186,24 +186,32 @@ def try_recv_via_connector(
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     """Compute the length of the talker prompt ids.
 
+    Multimodal encoder tokens (image/audio/video placeholders) are
+    excluded because the V1 scheduler processes them separately and
+    the thinker pooling output does not include their embeddings.
+
     Args:
         prompt_ids: The prompt ids tensor.
 
     Returns:
         The length of the talker prompt ids.
     """
+    # Filter out encoder placeholder tokens first
+    _ENCODER_TOKEN_IDS = {151655, 151646, 151656}  # image, audio, video
+    filtered = [t for t in prompt_ids if t not in _ENCODER_TOKEN_IDS]
+
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
-    im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
-    im_start_indexes.append(len(prompt_ids))
+    im_start_indexes = [i for i in range(len(filtered)) if filtered[i] == im_start_token_id]
+    im_start_indexes.append(len(filtered))
     sum_user_len = 0
     assistant_len = 0
     for i in range(len(im_start_indexes) - 1):
         s = im_start_indexes[i]
         e = im_start_indexes[i + 1]
-        role = prompt_ids[s + 1]
+        role = filtered[s + 1]
         if role == system_token_id:
             continue
         elif role == user_token_id:
