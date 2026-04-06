@@ -127,11 +127,7 @@ def thinker2talker_async_chunk(
         language = extract_language_from_request(request)
         if language is not None:
             talker_additional_info["language"] = language
-        if transfer_manager.request_payload.get(request_id) is None:
-            if not is_finished:
-                transfer_manager.request_payload[request_id] = talker_additional_info
-                return None
-        else:
+        if transfer_manager.request_payload.get(request_id) is not None:
             save_payload = transfer_manager.request_payload.pop(request_id)
             talker_additional_info["thinker_prefill_embeddings"] = torch.cat(
                 (
@@ -144,6 +140,21 @@ def thinker2talker_async_chunk(
                 (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
                 dim=0,
             )
+
+        # Trim thinker_sequences and thinker_input_ids to match actual
+        # embed length.  When chunked prefill splits multimodal encoder
+        # tokens into a separate step, the pooling output only covers
+        # the text portion.  By trimming the token IDs to match, the
+        # talker receives consistent data and produces correct audio.
+        embed_len = talker_additional_info["thinker_prefill_embeddings"].shape[0]
+        if embed_len < len(prompt_token_ids):
+            talker_additional_info["thinker_input_ids"] = prompt_token_ids[:embed_len]
+        if embed_len < len(all_token_ids):
+            talker_additional_info["thinker_sequences"] = all_token_ids[:embed_len]
+
+        if transfer_manager.request_payload.get(request_id) is None and not is_finished:
+            transfer_manager.request_payload[request_id] = talker_additional_info
+            return None
     else:
         output_token_ids = request.output_token_ids
         # Convert ConstantList to regular list for OmniSerializer serialization
