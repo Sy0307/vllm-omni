@@ -817,6 +817,7 @@ async def omni_init_app_state(
 
     state.openai_streaming_video = OmniStreamingVideoHandler(
         chat_service=state.openai_serving_chat,
+        engine_client=engine_client,
     )
 
     state.openai_serving_video = OmniOpenAIServingVideo(
