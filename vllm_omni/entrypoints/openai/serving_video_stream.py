@@ -332,16 +332,14 @@ class OmniStreamingVideoHandler:
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
-        if self._engine_client is not None:
-            await self._process_query_engine(
-                websocket, config, frame_buffer, audio_buffer,
-                message_history, query_text, request_id, interrupt_event,
-            )
-        else:
-            await self._process_query_chat(
-                websocket, config, frame_buffer, audio_buffer,
-                message_history, query_text,
-            )
+        # Always use chat_service SSE path. In async_chunk mode,
+        # engine_client.generate() only yields 1 audio output with
+        # partial audio. The SSE path via create_chat_completion()
+        # returns complete audio as base64 in the final text delta.
+        await self._process_query_chat(
+            websocket, config, frame_buffer, audio_buffer,
+            message_history, query_text,
+        )
 
     # ------------------------------------------------------------------
     # Engine-client path (async_chunk audio streaming)
@@ -511,6 +509,10 @@ class OmniStreamingVideoHandler:
 
         await websocket.send_json({"type": "response.start"})
         full_text = ""
+        audio_b64 = ""
+        text_done_sent = False
+        # WAV base64 starts with "UklGR" (RIFF header)
+        _WAV_B64_PREFIX = "UklGR"
 
         try:
             generator = await self._chat_service.create_chat_completion(
@@ -537,16 +539,46 @@ class OmniStreamingVideoHandler:
                         delta = choices[0].get("delta", {})
                         content = delta.get("content")
                         if content and isinstance(content, str):
-                            full_text += content
-                            await websocket.send_json(
-                                {"type": "response.text.delta", "delta": content}
-                            )
+                            # In async_chunk mode, audio WAV base64 is
+                            # appended to text content. Detect and split.
+                            wav_idx = content.find(_WAV_B64_PREFIX)
+                            if wav_idx >= 0:
+                                text_part = content[:wav_idx]
+                                audio_b64 += content[wav_idx:]
+                                if text_part:
+                                    full_text += text_part
+                                    await websocket.send_json(
+                                        {"type": "response.text.delta", "delta": text_part}
+                                    )
+                                if not text_done_sent:
+                                    await websocket.send_json(
+                                        {"type": "response.text.done", "text": full_text}
+                                    )
+                                    text_done_sent = True
+                            elif audio_b64:
+                                # Continuing audio base64 data
+                                audio_b64 += content
+                            else:
+                                full_text += content
+                                await websocket.send_json(
+                                    {"type": "response.text.delta", "delta": content}
+                                )
         except Exception as e:
             logger.error("Chat query failed: %s", e)
             await self._send_error(websocket, f"Generation failed: {e}")
             return
 
-        await websocket.send_json({"type": "response.text.done", "text": full_text})
+        if not text_done_sent:
+            await websocket.send_json({"type": "response.text.done", "text": full_text})
+
+        # Send audio if available
+        if audio_b64 and "audio" in config.modalities:
+            await websocket.send_json({
+                "type": "response.audio.delta",
+                "data": audio_b64,
+                "format": "wav",
+            })
+            await websocket.send_json({"type": "response.audio.done"})
 
         # Commit turn
         message_history.append(user_message)
