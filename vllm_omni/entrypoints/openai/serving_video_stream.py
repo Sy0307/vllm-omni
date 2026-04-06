@@ -121,6 +121,7 @@ class OmniStreamingVideoHandler:
             audio_buffer = bytearray()  # raw PCM16 16kHz mono
             message_history: list[dict[str, Any]] = []
             active_request_id: str | None = None
+            prev_request_id: str | None = None  # for abort on new query
             interrupt_event = asyncio.Event()
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
@@ -218,6 +219,16 @@ class OmniStreamingVideoHandler:
                             await self._send_error(websocket, "No frames buffered")
                             continue
 
+                        # Abort previous request so the thinker scheduler
+                        # releases KV blocks before the new prefill.
+                        if prev_request_id and self._engine_client:
+                            try:
+                                await self._engine_client.abort(prev_request_id)
+                            except Exception:
+                                pass
+                            # Give scheduler time to process the abort
+                            await asyncio.sleep(0.1)
+
                         request_id = f"video-{uuid.uuid4().hex[:12]}"
                         active_request_id = request_id
                         interrupt_event.clear()
@@ -233,6 +244,7 @@ class OmniStreamingVideoHandler:
                             interrupt_event,
                         )
 
+                        prev_request_id = active_request_id
                         active_request_id = None
                         audio_buffer.clear()
 
@@ -314,11 +326,6 @@ class OmniStreamingVideoHandler:
         """Build prompt, run inference, stream text + audio response."""
 
         if self._engine_client is not None:
-            # Wait briefly for previous pipeline stages (talker/code2wav)
-            # to fully drain.  Without this, the thinker scheduler may
-            # chunk the new prefill due to insufficient budget, causing
-            # incomplete embeddings in the thinker→talker transfer.
-            await asyncio.sleep(0.5)
             await self._process_query_engine(
                 websocket, config, frame_buffer, audio_buffer,
                 message_history, query_text, request_id, interrupt_event,
