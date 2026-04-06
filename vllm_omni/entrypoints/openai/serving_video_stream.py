@@ -314,6 +314,11 @@ class OmniStreamingVideoHandler:
         """Build prompt, run inference, stream text + audio response."""
 
         if self._engine_client is not None:
+            # Wait briefly for previous pipeline stages (talker/code2wav)
+            # to fully drain.  Without this, the thinker scheduler may
+            # chunk the new prefill due to insufficient budget, causing
+            # incomplete embeddings in the thinker→talker transfer.
+            await asyncio.sleep(0.5)
             await self._process_query_engine(
                 websocket, config, frame_buffer, audio_buffer,
                 message_history, query_text, request_id, interrupt_event,
