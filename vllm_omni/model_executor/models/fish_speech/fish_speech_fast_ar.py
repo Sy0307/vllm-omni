@@ -310,6 +310,7 @@ class FishSpeechFastAR(nn.Module):
         self._compiled_model_fwd: object | None = None
         self._compile_attempted = False
         self._compile_failed = False
+        self._disable_compile_for_graph = False
 
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
@@ -327,11 +328,13 @@ class FishSpeechFastAR(nn.Module):
         if self._compile_attempted:
             return
         self._compile_attempted = True
+        if self._disable_compile_for_graph:
+            self._compiled_model_fwd = self.model.forward
+            logger.info("Fast AR torch.compile disabled (outer CUDA Graph active)")
+            return
         try:
             self._compiled_model_fwd = torch.compile(
                 self.model.forward,
-                # Keep the helper compiler separate from vLLM's outer
-                # cudagraph-managed Stage-0 execution.
                 mode="default",
                 dynamic=True,
                 fullgraph=False,
