@@ -1048,9 +1048,31 @@ class Qwen3OmniMoeForConditionalGeneration(
     def _get_talker_assistant_parts(
         self, im_start_index, segment_end_index, speaker_id, thinker_embed, tts_pad_embed, tts_bos_embed, tts_eos_embed
     ):
-        assistant_hidden = self.talker.text_projection(thinker_embed[im_start_index:segment_end_index]).to(
-            tts_pad_embed.device
-        )  # [t, d]
+        # Clamp indices to available embed range (embed may be shorter than
+        # prompt when multimodal encoder tokens have separate scheduling).
+        effective_start = min(im_start_index, thinker_embed.shape[0])
+        effective_end = min(segment_end_index, thinker_embed.shape[0])
+        embed_slice = thinker_embed[effective_start:effective_end]
+        if embed_slice.shape[0] > 0:
+            assistant_hidden = self.talker.text_projection(embed_slice).to(tts_pad_embed.device)
+        else:
+            assistant_hidden = torch.zeros(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=tts_pad_embed.device, dtype=torch.bfloat16,
+            )
+
+        hidden_size = self.config.talker_config.text_config.hidden_size
+        device = tts_pad_embed.device
+
+        # Pad assistant_hidden to at least 4 tokens if needed.
+        # Expected layout: [3 header tokens] + [1 first text token] + [trailing]
+        # When embed is incomplete (multimodal scheduling), pad with zeros.
+        if assistant_hidden.shape[0] < 4:
+            pad_len = 4 - assistant_hidden.shape[0]
+            assistant_hidden = torch.cat([
+                assistant_hidden,
+                torch.zeros((pad_len, hidden_size), device=device, dtype=torch.bfloat16),
+            ], dim=0)
 
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
         assistant_text_hidden = torch.cat(
@@ -1058,13 +1080,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 assistant_hidden[:3],
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
-                assistant_hidden[3:4]
-                if assistant_hidden.shape[0] > 3
-                else torch.zeros(
-                    (1, assistant_hidden.shape[1]),
-                    device=assistant_hidden.device,
-                    dtype=assistant_hidden.dtype,
-                ),  # First text
+                assistant_hidden[3:4],
             ),
             dim=0,
         )
