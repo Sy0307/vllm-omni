@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.model_runner import (
     get_uniform_token_count,
 )
 
-from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.core.sched.output import OmniCachedRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
@@ -52,7 +52,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
     # ------------------------------------------------------------------
 
     def _handle_async_chunk_updates(self, scheduler_output: SchedulerOutput) -> None:
-        """Re-initialize cached requests whose prompt_token_ids changed.
+        """In-place update cached requests whose prompt_token_ids changed.
 
         In async_chunk mode, the ``ChunkTransferAdapter`` replaces
         ``Request.prompt_token_ids`` with new codec frames for each
@@ -60,14 +60,12 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         propagates the new ``prompt_token_ids`` via
         ``OmniCachedRequestData``.
 
-        Upstream V2 ``update_requests`` only handles block allocation
-        and does **not** replace token state.  This method removes the
-        stale request from ``req_states`` and re-adds it with the
-        updated tokens, mirroring V1's ``_update_request_states``.
-
-        Note: ``finish_requests`` / ``free_states`` (called before us)
-        already handle unscheduled request cleanup, so we only need to
-        process requests with new prompt_token_ids here.
+        Instead of remove + re-add (which involves free_indices churn
+        and redundant model_state init), we update the existing slot
+        in-place.  This is safe for Code2Wav because:
+        - No KV cache / rope state to reinitialize
+        - intermediate_buffer.update merges new info into existing slot
+        - staged writes are applied once at the end
         """
         cached = scheduler_output.scheduled_cached_reqs
         if not cached.req_ids:
@@ -81,67 +79,45 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             return
 
         addl_info = cached.additional_information
+        updated = False
 
-        # Phase 1: remove all stale states, collecting re-add data.
-        updates: list[tuple[str, list[int], Any]] = []
         for req_id in cached.req_ids:
             new_ids = new_prompt_ids.get(req_id)
             if new_ids is None:
                 continue
 
-            if req_id not in self.req_states.req_id_to_index:
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None:
                 continue
 
-            old_index = self.req_states.req_id_to_index[req_id]
+            # In-place update token state — same slot, no remove/re-add.
+            # .np[] = direct write (no GPU buffer); stage_write = GPU-synced.
+            n = len(new_ids)
+            self.req_states.prompt_len.np[req_idx] = n
+            self.req_states.prefill_len.np[req_idx] = n
+            self.req_states.total_len.stage_write_elem(req_idx, n)
+            self.req_states.all_token_ids.stage_write(req_idx, 0, new_ids)
+            self.req_states.num_computed_tokens.stage_write_elem(req_idx, 0)
+            self.req_states.num_computed_prefill_tokens[req_idx] = 0
 
-            self.req_states.remove_request(req_id)
-            self.model_state.remove_request(old_index)
+            # Update intermediate buffer with new additional_information.
+            # Payload may be an AdditionalInformationPayload object
+            # (not a plain dict) when scheduler and worker share the
+            # same serialized representation, so resolve first.
+            info = addl_info.get(req_id)
+            if info is not None:
+                from vllm_omni.worker_v2.model_states.intermediate_buffer import (
+                    _resolve_additional_information,
+                )
 
-            updates.append((req_id, new_ids, addl_info.get(req_id)))
+                resolved = _resolve_additional_information(info)
+                if resolved:
+                    self.model_state.intermediate_buffer.update(req_idx, resolved)
 
-        if not updates:
-            return
+            updated = True
 
-        # Phase 2: re-add all requests with new tokens, then batch-apply.
-        for req_id, new_ids, info in updates:
-            # req_id_to_index is updated eagerly by add_request() (not
-            # staged), so new_index is valid before apply_staged_writes().
-            self.req_states.add_request(
-                req_id=req_id,
-                prompt_len=len(new_ids),
-                all_token_ids=new_ids,
-                num_computed_tokens=0,
-            )
-
-            new_index = self.req_states.req_id_to_index[req_id]
-
-            # Build a synthetic NewRequestData so model_state.add_request
-            # can run _resolve_additional_information and notify plugins.
-            # sampling_params is None because the generation runner does
-            # not sample tokens — Code2Wav output goes directly to
-            # pooler_output.  block_ids is empty because generation
-            # models have no KV cache.
-            synthetic = OmniNewRequestData(
-                req_id=req_id,
-                prompt_token_ids=new_ids,
-                mm_features=None,
-                sampling_params=None,
-                pooling_params=None,
-                block_ids=([],),
-                num_computed_tokens=0,
-                lora_request=None,
-                prefill_token_ids=new_ids,
-                additional_information=info,
-            )
-            # model_state.add_request calls super().add_request()
-            # (DefaultModelState) internally.  This is safe for Code2Wav
-            # because generation models have no attention/rope state to
-            # initialize — the super() call only touches intermediate
-            # buffer and encoder cache, both of which are idempotent
-            # overwrites on the same slot.
-            self.model_state.add_request(new_index, synthetic)
-
-        self.req_states.apply_staged_writes()
+        if updated:
+            self.req_states.apply_staged_writes()
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
@@ -175,8 +151,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             # Handle async_chunk prompt_token_ids replacement for cached
-            # requests BEFORE add/update — so the stale request state is
-            # removed and re-created with the new chunk's tokens.
+            # requests BEFORE add/update — update the existing slot
+            # in-place with the new chunk's tokens.
             self._handle_async_chunk_updates(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)

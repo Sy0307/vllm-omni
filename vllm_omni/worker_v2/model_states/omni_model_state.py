@@ -83,42 +83,63 @@ class OmniModelState(DefaultModelState):
             OmniModelState._rope_patch_lock = threading.Lock()
 
         def _safe_get_rope(model_config: Any, mdl: Any, **kwargs: Any) -> Any:
+            result = None
+            needs_mrope_override = False
             try:
-                return _orig_get_rope(model_config, mdl, **kwargs)
+                result = _orig_get_rope(model_config, mdl, **kwargs)
             except (AssertionError, TypeError):
-                if not model_config.uses_mrope:
-                    return None
-                logger.info(
-                    "Model uses M-RoPE (config) but does not implement SupportsMRoPE; creating RopeState(num_dims=3)."
-                )
-                # Add get_mrope_input_positions if missing.
-                # Returns 3D sequential positions with delta=0
-                # (pure text, no vision token offsets).
-                if not hasattr(mdl, "get_mrope_input_positions"):
+                # Model does not implement SupportsMRoPE — may still
+                # need M-RoPE if config declares mrope_section.
+                needs_mrope_override = model_config.uses_mrope
 
-                    def _default_mrope_positions(
-                        self_model: Any,
-                        input_tokens: list[int],
-                        mm_features: list,
-                    ) -> tuple[torch.Tensor, int]:
-                        """Return 3D sequential positions with zero delta.
+            if result is not None and not needs_mrope_override:
+                # Upstream returned a rope but check dimensionality:
+                # config has mrope_section but upstream returned a 1D
+                # rope (e.g. rope_type="default" with mrope_section).
+                if model_config.uses_mrope and getattr(result, "num_dims", 0) < 3:
+                    logger.info(
+                        "Upstream returned %dD rope but config has mrope_section; "
+                        "overriding with RopeState(num_dims=3).",
+                        getattr(result, "num_dims", 0),
+                    )
+                    needs_mrope_override = True
+                else:
+                    return result
 
-                        For non-vision Omni models (e.g. TTS Talker),
-                        all 3 M-RoPE dimensions use the same sequential
-                        positions.  Delta=0 means decode-step positions
-                        are simply ``num_computed + offset``, identical
-                        to the 1D case but broadcast to 3 dims.
-                        """
-                        n = len(input_tokens)
-                        pos = torch.arange(n, dtype=torch.long)
-                        return pos.unsqueeze(0).expand(3, -1), 0
+            if not needs_mrope_override:
+                return None
 
-                    mdl.get_mrope_input_positions = types.MethodType(_default_mrope_positions, mdl)
-                # has_delta=True is required so init_prefill_positions
-                # calls get_mrope_input_positions (not the XD-RoPE
-                # path).  delta=0 (returned above) means no offset is
-                # applied during decode — positions stay sequential.
-                return RopeState(num_dims=3, has_delta=True, **kwargs)
+            logger.info(
+                "Model uses M-RoPE (config) but does not implement SupportsMRoPE; creating RopeState(num_dims=3)."
+            )
+            # Add get_mrope_input_positions if missing.
+            # Returns 3D sequential positions with delta=0
+            # (pure text, no vision token offsets).
+            if not hasattr(mdl, "get_mrope_input_positions"):
+
+                def _default_mrope_positions(
+                    self_model: Any,
+                    input_tokens: list[int],
+                    mm_features: list,
+                ) -> tuple[torch.Tensor, int]:
+                    """Return 3D sequential positions with zero delta.
+
+                    For non-vision Omni models (e.g. TTS Talker),
+                    all 3 M-RoPE dimensions use the same sequential
+                    positions.  Delta=0 means decode-step positions
+                    are simply ``num_computed + offset``, identical
+                    to the 1D case but broadcast to 3 dims.
+                    """
+                    n = len(input_tokens)
+                    pos = torch.arange(n, dtype=torch.long)
+                    return pos.unsqueeze(0).expand(3, -1), 0
+
+                mdl.get_mrope_input_positions = types.MethodType(_default_mrope_positions, mdl)
+            # has_delta=True is required so init_prefill_positions
+            # calls get_mrope_input_positions (not the XD-RoPE
+            # path).  delta=0 (returned above) means no offset is
+            # applied during decode — positions stay sequential.
+            return RopeState(num_dims=3, has_delta=True, **kwargs)
 
         with OmniModelState._rope_patch_lock:
             _orig_get_rope = _default_mod.get_rope_state

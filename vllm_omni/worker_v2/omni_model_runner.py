@@ -309,6 +309,39 @@ class OmniGPUModelRunner(GPUModelRunner):
         return None
 
     # ------------------------------------------------------------------
+    # Request lifecycle: update intermediate buffer from cached requests
+    # ------------------------------------------------------------------
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Merge updated additional_information into intermediate_buffer.
+
+        In async_chunk mode, chunk_transfer_adapter attaches updated
+        additional_information (e.g. thinker_decode_embeddings) to
+        OmniCachedRequestData for cached requests every schedule step.
+        Upstream GPUModelRunner.update_requests does not handle this
+        field, so we merge it into the intermediate buffer here.
+        """
+        super().update_requests(scheduler_output)
+
+        from vllm_omni.worker_v2.model_states.intermediate_buffer import (
+            _resolve_additional_information,
+        )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        addl_info = getattr(cached, "additional_information", None)
+        if not addl_info:
+            return
+        for req_id, info in addl_info.items():
+            if info is None:
+                continue
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is None:
+                continue
+            resolved = _resolve_additional_information(info)
+            if resolved:
+                self.model_state.intermediate_buffer.update(req_idx, resolved)
+
+    # ------------------------------------------------------------------
     # Request lifecycle: clean up intermediate buffer on finish
     # ------------------------------------------------------------------
 
