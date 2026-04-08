@@ -329,8 +329,15 @@ class FishSpeechFastAR(nn.Module):
             return
         self._compile_attempted = True
         if self._disable_compile_for_graph:
-            self._compiled_model_fwd = self.model.forward
-            logger.info("Fast AR torch.compile disabled (outer CUDA Graph active)")
+            try:
+                self._compiled_model_fwd = torch.compile(
+                    self.model.forward,
+                    dynamic=True,
+                    options={"epilogue_fusion": False},
+                )
+            except Exception as exc:
+                logger.warning("Fast AR torch.compile (graph mode) failed: %s", exc)
+                self._compiled_model_fwd = self.model.forward
             return
         try:
             self._compiled_model_fwd = torch.compile(
@@ -369,10 +376,10 @@ class FishSpeechFastAR(nn.Module):
 
     @torch.inference_mode()
     def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:
-        # Default-on compile only pays off for single-request decode. For
-        # batched decode, eager preserves loaded throughput and avoids the
-        # regression seen with batch>1 compiled execution.
-        model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
+        if self._disable_compile_for_graph:
+            model_fwd = self._compiled_model_fwd or self.model.forward
+        else:
+            model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
         try:
             return model_fwd(step_input, step_pos_ids)
         except Exception as exc:

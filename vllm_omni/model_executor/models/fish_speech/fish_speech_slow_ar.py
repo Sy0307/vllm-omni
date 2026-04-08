@@ -625,9 +625,8 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         # This ensures the Slow AR sees codes from FastAR(hidden_{t-1}).
         inputs_embeds_out = input_embeds.reshape(bsz, -1).clone()
 
-        # torch.where avoids host-device sync (.any()) for CUDA Graph compatibility.
         semantic_mask = (input_ids[:, 0] >= self._semantic_begin_id) & (input_ids[:, 0] <= self._semantic_end_id)
-        semantic_codes = audio_codes.clamp(min=0)
+        semantic_codes = audio_codes.clamp(min=0, max=self._codebook_size - 1)
         offsets = (
             torch.arange(self._num_codebooks, device=dev, dtype=semantic_codes.dtype) * self._codebook_size
         ).unsqueeze(0)

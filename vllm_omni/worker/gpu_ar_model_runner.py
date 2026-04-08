@@ -138,23 +138,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
-    def load_model(self, *args, **kwargs) -> None:
-        super().load_model(*args, **kwargs)
-        from vllm_omni.worker.gpu_model_runner import CUDAGraphWrapper
-
-        if (
-            self.has_talker_mtp
-            and not isinstance(self.talker_mtp, CUDAGraphWrapper)
-            and getattr(self.model, "talker_mtp_graph_safe", False)
-            and self.compilation_config.cudagraph_mode is not None
-            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        ):
-            self.talker_mtp = CUDAGraphWrapper(
-                self.model.talker_mtp,
-                self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
-            )
-
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
@@ -165,16 +148,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         if not self.has_talker_mtp or not isinstance(self.talker_mtp, CUDAGraphWrapper):
             return
-        if not getattr(self.model, "talker_mtp_graph_safe", False):
-            return
 
         from vllm.compilation.monitor import set_cudagraph_capturing_enabled
         from vllm.distributed.parallel_state import graph_capture
 
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
         num_warmups = self.compilation_config.cudagraph_num_of_warmups
-        # Capture largest first so _ensure_buffers pre-allocates for max bsz.
-        # Smaller captures then reuse the same buffer (shape[0] >= bsz).
         capture_sizes = sorted(capture_sizes, reverse=True)
         logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)
 
@@ -217,11 +196,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
         except RuntimeError as e:
             logger.warning("talker_mtp graph capture failed, falling back to eager: %s", e)
             self.talker_mtp = self.model.talker_mtp
-            # Re-enable torch.compile since we're back to eager
             fast_ar = getattr(self.model, "fast_ar", None)
             if fast_ar is not None:
                 fast_ar._disable_compile_for_graph = False
                 fast_ar._compile_attempted = False
+                fast_ar._compiled_model_fwd = None
         finally:
             set_cudagraph_capturing_enabled(False)
 
