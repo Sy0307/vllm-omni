@@ -195,8 +195,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
         except RuntimeError as e:
             raise RuntimeError(
-                f"talker_mtp graph capture failed for a model that declared "
-                f"talker_mtp_graph_safe=True: {e}"
+                f"talker_mtp graph capture failed for a model that declared talker_mtp_graph_safe=True: {e}"
             ) from e
         finally:
             set_cudagraph_capturing_enabled(False)
