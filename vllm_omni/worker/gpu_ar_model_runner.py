@@ -195,7 +195,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
         except RuntimeError as e:
             logger.warning("talker_mtp graph capture failed, falling back to eager: %s", e)
-            self.talker_mtp = self.model.talker_mtp
+            self.talker_mtp = self.talker_mtp.unwrap()
             fast_ar = getattr(self.model, "fast_ar", None)
             if fast_ar is not None:
                 fast_ar._disable_compile_for_graph = False
