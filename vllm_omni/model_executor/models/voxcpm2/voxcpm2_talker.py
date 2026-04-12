@@ -28,8 +28,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
 
 logger = init_logger(__name__)
@@ -114,7 +115,7 @@ class _PerfTimer:
         ]
         for name in sorted(self._timers):
             t, c = self._timers[name], self._counts[name]
-            lines.append(f"{name:<30} | {t:>10.2f} | {t/total*100:>5.1f}% | {c:>5} | {t/c:>8.3f}")
+            lines.append(f"{name:<30} | {t:>10.2f} | {t / total * 100:>5.1f}% | {c:>5} | {t / c:>8.3f}")
         lines.append(f"{'TOTAL':<30} | {total:>10.2f} |")
         return "\n".join(lines)
 
@@ -131,9 +132,15 @@ class _PerfTimer:
 
 
 class _CFMBufferManager:
-    def __init__(self, device: torch.device, dtype: torch.dtype,
-                 feat_dim: int, patch_size: int, dit_hidden_size: int,
-                 sway_sampling_coef: float = 1.0):
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        feat_dim: int,
+        patch_size: int,
+        dit_hidden_size: int,
+        sway_sampling_coef: float = 1.0,
+    ):
         self.x_in = torch.zeros(2, feat_dim, patch_size, device=device, dtype=dtype)
         self.mu_in = torch.zeros(2, dit_hidden_size, device=device, dtype=dtype)
         self.t_in = torch.zeros(2, device=device, dtype=dtype)
@@ -154,10 +161,16 @@ class _CFMBufferManager:
 
 
 def _optimized_solve_euler(
-    cfm_module: nn.Module, mu: torch.Tensor, patch_size: int,
-    cond: torch.Tensor, n_timesteps: int, cfg_value: float,
-    buffers: _CFMBufferManager, use_cfg_zero_star: bool = True,
-    cfg_cutoff_ratio: float = 1.0, perf: _PerfTimer | None = None,
+    cfm_module: nn.Module,
+    mu: torch.Tensor,
+    patch_size: int,
+    cond: torch.Tensor,
+    n_timesteps: int,
+    cfg_value: float,
+    buffers: _CFMBufferManager,
+    use_cfg_zero_star: bool = True,
+    cfg_cutoff_ratio: float = 1.0,
+    perf: _PerfTimer | None = None,
 ) -> torch.Tensor:
     estimator = cfm_module.estimator
     mean_mode = getattr(cfm_module, "mean_mode", False)
@@ -176,30 +189,36 @@ def _optimized_solve_euler(
             dphi_dt = torch.zeros_like(x)
         elif step <= cfg_cutoff_step:
             buffers.x_in[:b].copy_(x)
-            buffers.x_in[b:2*b].copy_(x)
+            buffers.x_in[b : 2 * b].copy_(x)
             buffers.mu_in[:b].copy_(mu)
-            buffers.mu_in[b:2*b].zero_()
+            buffers.mu_in[b : 2 * b].zero_()
             buffers.t_in[:b].fill_(t.item())
-            buffers.t_in[b:2*b].fill_(t.item())
+            buffers.t_in[b : 2 * b].fill_(t.item())
             if mean_mode:
                 buffers.dt_in[:b].fill_(dt.item())
-                buffers.dt_in[b:2*b].fill_(dt.item())
+                buffers.dt_in[b : 2 * b].fill_(dt.item())
             else:
                 buffers.dt_in.zero_()
             buffers.cond_in[:b].copy_(cond[:b])
-            buffers.cond_in[b:2*b].copy_(cond[:b])
+            buffers.cond_in[b : 2 * b].copy_(cond[:b])
 
-            if perf: perf.start("  cfm.estimator_cfg")
-            raw_out = estimator(buffers.x_in[:2*b], buffers.mu_in[:2*b],
-                                buffers.t_in[:2*b], buffers.cond_in[:2*b], buffers.dt_in[:2*b])
-            if perf: perf.stop("  cfm.estimator_cfg")
+            if perf:
+                perf.start("  cfm.estimator_cfg")
+            raw_out = estimator(
+                buffers.x_in[: 2 * b],
+                buffers.mu_in[: 2 * b],
+                buffers.t_in[: 2 * b],
+                buffers.cond_in[: 2 * b],
+                buffers.dt_in[: 2 * b],
+            )
+            if perf:
+                perf.stop("  cfm.estimator_cfg")
 
-            dphi_dt, cfg_dphi_dt = raw_out[:b], raw_out[b:2*b]
+            dphi_dt, cfg_dphi_dt = raw_out[:b], raw_out[b : 2 * b]
             if use_cfg_zero_star:
                 pos = dphi_dt.reshape(b, -1)
                 neg = cfg_dphi_dt.reshape(b, -1)
-                st = (torch.sum(pos * neg, 1, keepdim=True) /
-                      (torch.sum(neg**2, 1, keepdim=True) + 1e-8))
+                st = torch.sum(pos * neg, 1, keepdim=True) / (torch.sum(neg**2, 1, keepdim=True) + 1e-8)
                 st = st.view(b, *([1] * (len(dphi_dt.shape) - 1)))
             else:
                 st = 1.0
@@ -208,12 +227,18 @@ def _optimized_solve_euler(
             buffers.x_in[:b].copy_(x)
             buffers.mu_in[:b].copy_(mu)
             buffers.t_in[:b].fill_(t.item())
-            buffers.dt_in[:b].fill_(dt.item()) if mean_mode else buffers.dt_in[:b].zero_()
+            if mean_mode:
+                buffers.dt_in[:b].fill_(dt.item())
+            else:
+                buffers.dt_in[:b].zero_()
             buffers.cond_in[:b].copy_(cond[:b])
-            if perf: perf.start("  cfm.estimator_nocfg")
-            dphi_dt = estimator(buffers.x_in[:b], buffers.mu_in[:b],
-                                buffers.t_in[:b], buffers.cond_in[:b], buffers.dt_in[:b])
-            if perf: perf.stop("  cfm.estimator_nocfg")
+            if perf:
+                perf.start("  cfm.estimator_nocfg")
+            dphi_dt = estimator(
+                buffers.x_in[:b], buffers.mu_in[:b], buffers.t_in[:b], buffers.cond_in[:b], buffers.dt_in[:b]
+            )
+            if perf:
+                perf.stop("  cfm.estimator_nocfg")
 
         x = x - dt * dphi_dt
         t = t - dt
@@ -228,7 +253,6 @@ def _optimized_solve_euler(
 
 
 class VoxCPM2TalkerForConditionalGeneration(nn.Module):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -239,10 +263,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = True
 
         self.model = MiniCPM4PagedForVoxCPM2(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"),
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
         )
         self.residual_model = MiniCPM4PagedResidualLM(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "residual_model"),
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "residual_model"),
         )
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
@@ -305,8 +331,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         tts = self.tts
         dit_hidden = tts.lm_to_dit_proj.out_features + tts.res_to_dit_proj.out_features
         self._cfm_buffers = _CFMBufferManager(
-            device=torch.device(self._device), dtype=self._side_dtype,
-            feat_dim=self._feat_dim, patch_size=self._patch_size,
+            device=torch.device(self._device),
+            dtype=self._side_dtype,
+            feat_dim=self._feat_dim,
+            patch_size=self._patch_size,
             dit_hidden_size=dit_hidden,
         )
 
@@ -411,8 +439,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         for req_id, is_prefill, req_embeds in self._pending_requests:
             state = self._switch_to_request(req_id)
             n = req_embeds.shape[0] if req_embeds is not None else 1
-            req_hidden = scaffold_hidden[token_offset:token_offset + n]
-            req_pos = positions[token_offset:token_offset + n]
+            req_hidden = scaffold_hidden[token_offset : token_offset + n]
+            req_pos = positions[token_offset : token_offset + n]
 
             if is_prefill:
                 res_input, meta = self._prepare_residual_prefill(state, req_hidden, dev)
@@ -439,7 +467,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             offset = 0
             for idx, (state, is_prefill, meta) in enumerate(req_metas):
                 n = residual_inputs[idx].shape[0]
-                res_out = batch_out[offset:offset + n]
+                res_out = batch_out[offset : offset + n]
                 offset += n
 
                 if is_prefill:
@@ -463,15 +491,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         enc_out = base_lm_out.unsqueeze(0)
         prefix_feat_cond = (
-            feat[:, -1, ...] if feat.shape[1] > 0
+            feat[:, -1, ...]
+            if feat.shape[1] > 0
             else torch.zeros(1, self._patch_size, self._feat_dim, device=dev, dtype=self._side_dtype)
         )
         enc_outputs = tts.fsq_layer(enc_out) * feat_mask.unsqueeze(-1) + enc_out * text_mask.unsqueeze(-1)
         lm_hidden = enc_outputs[:, -1, :]
 
-        residual_input = tts.fusion_concat_proj(
-            torch.cat([enc_outputs, feat_mask.unsqueeze(-1) * feat_embed], dim=-1)
-        )
+        residual_input = tts.fusion_concat_proj(torch.cat([enc_outputs, feat_mask.unsqueeze(-1) * feat_embed], dim=-1))
         meta = {"lm_hidden": lm_hidden, "prefix_feat_cond": prefix_feat_cond}
         return residual_input.squeeze(0), meta
 
@@ -497,13 +524,22 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _run_cfm(self, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         if self._cfm_buffers is not None:
             return _optimized_solve_euler(
-                self.tts.feat_decoder, dit_h, self._patch_size, cond,
-                self._inference_timesteps, self._cfg_value, self._cfm_buffers,
-                cfg_cutoff_ratio=self._cfg_cutoff_ratio, perf=self._perf,
+                self.tts.feat_decoder,
+                dit_h,
+                self._patch_size,
+                cond,
+                self._inference_timesteps,
+                self._cfg_value,
+                self._cfm_buffers,
+                cfg_cutoff_ratio=self._cfg_cutoff_ratio,
+                perf=self._perf,
             ).transpose(1, 2)
         return self.tts.feat_decoder(
-            mu=dit_h, patch_size=self._patch_size, cond=cond,
-            n_timesteps=self._inference_timesteps, cfg_value=self._cfg_value,
+            mu=dit_h,
+            patch_size=self._patch_size,
+            cond=cond,
+            n_timesteps=self._inference_timesteps,
+            cfg_value=self._cfg_value,
         ).transpose(1, 2)
 
     def _finish_prefill(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
@@ -590,16 +626,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- compute_logits --------------------
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput,
-                       sampling_metadata: Any = None) -> torch.Tensor | None:
+    def compute_logits(
+        self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
+    ) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
 
         bsz = hidden_states.shape[0]
-        logits = torch.full((bsz, self.config.vocab_size), float("-inf"),
-                            device=hidden_states.device, dtype=hidden_states.dtype)
+        logits = torch.full(
+            (bsz, self.config.vocab_size), float("-inf"), device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
         if self._results_queue:
             for i, (req_id, stop_logits) in enumerate(self._results_queue):
@@ -644,8 +682,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- preprocess / postprocess --------------------
 
-    def preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None,
-                   **info_dict: Any) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    def preprocess(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info_dict: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         additional = info_dict.get("additional_information")
         if isinstance(additional, dict):
             merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
@@ -664,8 +703,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             pending_ids.add(req_id)
             if self._current_request_id:
                 pending_ids.add(self._current_request_id)
-            for rid in [r for r, s in self._active_states.items()
-                        if r not in pending_ids and s.prefill_completed]:
+            for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
                 self._cleanup_request(rid)
 
             ids = input_ids.tolist()
@@ -701,7 +739,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if ref_audio or (prompt_audio and prompt_text):
                 try:
                     state.prompt_cache = self.tts.build_prompt_cache(
-                        prompt_text=prompt_text, prompt_wav_path=prompt_audio,
+                        prompt_text=prompt_text,
+                        prompt_wav_path=prompt_audio,
                         reference_wav_path=ref_audio,
                     )
                 except Exception as e:
@@ -717,8 +756,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         else:
             state = self._active_states.get(req_id)
             curr = state.curr_embed_for_next if state else None
-            embeds = curr.to(dev, dtype=self._side_dtype).reshape(1, -1) if curr is not None \
+            embeds = (
+                curr.to(dev, dtype=self._side_dtype).reshape(1, -1)
+                if curr is not None
                 else torch.zeros(1, self.config.hidden_size, device=dev, dtype=self._side_dtype)
+            )
 
         self._pending_requests.append((req_id, is_prefill, embeds))
         return input_ids, embeds, {}
@@ -728,9 +770,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if _ENABLE_PROFILING:
             state = self._active_states.get(req_id)
             if state and state.decode_step_count > 0:
-                logger.info("REQUEST DONE[%s]: %d steps, %.2fs\n%s",
-                            req_id, state.decode_step_count,
-                            time.perf_counter() - state.request_start_time, self._perf.breakdown())
+                logger.info(
+                    "REQUEST DONE[%s]: %d steps, %.2fs\n%s",
+                    req_id,
+                    state.decode_step_count,
+                    time.perf_counter() - state.request_start_time,
+                    self._perf.breakdown(),
+                )
         return {}
 
     # -------------------- build prefill inputs --------------------
@@ -743,7 +789,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         cache = state.prompt_cache if state else None
         mode = cache.get("mode", "continuation") if cache else "zero_shot"
 
-        full_text = (cache.get("prompt_text", "") + text) if cache and mode in ("continuation", "ref_continuation") else text
+        if cache and mode in ("continuation", "ref_continuation"):
+            full_text = cache.get("prompt_text", "") + text
+        else:
+            full_text = text
 
         text_token = torch.LongTensor(tts.text_tokenizer(full_text))
         text_token = torch.cat([text_token, torch.tensor([tts.audio_start_token], dtype=torch.int32)], dim=-1)
@@ -772,8 +821,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             rt, rf, rtm, ram = tts._make_ref_prefix(ref, text_token.device)
             text_token = torch.cat([rt.cpu(), text_token, torch.zeros(p_len, dtype=torch.int32)])
             audio_feat = torch.cat([rf.cpu(), torch.zeros((text_len, ps, latent_dim), dtype=torch.float32), prompt])
-            text_mask = torch.cat([rtm.cpu(), torch.ones(text_len, dtype=torch.int32), torch.zeros(p_len, dtype=torch.int32)])
-            audio_mask = torch.cat([ram.cpu(), torch.zeros(text_len, dtype=torch.int32), torch.ones(p_len, dtype=torch.int32)])
+            ones_t = torch.ones(text_len, dtype=torch.int32)
+            zeros_p = torch.zeros(p_len, dtype=torch.int32)
+            zeros_t = torch.zeros(text_len, dtype=torch.int32)
+            ones_p = torch.ones(p_len, dtype=torch.int32)
+            text_mask = torch.cat([rtm.cpu(), ones_t, zeros_p])
+            audio_mask = torch.cat([ram.cpu(), zeros_t, ones_p])
 
         return {
             "text_token": text_token.unsqueeze(0).to(dev),
@@ -816,5 +869,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._tts.residual_lm = None
         torch.cuda.empty_cache()
 
-        logger.info("Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype)
+        logger.info(
+            "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype
+        )
         return loaded

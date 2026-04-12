@@ -9,8 +9,8 @@ import os
 import time
 from pathlib import Path
 
-import torch
 import soundfile as sf
+import torch
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
@@ -63,7 +63,7 @@ def benchmark_single(engine, text: str, warmup: bool = False) -> dict:
     duration = audio.numel() / SAMPLE_RATE
     rtf = elapsed / duration if duration > 0 else float("inf")
 
-    peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
+    peak_mem = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
 
     return {
         "text_len": len(text),
@@ -84,8 +84,11 @@ def main():
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--output-dir", type=str, default="benchmark_output")
     parser.add_argument("--profile", action="store_true", help="Enable torch profiler")
-    parser.add_argument("--deep-profile", action="store_true",
-                        help="Enable VOXCPM2_PROFILE=1 for sub-component breakdown (deferred-sync)")
+    parser.add_argument(
+        "--deep-profile",
+        action="store_true",
+        help="Enable VOXCPM2_PROFILE=1 for sub-component breakdown (deferred-sync)",
+    )
     args = parser.parse_args()
 
     if args.deep_profile:
@@ -102,19 +105,19 @@ def main():
     texts = TEST_TEXTS if args.text_length == "all" else {args.text_length: TEST_TEXTS[args.text_length]}
 
     for text_name, text in texts.items():
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Testing: {text_name} ({len(text)} chars)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Warmup
         for i in range(args.warmup_runs):
-            print(f"  Warmup {i+1}/{args.warmup_runs}...")
+            print(f"  Warmup {i + 1}/{args.warmup_runs}...")
             benchmark_single(engine, text, warmup=True)
 
         # Benchmark runs
         results = []
         for i in range(args.num_runs):
-            print(f"  Run {i+1}/{args.num_runs}...", end=" ")
+            print(f"  Run {i + 1}/{args.num_runs}...", end=" ")
             result = benchmark_single(engine, text)
             results.append(result)
             print(f"RTF={result['rtf']:.4f} ({result['inference_time']:.2f}s / {result['audio_duration']:.2f}s)")
@@ -128,16 +131,16 @@ def main():
         times = [r["inference_time"] for r in results]
         durations = [r["audio_duration"] for r in results]
         print(f"\n  Summary ({text_name}):")
-        print(f"    RTF:      {min(rtfs):.4f} (best) / {sum(rtfs)/len(rtfs):.4f} (avg)")
-        print(f"    Latency:  {min(times):.3f}s (best) / {sum(times)/len(times):.3f}s (avg)")
+        print(f"    RTF:      {min(rtfs):.4f} (best) / {sum(rtfs) / len(rtfs):.4f} (avg)")
+        print(f"    Latency:  {min(times):.3f}s (best) / {sum(times) / len(times):.3f}s (avg)")
         print(f"    Duration: {durations[0]:.2f}s")
         print(f"    GPU Mem:  {results[-1]['peak_gpu_mem_gb']:.2f} GB")
 
     # Run torch profiler if requested
     if args.profile:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Running torch profiler...")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         text = TEST_TEXTS["medium"]
 
         with torch.profiler.profile(
@@ -160,9 +163,9 @@ def main():
         print(f"Trace saved to: {trace_path}")
 
     if args.deep_profile:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("Deep profile results (sub-component breakdown)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print("Note: VOXCPM2_PROFILE=1 was set. The per-step breakdown is logged")
         print("by the model every 20 steps. Check the engine logs above for the")
         print("detailed breakdown table. The final request summary is logged")

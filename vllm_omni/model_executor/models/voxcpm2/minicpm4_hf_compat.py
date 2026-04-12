@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ===================================================================
 #  Primitives
 # ===================================================================
@@ -42,8 +41,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor,
-    cos: torch.Tensor, sin: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary embeddings in float32."""
     orig_dtype = q.dtype
@@ -62,9 +63,13 @@ class _MiniCPMLongRoPE(nn.Module):
     """LongRoPE matching native computation order."""
 
     def __init__(
-        self, hidden_size: int, num_attention_heads: int,
-        kv_channels: int | None, rope_theta: float,
-        max_position_embeddings: int, rope_scaling: dict[str, Any],
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        kv_channels: int | None,
+        rope_theta: float,
+        max_position_embeddings: int,
+        rope_scaling: dict[str, Any],
     ) -> None:
         super().__init__()
         self.dim = kv_channels if kv_channels else hidden_size // num_attention_heads
@@ -75,9 +80,7 @@ class _MiniCPMLongRoPE(nn.Module):
         self.original_max_position_embeddings = rope_scaling["original_max_position_embeddings"]
 
         scale = self.max_position_embeddings / self.original_max_position_embeddings
-        self.scaling_factor = math.sqrt(
-            1 + math.log(scale) / math.log(self.original_max_position_embeddings)
-        )
+        self.scaling_factor = math.sqrt(1 + math.log(scale) / math.log(self.original_max_position_embeddings))
 
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -93,7 +96,8 @@ class _MiniCPMLongRoPE(nn.Module):
 
         ext_factors = torch.tensor(
             self.long_factor if seq_len > self.original_max_position_embeddings else self.short_factor,
-            dtype=torch.float32, device=device,
+            dtype=torch.float32,
+            device=device,
         )
 
         freqs = torch.mul(

@@ -23,9 +23,9 @@ from vllm.model_executor.models.utils import make_empty_intermediate_tensors_fac
 from vllm.sequence import IntermediateTensors
 
 from .minicpm4_hf_compat import (
+    _apply_rotary_pos_emb,
     _MiniCPMLongRoPE,
     _MiniCPMMLP,
-    _apply_rotary_pos_emb,
 )
 
 logger = init_logger(__name__)
@@ -53,9 +53,7 @@ class _PagedMiniCPM4Attention(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
-        self.head_dim = (
-            kv_channels if kv_channels else hidden_size // num_attention_heads
-        )
+        self.head_dim = kv_channels if kv_channels else hidden_size // num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -71,7 +69,7 @@ class _PagedMiniCPM4Attention(nn.Module):
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
-            scale=self.head_dim ** -0.5,
+            scale=self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             prefix=f"{prefix}.attn",
@@ -86,9 +84,14 @@ class _PagedMiniCPM4Attention(nn.Module):
         """Forward: fused QKV → fp32 RoPE → PagedAttention → o_proj."""
         # Fused QKV: lazy-concat, cached after first forward
         if self._fused_qkv_weight is None:
-            self._fused_qkv_weight = torch.cat([
-                self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
-            ], dim=0).detach()  # detach to avoid grad tracking on the concat
+            self._fused_qkv_weight = torch.cat(
+                [
+                    self.q_proj.weight,
+                    self.k_proj.weight,
+                    self.v_proj.weight,
+                ],
+                dim=0,
+            ).detach()  # detach to avoid grad tracking on the concat
         qkv = nn.functional.linear(hidden_states, self._fused_qkv_weight)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -211,6 +214,7 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
             # Dict → namespace for attribute access
             class _Cfg:
                 pass
+
             c = _Cfg()
             for k, v in lm_cfg.items():
                 setattr(c, k, v)
@@ -249,23 +253,25 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
         else:
             self.rope_emb = None
 
-        self.layers = nn.ModuleList([
-            _PagedMiniCPM4DecoderLayer(
-                hidden_size=hidden_size,
-                intermediate_size=lm_cfg.intermediate_size,
-                num_attention_heads=lm_cfg.num_attention_heads,
-                num_key_value_heads=lm_cfg.num_key_value_heads,
-                kv_channels=kv_channels,
-                rms_norm_eps=lm_cfg.rms_norm_eps,
-                layer_idx=i,
-                num_hidden_layers=num_hidden_layers,
-                use_mup=getattr(lm_cfg, "use_mup", False),
-                scale_depth=getattr(lm_cfg, "scale_depth", 1.0),
-                cache_config=cache_config,
-                prefix=f"{prefix}.layers.{i}",
-            )
-            for i in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                _PagedMiniCPM4DecoderLayer(
+                    hidden_size=hidden_size,
+                    intermediate_size=lm_cfg.intermediate_size,
+                    num_attention_heads=lm_cfg.num_attention_heads,
+                    num_key_value_heads=lm_cfg.num_key_value_heads,
+                    kv_channels=kv_channels,
+                    rms_norm_eps=lm_cfg.rms_norm_eps,
+                    layer_idx=i,
+                    num_hidden_layers=num_hidden_layers,
+                    use_mup=getattr(lm_cfg, "use_mup", False),
+                    scale_depth=getattr(lm_cfg, "scale_depth", 1.0),
+                    cache_config=cache_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
+                for i in range(num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(hidden_size, eps=lm_cfg.rms_norm_eps)
 
@@ -295,7 +301,10 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions, hidden_states, residual, self.rope_emb,
+                positions,
+                hidden_states,
+                residual,
+                self.rope_emb,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -309,10 +318,14 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
                 continue
             try:
                 layer.mlp = torch.compile(
-                    layer.mlp, mode="default", fullgraph=True,
+                    layer.mlp,
+                    mode="default",
+                    fullgraph=True,
                 )
                 layer.self_attn.o_proj = torch.compile(
-                    layer.self_attn.o_proj, mode="default", fullgraph=True,
+                    layer.self_attn.o_proj,
+                    mode="default",
+                    fullgraph=True,
                 )
                 # Invalidate fused QKV cache
                 layer.self_attn._fused_qkv_weight = None
@@ -359,8 +372,10 @@ class MiniCPM4PagedResidualLM(nn.Module):
 
         lm_cfg = getattr(config, "lm_config", config)
         if isinstance(lm_cfg, dict):
+
             class _Cfg:
                 pass
+
             c = _Cfg()
             for k, v in lm_cfg.items():
                 setattr(c, k, v)
@@ -373,23 +388,25 @@ class MiniCPM4PagedResidualLM(nn.Module):
         # No RoPE for residual LM
         self.rope_emb = None
 
-        self.layers = nn.ModuleList([
-            _PagedMiniCPM4DecoderLayer(
-                hidden_size=hidden_size,
-                intermediate_size=lm_cfg.intermediate_size,
-                num_attention_heads=lm_cfg.num_attention_heads,
-                num_key_value_heads=lm_cfg.num_key_value_heads,
-                kv_channels=kv_channels,
-                rms_norm_eps=lm_cfg.rms_norm_eps,
-                layer_idx=i,
-                num_hidden_layers=num_hidden_layers,
-                use_mup=getattr(lm_cfg, "use_mup", False),
-                scale_depth=getattr(lm_cfg, "scale_depth", 1.0),
-                cache_config=cache_config,
-                prefix=f"{prefix}.layers.{i}",
-            )
-            for i in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                _PagedMiniCPM4DecoderLayer(
+                    hidden_size=hidden_size,
+                    intermediate_size=lm_cfg.intermediate_size,
+                    num_attention_heads=lm_cfg.num_attention_heads,
+                    num_key_value_heads=lm_cfg.num_key_value_heads,
+                    kv_channels=kv_channels,
+                    rms_norm_eps=lm_cfg.rms_norm_eps,
+                    layer_idx=i,
+                    num_hidden_layers=num_hidden_layers,
+                    use_mup=getattr(lm_cfg, "use_mup", False),
+                    scale_depth=getattr(lm_cfg, "scale_depth", 1.0),
+                    cache_config=cache_config,
+                    prefix=f"{prefix}.layers.{i}",
+                )
+                for i in range(num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(hidden_size, eps=lm_cfg.rms_norm_eps)
         self._compiled_layers: set[int] = set()
@@ -403,7 +420,10 @@ class MiniCPM4PagedResidualLM(nn.Module):
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions, hidden_states, residual, self.rope_emb,
+                positions,
+                hidden_states,
+                residual,
+                self.rope_emb,
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states
