@@ -70,7 +70,17 @@ class Omni(OmniBase):
         try:
             if py_generator:
                 return self._run_generation_with_generator(prompts, sampling_params_list, use_tqdm)
-            return list(self._run_generation(prompts, sampling_params_list, use_tqdm))
+            # Collect outputs and sort by submission order.
+            # _run_generation yields in completion order, but callers expect
+            # outputs[i] to correspond to prompts[i].
+            # request_id format is "{index}_{uuid}", extract the numeric prefix.
+            results = list(self._run_generation(prompts, sampling_params_list, use_tqdm))
+            if len(results) > 1:
+                try:
+                    results.sort(key=lambda r: int(r.request_id.split("_", 1)[0]))
+                except (ValueError, IndexError):
+                    pass  # Non-standard request_id format; return in completion order
+            return results
         except Exception as e:
             logger.exception("[Omni] Failed to run generation: %s", e)
             self.close()
