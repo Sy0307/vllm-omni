@@ -16,6 +16,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import librosa
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -36,6 +37,40 @@ from .voxcpm2_import_utils import import_voxcpm2_core
 logger = init_logger(__name__)
 
 _ENABLE_PROFILING = os.environ.get("VOXCPM2_PROFILE", "0") == "1"
+
+
+def _encode_raw_audio(
+    tts: nn.Module,
+    samples: list[float] | torch.Tensor,
+    sr: int,
+    padding_mode: str = "right",
+) -> torch.Tensor:
+    """Encode raw audio samples using the native VoxCPM2 AudioVAE.
+
+    Mirrors ``VoxCPM2Model._encode_wav`` but accepts in-memory samples
+    instead of a file path (needed for the OpenAI speech API).
+    """
+    if isinstance(samples, list):
+        audio = torch.tensor(samples, dtype=torch.float32)
+    else:
+        audio = samples.float()
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+
+    encode_sr = tts._encode_sample_rate
+    if sr != encode_sr:
+        audio_np = audio.squeeze(0).numpy()
+        audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=encode_sr)
+        audio = torch.from_numpy(audio_np).unsqueeze(0)
+
+    patch_len = tts.patch_size * tts.chunk_size
+    if audio.size(1) % patch_len != 0:
+        padding_size = patch_len - audio.size(1) % patch_len
+        pad = (padding_size, 0) if padding_mode == "left" else (0, padding_size)
+        audio = torch.nn.functional.pad(audio, pad)
+
+    feat = tts.audio_vae.encode(audio.to(tts.device), encode_sr).cpu()
+    return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 
 # ===================================================================
@@ -139,14 +174,16 @@ class _CFMBufferManager:
         feat_dim: int,
         patch_size: int,
         dit_hidden_size: int,
+        max_batch_size: int = 1,
         sway_sampling_coef: float = 1.0,
     ):
-        self.x_in = torch.zeros(2, feat_dim, patch_size, device=device, dtype=dtype)
-        self.mu_in = torch.zeros(2, dit_hidden_size, device=device, dtype=dtype)
-        self.t_in = torch.zeros(2, device=device, dtype=dtype)
-        self.dt_in = torch.zeros(2, device=device, dtype=dtype)
-        self.cond_in = torch.zeros(2, feat_dim, patch_size, device=device, dtype=dtype)
-        self.noise = torch.zeros(1, feat_dim, patch_size, device=device, dtype=dtype)
+        n = 2 * max_batch_size  # CFG doubles the batch
+        self.x_in = torch.zeros(n, feat_dim, patch_size, device=device, dtype=dtype)
+        self.mu_in = torch.zeros(n, dit_hidden_size, device=device, dtype=dtype)
+        self.t_in = torch.zeros(n, device=device, dtype=dtype)
+        self.dt_in = torch.zeros(n, device=device, dtype=dtype)
+        self.cond_in = torch.zeros(n, feat_dim, patch_size, device=device, dtype=dtype)
+        self.noise = torch.zeros(max_batch_size, feat_dim, patch_size, device=device, dtype=dtype)
         self._sway_coef = sway_sampling_coef
         self._device = device
         self._dtype = dtype
@@ -287,13 +324,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._enable_torch_compile = True
         self._compile_vae = True
         self._max_decode_steps = 2000
+        self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
 
         self._perf = _PerfTimer(enabled=_ENABLE_PROFILING)
         self._cfm_buffers: _CFMBufferManager | None = None
 
         self._active_states: dict[str, _RequestState] = {}
         self._current_request_id: str | None = None
-        self._pending_requests: list[tuple[str, bool, torch.Tensor | None]] = []
+        self._pending_requests: list[tuple[str, bool, torch.Tensor | None, int]] = []
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, Any]] = []
 
@@ -323,6 +361,61 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         for req_id in finished_req_ids:
             self._cleanup_request(req_id)
 
+    def _build_prompt_cache(
+        self,
+        ref_audio: Any = None,
+        prompt_audio: Any = None,
+        prompt_text: str | None = None,
+    ) -> dict | None:
+        """Build prompt cache, handling both file paths and raw audio data.
+
+        The OpenAI speech API sends decoded audio as [samples_list, sr]
+        via ``_resolve_ref_audio``, while offline usage sends file paths.
+        """
+        tts = self.tts
+
+        def _is_raw_audio(v: Any) -> bool:
+            return (
+                isinstance(v, (list, tuple))
+                and len(v) == 2
+                and isinstance(v[1], int)
+                and isinstance(v[0], (list, torch.Tensor))
+            )
+
+        if not _is_raw_audio(ref_audio) and not _is_raw_audio(prompt_audio):
+            return tts.build_prompt_cache(
+                prompt_text=prompt_text,
+                prompt_wav_path=prompt_audio,
+                reference_wav_path=ref_audio,
+            )
+
+        cache: dict[str, Any] = {}
+        if ref_audio is not None:
+            if _is_raw_audio(ref_audio):
+                samples, sr = ref_audio
+                cache["ref_audio_feat"] = _encode_raw_audio(tts, samples, sr)
+            else:
+                cache["ref_audio_feat"] = tts._encode_wav(ref_audio, padding_mode="right")
+
+        if prompt_audio is not None and prompt_text is not None:
+            cache["prompt_text"] = prompt_text
+            if _is_raw_audio(prompt_audio):
+                samples, sr = prompt_audio
+                cache["audio_feat"] = _encode_raw_audio(tts, samples, sr, padding_mode="left")
+            else:
+                cache["audio_feat"] = tts._encode_wav(prompt_audio, padding_mode="left")
+
+        has_ref = "ref_audio_feat" in cache
+        has_prompt = "audio_feat" in cache
+        if has_ref and has_prompt:
+            cache["mode"] = "ref_continuation"
+        elif has_ref:
+            cache["mode"] = "reference"
+        else:
+            cache["mode"] = "continuation"
+
+        return cache
+
     # -------------------- compile setup --------------------
 
     def _setup_cfm_buffers(self) -> None:
@@ -336,6 +429,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             feat_dim=self._feat_dim,
             patch_size=self._patch_size,
             dit_hidden_size=dit_hidden,
+            max_batch_size=self._max_batch_size,
         )
 
     def _setup_torch_compile(self) -> None:
@@ -436,9 +530,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         residual_positions: list[torch.Tensor] = []
         req_metas: list[tuple] = []
 
-        for req_id, is_prefill, req_embeds in self._pending_requests:
+        for req_id, is_prefill, _req_embeds, n in self._pending_requests:
             state = self._switch_to_request(req_id)
-            n = req_embeds.shape[0] if req_embeds is not None else 1
             req_hidden = scaffold_hidden[token_offset : token_offset + n]
             req_pos = positions[token_offset : token_offset + n]
 
@@ -489,7 +582,21 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         text_mask, feat_mask, feat, feat_embed = state.prefill_masks
         state.prefill_masks = None
 
-        enc_out = base_lm_out.unsqueeze(0)
+        tts_len = text_mask.shape[1]
+        scaffold_len = base_lm_out.shape[0]
+
+        if scaffold_len < tts_len:
+            # Voice clone / continuation: scaffold only processed vllm tokens.
+            # Pad to match TTS sequence length (extra positions are masked out).
+            pad = torch.zeros(
+                tts_len - scaffold_len,
+                base_lm_out.shape[-1],
+                device=base_lm_out.device,
+                dtype=base_lm_out.dtype,
+            )
+            enc_out = torch.cat([base_lm_out, pad], dim=0).unsqueeze(0)
+        else:
+            enc_out = base_lm_out.unsqueeze(0)
 
         prefix_feat_cond = (
             feat[:, -1, ...]
@@ -699,7 +806,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         if is_prefill:
             # Evict stale states
-            pending_ids = {rid for rid, _, _ in self._pending_requests}
+            pending_ids = {rid for rid, *_ in self._pending_requests}
             pending_ids.add(req_id)
             if self._current_request_id:
                 pending_ids.add(self._current_request_id)
@@ -738,10 +845,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.prompt_cache = None
             if ref_audio or (prompt_audio and prompt_text):
                 try:
-                    state.prompt_cache = self.tts.build_prompt_cache(
+                    state.prompt_cache = self._build_prompt_cache(
+                        ref_audio=ref_audio,
+                        prompt_audio=prompt_audio,
                         prompt_text=prompt_text,
-                        prompt_wav_path=prompt_audio,
-                        reference_wav_path=ref_audio,
                     )
                 except Exception as e:
                     logger.warning("build_prompt_cache failed: %s", e)
@@ -755,14 +862,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.prefill_masks = (text_mask, feat_mask, inputs["audio_feat"], feat_embed)
         else:
             state = self._active_states.get(req_id)
-            if state is None or state.curr_embed_for_next is None:
-                raise RuntimeError(
-                    f"decode called for {req_id} without prior prefill "
-                    f"(state={'missing' if state is None else 'no embed'})"
-                )
-            embeds = state.curr_embed_for_next.to(dev, dtype=self._side_dtype).reshape(1, -1)
+            curr = state.curr_embed_for_next if state else None
+            if curr is not None:
+                embeds = curr.to(dev, dtype=self._side_dtype).reshape(1, -1)
+            else:
+                embeds = torch.zeros(1, self.config.hidden_size, device=dev, dtype=self._side_dtype)
 
-        self._pending_requests.append((req_id, is_prefill, embeds))
+        self._pending_requests.append((req_id, is_prefill, embeds, span_len))
         return input_ids, embeds, {}
 
     def postprocess(self, hidden_states: torch.Tensor, **info: Any) -> dict[str, Any]:
