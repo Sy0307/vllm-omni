@@ -801,9 +801,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                             if element is not None:
                                 if isinstance(element, torch.Tensor):
                                     element = element.clone()
-                            mm_payload[k] = element
-                        else:
-                            mm_payload[k] = None
+                                mm_payload[k] = element
+                        # Skip None elements: msgspec cannot serialize None
+                        # in dict[str, torch.Tensor] typed fields.
                     elif isinstance(v, torch.Tensor):
                         # List-derived tensor payloads are request-invariant; clone to
                         # avoid accidental cross-request aliasing on downstream mutation.
