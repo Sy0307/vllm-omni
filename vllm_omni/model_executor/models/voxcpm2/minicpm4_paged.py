@@ -73,14 +73,12 @@ class _PagedMiniCPM4Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        # Separate projections for checkpoint compat; fused at forward
         self.q_proj = nn.Linear(hidden_size, self.q_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.kv_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.kv_size, bias=False)
         self.o_proj = nn.Linear(self.q_size, hidden_size, bias=False)
         self._fused_qkv_weight: torch.Tensor | None = None
 
-        # vllm PagedAttention
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -97,7 +95,6 @@ class _PagedMiniCPM4Attention(nn.Module):
         rope_emb: _MiniCPMLongRoPE | None = None,
     ) -> torch.Tensor:
         """Forward: fused QKV → fp32 RoPE → PagedAttention → o_proj."""
-        # Fused QKV: lazy-concat, cached after first forward
         if self._fused_qkv_weight is None:
             self._fused_qkv_weight = torch.cat(
                 [
@@ -106,25 +103,21 @@ class _PagedMiniCPM4Attention(nn.Module):
                     self.v_proj.weight,
                 ],
                 dim=0,
-            ).detach()  # detach to avoid grad tracking on the concat
+            ).detach()
         qkv = nn.functional.linear(hidden_states, self._fused_qkv_weight)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Apply RoPE in fp32 (precision-critical)
         if rope_emb is not None:
             cos, sin = rope_emb(positions)
-            # Reshape for rotary: [n_tokens, heads, head_dim]
             bsz = q.shape[0]
             q_r = q.view(bsz, self.num_heads, self.head_dim)
             k_r = k.view(bsz, self.num_kv_heads, self.head_dim)
-            # Add seq dim: [n_tokens, heads, dim] → [1, heads, n_tokens, dim]
             q_r = q_r.unsqueeze(0).transpose(1, 2)  # [1, heads, n_tokens, dim]
             k_r = k_r.unsqueeze(0).transpose(1, 2)  # [1, kv_heads, n_tokens, dim]
             q_r, k_r = _apply_rotary_pos_emb(q_r, k_r, cos, sin)
             q = q_r.transpose(1, 2).squeeze(0).reshape(bsz, -1)  # [n_tokens, q_size]
             k = k_r.transpose(1, 2).squeeze(0).reshape(bsz, -1)  # [n_tokens, kv_size]
 
-        # PagedAttention forward
         attn_output = self.attn(q, k, v)
 
         output = self.o_proj(attn_output)
@@ -165,7 +158,6 @@ class _PagedMiniCPM4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
         self.mlp = _MiniCPMMLP(hidden_size, intermediate_size)
-        # vllm fused RMSNorm (precision-safe)
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -232,7 +224,6 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
         self.vocab_size = lm_cfg.vocab_size
         self.embed_tokens = nn.Embedding(self.vocab_size, hidden_size)
 
-        # Build layers with PagedAttention
         rope_scaling = getattr(lm_cfg, "rope_scaling", None)
         if isinstance(rope_scaling, dict):
             rope_scaling_dict = rope_scaling
@@ -333,7 +324,6 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
                     mode="default",
                     fullgraph=True,
                 )
-                # Invalidate fused QKV cache
                 layer.self_attn._fused_qkv_weight = None
                 self._compiled_layers.add(i)
                 if i == 0:
@@ -382,7 +372,6 @@ class MiniCPM4PagedResidualLM(nn.Module):
         num_hidden_layers = getattr(config, "residual_lm_num_layers", 8)
         kv_channels = getattr(lm_cfg, "kv_channels", None)
 
-        # No RoPE for residual LM
         self.rope_emb = None
 
         self.layers = nn.ModuleList(

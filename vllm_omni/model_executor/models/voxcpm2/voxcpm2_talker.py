@@ -615,7 +615,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if n <= 1 or n % self._vae_decode_interval == 0 or state.is_stopping:
             self._perf.start("vae_decode")
             all_p = torch.cat(state.accumulated_patches, dim=0)
-            # Compact: replace list with single merged tensor
             state.accumulated_patches = [all_p]
             feat = rearrange(all_p.reshape(1, -1, self._feat_dim), "b t d -> b d t")
             with torch.no_grad():
@@ -707,7 +706,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
                 self._cleanup_request(rid)
 
-            # Use vllm input_ids directly (VoxCPM2Tokenizer already does char-level Chinese splitting)
+            # VoxCPM2Tokenizer does char-level Chinese splitting, so use input_ids directly
             token_ids = input_ids.tolist()
             if token_ids and token_ids[0] == self.config.bos_token_id:
                 token_ids = token_ids[1:]
@@ -859,7 +858,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
 
-        # Load residual_model from native, then free redundant components
         n = self.residual_model.load_weights_from_native(self._tts.residual_lm)
         for name, _ in self.residual_model.named_parameters():
             loaded.add(f"residual_model.{name}")
