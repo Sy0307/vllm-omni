@@ -756,12 +756,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.prefill_masks = (text_mask, feat_mask, inputs["audio_feat"], feat_embed)
         else:
             state = self._active_states.get(req_id)
-            curr = state.curr_embed_for_next if state else None
-            embeds = (
-                curr.to(dev, dtype=self._side_dtype).reshape(1, -1)
-                if curr is not None
-                else torch.zeros(1, self.config.hidden_size, device=dev, dtype=self._side_dtype)
-            )
+            if state is None or state.curr_embed_for_next is None:
+                raise RuntimeError(
+                    f"decode called for {req_id} without prior prefill "
+                    f"(state={'missing' if state is None else 'no embed'})"
+                )
+            embeds = state.curr_embed_for_next.to(dev, dtype=self._side_dtype).reshape(1, -1)
 
         self._pending_requests.append((req_id, is_prefill, embeds))
         return input_ids, embeds, {}

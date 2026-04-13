@@ -31,6 +31,21 @@ from .minicpm4_hf_compat import (
 logger = init_logger(__name__)
 
 
+def _resolve_lm_cfg(config: Any) -> Any:
+    """Extract lm_config from VoxCPM2Config, converting dict to namespace if needed."""
+    lm_cfg = getattr(config, "lm_config", config)
+    if isinstance(lm_cfg, dict):
+
+        class _Cfg:
+            pass
+
+        c = _Cfg()
+        for k, v in lm_cfg.items():
+            setattr(c, k, v)
+        return c
+    return lm_cfg
+
+
 # ===================================================================
 #  Attention with vllm PagedAttention backend
 # ===================================================================
@@ -208,17 +223,7 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
         cache_config = vllm_config.cache_config
         self.config = config
 
-        # VoxCPM2 nests base_lm config under lm_config
-        lm_cfg = getattr(config, "lm_config", config)
-        if isinstance(lm_cfg, dict):
-            # Dict → namespace for attribute access
-            class _Cfg:
-                pass
-
-            c = _Cfg()
-            for k, v in lm_cfg.items():
-                setattr(c, k, v)
-            lm_cfg = c
+        lm_cfg = _resolve_lm_cfg(config)
 
         hidden_size = lm_cfg.hidden_size
         num_hidden_layers = lm_cfg.num_hidden_layers
@@ -371,16 +376,7 @@ class MiniCPM4PagedResidualLM(nn.Module):
         cache_config = vllm_config.cache_config
         self.config = config
 
-        lm_cfg = getattr(config, "lm_config", config)
-        if isinstance(lm_cfg, dict):
-
-            class _Cfg:
-                pass
-
-            c = _Cfg()
-            for k, v in lm_cfg.items():
-                setattr(c, k, v)
-            lm_cfg = c
+        lm_cfg = _resolve_lm_cfg(config)
 
         hidden_size = lm_cfg.hidden_size
         num_hidden_layers = getattr(config, "residual_lm_num_layers", 8)
