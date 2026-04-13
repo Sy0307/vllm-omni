@@ -801,10 +801,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                             if element is not None:
                                 if isinstance(element, torch.Tensor):
                                     element = element.clone()
-                            mm_payload[k] = element  # None propagated explicitly
-                        # When idx >= len(v), this request was not processed
-                        # in the current forward step (time-sliced scheduling).
-                        # Do NOT fallback to v[0] which belongs to a different request.
+                            mm_payload[k] = element
+                        else:
+                            mm_payload[k] = None
                     elif isinstance(v, torch.Tensor):
                         # List-derived tensor payloads are request-invariant; clone to
                         # avoid accidental cross-request aliasing on downstream mutation.

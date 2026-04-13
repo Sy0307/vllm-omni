@@ -334,6 +334,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._pending_requests: list[tuple[str, bool, torch.Tensor | None, int]] = []
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, Any]] = []
+        self._deferred_cleanup_ids: set[str] = set()
 
     @property
     def tts(self) -> nn.Module:
@@ -358,8 +359,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             self._current_request_id = None
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
-        for req_id in finished_req_ids:
+        # Defer cleanup: on_requests_finished is called before forward(),
+        # so we must not delete state that the current step may still need.
+        self._deferred_cleanup_ids.update(finished_req_ids)
+
+    def _flush_deferred_cleanup(self) -> None:
+        for req_id in self._deferred_cleanup_ids:
             self._cleanup_request(req_id)
+        self._deferred_cleanup_ids.clear()
 
     def _build_prompt_cache(
         self,
@@ -375,10 +382,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         tts = self.tts
 
         def _is_raw_audio(v: Any) -> bool:
+            import numbers
+
             return (
                 isinstance(v, (list, tuple))
                 and len(v) == 2
-                and isinstance(v[1], int)
+                and isinstance(v[1], numbers.Integral)
                 and isinstance(v[0], (list, torch.Tensor))
             )
 
@@ -572,6 +581,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 self._audio_queue.append((state.request_id, self._collect_audio(state)))
 
         self._pending_requests.clear()
+        self._flush_deferred_cleanup()
         self._perf.stop("forward_total")
         return scaffold_hidden
 
