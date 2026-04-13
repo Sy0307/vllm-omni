@@ -490,6 +490,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.prefill_masks = None
 
         enc_out = base_lm_out.unsqueeze(0)
+
         prefix_feat_cond = (
             feat[:, -1, ...]
             if feat.shape[1] > 0
@@ -706,13 +707,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
                 self._cleanup_request(rid)
 
-            ids = input_ids.tolist()
-            if ids and ids[0] == self.config.bos_token_id:
-                ids = ids[1:]
-            text = self.tts.text_tokenizer.tokenizer.decode(ids, skip_special_tokens=True)
+            # Use vllm input_ids directly (VoxCPM2Tokenizer already does char-level Chinese splitting)
+            token_ids = input_ids.tolist()
+            if token_ids and token_ids[0] == self.config.bos_token_id:
+                token_ids = token_ids[1:]
 
             state = self._get_or_create_state(req_id)
-            state.prefill_text = text
+            state.prefill_text = ""
             state.accumulated_patches = []
             state.prefill_completed = False
             state.decode_step_count = 0
@@ -746,7 +747,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 except Exception as e:
                     logger.warning("build_prompt_cache failed: %s", e)
 
-            inputs = self._build_prefill_inputs(text, dev, req_id)
+            inputs = self._build_prefill_inputs(token_ids, dev, req_id)
             tts = self.tts
             feat_embed = tts.enc_to_lm_proj(tts.feat_encoder(inputs["audio_feat"]))
             text_embed = self.model.embed_input_ids(inputs["text_token"].to(dev))
@@ -781,8 +782,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- build prefill inputs --------------------
 
-    def _build_prefill_inputs(self, text: str, dev: Any, req_id: str = "default") -> dict:
-        # Built on CPU then transferred; prefill is small so overhead is negligible
+    def _build_prefill_inputs(self, token_ids: list[int], dev: Any, req_id: str = "default") -> dict:
         tts = self.tts
         dtype = self._side_dtype
         state = self._active_states.get(req_id)
@@ -790,11 +790,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         mode = cache.get("mode", "continuation") if cache else "zero_shot"
 
         if cache and mode in ("continuation", "ref_continuation"):
-            full_text = cache.get("prompt_text", "") + text
+            prompt_text = cache.get("prompt_text", "")
+            prompt_ids = list(tts.text_tokenizer(prompt_text)) if prompt_text else []
+            all_ids = prompt_ids + token_ids
         else:
-            full_text = text
+            all_ids = token_ids
 
-        text_token = torch.LongTensor(tts.text_tokenizer(full_text))
+        text_token = torch.tensor(all_ids, dtype=torch.int32)
         text_token = torch.cat([text_token, torch.tensor([tts.audio_start_token], dtype=torch.int32)], dim=-1)
         text_len = text_token.shape[0]
         latent_dim = tts.audio_vae.latent_dim

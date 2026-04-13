@@ -279,7 +279,8 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
             ["hidden_states", "residual"], hidden_size
         )
 
-        self._scale_emb = getattr(lm_cfg, "scale_emb", 1.0)
+        use_mup = getattr(lm_cfg, "use_mup", False)
+        self._scale_emb = getattr(lm_cfg, "scale_emb", 1.0) if use_mup else 1.0
         self._compiled_layers: set[int] = set()
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
