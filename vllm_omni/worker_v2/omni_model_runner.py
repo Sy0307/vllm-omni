@@ -273,22 +273,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                 model_output = self.model(**model_inputs)
 
             # Extract hidden_states from model output.
+            self._last_aux_output = None
             if isinstance(model_output, OmniOutput):
-                self._last_aux_output = None
                 hidden_states = model_output.text_hidden_states
             elif isinstance(model_output, tuple) and len(model_output) == 2:
-                first, second = model_output
-                if isinstance(first, torch.Tensor):
-                    self._last_aux_output = second
-                    if hasattr(self.model, "_last_captured_layers"):
-                        self.model._last_captured_layers = second
-                    hidden_states = first
-                else:
-                    self._last_aux_output = None
-                    hidden_states = model_output
+                hidden_states, self._last_aux_output = model_output
+                if hasattr(self.model, "_last_captured_layers"):
+                    self.model._last_captured_layers = self._last_aux_output
             else:
-                self._last_aux_output = None
-                hidden_states = model_output
+                raise TypeError(f"Unexpected model output type: {type(model_output)}")
 
         # ★ POST-FORWARD: per-request postprocess
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
