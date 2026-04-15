@@ -281,7 +281,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if hasattr(self.model, "_last_captured_layers"):
                     self.model._last_captured_layers = self._last_aux_output
             else:
-                raise TypeError(f"Unexpected model output type: {type(model_output)}")
+                hidden_states = model_output
 
         # ★ POST-FORWARD: per-request postprocess
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
