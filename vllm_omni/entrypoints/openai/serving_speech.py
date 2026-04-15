@@ -216,6 +216,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "Re-upload voices after each restart if needed."
         )
         self._tts_tokenizer = None
+        self._voxcpm2_tokenizer = None
+        self._voxcpm2_split_map: dict[int, list[int]] = {}
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
@@ -811,6 +813,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "voxcpm2":
             return None  # VoxCPM2 accepts any text input
         return self._validate_qwen_tts_request(request)
+
+    def _voxcpm2_encode(self, text: str) -> list[int]:
+        """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
+        if self._voxcpm2_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+                build_cjk_split_map,
+            )
+
+            model_name = self.engine_client.model_config.model
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            self._voxcpm2_split_map = build_cjk_split_map(tokenizer)
+            self._voxcpm2_tokenizer = tokenizer
+            logger.info("VoxCPM2 serving: built multichar split map (%d entries)", len(self._voxcpm2_split_map))
+
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            split_multichar_chinese,
+        )
+
+        ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
+        return split_multichar_chinese(ids, self._voxcpm2_split_map)
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -1508,7 +1532,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 additional["reference_audio"] = [[wav_list, sr]]
-            prompt = {"prompt": request.input}
+            # Tokenize and split multichar Chinese tokens before sending to
+            # the engine so that input_ids length matches the model's internal
+            # token count (VoxCPM2 was trained with single-char Chinese IDs).
+            token_ids = self._voxcpm2_encode(request.input)
+            prompt: dict[str, Any] = {"prompt_token_ids": token_ids}
             if additional:
                 prompt["additional_information"] = additional
         elif self._is_tts:
