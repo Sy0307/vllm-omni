@@ -155,16 +155,26 @@ class OmniModelState(DefaultModelState):
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
         self.plugins: list[OmniModelStatePlugin] = []
 
+        # Probe the model's actual embedding dim.  Talker models may
+        # replace embed_tokens with codec_embedding whose dim differs
+        # from hf_text_config.hidden_size (used by self.inputs_embeds_size).
+        self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
+
         # Static inputs_embeds buffer for FULL CUDA graph compatibility.
         # Models with preprocess modify inputs_embeds each step.  By
         # allocating a static GPU buffer and returning it from both
         # prepare_dummy_inputs (capture) and prepare_inputs (runtime),
         # FULL graph captures the tensor address once and preprocess
         # fills it in-place before each replay.
+        #
+        # Use has_preprocess (not supports_mm_inputs) as the guard:
+        # at init time supports_mm_inputs may still be True due to
+        # multimodal registry, but OmniGPUModelRunner.load_model()
+        # will set it to False after this __init__ returns.
         self._static_inputs_embeds: torch.Tensor | None = None
-        if self.has_preprocess and not self.supports_mm_inputs:
+        if self._embed_dim > 0:
             self._static_inputs_embeds = torch.zeros(
-                (self.max_num_tokens, self.inputs_embeds_size),
+                (self.max_num_tokens, self._embed_dim),
                 dtype=self.dtype,
                 device=device,
             )
@@ -176,17 +186,32 @@ class OmniModelState(DefaultModelState):
         self._mtp_input_embeds: torch.Tensor | None = None
         self._mtp_hidden: torch.Tensor | None = None
         self._mtp_text_step: torch.Tensor | None = None
-        if self.has_preprocess and hasattr(model, "talker_mtp"):
+        if self._embed_dim > 0 and hasattr(model, "talker_mtp"):
             max_bs = max_num_reqs
-            hidden_size = self.inputs_embeds_size
             self._mtp_input_ids = torch.zeros(max_bs, dtype=torch.long, device=device)
-            self._mtp_input_embeds = torch.zeros((max_bs, hidden_size), dtype=self.dtype, device=device)
-            self._mtp_hidden = torch.zeros((max_bs, hidden_size), dtype=self.dtype, device=device)
-            self._mtp_text_step = torch.zeros((max_bs, hidden_size), dtype=self.dtype, device=device)
+            self._mtp_input_embeds = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
+            self._mtp_hidden = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
+            self._mtp_text_step = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
 
         if hasattr(model, "get_omni_plugins"):
             for plugin in model.get_omni_plugins():
                 self.register_plugin(plugin)
+
+    @staticmethod
+    def _get_embed_dim(model: nn.Module, device: torch.device) -> int:
+        """Return the embedding dimension that ``embed_input_ids`` produces.
+
+        Talker models may replace ``embed_tokens`` with a
+        ``codec_embedding`` whose dim differs from
+        ``hf_text_config.hidden_size``.  We probe the model once at init
+        to get the correct dim for MTP buffer allocation.
+        """
+        if hasattr(model, "embed_input_ids"):
+            dummy = torch.zeros(1, dtype=torch.long, device=device)
+            with torch.no_grad():
+                out = model.embed_input_ids(dummy)
+            return out.shape[-1]
+        return 0
 
     # ------------------------------------------------------------------
     # Attention metadata: use actual max_seq_len, not max_model_len
