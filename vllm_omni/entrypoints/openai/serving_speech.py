@@ -816,22 +816,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
         """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            build_cjk_split_map,
+            split_multichar_chinese,
+        )
+
         if self._voxcpm2_tokenizer is None:
             from transformers import AutoTokenizer
-
-            from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-                build_cjk_split_map,
-            )
 
             model_name = self.engine_client.model_config.model
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             self._voxcpm2_split_map = build_cjk_split_map(tokenizer)
             self._voxcpm2_tokenizer = tokenizer
             logger.info("VoxCPM2 serving: built multichar split map (%d entries)", len(self._voxcpm2_split_map))
-
-        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-            split_multichar_chinese,
-        )
 
         ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
         return split_multichar_chinese(ids, self._voxcpm2_split_map)
@@ -1532,9 +1529,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 additional["reference_audio"] = [[wav_list, sr]]
-            # Tokenize and split multichar Chinese tokens before sending to
-            # the engine so that input_ids length matches the model's internal
-            # token count (VoxCPM2 was trained with single-char Chinese IDs).
+            # Pre-split multichar Chinese tokens (VoxCPM2 was trained with single-char CJK IDs).
             token_ids = self._voxcpm2_encode(request.input)
             prompt: dict[str, Any] = {"prompt_token_ids": token_ids}
             if additional:
