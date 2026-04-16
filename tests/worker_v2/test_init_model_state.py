@@ -61,6 +61,7 @@ def test_unknown_arch_delegates_to_upstream(mock_upstream):
 def test_omni_architectures_set_contains_expected():
     expected = {
         "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen2_5OmniForConditionalGeneration",
         "MammothModa2ForConditionalGeneration",
         "MiMoAudioForConditionalGeneration",
         "MammothModa2ARForConditionalGeneration",
