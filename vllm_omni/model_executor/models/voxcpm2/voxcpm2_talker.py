@@ -793,6 +793,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
+        assert scaffold_len == tts_len, (
+            f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
+            "serving layer must pad prompt_token_ids to the full prefill length."
+        )
 
         if scaffold_len < tts_len:
             # Voice clone / continuation: scaffold only processed vllm tokens.
@@ -1063,7 +1067,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
                 self._cleanup_request(rid)
 
-            token_ids = input_ids.tolist()
+            real = info_dict.get("text_token_ids")
+            token_ids = real[0] if real else input_ids.tolist()
             # Fail-fast: unsplit multichar Chinese IDs in input_ids means the
             # serving layer didn't pre-split.  Silent fixup here would cause
             # input_ids/embeds length mismatch (scheduler slot count is fixed).
