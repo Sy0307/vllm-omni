@@ -31,6 +31,9 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 
 from vllm_omni.worker_v2.model_states import init_omni_model_state
+from vllm_omni.worker_v2.model_states.intermediate_buffer import (
+    _resolve_additional_information,
+)
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
@@ -322,10 +325,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         field, so we merge it into the intermediate buffer here.
         """
         super().update_requests(scheduler_output)
-
-        from vllm_omni.worker_v2.model_states.intermediate_buffer import (
-            _resolve_additional_information,
-        )
 
         cached = scheduler_output.scheduled_cached_reqs
         addl_info = getattr(cached, "additional_information", None)

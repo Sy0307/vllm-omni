@@ -22,6 +22,9 @@ from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.worker_v2.model_states.intermediate_buffer import (
+    _resolve_additional_information,
+)
 
 logger = init_logger(__name__)
 
@@ -531,10 +534,6 @@ class OmniARScheduler(VLLMScheduler):
                         and hasattr(add_info, "entries")
                         and isinstance(getattr(add_info, "entries"), dict)
                     ):
-                        from vllm_omni.worker_v2.model_states.intermediate_buffer import (
-                            _resolve_additional_information,
-                        )
-
                         request.additional_information = _resolve_additional_information(add_info)
                         add_info = request.additional_information
                     if add_info is None:

@@ -64,8 +64,13 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         and redundant model_state init), we update the existing slot
         in-place.  This is safe for Code2Wav because:
         - No KV cache / rope state to reinitialize
-        - intermediate_buffer.update merges new info into existing slot
         - staged writes are applied once at the end
+
+        ``additional_information`` is NOT merged here — the inherited
+        ``OmniGPUModelRunner.update_requests`` (called right after this
+        method in ``execute_model``) is the single source of truth for
+        ``intermediate_buffer`` updates.  Doing it in both places would
+        clone every tensor to CPU twice per step.
         """
         cached = scheduler_output.scheduled_cached_reqs
         if not cached.req_ids:
@@ -78,7 +83,6 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         if not new_prompt_ids:
             return
 
-        addl_info = cached.additional_information
         updated = False
 
         for req_id in cached.req_ids:
@@ -99,20 +103,6 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.req_states.all_token_ids.stage_write(req_idx, 0, new_ids)
             self.req_states.num_computed_tokens.stage_write_elem(req_idx, 0)
             self.req_states.num_computed_prefill_tokens[req_idx] = 0
-
-            # Update intermediate buffer with new additional_information.
-            # Payload may be an AdditionalInformationPayload object
-            # (not a plain dict) when scheduler and worker share the
-            # same serialized representation, so resolve first.
-            info = addl_info.get(req_id)
-            if info is not None:
-                from vllm_omni.worker_v2.model_states.intermediate_buffer import (
-                    _resolve_additional_information,
-                )
-
-                resolved = _resolve_additional_information(info)
-                if resolved:
-                    self.model_state.intermediate_buffer.update(req_idx, resolved)
 
             updated = True
 

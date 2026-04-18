@@ -53,8 +53,12 @@ def _resolve_additional_information(payload: Any) -> dict[str, Any]:
                 arr = np.frombuffer(tensor_data, dtype=dt)
                 arr = arr.reshape(getattr(entry, "tensor_shape", ()))
                 info[k] = torch.from_numpy(arr.copy())
+            elif getattr(entry, "list_data", None) is not None:
+                info[k] = entry.list_data
+            elif getattr(entry, "scalar_data", None) is not None:
+                info[k] = entry.scalar_data
             else:
-                info[k] = getattr(entry, "list_data", None)
+                info[k] = None
         return info
     except Exception:
         logger.exception("Failed to decode additional_information payload")
