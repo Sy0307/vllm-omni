@@ -459,28 +459,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     async def _build_voxcpm2_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build prefill prompt for VoxCPM2 TTS (`prompt_token_ids` padded to full prefill length)."""
-        token_ids = self._voxcpm2_encode(request.input)
-        bos = self._voxcpm2_tokenizer.bos_token_id
-        if token_ids and token_ids[0] == bos:
-            token_ids = token_ids[1:]
-        prefill_len = len(token_ids) + 1  # + audio_start
-        additional: dict[str, Any] = {"text_token_ids": [token_ids]}
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
+
+        self._voxcpm2_encode("")  # lazy-init tokenizer + split_map
+        ref_audio = None
+        ref_sr = None
         if request.ref_audio is not None:
-            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-            hf_cfg = self.engine_client.model_config.hf_config
-            vae = hf_cfg.audio_vae_config
-            patch_samples = hf_cfg.patch_size * math.prod(vae["encoder_rates"])
-            ref_len = math.ceil(math.ceil(len(wav_list) * vae["sample_rate"] / sr) / patch_samples)
-            if request.ref_text is not None:
-                additional["prompt_audio"] = [[wav_list, sr]]
-                additional["prompt_text"] = [request.ref_text]
-                prefill_len += ref_len + len(
-                    self._voxcpm2_tokenizer.encode(request.ref_text, add_special_tokens=False)
-                )
-            else:
-                additional["reference_audio"] = [[wav_list, sr]]
-                prefill_len += ref_len + 2  # ref_start / ref_end
-        return {"prompt_token_ids": [1] * prefill_len, "additional_information": additional}
+            ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
+        return build_voxcpm2_prompt(
+            hf_config=self.engine_client.model_config.hf_config,
+            tokenizer=self._voxcpm2_tokenizer,
+            split_map=self._voxcpm2_split_map,
+            text=request.input,
+            ref_audio=ref_audio,
+            ref_sr=ref_sr,
+            ref_text=request.ref_text,
+        )
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Get base64 encoded audio data for uploaded voice."""
