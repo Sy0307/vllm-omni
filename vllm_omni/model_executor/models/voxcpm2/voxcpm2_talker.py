@@ -440,6 +440,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, Any]] = []
         self._deferred_cleanup_ids: set[str] = set()
+        self._active_state_warn_threshold = max(512, 4 * self._max_batch_size)
+        self._active_state_warned = False
 
     @property
     def tts(self) -> nn.Module:
@@ -449,9 +451,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     # -------------------- request state management --------------------
 
     def _get_or_create_state(self, request_id: str) -> _RequestState:
-        if request_id not in self._active_states:
-            self._active_states[request_id] = _RequestState(request_id=request_id)
-        return self._active_states[request_id]
+        state = self._active_states.get(request_id)
+        if state is None:
+            state = _RequestState(request_id=request_id)
+            self._active_states[request_id] = state
+            if len(self._active_states) > self._active_state_warn_threshold and not self._active_state_warned:
+                logger.warning(
+                    "VoxCPM2: _active_states size=%d exceeds threshold %d; possible cleanup path leak",
+                    len(self._active_states),
+                    self._active_state_warn_threshold,
+                )
+                self._active_state_warned = True
+        return state
 
     def _switch_to_request(self, request_id: str) -> _RequestState:
         if request_id != self._current_request_id:
@@ -1087,14 +1098,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         is_prefill = span_len > 1
 
         if is_prefill:
-            # Evict stale states
-            pending_ids = {rid for rid, *_ in self._pending_requests}
-            pending_ids.add(req_id)
-            if self._current_request_id:
-                pending_ids.add(self._current_request_id)
-            for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
-                self._cleanup_request(rid)
-
+            # State cleanup is driven by on_requests_finished; do not evict
+            # here based on _pending_requests (prefix-only, not batch-wide).
             real = info_dict.get("text_token_ids")
             token_ids = input_ids.tolist() if real is None else real[0]
             # Fail-fast: unsplit multichar Chinese IDs in input_ids means the
