@@ -159,7 +159,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "speaker": "vivian",
+        "voice": "vivian",
         "language": "English"
     }' --output output.wav
 
@@ -168,7 +168,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "I am so excited!",
-        "speaker": "vivian",
+        "voice": "vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
 
@@ -185,7 +185,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
 
 response = client.audio.speech.create(
     model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    speaker="vivian",
+    voice="vivian",
     input="Hello, how are you?",
 )
 
@@ -201,7 +201,7 @@ response = httpx.post(
     "http://localhost:8091/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
-        "speaker": "vivian",
+        "voice": "vivian",
         "language": "English",
     },
     timeout=300.0,
@@ -209,14 +209,6 @@ response = httpx.post(
 
 with open("output.wav", "wb") as f:
     f.write(response.content)
-```
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
 ```
 
 ## API Reference
@@ -300,7 +292,7 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 ```json
 {
     "input": "Text to synthesize",
-    "speaker": "vivian",
+    "voice": "vivian",
     "response_format": "wav",
     "task_type": "CustomVoice",
     "language": "Auto",
@@ -332,7 +324,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | ----------------- | ------ | -------------- | ----------------------------------------------------------- |
 | `input`           | string | **required**   | Text to synthesize                                          |
 | `model`           | string | server's model | Model to use (optional, should match server if specified)   |
-| `speaker`         | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
+| `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
 | `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus                |
 | `speed`           | float  | 1.0            | Playback speed (0.25-4.0, not supported with `stream=true`) |
 
@@ -367,7 +359,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "speaker": "vivian",
+        "voice": "vivian",
         "language": "English",
         "stream": true,
         "response_format": "pcm"

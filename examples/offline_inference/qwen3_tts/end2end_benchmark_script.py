@@ -46,7 +46,9 @@ def _estimate_prompt_len(
         if model_name not in _model_cache:
             from transformers import AutoTokenizer
 
-            tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left", fix_mistral_regex=True)
+            tok = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True, padding_side="left", fix_mistral_regex=True
+            )
             cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
 
             speech_tok = None
@@ -59,7 +61,9 @@ def _estimate_prompt_len(
                 if st_cfg_path:
                     speech_tok = Qwen3TTSTokenizer.from_pretrained(
                         # os.path.dirname(st_cfg_path), torch_dtype=torch.bfloat16
-                        os.path.dirname(st_cfg_path), torch_dtype=torch.bfloat16, fix_mistral_regex=True
+                        os.path.dirname(st_cfg_path),
+                        torch_dtype=torch.bfloat16,
+                        fix_mistral_regex=True,
                     )
                     logger.info("Loaded speech tokenizer for exact ref_code_len estimation")
             except Exception as e:
@@ -526,7 +530,9 @@ async def main_streaming(args):
                         logger.info("Request %s: chunk %d samples=%d TTFA=%.1fms", request_id, chunk_idx, n, ttfa_ms)
                     else:
                         dt_ms = (t_now - t_prev) * 1000
-                        logger.info("Request %s: chunk %d samples=%d inter_chunk=%.1fms", request_id, chunk_idx, n, dt_ms)
+                        logger.info(
+                            "Request %s: chunk %d samples=%d inter_chunk=%.1fms", request_id, chunk_idx, n, dt_ms
+                        )
                     t_prev = t_now
                     chunk_idx += 1
                 else:
@@ -545,55 +551,82 @@ async def main_streaming(args):
 def parse_args():
     parser = FlexibleArgumentParser(description="Benchmark script for Qwen3 TTS via vLLM Omni")
     parser.add_argument(
-        "--query-type", "-q", type=str, default="CustomVoice",
-        choices=query_map.keys(), help="Query type.",
+        "--query-type",
+        "-q",
+        type=str,
+        default="CustomVoice",
+        choices=query_map.keys(),
+        help="Query type.",
     )
     parser.add_argument(
-        "--warmup-rounds", type=int, default=3,
+        "--warmup-rounds",
+        type=int,
+        default=3,
         help="Number of warmup rounds (results discarded, default: 3).",
     )
     parser.add_argument(
-        "--test-rounds", type=int, default=7,
+        "--test-rounds",
+        type=int,
+        default=7,
         help="Number of test rounds (results saved and timed, default: 7).",
     )
     parser.add_argument(
-        "--log-stats", action="store_true", default=False,
+        "--log-stats",
+        action="store_true",
+        default=False,
         help="Enable writing detailed statistics (default: disabled).",
     )
     parser.add_argument(
-        "--stage-init-timeout", type=int, default=300,
+        "--stage-init-timeout",
+        type=int,
+        default=300,
         help="Timeout for initializing a single stage in seconds (default: 300).",
     )
     parser.add_argument(
-        "--output-dir", default="output_audio",
+        "--output-dir",
+        default="output_audio",
         help="Output directory for generated wav files (default: output_audio).",
     )
     parser.add_argument(
-        "--txt-prompts", type=str, default=None,
+        "--txt-prompts",
+        type=str,
+        default=None,
         help="Path to a .txt file with one prompt per line.",
     )
     parser.add_argument(
-        "--stage-configs-path", type=str, default=None,
+        "--stage-configs-path",
+        type=str,
+        default=None,
         help="Path to a stage configs file.",
     )
     parser.add_argument(
-        "--use-batch-sample", action="store_true", default=False,
+        "--use-batch-sample",
+        action="store_true",
+        default=False,
         help="Use batch input sample for CustomVoice/VoiceDesign/Base query.",
     )
     parser.add_argument(
-        "--mode-tag", type=str, default="icl", choices=["icl", "xvec_only"],
+        "--mode-tag",
+        type=str,
+        default="icl",
+        choices=["icl", "xvec_only"],
         help="Mode tag for Base query x_vector_only_mode (default: icl).",
     )
     parser.add_argument(
-        "--streaming", action="store_true", default=False,
+        "--streaming",
+        action="store_true",
+        default=False,
         help="Stream audio chunks via AsyncOmni.",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=1,
+        "--batch-size",
+        type=int,
+        default=1,
         help="Number of prompts per batch (default: 1).",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler", action="store_true",
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()

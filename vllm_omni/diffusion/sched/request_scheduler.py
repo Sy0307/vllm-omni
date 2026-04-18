@@ -48,9 +48,3 @@ class RequestScheduler(_BaseScheduler):
                 terminal_errors[sched_req_id] = None
 
         return self._finalize_update_from_output(sched_output, terminal_statuses, terminal_errors)
-
-    def abort_request(self, sched_req_id: str) -> bool:
-        if self.get_request_state(sched_req_id) is None:
-            return False
-        self.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
-        return True

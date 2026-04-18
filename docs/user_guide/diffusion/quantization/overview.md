@@ -106,7 +106,6 @@ config = build_quant_config({"method": "fp8", "activation_scheme": "static"})
 # AutoRound / INC (auto-detected from checkpoint, or explicit)
 config = build_quant_config("auto-round", bits=4, group_size=128)
 
-
 # Per-component dict
 config = build_quant_config({
     "transformer": {"method": "fp8"},

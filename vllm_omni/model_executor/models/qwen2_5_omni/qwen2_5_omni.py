@@ -380,6 +380,29 @@ class Qwen2_5OmniForConditionalGeneration(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec] | None = None,
+        # V1 runner passes these explicitly; thinker extracts them
+        # from mm_features via gather_kwargs, so they're unused here.
+        hf_config: PretrainedConfig | None = None,
+        image_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        video_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        second_per_grid_ts: list[float] | None = None,
+        context_len: int = 0,
+        seq_len: int | None = None,
+        audio_feature_lengths: torch.Tensor | None = None,
+        use_audio_in_video: bool = False,
+    ) -> tuple[torch.Tensor, int]:
+        if self.model_stage == "thinker":
+            if mm_features is None:
+                mm_features = []
+            return self.thinker.get_mrope_input_positions(input_tokens, mm_features)
+        seq_len_ = len(input_tokens)
+        positions = torch.arange(seq_len_).unsqueeze(0).expand(3, -1)
+        return positions, 0
+
+    def _get_mrope_input_positions_v1(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
         *,
         hf_config: PretrainedConfig,
         image_grid_thw: list[list[int]] | torch.Tensor,

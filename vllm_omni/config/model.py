@@ -188,8 +188,6 @@ class OmniModelConfig(ModelConfig):
         new_hf_text_config = self.draw_hf_text_config()
         if new_hf_text_config is not self.hf_text_config:
             self.hf_text_config = new_hf_text_config
-            # Recalculate model_arch_config since it depends on hf_text_config
-            self.model_arch_config = self.get_model_arch_config()
             # Recalculate dependent attributes
             self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
             # Recalculate max_model_len since it depends on hf_text_config

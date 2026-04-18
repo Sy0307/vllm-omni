@@ -58,6 +58,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.requests_origin_status = {}
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -160,6 +161,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
+                # Keep _all_token_ids in sync so the v2 model runner's
+                # prefill_token_ids length matches prompt_token_ids.
+                request._all_token_ids = list(new_ids)
                 # Preserve previously attached request metadata (e.g. prompt
                 # conditioning tensors) and update only per-chunk fields.
                 prev_info = getattr(request, "additional_information", None)
@@ -276,6 +280,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
+        self.requests_origin_status.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -405,6 +410,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
+            self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
@@ -417,3 +423,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 if req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_id)
+
+    def finish_requests(
+        self, request_ids: Any, finished_status: RequestStatus, requests: dict[str, Request] | None = None
+    ) -> list[tuple[str, int]]:
+        assert RequestStatus.is_finished(finished_status)
+        if isinstance(request_ids, str):
+            request_ids = (request_ids,)
+        elif request_ids is not None:
+            request_ids = set(request_ids)
+        else:
+            request_ids = requests.keys()
+
+        # First pass: collect requests to remove from queues
+        for req_id in request_ids:
+            request = requests.get(req_id) if requests else None
+            if request is None or request.is_finished():
+                # Invalid request ID.
+                continue
+            if req_id in self.requests_origin_status:
+                request.status = self.requests_origin_status.pop(req_id)

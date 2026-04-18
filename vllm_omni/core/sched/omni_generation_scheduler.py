@@ -1,3 +1,4 @@
+import os
 import time
 from collections import defaultdict
 
@@ -24,10 +25,14 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 
 logger = init_logger(__name__)
 
+VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+
 
 class OmniGenerationScheduler(VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if VLLM_OMNI_USE_V2_RUNNER and not self.use_v2_model_runner:
+            self.use_v2_model_runner = True
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -79,13 +84,13 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
                 if (
                     self.chunk_transfer_adapter is not None
                     and request.request_id in self.chunk_transfer_adapter.finished_requests
                 ):
-                    # Upstream finished: append one pad token so we can
-                    # emit FINISHED on the next forward pass.
+                    # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
                     if len(request.prompt_token_ids) <= num_computed_tokens:
                         request.prompt_token_ids.append(0)
                         try:
@@ -93,23 +98,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                         except Exception:
                             pass
                     required_tokens = len(request.prompt_token_ids) - num_computed_tokens
-                elif self.chunk_transfer_adapter is not None:
-                    # async_chunk: current chunk processed but upstream
-                    # has not signaled finished yet.  Wait for next
-                    # chunk — do NOT finish the request.
-                    req_index += 1
-                    continue
                 else:
-                    # no_async_chunk: all prompt tokens processed means
-                    # the request is truly done.
-                    if not request.is_finished():
-                        self.finish_requests(
-                            request.request_id,
-                            RequestStatus.FINISHED_STOPPED,
-                        )
-                        # running list was mutated by finish_requests;
-                        # don't increment req_index.
-                        continue
                     req_index += 1
                     continue
             num_new_tokens = min(required_tokens, token_budget)
@@ -227,15 +216,12 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         # Assemble SchedulerOutput (align with v0.14.0)
         if self.use_v2_model_runner:
-            # v2 requires len(prefill_token_ids) >= len(prompt_token_ids).
-            # For new generation requests use prompt_token_ids directly
-            # (no prior decode tokens).  _all_token_ids may be shorter
-            # (e.g. a single padding token) for non-AR generation models.
+            # No resumed reqs in fast path; pass prefill_token_ids for new reqs.
             new_reqs_data = [
                 OmniNewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
-                    self._get_prefill_token_ids(req),
+                    getattr(req, "_all_token_ids", None),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -320,9 +306,10 @@ class OmniGenerationScheduler(VLLMScheduler):
                     block_ids=nr.block_ids,
                     num_computed_tokens=nr.num_computed_tokens,
                     lora_request=nr.lora_request,
-                    prefill_token_ids=nr.prefill_token_ids,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    # Propagate prefill_token_ids from base scheduler for v2 model runner
+                    prefill_token_ids=getattr(nr, "prefill_token_ids", None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)
@@ -344,6 +331,24 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         return scheduler_output
 
+    def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
+        """Handles the finish signal from outside the scheduler.
+
+        For example, the API server can abort a request when the client
+        disconnects.
+
+        If request_ids is None, all requests will be finished.
+
+        Returns:
+            Tuple of (req_id, client_index) for requests that were aborted. Will not
+            include any that were already finished.
+        """
+
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
+
+        return super().finish_requests(request_ids, finished_status)
+
     """
     Scheduler for the diffusion model.
     This scheduler is modified to stop the request immediately for the diffusion model.
@@ -352,19 +357,6 @@ class OmniGenerationScheduler(VLLMScheduler):
     and there should be some further efforts to optimize the scheduler.
     The original scheduler is still used for the AR model.
     """
-
-    @staticmethod
-    def _get_prefill_token_ids(req: "Request") -> list[int]:
-        """Return prefill_token_ids for v2 model runner.
-
-        v2 requires ``len(prefill_token_ids) >= len(prompt_token_ids)``.
-        For non-AR generation models ``_all_token_ids`` may be shorter
-        (e.g. a single padding token), so fall back to prompt_token_ids.
-        """
-        all_ids = getattr(req, "_all_token_ids", None)
-        if all_ids is not None and len(all_ids) >= len(req.prompt_token_ids):
-            return all_ids
-        return list(req.prompt_token_ids)
 
     def update_from_output(
         self,
@@ -458,21 +450,20 @@ class OmniGenerationScheduler(VLLMScheduler):
             finish_reason = None
             routed_experts = None
 
-            # Generation request completes when all prompt tokens are
-            # processed.  In async_chunk mode, prompt_token_ids only
-            # contains the current chunk — _all_computed alone is not
-            # sufficient; the adapter must also confirm no more chunks.
-            _all_computed = request.num_computed_tokens >= len(request.prompt_token_ids)
-            _adapter_done = (
-                self.chunk_transfer_adapter is not None
-                and request.request_id in self.chunk_transfer_adapter.finished_requests
-            )
+            # Diffusion request: completes in one step; mark finished and free resources
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
-                or (_all_computed and self.chunk_transfer_adapter is None)
-                or (_all_computed and _adapter_done)
+                or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
+                or (
+                    self.chunk_transfer_adapter is not None
+                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                    and request.num_computed_tokens >= len(request.prompt_token_ids)
+                )
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
+                # Optional: set a stop_reason for front-end clarity
+                # (does not affect protocol)
+                request.stop_reason = request.stop_reason  # or "generation_done"
                 stopped = True
 
             if stopped:
