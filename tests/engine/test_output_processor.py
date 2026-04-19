@@ -72,7 +72,6 @@ def test_delta_drains_per_step():
     # If we have no mm accumulated data, get an empty dict back
     out3 = s._new_completion_output([3], None, None)
     assert out3.multimodal_output == {}
-    assert out3.multimodal_output == {}
 
 
 def test_cumulative_does_not_drain():

@@ -314,7 +314,7 @@ class AsyncOmni(EngineClient, OmniBase):
             raise ValueError("sampling_params_list cannot be empty for streaming input")
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
-
+        self._validate_streaming_input_sampling_params(stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
 
