@@ -236,6 +236,18 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
+
+            # Ensure all stages are delta stages; this is important to ensure
+            # that we don't redundantly emit multimodal outputs in later stages
+            for idx in range(len(req_sp_list)):
+                sp = req_sp_list[idx]
+                if isinstance(sp, SamplingParams):
+                    if not sp.skip_clone:
+                        sp = sp.clone()
+                        sp.skip_clone = True
+                        req_sp_list[idx] = sp
+                    sp.output_kind = RequestOutputKind.DELTA
+
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
@@ -302,14 +314,8 @@ class AsyncOmni(EngineClient, OmniBase):
             raise ValueError("sampling_params_list cannot be empty for streaming input")
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
-        self._validate_streaming_input_sampling_params(stage0_params)
 
         req_state = self.request_states[request_id]
-
-        if not stage0_params.skip_clone:
-            stage0_params = stage0_params.clone()
-            stage0_params.skip_clone = True
-
         has_submitted_first_chunk = False
 
         async def handle_inputs() -> None:
@@ -383,12 +389,12 @@ class AsyncOmni(EngineClient, OmniBase):
         if (
             not isinstance(params, SamplingParams)
             or params.n > 1
-            or params.output_kind == RequestOutputKind.FINAL_ONLY
+            or params.output_kind != RequestOutputKind.DELTA
             or params.stop
         ):
             raise ValueError(
                 "Input streaming is currently supported only for SamplingParams "
-                "with n == 1, output_kind != FINAL_ONLY, and without stop strings."
+                "with n == 1, output_kind == DELTA, and without stop strings."
             )
 
     async def encode(
