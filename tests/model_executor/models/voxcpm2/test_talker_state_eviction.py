@@ -21,6 +21,10 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
+# voxcpm2_talker.py imports librosa at module scope; the lightweight unit-test
+# environments (simple-unit-test, diffusion-cache-backend-test, etc.) don't
+# install librosa, so skip rather than error out on collection.
+pytest.importorskip("librosa")
 
 from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (  # noqa: E402
     VoxCPM2TalkerForConditionalGeneration,
