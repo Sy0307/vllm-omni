@@ -132,10 +132,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduled_running_reqs.append(request)
             req_index += 1
 
-        # OMNI: Remove already finished requests from running queue.
-        # Also propagate to finished_req_ids so the worker releases
-        # their req_state slots; otherwise the next new request will
-        # trigger AssertionError: No free indices in req_states.add_request.
+        # Remove from running and propagate to finished_req_ids so the worker releases req_state slots.
         if already_finished_reqs:
             self.running = remove_all(self.running, already_finished_reqs)
             for req in already_finished_reqs:
