@@ -106,19 +106,7 @@ def test_voxcpm2_voice_clone_002(voxcpm2_engine):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_prefill_decode_mixed_batch_003(voxcpm2_engine):
-    """Regression for PR #2903: prefill+decode mixed batch must not crash.
-
-    Submits one long prompt together with several short prompts in the same
-    batch. The long prompt stays in decode across many steps while the short
-    prompts keep entering prefill on later steps, producing the
-    "1 prefill + N cached decode" batch shape that used to evict cached-decode
-    state and trigger ``vectorized_gather: index out of bounds`` under #2803's
-    CUDA graph path.
-
-    Success criterion: every request produces non-empty audio in a plausible
-    duration range, i.e. the engine did not crash and no request was silently
-    dropped.
-    """
+    """Regression: prefill+decode mixed batch must not crash (PR #2903)."""
     long_prompt = (
         "This is a deliberately long prompt that will stay in the decode "
         "phase for many steps so that subsequent shorter prompts keep "
