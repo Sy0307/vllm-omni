@@ -32,7 +32,10 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 
 logger = init_logger(__name__)
 
-VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+VLLM_OMNI_USE_V2_RUNNER = bool(
+    int(os.environ.get("VLLM_OMNI_USE_V2_MODEL_RUNNER", os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+)
+
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
@@ -84,7 +87,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 req_index += 1
                 continue
             if self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED:
-                self.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+                already_finished_reqs.add(request)
+                req_index += 1
                 continue
 
             num_computed_tokens = request.num_computed_tokens
@@ -130,16 +134,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduled_running_reqs.append(request)
             req_index += 1
 
-        # Propagate ids for requests that were freed earlier so the worker releases req_state slots.
+        # Remove finished requests from running and free any scheduler-owned state that still remains.
         if already_finished_reqs:
             self.running = remove_all(self.running, already_finished_reqs)
             for req in already_finished_reqs:
-                req_id = req.request_id
-                if req_id in self.finished_req_ids:
-                    continue
-                self.finished_req_ids.add(req_id)
-                if self.finished_req_ids_dict is not None:
-                    self.finished_req_ids_dict[req.client_index].add(req_id)
+                if req.request_id in self.requests:
+                    self._free_request(req)
 
         # Fast path selection and scheduling (treat all as diffusion requests,
         # independent of pooling_params)
