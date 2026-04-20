@@ -55,10 +55,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Sync v2 model runner flag — same pattern as gpu_ar_worker.py:98.
-        # Upstream Scheduler.__init__ reads envs.VLLM_USE_V2_MODEL_RUNNER,
-        # but in subprocess contexts that env var may not be set yet.
-        # This ensures schedule() populates prefill_token_ids correctly.
+        # Sync the scheduler flag with the custom VLLM_OMNI_USE_V2_RUNNER toggle used by MR-V2.
         if VLLM_OMNI_USE_V2_RUNNER and not self.use_v2_model_runner:
             self.use_v2_model_runner = True
         # Track requests that need KV cache transfer when finished
@@ -119,7 +116,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if payload is None:
             result = False
         else:
-            info = deserialize_additional_information(payload)
+            info = _resolve_additional_information(payload)
             result = info.get("omni_final_stage_id") == 0
 
         self._omits_kv_transfer_cache[rid] = result

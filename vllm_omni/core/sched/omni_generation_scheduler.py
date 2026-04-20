@@ -75,17 +75,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
-        # OMNI: Track requests that are already finished (e.g., marked by connector)
-        # These should be removed from running and not scheduled
+        # Track running requests that were already freed elsewhere.
         already_finished_reqs: set[Request] = set()
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            # OMNI: Skip requests that are not in self.requests
-            if request.request_id not in self.requests or (
-                self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
-            ):
+            if request.request_id not in self.requests:
                 already_finished_reqs.add(request)
                 req_index += 1
+                continue
+            if self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED:
+                self.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
                 continue
 
             num_computed_tokens = request.num_computed_tokens
@@ -131,7 +130,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduled_running_reqs.append(request)
             req_index += 1
 
-        # Remove from running and propagate to finished_req_ids so the worker releases req_state slots.
+        # Propagate ids for requests that were freed earlier so the worker releases req_state slots.
         if already_finished_reqs:
             self.running = remove_all(self.running, already_finished_reqs)
             for req in already_finished_reqs:

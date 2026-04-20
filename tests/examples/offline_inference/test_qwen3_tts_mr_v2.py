@@ -20,8 +20,8 @@ os.environ["VLLM_OMNI_USE_V2_RUNNER"] = "1"
 
 import pytest
 
-from tests.examples.conftest import EXAMPLES, run_cmd
-from tests.utils import hardware_test
+from tests.examples.helpers import EXAMPLES, run_cmd
+from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
 
