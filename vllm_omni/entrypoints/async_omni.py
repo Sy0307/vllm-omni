@@ -237,16 +237,20 @@ class AsyncOmni(EngineClient, OmniBase):
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
 
-            # Ensure all stages are delta stages; this is important to ensure
-            # that we don't redundantly emit multimodal outputs in later stages
+            # Coerce vLLM's default CUMULATIVE to DELTA so later stages don't
+            # redundantly re-emit multimodal outputs. Explicit FINAL_ONLY /
+            # DELTA is preserved so callers keep their choice.
             for idx in range(len(req_sp_list)):
                 sp = req_sp_list[idx]
-                if isinstance(sp, SamplingParams):
-                    if not sp.skip_clone:
-                        sp = sp.clone()
-                        sp.skip_clone = True
-                        req_sp_list[idx] = sp
-                    sp.output_kind = RequestOutputKind.DELTA
+                if not isinstance(sp, SamplingParams):
+                    continue
+                if sp.output_kind != RequestOutputKind.CUMULATIVE:
+                    continue
+                if not sp.skip_clone:
+                    sp = sp.clone()
+                    sp.skip_clone = True
+                    req_sp_list[idx] = sp
+                sp.output_kind = RequestOutputKind.DELTA
 
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
