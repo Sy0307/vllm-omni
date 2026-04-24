@@ -110,9 +110,10 @@ async def run(args: argparse.Namespace) -> None:
             "model": args.model,
             "modalities": ["text", "audio"] if audio_data else ["text"],
             "max_frames": args.max_frames,
-            "num_sample_frames": args.num_sample_frames,
-            "evs_enabled": args.evs,
-            "evs_threshold": args.evs_threshold,
+            "num_frames": args.num_sample_frames,
+            "enable_frame_filter": args.evs,
+            "frame_filter_threshold": args.evs_threshold,
+            "use_audio_in_video": bool(audio_data),
         }
         await ws.send(json.dumps(config))
         print(f"Sent session.config: model={args.model} evs={args.evs}")

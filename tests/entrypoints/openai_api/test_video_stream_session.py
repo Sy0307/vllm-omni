@@ -189,6 +189,16 @@ class TestSampling:
         session = VideoStreamSession(cfg)
         assert session.sample_frames() == []
 
+    def test_sample_single_frame_from_multi_frame_buffer(self):
+        cfg = VideoStreamConfig(evs_enabled=False, num_sample_frames=1, max_frames=64)
+        session = VideoStreamSession(cfg)
+        first = make_gradient_jpeg(0)
+        second = make_gradient_jpeg(1)
+        session.add_frame(first)
+        session.add_frame(second)
+
+        assert session.sample_frames() == [second]
+
 
 # ---------------------------------------------------------------------------
 # Audio buffer (Phase 3)

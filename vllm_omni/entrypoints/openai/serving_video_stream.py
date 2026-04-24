@@ -115,8 +115,8 @@ class StreamingVideoSessionConfig(BaseModel):
         description="Custom system prompt.",
     )
     use_audio_in_video: bool = Field(
-        default=False,
-        description="Extract and interleave audio from video frames.",
+        default=True,
+        description="Interleave audio chunks with video frames when audio input is present.",
     )
     sampling_params_list: list[dict[str, Any]] | None = Field(
         default=None,
@@ -179,6 +179,7 @@ class OmniStreamingVideoHandler:
             prev_was_interrupted: bool = False
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
+            query_task: asyncio.Task[Any] | None = None
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -215,21 +216,31 @@ class OmniStreamingVideoHandler:
                     await msg_queue.put(None)
                     raise
 
-            async def _cancel_active_query() -> None:
+            async def _cancel_active_query(*, abort_now: bool = False) -> None:
                 """Signal soft interrupt for the active query."""
-                nonlocal active_request_id, prev_was_interrupted
+                nonlocal active_request_id, prev_was_interrupted, query_task
                 if active_request_id is not None:
                     interrupt_event.set()
                     prev_was_interrupted = True
                     logger.info("Interrupt signaled for %s", active_request_id)
+                    if abort_now and self._engine_client:
+                        try:
+                            await self._engine_client.abort(active_request_id)
+                        except Exception:
+                            logger.debug("Abort failed for %s", active_request_id, exc_info=True)
+                    if query_task is not None and not query_task.done():
+                        query_task.cancel()
+                        await asyncio.gather(query_task, return_exceptions=True)
+                    query_task = None
 
             async def _processor() -> None:
                 """Process enqueued messages."""
-                nonlocal active_request_id, prev_request_id, prev_was_interrupted
+                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
 
                 while True:
                     msg = await msg_queue.get()
                     if msg is None:
+                        await _cancel_active_query(abort_now=True)
                         return
 
                     msg_type = msg.get("type")
@@ -321,31 +332,36 @@ class OmniStreamingVideoHandler:
                         request_id = f"video-{uuid.uuid4().hex[:12]}"
                         active_request_id = request_id
                         interrupt_event.clear()
+                        query_frames = list(frame_buffer)
+                        query_audio_buffer = bytearray(audio_buffer)
+                        audio_buffer.clear()
+                        query_prewarmed_frames = dict(frame_pil_cache)
 
-                        try:
-                            await self._process_query(
-                                websocket,
-                                config,
-                                frame_buffer,
-                                audio_buffer,
-                                message_history,
-                                query_text,
-                                request_id,
-                                interrupt_event,
-                                frame_pil_cache,
-                            )
-                        finally:
-                            prev_request_id = active_request_id
-                            active_request_id = None
-                            audio_buffer.clear()
+                        async def _run_query() -> None:
+                            nonlocal active_request_id, prev_request_id
+                            try:
+                                await self._process_query(
+                                    websocket,
+                                    config,
+                                    query_frames,
+                                    query_audio_buffer,
+                                    message_history,
+                                    query_text,
+                                    request_id,
+                                    interrupt_event,
+                                    query_prewarmed_frames,
+                                )
+                            finally:
+                                if active_request_id == request_id:
+                                    prev_request_id = request_id
+                                    active_request_id = None
+
+                        query_task = asyncio.create_task(_run_query())
 
                     elif msg_type == "video.done":
-                        await _cancel_active_query()
-                        if active_request_id and self._engine_client:
-                            try:
-                                await self._engine_client.abort(active_request_id)
-                            except Exception:
-                                pass
+                        if query_task is not None and not query_task.done():
+                            await asyncio.gather(query_task, return_exceptions=True)
+                            query_task = None
                         await websocket.send_json({"type": "session.done"})
                         return
 
@@ -371,6 +387,8 @@ class OmniStreamingVideoHandler:
                     t.cancel()
                 if prewarm_tasks:
                     await asyncio.gather(*prewarm_tasks, return_exceptions=True)
+                if query_task is not None and not query_task.done():
+                    await _cancel_active_query(abort_now=True)
 
         except WebSocketDisconnect:
             logger.info("Streaming video: client disconnected")
@@ -405,8 +423,18 @@ class OmniStreamingVideoHandler:
             )
             return None
 
+        config_data = {k: v for k, v in msg.items() if k != "type"}
+        alias_map = {
+            "num_sample_frames": "num_frames",
+            "evs_enabled": "enable_frame_filter",
+            "evs_threshold": "frame_filter_threshold",
+        }
+        for old_key, new_key in alias_map.items():
+            if old_key in config_data and new_key not in config_data:
+                config_data[new_key] = config_data[old_key]
+
         try:
-            config = StreamingVideoSessionConfig(**{k: v for k, v in msg.items() if k != "type"})
+            config = StreamingVideoSessionConfig(**config_data)
         except ValidationError as e:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
@@ -486,6 +514,10 @@ class OmniStreamingVideoHandler:
             "stream": True,
             "modalities": config.modalities,
         }
+        if config.use_audio_in_video and len(audio_buffer) > 0:
+            request_kwargs["mm_processor_kwargs"] = {
+                "use_audio_in_video": True,
+            }
         if config.sampling_params_list:
             request_kwargs["sampling_params_list"] = config.sampling_params_list
 
@@ -668,6 +700,10 @@ class OmniStreamingVideoHandler:
             "stream": True,
             "modalities": config.modalities,
         }
+        if config.use_audio_in_video and len(audio_buffer) > 0:
+            request_kwargs["mm_processor_kwargs"] = {
+                "use_audio_in_video": True,
+            }
         if config.sampling_params_list:
             request_kwargs["sampling_params_list"] = config.sampling_params_list
 

@@ -117,6 +117,8 @@ class VideoStreamSession:
         k = min(n, self._config.num_sample_frames)
         if k == 0:
             return []
+        if k == 1:
+            return [self._frames[-1]]
         if k >= n:
             return list(self._frames)
         indices = [int(i * (n - 1) / (k - 1)) for i in range(k)]
