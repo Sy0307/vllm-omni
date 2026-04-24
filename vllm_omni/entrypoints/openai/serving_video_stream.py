@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """WebSocket handler for streaming video input understanding.
 
 Accepts video frames incrementally via WebSocket, buffers them, and
@@ -27,7 +29,6 @@ import base64
 import hashlib
 import io
 import json
-import os
 import time as _time
 import uuid
 import wave
@@ -39,6 +40,7 @@ from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
@@ -54,40 +56,11 @@ _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
+_BAD_FRAME = object()
 
-# Audio delta extraction mode.
-# - "fast" (default): emit only the new chunk(s) appended since last call.
-#   Matches the "list-of-new-chunks" semantics produced by output_processor
-#   (see output_processor.py:112-123 where audio is appended per-step and
-#   never concatenated). Keeps D2H transfer size independent of answer length.
-# - "slow": pre-fix behaviour. Concatenate the full audio history on every
-#   call, move it all to CPU, then slice. Kept for A/B verification and
-#   scheduled for removal in a future release.
-_AUDIO_DELTA_MODE = os.environ.get("VLLM_VIDEO_AUDIO_DELTA_MODE", "fast").lower()
-if _AUDIO_DELTA_MODE not in ("fast", "slow"):
-    logger.warning(
-        "VLLM_VIDEO_AUDIO_DELTA_MODE=%s not recognized; falling back to 'fast'",
-        _AUDIO_DELTA_MODE,
-    )
-    _AUDIO_DELTA_MODE = "fast"
 
-# Wire-level async-chunk kill switch.
-#   on  (default): emit text.delta / audio.delta to the WebSocket as the
-#                  engine produces them. Client sees streaming.
-#   off          : buffer all deltas server-side; emit one coalesced
-#                  text.done + one audio.delta + audio.done at the end.
-# This flag controls the *wire* only. The engine-internal thinker/talker/
-# code2wav overlap is unchanged — we do NOT delay talker handoff. So an
-# `off` vs `on` A/B measures what the client sees when the server chooses
-# not to stream, not the cost of turning engine-internal async_chunk off.
-# If a true engine-level A/B is needed, it belongs in the engine, not here.
-_ASYNC_CHUNK_MODE = os.environ.get("VLLM_VIDEO_ASYNC_CHUNK", "on").lower()
-if _ASYNC_CHUNK_MODE not in ("on", "off"):
-    logger.warning(
-        "VLLM_VIDEO_ASYNC_CHUNK=%s not recognized; falling back to 'on'",
-        _ASYNC_CHUNK_MODE,
-    )
-    _ASYNC_CHUNK_MODE = "on"
+def _decode_frame_bytes(raw_bytes: bytes) -> Any:
+    return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
 
 class StreamingVideoSessionConfig(BaseModel):
@@ -95,7 +68,7 @@ class StreamingVideoSessionConfig(BaseModel):
 
     model: str | None = None
     modalities: list[str] = Field(
-        default=["text", "audio"],
+        default_factory=lambda: ["text", "audio"],
         description="Output modalities: 'text', 'audio', or both.",
     )
     num_frames: int = Field(
@@ -168,7 +141,7 @@ class OmniStreamingVideoHandler:
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
-            frame_pil_cache: dict[str, tuple[Any, str]] = {}  # b64 -> (PIL.Image, uuid)
+            frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
             )
@@ -205,6 +178,11 @@ class OmniStreamingVideoHandler:
 
                         if not isinstance(msg, dict):
                             await self._send_error(websocket, "Messages must be JSON objects")
+                            continue
+
+                        msg_type = str(msg.get("type", ""))
+                        if msg_type.startswith("_internal."):
+                            await self._send_error(websocket, f"Unknown type: {msg_type}")
                             continue
 
                         await msg_queue.put(msg)
@@ -245,7 +223,17 @@ class OmniStreamingVideoHandler:
 
                     msg_type = msg.get("type")
 
-                    if msg_type == "video.frame":
+                    if msg_type == "_internal.frame_decode_failed":
+                        frame_data = msg.get("b64", "")
+                        removed = frame_data in frame_buffer
+                        if removed:
+                            frame_buffer[:] = [f for f in frame_buffer if f != frame_data]
+                        if frame_pil_cache.get(frame_data) is _BAD_FRAME:
+                            frame_pil_cache.pop(frame_data, None)
+                        if removed:
+                            await self._send_error(websocket, "Frame decode failed")
+
+                    elif msg_type == "video.frame":
                         frame_data = msg.get("data", "")
                         if not frame_data:
                             continue
@@ -253,13 +241,17 @@ class OmniStreamingVideoHandler:
                             await self._send_error(websocket, "Frame too large")
                             continue
                         try:
-                            raw_bytes = base64.b64decode(frame_data)
-                            Image.open(io.BytesIO(raw_bytes)).verify()
+                            raw_bytes = base64.b64decode(frame_data, validate=True)
                         except Exception:
                             await self._send_error(websocket, "Invalid image data")
                             continue
-                        if frame_filter is not None and not frame_filter.should_retain(raw_bytes):
-                            continue
+                        if frame_filter is not None:
+                            try:
+                                if not frame_filter.should_retain(raw_bytes):
+                                    continue
+                            except Exception:
+                                await self._send_error(websocket, "Invalid image data")
+                                continue
                         max_buf = config.max_frames
                         if len(frame_buffer) >= max_buf:
                             dropped = frame_buffer.pop(0)
@@ -268,17 +260,21 @@ class OmniStreamingVideoHandler:
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
                         if frame_data not in frame_pil_cache:
-                            mm_uuid = hashlib.md5(raw_bytes).hexdigest()
-
-                            def _decode(b: bytes) -> Any:
-                                return Image.open(io.BytesIO(b)).convert("RGB")
+                            mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
 
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
                                 try:
-                                    pil = await asyncio.to_thread(_decode, b)
+                                    pil = await asyncio.to_thread(_decode_frame_bytes, b)
                                     frame_pil_cache[b64] = (pil, u)
                                 except Exception:
-                                    logger.debug("prewarm decode failed", exc_info=True)
+                                    frame_pil_cache[b64] = _BAD_FRAME
+                                    logger.warning("prewarm decode failed for frame (len=%d)", len(b))
+                                    try:
+                                        msg_queue.put_nowait({"type": "_internal.frame_decode_failed", "b64": b64})
+                                    except asyncio.QueueFull:
+                                        logger.warning(
+                                            "frame decode failure event dropped because message queue is full"
+                                        )
 
                             task = asyncio.create_task(_prewarm(frame_data, raw_bytes, mm_uuid))
                             prewarm_tasks.add(task)
@@ -455,28 +451,21 @@ class OmniStreamingVideoHandler:
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
-        if self._engine_client is not None:
-            await self._process_query_engine(
-                websocket,
-                config,
-                frame_buffer,
-                audio_buffer,
-                message_history,
-                query_text,
-                request_id,
-                interrupt_event,
-                prewarmed_frames,
-            )
-        else:
-            await self._process_query_chat(
-                websocket,
-                config,
-                frame_buffer,
-                audio_buffer,
-                message_history,
-                query_text,
-                prewarmed_frames,
-            )
+        if self._engine_client is None:
+            await self._send_error(websocket, "Streaming video requires an engine client")
+            return
+
+        await self._process_query_engine(
+            websocket,
+            config,
+            frame_buffer,
+            audio_buffer,
+            message_history,
+            query_text,
+            request_id,
+            interrupt_event,
+            prewarmed_frames,
+        )
 
     # ------------------------------------------------------------------
     # Engine-client path (async_chunk audio streaming)
@@ -513,6 +502,9 @@ class OmniStreamingVideoHandler:
             "messages": messages,
             "stream": True,
             "modalities": config.modalities,
+            "add_generation_prompt": True,
+            "continue_final_message": False,
+            "add_special_tokens": False,
         }
         if config.use_audio_in_video and len(audio_buffer) > 0:
             request_kwargs["mm_processor_kwargs"] = {
@@ -546,10 +538,11 @@ class OmniStreamingVideoHandler:
         t_first_text = None
         t_first_audio = None
 
-        # Wire-level async-chunk switch (see _ASYNC_CHUNK_MODE). "off" means
+        # Wire-level async-chunk switch. "off" means
         # buffer all deltas server-side and flush once at the end; the engine
         # pipeline still overlaps internally.
-        streaming = _ASYNC_CHUNK_MODE == "on"
+        async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
+        streaming = async_chunk_mode == "on"
         audio_tail_tensors: list[Any] = []
 
         try:
@@ -651,7 +644,7 @@ class OmniStreamingVideoHandler:
             t_end = _time.monotonic()
             logger.info(
                 "[TIMING] mode=%s total=%.2fs first_text=%.2fs first_audio=%.2fs audio_chunks=%d",
-                _ASYNC_CHUNK_MODE,
+                async_chunk_mode,
                 t_end - t_start,
                 (t_first_text - t_start) if t_first_text else -1,
                 (t_first_audio - t_start) if t_first_audio else -1,
@@ -665,122 +658,6 @@ class OmniStreamingVideoHandler:
         if not text_done_sent:
             full_text = "".join(text_parts)
             await websocket.send_json({"type": "response.text.done", "text": full_text})
-
-    # ------------------------------------------------------------------
-    # Chat-service path (SSE fallback, no streaming audio)
-    # ------------------------------------------------------------------
-
-    async def _process_query_chat(
-        self,
-        websocket: WebSocket,
-        config: StreamingVideoSessionConfig,
-        frame_buffer: list[str],
-        audio_buffer: bytearray,
-        message_history: list[dict[str, Any]],
-        query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
-    ) -> None:
-        """Fallback path via chat_service.create_chat_completion()."""
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-        )
-
-        messages, user_message = self._build_messages(
-            config,
-            frame_buffer,
-            audio_buffer,
-            message_history,
-            query_text,
-            prewarmed_frames,
-        )
-
-        request_kwargs: dict[str, Any] = {
-            "model": config.model or "default",
-            "messages": messages,
-            "stream": True,
-            "modalities": config.modalities,
-        }
-        if config.use_audio_in_video and len(audio_buffer) > 0:
-            request_kwargs["mm_processor_kwargs"] = {
-                "use_audio_in_video": True,
-            }
-        if config.sampling_params_list:
-            request_kwargs["sampling_params_list"] = config.sampling_params_list
-
-        try:
-            request = ChatCompletionRequest(**request_kwargs)
-        except Exception as e:
-            await self._send_error(websocket, f"Failed to build request: {e}")
-            return
-
-        await websocket.send_json({"type": "response.start"})
-        full_text = ""
-        audio_b64 = ""
-        text_done_sent = False
-        _WAV_B64_PREFIX = "UklGR"  # RIFF header
-
-        try:
-            generator = await self._chat_service.create_chat_completion(
-                request,
-                raw_request=None,
-            )
-            if hasattr(generator, "__aiter__"):
-                async for chunk_str in generator:
-                    if not isinstance(chunk_str, str):
-                        continue
-                    for line in chunk_str.strip().split("\n"):
-                        line = line.strip()
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[len("data: ") :]
-                        if data_str == "[DONE]":
-                            continue
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        choices = data.get("choices", [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content")
-                        if content and isinstance(content, str):
-                            # async_chunk mode splices audio WAV b64 onto text content.
-                            wav_idx = content.find(_WAV_B64_PREFIX)
-                            if wav_idx >= 0:
-                                text_part = content[:wav_idx]
-                                audio_b64 += content[wav_idx:]
-                                if text_part:
-                                    full_text += text_part
-                                    await websocket.send_json({"type": "response.text.delta", "delta": text_part})
-                                if not text_done_sent:
-                                    await websocket.send_json({"type": "response.text.done", "text": full_text})
-                                    text_done_sent = True
-                            elif audio_b64:
-                                audio_b64 += content
-                            else:
-                                full_text += content
-                                await websocket.send_json({"type": "response.text.delta", "delta": content})
-        except Exception as e:
-            logger.error("Chat query failed: %s", e)
-            await self._send_error(websocket, f"Generation failed: {e}")
-            return
-
-        if not text_done_sent:
-            await websocket.send_json({"type": "response.text.done", "text": full_text})
-
-        if audio_b64 and "audio" in config.modalities:
-            await websocket.send_json(
-                {
-                    "type": "response.audio.delta",
-                    "data": audio_b64,
-                    "format": "wav",
-                }
-            )
-            await websocket.send_json({"type": "response.audio.done"})
-
-        message_history.append(user_message)
-        message_history.append({"role": "assistant", "content": full_text})
 
     # ------------------------------------------------------------------
     # Message building
@@ -813,6 +690,8 @@ class OmniStreamingVideoHandler:
         user_content: list[dict] = []
         for frame_b64 in frames:
             cached = prewarmed.get(frame_b64)
+            if cached is _BAD_FRAME:
+                continue
             if cached is not None:
                 pil, pil_uuid = cached
                 user_content.append(
@@ -894,7 +773,7 @@ class OmniStreamingVideoHandler:
         matter how many steps accumulated between reads (handles backpressure
         cleanly, unlike a simple ``audio_data[-1]``).
 
-        Two paths, selected at import time by ``VLLM_VIDEO_AUDIO_DELTA_MODE``:
+        Two paths, selected at runtime by ``VLLM_VIDEO_AUDIO_DELTA_MODE``:
           * fast — only D2H the new tail. Per-call cost ∝ new chunks.
           * slow — full cat + D2H each call. Per-call cost ∝ total history.
                    Retained for A/B; remove once downstream callers confirm.
@@ -903,7 +782,7 @@ class OmniStreamingVideoHandler:
         if audio_data is None:
             return None, chunks_drained
 
-        if _AUDIO_DELTA_MODE == "slow":
+        if video_stream_envs.VLLM_VIDEO_AUDIO_DELTA_MODE == "slow":
             return cls._delta_slow(audio_data, chunks_drained)
         return cls._delta_fast(audio_data, chunks_drained)
 
