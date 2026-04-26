@@ -379,9 +379,15 @@ class FishSpeechDACDecoder(nn.Module):
                 runtime_code_ids.append(flat_codes)
 
         if not has_runtime_codes and (input_ids is None or input_ids.numel() == 0):
+            # Output length must match the number of scheduled requests so the
+            # generation runner can unpack one multimodal output per request.
+            num_req = max(len(runtime_code_ids), 1)
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs={
+                    "model_outputs": [empty] * num_req,
+                    "sr": [sr_tensor] * num_req,
+                },
             )
 
         if has_runtime_codes:
