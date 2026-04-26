@@ -850,3 +850,83 @@ Interpretation:
   mostly the outer EngineCore tick once ready chunks are already queued. The
   bigger gap is upstream/downstream structure: Stage0 chunk production cadence,
   two-stage request lifecycle, response relay, and Stage0 unified decode.
+
+## 2026-04-26 re-baseline single-GPU; merged decode + V2 both blocked
+
+### Single-GPU re-baseline with direct worker + mixed bucket + batch=8
+
+Running the exact same `benchmark_output/run_fish_base_c10.py` workload with
+`CUDA_VISIBLE_DEVICES=3` only (Stage0 + Stage1 share one H20), on current
+`feat/fish-stage1-direct-worker-wip` HEAD:
+
+| Config | Req/s | Audio throughput | Mean TTFP | Mean RTF | Note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Direct worker + mixed bucket + batch=8 | 3.025 | 14.917 audio-s/s | 752 ms | 0.645 | Single H20 |
+
+This number is about 2.7x the earlier `5.556 audio-s/s` line in the table above.
+The earlier number was the 2-GPU (`3,2`) result with Stage1 on a separate GPU;
+single-GPU with the direct-worker path is actually higher because the
+cross-GPU handoff is the dominant bottleneck at c=10 on this workload, not
+Stage1 DAC throughput. The sglang c=10 comparison reference is `9.275`
+audio-s/s, so vllm-omni now sits ahead of sglang on this benchmark.
+
+### Merged decode on top of direct worker: audio truncation
+
+Tried `VLLM_FISH_MERGED_DECODE=1 VLLM_FISH_ALLOW_UNSAFE_UNIFIED_DECODE=1`
+layered on the best baseline. Every response came back with
+`audio_duration_s ~= 0.046s` (2 frames), i.e. the model emitted the
+semantic `<|im_end|>` token almost immediately. `mean_rtf` went to
+`20.16`, `audio_throughput` collapsed to `0.32` audio-s/s. Confirmed the
+warning in `gpu_ar_model_runner.py:153`: the Phase 2 inline sampler/code
+relay path is not safe to ship. Rolled back.
+
+Also fixed a real defensive bug found while triaging the above: when
+`runtime_additional_information` is non-empty but all entries lack
+`code_predictor_codes` and `input_ids` is empty, the DAC forward used to
+return a fixed length-1 list for `model_outputs`, which crashed EngineCore
+with `Multimodal output list for key 'model_outputs' has length 1 but
+expected N`. Now emits `[empty] * num_req` and `[sr_tensor] * num_req`.
+
+### Stage0 V2 single-graph unified decode: blocked by CUDA graph bake
+
+Attempted a new `VLLM_FISH_STAGE0_V2_UNIFIED=1` path, independent of
+Phase 2. Design:
+
+- runner arms the V2 path (`self.model._v2_armed = True`) only when the
+  scheduler step is pure-decode (`len(decode_req_ids) == len(req_ids)`);
+- `forward()` reads `self._v2_armed` and switches into a new code path
+  that does codebook inject + transformer + logits mask + sample + Fast AR
+  in one call, writing `_v2_output_codes` and `_v2_output_sampled_token`.
+
+Debug logs showed the runner armed the path correctly (`V2 arm check
+all_decode=True`) 20+ times on the first benchmark request, but the
+forward consistently observed `_v2_armed=False`. Root cause:
+
+- Stage0 compilation mode is `VLLM_COMPILE` with
+  `cudagraph_mode=FULL_AND_PIECEWISE` (not `enforce_eager`).
+- `capture_model` captures the forward path once with `_v2_armed=False`
+  (the default). The captured graph **bakes** the Python `if self._v2_armed`
+  branch at `_v2_armed=False`. Subsequent replays ignore the live Python
+  attribute and always take the non-V2 branch.
+
+Consequence: any approach that lives inside `forward()` and uses a Python
+bool/int as a branch selector will not be reached at runtime when Stage0
+is running in captured graphs. To actually run a merged decode path under
+captured graphs the whole V2 branch has to become tensor-mask code (no
+Python `if`), or the Stage0 model must be split into per-mode captured
+graphs and selected at dispatch time. Both are substantial work.
+
+Rolled back the V2 commits. Kept only the defensive DAC empty-batch fix.
+
+Takeaway for future work:
+
+- **Do not** try to add new forward-time behavior controlled by Python
+  booleans that the runner toggles. Any such code is only reached while
+  the path is not captured.
+- The remaining viable levers without touching Stage0 decode graphs are
+  Stage0 chunk production cadence, request lifecycle, response relay, and
+  decoupling the scheduler from EngineCore tick bursts. These are the
+  items that direct-worker already only partially addresses.
+- vLLM-omni Fish Speech is currently ahead of the sglang-omni c=10
+  reference on this hardware. Further gains should be measured against
+  TTFP/P99, not just mean throughput.
