@@ -535,6 +535,44 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         self._output_sampled_token[:bs] = semantic_token
 
+        # --- Diagnostic: log first N merged-decode samples so we can tell
+        # (A) "mask/params let im_end win on real decode hidden states" from
+        # (B) "prefill hidden gets fed here and poisons the buffer".
+        if (
+            os.environ.get("VLLM_FISH_MERGED_DECODE_DEBUG", "0") == "1"
+            and getattr(self, "_merged_dbg_steps", 0) < 12
+        ):
+            self._merged_dbg_steps = getattr(self, "_merged_dbg_steps", 0) + 1
+            try:
+                # Pick the first row; it's enough to disambiguate A vs B.
+                row0_logits = logits[0].detach().to(torch.float32)
+                vocab = row0_logits.shape[-1]
+                # Top-3 semantic candidates after mask.
+                top3_vals, top3_idx = torch.topk(row0_logits, 3)
+                # im_end tracker.
+                im_end_id = 151645
+                im_end_logit = float(row0_logits[im_end_id].item()) if im_end_id < vocab else float("-inf")
+                im_end_argmax = int(torch.argmax(row0_logits).item())
+                # Decode-rows context: is it a decode step (stable row count) or prefill?
+                decode_rows_preview = None
+                if self._decode_rows is not None:
+                    decode_rows_preview = self._decode_rows[: min(bs, 4)].detach().to("cpu").tolist()
+                logger.info(
+                    "MERGED_DEBUG step=%d bs=%d hidden_shape=%s decode_rows=%s "
+                    "sampled=%s top3_tok=%s top3_logit=%s im_end_logit=%.3f argmax=%d",
+                    self._merged_dbg_steps,
+                    bs,
+                    tuple(hidden_states.shape),
+                    decode_rows_preview,
+                    semantic_token.detach().to("cpu").tolist(),
+                    top3_idx.detach().to("cpu").tolist(),
+                    [round(float(v), 3) for v in top3_vals.detach().to("cpu").tolist()],
+                    im_end_logit,
+                    im_end_argmax,
+                )
+            except Exception as _e:
+                logger.info("MERGED_DEBUG failed to log: %s", _e)
+
         # 3. Fast AR codebook loop (re-prefill, all within the same graph).
         codes = self.fast_ar(
             slow_ar_hidden=h.reshape(bs, -1),
