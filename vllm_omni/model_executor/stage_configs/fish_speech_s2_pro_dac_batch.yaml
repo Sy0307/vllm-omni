@@ -1,3 +1,5 @@
+# Experimental config: Stage1 DAC micro-batch/bucket experiments.
+# Keep fish_speech_s2_pro.yaml at Stage1 max_num_seqs=1 by default.
 async_chunk: true
 stage_args:
   - stage_id: 0
@@ -7,7 +9,7 @@ stage_args:
       devices: "0"
       max_batch_size: 16
     engine_args:
-      max_num_seqs: 4
+      max_num_seqs: 8
       model_stage: fish_speech_slow_ar
       model_arch: FishSpeechSlowARForConditionalGeneration
       worker_type: ar
@@ -19,7 +21,7 @@ stage_args:
       engine_output_type: latent
       gpu_memory_utilization: 0.6
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 3072
+      max_num_batched_tokens: 8192
       max_model_len: 16384
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.fish_speech.slow_ar_to_dac_decoder_async_chunk
     output_connectors:
@@ -32,7 +34,6 @@ stage_args:
       seed: 42
       detokenize: false
       repetition_penalty: 1.0
-      # <|im_end|> token -- stop when model emits end-of-turn.
       stop_token_ids: [151645]
 
   - stage_id: 1
@@ -41,7 +42,7 @@ stage_args:
       devices: "0"
       max_batch_size: 16
     engine_args:
-      max_num_seqs: 1
+      max_num_seqs: 4
       model_stage: dac_decoder
       model_arch: FishSpeechDACDecoder
       worker_type: generation
@@ -84,8 +85,6 @@ runtime:
         connector_get_sleep_s: 0.001
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
-        # Chunk sizes for streaming -- ~21 Hz codec.
-        # First chunk is 4 frames; follow-up chunks are 25 frames.
         codec_chunk_frames: 25
         codec_left_context_frames: 25
         initial_codec_chunk_frames: 4

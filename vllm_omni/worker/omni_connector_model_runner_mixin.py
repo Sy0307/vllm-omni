@@ -1559,7 +1559,7 @@ class OmniConnectorModelRunnerMixin:
                 payload_consumable = incoming_payload_consumable
             else:
                 new_ids = payload_data.get("code_predictor_codes", [])
-                if not new_ids and not is_finished:
+                if not self._payload_value_has_content(new_ids) and not is_finished:
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
 

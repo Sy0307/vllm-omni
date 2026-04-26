@@ -103,6 +103,7 @@ class OrchestratorRequestState:
 
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
+    finished_stage_ids: set[int] = field(default_factory=set)
 
 
 class Orchestrator:
@@ -318,9 +319,13 @@ class Orchestrator:
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
         if finished and req_id in self._companion_ids:
+            req_state.finished_stage_ids.add(stage_id)
             await self._handle_cfg_companion_ready(req_id)
             self.request_states.pop(req_id, None)
             return
+
+        if finished:
+            req_state.finished_stage_ids.add(stage_id)
 
         if stage_client.final_output:
             await self.output_async_queue.put(
@@ -359,9 +364,14 @@ class Orchestrator:
             else:
                 await self._forward_to_next_stage(req_id, stage_id, output, req_state)
 
-        if finished and stage_id == req_state.final_stage_id:
+        if finished and self._can_cleanup_request_state(req_state):
             self._cleanup_companion_state(req_id)
             self.request_states.pop(req_id, None)
+
+    def _can_cleanup_request_state(self, req_state: OrchestratorRequestState) -> bool:
+        if not self.async_chunk:
+            return req_state.final_stage_id in req_state.finished_stage_ids
+        return all(stage_id in req_state.finished_stage_ids for stage_id in range(req_state.final_stage_id + 1))
 
     def _cleanup_companion_state(self, parent_id: str) -> None:
         """Remove all companion tracking state for a completed parent."""

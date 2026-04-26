@@ -7,7 +7,9 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 
 from __future__ import annotations
 
+import os
 import signal
+import time
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
@@ -23,7 +25,7 @@ from vllm.utils.system_utils import (
     get_mp_context,
     set_process_title,
 )
-from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.core import EngineCoreProc, EngineCoreRequestType
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -45,6 +47,281 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._fish_install_dac_ready_wakeup()
+
+    def _fish_dac_engine_side_loop_enabled(self) -> bool:
+        if os.environ.get("VLLM_FISH_DAC_ENGINE_SIDE_LOOP", "0") != "1":
+            return False
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        return (
+            getattr(model_config, "model_stage", "") == "dac_decoder"
+            and bool(getattr(model_config, "async_chunk", False))
+        )
+
+    def _fish_dac_direct_worker_enabled(self) -> bool:
+        if os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER", "0") != "1":
+            return False
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        return (
+            getattr(model_config, "model_stage", "") == "dac_decoder"
+            and bool(getattr(model_config, "async_chunk", False))
+        )
+
+    def _fish_dac_ready_wakeup_enabled(self) -> bool:
+        return (
+            os.environ.get("VLLM_FISH_DAC_READY_WAKEUP", "0") == "1"
+            and (
+                self._fish_dac_engine_side_loop_enabled()
+                or self._fish_dac_direct_worker_enabled()
+            )
+        )
+
+    def _fish_dac_has_ready_side_work(self) -> bool:
+        scheduler = getattr(self, "scheduler", None)
+        probe = getattr(scheduler, "fish_dac_has_ready_work", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("Fish DAC side-loop readiness probe failed", exc_info=True)
+            return False
+
+    def _fish_input_queue_empty(self) -> bool:
+        input_queue = getattr(self, "input_queue", None)
+        if input_queue is None:
+            return True
+        try:
+            return bool(input_queue.empty())
+        except Exception:
+            logger.debug("Fish DAC input queue probe failed", exc_info=True)
+            return False
+
+    def _fish_install_dac_ready_wakeup(self) -> None:
+        if not self._fish_dac_ready_wakeup_enabled():
+            return
+        scheduler = getattr(self, "scheduler", None)
+        adapter = getattr(scheduler, "chunk_transfer_adapter", None)
+        register = getattr(adapter, "set_ready_callback", None)
+        if not callable(register):
+            return
+        register(self._fish_dac_ready_wakeup)
+
+    def _fish_dac_ready_wakeup(self) -> None:
+        input_queue = getattr(self, "input_queue", None)
+        if input_queue is None:
+            return
+        try:
+            input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+        except Exception:
+            logger.debug("Fish DAC ready wakeup failed", exc_info=True)
+
+    def has_work(self) -> bool:
+        if (
+            self._fish_dac_ready_wakeup_enabled()
+            and self._fish_dac_has_ready_side_work()
+        ):
+            return True
+        return super().has_work()
+
+    def _process_engine_step(self) -> bool:
+        """Run one or more Stage1 DAC steps before returning to the busy loop.
+
+        The default vLLM loop performs one schedule/execute/update cycle per
+        outer EngineCore tick.  For Fish DAC chunks this leaves throughput on
+        the table because the recv thread can make the next chunk ready
+        immediately after the current decode.  In side-loop mode, Stage1 keeps
+        consuming already-ready DAC chunks and pushes each EngineCoreOutputs
+        object directly to the normal output queue.
+        """
+        if self._fish_dac_direct_worker_enabled():
+            handled, model_executed = self._fish_dac_process_direct_worker()
+            if handled:
+                return model_executed
+
+        if not self._fish_dac_engine_side_loop_enabled():
+            return super()._process_engine_step()
+
+        max_steps = max(
+            1,
+            int(os.environ.get("VLLM_FISH_DAC_ENGINE_SIDE_LOOP_MAX_STEPS", "8") or 8),
+        )
+        wait_s = max(
+            0.0,
+            float(os.environ.get("VLLM_FISH_DAC_ENGINE_SIDE_LOOP_WAIT_US", "0") or 0) / 1_000_000.0,
+        )
+        idle_budget_s = max(
+            0.0,
+            float(os.environ.get("VLLM_FISH_DAC_ENGINE_SIDE_LOOP_IDLE_US", "0") or 0) / 1_000_000.0,
+        )
+        poll_s = max(
+            0.0,
+            float(os.environ.get("VLLM_FISH_DAC_ENGINE_SIDE_LOOP_POLL_US", "100") or 100) / 1_000_000.0,
+        )
+        profile = os.environ.get("VLLM_FISH_DAC_ENGINE_SIDE_LOOP_PROFILE", "0") == "1"
+
+        model_executed_any = False
+        saw_empty_step = False
+        steps = 0
+        outputs_sent = 0
+        idle_polls = 0
+
+        while steps < max_steps:
+            outputs, model_executed = self.step_fn()
+            steps += 1
+            model_executed_any = model_executed_any or model_executed
+            saw_empty_step = saw_empty_step or not model_executed
+
+            for output in outputs.items() if outputs else ():
+                self.output_queue.put_nowait(output)
+                outputs_sent += 1
+
+            self.post_step(model_executed)
+
+            if not model_executed:
+                break
+            if steps >= max_steps:
+                break
+            if not self.input_queue.empty():
+                break
+            if self._fish_dac_has_ready_side_work():
+                continue
+            if idle_budget_s > 0 and self.scheduler.has_unfinished_requests():
+                deadline = time.monotonic() + idle_budget_s
+                ready_after_idle = False
+                while time.monotonic() < deadline and self.input_queue.empty():
+                    if poll_s > 0:
+                        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+                    idle_polls += 1
+                    if self._fish_dac_has_ready_side_work():
+                        ready_after_idle = True
+                        break
+                if ready_after_idle:
+                    continue
+            if wait_s > 0 and self.scheduler.has_unfinished_requests():
+                time.sleep(wait_s)
+                if self._fish_dac_has_ready_side_work():
+                    continue
+            break
+
+        if saw_empty_step and self.scheduler.has_unfinished_requests():
+            time.sleep(0.001)
+
+        if profile and (steps > 1 or outputs_sent):
+            logger.info(
+                "Fish DAC engine side loop: steps=%d model_executed=%s outputs=%d "
+                "idle_polls=%d has_more_ready=%s",
+                steps,
+                model_executed_any,
+                outputs_sent,
+                idle_polls,
+                self._fish_dac_has_ready_side_work(),
+            )
+
+        return model_executed_any
+
+    def _fish_dac_process_direct_worker(self) -> tuple[bool, bool]:
+        scheduler = getattr(self, "scheduler", None)
+        schedule_worker = getattr(scheduler, "fish_dac_worker_schedule", None)
+        update_worker = getattr(scheduler, "fish_dac_worker_update", None)
+        if not callable(schedule_worker) or not callable(update_worker):
+            return False, False
+
+        max_steps = max(
+            1,
+            int(os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER_MAX_STEPS", "8") or 8),
+        )
+        idle_budget_s = max(
+            0.0,
+            float(os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER_IDLE_US", "0") or 0) / 1_000_000.0,
+        )
+        poll_s = max(
+            0.0,
+            float(os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER_POLL_US", "100") or 100) / 1_000_000.0,
+        )
+        profile = os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER_PROFILE", "0") == "1"
+
+        handled_any = False
+        model_executed_any = False
+        outputs_sent = 0
+        idle_polls = 0
+        steps = 0
+
+        while steps < max_steps:
+            scheduler_output = schedule_worker()
+            if scheduler_output is None:
+                if not handled_any:
+                    return False, False
+                if (
+                    idle_budget_s <= 0
+                    or not self._fish_input_queue_empty()
+                    or not self.scheduler.has_unfinished_requests()
+                ):
+                    break
+                deadline = time.monotonic() + idle_budget_s
+                became_ready = False
+                while time.monotonic() < deadline and self._fish_input_queue_empty():
+                    if poll_s > 0:
+                        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+                    idle_polls += 1
+                    if self._fish_dac_has_ready_side_work():
+                        became_ready = True
+                        break
+                if became_ready:
+                    continue
+                break
+
+            handled_any = True
+            model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if not model_executed:
+                break
+
+            future = self.model_executor.execute_model(
+                scheduler_output,
+                non_block=True,
+            )
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.log_error_detail(scheduler_output),
+                self.log_iteration_details(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+
+            self._process_aborts_queue()
+            outputs = update_worker(scheduler_output, model_output)
+            for output in outputs.items() if outputs else ():
+                self.output_queue.put_nowait(output)
+                outputs_sent += 1
+            self.post_step(model_executed)
+            model_executed_any = True
+            steps += 1
+
+            if steps >= max_steps:
+                break
+            if not self._fish_input_queue_empty():
+                break
+            if self._fish_dac_has_ready_side_work():
+                continue
+            if idle_budget_s <= 0 or not self.scheduler.has_unfinished_requests():
+                break
+
+        if profile and handled_any:
+            logger.info(
+                "Fish DAC direct worker: steps=%d model_executed=%s outputs=%d "
+                "idle_polls=%d has_more_ready=%s",
+                steps,
+                model_executed_any,
+                outputs_sent,
+                idle_polls,
+                self._fish_dac_has_ready_side_work(),
+            )
+
+        return handled_any, model_executed_any
 
     @staticmethod
     def run_stage_core(

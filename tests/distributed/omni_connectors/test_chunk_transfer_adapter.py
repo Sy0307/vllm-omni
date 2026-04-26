@@ -120,6 +120,28 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._pending_load_reqs
 
 
+def test_load_poll_non_ar_tensor_codes_use_placeholder_tokens(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+
+    adapter.load_async(request)
+    codes = torch.arange(20, dtype=torch.long)
+    payload = {
+        "code_predictor_codes": codes,
+        "next_stage_prompt_len": 20,
+        "left_context_size": 1,
+        "finished": False,
+    }
+    connector.get.return_value = (payload, 16)
+    adapter._poll_single_request(request)
+
+    assert request.prompt_token_ids == [0] * 20
+    assert torch.equal(request.additional_information["code_predictor_codes"], codes)
+    assert request.additional_information["left_context_size"] == 1
+    assert adapter.get_req_chunk["req-1"] == 1
+    assert "req-1" in adapter._finished_load_reqs
+
+
 def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -196,6 +218,103 @@ def test_postprocess_scheduler_output(build_adapter):
     assert cached_info["cached-ready"] == {"k": "v"}
     assert cached_info["missing"] is None
     assert adapter.requests_with_ready_chunks == {"leftover"}
+
+
+def test_ready_queue_drains_recv_thread_chunks(build_adapter, monkeypatch):
+    monkeypatch.setenv("VLLM_FISH_DAC_READY_QUEUE", "1")
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    req1 = _req("req-1", RequestStatus.WAITING)
+    req2 = _req("req-2", RequestStatus.RUNNING)
+    adapter.waiting_for_chunk_waiting_requests.append(req1)
+    adapter.waiting_for_chunk_running_requests.append(req2)
+    adapter._finished_load_reqs.update({"req-1", "req-2"})
+    adapter.requests_with_ready_chunks.update({"req-1", "req-2"})
+
+    adapter._mark_ready_chunk(req1)
+    adapter._mark_ready_chunk(req2)
+
+    assert adapter.has_ready_chunks() is True
+    drained = adapter.drain_ready_chunks(1)
+
+    assert drained == [req1]
+    assert "req-1" not in adapter._finished_load_reqs
+    assert "req-1" not in adapter.requests_with_ready_chunks
+    assert list(adapter.waiting_for_chunk_waiting_requests) == []
+    assert list(adapter.waiting_for_chunk_running_requests) == [req2]
+    assert adapter.has_ready_chunks() is True
+
+
+def test_ready_queue_also_drains_finished_side_queue_chunks(build_adapter, monkeypatch):
+    monkeypatch.setenv("VLLM_FISH_DAC_READY_QUEUE", "1")
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    queued_req = _req("queued", RequestStatus.WAITING)
+    just_finished_req = _req("just-finished", RequestStatus.RUNNING)
+    adapter.waiting_for_chunk_waiting_requests.append(queued_req)
+    adapter.waiting_for_chunk_running_requests.append(just_finished_req)
+    adapter._finished_load_reqs.update({"queued", "just-finished"})
+    adapter.requests_with_ready_chunks.update({"queued", "just-finished"})
+    adapter._mark_ready_chunk(queued_req)
+
+    drained = adapter.drain_ready_chunks(4)
+
+    assert drained == [queued_req, just_finished_req]
+    assert adapter._finished_load_reqs == set()
+    assert adapter.requests_with_ready_chunks == set()
+    assert list(adapter.waiting_for_chunk_waiting_requests) == []
+    assert list(adapter.waiting_for_chunk_running_requests) == []
+
+
+def test_ready_probe_sees_finished_side_queue_chunks(build_adapter, monkeypatch):
+    monkeypatch.setenv("VLLM_FISH_DAC_READY_QUEUE", "1")
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    just_finished_req = _req("just-finished", RequestStatus.RUNNING)
+    adapter.waiting_for_chunk_running_requests.append(just_finished_req)
+    adapter._finished_load_reqs.add("just-finished")
+
+    assert adapter.has_ready_chunks() is True
+
+
+def test_ready_queue_wakeup_callback_fires_when_chunk_arrives(build_adapter, monkeypatch):
+    monkeypatch.setenv("VLLM_FISH_DAC_READY_QUEUE", "1")
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    req = _req("req-1", RequestStatus.WAITING)
+    calls = []
+    adapter.set_ready_callback(lambda: calls.append("wake"))
+
+    adapter._mark_ready_chunk(req)
+    adapter._mark_ready_chunk(req)
+
+    assert calls == ["wake"]
+
+
+def test_prepend_ready_chunks_restores_direct_worker_leftovers(build_adapter, monkeypatch):
+    monkeypatch.setenv("VLLM_FISH_DAC_READY_QUEUE", "1")
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    req1 = _req("req-1", RequestStatus.WAITING)
+    req2 = _req("req-2", RequestStatus.WAITING)
+
+    adapter.prepend_ready_chunks([req1, req2])
+
+    assert adapter.drain_ready_chunks(2) == [req1, req2]
+
+
+def test_rearm_running_chunk_request_moves_live_request_to_side_queue(build_adapter, monkeypatch):
+    monkeypatch.setenv("VLLM_FISH_DAC_READY_QUEUE", "1")
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    req = _req("req-1", RequestStatus.RUNNING, external_req_id="external-1")
+    adapter.requests_with_ready_chunks.add(req.request_id)
+    adapter._finished_load_reqs.add(req.request_id)
+    adapter._mark_ready_chunk(req)
+
+    assert adapter.rearm_running_chunk_request(req) is True
+
+    assert req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert list(adapter.waiting_for_chunk_running_requests) == [req]
+    assert list(adapter._pending_load_reqs) == [req]
+    assert adapter.request_ids_mapping[req.request_id] == "external-1"
+    assert req.request_id not in adapter.requests_with_ready_chunks
+    assert req.request_id not in adapter._finished_load_reqs
+    assert adapter.has_ready_chunks() is False
 
 
 # ---------------------------------------------------------------

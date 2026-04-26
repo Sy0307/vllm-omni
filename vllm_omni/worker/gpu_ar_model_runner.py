@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -140,7 +141,45 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
     def capture_model(self) -> int:
+        # Setup merged/unified decode BEFORE graph capture so forward()
+        # includes codebook injection + inline sampling + Fast AR.
+        # VLLM_FISH_MERGED_DECODE=1: full merge (eliminates talker_mtp)
+        # VLLM_FISH_UNIFIED_DECODE=1: partial merge (inline sampling only)
+        import os
+        merged = os.environ.get("VLLM_FISH_MERGED_DECODE", "0") == "1"
+        unified_only = os.environ.get("VLLM_FISH_UNIFIED_DECODE", "0") == "1"
+        allow_unified_experiment = os.environ.get("VLLM_FISH_ALLOW_UNSAFE_UNIFIED_DECODE", "0") == "1"
+        if (merged or unified_only) and not allow_unified_experiment:
+            logger.warning(
+                "VLLM_FISH_MERGED_DECODE/VLLM_FISH_UNIFIED_DECODE are disabled by default: "
+                "the current inline sampler/code relay path is experimental and can truncate Fish Speech audio. "
+                "Set VLLM_FISH_ALLOW_UNSAFE_UNIFIED_DECODE=1 only for controlled profiling."
+            )
+            merged = False
+            unified_only = False
+
+        if (merged or unified_only) and not getattr(self.model, "_unified_decode", False):
+            setup_name = "setup_merged_decode" if merged else "setup_unified_decode"
+            setup_fn = getattr(self.model, setup_name, None)
+            if callable(setup_fn):
+                max_bs = max(
+                    self.scheduler_config.max_num_seqs,
+                    self.compilation_config.max_cudagraph_capture_size,
+                )
+                setup_fn(max_bs, self.device)
+                logger.info(
+                    "Fish unified decode setup: max_batch_size=%d, merged=%s",
+                    max_bs,
+                    merged,
+                )
+
         result = super().capture_model()
+
+        # Set _codes_valid so talker_mtp graph captures the buffer-read
+        # path instead of the Fast AR re-computation path.
+        if getattr(self.model, "_unified_decode", False):
+            self.model._codes_valid = True
+
         self._capture_talker_mtp_graphs()
         return result
 
@@ -732,6 +771,93 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        post_sample_codes_cpu: dict[str, torch.Tensor] = {}
+        fish_cuda_ipc_relay = os.environ.get("VLLM_FISH_CUDA_IPC_RELAY", "0") == "1"
+        fish_cuda_ipc_stage0 = (
+            fish_cuda_ipc_relay
+            and os.environ.get("VLLM_FISH_CUDA_IPC_STAGE0", "0") == "1"
+        )
+        if (
+            getattr(self.model, "_post_sample_codebook", False)
+            and isinstance(sample_hidden_states, torch.Tensor)
+            and valid_sampled_token_ids
+        ):
+            with record_function_or_nullcontext("gpu_model_runner: fish_post_sample_codebook"):
+                sem_begin = getattr(self.model, "_semantic_begin_id", 0)
+                sem_end = getattr(self.model, "_semantic_end_id", 0)
+                hidden_row_indices: list[int] = []
+                token_ids: list[int] = []
+                code_req_ids: list[str] = []
+                for rid in req_ids_output_copy:
+                    idx = req_id_to_index_output_copy.get(rid)
+                    if idx is None or idx >= len(valid_sampled_token_ids):
+                        continue
+                    ids = valid_sampled_token_ids[idx]
+                    if not ids:
+                        continue
+                    tok = int(ids[0])
+                    if tok < sem_begin or tok > sem_end:
+                        continue
+                    if idx >= int(sample_hidden_states.shape[0]):
+                        continue
+                    hidden_row_indices.append(idx)
+                    token_ids.append(tok)
+                    code_req_ids.append(rid)
+
+                if hidden_row_indices:
+                    from vllm_omni.worker.gpu_model_runner import CUDAGraphWrapper
+
+                    row_indices = torch.tensor(hidden_row_indices, device=self.device, dtype=torch.long)
+                    h = sample_hidden_states.index_select(0, row_indices).to(device=self.device, dtype=torch.bfloat16)
+                    toks = torch.tensor(token_ids, device=self.device, dtype=torch.long)
+                    decode_batch_size = len(hidden_row_indices)
+                    _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+                        num_tokens=decode_batch_size,
+                        num_reqs=decode_batch_size,
+                        num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
+                        max_num_scheduled_tokens=1,
+                        use_cascade_attn=False,
+                    )
+                    if not isinstance(self.talker_mtp, CUDAGraphWrapper):
+                        _cudagraph_mode = CUDAGraphMode.NONE
+                        num_tokens_padded = decode_batch_size
+                    else:
+                        num_tokens_padded = batch_desc.num_tokens
+
+                    req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+                    req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+                    last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+                    text_step = self.text_step.gpu[:num_tokens_padded]
+                    req_input_ids[:decode_batch_size].copy_(toks)
+                    embeds = self.model.embed_input_ids(toks.reshape(-1, 1).to(torch.long)).reshape(decode_batch_size, -1)
+                    req_embeds[:decode_batch_size].copy_(embeds.to(device=self.device, dtype=self.dtype))
+                    last_talker_hidden[:decode_batch_size].copy_(h.reshape(decode_batch_size, -1))
+                    text_step[:decode_batch_size].zero_()
+
+                    with set_forward_context(
+                        None,
+                        self.vllm_config,
+                        cudagraph_runtime_mode=_cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                    ):
+                        _, codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
+                    codes = codes[:decode_batch_size]
+                    out_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
+                    codes_cpu = None if fish_cuda_ipc_stage0 else codes.detach().to("cpu").contiguous()
+                    for row, rid in enumerate(code_req_ids):
+                        one = codes[row : row + 1]
+                        self._update_intermediate_buffer(
+                            rid,
+                            {
+                                "_post_sample_prev_codes": one,
+                            },
+                        )
+                        self.model_intermediate_buffer.get(rid, {}).pop(out_key, None)
+                        if codes_cpu is None:
+                            post_sample_codes_cpu[rid] = one.detach().contiguous()
+                        else:
+                            post_sample_codes_cpu[rid] = codes_cpu[row : row + 1]
+
         # kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
@@ -749,19 +875,35 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
+        inline_dac_flush_cpu: dict[str, torch.Tensor] = {}
+        if valid_sampled_token_ids and getattr(self.model, "_inline_dac", False):
+            with record_function_or_nullcontext("gpu_model_runner: fish_inline_dac_finish_flush"):
+                inline_dac_flush_cpu = self._flush_inline_dac_on_finished_samples(
+                    req_ids_output_copy,
+                    req_id_to_index_output_copy,
+                    valid_sampled_token_ids,
+                )
+
         # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
         # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
         mm_cpu: dict[str, object] = {}
         if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+            fish_code_output_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
             for k, v in multimodal_outputs.items():
                 try:
                     if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                        mm_cpu[k] = v.detach().to("cpu").contiguous()
+                        if fish_cuda_ipc_stage0 and k == fish_code_output_key:
+                            mm_cpu[k] = v.detach().contiguous()
+                        else:
+                            mm_cpu[k] = v.detach().to("cpu").contiguous()
                     elif isinstance(v, dict):
                         sub_dict: dict[str, torch.Tensor] = {}
                         for sk, sv in v.items():
                             if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
-                                sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
+                                if fish_cuda_ipc_stage0 and str(sk) == fish_code_output_key:
+                                    sub_dict[str(sk)] = sv.detach().contiguous()
+                                else:
+                                    sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
                         if sub_dict:
                             mm_cpu[k] = sub_dict
                     elif isinstance(v, list):
@@ -805,6 +947,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     else:
                         mm_payload[k] = v
                 payload.update(mm_payload)
+            if rid in post_sample_codes_cpu:
+                payload[getattr(self.model, "talker_mtp_output_key", "audio_codes")] = post_sample_codes_cpu[rid]
+            if rid in inline_dac_flush_cpu:
+                flush_wav = inline_dac_flush_cpu[rid]
+                prev_wav = payload.get("model_outputs")
+                if isinstance(prev_wav, torch.Tensor) and prev_wav.numel() > 0:
+                    payload["model_outputs"] = torch.cat(
+                        [prev_wav.reshape(-1), flush_wav.reshape(-1)]
+                    ).contiguous()
+                else:
+                    payload["model_outputs"] = flush_wav.reshape(-1).contiguous()
+                if "sr" not in payload:
+                    payload["sr"] = torch.tensor(
+                        int(getattr(self.model, "_dac_sample_rate", 44100)),
+                        dtype=torch.int32,
+                    )
             pooler_output.append(payload)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
@@ -847,6 +1005,62 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
         return async_output
+
+    def _flush_inline_dac_on_finished_samples(
+        self,
+        req_ids_output_copy: list[str],
+        req_id_to_index_output_copy: dict[str, int],
+        valid_sampled_token_ids: list[list[int]],
+    ) -> dict[str, torch.Tensor]:
+        flush = getattr(self.model, "flush_inline_dac", None)
+        if not callable(flush):
+            return {}
+
+        flushed: dict[str, torch.Tensor] = {}
+        for rid in req_ids_output_copy:
+            idx = req_id_to_index_output_copy.get(rid)
+            if idx is None or idx >= len(valid_sampled_token_ids):
+                continue
+            sampled_ids = valid_sampled_token_ids[idx]
+            if not self._fish_sample_contains_stop(rid, sampled_ids):
+                continue
+            req_info = self.model_intermediate_buffer.get(rid)
+            if not isinstance(req_info, dict):
+                continue
+            try:
+                delta = flush(req_info)
+            except Exception as exc:
+                logger.error("Inline DAC finish flush failed for request %s: %s", rid, exc)
+                continue
+            if isinstance(delta, torch.Tensor) and delta.numel() > 0:
+                flushed[rid] = delta.detach().to("cpu").contiguous()
+        return flushed
+
+    def _fish_sample_contains_stop(self, req_id: str, sampled_ids: list[int]) -> bool:
+        if not sampled_ids:
+            return False
+
+        stop_ids: set[int] = set()
+        req_state = self.requests.get(req_id)
+        sampling_params = getattr(req_state, "sampling_params", None)
+        if sampling_params is not None:
+            for attr in ("stop_token_ids", "all_stop_token_ids"):
+                ids = getattr(sampling_params, attr, None)
+                if ids is None:
+                    continue
+                try:
+                    stop_ids.update(int(tok) for tok in ids)
+                except TypeError:
+                    stop_ids.add(int(ids))
+
+        if any(int(tok) in stop_ids for tok in sampled_ids):
+            return True
+
+        sem_begin = getattr(self.model, "_semantic_begin_id", None)
+        sem_end = getattr(self.model, "_semantic_end_id", None)
+        if sem_begin is None or sem_end is None:
+            return False
+        return any(int(tok) < int(sem_begin) or int(tok) > int(sem_end) for tok in sampled_ids)
 
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""

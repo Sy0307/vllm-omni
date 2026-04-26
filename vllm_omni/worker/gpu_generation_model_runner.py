@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 from copy import copy
+from typing import Any
 
 import numpy as np
 import torch
@@ -79,6 +81,138 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if self.uses_mrope:
                 self._init_mrope_positions(req_state)
 
+    def _fish_dac_runner_fastpath_enabled(self) -> bool:
+        return (
+            (
+                os.environ.get("VLLM_FISH_DAC_RUNNER_FASTPATH", "0") == "1"
+                or os.environ.get("VLLM_FISH_DAC_SCHED_FASTPATH", "0") == "1"
+            )
+            and getattr(self.model_config, "model_stage", "") == "dac_decoder"
+            and getattr(self.model_config, "async_chunk", False)
+            and hasattr(self.model, "forward")
+        )
+
+    @staticmethod
+    def _fish_dac_collect_runtime_infos(
+        scheduler_output: SchedulerOutput,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        req_ids: list[str] = []
+        runtime_infos: list[dict[str, Any]] = []
+
+        for req_data in scheduler_output.scheduled_new_reqs:
+            req_id = getattr(req_data, "req_id", None)
+            if not req_id:
+                continue
+            info = getattr(req_data, "additional_information", None)
+            req_ids.append(req_id)
+            runtime_infos.append(dict(info) if isinstance(info, dict) else {})
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        cached_infos = getattr(cached_reqs, "additional_information", {}) or {}
+        for req_id in cached_reqs.req_ids:
+            info = cached_infos.get(req_id)
+            req_ids.append(req_id)
+            runtime_infos.append(dict(info) if isinstance(info, dict) else {})
+
+        return req_ids, runtime_infos
+
+    @staticmethod
+    def _omni_multimodal_outputs_to_pooler_output(
+        multimodal_outputs: Any,
+        num_reqs: int,
+    ) -> list[object]:
+        pooler_output: list[object] = []
+        if isinstance(multimodal_outputs, torch.Tensor):
+            if multimodal_outputs.shape[0] != num_reqs:
+                raise ValueError(
+                    f"Tensor multimodal output has batch {multimodal_outputs.shape[0]}, "
+                    f"expected {num_reqs}"
+                )
+            for i in range(num_reqs):
+                pooler_output.append(
+                    {"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()}
+                )
+        elif isinstance(multimodal_outputs, list):
+            if len(multimodal_outputs) != num_reqs:
+                if len(multimodal_outputs) == 1 and num_reqs == 1:
+                    pass
+                else:
+                    raise ValueError(
+                        f"List multimodal output has length {len(multimodal_outputs)}, "
+                        f"expected {num_reqs}"
+                    )
+            for out in multimodal_outputs:
+                pooler_output.append(
+                    {
+                        "model_outputs": (
+                            out.detach().to("cpu").contiguous()
+                            if isinstance(out, torch.Tensor)
+                            else None
+                        )
+                    }
+                )
+        elif isinstance(multimodal_outputs, dict):
+            for i in range(num_reqs):
+                mm_payload = {}
+                for key, out in multimodal_outputs.items():
+                    if isinstance(out, list):
+                        if len(out) != num_reqs:
+                            raise ValueError(
+                                f"Multimodal output list for key '{key}' has length {len(out)} "
+                                f"but expected {num_reqs} (one entry per request)."
+                            )
+                        item = out[i]
+                        if isinstance(item, torch.Tensor):
+                            mm_payload[key] = item.detach().to("cpu").contiguous()
+                        elif item is not None:
+                            mm_payload[key] = item
+                    elif isinstance(out, torch.Tensor):
+                        mm_payload[key] = out.detach().to("cpu").contiguous()
+                    elif out is not None:
+                        logger.warning("Unsupported multimodal output type for key '%s': %s", key, type(out))
+                pooler_output.append(mm_payload)
+        else:
+            raise RuntimeError("Unsupported diffusion output type")
+        return pooler_output
+
+    @torch.inference_mode()
+    def _try_execute_fish_dac_runner_fastpath(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> OmniModelRunnerOutput | None:
+        if not self._fish_dac_runner_fastpath_enabled():
+            return None
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        req_ids, runtime_infos = self._fish_dac_collect_runtime_infos(scheduler_output)
+        if not req_ids:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        outputs = self.model.forward(
+            input_ids=None,
+            positions=None,
+            runtime_additional_information=runtime_infos,
+        )
+        _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
+        pooler_output = self._omni_multimodal_outputs_to_pooler_output(
+            multimodal_outputs,
+            len(req_ids),
+        )
+        req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
+        return OmniModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=pooler_output,
+            kv_connector_output=None,
+            num_nans_in_logits={},
+            cudagraph_stats=None,
+            ec_connector_output=None,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -87,6 +221,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     ) -> OmniModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        fish_dac_fastpath_output = self._try_execute_fish_dac_runner_fastpath(
+            scheduler_output
+        )
+        if fish_dac_fastpath_output is not None:
+            return fish_dac_fastpath_output
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -364,41 +504,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
-        pooler_output: list[object] = []
-        if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
-                pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
-        elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
-            for out in multimodal_outputs:
-                pooler_output.append(
-                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
-                )
-        elif isinstance(multimodal_outputs, dict):
-            num_reqs = self.input_batch.num_reqs
-            for i in range(num_reqs):
-                mm_payload = {}
-                for key, out in multimodal_outputs.items():
-                    if isinstance(out, list):
-                        if len(out) != num_reqs:
-                            raise ValueError(
-                                f"Multimodal output list for key '{key}' has length {len(out)} "
-                                f"but expected {num_reqs} (one entry per request)."
-                            )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
-                    elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = out.detach().to("cpu").contiguous()
-                    else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                pooler_output.append(mm_payload)
-        else:
-            raise RuntimeError("Unsupported diffusion output type")
+        pooler_output = self._omni_multimodal_outputs_to_pooler_output(
+            multimodal_outputs,
+            self.input_batch.num_reqs,
+        )
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()

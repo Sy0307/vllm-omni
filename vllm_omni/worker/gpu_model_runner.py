@@ -1228,6 +1228,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+            _is_unified = getattr(self.model, "_unified_decode", False)
+            _is_merged = getattr(self.model, "_merged_decode", False)
+            _is_post_sample_codebook = getattr(self.model, "_post_sample_codebook", False)
+            if _is_unified and getattr(self.model, "_decode_rows", None) is not None:
+                self.model._decode_rows.fill_(-1)
+            if _is_merged and getattr(self.model, "_vq_mask", None) is not None:
+                self.model._vq_mask.zero_()
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1253,12 +1260,67 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
 
                 if self.has_talker_mtp and span_len == 1:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
+                    decode_idx = len(decode_req_ids)
+                    if _is_unified and getattr(self.model, "_decode_rows", None) is not None:
+                        self.model._decode_rows[decode_idx] = s
+                    if _is_post_sample_codebook:
+                        prev_codes = self.model_intermediate_buffer.get(req_id, {}).get("_post_sample_prev_codes")
+                        if isinstance(prev_codes, torch.Tensor) and prev_codes.numel() > 0:
+                            codes = prev_codes.to(device=self.device, dtype=torch.long, non_blocking=True).reshape(
+                                -1, getattr(self.model, "_num_codebooks", 10)
+                            )[:1]
+                            inject_fn = getattr(self.model, "inject_codebook_embeddings", None)
+                            if callable(inject_fn):
+                                req_embeds = inject_fn(req_input_ids, req_embeds, codes)
+                    elif _is_merged:
+                        # Merged decode: set VQ mask and VQ codes for this decode request.
+                        # Codebook injection happens inside forward(), not talker_mtp.
+                        tok = int(req_input_ids[0].item()) if isinstance(req_input_ids, torch.Tensor) else int(req_input_ids)
+                        sem_begin = getattr(self.model, "_semantic_begin_id", 0)
+                        sem_end = getattr(self.model, "_semantic_end_id", 0)
+                        is_semantic = sem_begin <= tok <= sem_end
+
+                        buf = self.model_intermediate_buffer.get(req_id, {})
+                        prev_codes = buf.get("_merged_prev_codes")
+                        codes_for_token = None
+
+                        if is_semantic and isinstance(prev_codes, torch.Tensor) and prev_codes.numel() > 0:
+                            codes_for_token = prev_codes.to(
+                                device=self.device, dtype=torch.long, non_blocking=True
+                            ).reshape(-1, getattr(self.model, "_num_codebooks", 10))[:1]
+                        elif is_semantic:
+                            # First decode step after prefill: run Fast AR eagerly
+                            # from the stored prefill hidden so the first audio
+                            # frame is emitted and conditioning is correct.
+                            last_h = buf.get("last_slow_ar_hidden")
+                            if isinstance(last_h, torch.Tensor):
+                                with torch.no_grad():
+                                    h = last_h.to(device=self.device, dtype=torch.bfloat16).reshape(1, -1)
+                                    tok_t = torch.tensor([tok], device=self.device, dtype=torch.long)
+                                    codes_for_token = self.model.fast_ar(
+                                        slow_ar_hidden=h,
+                                        semantic_token_id=tok_t,
+                                        do_sample=False,
+                                    )
+
+                        if codes_for_token is not None:
+                            self.model._vq_mask[decode_idx] = True
+                            if self.model._vq_codes is not None:
+                                self.model._vq_codes[decode_idx] = codes_for_token[0]
+                            out_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
+                            self._update_intermediate_buffer(req_id, {out_key: codes_for_token})
+                        elif getattr(self.model, "_vq_mask", None) is not None:
+                            self.model._vq_mask[decode_idx] = False
+
+                        self._update_intermediate_buffer(req_id, {"_merged_decode_idx": decode_idx})
+                    else:
+                        # Standard path: prepare talker_mtp inputs.
+                        last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                        decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                        self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                        self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                        self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                        self.text_step.gpu[decode_slice].copy_(text_step)
                     decode_req_ids.append(req_id)
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
@@ -1270,8 +1332,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
                     input_ids[s : s + seg_len] = req_input_ids
 
-            # run talker mtp decode
-            if self.has_talker_mtp:
+            # Set unified decode batch size for compute_logits/sample
+            # (used outside graph to decide whether to return pre-computed results).
+            if _is_unified:
+                self.model._unified_decode_batch_size = len(decode_req_ids)
+
+            # Run talker mtp decode (skipped in merged decode mode).
+            if self.has_talker_mtp and not _is_merged and not _is_post_sample_codebook:
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (

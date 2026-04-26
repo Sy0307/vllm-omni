@@ -4,9 +4,9 @@
 autoregressively after each Slow AR step.  Analogous to Qwen3 TTS's
 CodePredictor but with its own embedding table, RoPE, and output head.
 
-Uses re-prefill (no KV cache): each AR step forwards the full growing
-sequence through the 4-layer transformer.  This trades ~O(T^2) attention
-FLOPs (negligible for T=10, 4 layers) for zero KV cache management.
+Uses re-prefill by default: each AR step forwards the full growing sequence
+through the 4-layer transformer. Set VLLM_FISH_FAST_AR_KV_CACHE=1 to enable
+an experimental KV-cached path for A/B profiling against sglang-omni.
 
 Optimisations:
   - torch.compile on model forward (kernel fusion)
@@ -17,6 +17,7 @@ Optimisations:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -124,6 +125,63 @@ class _FastARAttention(nn.Module):
         output, _ = self.o_proj(attn_out)
         return output.view(bsz, seq_len, -1)
 
+    def forward_kvcached(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_pos: int,
+    ) -> torch.Tensor:
+        """Forward with KV cache.  Processes 1 new token per call.
+
+        Args:
+            hidden_states: [B, 1, H] new token hidden state.
+            position_ids: [B, 1] position of the new token.
+            k_cache: [B, max_seq, num_kv_heads, head_dim] persistent K cache.
+            v_cache: [B, max_seq, num_kv_heads, head_dim] persistent V cache.
+            cache_pos: current write position in cache (0-indexed).
+
+        Returns:
+            output: [B, 1, H]
+        """
+        bsz = hidden_states.shape[0]
+
+        qkv, _ = self.qkv_proj(hidden_states.reshape(bsz, -1))
+        q, k_new, v_new = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if self.q_norm is not None:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).reshape(q.shape)
+            k_new = self.k_norm(k_new.view(-1, self.num_kv_heads, self.head_dim)).reshape(k_new.shape)
+
+        # Ensure contiguous for rotary_emb which uses .view() internally.
+        q = q.contiguous()
+        k_new = k_new.contiguous()
+        q, k_new = self.rotary_emb(position_ids, q, k_new)
+
+        # Write new K, V to cache.
+        k_new = k_new.view(bsz, 1, self.num_kv_heads, self.head_dim)
+        v_new = v_new.view(bsz, 1, self.num_kv_heads, self.head_dim)
+        k_cache[:bsz, cache_pos:cache_pos + 1] = k_new
+        v_cache[:bsz, cache_pos:cache_pos + 1] = v_new
+
+        # Read cached K, V up to current position (inclusive).
+        seq_len = cache_pos + 1
+        k_all = k_cache[:bsz, :seq_len].transpose(1, 2)  # [B, num_kv_heads, seq_len, head_dim]
+        v_all = v_cache[:bsz, :seq_len].transpose(1, 2)
+
+        q = q.view(bsz, 1, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, 1, head_dim]
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k_all, v_all,
+            scale=self.scaling,
+            is_causal=False,  # Not causal for single query attending to all cached KVs.
+            enable_gqa=self._use_gqa,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, -1)
+        output, _ = self.o_proj(attn_out)
+        return output.view(bsz, 1, -1)
+
 
 class _FastARMLP(nn.Module):
     """SiLU-gated MLP, matching Qwen3/LLaMA MLP structure."""
@@ -167,6 +225,27 @@ class _FastARDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_ids)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    def forward_kvcached(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_pos: int,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn.forward_kvcached(
+            hidden_states, position_ids, k_cache, v_cache, cache_pos,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -312,6 +391,12 @@ class FishSpeechFastAR(nn.Module):
         self._compile_failed = False
         self._disable_compile_for_graph = False
 
+        # KV cache for kv-cached mode (allocated lazily).
+        self._kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+        self._use_kv_cache = os.environ.get("VLLM_FISH_FAST_AR_KV_CACHE", "0") == "1"
+        if self._use_kv_cache:
+            logger.info("Fish Speech Fast AR KV-cache path enabled")
+
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
         if (
@@ -323,6 +408,34 @@ class FishSpeechFastAR(nn.Module):
             return
         self._embed_buf = torch.zeros(bsz, max_seq, self._fast_dim, dtype=dtype, device=device)
         self._pos_ids = torch.arange(max_seq, dtype=torch.long, device=device)
+
+    def _ensure_kv_caches(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
+        """Allocate KV caches for all layers if not already done."""
+        max_seq = self._num_codebooks + 1
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.head_dim
+        num_layers = self.config.num_hidden_layers
+
+        if (
+            self._kv_caches is not None
+            and len(self._kv_caches) == num_layers
+            and self._kv_caches[0][0].shape[0] >= bsz
+        ):
+            return
+
+        self._kv_caches = []
+        for _ in range(num_layers):
+            k_cache = torch.zeros(bsz, max_seq, num_kv_heads, head_dim, dtype=dtype, device=device)
+            v_cache = torch.zeros(bsz, max_seq, num_kv_heads, head_dim, dtype=dtype, device=device)
+            self._kv_caches.append((k_cache, v_cache))
+
+    def _reset_kv_caches(self) -> None:
+        """Zero out all KV caches (called at start of each decode step)."""
+        if self._kv_caches is None:
+            return
+        for k_cache, v_cache in self._kv_caches:
+            k_cache.zero_()
+            v_cache.zero_()
 
     def _setup_compile(self) -> None:
         if self._compile_attempted:
@@ -426,6 +539,14 @@ class FishSpeechFastAR(nn.Module):
         all_codes = torch.empty(bsz, num_cb, dtype=torch.long, device=device)
         all_codes[:, 0] = semantic_code
 
+        # KV-cached mode: each codebook step forwards only 1 new token.
+        if self._use_kv_cache:
+            return self._forward_kvcached(
+                slow_ar_hidden, semantic_code, all_codes,
+                bsz, num_cb, device, dtype,
+                do_sample, temperature, top_k, top_p,
+            )
+
         self._ensure_buffers(bsz, device, dtype)
         self._setup_compile()
 
@@ -483,6 +604,91 @@ class FishSpeechFastAR(nn.Module):
             if step < num_cb - 1:
                 new_embed = self.fast_embeddings(next_ids.reshape(bsz))
                 embed_buf[:bsz, step + 1, :] = new_embed
+
+        return all_codes
+
+    @torch.inference_mode()
+    def _forward_kvcached(
+        self,
+        slow_ar_hidden: torch.Tensor,
+        semantic_code: torch.Tensor,
+        all_codes: torch.Tensor,
+        bsz: int,
+        num_cb: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """KV-cached codebook prediction. Each step forwards 1 token only."""
+        self._ensure_kv_caches(bsz, device, dtype)
+        self._reset_kv_caches()
+        assert self._kv_caches is not None
+
+        self._ensure_buffers(bsz, device, dtype)
+        pos_ids = self._pos_ids
+        assert pos_ids is not None
+
+        residual_codebook_size = 1024
+        use_sampling = do_sample and temperature > 0
+        inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+
+        # Step 0: project Slow AR hidden → Fast AR hidden (position 0).
+        projected = self.fast_project_in(slow_ar_hidden.reshape(bsz, -1))
+        h = projected.unsqueeze(1)  # [B, 1, H]
+        pos_0 = pos_ids[0:1].unsqueeze(0).repeat(bsz, 1)
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            k_cache, v_cache = self._kv_caches[layer_idx]
+            h = layer.forward_kvcached(h, pos_0, k_cache, v_cache, cache_pos=0)
+        # Don't need output from position 0 (it's the conditioning input).
+
+        # Step 1: semantic code embedding (position 1).
+        h = self.fast_embeddings(semantic_code.clamp(min=0)).unsqueeze(1)  # [B, 1, H]
+        pos_1 = pos_ids[1:2].unsqueeze(0).repeat(bsz, 1)
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            k_cache, v_cache = self._kv_caches[layer_idx]
+            h = layer.forward_kvcached(h, pos_1, k_cache, v_cache, cache_pos=1)
+        # Output from position 1 predicts codebook 1.
+
+        for step in range(1, num_cb):
+            # Get logits from current hidden state.
+            logits = self.fast_output(self.fast_norm(h[:, 0, :]))
+            logits = logits[:, :residual_codebook_size]
+
+            if use_sampling:
+                scaled = logits * inv_temperature
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(min(top_k, scaled.shape[-1]), dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs - sorted_probs >= top_p
+                    sorted_logits = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
+                    scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+                probs = F.softmax(scaled, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1)
+            else:
+                next_ids = logits.argmax(dim=-1, keepdim=True)
+
+            all_codes[:, step] = next_ids.reshape(bsz)
+
+            # Forward next embedding through KV-cached layers.
+            if step < num_cb - 1:
+                h = self.fast_embeddings(next_ids.reshape(bsz)).unsqueeze(1)
+                cache_pos = step + 1
+                step_pos = pos_ids[cache_pos:cache_pos + 1].unsqueeze(0).repeat(bsz, 1)
+                for layer_idx, layer in enumerate(self.model.layers):
+                    k_cache, v_cache = self._kv_caches[layer_idx]
+                    h = layer.forward_kvcached(
+                        h, step_pos,
+                        k_cache, v_cache, cache_pos=cache_pos,
+                    )
 
         return all_codes
 

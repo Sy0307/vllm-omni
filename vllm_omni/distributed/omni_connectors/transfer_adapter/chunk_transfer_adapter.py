@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
+import threading
 from collections import defaultdict, deque
 from typing import Any
 
@@ -58,6 +60,54 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.fish_dac_ready_queue = (
+            (
+                os.environ.get("VLLM_FISH_DAC_READY_QUEUE", "0") == "1"
+                or os.environ.get("VLLM_FISH_DAC_DEDICATED_WORKER", "0") == "1"
+            )
+            and self.connector.stage_id != 0
+            and self.model_mode != "ar"
+        )
+        self._ready_chunk_reqs: deque[Request] = deque()
+        self._ready_chunk_req_ids: set[str] = set()
+        self._ready_chunk_lock = threading.Lock()
+        self._ready_callback = None
+        self.ready_only_scheduling = (
+            os.environ.get("VLLM_FISH_CHUNK_READY_ONLY_SCHED", "0") == "1"
+            and self.connector.stage_id != 0
+            and self.model_mode != "ar"
+        )
+        self.fish_dac_burst_recv = (
+            os.environ.get("VLLM_FISH_DAC_BURST_RECV", "0") == "1"
+            and self.connector.stage_id != 0
+            and self.model_mode != "ar"
+        )
+        self.fish_dac_burst_max_chunks = max(
+            1,
+            int(os.environ.get("VLLM_FISH_DAC_BURST_MAX_CHUNKS", "4") or 4),
+        )
+        self.fish_dac_inline_poll = (
+            os.environ.get("VLLM_FISH_DAC_INLINE_POLL", "0") == "1"
+            and self.connector.stage_id != 0
+            and self.model_mode != "ar"
+        )
+        self.fish_dac_inline_poll_profile = (
+            os.environ.get("VLLM_FISH_DAC_INLINE_POLL_PROFILE", "0") == "1"
+            and self.fish_dac_inline_poll
+        )
+
+    def set_ready_callback(self, callback) -> None:
+        """Register a callback fired when a new chunk becomes schedulable."""
+        self._ready_callback = callback
+
+    def _notify_ready_callback(self) -> None:
+        callback = self._ready_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.debug("Fish DAC ready callback failed", exc_info=True)
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -148,6 +198,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data:
             # Update connector state
             self.get_req_chunk[req_id] += 1
+            if self.fish_dac_burst_recv:
+                payload_data = self._collect_fish_dac_burst_payloads(
+                    first_payload=payload_data,
+                    req_id=req_id,
+                    external_req_id=external_req_id,
+                    target_stage_id=target_stage_id,
+                    stage_id=stage_id,
+                )
 
             if self.model_mode == "ar":
                 self._update_request_payload(external_req_id, payload_data)
@@ -159,11 +217,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self.finished_requests.add(req_id)
 
                 new_ids = payload_data.get("code_predictor_codes", [])
-                request.prompt_token_ids = new_ids
                 # Preserve previously attached request metadata (e.g. prompt
                 # conditioning tensors) and update only per-chunk fields.
                 prev_info = getattr(request, "additional_information", None)
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                if isinstance(new_ids, torch.Tensor):
+                    new_ids_len = int(new_ids.numel())
+                    prompt_len = int(payload_data.get("next_stage_prompt_len", new_ids_len))
+                    request.prompt_token_ids = [0] * prompt_len
+                    info["code_predictor_codes"] = new_ids
+                else:
+                    new_ids_len = len(new_ids) if hasattr(new_ids, "__len__") else int(new_ids is not None)
+                    request.prompt_token_ids = new_ids
                 for key, value in payload_data.items():
                     if key in {"code_predictor_codes", "finished"}:
                         continue
@@ -172,15 +237,277 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
-                if not new_ids and not payload_data.get("finished"):
+                if new_ids_len == 0 and not payload_data.get("finished"):
                     return True
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
+            if self.fish_dac_ready_queue:
+                self._mark_ready_chunk(request)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
             return True
 
         return False
+
+    def _mark_ready_chunk(self, request: Request) -> None:
+        request_id = request.request_id
+        marked = False
+        with self._ready_chunk_lock:
+            if request_id in self._ready_chunk_req_ids:
+                return
+            self._ready_chunk_reqs.append(request)
+            self._ready_chunk_req_ids.add(request_id)
+            marked = True
+        if marked:
+            self._notify_ready_callback()
+
+    @staticmethod
+    def _remove_from_deque(items: deque[Any], request_id: str) -> bool:
+        if not items:
+            return False
+        kept: deque[Any] = deque()
+        removed = False
+        while items:
+            item = items.popleft()
+            if getattr(item, "request_id", None) == request_id:
+                removed = True
+                continue
+            kept.append(item)
+        items.extend(kept)
+        return removed
+
+    def drain_ready_chunks(self, max_chunks: int) -> list[Request]:
+        """Pop chunk-ready Fish DAC requests collected by the recv thread.
+
+        The request objects already carry the decoded per-chunk metadata from
+        ``_poll_single_request``.  Draining removes them from the adapter's
+        WAITING_FOR_CHUNK side queues so the scheduler can submit them directly
+        without waiting for a restore pass.
+        """
+        if not self.fish_dac_ready_queue or max_chunks <= 0:
+            return []
+
+        ready: list[Request] = []
+        with self._ready_chunk_lock:
+            while self._ready_chunk_reqs and len(ready) < max_chunks:
+                request = self._ready_chunk_reqs.popleft()
+                self._ready_chunk_req_ids.discard(request.request_id)
+                ready.append(request)
+
+        for request in ready:
+            request_id = request.request_id
+            self._finished_load_reqs.discard(request_id)
+            self.requests_with_ready_chunks.discard(request_id)
+            self._remove_from_deque(
+                self.waiting_for_chunk_waiting_requests,
+                request_id,
+            )
+            self._remove_from_deque(
+                self.waiting_for_chunk_running_requests,
+                request_id,
+            )
+
+        if len(ready) < max_chunks:
+            ready.extend(
+                self._drain_finished_side_queue_chunks(max_chunks - len(ready))
+            )
+
+        return ready
+
+    def prepend_ready_chunks(self, requests: list[Request]) -> None:
+        """Put drained ready chunks back at the front of the ready queue."""
+        if not requests:
+            return
+        with self._ready_chunk_lock:
+            for request in reversed(requests):
+                request_id = request.request_id
+                if request_id in self._ready_chunk_req_ids:
+                    continue
+                self._ready_chunk_reqs.appendleft(request)
+                self._ready_chunk_req_ids.add(request_id)
+                self.requests_with_ready_chunks.add(request_id)
+
+    def rearm_running_chunk_request(self, request: Request) -> bool:
+        """Park a live DAC request directly for its next upstream chunk.
+
+        The normal Stage1 lifecycle leaves a chunk-finished request in the
+        scheduler's running queue until the next scheduler pass moves it back
+        into WAITING_FOR_CHUNK. For Fish DAC streaming that extra pass happens
+        for every chunk. This method lets the update path re-arm the connector
+        immediately after emitting audio, keeping the request in the adapter's
+        side queue until a real chunk is ready again.
+        """
+        if self.connector.stage_id == 0:
+            return False
+
+        request_id = request.request_id
+        if request_id in self.finished_requests:
+            return False
+
+        self.requests_with_ready_chunks.discard(request_id)
+        self._finished_load_reqs.discard(request_id)
+        self._remove_from_deque(
+            self.waiting_for_chunk_waiting_requests,
+            request_id,
+        )
+        self._remove_from_deque(
+            self.waiting_for_chunk_running_requests,
+            request_id,
+        )
+        with self._ready_chunk_lock:
+            self._ready_chunk_req_ids.discard(request_id)
+            if self._ready_chunk_reqs:
+                self._ready_chunk_reqs = deque(
+                    req for req in self._ready_chunk_reqs
+                    if req.request_id != request_id
+                )
+
+        request.status = RequestStatus.WAITING_FOR_CHUNK
+        self.request_ids_mapping[request_id] = request.external_req_id
+        self.waiting_for_chunk_running_requests.append(request)
+        self.load_async(request)
+        return True
+
+    def _drain_finished_side_queue_chunks(self, max_chunks: int) -> list[Request]:
+        """Drain ready chunks that reached side queues after the ready pop.
+
+        The recv thread can set ``_finished_load_reqs`` immediately before or
+        during a scheduler tick.  If the request has not been restored to the
+        main scheduler queues yet, waiting until the next tick leaves a batch
+        opportunity on the table.  This helper lets the Stage1 fastpath consume
+        those side-queue chunks directly.
+        """
+        if max_chunks <= 0 or not self._finished_load_reqs:
+            return []
+
+        ready: list[Request] = []
+
+        def drain_from(side_queue: deque[Any]) -> None:
+            if len(ready) >= max_chunks or not side_queue:
+                return
+            pending: deque[Any] = deque()
+            while side_queue:
+                request = side_queue.popleft()
+                request_id = request.request_id
+                if (
+                    len(ready) < max_chunks
+                    and request_id in self._finished_load_reqs
+                ):
+                    self._finished_load_reqs.discard(request_id)
+                    self.requests_with_ready_chunks.discard(request_id)
+                    with self._ready_chunk_lock:
+                        self._ready_chunk_req_ids.discard(request_id)
+                    ready.append(request)
+                else:
+                    pending.append(request)
+            side_queue.extend(pending)
+
+        drain_from(self.waiting_for_chunk_waiting_requests)
+        drain_from(self.waiting_for_chunk_running_requests)
+        return ready
+
+    def has_ready_chunks(self) -> bool:
+        """Return whether the Fish DAC recv thread has queued ready chunks."""
+        if not self.fish_dac_ready_queue:
+            return False
+        with self._ready_chunk_lock:
+            if self._ready_chunk_reqs:
+                return True
+        if not self._finished_load_reqs:
+            return False
+        for request in self.waiting_for_chunk_waiting_requests:
+            if request.request_id in self._finished_load_reqs:
+                return True
+        for request in self.waiting_for_chunk_running_requests:
+            if request.request_id in self._finished_load_reqs:
+                return True
+        return False
+
+    @staticmethod
+    def _payload_code_len(payload: dict[str, Any]) -> int:
+        codes = payload.get("code_predictor_codes", [])
+        if isinstance(codes, torch.Tensor):
+            return int(codes.numel())
+        if hasattr(codes, "__len__"):
+            return len(codes)
+        return int(codes is not None)
+
+    def _collect_fish_dac_burst_payloads(
+        self,
+        *,
+        first_payload: dict[str, Any],
+        req_id: str,
+        external_req_id: str,
+        target_stage_id: int,
+        stage_id: int,
+    ) -> dict[str, Any]:
+        """Drain consecutive ready Fish DAC chunks for one request.
+
+        This reduces Stage1 request-lifecycle churn when Stage0 has already
+        produced multiple chunks. Chunks are kept as separate decode windows so
+        left-context trimming remains equivalent to the streaming path.
+        """
+        payloads = [first_payload]
+        while (
+            len(payloads) < self.fish_dac_burst_max_chunks
+            and not bool(payloads[-1].get("finished"))
+        ):
+            chunk_id = self.get_req_chunk[req_id]
+            connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+            try:
+                result = self.connector.get(
+                    str(target_stage_id),
+                    str(stage_id),
+                    connector_get_key,
+                )
+            except Exception as exc:
+                logger.error(
+                    "SharedMemoryConnector burst get failed for req %s: %s",
+                    connector_get_key,
+                    exc,
+                )
+                break
+            if result is None:
+                break
+            payload_data, _size = result
+            if not payload_data:
+                break
+            self.get_req_chunk[req_id] += 1
+            payloads.append(payload_data)
+
+        if len(payloads) == 1:
+            return first_payload
+
+        merged = dict(payloads[-1])
+        code_chunks: list[Any] = []
+        left_context_sizes: list[int] = []
+        prompt_lens: list[int] = []
+        for payload in payloads:
+            code_len = self._payload_code_len(payload)
+            if code_len <= 0:
+                continue
+            codes = payload.get("code_predictor_codes")
+            code_chunks.append(codes)
+            left_context_sizes.append(int(payload.get("left_context_size", 0) or 0))
+            prompt_lens.append(int(payload.get("next_stage_prompt_len", code_len) or code_len))
+
+        if code_chunks:
+            merged["code_predictor_codes"] = code_chunks[0]
+            merged["code_predictor_chunks"] = code_chunks
+            merged["left_context_sizes"] = left_context_sizes
+            merged["next_stage_prompt_lens"] = prompt_lens
+            merged["next_stage_prompt_len"] = prompt_lens[0]
+            merged["fish_burst_chunk_count"] = len(code_chunks)
+        merged["finished"] = any(bool(payload.get("finished")) for payload in payloads)
+        if os.environ.get("VLLM_FISH_DAC_BURST_PROFILE", "0") == "1":
+            logger.info(
+                "[Stage-%s] Fish DAC burst recv: req=%s chunks=%d finished=%s",
+                stage_id,
+                external_req_id,
+                len(code_chunks),
+                merged["finished"],
+            )
+        return merged
 
     def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
         """Update the payload data for a request in the connector.
@@ -279,6 +606,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
+        with self._ready_chunk_lock:
+            self._ready_chunk_req_ids.discard(request_id)
+            if self._ready_chunk_reqs:
+                kept = deque(
+                    req for req in self._ready_chunk_reqs
+                    if req.request_id != request_id
+                )
+                self._ready_chunk_reqs = kept
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -339,6 +674,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
+        if self.ready_only_scheduling:
+            self._restore_ready_chunks(
+                waiting_queue,
+                self.waiting_for_chunk_waiting_requests,
+                RequestStatus.WAITING,
+            )
+            self._restore_ready_chunks(
+                running_queue,
+                self.waiting_for_chunk_running_requests,
+                RequestStatus.RUNNING,
+            )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
             request.status = RequestStatus.PREEMPTED
@@ -348,6 +694,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         Restore requests waiting for chunk to the waiting and running queues.
         """
+        if self.ready_only_scheduling:
+            self._restore_ready_chunks(
+                waiting_queue,
+                self.waiting_for_chunk_waiting_requests,
+                RequestStatus.WAITING,
+            )
+            self._restore_ready_chunks(
+                running_queue,
+                self.waiting_for_chunk_running_requests,
+                RequestStatus.RUNNING,
+            )
+            return
+
         # Add request waiting for chunk to the waiting and running queue
         for request in self.waiting_for_chunk_waiting_requests:
             waiting_queue.add_request(request)
@@ -399,6 +758,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if request.request_id in self.finished_requests:
                     continue
                 # Requests that waiting for chunk
+                if self._try_inline_poll_ready_chunk(request, target_status):
+                    finished_load_reqs.discard(request.request_id)
+                    self.requests_with_ready_chunks.add(request.request_id)
+                    continue
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
@@ -409,6 +772,69 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     continue
             queue.remove(request)
             waiting_for_chunk_list.append(request)
+
+    def _try_inline_poll_ready_chunk(
+        self,
+        request: Request,
+        target_status: RequestStatus,
+    ) -> bool:
+        """Synchronously poll once before moving a DAC request off-queue.
+
+        The background recv loop is still the fallback.  This only handles
+        requests that are about to enter WAITING_FOR_CHUNK, so it does not race
+        with a request that is already being polled by the recv thread.
+        """
+        if not self.fish_dac_inline_poll:
+            return False
+        request_id = request.request_id
+        self._cancelled_load_reqs.discard(request_id)
+        self.request_ids_mapping[request_id] = request.external_req_id
+        try:
+            ready = self._poll_single_request(request)
+        except Exception as exc:
+            logger.warning("Inline Fish DAC chunk poll failed for %s: %s", request_id, exc)
+            return False
+        if not ready:
+            return False
+        request.status = target_status
+        if self.fish_dac_inline_poll_profile:
+            logger.info(
+                "[Stage-%s] Fish DAC inline poll hit: req=%s",
+                self.connector.stage_id,
+                request.external_req_id,
+            )
+        return True
+
+    def _restore_ready_chunks(
+        self,
+        queue: Any,
+        waiting_for_chunk_list: deque[Any],
+        target_status: RequestStatus,
+    ) -> None:
+        """Move only chunk-ready requests back to the scheduler queue.
+
+        In streaming DAC workloads most downstream requests spend many scheduler
+        ticks waiting for the next chunk.  Keeping those requests off the main
+        scheduler queues avoids a 1ms remove/restore cycle while the background
+        recv loop continues polling the connector.
+        """
+        if not waiting_for_chunk_list or not self._finished_load_reqs:
+            return
+
+        pending: deque[Any] = deque()
+        while waiting_for_chunk_list:
+            request = waiting_for_chunk_list.popleft()
+            if request.request_id in self._finished_load_reqs:
+                request.status = target_status
+                self._finished_load_reqs.remove(request.request_id)
+                self.requests_with_ready_chunks.add(request.request_id)
+                if target_status == RequestStatus.RUNNING:
+                    queue.append(request)
+                else:
+                    queue.add_request(request)
+            else:
+                pending.append(request)
+        waiting_for_chunk_list.extend(pending)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:

@@ -44,9 +44,20 @@ class AudioMixin:
 
         audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
 
+        if response_format == "pcm":
+            audio_array = np.asarray(audio_tensor)
+            if np.issubdtype(audio_array.dtype, np.floating):
+                audio_array = np.clip(audio_array, -1.0, 1.0)
+                audio_array = (audio_array * np.iinfo(np.int16).max).astype(np.int16)
+            else:
+                audio_array = audio_array.astype(np.int16, copy=False)
+            return AudioResponse(
+                audio_data=np.ascontiguousarray(audio_array).tobytes(),
+                media_type="audio/pcm",
+            )
+
         supported_formats = {
             "wav": ("WAV", "audio/wav", {}),
-            "pcm": ("RAW", "audio/pcm", {"subtype": "PCM_16"}),
             "flac": ("FLAC", "audio/flac", {}),
             "mp3": ("MP3", "audio/mpeg", {}),
             "aac": ("AAC", "audio/aac", {}),

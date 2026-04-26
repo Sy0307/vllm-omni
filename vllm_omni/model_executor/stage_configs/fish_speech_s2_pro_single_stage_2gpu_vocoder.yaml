@@ -1,0 +1,52 @@
+# Fish Speech S2 Pro -- single-stage AR with inline DAC on an extra visible GPU.
+#
+# Launch with two visible physical GPUs, for example:
+#   CUDA_VISIBLE_DEVICES=3,2 \
+#   VLLM_OMNI_FISH_ASYNC_VOCODER=1 \
+#   VLLM_OMNI_FISH_VOCODER_DEVICE=cuda:1 \
+#   vllm-omni serve ... --stage-configs-path this-file.yaml --omni
+#
+# Stage 0 still uses tensor_parallel_size=1 and runs AR on cuda:0. The second
+# visible device is intentionally not used by vLLM parallelism; it is reserved
+# for Fish inline DAC async decode via VLLM_OMNI_FISH_VOCODER_DEVICE=cuda:1.
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0,1"
+      max_batch_size: 16
+    engine_args:
+      max_num_seqs: 16
+      model_stage: fish_speech_slow_ar
+      model_arch: FishSpeechSlowARForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.75
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 16384
+      tensor_parallel_size: 1
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 30
+      top_p: 0.9
+      max_tokens: 2048
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+      stop_token_ids: [151645]
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 16

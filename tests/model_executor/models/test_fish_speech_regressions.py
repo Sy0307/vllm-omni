@@ -8,6 +8,7 @@ from vllm_omni.model_executor.models.fish_speech.fish_speech_dac_decoder import 
 from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import (
     FishSpeechSlowARForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -20,6 +21,19 @@ class _FakeCodec:
         return wav, audio_lengths
 
 
+class _RecordingCodec:
+    def __init__(self):
+        self.codes_bqf = None
+        self.feature_lengths = None
+
+    def decode(self, codes_bqf: torch.Tensor, feature_lengths: torch.Tensor):
+        self.codes_bqf = codes_bqf.detach().cpu()
+        self.feature_lengths = feature_lengths.detach().cpu()
+        wav = torch.arange(100, dtype=torch.float32).view(1, 1, 100)
+        audio_lengths = torch.tensor([100], dtype=torch.long)
+        return wav, audio_lengths
+
+
 class _FakeTokenizer:
     def __init__(self, mapping, unk_token_id=-1):
         self._mapping = mapping
@@ -27,6 +41,22 @@ class _FakeTokenizer:
 
     def convert_tokens_to_ids(self, token: str) -> int:
         return self._mapping.get(token, self.unk_token_id)
+
+
+class _FakeCudaEvent:
+    def query(self):
+        return True
+
+    def synchronize(self):
+        return None
+
+
+class _NotReadyCudaEvent:
+    def query(self):
+        return False
+
+    def synchronize(self):
+        raise AssertionError("non-blocking collect must not synchronize pending DAC work")
 
 
 def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
@@ -53,6 +83,35 @@ def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
     assert audios[0].numel() == 0
     # 2 total frames with 1 frame of left context => proportional trim removes half the samples.
     assert audios[1].shape[0] == 50
+
+
+def test_dac_decoder_consumes_tensor_relay_codes_from_runtime_metadata():
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    codec = _RecordingCodec()
+    decoder._codec = codec
+    decoder._num_codebooks = 10
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._ensure_codec_loaded = lambda: None
+
+    relay_codes = torch.arange(20, dtype=torch.long)
+    out = decoder.forward(
+        input_ids=torch.zeros(20, dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "code_predictor_codes": relay_codes,
+                "left_context_size": 1,
+            }
+        ],
+    )
+
+    assert codec.codes_bqf is not None
+    assert torch.equal(codec.codes_bqf[0], relay_codes.reshape(10, 2))
+    assert torch.equal(codec.feature_lengths, torch.tensor([2]))
+    # 2 total frames with 1 frame of left context => proportional trim removes half the samples.
+    assert out.multimodal_outputs["model_outputs"][0].shape[0] == 50
 
 
 def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(monkeypatch):
@@ -104,3 +163,64 @@ def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(mo
     expected_1 = (torch.tensor([4.0, 5.0, 6.0]) + torch.tensor([30.0, 40.0, 0.0])) / math.sqrt(3.0)
     assert torch.allclose(prefill[2].to(dtype=torch.float32), expected_0, atol=2e-2, rtol=0)
     assert torch.allclose(prefill[3].to(dtype=torch.float32), expected_1, atol=2e-2, rtol=0)
+
+
+def test_inline_dac_async_path_collects_pending_without_sync_decode():
+    model = object.__new__(FishSpeechSlowARForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._dac_sample_rate = 44100
+    model._initial_vocode_stride = 1
+    model._vocode_stride = 10
+    model._vocode_left_context = 0
+    model._use_async_vocoder = True
+
+    submitted = []
+
+    def _submit_decode_async(codes):
+        submitted.append(codes.detach().clone())
+        return _FakeCudaEvent(), (torch.arange(8, dtype=torch.float32), None)
+
+    model._submit_decode_async = _submit_decode_async
+    model._decode_all = lambda codes: (_ for _ in ()).throw(
+        AssertionError("sync decode should not run when async vocoder is enabled")
+    )
+
+    req_info = {}
+    first = model._inline_dac_output(
+        OmniOutput(
+            text_hidden_states=torch.zeros(1, 4),
+            multimodal_outputs={"audio_codes": torch.ones(1, 10, dtype=torch.long)},
+        ),
+        model_intermediate_buffer=[req_info],
+    )
+
+    assert len(submitted) == 1
+    assert req_info.get("_pending_decode") is not None
+    assert first.multimodal_outputs["model_outputs"][0].numel() == 0
+
+    second = model._inline_dac_output(
+        OmniOutput(text_hidden_states=torch.zeros(0, 4), multimodal_outputs={}),
+        model_intermediate_buffer=[req_info],
+    )
+
+    assert req_info.get("_pending_decode") is None
+    assert torch.equal(
+        second.multimodal_outputs["model_outputs"][0],
+        torch.arange(8, dtype=torch.float32),
+    )
+
+
+def test_inline_dac_async_collect_does_not_block_when_event_is_not_ready():
+    model = object.__new__(FishSpeechSlowARForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+
+    req_info = {
+        "_pending_decode": (
+            _NotReadyCudaEvent(),
+            (torch.arange(8, dtype=torch.float32), None),
+            4,
+        )
+    }
+
+    assert model._collect_pending_inline_dac(req_info) is None
+    assert req_info.get("_pending_decode") is not None

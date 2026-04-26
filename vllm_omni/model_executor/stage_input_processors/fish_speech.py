@@ -1,11 +1,136 @@
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
+import os
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.distributed.omni_connectors.utils.serialization import (
+    encode_cuda_ipc_pool_tensor,
+)
+
 logger = init_logger(__name__)
+
+
+def _fish_cuda_ipc_relay_enabled() -> bool:
+    return os.environ.get("VLLM_FISH_CUDA_IPC_RELAY", "0") == "1"
+
+
+def _fish_cuda_ipc_stage0_enabled() -> bool:
+    return (
+        _fish_cuda_ipc_relay_enabled()
+        and os.environ.get("VLLM_FISH_CUDA_IPC_STAGE0", "0") == "1"
+    )
+
+
+def _fish_pooled_gpu_relay_enabled() -> bool:
+    return os.environ.get("VLLM_FISH_POOLED_GPU_RELAY", "0") == "1"
+
+
+def _compact_fish_codes_if_enabled(flat_codes: torch.Tensor) -> torch.Tensor:
+    compact = os.environ.get("VLLM_FISH_COMPACT_CODES", "0") == "1"
+    dtype_name = os.environ.get("VLLM_FISH_COMPACT_CODE_DTYPE", "int16").strip().lower()
+    if not compact:
+        return flat_codes
+    if dtype_name in {"int32", "torch.int32"}:
+        return flat_codes.to(dtype=torch.int32)
+    if dtype_name not in {"int16", "torch.int16"}:
+        logger.warning_once(
+            "Ignoring unsupported VLLM_FISH_COMPACT_CODE_DTYPE=%r; using int16.",
+            dtype_name,
+        )
+    return flat_codes.to(dtype=torch.int16)
+
+
+def _make_pooled_gpu_relay_codes(
+    *,
+    request_payload: dict[str, Any],
+    request_id: str,
+    flat_codes: torch.Tensor,
+    num_codebooks: int,
+) -> dict[str, Any]:
+    if not flat_codes.is_cuda:
+        relay_device = os.environ.get("VLLM_FISH_GPU_RELAY_DEVICE", "cuda")
+        flat_codes = flat_codes.to(device=relay_device, non_blocking=True)
+
+    frame_count = int(flat_codes.numel() // num_codebooks)
+    bucket_spec = os.environ.get("VLLM_FISH_GPU_RELAY_BUCKET_FRAMES", "4,50")
+    buckets = sorted(int(part.strip()) for part in bucket_spec.split(",") if part.strip())
+    frame_capacity = frame_count
+    for bucket in buckets:
+        if frame_count <= bucket:
+            frame_capacity = bucket
+            break
+    frame_capacity = max(frame_capacity, int(os.environ.get("VLLM_FISH_GPU_RELAY_POOL_FRAMES", "0") or 0))
+    frame_capacity = max(frame_capacity, frame_count)
+    num_slots = int(os.environ.get("VLLM_FISH_GPU_RELAY_POOL_SLOTS", "8"))
+    num_slots = max(1, num_slots)
+
+    pool = request_payload.get("_fish_gpu_relay_pool")
+    if (
+        not isinstance(pool, torch.Tensor)
+        or pool.shape[0] < num_slots
+        or pool.shape[1] != num_codebooks
+        or pool.shape[2] < frame_capacity
+        or pool.device != flat_codes.device
+        or pool.dtype != torch.long
+    ):
+        generation = int(request_payload.get("_fish_gpu_relay_pool_generation", 0)) + 1
+        pool = torch.empty(
+            (num_slots, num_codebooks, frame_capacity),
+            device=flat_codes.device,
+            dtype=torch.long,
+        )
+        request_payload["_fish_gpu_relay_pool"] = pool
+        request_payload["_fish_gpu_relay_pool_generation"] = generation
+        request_payload["_fish_gpu_relay_sent_handles"] = set()
+        request_payload["_fish_gpu_relay_events"] = None
+
+    use_events = os.environ.get("VLLM_FISH_GPU_RELAY_EVENT", "0") == "1"
+    if use_events and request_payload.get("_fish_gpu_relay_events") is None:
+        try:
+            request_payload["_fish_gpu_relay_events"] = [
+                torch.cuda.Event(enable_timing=False, interprocess=True)
+                for _ in range(num_slots)
+            ]
+        except Exception as exc:
+            logger.warning_once(
+                "Fish pooled GPU relay disabled CUDA event handoff and will use sync: %s",
+                exc,
+            )
+            use_events = False
+
+    chunk_idx = int(request_payload.get("_fish_gpu_relay_chunk_idx", 0))
+    request_payload["_fish_gpu_relay_chunk_idx"] = chunk_idx + 1
+    slot = chunk_idx % num_slots
+    slot_view = pool[slot]
+    slot_view[:, :frame_count].copy_(flat_codes.view(num_codebooks, frame_count), non_blocking=True)
+
+    event_handle = None
+    if use_events:
+        events = request_payload.get("_fish_gpu_relay_events")
+        if isinstance(events, list):
+            event = events[slot]
+            event.record(torch.cuda.current_stream(slot_view.device))
+    elif os.environ.get("VLLM_FISH_GPU_RELAY_SYNC", "1") == "1":
+        torch.cuda.current_stream(slot_view.device).synchronize()
+
+    generation = int(request_payload.get("_fish_gpu_relay_pool_generation", 0))
+    relay_id = f"fish:{request_id}:{generation}:{slot}"
+    sent_handles = request_payload.setdefault("_fish_gpu_relay_sent_handles", set())
+    include_handle = relay_id not in sent_handles
+    sent_handles.add(relay_id)
+    if include_handle and use_events:
+        events = request_payload.get("_fish_gpu_relay_events")
+        if isinstance(events, list):
+            event_handle = events[slot].ipc_handle()
+    return encode_cuda_ipc_pool_tensor(
+        slot_view,
+        relay_id,
+        include_handle=include_handle,
+        event_handle=event_handle,
+    )
 
 
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
@@ -15,6 +140,14 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
+        if (
+            _fish_cuda_ipc_stage0_enabled()
+            and os.environ.get("VLLM_FISH_CUDA_IPC_SKIP_ZERO_FILTER", "0") == "1"
+            and frame.is_cuda
+        ):
+            # The post-sample Fish path only emits real codebook frames. Avoid
+            # a per-frame GPU->CPU sync just to filter zero padding.
+            return frame.to(torch.long).reshape(-1)
         if frame.numel() == 0 or not bool(frame.any().item()):
             return None
         return frame.to(torch.long).reshape(-1)
@@ -74,7 +207,12 @@ def slow_ar_to_dac_decoder_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(device="cpu", dtype=torch.long))
+            if _fish_cuda_ipc_stage0_enabled():
+                transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(dtype=torch.long))
+            else:
+                transfer_manager.code_prompt_token_ids[request_id].append(
+                    frame.detach().to(device="cpu", dtype=torch.long)
+                )
     elif not finished:
         return None
 
@@ -102,6 +240,8 @@ def slow_ar_to_dac_decoder_async_chunk(
             f"codec_left_context_frames={left_context_size_config}, "
             f"initial_codec_chunk_frames={initial_chunk_size}"
         )
+
+    request_payload = transfer_manager.request_payload.setdefault(request_id, {})
     if initial_chunk_size > chunk_size:
         initial_chunk_size = chunk_size
 
@@ -115,35 +255,62 @@ def slow_ar_to_dac_decoder_async_chunk(
             }
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and length <= chunk_size
+    sent_frames = int(request_payload.get("_fish_speech_sent_frames", 0))
+    pending = length - sent_frames
 
-    if in_initial_phase:
-        already_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_size
-        pending = length - already_sent
-        if pending <= 0:
-            return None
+    if pending <= 0:
+        if finished:
+            return {
+                "code_predictor_codes": [],
+                "finished": True,
+            }
+        return None
+
+    if sent_frames == 0 and initial_chunk_size > 0:
         if pending < initial_chunk_size and not finished:
             return None
         context_length = min(pending, initial_chunk_size)
-        left_context_size = max(0, length - context_length)
-        window_frames = transfer_manager.code_prompt_token_ids[request_id][:length]
+        chunk_end = context_length
+        left_context_size = 0
+        window_frames = transfer_manager.code_prompt_token_ids[request_id][:chunk_end]
     else:
-        initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size if initial_chunk_size > 0 else 0
-        adjusted = length - initial_coverage
-        chunk_length = adjusted % chunk_size
-        if chunk_length != 0 and not finished:
+        if pending < chunk_size and not finished:
             return None
-        context_length = chunk_length if chunk_length != 0 else chunk_size
-        end_index = min(length, left_context_size_config + context_length)
-        left_context_size = max(0, int(end_index - context_length))
-        window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+        context_length = pending if finished else chunk_size
+        chunk_end = sent_frames + context_length
+        left_start = max(0, sent_frames - left_context_size_config)
+        left_context_size = sent_frames - left_start
+        window_frames = transfer_manager.code_prompt_token_ids[request_id][left_start:chunk_end]
 
     # Pack into codebook-major flat codes.
     stacked_frames = torch.stack(window_frames, dim=0)
-    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1).tolist()
+    flat_codes = stacked_frames.transpose(0, 1).reshape(-1).contiguous()
+    if _fish_cuda_ipc_relay_enabled() and not flat_codes.is_cuda:
+        try:
+            relay_device = os.environ.get("VLLM_FISH_CUDA_IPC_RELAY_DEVICE", "cuda")
+            flat_codes = flat_codes.to(device=relay_device, non_blocking=True)
+        except Exception as exc:
+            logger.warning_once("Fish CUDA IPC chunk relay fell back to CPU: %s", exc)
+    request_payload["_fish_speech_sent_frames"] = chunk_end
+    if _fish_pooled_gpu_relay_enabled():
+        code_predictor_codes = _make_pooled_gpu_relay_codes(
+            request_payload=request_payload,
+            request_id=request_id,
+            flat_codes=flat_codes,
+            num_codebooks=stacked_frames.shape[1],
+        )
+    elif (
+        os.environ.get("VLLM_FISH_TENSOR_RELAY", "0") == "1"
+        or os.environ.get("VLLM_FISH_COMPACT_CODES", "0") == "1"
+        or _fish_cuda_ipc_relay_enabled()
+    ):
+        code_predictor_codes: torch.Tensor | list[int] = _compact_fish_codes_if_enabled(flat_codes)
+    else:
+        code_predictor_codes = flat_codes.tolist()
 
     return {
         "code_predictor_codes": code_predictor_codes,
+        "next_stage_prompt_len": int(flat_codes.numel()),
         "left_context_size": left_context_size,
         "finished": finished,
     }

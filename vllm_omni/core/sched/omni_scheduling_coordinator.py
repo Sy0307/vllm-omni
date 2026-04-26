@@ -16,6 +16,7 @@ import time
 from collections import deque
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
@@ -316,6 +317,16 @@ class OmniSchedulingCoordinator:
                     runtime_seed = {
                         "left_context_size": metadata["left_context_size"],
                     }
+                if isinstance(new_ids, torch.Tensor):
+                    runtime_seed = dict(runtime_seed or {})
+                    runtime_seed["code_predictor_codes"] = new_ids
+                    new_ids_len = int(new_ids.numel())
+                    if new_ids_len > 0:
+                        next_len = int(metadata.get("next_stage_prompt_len", new_ids_len))
+                        request.prompt_token_ids = [0] * next_len
+                        request.num_computed_tokens = 0
+                    request._omni_initial_model_buffer = runtime_seed
+                    return
                 request._omni_initial_model_buffer = runtime_seed
                 if new_ids:
                     request.prompt_token_ids = new_ids

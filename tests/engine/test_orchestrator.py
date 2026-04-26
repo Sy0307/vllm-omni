@@ -456,7 +456,10 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         assert output_msg["request_id"] == "req-async"
         assert output_msg["stage_id"] == 1
         assert output_msg["finished"] is True
-        assert "req-async" not in orchestrator_fixture.orchestrator.request_states
+        assert "req-async" in orchestrator_fixture.orchestrator.request_states
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-final", 4.0))
+        await _wait_for(lambda: "req-async" not in orchestrator_fixture.orchestrator.request_states)
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

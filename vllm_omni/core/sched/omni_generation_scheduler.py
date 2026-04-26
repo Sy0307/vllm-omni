@@ -1,3 +1,4 @@
+import os
 import time
 from collections import defaultdict
 
@@ -32,6 +33,963 @@ class OmniGenerationScheduler(VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self._fish_dac_microbatch = (
+            os.environ.get("VLLM_FISH_DAC_MICROBATCH", "0") == "1"
+            and getattr(model_config, "model_stage", "") == "dac_decoder"
+        )
+        self._fish_dac_microbatch_target = max(
+            1,
+            int(os.environ.get("VLLM_FISH_DAC_MICROBATCH_TARGET", "4") or 4),
+        )
+        self._fish_dac_microbatch_wait_s = max(
+            0.0,
+            float(os.environ.get("VLLM_FISH_DAC_MICROBATCH_WAIT_MS", "1.0") or 0.0) / 1000.0,
+        )
+        self._fish_dac_bucket_aware = (
+            os.environ.get("VLLM_FISH_DAC_BUCKET_AWARE", "0") == "1"
+            and getattr(model_config, "model_stage", "") == "dac_decoder"
+        )
+        self._fish_dac_sched_fastpath = (
+            os.environ.get("VLLM_FISH_DAC_SCHED_FASTPATH", "0") == "1"
+            and getattr(model_config, "model_stage", "") == "dac_decoder"
+            and getattr(model_config, "async_chunk", False)
+        )
+        self._fish_dac_sched_fastpath_profile = (
+            os.environ.get("VLLM_FISH_DAC_SCHED_FASTPATH_PROFILE", "0") == "1"
+            and self._fish_dac_sched_fastpath
+        )
+        self._fish_dac_dedicated_worker = (
+            os.environ.get("VLLM_FISH_DAC_DEDICATED_WORKER", "0") == "1"
+            and self._fish_dac_sched_fastpath
+        )
+        self._fish_dac_worker_batch_size = max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_FISH_DAC_WORKER_BATCH_SIZE",
+                    str(max(1, self.max_num_running_reqs)),
+                )
+                or max(1, self.max_num_running_reqs)
+            ),
+        )
+        self._fish_dac_sched_profile = (
+            os.environ.get("VLLM_FISH_DAC_SCHED_PROFILE", "0") == "1"
+            and getattr(model_config, "model_stage", "") == "dac_decoder"
+        )
+        self._fish_dac_update_fastpath = (
+            os.environ.get("VLLM_FISH_DAC_UPDATE_FASTPATH", "0") == "1"
+            and self._fish_dac_sched_fastpath
+        )
+        self._fish_dac_rearm_in_update = (
+            os.environ.get("VLLM_FISH_DAC_REARM_IN_UPDATE", "0") == "1"
+            and self._fish_dac_update_fastpath
+        )
+        self._fish_dac_direct_worker = (
+            os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER", "0") == "1"
+            and self._fish_dac_sched_fastpath
+            and self._fish_dac_update_fastpath
+        )
+        self._fish_dac_direct_worker_mixed_bucket = (
+            os.environ.get("VLLM_FISH_DAC_DIRECT_WORKER_MIXED_BUCKET", "0") == "1"
+            and self._fish_dac_direct_worker
+        )
+        self._fish_dac_direct_worker_prefetch = max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_FISH_DAC_DIRECT_WORKER_PREFETCH",
+                    str(max(1, self._fish_dac_worker_batch_size * 2)),
+                )
+                or max(1, self._fish_dac_worker_batch_size * 2)
+            ),
+        )
+        self._fish_dac_sched_profile_interval = max(
+            1,
+            int(os.environ.get("VLLM_FISH_DAC_SCHED_PROFILE_INTERVAL", "200") or 200),
+        )
+        self._fish_dac_bucket_frames = self._parse_fish_dac_bucket_frames()
+        self._fish_dac_sched_steps = 0
+        self._fish_dac_fastpath_steps = 0
+
+    def _fish_count_ready_dac_chunks(self) -> tuple[int, int]:
+        ready = 0
+        live = 0
+        for request in self.running:
+            if request.request_id not in self.requests:
+                continue
+            live += 1
+            if len(request.prompt_token_ids) > request.num_computed_tokens:
+                ready += 1
+        for request in self.waiting:
+            if request.request_id not in self.requests:
+                continue
+            live += 1
+            if len(request.prompt_token_ids) > 0:
+                ready += 1
+        return ready, live
+
+    @staticmethod
+    def _parse_fish_dac_bucket_frames() -> list[int]:
+        spec = os.environ.get("VLLM_FISH_DAC_BUCKET_FRAMES", "4,25,50").strip()
+        try:
+            return sorted(int(part.strip()) for part in spec.split(",") if part.strip())
+        except ValueError:
+            logger.warning_once("Ignoring invalid VLLM_FISH_DAC_BUCKET_FRAMES=%r", spec)
+            return [4, 25, 50]
+
+    def _fish_dac_ready_tokens(self, request: Request) -> int:
+        if request.request_id not in self.requests:
+            return 0
+        ready_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+        if ready_tokens > 0:
+            return ready_tokens
+        if (
+            self.chunk_transfer_adapter is not None
+            and request.request_id in self.chunk_transfer_adapter.finished_requests
+        ):
+            return 1
+        return 0
+
+    def fish_dac_has_ready_work(self) -> bool:
+        """Return whether Stage1 can run a DAC chunk without waiting.
+
+        This is intentionally a non-mutating probe used by the Stage1 engine
+        side loop.  Queue restoration and chunk metadata transfer still happen
+        inside ``schedule()`` so the normal scheduler invariants stay in one
+        place.
+        """
+        if not self._fish_dac_sched_fastpath or self.chunk_transfer_adapter is None:
+            return False
+        if hasattr(self.chunk_transfer_adapter, "has_ready_chunks") and self.chunk_transfer_adapter.has_ready_chunks():
+            return True
+        for request in self.running:
+            if self._fish_dac_ready_tokens(request) > 0:
+                return True
+        for request in self.waiting:
+            if self._fish_dac_ready_tokens(request) > 0:
+                return True
+        return False
+
+    def has_requests(self) -> bool:
+        if (
+            os.environ.get("VLLM_FISH_DAC_READY_WAKEUP", "0") == "1"
+            and self.fish_dac_has_ready_work()
+        ):
+            return True
+        return super().has_requests()
+
+    def _fish_dac_frame_bucket(self, request: Request) -> int:
+        info = getattr(request, "additional_information", None)
+        token_count = None
+        if isinstance(info, dict):
+            next_len = info.get("next_stage_prompt_len")
+            if isinstance(next_len, int) and next_len > 0:
+                token_count = next_len
+        if token_count is None:
+            token_count = max(
+                len(request.prompt_token_ids) - request.num_computed_tokens,
+                len(request.prompt_token_ids),
+            )
+        frames = max(1, int(token_count + 9) // 10)
+        for bucket in self._fish_dac_bucket_frames:
+            if frames <= bucket:
+                return bucket
+        return frames
+
+    def _fish_reorder_ready_waiting(self, selected: list[Request]) -> None:
+        if not selected:
+            return
+        selected_ids = {request.request_id for request in selected}
+        if hasattr(self.waiting, "remove_requests"):
+            self.waiting.remove_requests(selected)
+        else:
+            for request in selected:
+                try:
+                    self.waiting.remove(request)
+                except ValueError:
+                    pass
+        if hasattr(self.waiting, "prepend_requests"):
+            self.waiting.prepend_requests(selected)
+        else:
+            for request in reversed(selected):
+                self.waiting.insert(0, request)
+        if self._fish_dac_sched_profile:
+            logger.debug("Stage1 bucket-aware waiting reorder selected=%s", selected_ids)
+
+    def _fish_bucket_aware_reorder(self) -> None:
+        if not self._fish_dac_bucket_aware or self.chunk_transfer_adapter is None:
+            return
+
+        def score(request: Request) -> tuple[int, int, int]:
+            is_terminal = int(
+                request.request_id in self.chunk_transfer_adapter.finished_requests
+            )
+            return (
+                is_terminal,
+                self._fish_dac_frame_bucket(request),
+                -len(request.prompt_token_ids),
+            )
+
+        ready_running = [
+            request
+            for request in self.running
+            if self._fish_dac_ready_tokens(request) > 0
+        ]
+        if ready_running:
+            grouped: dict[int, list[Request]] = defaultdict(list)
+            for request in ready_running:
+                grouped[self._fish_dac_frame_bucket(request)].append(request)
+            preferred_bucket = max(
+                grouped.items(),
+                key=lambda item: (
+                    any(
+                        r.request_id in self.chunk_transfer_adapter.finished_requests
+                        for r in item[1]
+                    ),
+                    len(item[1]),
+                ),
+            )[0]
+            preferred_ids = {request.request_id for request in grouped[preferred_bucket]}
+            terminal_ids = set(self.chunk_transfer_adapter.finished_requests)
+            self.running.sort(
+                key=lambda request: (
+                    request.request_id not in terminal_ids,
+                    request.request_id not in preferred_ids,
+                    -self._fish_dac_ready_tokens(request),
+                )
+            )
+
+        if not self.waiting:
+            return
+
+        ready_waiting = [
+            request
+            for request in list(self.waiting)
+            if self._fish_dac_ready_tokens(request) > 0
+        ]
+        if not ready_waiting:
+            return
+
+        grouped_waiting: dict[int, list[Request]] = defaultdict(list)
+        for request in ready_waiting:
+            grouped_waiting[self._fish_dac_frame_bucket(request)].append(request)
+        preferred_bucket = max(
+            grouped_waiting.items(),
+            key=lambda item: (
+                any(
+                    r.request_id in self.chunk_transfer_adapter.finished_requests
+                    for r in item[1]
+                ),
+                len(item[1]),
+            ),
+        )[0]
+        selected = sorted(
+            grouped_waiting[preferred_bucket],
+            key=score,
+            reverse=True,
+        )
+        self._fish_reorder_ready_waiting(selected)
+
+    def _fish_log_sched_profile(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        scheduled_new_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+    ) -> None:
+        if not self._fish_dac_sched_profile:
+            return
+        self._fish_dac_sched_steps += 1
+        if self._fish_dac_sched_steps > 10 and self._fish_dac_sched_steps % self._fish_dac_sched_profile_interval:
+            return
+
+        ready_buckets: dict[int, int] = defaultdict(int)
+        for request in list(self.running) + list(self.waiting):
+            if self._fish_dac_ready_tokens(request) > 0:
+                ready_buckets[self._fish_dac_frame_bucket(request)] += 1
+        scheduled_buckets: dict[int, int] = defaultdict(int)
+        for request in scheduled_new_reqs + scheduled_running_reqs:
+            scheduled_buckets[self._fish_dac_frame_bucket(request)] += 1
+
+        logger.info(
+            "Stage1 DAC sched profile: step=%d scheduled=%d new=%d running=%d tokens=%d "
+            "ready_buckets=%s scheduled_buckets=%s waiting=%d running_queue=%d",
+            self._fish_dac_sched_steps,
+            len(num_scheduled_tokens),
+            len(scheduled_new_reqs),
+            len(scheduled_running_reqs),
+            sum(num_scheduled_tokens.values()),
+            dict(sorted(ready_buckets.items())),
+            dict(sorted(scheduled_buckets.items())),
+            len(self.waiting),
+            len(self.running),
+        )
+
+    def _fish_make_empty_cached_request_data(self) -> OmniCachedRequestData:
+        return OmniCachedRequestData(
+            req_ids=[],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[],
+            num_computed_tokens=[],
+            num_output_tokens=[],
+            prompt_token_ids={},
+            additional_information={},
+        )
+
+    def _fish_make_dac_fastpath_output(
+        self,
+        *,
+        scheduled_new_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        cached_prompt_token_ids: dict[str, list[int]],
+        cached_additional_information: dict[str, dict | None],
+    ) -> SchedulerOutput:
+        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        empty_block_ids = tuple([] for _ in self.kv_cache_config.kv_cache_groups)
+
+        new_reqs_data = [
+            OmniNewRequestData.from_request(
+                req,
+                empty_block_ids,
+                getattr(req, "_all_token_ids", None) if self.use_v2_model_runner else None,
+            )
+            for req in scheduled_new_reqs
+        ]
+
+        cached_reqs_data = OmniCachedRequestData(
+            req_ids=[req.request_id for req in scheduled_running_reqs],
+            resumed_req_ids=set(),
+            new_token_ids=[[] for _ in scheduled_running_reqs],
+            all_token_ids={},
+            new_block_ids=[None for _ in scheduled_running_reqs],
+            num_computed_tokens=[
+                req.num_computed_tokens for req in scheduled_running_reqs
+            ],
+            num_output_tokens=[
+                req.num_output_tokens for req in scheduled_running_reqs
+            ],
+            prompt_token_ids=cached_prompt_token_ids,
+            additional_information=cached_additional_information,
+        )
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            preempted_req_ids=set(),
+            new_block_ids_to_zero=None,
+        )
+
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.postprocess_scheduler_output(
+                scheduler_output
+            )
+
+        return scheduler_output
+
+    def fish_dac_worker_schedule(self) -> SchedulerOutput | None:
+        """Build a DAC batch directly from the ready-chunk side queue.
+
+        This is the Stage1 worker/coalescer path. It bypasses the generic
+        request lifecycle in ``schedule()`` for chunk-ready Fish DAC work:
+        ready chunks are drained from the adapter, grouped by decode bucket,
+        and returned as a cached-request batch for the DAC runner fastpath.
+        """
+        if not self._fish_dac_direct_worker or self.chunk_transfer_adapter is None:
+            return None
+        if self._pause_state == PauseState.PAUSED_ALL:
+            return None
+
+        self.kv_cache_manager.new_step_starts()
+
+        scheduled_req_limit = self._fish_dac_worker_batch_size
+        drain_limit = max(scheduled_req_limit, self._fish_dac_direct_worker_prefetch)
+        ready_chunks = self.chunk_transfer_adapter.drain_ready_chunks(drain_limit)
+        if not ready_chunks:
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting,
+                self.running,
+            )
+            ready_chunks = self.chunk_transfer_adapter.drain_ready_chunks(drain_limit)
+            if not ready_chunks:
+                return None
+
+        grouped: dict[int, list[Request]] = defaultdict(list)
+        valid_chunks: list[Request] = []
+        leftovers: list[Request] = []
+        for request in ready_chunks:
+            if request.request_id not in self.requests:
+                continue
+            if self._fish_dac_ready_tokens(request) <= 0:
+                if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                    if len(request.prompt_token_ids) <= request.num_computed_tokens:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                else:
+                    continue
+            valid_chunks.append(request)
+            grouped[self._fish_dac_frame_bucket(request)].append(request)
+
+        if not grouped:
+            return None
+
+        selected_ids: set[str] = set()
+        scheduled_bucket: int | str = "mixed"
+        if getattr(self, "_fish_dac_direct_worker_mixed_bucket", False):
+            ordered_chunks = sorted(
+                valid_chunks,
+                key=lambda req: (
+                    req.request_id not in self.chunk_transfer_adapter.finished_requests,
+                    self._fish_dac_frame_bucket(req),
+                ),
+            )
+            selected = ordered_chunks[:scheduled_req_limit]
+            selected_ids.update(req.request_id for req in selected)
+        else:
+            preferred_bucket, selected_bucket_reqs = max(
+                grouped.items(),
+                key=lambda item: (
+                    any(
+                        req.request_id in self.chunk_transfer_adapter.finished_requests
+                        for req in item[1]
+                    ),
+                    len(item[1]),
+                ),
+            )
+            scheduled_bucket = preferred_bucket
+            selected = selected_bucket_reqs[:scheduled_req_limit]
+            selected_ids.update(req.request_id for req in selected)
+        for bucket, bucket_reqs in grouped.items():
+            for request in bucket_reqs:
+                if request.request_id not in selected_ids:
+                    leftovers.append(request)
+        if leftovers and hasattr(self.chunk_transfer_adapter, "prepend_ready_chunks"):
+            self.chunk_transfer_adapter.prepend_ready_chunks(leftovers)
+
+        token_budget = self.max_num_scheduled_tokens
+        scheduled_timestamp = time.monotonic()
+        scheduled_running_reqs: list[Request] = []
+        num_scheduled_tokens: dict[str, int] = {}
+        cached_prompt_token_ids: dict[str, list[int]] = {}
+        cached_additional_information: dict[str, dict | None] = {}
+
+        for request in selected:
+            if token_budget <= 0:
+                break
+            required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+            if required_tokens <= 0:
+                if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                    if len(request.prompt_token_ids) <= request.num_computed_tokens:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+                else:
+                    continue
+            num_new_tokens = min(required_tokens, token_budget)
+            if num_new_tokens <= 0:
+                continue
+
+            request.status = RequestStatus.RUNNING
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = max(0, request.num_computed_tokens)
+            num_scheduled_tokens[request.request_id] = num_new_tokens
+            cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
+            cached_additional_information[request.request_id] = getattr(
+                request,
+                "additional_information",
+                None,
+            )
+            request.num_computed_tokens += num_new_tokens
+            scheduled_running_reqs.append(request)
+            token_budget -= num_new_tokens
+
+        if not num_scheduled_tokens:
+            return None
+
+        scheduler_output = self._fish_make_dac_fastpath_output(
+            scheduled_new_reqs=[],
+            scheduled_running_reqs=scheduled_running_reqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            cached_prompt_token_ids=cached_prompt_token_ids,
+            cached_additional_information=cached_additional_information,
+        )
+
+        self._fish_dac_fastpath_steps += 1
+        if self._fish_dac_sched_fastpath_profile and (
+            self._fish_dac_fastpath_steps <= 10
+            or self._fish_dac_fastpath_steps % self._fish_dac_sched_profile_interval == 0
+        ):
+            logger.info(
+                "Stage1 DAC direct worker: step=%d bucket=%s scheduled=%d "
+                "tokens=%d leftovers=%d waiting=%d running_queue=%d",
+                self._fish_dac_fastpath_steps,
+                scheduled_bucket,
+                len(num_scheduled_tokens),
+                sum(num_scheduled_tokens.values()),
+                len(leftovers),
+                len(self.waiting),
+                len(self.running),
+            )
+
+        return scheduler_output
+
+    def fish_dac_worker_update(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: OmniModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs]:
+        outputs = self._fish_try_update_dac_fastpath(
+            scheduler_output,
+            model_runner_output,
+        )
+        if outputs is None:
+            return {}
+        return outputs
+
+    def _fish_try_schedule_dac_fastpath(self) -> SchedulerOutput | None:
+        if not self._fish_dac_sched_fastpath or self.chunk_transfer_adapter is None:
+            return None
+
+        token_budget = self.max_num_scheduled_tokens
+        if self._pause_state == PauseState.PAUSED_ALL:
+            token_budget = 0
+        scheduled_timestamp = time.monotonic()
+
+        self.kv_cache_manager.new_step_starts()
+
+        self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        if self._fish_dac_dedicated_worker:
+            self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        if self._fish_dac_microbatch and self._fish_dac_microbatch_wait_s > 0:
+            ready, live = self._fish_count_ready_dac_chunks()
+            if 0 < ready < self._fish_dac_microbatch_target and live > ready:
+                time.sleep(self._fish_dac_microbatch_wait_s)
+                self.chunk_transfer_adapter.process_pending_chunks(
+                    self.waiting,
+                    self.running,
+                )
+                if self._fish_dac_dedicated_worker:
+                    self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+                    self.chunk_transfer_adapter.process_pending_chunks(
+                        self.waiting,
+                        self.running,
+                    )
+        self._fish_bucket_aware_reorder()
+
+        scheduled_new_reqs: list[Request] = []
+        scheduled_running_reqs: list[Request] = []
+        num_scheduled_tokens: dict[str, int] = {}
+        cached_prompt_token_ids: dict[str, list[int]] = {}
+        cached_additional_information: dict[str, dict | None] = {}
+        scheduled_req_limit = (
+            self._fish_dac_worker_batch_size
+            if self._fish_dac_dedicated_worker
+            else self.max_num_running_reqs
+        )
+
+        if self._fish_dac_dedicated_worker and token_budget > 0:
+            ready_chunks = self.chunk_transfer_adapter.drain_ready_chunks(
+                scheduled_req_limit
+            )
+            if ready_chunks:
+                waiting_remove: list[Request] = []
+                running_ids = {request.request_id for request in self.running}
+                for request in ready_chunks:
+                    if (
+                        token_budget <= 0
+                        or len(num_scheduled_tokens) >= scheduled_req_limit
+                    ):
+                        break
+                    if request.request_id not in self.requests:
+                        continue
+                    if request.request_id in num_scheduled_tokens:
+                        continue
+
+                    required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+                    if required_tokens <= 0:
+                        if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                            if len(request.prompt_token_ids) <= request.num_computed_tokens:
+                                request.prompt_token_ids.append(0)
+                                try:
+                                    request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                            required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+                        else:
+                            continue
+
+                    num_new_tokens = min(required_tokens, token_budget)
+                    if num_new_tokens <= 0:
+                        continue
+
+                    request.status = RequestStatus.RUNNING
+                    if self.log_stats:
+                        request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+                    if request.num_cached_tokens < 0:
+                        request.num_cached_tokens = (
+                            request.num_computed_tokens
+                            if request.request_id in running_ids
+                            else 0
+                        )
+                    num_scheduled_tokens[request.request_id] = num_new_tokens
+                    token_budget -= num_new_tokens
+
+                    if request.request_id in running_ids:
+                        cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
+                        cached_additional_information[request.request_id] = getattr(
+                            request,
+                            "additional_information",
+                            None,
+                        )
+                        scheduled_running_reqs.append(request)
+                    else:
+                        self.running.append(request)
+                        running_ids.add(request.request_id)
+                        waiting_remove.append(request)
+                        scheduled_new_reqs.append(request)
+
+                if waiting_remove:
+                    if hasattr(self.waiting, "remove_requests"):
+                        self.waiting.remove_requests(waiting_remove)
+                    else:
+                        for request in waiting_remove:
+                            try:
+                                self.waiting.remove(request)
+                            except ValueError:
+                                pass
+
+        req_index = 0
+        while (
+            req_index < len(self.running)
+            and token_budget > 0
+            and len(num_scheduled_tokens) < scheduled_req_limit
+        ):
+            request = self.running[req_index]
+            if request.request_id not in self.requests:
+                req_index += 1
+                continue
+            if request.request_id in num_scheduled_tokens:
+                req_index += 1
+                continue
+
+            required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+            if required_tokens <= 0:
+                if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                    if len(request.prompt_token_ids) <= request.num_computed_tokens:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+                else:
+                    req_index += 1
+                    continue
+
+            num_new_tokens = min(required_tokens, token_budget)
+            if num_new_tokens <= 0:
+                req_index += 1
+                continue
+
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = request.num_computed_tokens
+            cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
+            cached_additional_information[request.request_id] = getattr(
+                request,
+                "additional_information",
+                None,
+            )
+            num_scheduled_tokens[request.request_id] = num_new_tokens
+            token_budget -= num_new_tokens
+            scheduled_running_reqs.append(request)
+            req_index += 1
+
+        if self._fish_dac_dedicated_worker:
+            selected_waiting: list[tuple[Request, int]] = []
+            stale_waiting: list[Request] = []
+            for request in list(self.waiting):
+                if (
+                    token_budget <= 0
+                    or len(num_scheduled_tokens) >= scheduled_req_limit
+                    or self._pause_state != PauseState.UNPAUSED
+                ):
+                    break
+                if request.request_id not in self.requests:
+                    stale_waiting.append(request)
+                    continue
+                if request.request_id in num_scheduled_tokens:
+                    continue
+                if len(request.prompt_token_ids) == 0:
+                    if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    else:
+                        continue
+
+                required_tokens = max(len(request.prompt_token_ids), 1)
+                num_new_tokens = min(required_tokens, token_budget)
+                if num_new_tokens <= 0:
+                    break
+                selected_waiting.append((request, num_new_tokens))
+                token_budget -= num_new_tokens
+
+            to_remove = stale_waiting + [request for request, _ in selected_waiting]
+            if to_remove:
+                if hasattr(self.waiting, "remove_requests"):
+                    self.waiting.remove_requests(to_remove)
+                else:
+                    for request in to_remove:
+                        try:
+                            self.waiting.remove(request)
+                        except ValueError:
+                            pass
+
+            for request, num_new_tokens in selected_waiting:
+                self.running.append(request)
+                if self.log_stats:
+                    request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = 0
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                scheduled_new_reqs.append(request)
+        else:
+            skipped_waiting_requests = create_request_queue(self.policy)
+            while (
+                self.waiting
+                and token_budget > 0
+                and len(num_scheduled_tokens) < scheduled_req_limit
+                and len(self.running) < self.max_num_running_reqs
+                and self._pause_state == PauseState.UNPAUSED
+            ):
+                request = self.waiting.peek_request()
+                if request.request_id not in self.requests:
+                    self.waiting.pop_request()
+                    continue
+
+                if len(request.prompt_token_ids) == 0:
+                    if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    else:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+
+                required_tokens = max(len(request.prompt_token_ids), 1)
+                num_new_tokens = min(required_tokens, token_budget)
+                if num_new_tokens <= 0:
+                    break
+
+                request = self.waiting.pop_request()
+                self.running.append(request)
+                if self.log_stats:
+                    request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = 0
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                scheduled_new_reqs.append(request)
+
+            if skipped_waiting_requests:
+                self.waiting.prepend_requests(skipped_waiting_requests)
+
+        if not num_scheduled_tokens:
+            self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+            return self._fish_make_dac_fastpath_output(
+                scheduled_new_reqs=[],
+                scheduled_running_reqs=[],
+                num_scheduled_tokens={},
+                cached_prompt_token_ids={},
+                cached_additional_information={},
+            )
+
+        scheduler_output = self._fish_make_dac_fastpath_output(
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_running_reqs=scheduled_running_reqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            cached_prompt_token_ids=cached_prompt_token_ids,
+            cached_additional_information=cached_additional_information,
+        )
+
+        for request in scheduled_new_reqs + scheduled_running_reqs:
+            request.num_computed_tokens += num_scheduled_tokens[request.request_id]
+
+        try:
+            self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+        finally:
+            pass
+
+        self._fish_dac_fastpath_steps += 1
+        if self._fish_dac_sched_fastpath_profile and (
+            self._fish_dac_fastpath_steps <= 10
+            or self._fish_dac_fastpath_steps % self._fish_dac_sched_profile_interval == 0
+        ):
+            ready, live = self._fish_count_ready_dac_chunks()
+            logger.info(
+                "Stage1 DAC sched fastpath: step=%d scheduled=%d new=%d running=%d "
+                "tokens=%d ready=%d live=%d waiting=%d running_queue=%d "
+                "dedicated=%s batch_limit=%d",
+                self._fish_dac_fastpath_steps,
+                len(num_scheduled_tokens),
+                len(scheduled_new_reqs),
+                len(scheduled_running_reqs),
+                sum(num_scheduled_tokens.values()),
+                ready,
+                live,
+                len(self.waiting),
+                len(self.running),
+                self._fish_dac_dedicated_worker,
+                scheduled_req_limit,
+            )
+
+        return scheduler_output
+
+    def _fish_try_update_dac_fastpath(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: OmniModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs] | None:
+        if (
+            getattr(self, "_fish_dac_update_fastpath", False) is not True
+            or self.chunk_transfer_adapter is None
+        ):
+            return None
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if not num_scheduled_tokens:
+            return {}
+
+        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        pooler_outputs = model_runner_output.pooler_output
+        stopped_running_reqs: set[Request] = set()
+        stopped_preempted_reqs: set[Request] = set()
+        rearmed_running_reqs: set[Request] = set()
+
+        for req_id in num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+
+            req_index = model_runner_output.req_id_to_index.get(req_id)
+            pooler_output = (
+                pooler_outputs[req_index]
+                if pooler_outputs is not None and req_index is not None
+                else None
+            )
+            status_before_stop = request.status
+            stopped = False
+            finish_reason = None
+            kv_transfer_params = None
+
+            if (
+                req_id in self.chunk_transfer_adapter.finished_requests
+                and request.num_computed_tokens >= len(request.prompt_token_ids)
+            ):
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+
+            if stopped:
+                finish_reason = request.get_finished_reason()
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+                    self.chunk_transfer_adapter.cleanup(
+                        request.request_id,
+                        getattr(request, "external_req_id", None),
+                    )
+                if status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
+                    stopped_running_reqs.add(request)
+                    stopped_preempted_reqs.add(request)
+                else:
+                    stopped_running_reqs.add(request)
+
+            if pooler_output is not None or stopped:
+                num_cached = request.num_cached_tokens
+                if num_cached < 0:
+                    num_cached = 0
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=req_id,
+                        new_token_ids=[],
+                        finish_reason=finish_reason,
+                        pooling_output=pooler_output,
+                        stop_reason=request.stop_reason,
+                        events=request.take_events(),
+                        kv_transfer_params=kv_transfer_params,
+                        trace_headers=request.trace_headers,
+                        num_cached_tokens=num_cached,
+                        num_external_computed_tokens=request.num_external_computed_tokens,
+                        num_nans_in_logits=request.num_nans_in_logits,
+                    )
+                )
+                if (
+                    not stopped
+                    and pooler_output is not None
+                    and getattr(self, "_fish_dac_rearm_in_update", False)
+                    and hasattr(
+                        self.chunk_transfer_adapter,
+                        "rearm_running_chunk_request",
+                    )
+                ):
+                    if self.chunk_transfer_adapter.rearm_running_chunk_request(
+                        request
+                    ):
+                        rearmed_running_reqs.add(request)
+
+        if stopped_running_reqs or rearmed_running_reqs:
+            self.running = remove_all(
+                self.running,
+                stopped_running_reqs | rearmed_running_reqs,
+            )
+        if stopped_preempted_reqs:
+            self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
+
+        engine_core_outputs = {
+            client_index: EngineCoreOutputs(outputs=outs)
+            for client_index, outs in outputs.items()
+        }
+
+        finished_req_ids = self.finished_req_ids_dict
+        if finished_req_ids:
+            for client_index, finished_set in finished_req_ids.items():
+                if (eco := engine_core_outputs.get(client_index)) is not None:
+                    eco.finished_requests = finished_set
+                else:
+                    engine_core_outputs[client_index] = EngineCoreOutputs(
+                        finished_requests=finished_set
+                    )
+            finished_req_ids.clear()
+
+        return engine_core_outputs
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -40,6 +998,9 @@ class OmniGenerationScheduler(VLLMScheduler):
         - If the token budget cannot be satisfied at once, fall back to the
           default vLLM scheduling.
         """
+        fish_dac_fastpath_output = self._fish_try_schedule_dac_fastpath()
+        if fish_dac_fastpath_output is not None:
+            return fish_dac_fastpath_output
 
         token_budget = self.max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -63,6 +1024,12 @@ class OmniGenerationScheduler(VLLMScheduler):
         req_index = 0
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            if self._fish_dac_microbatch and self._fish_dac_microbatch_wait_s > 0:
+                ready, live = self._fish_count_ready_dac_chunks()
+                if 0 < ready < self._fish_dac_microbatch_target and live > ready:
+                    time.sleep(self._fish_dac_microbatch_wait_s)
+                    self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            self._fish_bucket_aware_reorder()
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -247,6 +1214,11 @@ class OmniGenerationScheduler(VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        self._fish_log_sched_profile(
+            num_scheduled_tokens,
+            scheduled_new_reqs,
+            scheduled_running_reqs,
+        )
 
         # Record the request ids scheduled in this step (v0.14.0 behavior).
         self.prev_step_scheduled_req_ids.clear()
@@ -342,6 +1314,14 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         This method is modified to stop the request immediately for the diffusion model.
         """
+        fish_dac_fastpath_outputs = OmniGenerationScheduler._fish_try_update_dac_fastpath(
+            self,
+            scheduler_output,
+            model_runner_output,
+        )
+        if fish_dac_fastpath_outputs is not None:
+            return fish_dac_fastpath_outputs
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

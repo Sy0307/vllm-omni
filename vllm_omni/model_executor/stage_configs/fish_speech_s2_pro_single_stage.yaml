@@ -1,0 +1,51 @@
+# Fish Speech S2 Pro -- Single-stage configuration.
+#
+# Runs AR + DAC decode in a single engine process.
+# DAC vocoder is compiled and called inline in make_omni_output.
+# No connector overhead, no Stage 1 process.
+#
+# Usage:
+#   vllm-omni serve fishaudio/s2-pro \
+#       --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro_single_stage.yaml \
+#       --omni --trust-remote-code
+#
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+      max_batch_size: 16
+    engine_args:
+      max_num_seqs: 16
+      model_stage: fish_speech_slow_ar
+      model_arch: FishSpeechSlowARForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.8
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 16384
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 30
+      top_p: 0.9
+      max_tokens: 2048
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+      stop_token_ids: [151645]
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 16

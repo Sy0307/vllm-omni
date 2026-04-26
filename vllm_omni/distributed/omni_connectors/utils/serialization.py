@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from collections import deque
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -13,6 +15,8 @@ from vllm.outputs import CompletionOutput, RequestOutput
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
+_CUDA_IPC_TENSOR_MARKER = "__cuda_ipc_tensor__"
+_CUDA_IPC_POOL_TENSOR_MARKER = "__cuda_ipc_pool_tensor__"
 _NDARRAY_MARKER = "__ndarray__"
 _PIL_IMAGE_MARKER = "__pil_image__"
 
@@ -26,6 +30,63 @@ _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reaso
 # OmniRequestOutput has 'final_output_type' which is unique, or can be identified by
 # having 'finished' and ('images' or 'final_output_type')
 _OMNI_REQUEST_OUTPUT_KEYS = frozenset({"finished", "final_output_type"})
+
+_CUDA_IPC_PRODUCER_REFS: deque[torch.Tensor] = deque()
+_CUDA_IPC_CONSUMER_STORAGES: dict[str, torch.UntypedStorage] = {}
+_CUDA_IPC_CONSUMER_EVENTS: dict[str, torch.cuda.Event] = {}
+
+
+def _cuda_ipc_enabled() -> bool:
+    return os.environ.get("VLLM_FISH_CUDA_IPC_RELAY", "0") == "1"
+
+
+def _remember_cuda_ipc_tensor(tensor: torch.Tensor) -> None:
+    max_refs = int(os.environ.get("VLLM_FISH_CUDA_IPC_MAX_REFS", "4096"))
+    _CUDA_IPC_PRODUCER_REFS.append(tensor)
+    while len(_CUDA_IPC_PRODUCER_REFS) > max_refs:
+        _CUDA_IPC_PRODUCER_REFS.popleft()
+
+
+def encode_cuda_ipc_pool_tensor(
+    tensor: torch.Tensor,
+    relay_id: str,
+    *,
+    include_handle: bool = True,
+    event_handle: bytes | None = None,
+) -> dict[str, Any]:
+    """Encode a CUDA tensor view backed by a long-lived producer pool.
+
+    Unlike the regular CUDA IPC tensor marker, callers keep reusing the same
+    producer allocation and send the handle only when the consumer may not have
+    it yet. Later messages can carry only relay_id + view metadata, so the
+    consumer reuses its opened storage instead of paying CUDA IPC open cost per
+    chunk.
+    """
+    if not tensor.is_cuda:
+        raise ValueError("encode_cuda_ipc_pool_tensor expects a CUDA tensor")
+
+    t = tensor.detach()
+    if not t.is_contiguous():
+        # Preserve a compact view for small slices. The pooled fast path should
+        # pass contiguous slot views when it wants true zero-copy reuse.
+        t = t.contiguous()
+
+    payload: dict[str, Any] = {
+        _CUDA_IPC_POOL_TENSOR_MARKER: True,
+        "relay_id": relay_id,
+        "dtype": str(t.dtype).removeprefix("torch."),
+        "shape": list(t.shape),
+        "stride": list(t.stride()),
+        "device_index": int(t.device.index or 0),
+        "storage_offset": int(t.storage_offset()),
+    }
+    if include_handle:
+        storage = t.untyped_storage()
+        payload["handle"] = storage._share_cuda_()
+        _remember_cuda_ipc_tensor(t)
+        if event_handle is not None:
+            payload["event_handle"] = event_handle
+    return payload
 
 
 class OmniMsgpackEncoder:
@@ -82,6 +143,21 @@ class OmniMsgpackEncoder:
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
+        if _cuda_ipc_enabled() and tensor.is_cuda:
+            t = tensor.detach().contiguous()
+            storage = t.untyped_storage()
+            handle = storage._share_cuda_()
+            _remember_cuda_ipc_tensor(t)
+            return {
+                _CUDA_IPC_TENSOR_MARKER: True,
+                "handle": handle,
+                "dtype": str(t.dtype).removeprefix("torch."),
+                "shape": list(t.shape),
+                "stride": list(t.stride()),
+                "device_index": int(t.device.index or 0),
+                "storage_offset": int(t.storage_offset()),
+            }
+
         t = tensor.detach().contiguous().cpu()
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
@@ -185,6 +261,10 @@ class OmniMsgpackDecoder:
         """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
         if isinstance(obj, dict):
             # Check for type markers first
+            if obj.get(_CUDA_IPC_POOL_TENSOR_MARKER):
+                return self._decode_cuda_ipc_pool_tensor(obj)
+            if obj.get(_CUDA_IPC_TENSOR_MARKER):
+                return self._decode_cuda_ipc_tensor(obj)
             if obj.get(_TENSOR_MARKER):
                 return self._decode_tensor(obj)
             if obj.get(_NDARRAY_MARKER):
@@ -320,6 +400,65 @@ class OmniMsgpackDecoder:
         if mm_output is not None:
             setattr(ro, "multimodal_output", mm_output)
         return ro
+
+    def _decode_cuda_ipc_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
+        """Rebuild a CUDA tensor from a CUDA IPC storage handle."""
+        handle = obj["handle"]
+        dtype_str = obj["dtype"]
+        shape = tuple(int(v) for v in obj["shape"])
+        stride = tuple(int(v) for v in obj["stride"])
+        device_index = int(obj["device_index"])
+        storage_offset = int(obj["storage_offset"])
+        torch_dtype = getattr(torch, dtype_str)
+
+        target_device = torch.device(f"cuda:{device_index}")
+        with torch.cuda.device(target_device):
+            storage = torch.UntypedStorage._new_shared_cuda(*handle)
+            return torch.empty(0, dtype=torch_dtype, device=target_device).set_(
+                storage,
+                storage_offset=storage_offset,
+                size=shape,
+                stride=stride,
+            )
+
+    def _decode_cuda_ipc_pool_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
+        """Rebuild a CUDA tensor view using a cached pooled IPC storage."""
+        relay_id = str(obj["relay_id"])
+        dtype_str = obj["dtype"]
+        shape = tuple(int(v) for v in obj["shape"])
+        stride = tuple(int(v) for v in obj["stride"])
+        device_index = int(obj["device_index"])
+        storage_offset = int(obj["storage_offset"])
+        torch_dtype = getattr(torch, dtype_str)
+
+        storage = _CUDA_IPC_CONSUMER_STORAGES.get(relay_id)
+        if storage is None:
+            handle = obj.get("handle")
+            if handle is None:
+                raise RuntimeError(f"Missing CUDA IPC pool handle for relay_id={relay_id}")
+            target_device = torch.device(f"cuda:{device_index}")
+            with torch.cuda.device(target_device):
+                storage = torch.UntypedStorage._new_shared_cuda(*handle)
+            _CUDA_IPC_CONSUMER_STORAGES[relay_id] = storage
+
+        target_device = torch.device(f"cuda:{device_index}")
+        event_handle = obj.get("event_handle")
+        if event_handle is not None or relay_id in _CUDA_IPC_CONSUMER_EVENTS:
+            event = _CUDA_IPC_CONSUMER_EVENTS.get(relay_id)
+            if event is None:
+                if event_handle is None:
+                    raise RuntimeError(f"Missing CUDA IPC event handle for relay_id={relay_id}")
+                with torch.cuda.device(target_device):
+                    event = torch.cuda.Event.from_ipc_handle(target_device, event_handle)
+                _CUDA_IPC_CONSUMER_EVENTS[relay_id] = event
+            torch.cuda.current_stream(target_device).wait_event(event)
+
+        return torch.empty(0, dtype=torch_dtype, device=target_device).set_(
+            storage,
+            storage_offset=storage_offset,
+            size=shape,
+            stride=stride,
+        )
 
 
 class OmniSerde:
