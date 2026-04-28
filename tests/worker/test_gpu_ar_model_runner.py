@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -87,3 +88,11 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
     runner._store_fast_acoustic_token(1, torch.tensor(12, dtype=torch.int64))
 
     assert runner._fast_acoustic_sampled_token_ids.tolist()[:2] == [11, 12]
+
+
+def test_fast_acoustic_loop_has_single_hidden_append_and_no_per_step_cpu_item():
+    source = inspect.getsource(GPUARModelRunner._run_acoustic_inner_loop)
+
+    assert source.count("hidden_chunks.append(hidden_states[:1])") == 1
+    fast_branch = source.split("if use_fast_path:", 1)[1].split("else:", 1)[0]
+    assert ".item()" not in fast_branch
