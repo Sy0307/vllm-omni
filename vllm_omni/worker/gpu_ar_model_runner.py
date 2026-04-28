@@ -291,12 +291,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         top_k = getattr(sampling_params, "top_k", -1)
         if top_k not in (-1, 0, None):
             return False
+        min_p = getattr(sampling_params, "min_p", 0.0)
+        if min_p not in (0, 0.0, None):
+            return False
         if getattr(sampling_params, "seed", None) is not None:
             return False
         sampling_type = getattr(sampling_params, "sampling_type", None)
         if sampling_type not in (None, SamplingType.GREEDY):
             return False
         if getattr(sampling_params, "do_sample", False):
+            return False
+        if getattr(sampling_params, "early_stopping", False) not in (False, None):
             return False
         if getattr(sampling_params, "use_beam_search", False):
             return False

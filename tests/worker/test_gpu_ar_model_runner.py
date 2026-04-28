@@ -21,6 +21,7 @@ class _SamplingParams:
         self.temperature = 0.0
         self.top_p = 1.0
         self.top_k = -1
+        self.min_p = 0.0
         self.seed = None
         self.sampling_type = None
         self.do_sample = False
@@ -112,10 +113,13 @@ def test_acoustic_inner_loop_fast_path_rejects_spec_encoder_and_ubatching():
         {"temperature": 0.7},
         {"top_p": 0.9},
         {"top_k": 50},
+        {"min_p": 0.1},
         {"seed": 1234},
         {"sampling_type": SamplingType.RANDOM},
         {"sampling_type": SamplingType.RANDOM_SEED},
         {"do_sample": True},
+        {"early_stopping": True},
+        {"early_stopping": "never"},
         {"use_beam_search": True},
         {"n": 2},
         {"presence_penalty": 0.1},
