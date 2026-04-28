@@ -300,6 +300,45 @@ class CodePredictorBaseModel(nn.Module):
 
 
 @dataclasses.dataclass
+class CodePredictorCacheConfig:
+    max_seq_len: int
+
+
+@dataclasses.dataclass
+class CodePredictorCacheState:
+    keys: torch.Tensor | None
+    values: torch.Tensor | None
+    seq_lens: torch.Tensor | None
+
+    @classmethod
+    def disabled(cls) -> "CodePredictorCacheState":
+        return cls(keys=None, values=None, seq_lens=None)
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        batch_size: int,
+        max_seq_len: int,
+        num_layers: int,
+        num_key_value_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> "CodePredictorCacheState":
+        shape = (num_layers, batch_size, num_key_value_heads, max_seq_len, head_dim)
+        return cls(
+            keys=torch.empty(shape, device=device, dtype=dtype),
+            values=torch.empty(shape, device=device, dtype=dtype),
+            seq_lens=torch.zeros(batch_size, device=device, dtype=torch.long),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.keys is not None
+
+
+@dataclasses.dataclass
 class CodePredictorWrapperConfig:
     """Controls behavioral differences between model-specific code predictors."""
 
@@ -308,6 +347,8 @@ class CodePredictorWrapperConfig:
     use_projection: bool = False
     return_proj_buf: bool = False
     sampling_mode: str = "stored"
+    use_cache: bool = False
+    cache_config: CodePredictorCacheConfig | None = None
 
 
 # ===================================================================
