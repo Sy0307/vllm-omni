@@ -19,6 +19,7 @@
 """Inference-only Qwen3TTS Talker model compatible with HuggingFace weights."""
 
 import bisect
+import dataclasses
 from collections.abc import Callable, Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any, Optional, Union
@@ -62,6 +63,44 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+@dataclasses.dataclass
+class Qwen3TTSNativeAttentionCacheState:
+    keys: torch.Tensor | None
+    values: torch.Tensor | None
+    seq_lens: torch.Tensor | None
+
+    @classmethod
+    def disabled(cls) -> "Qwen3TTSNativeAttentionCacheState":
+        return cls(keys=None, values=None, seq_lens=None)
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        batch_size: int,
+        max_seq_len: int,
+        num_layers: int,
+        num_key_value_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> "Qwen3TTSNativeAttentionCacheState":
+        shape = (num_layers, batch_size, num_key_value_heads, max_seq_len, head_dim)
+        return cls(
+            keys=torch.empty(shape, device=device, dtype=dtype),
+            values=torch.empty(shape, device=device, dtype=dtype),
+            seq_lens=torch.zeros(num_layers, batch_size, device=device, dtype=torch.long),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.keys is not None
+
+    def reset(self) -> None:
+        if self.seq_lens is not None:
+            self.seq_lens.zero_()
 
 
 def _apply_rotary_pos_emb(
@@ -360,6 +399,75 @@ class Qwen3TTSNativeAttention(nn.Module):
         
         output = self.o_proj(attn_output)
         return output
+
+    def forward_cached_step(
+        self,
+        hidden_states: torch.Tensor,
+        cache_state: Qwen3TTSNativeAttentionCacheState,
+        *,
+        layer_idx: int,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if hidden_states.shape[1] != 1:
+            raise ValueError("cached step expects a single token")
+        if not cache_state.enabled:
+            return self.forward(hidden_states, position_embeddings=position_embeddings)
+        if cache_state.keys is None or cache_state.values is None or cache_state.seq_lens is None:
+            raise ValueError("cache state is incomplete")
+
+        batch_size, _, _ = hidden_states.shape
+        q = self.q_proj(hidden_states).view(batch_size, 1, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(batch_size, 1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(batch_size, 1, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+
+        layer_seq_lens = cache_state.seq_lens[layer_idx, :batch_size]
+        write_pos = layer_seq_lens
+        max_seq_len = cache_state.keys.shape[3]
+        if torch.any(write_pos >= max_seq_len):
+            raise ValueError("code predictor cache is full")
+
+        batch_idx = torch.arange(batch_size, device=hidden_states.device)
+        cache_state.keys[layer_idx, batch_idx, :, write_pos, :] = k.squeeze(2)
+        cache_state.values[layer_idx, batch_idx, :, write_pos, :] = v.squeeze(2)
+        layer_seq_lens.add_(1)
+        new_seq_lens = layer_seq_lens
+        max_active_len = int(new_seq_lens.max().item())
+        keys = cache_state.keys[layer_idx, :batch_size, :, :max_active_len, :]
+        values = cache_state.values[layer_idx, :batch_size, :, :max_active_len, :]
+
+        if self.num_kv_groups > 1:
+            keys = keys.repeat_interleave(self.num_kv_groups, dim=1)
+            values = values.repeat_interleave(self.num_kv_groups, dim=1)
+
+        if bool(torch.all(new_seq_lens == max_active_len)):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                keys,
+                values,
+                is_causal=False,
+                scale=self.scaling,
+            )
+        else:
+            attn_mask = torch.arange(max_active_len, device=hidden_states.device).unsqueeze(0) < new_seq_lens.unsqueeze(1)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                keys,
+                values,
+                attn_mask=attn_mask[:, None, None, :],
+                is_causal=False,
+                scale=self.scaling,
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, -1)
+        return self.o_proj(attn_output)
 
 
 class Qwen3TTSNativeMLP(nn.Module):

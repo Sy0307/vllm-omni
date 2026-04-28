@@ -32,6 +32,9 @@ import torch.nn as nn
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_tts_nv import qwen3_tts_talker_nv as nv
 from vllm_omni.model_executor.models.qwen3_tts_nv.qwen3_tts_talker_nv import (
+    Qwen3TTSNativeAttention,
+    Qwen3TTSNativeAttentionCacheState,
+    Qwen3TTSNativeRotaryEmbedding,
     Qwen3TTSTalkerForConditionalGenerationNv,
     _dict_to_namespace,
     _get_talker_config,
@@ -44,6 +47,83 @@ HIDDEN = 8
 NUM_CODE_GROUPS = 4
 VOCAB_SIZE = 16
 MAX_NUM_TOKENS = 16
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Native code predictor attention cache
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_native_attention_cache_state_allocates_and_resets():
+    state = Qwen3TTSNativeAttentionCacheState.allocate(
+        batch_size=2,
+        max_seq_len=5,
+        num_layers=3,
+        num_key_value_heads=4,
+        head_dim=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert state.keys.shape == (3, 2, 4, 5, 8)
+    assert state.values.shape == (3, 2, 4, 5, 8)
+    assert state.seq_lens.tolist() == [[0, 0], [0, 0], [0, 0]]
+
+    state.seq_lens[:] = torch.tensor([[3, 5], [2, 4], [1, 3]])
+    state.reset()
+
+    assert state.seq_lens.tolist() == [[0, 0], [0, 0], [0, 0]]
+
+
+def test_native_attention_cached_step_matches_refill_last_token():
+    attention = Qwen3TTSNativeAttention(
+        hidden_size=8,
+        num_heads=2,
+        num_kv_heads=2,
+        head_dim=4,
+        rms_norm_eps=1e-6,
+        qkv_bias=False,
+    )
+    hidden_states = torch.randn(2, 4, 8)
+    rotary_emb = Qwen3TTSNativeRotaryEmbedding(head_dim=4)
+    cache_state = Qwen3TTSNativeAttentionCacheState.allocate(
+        batch_size=2,
+        max_seq_len=4,
+        num_layers=1,
+        num_key_value_heads=2,
+        head_dim=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    full_position_embeddings = rotary_emb(4, torch.device("cpu"), torch.float32)
+    for step in range(3):
+        attention.forward_cached_step(
+            hidden_states[:, step : step + 1],
+            cache_state,
+            layer_idx=0,
+            position_embeddings=(
+                full_position_embeddings[0][:, :, step : step + 1, :],
+                full_position_embeddings[1][:, :, step : step + 1, :],
+            ),
+        )
+    refill_last = attention(
+        hidden_states,
+        position_embeddings=full_position_embeddings,
+    )[:, -1:]
+
+    cached_last = attention.forward_cached_step(
+        hidden_states[:, -1:],
+        cache_state,
+        layer_idx=0,
+        position_embeddings=(
+            full_position_embeddings[0][:, :, -1:, :],
+            full_position_embeddings[1][:, :, -1:, :],
+        ),
+    )
+
+    torch.testing.assert_close(cached_last, refill_last, atol=1e-6, rtol=1e-5)
+    assert cache_state.seq_lens.tolist() == [[4, 4]]
 
 
 # ──────────────────────────────────────────────────────────────────────

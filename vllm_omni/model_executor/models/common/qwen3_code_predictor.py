@@ -111,8 +111,6 @@ class CodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
-    No KV cache -- the code predictor always re-prefills the full (short)
-    sequence each AR step.
 
     Input : [B, seq_len, hidden_size]
     Output: [B, seq_len, hidden_size]
@@ -172,6 +170,74 @@ class CodePredictorAttention(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
 
+    def forward_cached_step(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cache_state: "CodePredictorCacheState",
+        *,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        if hidden_states.shape[1] != 1:
+            raise ValueError("cached step expects a single token")
+        if not cache_state.enabled:
+            return self.forward(hidden_states, position_embeddings)
+        if cache_state.keys is None or cache_state.values is None or cache_state.seq_lens is None:
+            raise ValueError("cache state is incomplete")
+
+        bsz, _, _ = hidden_states.shape
+        hidden_shape_q = (bsz, 1, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, 1, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape_kv)).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape_kv).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
+
+        layer_seq_lens = cache_state.seq_lens[layer_idx, :bsz]
+        write_pos = layer_seq_lens
+        max_seq_len = cache_state.keys.shape[3]
+        if torch.any(write_pos >= max_seq_len):
+            raise ValueError("code predictor cache is full")
+
+        batch_idx = torch.arange(bsz, device=hidden_states.device)
+        cache_state.keys[layer_idx, batch_idx, :, write_pos, :] = k.squeeze(2)
+        cache_state.values[layer_idx, batch_idx, :, write_pos, :] = v.squeeze(2)
+        layer_seq_lens.add_(1)
+        new_seq_lens = layer_seq_lens
+        max_active_len = int(new_seq_lens.max().item())
+        keys = cache_state.keys[layer_idx, :bsz, :, :max_active_len, :]
+        values = cache_state.values[layer_idx, :bsz, :, :max_active_len, :]
+
+        if bool(torch.all(new_seq_lens == max_active_len)):
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                keys,
+                values,
+                scale=self.scaling,
+                is_causal=False,
+                enable_gqa=self._use_gqa,
+            )
+        else:
+            attn_mask = torch.arange(max_active_len, device=hidden_states.device).unsqueeze(0) < new_seq_lens.unsqueeze(1)
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                keys,
+                values,
+                attn_mask=attn_mask[:, None, None, :],
+                scale=self.scaling,
+                is_causal=False,
+                enable_gqa=self._use_gqa,
+            )
+
+        attn_out = attn_out.transpose(1, 2).reshape(bsz, 1, -1)
+        return self.o_proj(attn_out)
+
 
 # ===================================================================
 #  MLP
@@ -214,6 +280,30 @@ class CodePredictorDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    def forward_cached_step(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cache_state: "CodePredictorCacheState",
+        *,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn.forward_cached_step(
+            hidden_states,
+            position_embeddings,
+            cache_state,
+            layer_idx=layer_idx,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -279,6 +369,24 @@ class CodePredictorBaseModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def forward_cached_step(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_state: "CodePredictorCacheState",
+    ) -> torch.Tensor:
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = layer.forward_cached_step(
+                hidden_states,
+                position_embeddings,
+                cache_state,
+                layer_idx=layer_idx,
+            )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
@@ -330,12 +438,16 @@ class CodePredictorCacheState:
         return cls(
             keys=torch.empty(shape, device=device, dtype=dtype),
             values=torch.empty(shape, device=device, dtype=dtype),
-            seq_lens=torch.zeros(batch_size, device=device, dtype=torch.long),
+            seq_lens=torch.zeros(num_layers, batch_size, device=device, dtype=torch.long),
         )
 
     @property
     def enabled(self) -> bool:
         return self.keys is not None
+
+    def reset(self) -> None:
+        if self.seq_lens is not None:
+            self.seq_lens.zero_()
 
 
 @dataclasses.dataclass
@@ -426,6 +538,7 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._cuda_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        self._cache_state: CodePredictorCacheState = CodePredictorCacheState.disabled()
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -451,6 +564,52 @@ class CodePredictorWrapper(nn.Module):
         ):
             return
         self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
+
+    def reset_cache(self) -> None:
+        self._cache_state.reset()
+
+    def _cache_max_seq_len(self) -> int:
+        if self._wrapper_config.cache_config is not None:
+            return int(self._wrapper_config.cache_config.max_seq_len)
+        return self._num_groups + 1
+
+    def _ensure_cache_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> CodePredictorCacheState:
+        max_seq_len = self._cache_max_seq_len()
+        current = self._cache_state
+        if (
+            current.enabled
+            and current.keys is not None
+            and current.values is not None
+            and current.seq_lens is not None
+            and current.keys.device == device
+            and current.keys.dtype == dtype
+            and current.keys.shape[1] >= batch_size
+            and current.keys.shape[3] >= max_seq_len
+        ):
+            current.reset()
+            return current
+
+        head_dim = getattr(
+            self.config,
+            "head_dim",
+            self.config.hidden_size // self.config.num_attention_heads,
+        )
+        self._cache_state = CodePredictorCacheState.allocate(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_layers=int(self.config.num_hidden_layers),
+            num_key_value_heads=int(self.config.num_key_value_heads),
+            head_dim=int(head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        return self._cache_state
 
     def _setup_compile(self) -> None:
         """Lazily set up torch.compile with optional CUDA graph capture."""
@@ -536,6 +695,118 @@ class CodePredictorWrapper(nn.Module):
 
         logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
 
+    def _sample_next_code(
+        self,
+        logits: torch.Tensor,
+        *,
+        stored_mode: bool,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        if stored_mode:
+            if self._top_k > 0:
+                topk_vals, _ = logits.topk(self._top_k, dim=-1)
+                logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+            if self._top_p < 1.0:
+                sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumulative_probs = sorted_probs.cumsum(dim=-1)
+                remove_mask = (cumulative_probs - sorted_probs) >= self._top_p
+                sorted_logits[remove_mask] = float("-inf")
+                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+            probs = F.softmax(logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+
+        use_sampling = do_sample and temperature > 0
+        if use_sampling and top_p != 1.0:
+            raise NotImplementedError(
+                "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+            )
+        if not use_sampling:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        scaled = logits / max(temperature, 1e-6)
+        if top_k > 0:
+            topk_vals, _ = scaled.topk(top_k, dim=-1)
+            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+        probs = F.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    @torch.inference_mode()
+    def forward_cached_step(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        bsz = int(layer0_code.shape[0])
+        num_groups = self._num_groups
+        device = layer0_code.device
+        self._model_dtype = next(self.model.parameters()).dtype
+        dtype = self._model_dtype
+        self._ensure_buffers(device, dtype, bsz)
+        cache_state = self._ensure_cache_state(batch_size=bsz, device=device, dtype=dtype)
+
+        proj_buf = self._proj_buf
+        projection = self.small_to_mtp_projection
+        lm_heads = list(self.lm_head)
+        codec_embeds = list(self.model.codec_embedding)
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+
+        proj_buf[:bsz].zero_()
+        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+
+        if self._wrapper_config.return_proj_buf:
+            all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
+        else:
+            all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz)
+
+        hidden_out = None
+        for pos in range(2):
+            pos_ids = torch.full((bsz, 1), pos, dtype=torch.long, device=device)
+            hidden_out = self.model.forward_cached_step(proj_buf[:bsz, pos : pos + 1, :], pos_ids, cache_state)
+
+        for step in range(1, num_groups):
+            logits = lm_heads[step - 1](hidden_out[:, 0, :])
+            code = self._sample_next_code(
+                logits,
+                stored_mode=stored_mode,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
+            if self._wrapper_config.return_proj_buf:
+                all_codes[:, step] = code
+            else:
+                all_codes[:, step] = code.reshape(bsz)
+
+            if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
+                new_embed = codec_embeds[step - 1](code)
+                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+            if step < num_groups - 1:
+                next_pos = step + 1
+                pos_ids = torch.full((bsz, 1), next_pos, dtype=torch.long, device=device)
+                hidden_out = self.model.forward_cached_step(
+                    proj_buf[:bsz, next_pos : next_pos + 1, :],
+                    pos_ids,
+                    cache_state,
+                )
+
+        if self._wrapper_config.return_proj_buf:
+            return all_codes, proj_buf[:bsz].clone()
+        return all_codes
+
     # ------------------------------------------------------------------
     #  Forward -- re-prefill + inline sampling
     # ------------------------------------------------------------------
@@ -552,6 +823,17 @@ class CodePredictorWrapper(nn.Module):
         top_p: float = 1.0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
+        if self._wrapper_config.use_cache:
+            return self.forward_cached_step(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         device = layer0_code.device

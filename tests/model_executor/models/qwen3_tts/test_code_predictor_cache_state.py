@@ -93,7 +93,7 @@ def test_cache_state_allocates_expected_shapes(mocker: MockerFixture) -> None:
 
     assert state.keys.shape == (3, 2, 4, 5, 8)
     assert state.values.shape == (3, 2, 4, 5, 8)
-    assert state.seq_lens.tolist() == [0, 0]
+    assert state.seq_lens.tolist() == [[0, 0], [0, 0], [0, 0]]
     assert state.enabled is True
 
 
@@ -106,3 +106,68 @@ def test_disabled_cache_state_has_no_tensors(mocker: MockerFixture) -> None:
     assert state.values is None
     assert state.seq_lens is None
     assert state.enabled is False
+
+
+def test_cache_state_reset_clears_sequence_lengths(mocker: MockerFixture) -> None:
+    mod = _load_common_module(mocker)
+    state = mod.CodePredictorCacheState.allocate(
+        batch_size=2,
+        max_seq_len=5,
+        num_layers=3,
+        num_key_value_heads=4,
+        head_dim=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    state.seq_lens[:] = torch.tensor([[3, 5], [2, 4], [1, 3]])
+
+    state.reset()
+
+    assert state.seq_lens.tolist() == [[0, 0], [0, 0], [0, 0]]
+
+
+def test_attention_cached_step_matches_refill_last_token(
+    mocker: MockerFixture,
+) -> None:
+    mod = _load_common_module(mocker)
+    config = types.SimpleNamespace(
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        hidden_size=8,
+        head_dim=4,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+    )
+    attention = mod.CodePredictorAttention(config)
+    hidden_states = torch.randn(2, 4, 8)
+    rotary_emb = mod._RotaryEmbedding(config)
+    full_position_ids = torch.arange(4, dtype=torch.long).unsqueeze(0).expand(2, -1)
+    step_position_ids = full_position_ids[:, -1:]
+    cache_state = mod.CodePredictorCacheState.allocate(
+        batch_size=2,
+        max_seq_len=4,
+        num_layers=1,
+        num_key_value_heads=2,
+        head_dim=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    for step in range(3):
+        attention.forward_cached_step(
+            hidden_states[:, step : step + 1],
+            rotary_emb(hidden_states[:, step : step + 1], full_position_ids[:, step : step + 1]),
+            cache_state,
+            layer_idx=0,
+        )
+    refill_last = attention(hidden_states, rotary_emb(hidden_states, full_position_ids))[:, -1:]
+
+    cached_last = attention.forward_cached_step(
+        hidden_states[:, -1:],
+        rotary_emb(hidden_states[:, -1:], step_position_ids),
+        cache_state,
+        layer_idx=0,
+    )
+
+    torch.testing.assert_close(cached_last, refill_last, atol=1e-6, rtol=1e-5)
+    assert cache_state.seq_lens.tolist() == [[4, 4]]
