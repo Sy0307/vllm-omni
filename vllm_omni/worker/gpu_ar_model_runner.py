@@ -438,8 +438,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return False
         if getattr(self.parallel_config, "num_ubatches", 1) != 1:
             return False
-        greedy_group0_tokens = getattr(self.model, "greedy_group0_tokens", None)
-        if not callable(greedy_group0_tokens):
+        if not self._has_qwen3_tts_nv_fast_acoustic_capability():
             return False
 
         req_id = self.input_batch.req_ids[0]
@@ -456,6 +455,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if num_computed < len(prompt_token_ids):
                 return False
         return True
+
+    def _has_qwen3_tts_nv_fast_acoustic_capability(self) -> bool:
+        greedy_group0_tokens = getattr(self.model, "greedy_group0_tokens", None)
+        if not callable(greedy_group0_tokens):
+            return False
+        model_module = type(self.model).__module__
+        return ".qwen3_tts_nv." in model_module or model_module.endswith("qwen3_tts_talker_nv")
 
     def _ensure_fast_acoustic_token_buffer(self, max_steps: int) -> torch.Tensor:
         token_buffer = getattr(self, "_fast_acoustic_sampled_token_ids", None)
@@ -499,31 +505,205 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput:
         req_id = self.input_batch.req_ids[0]
         req_state = self.requests[req_id]
+        use_fast_path = self._should_run_fast_acoustic_inner_loop(scheduler_output, None)
+        stop_token_ids = set(getattr(req_state.sampling_params, "stop_token_ids", ()) or ())
+        if getattr(req_state.sampling_params, "stop_token_id", None) is not None:
+            stop_token_ids.add(int(req_state.sampling_params.stop_token_id))
+        if use_fast_path and not stop_token_ids:
+            self._last_acoustic_inner_loop_path = "fast"
+            return self._run_fast_qwen3_tts_nv_acoustic_inner_loop(
+                scheduler_output,
+                intermediate_tensors,
+                ec_connector_output,
+                cudagraph_stats,
+            )
+
+        self._last_acoustic_inner_loop_path = "fallback"
+        return self._run_generic_acoustic_inner_loop(
+            scheduler_output,
+            intermediate_tensors,
+            ec_connector_output,
+            cudagraph_stats,
+            stop_token_ids,
+        )
+
+    def _has_separate_kv_cache_update(self) -> bool:
+        from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+
+        return not all(
+            all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+            for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+        )
+
+    def _run_fast_qwen3_tts_nv_acoustic_inner_loop(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None,
+        ec_connector_output: Any,
+        cudagraph_stats: Any,
+    ) -> OmniModelRunnerOutput:
+        req_id = self.input_batch.req_ids[0]
+        max_steps = scheduler_output.num_scheduled_tokens[req_id]
+        start_num_computed = int(self.input_batch.num_computed_tokens_cpu[0])
+        sampled_token_ids: list[int] = []
+        hidden_chunks: list[torch.Tensor] = []
+        multimodal_chunks: dict[str, list[torch.Tensor]] = {}
+        num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
+        sub_output = self._make_single_token_scheduler_output(scheduler_output, req_id)
+        has_separate_kv_update = self._has_separate_kv_cache_update()
+        self._ensure_fast_acoustic_token_buffer(max_steps)
+
+        (
+            cudagraph_mode,
+            batch_desc,
+            should_ubatch,
+            num_tokens_across_dp,
+            cudagraph_stats,
+        ) = self._determine_batch_execution_and_padding(
+            num_tokens=1,
+            num_reqs=1,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            max_num_scheduled_tokens=1,
+            use_cascade_attn=False,
+            num_encoder_reqs=0,
+        )
+        num_tokens_padded = batch_desc.num_tokens
+        num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else 1
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch,
+            num_scheduled_tokens_np,
+            num_tokens_padded,
+            num_reqs_padded,
+            self.parallel_config.num_ubatches,
+        )
+        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+        with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
+            for inner_idx in range(max_steps):
+                current_pos = start_num_computed + inner_idx
+                self.input_batch.num_computed_tokens_cpu[0] = current_pos
+                self.input_batch.num_computed_tokens_cpu_tensor[0] = current_pos
+                logits_indices, sub_spec_decode_metadata = self._prepare_inputs(
+                    sub_output,
+                    num_scheduled_tokens_np,
+                )
+                assert sub_spec_decode_metadata is None
+
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=(num_tokens_padded if pad_attn or has_separate_kv_update else 1),
+                    num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else 1),
+                    num_tokens_unpadded=1,
+                    ubatch_slices=ubatch_slices_padded,
+                )
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=1,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=1,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=1,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=sub_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=None,
+                    slot_mappings=slot_mappings_by_group,
+                )
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    _,
+                ) = self._preprocess(sub_output, num_tokens_padded, intermediate_tensors)
+                if inner_idx > 0:
+                    input_ids[:1].copy_(self._fast_acoustic_sampled_token_ids[inner_idx - 1 : inner_idx])
+                if hasattr(self.model, "prepare_runner_inputs"):
+                    input_ids, positions = self.model.prepare_runner_inputs(
+                        input_ids=input_ids,
+                        positions=positions,
+                        inputs_embeds=inputs_embeds,
+                        req_ids=[req_id],
+                        num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[0])],
+                        num_scheduled_tokens=[1],
+                        input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
+                    )
+
+                with (
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                        slot_mapping=slot_mappings,
+                    ),
+                    record_function_or_nullcontext("gpu_model_runner: acoustic_inner_forward"),
+                ):
+                    model_output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                        sampling_metadata=self.input_batch.sampling_metadata,
+                        logits_index=logits_indices,
+                        sampler=self.sampler,
+                    )
+                    if hasattr(self.model, "flush_pending_metadata"):
+                        self.model.flush_pending_metadata([req_id])
+
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                sample_hidden_states = hidden_states[logits_indices]
+                token_ids_gpu = self.model.greedy_group0_tokens(sample_hidden_states)
+                self._store_fast_acoustic_token(inner_idx, token_ids_gpu)
+                hidden_chunks.append(hidden_states[:1])
+                for key, value in (multimodal_outputs or {}).items():
+                    if isinstance(value, torch.Tensor):
+                        multimodal_chunks.setdefault(key, []).append(value[:1])
+
+                self._process_additional_information_updates(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_scheduled_tokens_np,
+                    sub_output,
+                )
+
+        generated = len(hidden_chunks)
+        sampled_token_ids = self._fast_acoustic_tokens_to_cpu_list(generated)
+        self.input_batch.num_computed_tokens_cpu[0] = start_num_computed + generated
+        self.input_batch.num_computed_tokens_cpu_tensor[0] = start_num_computed + generated
+        return self._build_acoustic_inner_loop_output(
+            req_id,
+            generated,
+            sampled_token_ids,
+            hidden_chunks,
+            multimodal_chunks,
+            kv_connector_output,
+            ec_connector_output,
+            {},
+            cudagraph_stats,
+        )
+
+    def _run_generic_acoustic_inner_loop(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None,
+        ec_connector_output: Any,
+        cudagraph_stats: Any,
+        stop_token_ids: set[int],
+    ) -> OmniModelRunnerOutput:
+        req_id = self.input_batch.req_ids[0]
         max_steps = scheduler_output.num_scheduled_tokens[req_id]
         sampled_token_ids: list[int] = []
         hidden_chunks: list[torch.Tensor] = []
         multimodal_chunks: dict[str, list[torch.Tensor]] = {}
         num_nans_in_logits: dict[str, int] = {}
-        use_fast_path = self._should_run_fast_acoustic_inner_loop(scheduler_output, None)
-        self._last_acoustic_inner_loop_path = "fast" if use_fast_path else "fallback"
-
         start_num_computed = int(self.input_batch.num_computed_tokens_cpu[0])
-        stop_token_ids = set(getattr(req_state.sampling_params, "stop_token_ids", ()) or ())
-        if getattr(req_state.sampling_params, "stop_token_id", None) is not None:
-            stop_token_ids.add(int(req_state.sampling_params.stop_token_id))
-        if use_fast_path and stop_token_ids:
-            use_fast_path = False
-            self._last_acoustic_inner_loop_path = "fallback"
-        if use_fast_path:
-            self._ensure_fast_acoustic_token_buffer(max_steps)
-
-        from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
-
-        has_separate_kv_update = not all(
-            all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
-            for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
-            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
-        )
+        has_separate_kv_update = self._has_separate_kv_cache_update()
         num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
 
         with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
@@ -593,8 +773,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     model_kwargs,
                     _,
                 ) = self._preprocess(sub_output, num_tokens_padded, intermediate_tensors)
-                if use_fast_path and inner_idx > 0:
-                    input_ids[:1].copy_(self._fast_acoustic_sampled_token_ids[inner_idx - 1 : inner_idx])
                 if hasattr(self.model, "prepare_runner_inputs"):
                     input_ids, positions = self.model.prepare_runner_inputs(
                         input_ids=input_ids,
@@ -634,42 +812,36 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
                 sample_hidden_states = hidden_states[logits_indices]
-                if use_fast_path:
-                    token_ids_gpu = self.model.greedy_group0_tokens(sample_hidden_states)
-                    self._store_fast_acoustic_token(inner_idx, token_ids_gpu)
-                    token_id = None
-                else:
-                    try:
-                        logits = self.model.compute_logits(
-                            sample_hidden_states,
-                            sampling_metadata=self.input_batch.sampling_metadata,
-                        )
-                    except TypeError:
-                        logits = self.model.compute_logits(sample_hidden_states)
-
-                    sampler_output = self._sample(logits, None)
-                    (
-                        step_nans,
-                        _,
-                        valid_sampled_token_ids,
-                        _,
-                        _,
-                        _,
-                        _,
-                    ) = self._bookkeeping_sync(
-                        sub_output,
-                        sampler_output,
-                        logits,
-                        hidden_states,
-                        1,
-                        None,
+                try:
+                    logits = self.model.compute_logits(
+                        sample_hidden_states,
+                        sampling_metadata=self.input_batch.sampling_metadata,
                     )
-                    num_nans_in_logits.update(step_nans)
-                    if not valid_sampled_token_ids or not valid_sampled_token_ids[0]:
-                        break
-                    token_id = int(valid_sampled_token_ids[0][0])
-                if token_id is not None:
-                    sampled_token_ids.append(token_id)
+                except TypeError:
+                    logits = self.model.compute_logits(sample_hidden_states)
+
+                sampler_output = self._sample(logits, None)
+                (
+                    step_nans,
+                    _,
+                    valid_sampled_token_ids,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = self._bookkeeping_sync(
+                    sub_output,
+                    sampler_output,
+                    logits,
+                    hidden_states,
+                    1,
+                    None,
+                )
+                num_nans_in_logits.update(step_nans)
+                if not valid_sampled_token_ids or not valid_sampled_token_ids[0]:
+                    break
+                token_id = int(valid_sampled_token_ids[0][0])
+                sampled_token_ids.append(token_id)
                 hidden_chunks.append(hidden_states[:1])
                 for key, value in (multimodal_outputs or {}).items():
                     if isinstance(value, torch.Tensor):
@@ -681,15 +853,36 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     num_scheduled_tokens_np,
                     sub_output,
                 )
-                if token_id is not None and token_id in stop_token_ids:
+                if token_id in stop_token_ids:
                     break
 
-        generated = len(hidden_chunks) if use_fast_path else len(sampled_token_ids)
-        if use_fast_path:
-            sampled_token_ids = self._fast_acoustic_tokens_to_cpu_list(generated)
+        generated = len(sampled_token_ids)
         self.input_batch.num_computed_tokens_cpu[0] = start_num_computed + generated
         self.input_batch.num_computed_tokens_cpu_tensor[0] = start_num_computed + generated
+        return self._build_acoustic_inner_loop_output(
+            req_id,
+            generated,
+            sampled_token_ids,
+            hidden_chunks,
+            multimodal_chunks,
+            kv_connector_output,
+            ec_connector_output,
+            num_nans_in_logits,
+            cudagraph_stats,
+        )
 
+    def _build_acoustic_inner_loop_output(
+        self,
+        req_id: str,
+        generated: int,
+        sampled_token_ids: list[int],
+        hidden_chunks: list[torch.Tensor],
+        multimodal_chunks: dict[str, list[torch.Tensor]],
+        kv_connector_output: Any,
+        ec_connector_output: Any,
+        num_nans_in_logits: dict[str, int],
+        cudagraph_stats: Any,
+    ) -> OmniModelRunnerOutput:
         if hidden_chunks:
             hidden_states = torch.cat(hidden_chunks, dim=0)
         else:
@@ -714,7 +907,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 seq_len=generated,
             )
 
-        output = OmniModelRunnerOutput(
+        return OmniModelRunnerOutput(
             req_ids=[req_id],
             req_id_to_index={req_id: 0},
             sampled_token_ids=[sampled_token_ids],
@@ -730,7 +923,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             num_nans_in_logits=num_nans_in_logits,
             cudagraph_stats=cudagraph_stats,
         )
-        return output
 
     @torch.inference_mode()
     def execute_model(

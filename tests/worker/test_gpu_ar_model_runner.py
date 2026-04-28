@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingType
 
+from vllm_omni.worker import gpu_ar_model_runner as ar_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
@@ -40,6 +41,14 @@ class _SamplingParams:
             setattr(self, key, value)
 
 
+class _Qwen3TTSNVModel:
+    def greedy_group0_tokens(self, hidden):
+        return hidden.argmax(dim=-1)
+
+
+_Qwen3TTSNVModel.__module__ = "vllm_omni.model_executor.models.qwen3_tts_nv.qwen3_tts_talker_nv"
+
+
 class _SchedulerOutput:
     def __init__(self):
         self.omni_acoustic_inner_loop_extra_slots = {"rid": 2}
@@ -61,8 +70,8 @@ def _make_runner():
     runner.input_batch = _InputBatch()
     runner.requests = {"rid": SimpleNamespace(sampling_params=_SamplingParams())}
     runner.speculative_config = None
-    runner.parallel_config = SimpleNamespace(use_ubatching=False)
-    runner.model = SimpleNamespace(greedy_group0_tokens=lambda hidden: hidden.argmax(dim=-1))
+    runner.parallel_config = SimpleNamespace(use_ubatching=False, num_ubatches=1)
+    runner.model = _Qwen3TTSNVModel()
     return runner
 
 
@@ -75,6 +84,13 @@ def test_acoustic_inner_loop_fast_path_requires_greedy_model_helper():
     runner.model = SimpleNamespace()
 
     assert not runner._should_run_fast_acoustic_inner_loop(scheduler_output, None)
+
+
+def test_acoustic_inner_loop_fast_path_requires_qwen3_tts_nv_model():
+    runner = _make_runner()
+    runner.model = SimpleNamespace(greedy_group0_tokens=lambda hidden: hidden.argmax(dim=-1))
+
+    assert not runner._should_run_fast_acoustic_inner_loop(_SchedulerOutput(), None)
 
 
 @pytest.mark.parametrize(
@@ -160,8 +176,75 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
 
 
 def test_fast_acoustic_loop_has_single_hidden_append_and_no_per_step_cpu_item():
-    source = inspect.getsource(GPUARModelRunner._run_acoustic_inner_loop)
+    source = inspect.getsource(GPUARModelRunner._run_fast_qwen3_tts_nv_acoustic_inner_loop)
 
     assert source.count("hidden_chunks.append(hidden_states[:1])") == 1
-    fast_branch = source.split("if use_fast_path:", 1)[1].split("else:", 1)[0]
-    assert ".item()" not in fast_branch
+    assert ".item()" not in source
+
+
+def test_fast_acoustic_loop_hoists_shape_stable_prep(monkeypatch):
+    runner = _make_runner()
+    scheduler_output = _SchedulerOutput()
+    scheduler_output.total_num_scheduled_tokens = 3
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="multi"))
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
+    runner.supports_mm_inputs = False
+    runner.parallel_config.num_ubatches = 1
+    runner.input_batch.num_computed_tokens_cpu = [4]
+    runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
+    runner.input_batch.sampling_metadata = None
+    runner.input_ids = SimpleNamespace(gpu=torch.empty(1, dtype=torch.int64))
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+    runner.attn_groups = []
+
+    counts = {"determine": 0, "ubatch": 0}
+
+    class _KVContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    runner.maybe_get_kv_connector_output = lambda scheduler_output: _KVContext()
+    runner._make_single_token_scheduler_output = lambda scheduler_output, req_id: SimpleNamespace(
+        num_scheduled_tokens={req_id: 1}, total_num_scheduled_tokens=1, scheduled_spec_decode_tokens={}
+    )
+    runner._prepare_inputs = lambda sub_output, num_scheduled_tokens_np: (torch.tensor([0]), None)
+
+    def determine(**kwargs):
+        counts["determine"] += 1
+        return None, SimpleNamespace(num_tokens=1, num_reqs=1), False, 1, None
+
+    runner._determine_batch_execution_and_padding = determine
+
+    def ubatch(*args):
+        counts["ubatch"] += 1
+        return None, None
+
+    monkeypatch.setattr(ar_runner, "maybe_create_ubatch_slices", ubatch)
+    runner._get_slot_mappings = lambda **kwargs: ({}, None)
+    runner._build_attention_metadata = lambda **kwargs: (None, None)
+    runner._preprocess = lambda sub_output, num_tokens_padded, intermediate_tensors: (
+        torch.zeros(1, dtype=torch.int64),
+        None,
+        torch.zeros(1, dtype=torch.int64),
+        intermediate_tensors,
+        {},
+        None,
+    )
+    runner._model_forward = lambda **kwargs: torch.ones(1, 2)
+    runner.extract_multimodal_outputs = lambda model_output: (model_output, {})
+    runner.model.greedy_group0_tokens = lambda hidden: torch.tensor([1])
+    runner._ensure_fast_acoustic_token_buffer = lambda max_steps: setattr(
+        runner, "_fast_acoustic_sampled_token_ids", torch.empty(max_steps, dtype=torch.int64)
+    )
+    runner._process_additional_information_updates = lambda *args: None
+
+    output = runner._run_acoustic_inner_loop(scheduler_output, None, None, None)
+
+    assert output.sampled_token_ids == [[1, 1, 1]]
+    assert counts["determine"] == 1
+    assert counts["ubatch"] == 1
