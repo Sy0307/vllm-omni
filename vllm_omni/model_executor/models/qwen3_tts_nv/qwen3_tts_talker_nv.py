@@ -1088,6 +1088,14 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
         return logits
 
+    def greedy_group0_tokens(
+        self,
+        hidden_states: Union[torch.Tensor, OmniOutput],
+    ) -> torch.Tensor:
+        """Return deterministic greedy group-0 token ids on the input device."""
+        logits = self.compute_logits(hidden_states)
+        return logits.argmax(dim=-1)
+
     def make_omni_output(
         self,
         model_outputs: Union[torch.Tensor, OmniOutput],

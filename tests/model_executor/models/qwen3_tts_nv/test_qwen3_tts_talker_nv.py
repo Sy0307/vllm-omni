@@ -486,6 +486,30 @@ def test_compute_logits_unwraps_omni_output():
     torch.testing.assert_close(via_omni, direct)
 
 
+def test_greedy_group0_tokens_argmaxes_compute_logits_output():
+    model = _make_talker_instance()
+    with torch.no_grad():
+        model.codec_head.weight.copy_(
+            torch.eye(VOCAB_SIZE, HIDDEN)[:VOCAB_SIZE, :HIDDEN]
+        )
+        mask = torch.zeros(VOCAB_SIZE, dtype=torch.bool)
+        mask[2] = True
+        mask[7] = True
+        model.suppress_mask.data.copy_(mask)
+
+    hidden = torch.zeros(2, HIDDEN)
+    hidden[0, 2] = 10.0
+    hidden[0, 4] = 9.0
+    hidden[1, 7] = 10.0
+    hidden[1, 5] = 9.0
+
+    tokens = model.greedy_group0_tokens(hidden)
+
+    torch.testing.assert_close(tokens, torch.tensor([4, 5], dtype=torch.long))
+    assert tokens.device == hidden.device
+    assert tokens.dtype == torch.long
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Static helpers
 # ──────────────────────────────────────────────────────────────────────
