@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+import os
 from time import time
 from typing import Any
 
@@ -18,6 +19,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.acoustic_inner_loop import (
+    acoustic_inner_loop_extra_slots,
+    corrected_num_computed_tokens,
+)
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -79,6 +84,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self.acoustic_inner_loop_steps = int(
+            os.environ.get("VLLM_OMNI_QWEN3_TTS_NV_INNER_LOOP_STEPS", "1")
+        )
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -187,12 +195,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
+        reserved_inner_loop_slots = self._reserve_acoustic_inner_loop_slots()
         try:
             scheduler_output = super().schedule()
         finally:
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+        scheduled_inner_loop_slots = self._finalize_acoustic_inner_loop_slots(
+            reserved_inner_loop_slots,
+            scheduler_output,
+        )
+        if scheduled_inner_loop_slots:
+            setattr(
+                scheduler_output,
+                "omni_acoustic_inner_loop_extra_slots",
+                scheduled_inner_loop_slots,
+            )
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -233,10 +252,65 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
-        return OmniSchedulerOutput(
+        omni_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        if scheduled_inner_loop_slots:
+            setattr(
+                omni_output,
+                "omni_acoustic_inner_loop_extra_slots",
+                scheduled_inner_loop_slots,
+            )
+        return omni_output
+
+    def _reserve_acoustic_inner_loop_slots(self) -> dict[str, int]:
+        if self.acoustic_inner_loop_steps <= 1:
+            return {}
+        if self.scheduler_config.async_scheduling:
+            return {}
+        if len(self.running) != 1:
+            return {}
+
+        request = self.running[0]
+        if request.request_id not in self.requests or request.is_finished():
+            return {}
+        extra_slots = acoustic_inner_loop_extra_slots(
+            max_inner_steps=self.acoustic_inner_loop_steps,
+            num_running_requests=len(self.running),
+            num_computed_tokens=request.num_computed_tokens,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_output_tokens=request.num_output_tokens,
+            max_tokens=request.max_tokens,
+            has_spec_tokens=bool(request.spec_token_ids),
+            uses_structured_output=request.use_structured_output,
+        )
+        if extra_slots <= 0:
+            return {}
+        request.num_output_placeholders += extra_slots
+        return {request.request_id: extra_slots}
+
+    def _finalize_acoustic_inner_loop_slots(
+        self,
+        reserved_slots: dict[str, int],
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, int]:
+        scheduled_slots: dict[str, int] = {}
+        for req_id, reserved in reserved_slots.items():
+            request = self.requests.get(req_id)
+            scheduled_extra = max(
+                0,
+                scheduler_output.num_scheduled_tokens.get(req_id, 0) - 1,
+            )
+            if scheduled_extra:
+                scheduled_slots[req_id] = min(reserved, scheduled_extra)
+            unused = reserved - scheduled_slots.get(req_id, 0)
+            if request is not None and unused > 0:
+                request.num_output_placeholders = max(
+                    0,
+                    request.num_output_placeholders - unused,
+                )
+        return scheduled_slots
 
     def update_from_output(
         self,
@@ -267,6 +341,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
 
         failed_kv_load_req_ids = None
+        inner_loop_slots = getattr(
+            scheduler_output,
+            "omni_acoustic_inner_loop_extra_slots",
+            {},
+        )
         if kv_connector_output and kv_connector_output.invalid_block_ids:
             # These blocks contain externally computed tokens that failed to
             # load. Identify affected requests and adjust their computed token
@@ -315,6 +394,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            if req_id in inner_loop_slots:
+                request.num_output_placeholders = max(
+                    0,
+                    request.num_output_placeholders - inner_loop_slots[req_id],
+                )
+                request.num_computed_tokens = corrected_num_computed_tokens(
+                    num_computed_tokens_after_schedule=request.num_computed_tokens,
+                    num_scheduled_tokens=num_tokens_scheduled,
+                    num_generated_tokens=len(generated_token_ids),
+                )
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:

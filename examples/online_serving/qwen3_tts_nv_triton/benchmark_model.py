@@ -116,6 +116,9 @@ def _build_talker_only_stage_config(
         "max_model_len": max_model_len,
     }
 
+    if (async_scheduling := os.environ.get("VLLM_OMNI_BENCH_ASYNC_SCHEDULING")) is not None:
+        engine_args["async_scheduling"] = async_scheduling not in {"0", "false", "False"}
+
     if profile:
         engine_args["profiler_config"] = {
             "profiler": "torch",

@@ -259,6 +259,280 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         return combined_hidden_states, combined_multimodal_outputs
 
+    def _should_run_acoustic_inner_loop(
+        self,
+        scheduler_output: SchedulerOutput,
+        spec_decode_metadata: Any,
+    ) -> bool:
+        if spec_decode_metadata is not None or self.use_async_scheduling:
+            return False
+        if self.omni_prefix_cache is not None:
+            return False
+        inner_loop_slots = getattr(
+            scheduler_output,
+            "omni_acoustic_inner_loop_extra_slots",
+            {},
+        )
+        if not inner_loop_slots or len(inner_loop_slots) != 1:
+            return False
+        if self.input_batch.num_reqs != 1:
+            return False
+        req_id = self.input_batch.req_ids[0]
+        if req_id not in inner_loop_slots:
+            return False
+        if scheduler_output.num_scheduled_tokens.get(req_id, 0) <= 1:
+            return False
+        req_state = self.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            return False
+        return req_state.sampling_params.logprobs is None
+
+    def _should_prepare_acoustic_inner_loop(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> bool:
+        return self._should_run_acoustic_inner_loop(
+            scheduler_output,
+            None,
+        ) and not scheduler_output.scheduled_spec_decode_tokens
+
+    def _make_single_token_scheduler_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        req_id: str,
+    ) -> SchedulerOutput:
+        sub_output = copy(scheduler_output)
+        sub_output.num_scheduled_tokens = {req_id: 1}
+        sub_output.total_num_scheduled_tokens = 1
+        sub_output.scheduled_spec_decode_tokens = {}
+        return sub_output
+
+    def _run_acoustic_inner_loop(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None,
+        ec_connector_output: Any,
+        cudagraph_stats: Any,
+    ) -> OmniModelRunnerOutput:
+        req_id = self.input_batch.req_ids[0]
+        req_state = self.requests[req_id]
+        max_steps = scheduler_output.num_scheduled_tokens[req_id]
+        sampled_token_ids: list[int] = []
+        hidden_chunks: list[torch.Tensor] = []
+        multimodal_chunks: dict[str, list[torch.Tensor]] = {}
+        num_nans_in_logits: dict[str, int] = {}
+
+        start_num_computed = int(self.input_batch.num_computed_tokens_cpu[0])
+        stop_token_ids = set(getattr(req_state.sampling_params, "stop_token_ids", ()) or ())
+        if getattr(req_state.sampling_params, "stop_token_id", None) is not None:
+            stop_token_ids.add(int(req_state.sampling_params.stop_token_id))
+
+        from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+
+        has_separate_kv_update = not all(
+            all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+            for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+            if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+        )
+        num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
+
+        kv_connector_output = None
+        with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
+            for inner_idx in range(max_steps):
+                current_pos = start_num_computed + inner_idx
+                self.input_batch.num_computed_tokens_cpu[0] = current_pos
+                self.input_batch.num_computed_tokens_cpu_tensor[0] = current_pos
+                sub_output = self._make_single_token_scheduler_output(
+                    scheduler_output,
+                    req_id,
+                )
+                logits_indices, sub_spec_decode_metadata = self._prepare_inputs(
+                    sub_output,
+                    num_scheduled_tokens_np,
+                )
+                assert sub_spec_decode_metadata is None
+
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=1,
+                    num_reqs=1,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=1,
+                    use_cascade_attn=False,
+                    num_encoder_reqs=0,
+                )
+                num_tokens_padded = batch_desc.num_tokens
+                num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else 1
+                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                    should_ubatch,
+                    num_scheduled_tokens_np,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    self.parallel_config.num_ubatches,
+                )
+                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=(num_tokens_padded if pad_attn or has_separate_kv_update else 1),
+                    num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else 1),
+                    num_tokens_unpadded=1,
+                    ubatch_slices=ubatch_slices_padded,
+                )
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=1,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=1,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=1,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=sub_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=None,
+                    slot_mappings=slot_mappings_by_group,
+                )
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    _,
+                ) = self._preprocess(sub_output, num_tokens_padded, intermediate_tensors)
+                if hasattr(self.model, "prepare_runner_inputs"):
+                    input_ids, positions = self.model.prepare_runner_inputs(
+                        input_ids=input_ids,
+                        positions=positions,
+                        inputs_embeds=inputs_embeds,
+                        req_ids=[req_id],
+                        num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[0])],
+                        num_scheduled_tokens=[1],
+                        input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
+                    )
+
+                with (
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                        slot_mapping=slot_mappings,
+                    ),
+                    record_function_or_nullcontext("gpu_model_runner: acoustic_inner_forward"),
+                ):
+                    model_output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                        sampling_metadata=self.input_batch.sampling_metadata,
+                        logits_index=logits_indices,
+                        sampler=self.sampler,
+                    )
+                    if hasattr(self.model, "flush_pending_metadata"):
+                        self.model.flush_pending_metadata([req_id])
+
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+                sample_hidden_states = hidden_states[logits_indices]
+                try:
+                    logits = self.model.compute_logits(
+                        sample_hidden_states,
+                        sampling_metadata=self.input_batch.sampling_metadata,
+                    )
+                except TypeError:
+                    logits = self.model.compute_logits(sample_hidden_states)
+
+                sampler_output = self._sample(logits, None)
+                (
+                    step_nans,
+                    _,
+                    valid_sampled_token_ids,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = self._bookkeeping_sync(
+                    sub_output,
+                    sampler_output,
+                    logits,
+                    hidden_states,
+                    1,
+                    None,
+                )
+                num_nans_in_logits.update(step_nans)
+                if not valid_sampled_token_ids or not valid_sampled_token_ids[0]:
+                    break
+                token_id = int(valid_sampled_token_ids[0][0])
+                sampled_token_ids.append(token_id)
+                hidden_chunks.append(hidden_states[:1])
+                for key, value in (multimodal_outputs or {}).items():
+                    if isinstance(value, torch.Tensor):
+                        multimodal_chunks.setdefault(key, []).append(value[:1])
+
+                self._process_additional_information_updates(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_scheduled_tokens_np,
+                    sub_output,
+                )
+                if token_id in stop_token_ids:
+                    break
+
+        generated = len(sampled_token_ids)
+        self.input_batch.num_computed_tokens_cpu[0] = start_num_computed + generated
+        self.input_batch.num_computed_tokens_cpu_tensor[0] = start_num_computed + generated
+
+        if hidden_chunks:
+            hidden_states = torch.cat(hidden_chunks, dim=0)
+        else:
+            hidden_size = getattr(self.model_config.hf_config, "hidden_size", 0)
+            hidden_states = torch.empty((0, hidden_size), device=self.device, dtype=self.dtype)
+        multimodal_outputs = {
+            key: torch.cat(chunks, dim=0)
+            for key, chunks in multimodal_chunks.items()
+            if chunks
+        }
+        mm_cpu = build_mm_cpu(multimodal_outputs)
+        hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+
+        payload: dict[str, object] = {"hidden": hidden_states_cpu}
+        for mm_key, mm_val in mm_cpu.items():
+            payload[mm_key] = to_payload_element(
+                element=mm_val,
+                idx=0,
+                start=0,
+                end=generated,
+                pass_lists_through=False,
+                seq_len=generated,
+            )
+
+        output = OmniModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[sampled_token_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=(
+                [payload]
+                if self.vllm_config.model_config.engine_output_type != "text"
+                else None
+            ),
+            kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            num_nans_in_logits=num_nans_in_logits,
+            cudagraph_stats=cudagraph_stats,
+        )
+        return output
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -377,92 +651,108 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
+            run_acoustic_inner_loop = self._should_prepare_acoustic_inner_loop(
                 scheduler_output,
-                num_scheduled_tokens_np,
             )
+            cudagraph_stats = None
 
-            cascade_attn_prefix_lens = None
-            # Disable cascade attention when using microbatching (DBO)
-            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
-                # Pre-compute cascade attention prefix lengths
-                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+            if not run_acoustic_inner_loop:
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
                     num_scheduled_tokens_np,
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                    scheduler_output.num_common_prefix_blocks,
                 )
 
-            (
-                cudagraph_mode,
-                batch_desc,
-                should_ubatch,
-                num_tokens_across_dp,
-                cudagraph_stats,
-            ) = self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens_np,
-                max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
-                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-            )
+                cascade_attn_prefix_lens = None
+                # Disable cascade attention when using microbatching (DBO)
+                if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
+                    # Pre-compute cascade attention prefix lengths
+                    cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                        num_scheduled_tokens_np,
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                        scheduler_output.num_common_prefix_blocks,
+                    )
 
-            num_tokens_padded = batch_desc.num_tokens
-            num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
-            ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
-                should_ubatch,
-                num_scheduled_tokens_np,
-                num_tokens_padded,
-                num_reqs_padded,
-                self.parallel_config.num_ubatches,
-            )
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                )
 
-            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+                num_tokens_padded = batch_desc.num_tokens
+                num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                    should_ubatch,
+                    num_scheduled_tokens_np,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    self.parallel_config.num_ubatches,
+                )
 
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-            ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-            # True if any attention backend handles KV cache update separately
-            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
-            # slot_mappings must use padded dimensions to match the key/value tensors.
-            from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+                use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            has_separate_kv_update = not all(
-                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
-                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
-                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
-            )
+                # True if any attention backend handles KV cache update separately
+                # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
+                # slot_mappings must use padded dimensions to match the key/value tensors.
+                from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
 
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
-                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
-            )
+                has_separate_kv_update = not all(
+                    all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                    for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                    if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+                )
 
-            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded if pad_attn else None,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded if pad_attn else None,
-                max_query_len=max_num_scheduled_tokens,
-                ubatch_slices=ubatch_slices_attn,
-                logits_indices=logits_indices,
-                use_spec_decode=use_spec_decode,
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                slot_mappings=slot_mappings_by_group,
-            )
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
+                    num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded,
+                )
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
+                attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
+                )
+
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+
+        if run_acoustic_inner_loop:
+            output = self._run_acoustic_inner_loop(
+                scheduler_output,
                 intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+                None,
+                cudagraph_stats,
+            )
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+            return output
 
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
