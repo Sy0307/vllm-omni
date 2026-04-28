@@ -401,7 +401,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
         num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
 
-        kv_connector_output = None
         with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
             for inner_idx in range(max_steps):
                 current_pos = start_num_computed + inner_idx
