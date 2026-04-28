@@ -177,6 +177,9 @@ AGENTS.md
 .codex
 .codex/
 
+# Humanize RLCR
+.humanize*
+
 # cursor
 .cursor/
 
