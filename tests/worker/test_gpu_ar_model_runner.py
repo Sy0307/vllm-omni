@@ -3,14 +3,40 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingType
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
 class _SamplingParams:
-    logprobs = None
-    stop_token_id = None
-    stop_token_ids = None
+    def __init__(self, **overrides):
+        self.logprobs = None
+        self.prompt_logprobs = None
+        self.stop = None
+        self.stop_token_id = None
+        self.stop_token_ids = None
+        self.all_stop_token_ids = None
+        self.ignore_eos = False
+        self.min_tokens = 0
+        self.temperature = 0.0
+        self.top_p = 1.0
+        self.top_k = -1
+        self.seed = None
+        self.sampling_type = None
+        self.do_sample = False
+        self.use_beam_search = False
+        self.n = 1
+        self.presence_penalty = 0.0
+        self.frequency_penalty = 0.0
+        self.repetition_penalty = 1.0
+        self.encoder_repetition_penalty = 1.0
+        self.logits_processors = None
+        self.allowed_token_ids = None
+        self.structured_outputs = None
+        self.guided_decoding = None
+        self.extra_args = None
+        for key, value in overrides.items():
+            setattr(self, key, value)
 
 
 class _SchedulerOutput:
@@ -77,6 +103,45 @@ def test_acoustic_inner_loop_fast_path_rejects_spec_encoder_and_ubatching():
 
     runner = _make_runner()
     runner.parallel_config.use_ubatching = True
+    assert not runner._should_run_fast_acoustic_inner_loop(_SchedulerOutput(), None)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"temperature": 0.7},
+        {"top_p": 0.9},
+        {"top_k": 50},
+        {"seed": 1234},
+        {"sampling_type": SamplingType.RANDOM},
+        {"sampling_type": SamplingType.RANDOM_SEED},
+        {"do_sample": True},
+        {"use_beam_search": True},
+        {"n": 2},
+        {"presence_penalty": 0.1},
+        {"frequency_penalty": 0.1},
+        {"repetition_penalty": 1.1},
+        {"encoder_repetition_penalty": 1.1},
+        {"logits_processors": [object()]},
+        {"allowed_token_ids": [1, 2]},
+        {"prompt_logprobs": 1},
+        {"logprobs": 1},
+        {"stop": ["<eos>"]},
+        {"stop_token_ids": [2]},
+        {"stop_token_id": 2},
+        {"all_stop_token_ids": {2}},
+        {"ignore_eos": True},
+        {"min_tokens": 1},
+        {"structured_outputs": object()},
+        {"guided_decoding": object()},
+        {"extra_args": {"bad_words": ["x"]}},
+        {"unknown_constraint": object()},
+    ],
+)
+def test_acoustic_inner_loop_fast_path_rejects_non_greedy_sampling_params(overrides):
+    runner = _make_runner()
+    runner.requests["rid"].sampling_params = _SamplingParams(**overrides)
+
     assert not runner._should_run_fast_acoustic_inner_loop(_SchedulerOutput(), None)
 
 

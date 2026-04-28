@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -259,6 +260,120 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         return combined_hidden_states, combined_multimodal_outputs
 
+    @staticmethod
+    def _sampling_params_are_greedy_group0_compatible(sampling_params: Any) -> bool:
+        if sampling_params is None:
+            return False
+
+        if getattr(sampling_params, "logprobs", None) is not None:
+            return False
+        if getattr(sampling_params, "prompt_logprobs", None) is not None:
+            return False
+        if getattr(sampling_params, "stop", None):
+            return False
+        if getattr(sampling_params, "stop_token_id", None) is not None:
+            return False
+        if getattr(sampling_params, "stop_token_ids", None):
+            return False
+        if getattr(sampling_params, "ignore_eos", False):
+            return False
+        if getattr(sampling_params, "min_tokens", 0) not in (0, None):
+            return False
+        if getattr(sampling_params, "all_stop_token_ids", None):
+            return False
+
+        temperature = getattr(sampling_params, "temperature", 0.0)
+        if temperature not in (0, 0.0, None):
+            return False
+        top_p = getattr(sampling_params, "top_p", 1.0)
+        if top_p not in (1, 1.0, None):
+            return False
+        top_k = getattr(sampling_params, "top_k", -1)
+        if top_k not in (-1, 0, None):
+            return False
+        if getattr(sampling_params, "seed", None) is not None:
+            return False
+        sampling_type = getattr(sampling_params, "sampling_type", None)
+        if sampling_type not in (None, SamplingType.GREEDY):
+            return False
+        if getattr(sampling_params, "do_sample", False):
+            return False
+        if getattr(sampling_params, "use_beam_search", False):
+            return False
+        if getattr(sampling_params, "n", 1) not in (1, None):
+            return False
+
+        if getattr(sampling_params, "presence_penalty", 0.0) not in (0, 0.0, None):
+            return False
+        if getattr(sampling_params, "frequency_penalty", 0.0) not in (0, 0.0, None):
+            return False
+        if getattr(sampling_params, "repetition_penalty", 1.0) not in (1, 1.0, None):
+            return False
+        if getattr(sampling_params, "encoder_repetition_penalty", 1.0) not in (1, 1.0, None):
+            return False
+
+        constraint_fields = (
+            "logits_processors",
+            "allowed_token_ids",
+            "structured_outputs",
+            "guided_decoding",
+            "bad_words",
+            "logit_bias",
+            "extra_args",
+        )
+        if any(getattr(sampling_params, field, None) for field in constraint_fields):
+            return False
+
+        known_safe_fields = {
+            "detokenize",
+            "include_stop_str_in_output",
+            "length_penalty",
+            "max_tokens",
+            "output_kind",
+            "output_text_buffer_length",
+            "spaces_between_special_tokens",
+            "skip_special_tokens",
+            "truncate_prompt_tokens",
+        }
+        known_checked_fields = {
+            "all_stop_token_ids",
+            "allowed_token_ids",
+            "bad_words",
+            "do_sample",
+            "early_stopping",
+            "encoder_repetition_penalty",
+            "extra_args",
+            "frequency_penalty",
+            "guided_decoding",
+            "ignore_eos",
+            "logit_bias",
+            "logits_processors",
+            "logprobs",
+            "min_p",
+            "min_tokens",
+            "n",
+            "presence_penalty",
+            "prompt_logprobs",
+            "repetition_penalty",
+            "sampling_type",
+            "seed",
+            "stop",
+            "stop_token_id",
+            "stop_token_ids",
+            "structured_outputs",
+            "temperature",
+            "top_k",
+            "top_p",
+            "use_beam_search",
+        }
+        for field, value in getattr(sampling_params, "__dict__", {}).items():
+            if field.startswith("_") or field in known_checked_fields or field in known_safe_fields:
+                continue
+            if value not in (None, False, 0, 0.0, "", (), [], {}):
+                return False
+
+        return True
+
     def _should_run_acoustic_inner_loop(
         self,
         scheduler_output: SchedulerOutput,
@@ -285,7 +400,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         req_state = self.requests.get(req_id)
         if req_state is None or req_state.sampling_params is None:
             return False
-        return req_state.sampling_params.logprobs is None
+        sampling_params = req_state.sampling_params
+        if getattr(sampling_params, "logprobs", None) is not None:
+            return False
+        return getattr(sampling_params, "prompt_logprobs", None) is None
 
     def _should_prepare_acoustic_inner_loop(
         self,
@@ -321,6 +439,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         req_id = self.input_batch.req_ids[0]
         req_state = self.requests[req_id]
+        if not self._sampling_params_are_greedy_group0_compatible(req_state.sampling_params):
+            return False
         if getattr(req_state, "use_structured_output", False):
             return False
         if getattr(req_state, "structured_output_request", None) is not None:
