@@ -298,6 +298,70 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
     assert corrected == [("rid", 2, 4)]
 
 
+def test_acoustic_inner_loop_output_keeps_audio_codes_gpu_resident_without_hidden_cpu_payload(monkeypatch):
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="audio"))
+    runner.supports_mm_inputs = False
+
+    def fail_build_mm_cpu(multimodal_outputs):
+        raise AssertionError("audio_codes should stay GPU-resident until output processing")
+
+    monkeypatch.setattr(ar_runner, "build_mm_cpu", fail_build_mm_cpu)
+
+    output = runner._build_acoustic_inner_loop_output(
+        req_id="rid",
+        generated=2,
+        sampled_token_ids=[3, 4],
+        hidden_chunks=[torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 4.0]])],
+        multimodal_chunks={
+            "audio_codes": [torch.tensor([[11, 12]]), torch.tensor([[13, 14]])],
+        },
+        kv_connector_output=None,
+        ec_connector_output=None,
+        num_nans_in_logits={},
+        cudagraph_stats=None,
+    )
+
+    payload = output.pooler_output[0]
+    assert "hidden" not in payload
+    assert torch.equal(payload["audio_codes"], torch.tensor([[11, 12], [13, 14]]))
+
+
+def test_acoustic_inner_loop_text_output_skips_payload_concat(monkeypatch):
+    runner = object.__new__(GPUARModelRunner)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
+    runner.supports_mm_inputs = False
+
+    def fail_cat(*args, **kwargs):
+        raise AssertionError("text outputs should not build hidden/audio payloads")
+
+    monkeypatch.setattr(torch, "cat", fail_cat)
+
+    output = runner._build_acoustic_inner_loop_output(
+        req_id="rid",
+        generated=1,
+        sampled_token_ids=[3],
+        hidden_chunks=[torch.tensor([[1.0, 2.0]])],
+        multimodal_chunks={"audio_codes": [torch.tensor([[11, 12]])]},
+        kv_connector_output=None,
+        ec_connector_output=None,
+        num_nans_in_logits={},
+        cudagraph_stats=None,
+    )
+
+    assert output.pooler_output is None
+
+
+def test_acoustic_inner_loop_output_builder_has_no_eager_mm_cpu_payload_copy():
+    source = inspect.getsource(GPUARModelRunner._build_acoustic_inner_loop_output)
+
+    assert "build_mm_cpu" not in source
+    assert '.to("cpu")' not in source
+
+
 def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch):
     runner = _make_runner()
     scheduler_output = _SchedulerOutput()

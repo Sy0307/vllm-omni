@@ -1097,29 +1097,36 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_nans_in_logits: dict[str, int],
         cudagraph_stats: Any,
     ) -> OmniModelRunnerOutput:
-        if hidden_chunks:
-            hidden_states = torch.cat(hidden_chunks, dim=0)
-        else:
-            hidden_size = getattr(self.model_config.hf_config, "hidden_size", 0)
-            hidden_states = torch.empty((0, hidden_size), device=self.device, dtype=self.dtype)
-        multimodal_outputs = {
-            key: torch.cat(chunks, dim=0)
-            for key, chunks in multimodal_chunks.items()
-            if chunks
-        }
-        mm_cpu = build_mm_cpu(multimodal_outputs)
-        hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        pooler_output: list[dict[str, object]] | None = None
+        if self.vllm_config.model_config.engine_output_type != "text":
+            multimodal_outputs = {
+                key: torch.cat(chunks, dim=0)
+                for key, chunks in multimodal_chunks.items()
+                if chunks
+            }
+            payload: dict[str, object] = {}
+            for mm_key, mm_val in multimodal_outputs.items():
+                payload[mm_key] = to_payload_element(
+                    element=mm_val,
+                    idx=0,
+                    start=0,
+                    end=generated,
+                    pass_lists_through=False,
+                    seq_len=generated,
+                )
 
-        payload: dict[str, object] = {"hidden": hidden_states_cpu}
-        for mm_key, mm_val in mm_cpu.items():
-            payload[mm_key] = to_payload_element(
-                element=mm_val,
-                idx=0,
-                start=0,
-                end=generated,
-                pass_lists_through=False,
-                seq_len=generated,
-            )
+            if not payload:
+                if hidden_chunks:
+                    hidden_states = torch.cat(hidden_chunks, dim=0)
+                else:
+                    hidden_size = getattr(self.model_config.hf_config, "hidden_size", 0)
+                    hidden_states = torch.empty(
+                        (0, hidden_size),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                payload["hidden"] = hidden_states.detach().cpu().contiguous()
+            pooler_output = [payload]
 
         return OmniModelRunnerOutput(
             req_ids=[req_id],
@@ -1127,11 +1134,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             sampled_token_ids=[sampled_token_ids],
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=(
-                [payload]
-                if self.vllm_config.model_config.engine_output_type != "text"
-                else None
-            ),
+            pooler_output=pooler_output,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             num_nans_in_logits=num_nans_in_logits,
