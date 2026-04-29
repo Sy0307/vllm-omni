@@ -662,9 +662,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         slot_mapping_buffers: dict[int, torch.Tensor],
         max_steps: int,
     ) -> int | None:
-        """Pick a KV slot that is not visible to the active request."""
-        block_size = int(getattr(getattr(self, "cache_config", None), "block_size", 0) or 0)
-        num_blocks = int(getattr(getattr(self, "kv_cache_config", None), "num_blocks", 0) or 0)
+        """Pick a KV slot that is not visible to the active request.
+
+        Graph-ready replay masks post-stop decode steps to a scratch KV slot, but
+        the slot is not reserved from the allocator. This is safe only in the
+        restricted fast-acoustic mode: a single scheduled request, no prefix
+        cache, no async/spec decode, and no ubatching. Under those restrictions,
+        a candidate block-start slot is safe if it is not in the request's
+        precomputed slot mapping and not in any block currently visible through
+        the request block table. If every allocator-backed candidate may be live,
+        return None so graph-ready execution is disabled and the generic path is
+        used instead of writing to a request-visible KV slot.
+        """
+        block_size = int(
+            getattr(getattr(self, "cache_config", None), "block_size", 0) or 0
+        )
+        num_blocks = int(
+            getattr(getattr(self, "kv_cache_config", None), "num_blocks", 0) or 0
+        )
         if block_size > 0 and num_blocks > 0:
             candidates = [block_idx * block_size for block_idx in range(num_blocks - 1, -1, -1)]
         else:
@@ -672,10 +687,29 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         request_slots: set[int] = set()
         for slot_mapping in slot_mapping_buffers.values():
             request_slots.update(int(slot) for slot in slot_mapping[:max_steps].detach().cpu().tolist())
+        live_block_starts = self._fast_acoustic_live_block_start_slots(block_size)
         for candidate in candidates:
-            if candidate not in request_slots:
+            if candidate not in request_slots and candidate not in live_block_starts:
                 return candidate
         return None
+
+    def _fast_acoustic_live_block_start_slots(self, block_size: int) -> set[int]:
+        if block_size <= 0:
+            return set()
+        input_batch = getattr(self, "input_batch", None)
+        block_table_by_group = getattr(input_batch, "block_table", None)
+        if not block_table_by_group:
+            return set()
+        live_block_starts: set[int] = set()
+        for group_table in block_table_by_group.values():
+            block_table = getattr(getattr(group_table, "block_table", None), "cpu", None)
+            if block_table is None:
+                continue
+            block_ids = torch.as_tensor(block_table).reshape(-1).detach().cpu().tolist()
+            for block_id in block_ids:
+                if int(block_id) >= 0:
+                    live_block_starts.add(int(block_id) * block_size)
+        return live_block_starts
 
     def _mask_fast_acoustic_post_stop_slots(self, graph_state: AcousticGraphState) -> None:
         if not graph_state.slot_mapping_buffers:

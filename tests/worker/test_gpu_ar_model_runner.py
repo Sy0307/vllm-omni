@@ -474,7 +474,10 @@ def test_graph_ready_fast_acoustic_scratch_overlap_falls_back_without_crash(monk
     runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
     runner.input_batch.sampling_metadata = None
     runner.cache_config = SimpleNamespace(block_size=4)
-    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())], num_blocks=2)
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
+        num_blocks=2,
+    )
     runner.input_batch.block_table = {
         0: SimpleNamespace(slot_mapping=SimpleNamespace(gpu=torch.tensor([0, 4, 5], dtype=torch.int64)))
     }
@@ -512,6 +515,70 @@ def test_graph_ready_fast_acoustic_scratch_overlap_falls_back_without_crash(monk
 
     assert runner._run_acoustic_inner_loop(scheduler_output, None, None, None) == "generic-output"
     assert runner._last_acoustic_inner_loop_path == "fallback_scratch_overlap"
+
+
+def test_graph_ready_fast_acoustic_disables_when_live_blocks_cover_all_scratch_slots(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_OMNI_ACOUSTIC_GRAPH_READY", "1")
+    runner = _make_runner()
+    runner.requests["rid"].sampling_params = _SamplingParams(stop_token_ids=[7])
+    scheduler_output = _SchedulerOutput()
+    scheduler_output.num_scheduled_tokens = {"rid": 3}
+    scheduler_output.total_num_scheduled_tokens = 3
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    runner.parallel_config.num_ubatches = 1
+    runner.input_batch.num_computed_tokens_cpu = [4]
+    runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
+    runner.input_batch.sampling_metadata = None
+    runner.cache_config = SimpleNamespace(block_size=4)
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
+        num_blocks=2,
+    )
+    runner.input_batch.block_table = {
+        0: SimpleNamespace(
+            block_table=SimpleNamespace(cpu=torch.tensor([[0, 1]], dtype=torch.int64)),
+            slot_mapping=SimpleNamespace(gpu=torch.tensor([4, 5, 6], dtype=torch.int64)),
+        )
+    }
+    runner.attn_groups = [[]]
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="multi"),
+        parallel_config=runner.parallel_config,
+        compilation_config=SimpleNamespace(
+            static_forward_context=None,
+            fast_moe_cold_start=False,
+            cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+            cudagraph_runtime_mode=ar_runner.CUDAGraphMode.NONE,
+        ),
+    )
+    runner.input_ids = SimpleNamespace(gpu=torch.empty(1, dtype=torch.int64))
+    runner.query_start_loc = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        copy_to_gpu=lambda: None,
+    )
+    runner.seq_lens = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        gpu=torch.zeros(4, dtype=torch.int32),
+        copy_to_gpu=lambda: None,
+    )
+    runner._determine_batch_execution_and_padding = lambda **kwargs: (
+        ar_runner.CUDAGraphMode.NONE,
+        SimpleNamespace(num_tokens=1, num_reqs=1),
+        False,
+        1,
+        None,
+    )
+    monkeypatch.setattr(ar_runner, "maybe_create_ubatch_slices", lambda *args: (None, None))
+    runner._prepare_inputs = lambda scheduler_output, num_scheduled_tokens_np: (torch.tensor([0]), None)
+    runner._run_generic_acoustic_inner_loop = lambda *args: "generic-output"
+
+    assert runner._run_acoustic_inner_loop(scheduler_output, None, None, None) == "generic-output"
+    assert runner._last_acoustic_inner_loop_path == "fallback_scratch_overlap"
+    assert not runner._fast_acoustic_graph_state.scratch_slot_available
 
 
 def test_fast_acoustic_gpu_step_state_uses_static_buffers_without_cpu_mirrors():
