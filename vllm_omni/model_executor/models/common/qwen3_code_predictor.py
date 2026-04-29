@@ -202,38 +202,27 @@ class CodePredictorAttention(nn.Module):
         layer_seq_lens = cache_state.seq_lens[layer_idx, :bsz]
         write_pos = layer_seq_lens
         max_seq_len = cache_state.keys.shape[3]
-        if torch.any(write_pos >= max_seq_len):
-            raise ValueError("code predictor cache is full")
 
         batch_idx = torch.arange(bsz, device=hidden_states.device)
         cache_state.keys[layer_idx, batch_idx, :, write_pos, :] = k.squeeze(2)
         cache_state.values[layer_idx, batch_idx, :, write_pos, :] = v.squeeze(2)
         layer_seq_lens.add_(1)
         new_seq_lens = layer_seq_lens
-        max_active_len = int(new_seq_lens.max().item())
-        keys = cache_state.keys[layer_idx, :bsz, :, :max_active_len, :]
-        values = cache_state.values[layer_idx, :bsz, :, :max_active_len, :]
+        keys = cache_state.keys[layer_idx, :bsz, :, :max_seq_len, :]
+        values = cache_state.values[layer_idx, :bsz, :, :max_seq_len, :]
 
-        if bool(torch.all(new_seq_lens == max_active_len)):
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                keys,
-                values,
-                scale=self.scaling,
-                is_causal=False,
-                enable_gqa=self._use_gqa,
-            )
-        else:
-            attn_mask = torch.arange(max_active_len, device=hidden_states.device).unsqueeze(0) < new_seq_lens.unsqueeze(1)
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                keys,
-                values,
-                attn_mask=attn_mask[:, None, None, :],
-                scale=self.scaling,
-                is_causal=False,
-                enable_gqa=self._use_gqa,
-            )
+        attn_mask = torch.arange(
+            max_seq_len, device=hidden_states.device
+        ).unsqueeze(0) < new_seq_lens.unsqueeze(1)
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            keys,
+            values,
+            attn_mask=attn_mask[:, None, None, :],
+            scale=self.scaling,
+            is_causal=False,
+            enable_gqa=self._use_gqa,
+        )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, 1, -1)
         return self.o_proj(attn_out)

@@ -35,6 +35,8 @@ from vllm_omni.model_executor.models.qwen3_tts_nv.qwen3_tts_talker_nv import (
     Qwen3TTSNativeAttention,
     Qwen3TTSNativeAttentionCacheState,
     Qwen3TTSNativeRotaryEmbedding,
+    Qwen3TTSTalkerCodePredictor,
+    Qwen3TTSTalkerCodePredictorModel,
     Qwen3TTSTalkerForConditionalGenerationNv,
     _dict_to_namespace,
     _get_talker_config,
@@ -124,6 +126,78 @@ def test_native_attention_cached_step_matches_refill_last_token():
 
     torch.testing.assert_close(cached_last, refill_last, atol=1e-6, rtol=1e-5)
     assert cache_state.seq_lens.tolist() == [[4, 4]]
+
+
+def _make_native_code_predictor(*, use_cache: bool) -> Qwen3TTSTalkerCodePredictor:
+    config = SimpleNamespace(
+        vocab_size=32,
+        hidden_size=8,
+        num_code_groups=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        intermediate_size=16,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+        rope_theta=10000.0,
+        do_sample=False,
+        temperature=0.0,
+        top_k=0,
+        top_p=1.0,
+        repetition_penalty=1.0,
+        use_gumbel=False,
+        use_cache=use_cache,
+    )
+    predictor = object.__new__(Qwen3TTSTalkerCodePredictor)
+    nn.Module.__init__(predictor)
+    predictor.config = config
+    predictor.num_code_groups = config.num_code_groups
+    predictor.hidden_size = config.hidden_size
+    predictor.talker_hidden_size = config.hidden_size
+    predictor.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+    predictor.model = Qwen3TTSTalkerCodePredictorModel(
+        config, config.hidden_size
+    )
+    predictor.small_to_mtp_projection = nn.Identity()
+    predictor.lm_head = nn.ModuleList(
+        [
+            nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            for _ in range(config.num_code_groups - 1)
+        ]
+    )
+    predictor.do_sample = False
+    predictor.temperature = 0.0
+    predictor.top_k = 0
+    predictor.top_p = 1.0
+    predictor.repetition_penalty = 1.0
+    predictor.use_gumbel = False
+    predictor._max_cp_len = 1 + config.num_code_groups
+    predictor._cp_inputs_embeds = torch.zeros(
+        3, predictor._max_cp_len, config.hidden_size
+    )
+    predictor._cp_hidden_states = torch.empty(
+        3, predictor._max_cp_len, config.hidden_size
+    )
+    predictor._cp_all_codecs = torch.empty(
+        3, config.num_code_groups - 1, dtype=torch.long
+    )
+    predictor._cache_state = Qwen3TTSNativeAttentionCacheState.disabled()
+    return predictor
+
+
+def test_native_code_predictor_cached_generation_matches_refill():
+    torch.manual_seed(0)
+    refill = _make_native_code_predictor(use_cache=False)
+    cached = _make_native_code_predictor(use_cache=True)
+    cached.load_state_dict(refill.state_dict())
+    prev_hidden = torch.randn(3, refill.config.hidden_size)
+    group0_tokens = torch.tensor([1, 7, 13], dtype=torch.long)
+
+    refill_codes = refill.generate_groups_1_15(prev_hidden, group0_tokens)
+    cached_codes = cached.generate_groups_1_15(prev_hidden, group0_tokens)
+
+    torch.testing.assert_close(cached_codes, refill_codes)
 
 
 # ──────────────────────────────────────────────────────────────────────

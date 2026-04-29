@@ -431,40 +431,30 @@ class Qwen3TTSNativeAttention(nn.Module):
         layer_seq_lens = cache_state.seq_lens[layer_idx, :batch_size]
         write_pos = layer_seq_lens
         max_seq_len = cache_state.keys.shape[3]
-        if torch.any(write_pos >= max_seq_len):
-            raise ValueError("code predictor cache is full")
 
         batch_idx = torch.arange(batch_size, device=hidden_states.device)
         cache_state.keys[layer_idx, batch_idx, :, write_pos, :] = k.squeeze(2)
         cache_state.values[layer_idx, batch_idx, :, write_pos, :] = v.squeeze(2)
         layer_seq_lens.add_(1)
         new_seq_lens = layer_seq_lens
-        max_active_len = int(new_seq_lens.max().item())
-        keys = cache_state.keys[layer_idx, :batch_size, :, :max_active_len, :]
-        values = cache_state.values[layer_idx, :batch_size, :, :max_active_len, :]
+        keys = cache_state.keys[layer_idx, :batch_size, :, :max_seq_len, :]
+        values = cache_state.values[layer_idx, :batch_size, :, :max_seq_len, :]
 
         if self.num_kv_groups > 1:
             keys = keys.repeat_interleave(self.num_kv_groups, dim=1)
             values = values.repeat_interleave(self.num_kv_groups, dim=1)
 
-        if bool(torch.all(new_seq_lens == max_active_len)):
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                keys,
-                values,
-                is_causal=False,
-                scale=self.scaling,
-            )
-        else:
-            attn_mask = torch.arange(max_active_len, device=hidden_states.device).unsqueeze(0) < new_seq_lens.unsqueeze(1)
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                keys,
-                values,
-                attn_mask=attn_mask[:, None, None, :],
-                is_causal=False,
-                scale=self.scaling,
-            )
+        attn_mask = torch.arange(
+            max_seq_len, device=hidden_states.device
+        ).unsqueeze(0) < new_seq_lens.unsqueeze(1)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            keys,
+            values,
+            attn_mask=attn_mask[:, None, None, :],
+            is_causal=False,
+            scale=self.scaling,
+        )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, -1)
         return self.o_proj(attn_output)
@@ -540,7 +530,31 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
+
+        return hidden_states
+
+    def forward_cached_step(
+        self,
+        hidden_states: torch.Tensor,
+        cache_state: Qwen3TTSNativeAttentionCacheState,
+        *,
+        layer_idx: int,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn.forward_cached_step(
+            hidden_states,
+            cache_state,
+            layer_idx=layer_idx,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
         return hidden_states
 
 
@@ -631,16 +645,16 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass.
-        
+
         Args:
             inputs_embeds: [batch_size, seq_len, hidden_size]
             attention_mask: Optional causal mask
-            
+
         Returns:
             hidden_states: [batch_size, seq_len, hidden_size]
         """
         hidden_states = inputs_embeds
-        
+
         # Compute position embeddings shared across all decoder layers.
         # Positions are simply [0, 1, ..., seq_len-1] since we
         # recompute from scratch each call (no KV cache).
@@ -648,14 +662,31 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
         position_embeddings = self.rotary_emb(
             seq_len, hidden_states.device, hidden_states.dtype
         )
-        
+
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states, attention_mask, position_embeddings
             )
-        
+
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def forward_cached_step(
+        self,
+        inputs_embeds: torch.Tensor,
+        cache_state: Qwen3TTSNativeAttentionCacheState,
+        *,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        hidden_states = inputs_embeds
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = layer.forward_cached_step(
+                hidden_states,
+                cache_state,
+                layer_idx=layer_idx,
+                position_embeddings=position_embeddings,
+            )
+        return self.norm(hidden_states)
 
 
 @support_torch_compile
@@ -748,6 +779,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         self._cp_all_codecs = torch.empty(
             max_num_tokens, N - 1, dtype=torch.long
         )
+        self._cache_state = Qwen3TTSNativeAttentionCacheState.disabled()
 
     def get_group0_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Look up group-0 codec embeddings."""
@@ -779,6 +811,117 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             )
         return self.lm_head[generation_step](hidden_states)
 
+    def _ensure_cache_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Qwen3TTSNativeAttentionCacheState:
+        current = getattr(
+            self,
+            "_cache_state",
+            Qwen3TTSNativeAttentionCacheState.disabled(),
+        )
+        max_seq_len = self.num_code_groups + 1
+        head_dim = getattr(
+            self.config,
+            "head_dim",
+            self.config.hidden_size // self.config.num_attention_heads,
+        )
+        if (
+            current.enabled
+            and current.keys is not None
+            and current.values is not None
+            and current.seq_lens is not None
+            and current.keys.device == device
+            and current.keys.dtype == dtype
+            and current.keys.shape[1] >= batch_size
+            and current.keys.shape[3] >= max_seq_len
+        ):
+            current.reset()
+            return current
+
+        self._cache_state = Qwen3TTSNativeAttentionCacheState.allocate(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_layers=int(self.config.num_hidden_layers),
+            num_key_value_heads=int(self.config.num_key_value_heads),
+            head_dim=int(head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        return self._cache_state
+
+    def _generate_groups_1_15_cached(
+        self,
+        prev_hidden: torch.Tensor,
+        group0_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = prev_hidden.shape[0]
+        N = self.num_code_groups
+        inputs_embeds = self._cp_inputs_embeds[:seq_len]
+        all_codecs = self._cp_all_codecs[:seq_len]
+
+        inputs_embeds.zero_()
+        inputs_embeds[:, 0, :] = prev_hidden
+        inputs_embeds[:, 1, :] = self.codec_embedding(group0_tokens)
+
+        projected = self.small_to_mtp_projection(inputs_embeds)
+        cache_state = self._ensure_cache_state(
+            batch_size=seq_len,
+            device=projected.device,
+            dtype=projected.dtype,
+        )
+        position_embeddings = self.model.rotary_emb(
+            N + 1, projected.device, projected.dtype
+        )
+        hidden_states = None
+        for pos in range(2):
+            hidden_states = self.model.forward_cached_step(
+                projected[:, pos : pos + 1, :],
+                cache_state,
+                position_embeddings=(
+                    position_embeddings[0][:, :, pos : pos + 1, :],
+                    position_embeddings[1][:, :, pos : pos + 1, :],
+                ),
+            )
+
+        for step in range(N - 1):
+            logits = self._compute_inner_logits(hidden_states[:, 0, :], step)
+            if self.repetition_penalty != 1.0 and step > 0:
+                current_context = all_codecs[:, :step]
+            else:
+                current_context = None
+            next_token = _sample_from_logits(
+                logits,
+                do_sample=self.do_sample,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
+                previous_tokens=current_context,
+                use_gumbel=self.use_gumbel,
+            )
+            all_codecs[:, step] = next_token
+
+            if step < N - 2:
+                next_pos = step + 2
+                inputs_embeds[:, next_pos, :] = self.get_group_embeddings()[step](next_token)
+                projected[:, next_pos, :] = self.small_to_mtp_projection(
+                    inputs_embeds[:, next_pos : next_pos + 1, :]
+                ).reshape(seq_len, -1)
+                hidden_states = self.model.forward_cached_step(
+                    projected[:, next_pos : next_pos + 1, :],
+                    cache_state,
+                    position_embeddings=(
+                        position_embeddings[0][:, :, next_pos : next_pos + 1, :],
+                        position_embeddings[1][:, :, next_pos : next_pos + 1, :],
+                    ),
+                )
+
+        return all_codecs
+
     def generate_groups_1_15(
         self,
         prev_hidden: torch.Tensor,
@@ -793,6 +936,9 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         Returns:
             codes_1_15: [seq_len, num_code_groups - 1]
         """
+        if getattr(self.config, "use_cache", False):
+            return self._generate_groups_1_15_cached(prev_hidden, group0_tokens)
+
         seq_len = prev_hidden.shape[0]
         N = self.num_code_groups
 

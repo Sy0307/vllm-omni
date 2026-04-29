@@ -126,6 +126,65 @@ def test_cache_state_reset_clears_sequence_lengths(mocker: MockerFixture) -> Non
     assert state.seq_lens.tolist() == [[0, 0], [0, 0], [0, 0]]
 
 
+def _make_wrapper(mod, *, use_cache: bool):
+    cp_config = types.SimpleNamespace(
+        vocab_size=32,
+        hidden_size=8,
+        num_code_groups=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        intermediate_size=16,
+        rms_norm_eps=1e-6,
+        attention_bias=False,
+        rope_theta=10000.0,
+    )
+    vllm_config = types.SimpleNamespace(
+        scheduler_config=types.SimpleNamespace(max_num_seqs=4)
+    )
+    return mod.CodePredictorWrapper(
+        vllm_config=vllm_config,
+        cp_config=cp_config,
+        wrapper_config=mod.CodePredictorWrapperConfig(
+            use_cache=use_cache,
+            sampling_mode="per_call",
+        ),
+    )
+
+
+def test_wrapper_cached_forward_matches_refill_forward(
+    mocker: MockerFixture,
+) -> None:
+    mod = _load_common_module(mocker)
+    torch.manual_seed(0)
+    refill = _make_wrapper(mod, use_cache=False)
+    cached = _make_wrapper(mod, use_cache=True)
+    cached.load_state_dict(refill.state_dict())
+    layer0_code = torch.tensor([1, 7, 13], dtype=torch.long)
+    layer0_embed = torch.randn(3, 8)
+    last_talker_hidden = torch.randn(3, 8)
+
+    refill_codes = refill(
+        layer0_code,
+        layer0_embed,
+        last_talker_hidden,
+        do_sample=False,
+        temperature=0.0,
+        top_k=0,
+    )
+    cached_codes = cached(
+        layer0_code,
+        layer0_embed,
+        last_talker_hidden,
+        do_sample=False,
+        temperature=0.0,
+        top_k=0,
+    )
+
+    torch.testing.assert_close(cached_codes, refill_codes)
+
+
 def test_attention_cached_step_matches_refill_last_token(
     mocker: MockerFixture,
 ) -> None:
