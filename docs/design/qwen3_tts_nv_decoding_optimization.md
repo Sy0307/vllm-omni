@@ -144,8 +144,6 @@ Verification completed:
 
 ## Benchmark Results
 
-### Inner-loop Prototype Benchmark
-
 Benchmark configuration:
 
 - `concurrency=1`;
@@ -205,36 +203,6 @@ goes through much of the generic single-token vLLM path:
 Therefore, the current bottleneck is no longer just the scheduler gap. A large
 part of the remaining cost is the per-acoustic-token generic runner, sampler,
 bookkeeping, and code predictor execution structure.
-
-### Final Implementation Benchmark
-
-A later remote validation round measured the final implementation at commit
-`b82c03f8`, using `Qwen3-TTS-12Hz-1.7B-Base-cv-view` on an H20 GPU.
-
-The final implementation includes the main structural changes proposed above:
-
-- lightweight decode state mutation (AC2);
-- greedy GPU-resident group-0 sampling (AC3);
-- cached residual code prediction (AC4);
-- graph-ready fixed-K loop (AC5).
-
-Round 1 validation results:
-
-| Configuration | E2E mean | Token throughput | Generated tokens |
-|---|---:|---:|---:|
-| K=1 baseline, no-async fallback | 784.32 ms | 75.19 tok/s | 708 |
-| K=6 fast graph-ready, no-async | 660.98 ms | 89.21 tok/s | 708 |
-
-Compared with the K=1 no-async fallback baseline, the K=6 fast graph-ready path
-reduced E2E latency by `15.7%` and improved token throughput by `18.6%`.
-
-This confirms that moving beyond the original runner-layer inner-loop prototype
-is necessary for larger gains. The prototype benchmark remains useful as a
-historical comparison: reserving multiple acoustic slots and looping in the
-worker produced a measurable `+6.1%` throughput gain at K=6, while the final
-fast path combines lighter state mutation, GPU-resident greedy sampling, cached
-residual prediction, and fixed-K loop structure to reach the expected `15-20%`
-range.
 
 ## Recommended Optimization Direction
 
