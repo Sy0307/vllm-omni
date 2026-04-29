@@ -182,11 +182,12 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
     assert runner._fast_acoustic_sampled_token_ids.tolist()[:2] == [11, 12]
 
 
-def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_item():
+def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_sync():
     source = inspect.getsource(GPUARModelRunner._run_fast_qwen3_tts_nv_acoustic_inner_loop)
 
     assert "break" not in source
     assert ".item()" not in source
+    assert ".cpu()" not in source
 
 
 def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypatch):

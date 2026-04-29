@@ -759,12 +759,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         if isinstance(value, torch.Tensor):
                             multimodal_chunks.setdefault(key, []).append(value[:1])
                     active.logical_and_(~token_is_stop)
-                    step_valid_bool = bool(step_valid.cpu())
-                    if step_valid_bool:
-                        self._update_fast_qwen3_tts_nv_decode_preprocess_state(
-                            inputs_embeds,
-                            hidden_states,
-                        )
+                    self._update_fast_qwen3_tts_nv_decode_preprocess_state(
+                        inputs_embeds,
+                        hidden_states,
+                        step_valid=step_valid,
+                    )
                 else:
                     hidden_chunks.append(hidden_states[:1])
                     for key, value in (multimodal_outputs or {}).items():
@@ -783,7 +782,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
 
         generated = (
-            int(valid_count_tensor.cpu())
+            int(valid_count_tensor.detach().to("cpu"))
             if graph_ready and valid_count_tensor is not None
             else len(hidden_chunks)
         )
@@ -890,17 +889,37 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         inputs_embeds: torch.Tensor | None,
         hidden_states: torch.Tensor,
+        step_valid: torch.Tensor | None = None,
     ) -> None:
         if inputs_embeds is not None:
-            inputs_embeds[:1].zero_()
+            if step_valid is None:
+                inputs_embeds[:1].zero_()
+            else:
+                input_step_valid = step_valid.to(
+                    device=inputs_embeds.device,
+                    dtype=torch.bool,
+                ).reshape(1, *([1] * (inputs_embeds[:1].dim() - 1)))
+                inputs_embeds[:1].mul_((~input_step_valid).to(dtype=inputs_embeds.dtype))
         prev_hidden_buffer = getattr(self.model, "_prev_hidden_buffer", None)
         if isinstance(prev_hidden_buffer, torch.Tensor) and hidden_states.numel() > 0:
-            prev_hidden_buffer[:1].copy_(
-                hidden_states[-1:].to(
-                    device=prev_hidden_buffer.device,
-                    dtype=prev_hidden_buffer.dtype,
-                )
+            current_hidden = hidden_states[-1:].to(
+                device=prev_hidden_buffer.device,
+                dtype=prev_hidden_buffer.dtype,
             )
+            if step_valid is None:
+                prev_hidden_buffer[:1].copy_(current_hidden)
+            else:
+                step_valid_expanded = step_valid.to(
+                    device=prev_hidden_buffer.device,
+                    dtype=torch.bool,
+                ).reshape(1, *([1] * (prev_hidden_buffer[:1].dim() - 1)))
+                prev_hidden_buffer[:1].copy_(
+                    torch.where(
+                        step_valid_expanded,
+                        current_hidden,
+                        prev_hidden_buffer[:1],
+                    )
+                )
 
     def _run_generic_acoustic_inner_loop(
         self,
