@@ -229,6 +229,41 @@ def test_fast_acoustic_graph_state_masks_post_stop_slots_to_scratch(generated):
     ]
 
 
+def test_fast_acoustic_graph_replay_invalidates_same_k_different_stop_tokens():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    graph = SimpleNamespace(replay=lambda: None)
+
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.graph = graph
+    state.graph_max_steps = 4
+    state.graph_cache_key = (4, frozenset({7}), (1, 1), ((4, 2), "torch.float32"))
+    state.replay_cache_key = (4, frozenset({8}), (1, 1), ((4, 2), "torch.float32"))
+
+    assert not runner._can_replay_acoustic_graph(state)
+    assert state.graph is None
+    assert state.graph_max_steps is None
+    assert state.graph_cache_key is None
+
+
+def test_fast_acoustic_scratch_slot_asserts_against_live_request_slots():
+    runner = object.__new__(GPUARModelRunner)
+    runner.cache_config = SimpleNamespace(block_size=4)
+    runner.kv_cache_config = SimpleNamespace(num_blocks=2)
+
+    with pytest.raises(AssertionError, match="scratch slot overlaps live request slots"):
+        runner._select_fast_acoustic_scratch_slot(
+            {0: torch.tensor([7, 8, 9], dtype=torch.int64)},
+            max_steps=3,
+        )
+
+
 def test_fast_acoustic_gpu_step_state_uses_static_buffers_without_cpu_mirrors():
     runner = object.__new__(GPUARModelRunner)
     runner.device = torch.device("cpu")
@@ -412,6 +447,7 @@ def test_graph_ready_fast_acoustic_captures_then_replays_same_shape(monkeypatch)
 
         state.graph = SimpleNamespace(replay=replay)
         state.graph_max_steps = state.max_steps
+        state.graph_cache_key = state.replay_cache_key
         return state
 
     def replay_acoustic_graph():
