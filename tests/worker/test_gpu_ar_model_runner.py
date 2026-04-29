@@ -299,6 +299,120 @@ def test_fast_acoustic_graph_replay_invalidates_same_k_different_model_kwargs_sh
     assert state.graph is None
 
 
+def _contains_replay_disabled_sentinel(signature):
+    if signature == ("_replay_disabled",):
+        return True
+    if isinstance(signature, (tuple, frozenset)):
+        return any(_contains_replay_disabled_sentinel(item) for item in signature)
+    return False
+
+
+def _fast_acoustic_cache_key_kwargs(runner, state, **overrides):
+    kwargs = dict(
+        graph_state=state,
+        stop_token_ids={7},
+        cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+        batch_desc=SimpleNamespace(num_tokens=1, num_reqs=1),
+        should_ubatch=False,
+        num_tokens_across_dp=1,
+        pad_attn=False,
+        ubatch_slices=None,
+        ubatch_slices_padded=None,
+        logits_indices=torch.zeros(1, dtype=torch.int64),
+        attn_metadata=None,
+        intermediate_tensors=None,
+        model_kwargs={},
+        num_tokens_padded=1,
+        num_reqs_padded=1,
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        positions=torch.zeros(1, dtype=torch.int64),
+        inputs_embeds=None,
+        prev_hidden_buffer=None,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_fast_acoustic_graph_replay_disables_unsupported_mutable_model_kwargs():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.graph = SimpleNamespace(replay=lambda: None)
+    state.graph_max_steps = 4
+
+    key = runner._make_fast_acoustic_graph_cache_key(
+        **_fast_acoustic_cache_key_kwargs(
+            runner,
+            state,
+            model_kwargs={"opaque": {"mutable"}},
+        )
+    )
+    state.graph_cache_key = key
+    state.replay_cache_key = key
+
+    assert _contains_replay_disabled_sentinel(key)
+    assert not runner._can_replay_acoustic_graph(state)
+
+
+def test_fast_acoustic_graph_replay_invalidates_in_place_mutated_attn_metadata():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.graph = SimpleNamespace(replay=lambda: None)
+    state.graph_max_steps = 4
+    attn_metadata = SimpleNamespace(num_tokens=1, block_table=torch.zeros(1, 2, dtype=torch.int64))
+
+    state.graph_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **_fast_acoustic_cache_key_kwargs(runner, state, attn_metadata=attn_metadata)
+    )
+    attn_metadata.num_tokens = 2
+    state.replay_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **_fast_acoustic_cache_key_kwargs(runner, state, attn_metadata=attn_metadata)
+    )
+
+    assert state.graph_cache_key != state.replay_cache_key
+    assert not runner._can_replay_acoustic_graph(state)
+    assert state.graph is None
+
+
+def test_fast_acoustic_graph_replay_allows_rebuilt_same_structure_attn_metadata():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.graph = SimpleNamespace(replay=lambda: None)
+    state.graph_max_steps = 4
+    first_metadata = SimpleNamespace(num_tokens=1, block_table=torch.zeros(1, 2, dtype=torch.int64))
+    rebuilt_metadata = SimpleNamespace(num_tokens=1, block_table=torch.ones(1, 2, dtype=torch.int64))
+
+    state.graph_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **_fast_acoustic_cache_key_kwargs(runner, state, attn_metadata=first_metadata)
+    )
+    state.replay_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **_fast_acoustic_cache_key_kwargs(runner, state, attn_metadata=rebuilt_metadata)
+    )
+
+    assert state.graph_cache_key == state.replay_cache_key
+    assert runner._can_replay_acoustic_graph(state)
+
+
 def test_fast_acoustic_graph_replay_invalidates_same_k_different_cudagraph_mode():
     runner = object.__new__(GPUARModelRunner)
     runner.device = torch.device("cpu")

@@ -11,6 +11,7 @@ from collections.abc import Hashable
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -47,6 +48,9 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+_REPLAY_DISABLED_SENTINEL = ("_replay_disabled",)
+_REPLAY_SCALAR_TYPES = (str, bytes, int, float, bool, type(None), Enum)
 
 
 class ExecuteModelState(NamedTuple):
@@ -754,9 +758,44 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         if isinstance(obj, (list, tuple)):
             return tuple(GPUARModelRunner._make_tensor_signature(item) for item in obj)
-        if isinstance(obj, Hashable):
+        if isinstance(obj, _REPLAY_SCALAR_TYPES):
             return obj
-        return ("_opaque", id(obj))
+        return _REPLAY_DISABLED_SENTINEL
+
+    @staticmethod
+    def _make_attn_metadata_signature(obj: Any) -> Hashable:
+        if obj is None:
+            return None
+        try:
+            fields = vars(obj)
+        except TypeError:
+            return _REPLAY_DISABLED_SENTINEL
+        signature_fields = []
+        for key, value in fields.items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, torch.Tensor) or isinstance(value, _REPLAY_SCALAR_TYPES):
+                field_signature = GPUARModelRunner._make_tensor_signature(value)
+            else:
+                return _REPLAY_DISABLED_SENTINEL
+            signature_fields.append((key, field_signature))
+        return (type(obj).__qualname__, tuple(sorted(signature_fields)))
+
+    @staticmethod
+    def _contains_replay_disabled_sentinel(signature: Any) -> bool:
+        if signature == _REPLAY_DISABLED_SENTINEL:
+            return True
+        if isinstance(signature, tuple):
+            return any(
+                GPUARModelRunner._contains_replay_disabled_sentinel(item)
+                for item in signature
+            )
+        if isinstance(signature, frozenset):
+            return any(
+                GPUARModelRunner._contains_replay_disabled_sentinel(item)
+                for item in signature
+            )
+        return False
 
     @staticmethod
     def _tensor_replay_signature(tensor: torch.Tensor | None) -> Hashable:
@@ -783,12 +822,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if key not in fields and hasattr(batch_desc, key):
                     fields[key] = getattr(batch_desc, key)
         return GPUARModelRunner._make_tensor_signature(fields)
-
-    @staticmethod
-    def _static_identity_signature(obj: Any) -> Hashable:
-        if obj is None:
-            return None
-        return (type(obj).__qualname__, id(obj))
 
     def _make_fast_acoustic_graph_cache_key(
         self,
@@ -846,7 +879,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._make_tensor_signature(ubatch_slices),
             self._make_tensor_signature(ubatch_slices_padded),
             self._tensor_replay_signature(logits_indices),
-            self._static_identity_signature(attn_metadata),
+            self._make_attn_metadata_signature(attn_metadata),
             self._make_tensor_signature(intermediate_tensors),
             self._make_tensor_signature(model_kwargs),
             (int(num_tokens_padded), int(num_reqs_padded)),
@@ -874,6 +907,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _can_replay_acoustic_graph(self, graph_state: AcousticGraphState) -> bool:
         if graph_state.graph is None or graph_state.graph_max_steps != graph_state.max_steps:
+            return False
+        if self._contains_replay_disabled_sentinel(graph_state.replay_cache_key):
             return False
         if graph_state.graph_cache_key != graph_state.replay_cache_key:
             self._invalidate_fast_acoustic_graph(graph_state)
@@ -1164,6 +1199,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 prev_hidden_buffer=prev_hidden_buffer,
             )
+            if self._contains_replay_disabled_sentinel(graph_state.replay_cache_key):
+                graph_ready = False
+                graph_state.replay_cache_key = None
         else:
             graph_state.replay_cache_key = None
 
