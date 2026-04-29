@@ -182,6 +182,79 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
     assert runner._fast_acoustic_sampled_token_ids.tolist()[:2] == [11, 12]
 
 
+def test_fast_acoustic_graph_state_prefills_fixed_k_gpu_buffers():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+
+    assert state.positions_buffer.tolist() == [10, 11, 12, 13]
+    assert state.seq_lens_buffer.tolist() == [11, 12, 13, 14]
+    assert state.slot_mapping_buffers[0].tolist() == [101, 102, 103, 104]
+    assert state.sampled_tokens_buffer.dtype == torch.int64
+    assert state.valid_mask.tolist() == [False, False, False, False]
+    assert state.valid_count.shape == (1,)
+    assert int(state.valid_count[0]) == 0
+
+
+@pytest.mark.parametrize("generated", [0, 1, 2])
+def test_fast_acoustic_graph_state_masks_post_stop_slots_to_scratch(generated):
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.valid_mask[:generated] = True
+    runner._mask_fast_acoustic_post_stop_slots(state)
+
+    scratch_slot = int(state.scratch_slot[0])
+    assert state.slot_mapping_buffers[0].tolist() == [
+        101 if idx < generated else scratch_slot for idx in range(4)
+    ]
+
+
+def test_fast_acoustic_gpu_step_state_uses_static_buffers_without_cpu_mirrors():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.seq_lens = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        gpu=torch.zeros(4, dtype=torch.int32),
+    )
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=[999],
+        num_computed_tokens_cpu_tensor=torch.tensor([999], dtype=torch.int32),
+    )
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=3,
+        start_num_computed=20,
+        precomputed_slot_mappings_by_group={0: torch.tensor([201, 202, 203], dtype=torch.int64)},
+    )
+    state.valid_mask[2] = True
+    positions = torch.zeros(1, dtype=torch.int64)
+    live_slots = {0: torch.zeros(1, dtype=torch.int64)}
+
+    runner._set_fast_acoustic_decode_step_state_gpu(
+        positions=positions,
+        slot_mappings_by_group=live_slots,
+        graph_state=state,
+        step=2,
+    )
+
+    assert int(positions[0]) == 22
+    assert int(runner.seq_lens.gpu[0]) == 23
+    assert int(live_slots[0][0]) == 203
+    assert runner.input_batch.num_computed_tokens_cpu[0] == 999
+    assert int(runner.input_batch.num_computed_tokens_cpu_tensor[0]) == 999
+    assert runner.seq_lens.np[0] == 0
+
+
 def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_sync():
     source = inspect.getsource(GPUARModelRunner._run_fast_qwen3_tts_nv_acoustic_inner_loop)
     capture_start = "# CUDA graph capture-eligible K loop begins."
@@ -193,6 +266,10 @@ def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_sync():
     output_construction = source[end_idx:]
 
     assert "break" not in capture_scope
+    assert "current_pos = start_num_computed + inner_idx" not in capture_scope
+    assert "current_pos=" not in capture_scope
+    assert "_set_fast_acoustic_decode_step_state(" not in capture_scope
+    assert "_set_fast_acoustic_decode_step_state_gpu(" in capture_scope
     assert ".item()" not in capture_scope
     assert ".cpu()" not in capture_scope
     assert '.to("cpu")' not in capture_scope
