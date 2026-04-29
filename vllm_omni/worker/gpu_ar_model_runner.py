@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -261,7 +262,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return combined_hidden_states, combined_multimodal_outputs
 
     @staticmethod
-    def _sampling_params_are_greedy_group0_compatible(sampling_params: Any) -> bool:
+    def _sampling_params_are_greedy_group0_compatible(
+        sampling_params: Any,
+        *,
+        allow_stop_token_ids: bool = False,
+    ) -> bool:
         if sampling_params is None:
             return False
 
@@ -271,15 +276,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return False
         if getattr(sampling_params, "stop", None):
             return False
-        if getattr(sampling_params, "stop_token_id", None) is not None:
-            return False
-        if getattr(sampling_params, "stop_token_ids", None):
-            return False
+        if not allow_stop_token_ids:
+            if getattr(sampling_params, "stop_token_id", None) is not None:
+                return False
+            if getattr(sampling_params, "stop_token_ids", None):
+                return False
         if getattr(sampling_params, "ignore_eos", False):
             return False
         if getattr(sampling_params, "min_tokens", 0) not in (0, None):
             return False
-        if getattr(sampling_params, "all_stop_token_ids", None):
+        all_stop_token_ids = getattr(sampling_params, "all_stop_token_ids", None)
+        if all_stop_token_ids and not allow_stop_token_ids:
             return False
 
         temperature = getattr(sampling_params, "temperature", 0.0)
@@ -443,7 +450,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         req_id = self.input_batch.req_ids[0]
         req_state = self.requests[req_id]
-        if not self._sampling_params_are_greedy_group0_compatible(req_state.sampling_params):
+        if not self._sampling_params_are_greedy_group0_compatible(
+            req_state.sampling_params,
+            allow_stop_token_ids=self._fast_acoustic_graph_ready_enabled(),
+        ):
             return False
         if getattr(req_state, "use_structured_output", False):
             return False
@@ -463,6 +473,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model_module = type(self.model).__module__
         return ".qwen3_tts_nv." in model_module or model_module.endswith("qwen3_tts_talker_nv")
 
+    @staticmethod
+    def _fast_acoustic_graph_ready_enabled() -> bool:
+        return os.getenv("VLLM_OMNI_ACOUSTIC_GRAPH_READY") == "1"
+
     def _ensure_fast_acoustic_token_buffer(self, max_steps: int) -> torch.Tensor:
         token_buffer = getattr(self, "_fast_acoustic_sampled_token_ids", None)
         if (
@@ -475,6 +489,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._fast_acoustic_sampled_token_ids = token_buffer
         return token_buffer
 
+    def _ensure_fast_acoustic_valid_buffers(self, max_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+        valid_token_mask = getattr(self, "_fast_acoustic_valid_token_mask", None)
+        if (
+            valid_token_mask is None
+            or valid_token_mask.device != self.device
+            or valid_token_mask.dtype != torch.bool
+            or valid_token_mask.numel() < max_steps
+        ):
+            valid_token_mask = torch.empty(max_steps, device=self.device, dtype=torch.bool)
+            self._fast_acoustic_valid_token_mask = valid_token_mask
+        valid_count = getattr(self, "_fast_acoustic_valid_count", None)
+        if valid_count is None or valid_count.device != self.device or valid_count.dtype != torch.int32:
+            valid_count = torch.zeros((), device=self.device, dtype=torch.int32)
+            self._fast_acoustic_valid_count = valid_count
+        return valid_token_mask, valid_count
+
     def _store_fast_acoustic_token(self, step: int, token_ids: torch.Tensor) -> None:
         token_buffer = self._fast_acoustic_sampled_token_ids
         token = token_ids.reshape(-1)[:1].to(device=token_buffer.device, dtype=token_buffer.dtype)
@@ -484,6 +514,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if generated <= 0:
             return []
         return self._fast_acoustic_sampled_token_ids[:generated].detach().to("cpu").tolist()
+
+    def _apply_fast_acoustic_corrected_num_computed_tokens(
+        self,
+        start_num_computed: int,
+        generated: int,
+        max_steps: int,
+    ) -> int:
+        if generated >= max_steps:
+            return start_num_computed + generated
+        from vllm_omni.core.sched.acoustic_inner_loop import corrected_num_computed_tokens
+
+        return corrected_num_computed_tokens(
+            num_computed_tokens_after_schedule=start_num_computed + max_steps,
+            num_scheduled_tokens=max_steps,
+            num_generated_tokens=generated,
+        )
 
     def _make_single_token_scheduler_output(
         self,
@@ -507,15 +553,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         req_state = self.requests[req_id]
         use_fast_path = self._should_run_fast_acoustic_inner_loop(scheduler_output, None)
         stop_token_ids = set(getattr(req_state.sampling_params, "stop_token_ids", ()) or ())
+        all_stop_token_ids = getattr(req_state.sampling_params, "all_stop_token_ids", None)
+        if all_stop_token_ids:
+            stop_token_ids.update(int(token_id) for token_id in all_stop_token_ids)
         if getattr(req_state.sampling_params, "stop_token_id", None) is not None:
             stop_token_ids.add(int(req_state.sampling_params.stop_token_id))
-        if use_fast_path and not stop_token_ids:
-            self._last_acoustic_inner_loop_path = "fast"
+        if use_fast_path and (not stop_token_ids or self._fast_acoustic_graph_ready_enabled()):
+            self._last_acoustic_inner_loop_path = "fast_graph_ready" if stop_token_ids else "fast"
             return self._run_fast_qwen3_tts_nv_acoustic_inner_loop(
                 scheduler_output,
                 intermediate_tensors,
                 ec_connector_output,
                 cudagraph_stats,
+                stop_token_ids=stop_token_ids,
             )
 
         self._last_acoustic_inner_loop_path = "fallback"
@@ -542,6 +592,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         intermediate_tensors: IntermediateTensors | None,
         ec_connector_output: Any,
         cudagraph_stats: Any,
+        stop_token_ids: set[int] | None = None,
     ) -> OmniModelRunnerOutput:
         req_id = self.input_batch.req_ids[0]
         max_steps = scheduler_output.num_scheduled_tokens[req_id]
@@ -552,7 +603,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         one_token_num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
         sub_output = self._make_single_token_scheduler_output(scheduler_output, req_id)
         has_separate_kv_update = self._has_separate_kv_cache_update()
+        graph_ready = self._fast_acoustic_graph_ready_enabled()
+        stop_token_ids = stop_token_ids or set()
         self._ensure_fast_acoustic_token_buffer(max_steps)
+        valid_token_mask = None
+        valid_count_tensor = None
+        if graph_ready:
+            valid_token_mask, valid_count_tensor = self._ensure_fast_acoustic_valid_buffers(max_steps)
+            valid_token_mask[:max_steps].fill_(True)
+            valid_count_tensor.zero_()
 
         (
             cudagraph_mode,
@@ -682,26 +741,67 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sample_hidden_states = hidden_states[logits_indices]
                 token_ids_gpu = self.model.greedy_group0_tokens(sample_hidden_states)
                 self._store_fast_acoustic_token(inner_idx, token_ids_gpu)
-                hidden_chunks.append(hidden_states[:1])
-                for key, value in (multimodal_outputs or {}).items():
-                    if isinstance(value, torch.Tensor):
-                        multimodal_chunks.setdefault(key, []).append(value[:1])
+                if graph_ready:
+                    assert valid_token_mask is not None
+                    assert valid_count_tensor is not None
+                    token = token_ids_gpu.reshape(-1)[:1].to(device=self.device, dtype=torch.int64)
+                    token_is_stop = torch.zeros(1, device=self.device, dtype=torch.bool)
+                    for stop_token_id in stop_token_ids:
+                        token_is_stop.logical_or_(token == stop_token_id)
+                    step_valid = torch.logical_and(valid_count_tensor.reshape(1) == inner_idx, ~token_is_stop)
+                    valid_token_mask[inner_idx : inner_idx + 1].copy_(step_valid)
+                    valid_count_tensor.add_(step_valid.to(dtype=valid_count_tensor.dtype).reshape(()))
+                    hidden_chunks.append(hidden_states[:1])
+                    for key, value in (multimodal_outputs or {}).items():
+                        if isinstance(value, torch.Tensor):
+                            multimodal_chunks.setdefault(key, []).append(value[:1])
+                    self._process_additional_information_updates(
+                        hidden_states,
+                        multimodal_outputs,
+                        one_token_num_scheduled_tokens_np,
+                        sub_output,
+                    )
+                    self._update_fast_qwen3_tts_nv_decode_preprocess_state(
+                        inputs_embeds,
+                        hidden_states,
+                    )
+                else:
+                    hidden_chunks.append(hidden_states[:1])
+                    for key, value in (multimodal_outputs or {}).items():
+                        if isinstance(value, torch.Tensor):
+                            multimodal_chunks.setdefault(key, []).append(value[:1])
 
-                self._process_additional_information_updates(
-                    hidden_states,
-                    multimodal_outputs,
-                    one_token_num_scheduled_tokens_np,
-                    sub_output,
-                )
-                self._update_fast_qwen3_tts_nv_decode_preprocess_state(
-                    inputs_embeds,
-                    hidden_states,
-                )
+                    self._process_additional_information_updates(
+                        hidden_states,
+                        multimodal_outputs,
+                        one_token_num_scheduled_tokens_np,
+                        sub_output,
+                    )
+                    self._update_fast_qwen3_tts_nv_decode_preprocess_state(
+                        inputs_embeds,
+                        hidden_states,
+                    )
 
-        generated = len(hidden_chunks)
+        generated = (
+            int(valid_count_tensor.cpu())
+            if graph_ready and valid_count_tensor is not None
+            else len(hidden_chunks)
+        )
+        if graph_ready:
+            hidden_chunks = hidden_chunks[:generated]
+            multimodal_chunks = {key: chunks[:generated] for key, chunks in multimodal_chunks.items()}
         sampled_token_ids = self._fast_acoustic_tokens_to_cpu_list(generated)
-        self.input_batch.num_computed_tokens_cpu[0] = start_num_computed + generated
-        self.input_batch.num_computed_tokens_cpu_tensor[0] = start_num_computed + generated
+        corrected_num_computed = (
+            self._apply_fast_acoustic_corrected_num_computed_tokens(
+                start_num_computed,
+                generated,
+                max_steps,
+            )
+            if graph_ready
+            else start_num_computed + generated
+        )
+        self.input_batch.num_computed_tokens_cpu[0] = corrected_num_computed
+        self.input_batch.num_computed_tokens_cpu_tensor[0] = corrected_num_computed
         return self._build_acoustic_inner_loop_output(
             req_id,
             generated,

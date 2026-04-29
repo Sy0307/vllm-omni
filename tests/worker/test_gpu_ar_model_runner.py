@@ -179,11 +179,104 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
     assert runner._fast_acoustic_sampled_token_ids.tolist()[:2] == [11, 12]
 
 
-def test_fast_acoustic_loop_has_single_hidden_append_and_no_per_step_cpu_item():
+def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_item():
     source = inspect.getsource(GPUARModelRunner._run_fast_qwen3_tts_nv_acoustic_inner_loop)
 
-    assert source.count("hidden_chunks.append(hidden_states[:1])") == 1
+    assert "break" not in source
     assert ".item()" not in source
+
+
+def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_ACOUSTIC_GRAPH_READY", "1")
+    runner = _make_runner()
+    runner.requests["rid"].sampling_params = _SamplingParams(stop_token_ids=[7])
+    scheduler_output = _SchedulerOutput()
+    scheduler_output.num_scheduled_tokens = {"rid": 4}
+    scheduler_output.total_num_scheduled_tokens = 4
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="multi"))
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
+    runner.supports_mm_inputs = False
+    runner.parallel_config.num_ubatches = 1
+    runner.input_batch.num_computed_tokens_cpu = [4]
+    runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
+    runner.input_batch.sampling_metadata = None
+    runner.input_ids = SimpleNamespace(gpu=torch.empty(1, dtype=torch.int64))
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+    runner.attn_groups = []
+    runner.query_start_loc = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        copy_to_gpu=lambda: None,
+    )
+    runner.seq_lens = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        gpu=torch.zeros(4, dtype=torch.int32),
+        copy_to_gpu=lambda: None,
+    )
+
+    class _KVContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    runner.maybe_get_kv_connector_output = lambda scheduler_output: _KVContext()
+    runner._make_single_token_scheduler_output = lambda scheduler_output, req_id: SimpleNamespace(
+        num_scheduled_tokens={req_id: 1}, total_num_scheduled_tokens=1, scheduled_spec_decode_tokens={}
+    )
+    runner._prepare_inputs = lambda sub_output, num_scheduled_tokens_np: (torch.tensor([0]), None)
+    runner._determine_batch_execution_and_padding = lambda **kwargs: (
+        None,
+        SimpleNamespace(num_tokens=1, num_reqs=1),
+        False,
+        1,
+        None,
+    )
+    monkeypatch.setattr(ar_runner, "maybe_create_ubatch_slices", lambda *args: (None, None))
+    runner._get_slot_mappings = lambda **kwargs: ({}, None)
+    runner._build_attention_metadata = lambda **kwargs: (None, None)
+    runner._preprocess = lambda sub_output, num_tokens_padded, intermediate_tensors: (
+        torch.zeros(1, dtype=torch.int64),
+        None,
+        torch.zeros(1, dtype=torch.int64),
+        intermediate_tensors,
+        {},
+        None,
+    )
+    forward_calls = []
+
+    def model_forward(**kwargs):
+        forward_calls.append(int(kwargs["positions"][0]))
+        return torch.ones(1, 2)
+
+    runner._model_forward = model_forward
+    runner.extract_multimodal_outputs = lambda model_output: (model_output, {})
+    tokens = iter([5, 7, 9, 10])
+    runner.model.greedy_group0_tokens = lambda hidden: torch.tensor([next(tokens)])
+    runner._ensure_fast_acoustic_token_buffer = lambda max_steps: setattr(
+        runner, "_fast_acoustic_sampled_token_ids", torch.empty(max_steps, dtype=torch.int64)
+    )
+    runner._process_additional_information_updates = lambda *args: None
+    corrected = []
+
+    def apply_correction(start_num_computed, generated, max_steps):
+        corrected.append(("rid", generated, max_steps))
+        return start_num_computed + generated
+
+    runner._apply_fast_acoustic_corrected_num_computed_tokens = apply_correction
+
+    output = runner._run_acoustic_inner_loop(scheduler_output, None, None, None)
+
+    assert forward_calls == [4, 5, 6, 7]
+    assert runner._last_acoustic_inner_loop_path == "fast_graph_ready"
+    assert runner._fast_acoustic_valid_token_mask.tolist() == [True, False, False, False]
+    assert int(runner._fast_acoustic_valid_count.cpu()) == 1
+    assert output.sampled_token_ids == [[5]]
+    assert output.pooler_output[0]["hidden"].shape[0] == 1
+    assert runner.input_batch.num_computed_tokens_cpu[0] == 5
+    assert corrected == [("rid", 1, 4)]
 
 
 def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch):
