@@ -184,10 +184,19 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
 
 def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_sync():
     source = inspect.getsource(GPUARModelRunner._run_fast_qwen3_tts_nv_acoustic_inner_loop)
+    capture_start = "# CUDA graph capture-eligible K loop begins."
+    capture_end = "# CUDA graph capture-eligible K loop ends."
 
-    assert "break" not in source
-    assert ".item()" not in source
-    assert ".cpu()" not in source
+    start_idx = source.index(capture_start)
+    end_idx = source.index(capture_end)
+    capture_scope = source[start_idx:end_idx]
+    output_construction = source[end_idx:]
+
+    assert "break" not in capture_scope
+    assert ".item()" not in capture_scope
+    assert ".cpu()" not in capture_scope
+    assert '.to("cpu")' not in capture_scope
+    assert 'valid_count_tensor.detach().to("cpu")' in output_construction
 
 
 def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypatch):

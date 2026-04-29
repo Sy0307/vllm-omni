@@ -699,6 +699,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
 
         with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
+            # CUDA graph capture-eligible K loop begins.
+            # Keep host synchronizations out of this scope; output construction
+            # after replay may synchronize to determine the valid token count.
             for inner_idx in range(max_steps):
                 current_pos = start_num_computed + inner_idx
                 self._set_fast_acoustic_decode_step_state(
@@ -780,6 +783,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         inputs_embeds,
                         hidden_states,
                     )
+            # CUDA graph capture-eligible K loop ends.
 
         generated = (
             int(valid_count_tensor.detach().to("cpu"))
