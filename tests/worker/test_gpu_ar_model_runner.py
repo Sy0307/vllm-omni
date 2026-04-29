@@ -199,7 +199,10 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
     scheduler_output.total_num_scheduled_tokens = 4
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="multi"))
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="multi"),
+        parallel_config=runner.parallel_config,
+    )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
     runner.supports_mm_inputs = False
     runner.parallel_config.num_ubatches = 1
@@ -369,7 +372,10 @@ def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch)
     scheduler_output.total_num_scheduled_tokens = 3
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="multi"))
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="multi"),
+        parallel_config=runner.parallel_config,
+    )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
     runner.supports_mm_inputs = False
     runner.parallel_config.num_ubatches = 1

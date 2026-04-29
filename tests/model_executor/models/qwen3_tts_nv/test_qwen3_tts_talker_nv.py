@@ -152,6 +152,9 @@ def _make_native_code_predictor(*, use_cache: bool) -> Qwen3TTSTalkerCodePredict
     predictor = object.__new__(Qwen3TTSTalkerCodePredictor)
     nn.Module.__init__(predictor)
     predictor.config = config
+    # The production __init__ normally sets this via @support_torch_compile.
+    # This test bypasses __init__ to avoid distributed setup, so keep calls eager.
+    predictor.do_not_compile = True
     predictor.num_code_groups = config.num_code_groups
     predictor.hidden_size = config.hidden_size
     predictor.talker_hidden_size = config.hidden_size
