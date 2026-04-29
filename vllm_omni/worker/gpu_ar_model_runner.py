@@ -608,10 +608,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._ensure_fast_acoustic_token_buffer(max_steps)
         valid_token_mask = None
         valid_count_tensor = None
+        active = None
         if graph_ready:
             valid_token_mask, valid_count_tensor = self._ensure_fast_acoustic_valid_buffers(max_steps)
-            valid_token_mask[:max_steps].fill_(True)
+            valid_token_mask[:max_steps].fill_(False)
             valid_count_tensor.zero_()
+            active = torch.ones(1, device=self.device, dtype=torch.bool)
 
         (
             cudagraph_mode,
@@ -744,27 +746,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if graph_ready:
                     assert valid_token_mask is not None
                     assert valid_count_tensor is not None
+                    assert active is not None
                     token = token_ids_gpu.reshape(-1)[:1].to(device=self.device, dtype=torch.int64)
                     token_is_stop = torch.zeros(1, device=self.device, dtype=torch.bool)
                     for stop_token_id in stop_token_ids:
                         token_is_stop.logical_or_(token == stop_token_id)
-                    step_valid = torch.logical_and(valid_count_tensor.reshape(1) == inner_idx, ~token_is_stop)
+                    step_valid = active.clone()
                     valid_token_mask[inner_idx : inner_idx + 1].copy_(step_valid)
                     valid_count_tensor.add_(step_valid.to(dtype=valid_count_tensor.dtype).reshape(()))
                     hidden_chunks.append(hidden_states[:1])
                     for key, value in (multimodal_outputs or {}).items():
                         if isinstance(value, torch.Tensor):
                             multimodal_chunks.setdefault(key, []).append(value[:1])
-                    self._process_additional_information_updates(
-                        hidden_states,
-                        multimodal_outputs,
-                        one_token_num_scheduled_tokens_np,
-                        sub_output,
-                    )
-                    self._update_fast_qwen3_tts_nv_decode_preprocess_state(
-                        inputs_embeds,
-                        hidden_states,
-                    )
+                    active.logical_and_(~token_is_stop)
+                    step_valid_bool = bool(step_valid.cpu())
+                    if step_valid_bool:
+                        self._update_fast_qwen3_tts_nv_decode_preprocess_state(
+                            inputs_embeds,
+                            hidden_states,
+                        )
                 else:
                     hidden_chunks.append(hidden_states[:1])
                     for key, value in (multimodal_outputs or {}).items():
@@ -790,6 +790,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if graph_ready:
             hidden_chunks = hidden_chunks[:generated]
             multimodal_chunks = {key: chunks[:generated] for key, chunks in multimodal_chunks.items()}
+            if hidden_chunks:
+                valid_hidden_states = torch.cat(hidden_chunks, dim=0)
+            else:
+                valid_hidden_states = torch.empty((0, self.hidden_size), device=self.device, dtype=self.dtype)
+            valid_multimodal_outputs = {
+                key: torch.cat(chunks, dim=0)
+                for key, chunks in multimodal_chunks.items()
+                if chunks
+            }
+            self._process_additional_information_updates(
+                valid_hidden_states,
+                valid_multimodal_outputs,
+                np.array([generated], dtype=np.int32),
+                sub_output,
+            )
         sampled_token_ids = self._fast_acoustic_tokens_to_cpu_list(generated)
         corrected_num_computed = (
             self._apply_fast_acoustic_corrected_num_computed_tokens(

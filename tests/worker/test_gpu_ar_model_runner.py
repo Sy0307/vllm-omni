@@ -44,6 +44,9 @@ class _SamplingParams:
 
 
 class _Qwen3TTSNVModel:
+    def __init__(self):
+        self._prev_hidden_buffer = torch.zeros(1, 2)
+
     def greedy_group0_tokens(self, hidden):
         return hidden.argmax(dim=-1)
 
@@ -246,10 +249,17 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
         None,
     )
     forward_calls = []
+    hidden_by_pos = {
+        4: torch.tensor([[1.0, 4.0]]),
+        5: torch.tensor([[2.0, 5.0]]),
+        6: torch.tensor([[99.0, 99.0]]),
+        7: torch.tensor([[100.0, 100.0]]),
+    }
 
     def model_forward(**kwargs):
-        forward_calls.append(int(kwargs["positions"][0]))
-        return torch.ones(1, 2)
+        pos = int(kwargs["positions"][0])
+        forward_calls.append(pos)
+        return hidden_by_pos[pos].clone()
 
     runner._model_forward = model_forward
     runner.extract_multimodal_outputs = lambda model_output: (model_output, {})
@@ -258,7 +268,12 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
     runner._ensure_fast_acoustic_token_buffer = lambda max_steps: setattr(
         runner, "_fast_acoustic_sampled_token_ids", torch.empty(max_steps, dtype=torch.int64)
     )
-    runner._process_additional_information_updates = lambda *args: None
+    additional_updates = []
+
+    def process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np, sub_output):
+        additional_updates.append((hidden_states.clone(), int(num_scheduled_tokens_np[0])))
+
+    runner._process_additional_information_updates = process_additional_information_updates
     corrected = []
 
     def apply_correction(start_num_computed, generated, max_steps):
@@ -271,12 +286,16 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
 
     assert forward_calls == [4, 5, 6, 7]
     assert runner._last_acoustic_inner_loop_path == "fast_graph_ready"
-    assert runner._fast_acoustic_valid_token_mask.tolist() == [True, False, False, False]
-    assert int(runner._fast_acoustic_valid_count.cpu()) == 1
-    assert output.sampled_token_ids == [[5]]
-    assert output.pooler_output[0]["hidden"].shape[0] == 1
-    assert runner.input_batch.num_computed_tokens_cpu[0] == 5
-    assert corrected == [("rid", 1, 4)]
+    assert runner._fast_acoustic_valid_token_mask.tolist() == [True, True, False, False]
+    assert int(runner._fast_acoustic_valid_count.cpu()) == 2
+    assert output.sampled_token_ids == [[5, 7]]
+    assert torch.equal(output.pooler_output[0]["hidden"], torch.tensor([[1.0, 4.0], [2.0, 5.0]]))
+    assert len(additional_updates) == 1
+    assert torch.equal(additional_updates[0][0], torch.tensor([[1.0, 4.0], [2.0, 5.0]]))
+    assert additional_updates[0][1] == 2
+    assert torch.equal(runner.model._prev_hidden_buffer, torch.tensor([[2.0, 5.0]]))
+    assert runner.input_batch.num_computed_tokens_cpu[0] == 6
+    assert corrected == [("rid", 2, 4)]
 
 
 def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch):
