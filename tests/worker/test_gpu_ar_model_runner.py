@@ -303,7 +303,10 @@ def test_graph_ready_fast_acoustic_captures_then_replays_same_shape(monkeypatch)
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="multi"),
         parallel_config=runner.parallel_config,
-        compilation_config=SimpleNamespace(fast_moe_cold_start=False),
+        compilation_config=SimpleNamespace(
+            static_forward_context=None,
+            fast_moe_cold_start=False,
+        ),
     )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
     runner.supports_mm_inputs = False
@@ -521,7 +524,10 @@ def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch)
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="multi"),
         parallel_config=runner.parallel_config,
-        compilation_config=SimpleNamespace(fast_moe_cold_start=False),
+        compilation_config=SimpleNamespace(
+            static_forward_context=None,
+            fast_moe_cold_start=False,
+        ),
     )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
     runner.supports_mm_inputs = False
