@@ -87,6 +87,7 @@ class AcousticGraphState:
     initial_inputs_embeds_buffer: torch.Tensor | None
     initial_prev_hidden_buffer: torch.Tensor | None
     scratch_slot: torch.Tensor
+    scratch_slot_available: bool = True
     graph: torch.cuda.CUDAGraph | None = None
     graph_max_steps: int | None = None
     graph_cache_key: tuple[Hashable, ...] | None = None
@@ -591,6 +592,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 initial_inputs_embeds_buffer=None,
                 initial_prev_hidden_buffer=None,
                 scratch_slot=scratch_slot,
+                scratch_slot_available=True,
             )
             self._fast_acoustic_graph_state = graph_state
         elif graph_state.graph_max_steps != max_steps:
@@ -644,26 +646,32 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 graph_state.slot_mapping_buffers,
                 max_steps,
             )
-            graph_state.scratch_slot.fill_(scratch_slot)
+            graph_state.scratch_slot_available = scratch_slot is not None
+            if scratch_slot is None:
+                self._invalidate_fast_acoustic_graph(graph_state)
+            else:
+                graph_state.scratch_slot.fill_(scratch_slot)
         return graph_state
 
     def _select_fast_acoustic_scratch_slot(
         self,
         slot_mapping_buffers: dict[int, torch.Tensor],
         max_steps: int,
-    ) -> int:
+    ) -> int | None:
         """Pick a KV slot that is not visible to the active request."""
         block_size = int(getattr(getattr(self, "cache_config", None), "block_size", 0) or 0)
         num_blocks = int(getattr(getattr(self, "kv_cache_config", None), "num_blocks", 0) or 0)
         if block_size > 0 and num_blocks > 0:
-            candidate = (num_blocks - 1) * block_size
+            candidates = [block_idx * block_size for block_idx in range(num_blocks - 1, -1, -1)]
         else:
-            candidate = 0
+            candidates = [0]
         request_slots: set[int] = set()
         for slot_mapping in slot_mapping_buffers.values():
             request_slots.update(int(slot) for slot in slot_mapping[:max_steps].detach().cpu().tolist())
-        assert candidate not in request_slots, "scratch slot overlaps live request slots"
-        return candidate
+        for candidate in candidates:
+            if candidate not in request_slots:
+                return candidate
+        return None
 
     def _mask_fast_acoustic_post_stop_slots(self, graph_state: AcousticGraphState) -> None:
         if not graph_state.slot_mapping_buffers:
@@ -734,16 +742,70 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         graph_state.token_is_stop_buffer.zero_()
 
     @staticmethod
-    def _tensor_replay_signature(tensor: torch.Tensor | None) -> tuple[Hashable, ...] | None:
+    def _make_tensor_signature(obj: Any) -> Hashable:
+        if isinstance(obj, torch.Tensor):
+            return (tuple(obj.shape), str(obj.dtype), obj.device.type)
+        if isinstance(obj, dict):
+            return tuple(
+                sorted(
+                    (key, GPUARModelRunner._make_tensor_signature(value))
+                    for key, value in obj.items()
+                )
+            )
+        if isinstance(obj, (list, tuple)):
+            return tuple(GPUARModelRunner._make_tensor_signature(item) for item in obj)
+        if isinstance(obj, Hashable):
+            return obj
+        return ("_opaque", id(obj))
+
+    @staticmethod
+    def _tensor_replay_signature(tensor: torch.Tensor | None) -> Hashable:
         if tensor is None:
             return None
-        return (tuple(tensor.shape), str(tensor.dtype), str(tensor.device))
+        return GPUARModelRunner._make_tensor_signature(tensor)
+
+    @staticmethod
+    def _batch_desc_replay_signature(batch_desc: Any) -> Hashable:
+        if batch_desc is None:
+            return None
+        if hasattr(batch_desc, "_asdict"):
+            fields = batch_desc._asdict()
+        else:
+            try:
+                fields = {
+                    key: value
+                    for key, value in vars(batch_desc).items()
+                    if not key.startswith("_")
+                }
+            except TypeError:
+                fields = {}
+            for key in ("num_tokens", "num_reqs"):
+                if key not in fields and hasattr(batch_desc, key):
+                    fields[key] = getattr(batch_desc, key)
+        return GPUARModelRunner._make_tensor_signature(fields)
+
+    @staticmethod
+    def _static_identity_signature(obj: Any) -> Hashable:
+        if obj is None:
+            return None
+        return (type(obj).__qualname__, id(obj))
 
     def _make_fast_acoustic_graph_cache_key(
         self,
         *,
         graph_state: AcousticGraphState,
         stop_token_ids: set[int],
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: Any,
+        should_ubatch: bool,
+        num_tokens_across_dp: int,
+        pad_attn: bool,
+        ubatch_slices: Any,
+        ubatch_slices_padded: Any,
+        logits_indices: torch.Tensor,
+        attn_metadata: Any,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
         num_tokens_padded: int,
         num_reqs_padded: int,
         input_ids: torch.Tensor,
@@ -776,6 +838,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return (
             graph_state.max_steps,
             frozenset(int(token_id) for token_id in stop_token_ids),
+            cudagraph_mode,
+            self._batch_desc_replay_signature(batch_desc),
+            bool(should_ubatch),
+            int(num_tokens_across_dp),
+            bool(pad_attn),
+            self._make_tensor_signature(ubatch_slices),
+            self._make_tensor_signature(ubatch_slices_padded),
+            self._tensor_replay_signature(logits_indices),
+            self._static_identity_signature(attn_metadata),
+            self._make_tensor_signature(intermediate_tensors),
+            self._make_tensor_signature(model_kwargs),
             (int(num_tokens_padded), int(num_reqs_padded)),
             int(getattr(self, "hidden_size", graph_state.hidden_buffer.shape[-1])),
             str(getattr(self, "dtype", graph_state.hidden_buffer.dtype)),
@@ -948,6 +1021,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             precomputed_slot_mappings_by_group=precomputed_slot_mappings_by_group,
         )
         precomputed_slot_mappings_by_group = graph_state.slot_mapping_buffers
+        if graph_ready and not graph_state.scratch_slot_available:
+            self._last_acoustic_inner_loop_path = "fallback_scratch_overlap"
+            return self._run_generic_acoustic_inner_loop(
+                scheduler_output,
+                intermediate_tensors,
+                ec_connector_output,
+                cudagraph_stats,
+                stop_token_ids,
+            )
         if graph_ready:
             valid_token_mask = graph_state.valid_mask
             valid_count_tensor = graph_state.valid_count
@@ -1064,6 +1146,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             graph_state.replay_cache_key = self._make_fast_acoustic_graph_cache_key(
                 graph_state=graph_state,
                 stop_token_ids=stop_token_ids,
+                cudagraph_mode=cudagraph_mode,
+                batch_desc=batch_desc,
+                should_ubatch=should_ubatch,
+                num_tokens_across_dp=num_tokens_across_dp,
+                pad_attn=pad_attn,
+                ubatch_slices=ubatch_slices,
+                ubatch_slices_padded=ubatch_slices_padded,
+                logits_indices=logits_indices,
+                attn_metadata=attn_metadata,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
                 num_tokens_padded=num_tokens_padded,
                 num_reqs_padded=num_reqs_padded,
                 input_ids=input_ids,
@@ -1181,6 +1274,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 graph_state.replay_cache_key = self._make_fast_acoustic_graph_cache_key(
                     graph_state=graph_state,
                     stop_token_ids=stop_token_ids,
+                    cudagraph_mode=cudagraph_mode,
+                    batch_desc=batch_desc,
+                    should_ubatch=should_ubatch,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    pad_attn=pad_attn,
+                    ubatch_slices=ubatch_slices,
+                    ubatch_slices_padded=ubatch_slices_padded,
+                    logits_indices=logits_indices,
+                    attn_metadata=attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
                     num_tokens_padded=num_tokens_padded,
                     num_reqs_padded=num_reqs_padded,
                     input_ids=input_ids,

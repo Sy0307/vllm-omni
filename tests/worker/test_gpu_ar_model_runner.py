@@ -252,16 +252,151 @@ def test_fast_acoustic_graph_replay_invalidates_same_k_different_stop_tokens():
     assert state.graph_cache_key is None
 
 
-def test_fast_acoustic_scratch_slot_asserts_against_live_request_slots():
+def test_fast_acoustic_graph_replay_invalidates_same_k_different_model_kwargs_shape():
     runner = object.__new__(GPUARModelRunner)
-    runner.cache_config = SimpleNamespace(block_size=4)
-    runner.kv_cache_config = SimpleNamespace(num_blocks=2)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.graph = SimpleNamespace(replay=lambda: None)
+    state.graph_max_steps = 4
+    common_kwargs = dict(
+        graph_state=state,
+        stop_token_ids={7},
+        cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+        batch_desc=SimpleNamespace(num_tokens=1, num_reqs=1),
+        should_ubatch=False,
+        num_tokens_across_dp=1,
+        pad_attn=False,
+        ubatch_slices=None,
+        ubatch_slices_padded=None,
+        logits_indices=torch.zeros(1, dtype=torch.int64),
+        attn_metadata=None,
+        intermediate_tensors=None,
+        num_tokens_padded=1,
+        num_reqs_padded=1,
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        positions=torch.zeros(1, dtype=torch.int64),
+        inputs_embeds=None,
+        prev_hidden_buffer=None,
+    )
 
-    with pytest.raises(AssertionError, match="scratch slot overlaps live request slots"):
-        runner._select_fast_acoustic_scratch_slot(
-            {0: torch.tensor([4, 5, 6], dtype=torch.int64)},
-            max_steps=3,
-        )
+    state.graph_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **common_kwargs,
+        model_kwargs={"encoder_outputs": torch.zeros(1, 2)},
+    )
+    state.replay_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **common_kwargs,
+        model_kwargs={"encoder_outputs": torch.zeros(2, 2)},
+    )
+
+    assert not runner._can_replay_acoustic_graph(state)
+    assert state.graph is None
+
+
+def test_fast_acoustic_graph_replay_invalidates_same_k_different_cudagraph_mode():
+    runner = object.__new__(GPUARModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    state = runner._prepare_fast_acoustic_graph_state(
+        max_steps=4,
+        start_num_computed=10,
+        precomputed_slot_mappings_by_group={0: torch.tensor([101, 102, 103, 104], dtype=torch.int64)},
+    )
+    state.graph = SimpleNamespace(replay=lambda: None)
+    state.graph_max_steps = 4
+    common_kwargs = dict(
+        graph_state=state,
+        stop_token_ids={7},
+        batch_desc=SimpleNamespace(num_tokens=1, num_reqs=1),
+        should_ubatch=False,
+        num_tokens_across_dp=1,
+        pad_attn=False,
+        ubatch_slices=None,
+        ubatch_slices_padded=None,
+        logits_indices=torch.zeros(1, dtype=torch.int64),
+        attn_metadata=None,
+        intermediate_tensors=None,
+        model_kwargs={},
+        num_tokens_padded=1,
+        num_reqs_padded=1,
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        positions=torch.zeros(1, dtype=torch.int64),
+        inputs_embeds=None,
+        prev_hidden_buffer=None,
+    )
+
+    state.graph_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **common_kwargs,
+        cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+    )
+    state.replay_cache_key = runner._make_fast_acoustic_graph_cache_key(
+        **common_kwargs,
+        cudagraph_mode=ar_runner.CUDAGraphMode.FULL,
+    )
+
+    assert not runner._can_replay_acoustic_graph(state)
+    assert state.graph is None
+
+
+def test_graph_ready_fast_acoustic_scratch_overlap_falls_back_without_crash(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_ACOUSTIC_GRAPH_READY", "1")
+    runner = _make_runner()
+    runner.requests["rid"].sampling_params = _SamplingParams(stop_token_ids=[7])
+    scheduler_output = _SchedulerOutput()
+    scheduler_output.num_scheduled_tokens = {"rid": 3}
+    scheduler_output.total_num_scheduled_tokens = 3
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
+    runner.parallel_config.num_ubatches = 1
+    runner.input_batch.num_computed_tokens_cpu = [4]
+    runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
+    runner.input_batch.sampling_metadata = None
+    runner.cache_config = SimpleNamespace(block_size=4)
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()], num_blocks=2)
+    runner.input_batch.block_table = {
+        0: SimpleNamespace(slot_mapping=SimpleNamespace(gpu=torch.tensor([0, 4, 5], dtype=torch.int64)))
+    }
+    runner.attn_groups = [[]]
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(engine_output_type="multi"),
+        parallel_config=runner.parallel_config,
+        compilation_config=SimpleNamespace(
+            static_forward_context=None,
+            fast_moe_cold_start=False,
+            cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+            cudagraph_runtime_mode=ar_runner.CUDAGraphMode.NONE,
+        ),
+    )
+    runner.input_ids = SimpleNamespace(gpu=torch.empty(1, dtype=torch.int64))
+    runner.query_start_loc = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        copy_to_gpu=lambda: None,
+    )
+    runner.seq_lens = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        gpu=torch.zeros(4, dtype=torch.int32),
+        copy_to_gpu=lambda: None,
+    )
+    runner._determine_batch_execution_and_padding = lambda **kwargs: (
+        ar_runner.CUDAGraphMode.NONE,
+        SimpleNamespace(num_tokens=1, num_reqs=1),
+        False,
+        1,
+        None,
+    )
+    monkeypatch.setattr(ar_runner, "maybe_create_ubatch_slices", lambda *args: (None, None))
+    runner._prepare_inputs = lambda scheduler_output, num_scheduled_tokens_np: (torch.tensor([0]), None)
+    runner._run_generic_acoustic_inner_loop = lambda *args: "generic-output"
+
+    assert runner._run_acoustic_inner_loop(scheduler_output, None, None, None) == "generic-output"
+    assert runner._last_acoustic_inner_loop_path == "fallback_scratch_overlap"
 
 
 def test_fast_acoustic_gpu_step_state_uses_static_buffers_without_cpu_mirrors():
