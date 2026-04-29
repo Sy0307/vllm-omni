@@ -77,6 +77,7 @@ def _make_runner():
     runner.speculative_config = None
     runner.parallel_config = SimpleNamespace(use_ubatching=False, num_ubatches=1, data_parallel_size=1)
     runner.model = _Qwen3TTSNVModel()
+    runner.sampler = SimpleNamespace()
     return runner
 
 
@@ -359,7 +360,7 @@ def test_graph_ready_fast_acoustic_scratch_overlap_falls_back_without_crash(monk
     runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
     runner.input_batch.sampling_metadata = None
     runner.cache_config = SimpleNamespace(block_size=4)
-    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()], num_blocks=2)
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())], num_blocks=2)
     runner.input_batch.block_table = {
         0: SimpleNamespace(slot_mapping=SimpleNamespace(gpu=torch.tensor([0, 4, 5], dtype=torch.int64)))
     }
