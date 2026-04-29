@@ -185,6 +185,8 @@ def test_store_fast_acoustic_token_keeps_gpu_tensor_until_output_boundary():
 def test_fast_acoustic_graph_state_prefills_fixed_k_gpu_buffers():
     runner = object.__new__(GPUARModelRunner)
     runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
 
     state = runner._prepare_fast_acoustic_graph_state(
         max_steps=4,
@@ -199,12 +201,18 @@ def test_fast_acoustic_graph_state_prefills_fixed_k_gpu_buffers():
     assert state.valid_mask.tolist() == [False, False, False, False]
     assert state.valid_count.shape == (1,)
     assert int(state.valid_count[0]) == 0
+    assert state.hidden_buffer.shape == (4, 2)
+    assert state.mm_buffers == {}
+    assert state.input_ids_buffer.shape == (1,)
+    assert state.positions_live_buffer.shape == (1,)
 
 
 @pytest.mark.parametrize("generated", [0, 1, 2])
 def test_fast_acoustic_graph_state_masks_post_stop_slots_to_scratch(generated):
     runner = object.__new__(GPUARModelRunner)
     runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
 
     state = runner._prepare_fast_acoustic_graph_state(
         max_steps=4,
@@ -215,6 +223,7 @@ def test_fast_acoustic_graph_state_masks_post_stop_slots_to_scratch(generated):
     runner._mask_fast_acoustic_post_stop_slots(state)
 
     scratch_slot = int(state.scratch_slot[0])
+    assert scratch_slot not in {101, 102, 103, 104}
     assert state.slot_mapping_buffers[0].tolist() == [
         101 + idx if idx < generated else scratch_slot for idx in range(4)
     ]
@@ -223,6 +232,8 @@ def test_fast_acoustic_graph_state_masks_post_stop_slots_to_scratch(generated):
 def test_fast_acoustic_gpu_step_state_uses_static_buffers_without_cpu_mirrors():
     runner = object.__new__(GPUARModelRunner)
     runner.device = torch.device("cpu")
+    runner.dtype = torch.float32
+    runner.hidden_size = 2
     runner.seq_lens = SimpleNamespace(
         np=torch.zeros(4, dtype=torch.int32).numpy(),
         gpu=torch.zeros(4, dtype=torch.int32),
@@ -257,12 +268,13 @@ def test_fast_acoustic_gpu_step_state_uses_static_buffers_without_cpu_mirrors():
 
 def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_sync():
     source = inspect.getsource(GPUARModelRunner._run_fast_qwen3_tts_nv_acoustic_inner_loop)
-    capture_start = "# CUDA graph capture-eligible K loop begins."
-    capture_end = "# CUDA graph capture-eligible K loop ends."
+    capture_start = "# Fast acoustic K loop begins."
+    capture_end = "# Fast acoustic K loop ends."
 
     start_idx = source.index(capture_start)
     end_idx = source.index(capture_end)
     capture_scope = source[start_idx:end_idx]
+    graph_ready_scope = capture_scope[capture_scope.index("if graph_ready:") : capture_scope.index("else:")]
     output_construction = source[end_idx:]
 
     assert "break" not in capture_scope
@@ -270,13 +282,15 @@ def test_fast_acoustic_loop_has_no_python_break_or_per_step_cpu_sync():
     assert "current_pos=" not in capture_scope
     assert "_set_fast_acoustic_decode_step_state(" not in capture_scope
     assert "_set_fast_acoustic_decode_step_state_gpu(" in capture_scope
+    assert "hidden_chunks.append" not in graph_ready_scope
+    assert "multimodal_chunks.setdefault" not in graph_ready_scope
     assert ".item()" not in capture_scope
     assert ".cpu()" not in capture_scope
     assert '.to("cpu")' not in capture_scope
     assert 'valid_count_tensor.detach().to("cpu")' in output_construction
 
 
-def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypatch):
+def test_graph_ready_fast_acoustic_captures_then_replays_same_shape(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_ACOUSTIC_GRAPH_READY", "1")
     runner = _make_runner()
     runner.requests["rid"].sampling_params = _SamplingParams(stop_token_ids=[7])
@@ -285,6 +299,7 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
     scheduler_output.total_num_scheduled_tokens = 4
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
+    runner.hidden_size = 2
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="multi"),
         parallel_config=runner.parallel_config,
@@ -372,9 +387,43 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
         return start_num_computed + generated
 
     runner._apply_fast_acoustic_corrected_num_computed_tokens = apply_correction
+    capture_calls = []
+    replay_calls = []
+
+    def capture_acoustic_graph(body):
+        capture_calls.append(True)
+        body()
+        state = runner._fast_acoustic_graph_state
+        token_snapshot = state.sampled_tokens_buffer.clone()
+        valid_mask_snapshot = state.valid_mask.clone()
+        valid_count_snapshot = state.valid_count.clone()
+        hidden_snapshot = state.hidden_buffer.clone()
+        prev_hidden_snapshot = runner.model._prev_hidden_buffer.clone()
+
+        def replay():
+            state.sampled_tokens_buffer.copy_(token_snapshot)
+            state.valid_mask.copy_(valid_mask_snapshot)
+            state.valid_count.copy_(valid_count_snapshot)
+            state.hidden_buffer.copy_(hidden_snapshot)
+            runner.model._prev_hidden_buffer.copy_(prev_hidden_snapshot)
+
+        state.graph = SimpleNamespace(replay=replay)
+        state.graph_max_steps = state.max_steps
+        return state
+
+    def replay_acoustic_graph():
+        replay_calls.append(True)
+        state = runner._fast_acoustic_graph_state
+        state.graph.replay()
+        return state
+
+    runner.capture_acoustic_graph = capture_acoustic_graph
+    runner.replay_acoustic_graph = replay_acoustic_graph
 
     output = runner._run_acoustic_inner_loop(scheduler_output, None, None, None)
 
+    assert capture_calls == [True]
+    assert replay_calls == []
     assert forward_calls == [4, 5, 6, 7]
     assert runner._last_acoustic_inner_loop_path == "fast_graph_ready"
     assert runner._fast_acoustic_valid_token_mask.tolist() == [True, True, False, False]
@@ -387,6 +436,15 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
     assert torch.equal(runner.model._prev_hidden_buffer, torch.tensor([[2.0, 5.0]]))
     assert runner.input_batch.num_computed_tokens_cpu[0] == 6
     assert corrected == [("rid", 2, 4)]
+
+    runner.input_batch.num_computed_tokens_cpu = [4]
+    runner.input_batch.num_computed_tokens_cpu_tensor = torch.tensor([4])
+    output = runner._run_acoustic_inner_loop(scheduler_output, None, None, None)
+
+    assert capture_calls == [True]
+    assert replay_calls == [True]
+    assert forward_calls == [4, 5, 6, 7]
+    assert output.sampled_token_ids == [[5, 7]]
 
 
 def test_acoustic_inner_loop_output_keeps_audio_codes_gpu_resident_without_hidden_cpu_payload(monkeypatch):
@@ -459,6 +517,7 @@ def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch)
     scheduler_output.total_num_scheduled_tokens = 3
     runner.device = torch.device("cpu")
     runner.dtype = torch.float32
+    runner.hidden_size = 2
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="multi"),
         parallel_config=runner.parallel_config,

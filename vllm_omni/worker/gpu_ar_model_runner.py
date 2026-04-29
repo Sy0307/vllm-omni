@@ -76,8 +76,19 @@ class AcousticGraphState:
     sampled_tokens_buffer: torch.Tensor
     valid_mask: torch.Tensor
     valid_count: torch.Tensor
+    active_buffer: torch.Tensor
+    token_is_stop_buffer: torch.Tensor
+    hidden_buffer: torch.Tensor
+    mm_buffers: dict[str, torch.Tensor]
+    input_ids_buffer: torch.Tensor
+    first_input_id_buffer: torch.Tensor
+    positions_live_buffer: torch.Tensor
+    initial_inputs_embeds_buffer: torch.Tensor | None
+    initial_prev_hidden_buffer: torch.Tensor | None
     scratch_slot: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
+    graph_max_steps: int | None = None
+    graph_out_stream: torch.cuda.Stream | None = None
 
 
 class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -534,10 +545,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         precomputed_slot_mappings_by_group: dict[int, torch.Tensor] | None,
     ) -> AcousticGraphState:
         graph_state = getattr(self, "_fast_acoustic_graph_state", None)
+        if hasattr(self, "hidden_size"):
+            hidden_size = int(self.hidden_size)
+        else:
+            hidden_size = int(getattr(self.model_config.hf_config, "hidden_size", 0))
         needs_new_state = (
             graph_state is None
             or graph_state.positions_buffer.numel() < max_steps
             or graph_state.positions_buffer.device != self.device
+            or graph_state.hidden_buffer.shape != (max_steps, hidden_size)
+            or graph_state.hidden_buffer.dtype != self.dtype
         )
         if needs_new_state:
             positions_buffer = torch.empty(max_steps, device=self.device, dtype=torch.int64)
@@ -545,6 +562,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             sampled_tokens_buffer = torch.empty(max_steps, device=self.device, dtype=torch.int64)
             valid_mask = torch.empty(max_steps, device=self.device, dtype=torch.bool)
             valid_count = torch.zeros(1, device=self.device, dtype=torch.int32)
+            active_buffer = torch.ones(1, device=self.device, dtype=torch.bool)
+            token_is_stop_buffer = torch.zeros(1, device=self.device, dtype=torch.bool)
+            hidden_buffer = torch.empty(max_steps, hidden_size, device=self.device, dtype=self.dtype)
+            input_ids_buffer = torch.empty(1, device=self.device, dtype=torch.int64)
+            first_input_id_buffer = torch.empty(1, device=self.device, dtype=torch.int64)
+            positions_live_buffer = torch.empty(1, device=self.device, dtype=torch.int64)
             scratch_slot = torch.zeros(1, device=self.device, dtype=torch.int64)
             graph_state = AcousticGraphState(
                 max_steps=max_steps,
@@ -555,9 +578,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sampled_tokens_buffer=sampled_tokens_buffer,
                 valid_mask=valid_mask,
                 valid_count=valid_count,
+                active_buffer=active_buffer,
+                token_is_stop_buffer=token_is_stop_buffer,
+                hidden_buffer=hidden_buffer,
+                mm_buffers={},
+                input_ids_buffer=input_ids_buffer,
+                first_input_id_buffer=first_input_id_buffer,
+                positions_live_buffer=positions_live_buffer,
+                initial_inputs_embeds_buffer=None,
+                initial_prev_hidden_buffer=None,
                 scratch_slot=scratch_slot,
             )
             self._fast_acoustic_graph_state = graph_state
+        elif graph_state.graph_max_steps != max_steps:
+            graph_state.graph = None
+            graph_state.graph_max_steps = None
 
         graph_state.max_steps = max_steps
         offsets = torch.arange(max_steps, device=self.device, dtype=graph_state.positions_buffer.dtype)
@@ -567,7 +602,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
         graph_state.valid_mask[:max_steps].fill_(False)
         graph_state.valid_count.zero_()
-        graph_state.graph = None
+        graph_state.active_buffer.fill_(True)
+        graph_state.token_is_stop_buffer.zero_()
         self._fast_acoustic_sampled_token_ids = graph_state.sampled_tokens_buffer
         self._fast_acoustic_valid_token_mask = graph_state.valid_mask
         self._fast_acoustic_valid_count = graph_state.valid_count
@@ -602,10 +638,31 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 precomputed_slice = precomputed[:max_steps].to(device=self.device, dtype=torch.int64)
                 slot_mapping[:max_steps].copy_(precomputed_slice)
                 original[:max_steps].copy_(precomputed_slice)
-            if graph_state.slot_mapping_buffers:
-                first_slots = next(iter(graph_state.slot_mapping_buffers.values()))
-                graph_state.scratch_slot[:1].copy_(first_slots[max_steps - 1 : max_steps])
+            scratch_slot = self._select_fast_acoustic_scratch_slot(
+                graph_state.slot_mapping_buffers,
+                max_steps,
+            )
+            graph_state.scratch_slot.fill_(scratch_slot)
         return graph_state
+
+    def _select_fast_acoustic_scratch_slot(
+        self,
+        slot_mapping_buffers: dict[int, torch.Tensor],
+        max_steps: int,
+    ) -> int:
+        """Pick a KV slot that is not visible to the active request."""
+        block_size = int(getattr(getattr(self, "cache_config", None), "block_size", 0) or 0)
+        num_blocks = int(getattr(getattr(self, "kv_cache_config", None), "num_blocks", 0) or 0)
+        if block_size > 0 and num_blocks > 0:
+            candidate = (num_blocks - 1) * block_size
+        else:
+            candidate = 0
+        request_slots: set[int] = set()
+        for slot_mapping in slot_mapping_buffers.values():
+            request_slots.update(int(slot) for slot in slot_mapping[:max_steps].detach().cpu().tolist())
+        while candidate in request_slots:
+            candidate += 1
+        return candidate
 
     def _mask_fast_acoustic_post_stop_slots(self, graph_state: AcousticGraphState) -> None:
         if not graph_state.slot_mapping_buffers:
@@ -623,6 +680,59 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         token_buffer = self._fast_acoustic_sampled_token_ids
         token = token_ids.reshape(-1)[:1].to(device=token_buffer.device, dtype=token_buffer.dtype)
         token_buffer[step : step + 1].copy_(token)
+
+    def _store_fast_acoustic_outputs(
+        self,
+        graph_state: AcousticGraphState,
+        step: int,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: dict | None,
+    ) -> None:
+        graph_state.hidden_buffer[step : step + 1].copy_(
+            hidden_states[:1].to(
+                device=graph_state.hidden_buffer.device,
+                dtype=graph_state.hidden_buffer.dtype,
+            )
+        )
+        for key, value in (multimodal_outputs or {}).items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            source = value[:1]
+            buffer = graph_state.mm_buffers.get(key)
+            expected_shape = (graph_state.max_steps, *source.shape[1:])
+            if (
+                buffer is None
+                or buffer.shape != expected_shape
+                or buffer.device != self.device
+                or buffer.dtype != source.dtype
+            ):
+                if graph_state.graph is not None:
+                    raise RuntimeError(f"Acoustic graph output shape changed for {key!r}")
+                buffer = torch.empty(expected_shape, device=self.device, dtype=source.dtype)
+                graph_state.mm_buffers[key] = buffer
+            buffer[step : step + 1].copy_(source.to(device=buffer.device, dtype=buffer.dtype))
+
+    def _fast_acoustic_static_chunks(
+        self,
+        graph_state: AcousticGraphState,
+        generated: int,
+    ) -> tuple[list[torch.Tensor], dict[str, list[torch.Tensor]]]:
+        hidden_chunks = [graph_state.hidden_buffer[:generated]] if generated > 0 else []
+        multimodal_chunks = {
+            key: [buffer[:generated]]
+            for key, buffer in graph_state.mm_buffers.items()
+            if generated > 0
+        }
+        return hidden_chunks, multimodal_chunks
+
+    def _reset_fast_acoustic_graph_runtime_state(self, graph_state: AcousticGraphState) -> None:
+        graph_state.valid_mask[: graph_state.max_steps].fill_(False)
+        graph_state.valid_count.zero_()
+        graph_state.active_buffer.fill_(True)
+        graph_state.token_is_stop_buffer.zero_()
+
+    def _can_replay_acoustic_graph(self, graph_state: AcousticGraphState) -> bool:
+        return graph_state.graph is not None and graph_state.graph_max_steps == graph_state.max_steps
 
     def _fast_acoustic_tokens_to_cpu_list(self, generated: int) -> list[int]:
         if generated <= 0:
@@ -768,7 +878,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if graph_ready:
             valid_token_mask = graph_state.valid_mask
             valid_count_tensor = graph_state.valid_count
-            active = torch.ones(1, device=self.device, dtype=torch.bool)
+            active = graph_state.active_buffer
         else:
             graph_state.valid_mask[:max_steps].fill_(True)
 
@@ -807,7 +917,39 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             model_kwargs,
             _,
         ) = self._preprocess(sub_output, num_tokens_padded, intermediate_tensors)
-        first_input_id = input_ids[:1].clone()
+        if graph_ready:
+            graph_state.first_input_id_buffer[:1].copy_(input_ids[:1])
+            preprocessed_positions = positions
+            if (
+                graph_state.input_ids_buffer.numel() < num_tokens_padded
+                or graph_state.input_ids_buffer.dtype != input_ids.dtype
+            ):
+                graph_state.input_ids_buffer = torch.empty(
+                    num_tokens_padded,
+                    device=self.device,
+                    dtype=input_ids.dtype,
+                )
+                graph_state.graph = None
+                graph_state.graph_max_steps = None
+            if (
+                graph_state.positions_live_buffer.numel() < num_tokens_padded
+                or graph_state.positions_live_buffer.dtype != positions.dtype
+            ):
+                graph_state.positions_live_buffer = torch.empty(
+                    num_tokens_padded,
+                    device=self.device,
+                    dtype=positions.dtype,
+                )
+                graph_state.graph = None
+                graph_state.graph_max_steps = None
+            input_ids = graph_state.input_ids_buffer[:num_tokens_padded]
+            positions = graph_state.positions_live_buffer[:num_tokens_padded]
+            input_ids[:1].copy_(graph_state.first_input_id_buffer)
+            positions[:1].copy_(preprocessed_positions[:1].to(device=positions.device, dtype=positions.dtype))
+            input_ids_buffer = graph_state.input_ids_buffer[:num_tokens_padded]
+        else:
+            loop_first_input_id = input_ids[:1].clone()
+            input_ids_buffer = self.input_ids.gpu[:num_tokens_padded]
         if hasattr(self.model, "prepare_runner_inputs"):
             input_ids, positions = self.model.prepare_runner_inputs(
                 input_ids=input_ids,
@@ -816,11 +958,46 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 req_ids=[req_id],
                 num_computed_tokens=[start_num_computed],
                 num_scheduled_tokens=[1],
-                input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
+                input_ids_buffer=input_ids_buffer,
             )
+        if graph_ready and inputs_embeds is not None:
+            initial_inputs_embeds_buffer = graph_state.initial_inputs_embeds_buffer
+            if (
+                initial_inputs_embeds_buffer is None
+                or initial_inputs_embeds_buffer.shape != inputs_embeds[:1].shape
+                or initial_inputs_embeds_buffer.device != inputs_embeds.device
+                or initial_inputs_embeds_buffer.dtype != inputs_embeds.dtype
+            ):
+                initial_inputs_embeds_buffer = torch.empty_like(inputs_embeds[:1])
+                graph_state.initial_inputs_embeds_buffer = initial_inputs_embeds_buffer
+                graph_state.graph = None
+                graph_state.graph_max_steps = None
+            initial_inputs_embeds_buffer.copy_(inputs_embeds[:1])
+        else:
+            initial_inputs_embeds_buffer = None
+        prev_hidden_buffer = getattr(self.model, "_prev_hidden_buffer", None)
+        if graph_ready and isinstance(prev_hidden_buffer, torch.Tensor):
+            initial_prev_hidden_buffer = graph_state.initial_prev_hidden_buffer
+            if (
+                initial_prev_hidden_buffer is None
+                or initial_prev_hidden_buffer.shape != prev_hidden_buffer[:1].shape
+                or initial_prev_hidden_buffer.device != prev_hidden_buffer.device
+                or initial_prev_hidden_buffer.dtype != prev_hidden_buffer.dtype
+            ):
+                initial_prev_hidden_buffer = torch.empty_like(prev_hidden_buffer[:1])
+                graph_state.initial_prev_hidden_buffer = initial_prev_hidden_buffer
+                graph_state.graph = None
+                graph_state.graph_max_steps = None
+            initial_prev_hidden_buffer.copy_(prev_hidden_buffer[:1])
+        else:
+            initial_prev_hidden_buffer = None
 
-        with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
-            # CUDA graph capture-eligible K loop begins.
+        def acoustic_graph_body() -> None:
+            if initial_inputs_embeds_buffer is not None:
+                inputs_embeds[:1].copy_(initial_inputs_embeds_buffer)
+            if initial_prev_hidden_buffer is not None:
+                prev_hidden_buffer[:1].copy_(initial_prev_hidden_buffer)
+            # Fast acoustic K loop begins.
             # Keep host synchronizations out of this scope; output construction
             # after replay may synchronize to determine the valid token count.
             for inner_idx in range(max_steps):
@@ -836,7 +1013,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     step=inner_idx,
                 )
                 if inner_idx == 0:
-                    input_ids[:1].copy_(first_input_id)
+                    if graph_ready:
+                        input_ids[:1].copy_(graph_state.first_input_id_buffer)
+                    else:
+                        input_ids[:1].copy_(loop_first_input_id)
                 else:
                     input_ids[:1].copy_(self._fast_acoustic_sampled_token_ids[inner_idx - 1 : inner_idx])
 
@@ -871,18 +1051,20 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 token_ids_gpu = self.model.greedy_group0_tokens(sample_hidden_states)
                 self._store_fast_acoustic_token(inner_idx, token_ids_gpu)
                 if graph_ready:
-                    assert valid_token_mask is not None
                     assert valid_count_tensor is not None
                     assert active is not None
                     token = token_ids_gpu.reshape(-1)[:1].to(device=self.device, dtype=torch.int64)
-                    token_is_stop = torch.zeros(1, device=self.device, dtype=torch.bool)
+                    token_is_stop = graph_state.token_is_stop_buffer
+                    token_is_stop.zero_()
                     for stop_token_id in stop_token_ids:
                         token_is_stop.logical_or_(token == stop_token_id)
                     valid_count_tensor.add_(step_valid.to(dtype=valid_count_tensor.dtype))
-                    hidden_chunks.append(hidden_states[:1])
-                    for key, value in (multimodal_outputs or {}).items():
-                        if isinstance(value, torch.Tensor):
-                            multimodal_chunks.setdefault(key, []).append(value[:1])
+                    self._store_fast_acoustic_outputs(
+                        graph_state,
+                        inner_idx,
+                        hidden_states,
+                        multimodal_outputs,
+                    )
                     active.logical_and_(~token_is_stop)
                     self._update_fast_qwen3_tts_nv_decode_preprocess_state(
                         inputs_embeds,
@@ -905,7 +1087,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         inputs_embeds,
                         hidden_states,
                     )
-            # CUDA graph capture-eligible K loop ends.
+            # Fast acoustic K loop ends.
+
+        # CUDA graph capture-eligible K loop begins.
+        with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
+            if graph_ready and self._can_replay_acoustic_graph(graph_state):
+                self._reset_fast_acoustic_graph_runtime_state(graph_state)
+                self.replay_acoustic_graph()
+            elif graph_ready:
+                self.capture_acoustic_graph(acoustic_graph_body)
+            else:
+                acoustic_graph_body()
+        # CUDA graph capture-eligible K loop ends.
 
         if graph_ready:
             self._mask_fast_acoustic_post_stop_slots(graph_state)
@@ -916,14 +1109,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             else len(hidden_chunks)
         )
         if graph_ready:
-            hidden_chunks = hidden_chunks[:generated]
-            multimodal_chunks = {key: chunks[:generated] for key, chunks in multimodal_chunks.items()}
+            hidden_chunks, multimodal_chunks = self._fast_acoustic_static_chunks(graph_state, generated)
             if hidden_chunks:
-                valid_hidden_states = torch.cat(hidden_chunks, dim=0)
+                valid_hidden_states = hidden_chunks[0]
             else:
                 valid_hidden_states = torch.empty((0, self.hidden_size), device=self.device, dtype=self.dtype)
             valid_multimodal_outputs = {
-                key: torch.cat(chunks, dim=0)
+                key: chunks[0]
                 for key, chunks in multimodal_chunks.items()
                 if chunks
             }
@@ -1035,17 +1227,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def capture_acoustic_graph(self, body) -> AcousticGraphState | None:
         """Warm up and capture the prepared fixed-K acoustic body on CUDA."""
         graph_state = getattr(self, "_fast_acoustic_graph_state", None)
-        if graph_state is None or self.device.type != "cuda":
+        if graph_state is None:
             return None
+        if self.device.type != "cuda":
+            body()
+            return graph_state
         warmup_stream = torch.cuda.Stream(device=self.device)
         warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(warmup_stream), torch.inference_mode():
             body()
         torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
+        self._reset_fast_acoustic_graph_runtime_state(graph_state)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph), torch.inference_mode():
             body()
         graph_state.graph = graph
+        graph_state.graph_max_steps = graph_state.max_steps
+        graph_state.graph_out_stream = torch.cuda.current_stream(self.device)
         return graph_state
 
     def replay_acoustic_graph(self) -> AcousticGraphState | None:
