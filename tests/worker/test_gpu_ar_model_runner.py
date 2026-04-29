@@ -259,7 +259,7 @@ def test_fast_acoustic_scratch_slot_asserts_against_live_request_slots():
 
     with pytest.raises(AssertionError, match="scratch slot overlaps live request slots"):
         runner._select_fast_acoustic_scratch_slot(
-            {0: torch.tensor([7, 8, 9], dtype=torch.int64)},
+            {0: torch.tensor([4, 5, 6], dtype=torch.int64)},
             max_steps=3,
         )
 
@@ -341,6 +341,8 @@ def test_graph_ready_fast_acoustic_captures_then_replays_same_shape(monkeypatch)
         compilation_config=SimpleNamespace(
             static_forward_context=None,
             fast_moe_cold_start=False,
+            cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+            cudagraph_runtime_mode=ar_runner.CUDAGraphMode.NONE,
         ),
     )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
@@ -375,7 +377,7 @@ def test_graph_ready_fast_acoustic_captures_then_replays_same_shape(monkeypatch)
     )
     runner._prepare_inputs = lambda sub_output, num_scheduled_tokens_np: (torch.tensor([0]), None)
     runner._determine_batch_execution_and_padding = lambda **kwargs: (
-        None,
+        ar_runner.CUDAGraphMode.NONE,
         SimpleNamespace(num_tokens=1, num_reqs=1),
         False,
         1,
@@ -563,6 +565,8 @@ def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch)
         compilation_config=SimpleNamespace(
             static_forward_context=None,
             fast_moe_cold_start=False,
+            cudagraph_mode=ar_runner.CUDAGraphMode.NONE,
+            cudagraph_runtime_mode=ar_runner.CUDAGraphMode.NONE,
         ),
     )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
@@ -613,7 +617,7 @@ def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch)
 
     def determine(**kwargs):
         counts["determine"] += 1
-        return None, SimpleNamespace(num_tokens=1, num_reqs=1), False, 1, None
+        return ar_runner.CUDAGraphMode.NONE, SimpleNamespace(num_tokens=1, num_reqs=1), False, 1, None
 
     runner._determine_batch_execution_and_padding = determine
 
