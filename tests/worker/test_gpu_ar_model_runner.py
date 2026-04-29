@@ -36,6 +36,8 @@ class _SamplingParams:
         self.allowed_token_ids = None
         self.structured_outputs = None
         self.guided_decoding = None
+        self.bad_words = None
+        self.logit_bias = None
         self.extra_args = None
         for key, value in overrides.items():
             setattr(self, key, value)
@@ -154,6 +156,8 @@ def test_acoustic_inner_loop_fast_path_rejects_spec_encoder_and_ubatching():
         {"min_tokens": 1},
         {"structured_outputs": object()},
         {"guided_decoding": object()},
+        {"bad_words": ["x"]},
+        {"logit_bias": {1: 1.0}},
         {"extra_args": {"bad_words": ["x"]}},
         {"unknown_constraint": object()},
     ],
@@ -182,7 +186,7 @@ def test_fast_acoustic_loop_has_single_hidden_append_and_no_per_step_cpu_item():
     assert ".item()" not in source
 
 
-def test_fast_acoustic_loop_hoists_shape_stable_prep_and_keeps_dynamic_prep_per_step(monkeypatch):
+def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch):
     runner = _make_runner()
     scheduler_output = _SchedulerOutput()
     scheduler_output.total_num_scheduled_tokens = 3
@@ -198,6 +202,15 @@ def test_fast_acoustic_loop_hoists_shape_stable_prep_and_keeps_dynamic_prep_per_
     runner.input_ids = SimpleNamespace(gpu=torch.empty(1, dtype=torch.int64))
     runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
     runner.attn_groups = []
+    runner.query_start_loc = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        copy_to_gpu=lambda: None,
+    )
+    runner.seq_lens = SimpleNamespace(
+        np=torch.zeros(4, dtype=torch.int32).numpy(),
+        gpu=torch.zeros(4, dtype=torch.int32),
+        copy_to_gpu=lambda: None,
+    )
 
     counts = {
         "determine": 0,
@@ -280,8 +293,8 @@ def test_fast_acoustic_loop_hoists_shape_stable_prep_and_keeps_dynamic_prep_per_
     assert output.sampled_token_ids == [[1, 1, 1]]
     assert counts["determine"] == 1
     assert counts["ubatch"] == 1
-    assert counts["prepare_inputs"] == 3
-    assert counts["slot_mappings"] == 3
-    assert counts["attention_metadata"] == 3
-    assert counts["preprocess"] == 3
-    assert counts["prepare_runner_inputs"] == 3
+    assert counts["prepare_inputs"] == 1
+    assert counts["slot_mappings"] == 1
+    assert counts["attention_metadata"] == 1
+    assert counts["preprocess"] == 1
+    assert counts["prepare_runner_inputs"] == 1

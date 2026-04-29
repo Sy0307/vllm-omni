@@ -546,10 +546,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         req_id = self.input_batch.req_ids[0]
         max_steps = scheduler_output.num_scheduled_tokens[req_id]
         start_num_computed = int(self.input_batch.num_computed_tokens_cpu[0])
-        sampled_token_ids: list[int] = []
         hidden_chunks: list[torch.Tensor] = []
         multimodal_chunks: dict[str, list[torch.Tensor]] = {}
-        num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
+        full_num_scheduled_tokens_np = np.array([max_steps], dtype=np.int32)
+        one_token_num_scheduled_tokens_np = np.ones(1, dtype=np.int32)
         sub_output = self._make_single_token_scheduler_output(scheduler_output, req_id)
         has_separate_kv_update = self._has_separate_kv_cache_update()
         self._ensure_fast_acoustic_token_buffer(max_steps)
@@ -563,7 +563,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         ) = self._determine_batch_execution_and_padding(
             num_tokens=1,
             num_reqs=1,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            num_scheduled_tokens_np=one_token_num_scheduled_tokens_np,
             max_num_scheduled_tokens=1,
             use_cascade_attn=False,
             num_encoder_reqs=0,
@@ -572,63 +572,85 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else 1
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
-            num_scheduled_tokens_np,
+            one_token_num_scheduled_tokens_np,
             num_tokens_padded,
             num_reqs_padded,
             self.parallel_config.num_ubatches,
         )
         pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+        self.input_batch.num_computed_tokens_cpu[0] = start_num_computed
+        self.input_batch.num_computed_tokens_cpu_tensor[0] = start_num_computed
+        prepared_logits_indices, spec_decode_metadata = self._prepare_inputs(
+            scheduler_output,
+            full_num_scheduled_tokens_np,
+        )
+        assert spec_decode_metadata is None
+        logits_indices = prepared_logits_indices[:1].clone()
+        logits_indices.fill_(0)
+        precomputed_slot_mappings_by_group = self._clone_fast_acoustic_slot_mappings(max_steps)
+
+        self._set_fast_acoustic_single_token_query_metadata(
+            seq_len=start_num_computed + max_steps,
+        )
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=(num_tokens_padded if pad_attn or has_separate_kv_update else 1),
+            num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else 1),
+            num_tokens_unpadded=1,
+            ubatch_slices=ubatch_slices_padded,
+        )
+        self._set_fast_acoustic_slot_mapping_step(
+            slot_mappings_by_group,
+            precomputed_slot_mappings_by_group,
+            0,
+        )
+        attn_metadata, _ = self._build_attention_metadata(
+            num_tokens=1,
+            num_tokens_padded=num_tokens_padded if pad_attn else None,
+            num_reqs=1,
+            num_reqs_padded=num_reqs_padded if pad_attn else None,
+            max_query_len=1,
+            ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=False,
+            num_scheduled_tokens=sub_output.num_scheduled_tokens,
+            cascade_attn_prefix_lens=None,
+            slot_mappings=slot_mappings_by_group,
+        )
+        (
+            input_ids,
+            inputs_embeds,
+            positions,
+            intermediate_tensors,
+            model_kwargs,
+            _,
+        ) = self._preprocess(sub_output, num_tokens_padded, intermediate_tensors)
+        first_input_id = input_ids[:1].clone()
+        if hasattr(self.model, "prepare_runner_inputs"):
+            input_ids, positions = self.model.prepare_runner_inputs(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                req_ids=[req_id],
+                num_computed_tokens=[start_num_computed],
+                num_scheduled_tokens=[1],
+                input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
+            )
+
         with self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
             for inner_idx in range(max_steps):
                 current_pos = start_num_computed + inner_idx
-                self.input_batch.num_computed_tokens_cpu[0] = current_pos
-                self.input_batch.num_computed_tokens_cpu_tensor[0] = current_pos
-                logits_indices, sub_spec_decode_metadata = self._prepare_inputs(
-                    sub_output,
-                    num_scheduled_tokens_np,
+                self._set_fast_acoustic_decode_step_state(
+                    positions=positions,
+                    slot_mappings_by_group=slot_mappings_by_group,
+                    precomputed_slot_mappings_by_group=precomputed_slot_mappings_by_group,
+                    step=inner_idx,
+                    current_pos=current_pos,
                 )
-                assert sub_spec_decode_metadata is None
-
-                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                    num_tokens_padded=(num_tokens_padded if pad_attn or has_separate_kv_update else 1),
-                    num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else 1),
-                    num_tokens_unpadded=1,
-                    ubatch_slices=ubatch_slices_padded,
-                )
-                attn_metadata, _ = self._build_attention_metadata(
-                    num_tokens=1,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=1,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=1,
-                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
-                    logits_indices=logits_indices,
-                    use_spec_decode=False,
-                    num_scheduled_tokens=sub_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=None,
-                    slot_mappings=slot_mappings_by_group,
-                )
-                (
-                    input_ids,
-                    inputs_embeds,
-                    positions,
-                    intermediate_tensors,
-                    model_kwargs,
-                    _,
-                ) = self._preprocess(sub_output, num_tokens_padded, intermediate_tensors)
-                if inner_idx > 0:
+                if inner_idx == 0:
+                    input_ids[:1].copy_(first_input_id)
+                else:
                     input_ids[:1].copy_(self._fast_acoustic_sampled_token_ids[inner_idx - 1 : inner_idx])
-                if hasattr(self.model, "prepare_runner_inputs"):
-                    input_ids, positions = self.model.prepare_runner_inputs(
-                        input_ids=input_ids,
-                        positions=positions,
-                        inputs_embeds=inputs_embeds,
-                        req_ids=[req_id],
-                        num_computed_tokens=[int(self.input_batch.num_computed_tokens_cpu[0])],
-                        num_scheduled_tokens=[1],
-                        input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
-                    )
 
                 with (
                     set_forward_context(
@@ -668,8 +690,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 self._process_additional_information_updates(
                     hidden_states,
                     multimodal_outputs,
-                    num_scheduled_tokens_np,
+                    one_token_num_scheduled_tokens_np,
                     sub_output,
+                )
+                self._update_fast_qwen3_tts_nv_decode_preprocess_state(
+                    inputs_embeds,
+                    hidden_states,
                 )
 
         generated = len(hidden_chunks)
@@ -687,6 +713,79 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             {},
             cudagraph_stats,
         )
+
+    def _clone_fast_acoustic_slot_mappings(
+        self,
+        max_steps: int,
+    ) -> dict[int, torch.Tensor] | None:
+        if not (
+            hasattr(self, "kv_cache_config")
+            and self.kv_cache_config is not None
+            and len(self.kv_cache_config.kv_cache_groups) > 0
+        ):
+            return None
+        return {
+            gid: self.input_batch.block_table[gid].slot_mapping.gpu[:max_steps].clone()
+            for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
+        }
+
+    def _set_fast_acoustic_single_token_query_metadata(self, seq_len: int) -> None:
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1] = 1
+        self.query_start_loc.np[2:].fill(1)
+        self.query_start_loc.copy_to_gpu()
+        self.seq_lens.np[:1] = seq_len
+        self.seq_lens.np[1:].fill(0)
+        self.seq_lens.copy_to_gpu()
+        self.seq_lens.gpu[0] = seq_len
+
+    def _set_fast_acoustic_slot_mapping_step(
+        self,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        precomputed_slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        step: int,
+    ) -> None:
+        if slot_mappings_by_group is None or precomputed_slot_mappings_by_group is None:
+            return
+        for gid, slot_mapping in slot_mappings_by_group.items():
+            precomputed = precomputed_slot_mappings_by_group[gid]
+            slot_mapping[:1].copy_(precomputed[step : step + 1])
+
+    def _set_fast_acoustic_decode_step_state(
+        self,
+        *,
+        positions: torch.Tensor,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        precomputed_slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        step: int,
+        current_pos: int,
+    ) -> None:
+        self.input_batch.num_computed_tokens_cpu[0] = current_pos
+        self.input_batch.num_computed_tokens_cpu_tensor[0] = current_pos
+        positions[:1] = current_pos
+        self.seq_lens.np[0] = current_pos + 1
+        self.seq_lens.gpu[0] = current_pos + 1
+        self._set_fast_acoustic_slot_mapping_step(
+            slot_mappings_by_group,
+            precomputed_slot_mappings_by_group,
+            step,
+        )
+
+    def _update_fast_qwen3_tts_nv_decode_preprocess_state(
+        self,
+        inputs_embeds: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        if inputs_embeds is not None:
+            inputs_embeds[:1].zero_()
+        prev_hidden_buffer = getattr(self.model, "_prev_hidden_buffer", None)
+        if isinstance(prev_hidden_buffer, torch.Tensor) and hidden_states.numel() > 0:
+            prev_hidden_buffer[:1].copy_(
+                hidden_states[-1:].to(
+                    device=prev_hidden_buffer.device,
+                    dtype=prev_hidden_buffer.dtype,
+                )
+            )
 
     def _run_generic_acoustic_inner_loop(
         self,
