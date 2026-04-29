@@ -75,7 +75,7 @@ def _make_runner():
     runner.input_batch = _InputBatch()
     runner.requests = {"rid": SimpleNamespace(sampling_params=_SamplingParams())}
     runner.speculative_config = None
-    runner.parallel_config = SimpleNamespace(use_ubatching=False, num_ubatches=1)
+    runner.parallel_config = SimpleNamespace(use_ubatching=False, num_ubatches=1, data_parallel_size=1)
     runner.model = _Qwen3TTSNVModel()
     return runner
 
