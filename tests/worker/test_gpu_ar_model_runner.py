@@ -216,7 +216,7 @@ def test_fast_acoustic_graph_state_masks_post_stop_slots_to_scratch(generated):
 
     scratch_slot = int(state.scratch_slot[0])
     assert state.slot_mapping_buffers[0].tolist() == [
-        101 if idx < generated else scratch_slot for idx in range(4)
+        101 + idx if idx < generated else scratch_slot for idx in range(4)
     ]
 
 
@@ -288,6 +288,7 @@ def test_graph_ready_fast_acoustic_mask_tracks_early_stop_without_break(monkeypa
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="multi"),
         parallel_config=runner.parallel_config,
+        compilation_config=SimpleNamespace(fast_moe_cold_start=False),
     )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
     runner.supports_mm_inputs = False
@@ -461,6 +462,7 @@ def test_fast_acoustic_loop_hoists_generic_prep_out_of_substep_loop(monkeypatch)
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type="multi"),
         parallel_config=runner.parallel_config,
+        compilation_config=SimpleNamespace(fast_moe_cold_start=False),
     )
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=2))
     runner.supports_mm_inputs = False
