@@ -26,6 +26,14 @@ Usage:
         --num-requests 100 \\
         --concurrency 1 4 8
 
+    # Base checkpoint voice-clone benchmark
+    python benchmark_qwen3_tts_talker.py \\
+        --model /path/to/Qwen3-TTS-12Hz-1.7B-Base \\
+        --task-type Base \\
+        --ref-audio /path/to/ref.wav \\
+        --ref-text "Reference audio transcript" \\
+        --num-requests 50
+
     # With torch profiler on the final run
     python benchmark_qwen3_tts_talker.py \\
         --model /path/to/checkpoint \\
@@ -97,12 +105,17 @@ def _build_talker_only_stage_config(
     max_num_batched_tokens: int = 512,
     enforce_eager: bool = False,
     max_new_tokens: int = 2048,
+    task_type: str = "CustomVoice",
 ) -> dict:
-    """Build a single-stage YAML dict containing only the NV AR talker."""
+    """Build a single-stage YAML dict containing only the AR talker."""
+    model_arch = "Qwen3TTSTalkerForConditionalGenerationNv"
+    if task_type == "Base":
+        model_arch = "Qwen3TTSTalkerForConditionalGeneration"
+
     engine_args: dict[str, Any] = {
         "model_stage": "qwen3_tts",
         "max_num_seqs": max_num_seqs,
-        "model_arch": "Qwen3TTSTalkerForConditionalGenerationNv",
+        "model_arch": model_arch,
         "worker_type": "ar",
         "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
         "enforce_eager": enforce_eager,
@@ -172,10 +185,13 @@ def _estimate_prompt_len(
     model_name: str,
     _cache: dict[str, Any] = {},
 ) -> int:
-    """Estimate prompt_token_ids placeholder length for the NV talker."""
+    """Estimate prompt_token_ids placeholder length for the talker."""
     try:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
+        )
+        from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+            Qwen3TTSTalkerForConditionalGeneration,
         )
         from vllm_omni.model_executor.models.qwen3_tts_nv.qwen3_tts_talker_nv import (
             Qwen3TTSTalkerForConditionalGenerationNv,
@@ -194,11 +210,36 @@ def _estimate_prompt_len(
 
         tok, tcfg = _cache[model_name]
         task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+        tokenize_prompt = lambda t: tok(t, padding=False)["input_ids"]
+
+        if task_type == "Base":
+            def _estimate_ref_code_len(ref_audio: object) -> int | None:
+                audio_path = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
+                if not isinstance(audio_path, str) or not audio_path.strip():
+                    return None
+                try:
+                    from vllm.multimodal.media import MediaConnector
+
+                    connector = MediaConnector(allowed_local_media_path="/")
+                    audio, sr = connector.fetch_audio(audio_path)
+                    codec_hz = getattr(tcfg, "codec_frame_rate", None) or 12
+                    return int(len(audio) / sr * codec_hz)
+                except Exception:
+                    return None
+
+            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+                additional_information=additional_information,
+                task_type=task_type,
+                tokenize_prompt=tokenize_prompt,
+                codec_language_id=getattr(tcfg, "codec_language_id", None),
+                spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+                estimate_ref_code_len=_estimate_ref_code_len,
+            )
 
         return Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
             additional_information=additional_information,
             task_type=task_type,
-            tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
+            tokenize_prompt=tokenize_prompt,
             codec_language_id=getattr(tcfg, "codec_language_id", None),
             spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
         )
@@ -212,14 +253,30 @@ def build_input(
     speaker: str,
     language: str,
     model_name: str,
+    task_type: str = "CustomVoice",
+    ref_audio: str | None = None,
+    ref_text: str | None = None,
+    x_vector_only_mode: bool = False,
 ) -> dict:
-    """Build an engine input dict from text + speaker + language."""
-    additional_information = {
-        "task_type": ["CustomVoice"],
-        "text": [text],
-        "language": [language],
-        "speaker": [speaker],
-    }
+    """Build an engine input dict from benchmark CLI fields."""
+    if task_type == "Base":
+        if not ref_audio or not ref_text:
+            raise ValueError("--task-type Base requires --ref-audio and --ref-text")
+        additional_information = {
+            "task_type": ["Base"],
+            "text": [text],
+            "language": [language],
+            "ref_audio": [ref_audio],
+            "ref_text": [ref_text],
+            "x_vector_only_mode": [x_vector_only_mode],
+        }
+    else:
+        additional_information = {
+            "task_type": ["CustomVoice"],
+            "text": [text],
+            "language": [language],
+            "speaker": [speaker],
+        }
     ph_len = _estimate_prompt_len(additional_information, model_name)
     return {
         "prompt_token_ids": [0] * ph_len,
@@ -333,6 +390,10 @@ async def worker(
     model_name: str,
     speaker: str,
     language: str,
+    task_type: str,
+    ref_audio: str | None,
+    ref_text: str | None,
+    x_vector_only_mode: bool,
     results: list[RequestResult],
     counter: dict,
     lock: asyncio.Lock,
@@ -354,6 +415,10 @@ async def worker(
             speaker=speaker,
             language=language,
             model_name=model_name,
+            task_type=task_type,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            x_vector_only_mode=x_vector_only_mode,
         )
 
         result = await run_one_request(omni, prompt, request_id)
@@ -538,6 +603,7 @@ async def main(args):
         max_num_batched_tokens=args.max_num_batched_tokens,
         enforce_eager=args.enforce_eager,
         max_new_tokens=args.max_new_tokens,
+        task_type=args.task_type,
     )
     tmp_config_path = _write_temp_stage_config(stage_cfg)
 
@@ -579,6 +645,10 @@ async def main(args):
                         model_name=model_name,
                         speaker=args.speaker,
                         language=args.language,
+                        task_type=args.task_type,
+                        ref_audio=args.ref_audio,
+                        ref_text=args.ref_text,
+                        x_vector_only_mode=args.x_vector_only_mode,
                         results=warmup_results,
                         counter=warmup_counter,
                         lock=warmup_lock,
@@ -618,6 +688,10 @@ async def main(args):
                         model_name=model_name,
                         speaker=args.speaker,
                         language=args.language,
+                        task_type=args.task_type,
+                        ref_audio=args.ref_audio,
+                        ref_text=args.ref_text,
+                        x_vector_only_mode=args.x_vector_only_mode,
                         results=bench_results,
                         counter=counter,
                         lock=lock,
@@ -672,8 +746,24 @@ def parse_args():
         help="Path to text file (one utterance per line, optionally "
              "tab-separated with text in 2nd column)",
     )
+    model.add_argument(
+        "--task-type", choices=["CustomVoice", "Base"], default="CustomVoice",
+        help="CustomVoice uses the NV talker and --speaker; Base uses the generic talker and requires --ref-audio/--ref-text",
+    )
     model.add_argument("--speaker", type=str, default="vivian")
     model.add_argument("--language", type=str, default="English")
+    model.add_argument(
+        "--ref-audio", type=str, default=None,
+        help="Reference audio path/URL for --task-type Base voice cloning",
+    )
+    model.add_argument(
+        "--ref-text", type=str, default=None,
+        help="Transcript of --ref-audio for --task-type Base voice cloning",
+    )
+    model.add_argument(
+        "--x-vector-only-mode", action="store_true",
+        help="Use Base x-vector-only voice cloning instead of in-context cloning",
+    )
     model.add_argument(
         "--max-new-tokens", type=int, default=2048,
         help="Max sampling tokens per request (passed via "

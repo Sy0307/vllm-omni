@@ -90,9 +90,19 @@ concurrency / `--num-workers` argument so the same load can be replayed
 across different batch sizes.
 
 ```bash
-# Talker-only (model) benchmark
+# Talker-only (model) benchmark with a CustomVoice checkpoint
 python3 benchmark_model.py \
     --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --text-file vctk_subset.txt \
+    --num-requests 100 \
+    --concurrency 1 4 8 32
+
+# Talker-only benchmark with a Base checkpoint
+python3 benchmark_model.py \
+    --model /path/to/Qwen3-TTS-12Hz-1.7B-Base \
+    --task-type Base \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Transcript of the reference audio" \
     --text-file vctk_subset.txt \
     --num-requests 100 \
     --concurrency 1 4 8 32
