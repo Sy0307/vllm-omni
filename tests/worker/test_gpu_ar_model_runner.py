@@ -182,7 +182,7 @@ def test_fast_acoustic_loop_has_single_hidden_append_and_no_per_step_cpu_item():
     assert ".item()" not in source
 
 
-def test_fast_acoustic_loop_hoists_shape_stable_prep(monkeypatch):
+def test_fast_acoustic_loop_hoists_shape_stable_prep_and_keeps_dynamic_prep_per_step(monkeypatch):
     runner = _make_runner()
     scheduler_output = _SchedulerOutput()
     scheduler_output.total_num_scheduled_tokens = 3
@@ -199,7 +199,15 @@ def test_fast_acoustic_loop_hoists_shape_stable_prep(monkeypatch):
     runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
     runner.attn_groups = []
 
-    counts = {"determine": 0, "ubatch": 0}
+    counts = {
+        "determine": 0,
+        "ubatch": 0,
+        "prepare_inputs": 0,
+        "slot_mappings": 0,
+        "attention_metadata": 0,
+        "preprocess": 0,
+        "prepare_runner_inputs": 0,
+    }
 
     class _KVContext:
         def __enter__(self):
@@ -212,7 +220,11 @@ def test_fast_acoustic_loop_hoists_shape_stable_prep(monkeypatch):
     runner._make_single_token_scheduler_output = lambda scheduler_output, req_id: SimpleNamespace(
         num_scheduled_tokens={req_id: 1}, total_num_scheduled_tokens=1, scheduled_spec_decode_tokens={}
     )
-    runner._prepare_inputs = lambda sub_output, num_scheduled_tokens_np: (torch.tensor([0]), None)
+    def prepare_inputs(sub_output, num_scheduled_tokens_np):
+        counts["prepare_inputs"] += 1
+        return torch.tensor([0]), None
+
+    runner._prepare_inputs = prepare_inputs
 
     def determine(**kwargs):
         counts["determine"] += 1
@@ -225,19 +237,39 @@ def test_fast_acoustic_loop_hoists_shape_stable_prep(monkeypatch):
         return None, None
 
     monkeypatch.setattr(ar_runner, "maybe_create_ubatch_slices", ubatch)
-    runner._get_slot_mappings = lambda **kwargs: ({}, None)
-    runner._build_attention_metadata = lambda **kwargs: (None, None)
-    runner._preprocess = lambda sub_output, num_tokens_padded, intermediate_tensors: (
-        torch.zeros(1, dtype=torch.int64),
-        None,
-        torch.zeros(1, dtype=torch.int64),
-        intermediate_tensors,
-        {},
-        None,
-    )
+    def get_slot_mappings(**kwargs):
+        counts["slot_mappings"] += 1
+        return {}, None
+
+    runner._get_slot_mappings = get_slot_mappings
+
+    def build_attention_metadata(**kwargs):
+        counts["attention_metadata"] += 1
+        return None, None
+
+    runner._build_attention_metadata = build_attention_metadata
+
+    def preprocess(sub_output, num_tokens_padded, intermediate_tensors):
+        counts["preprocess"] += 1
+        return (
+            torch.zeros(1, dtype=torch.int64),
+            None,
+            torch.zeros(1, dtype=torch.int64),
+            intermediate_tensors,
+            {},
+            None,
+        )
+
+    runner._preprocess = preprocess
     runner._model_forward = lambda **kwargs: torch.ones(1, 2)
     runner.extract_multimodal_outputs = lambda model_output: (model_output, {})
     runner.model.greedy_group0_tokens = lambda hidden: torch.tensor([1])
+
+    def prepare_runner_inputs(**kwargs):
+        counts["prepare_runner_inputs"] += 1
+        return kwargs["input_ids"], kwargs["positions"]
+
+    runner.model.prepare_runner_inputs = prepare_runner_inputs
     runner._ensure_fast_acoustic_token_buffer = lambda max_steps: setattr(
         runner, "_fast_acoustic_sampled_token_ids", torch.empty(max_steps, dtype=torch.int64)
     )
@@ -248,3 +280,8 @@ def test_fast_acoustic_loop_hoists_shape_stable_prep(monkeypatch):
     assert output.sampled_token_ids == [[1, 1, 1]]
     assert counts["determine"] == 1
     assert counts["ubatch"] == 1
+    assert counts["prepare_inputs"] == 3
+    assert counts["slot_mappings"] == 3
+    assert counts["attention_metadata"] == 3
+    assert counts["preprocess"] == 3
+    assert counts["prepare_runner_inputs"] == 3
