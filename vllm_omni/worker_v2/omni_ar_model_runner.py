@@ -50,6 +50,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         intermediate_tensors: Any | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
@@ -58,6 +59,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             intermediate_tensors,
             dummy_run=dummy_run,
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
         )
 
     # ------------------------------------------------------------------
@@ -140,7 +142,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            copy_event=self.output_copy_event,
             text_hidden=text_hidden if need_pooler else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
@@ -281,7 +282,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
-        copy_event: torch.cuda.Event,
+        copy_event: torch.cuda.Event | None = None,
         text_hidden: torch.Tensor | None = None,
         multimodal_outputs: dict | None = None,
         input_batch: Any | None = None,
@@ -289,7 +290,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        self.copy_event = copy_event
+        self.copy_event = copy_event if copy_event is not None else torch.cuda.Event()
 
         # Snapshot input_batch metadata needed for pooler_output slicing
         self._need_pooler = text_hidden is not None

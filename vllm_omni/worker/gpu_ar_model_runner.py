@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import inspect
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -79,6 +80,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self._bookkeeping_accepts_spec_decode_metadata = (
+            "spec_decode_metadata" in inspect.signature(self._bookkeeping_sync).parameters
+        )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -673,6 +677,32 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Prefix caching is disabled
         return hidden_states_cpu[start:end]
 
+    def _bookkeeping_sync_compat(
+        self,
+        scheduler_output,
+        sampler_output,
+        logits,
+        hidden_states,
+        total_num_scheduled_tokens,
+        spec_decode_metadata,
+    ):
+        if self._bookkeeping_accepts_spec_decode_metadata:
+            return self._bookkeeping_sync(
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                total_num_scheduled_tokens,
+                spec_decode_metadata,
+            )
+        return self._bookkeeping_sync(
+            scheduler_output,
+            sampler_output,
+            logits,
+            hidden_states,
+            total_num_scheduled_tokens,
+        )
+
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -805,7 +835,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
-            ) = self._bookkeeping_sync(
+            ) = self._bookkeeping_sync_compat(
                 scheduler_output,
                 sampler_output,
                 logits,

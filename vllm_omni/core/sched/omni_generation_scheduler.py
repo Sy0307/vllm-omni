@@ -23,6 +23,7 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.compat import make_filtered_call
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -35,6 +36,31 @@ logger = init_logger(__name__)
 VLLM_OMNI_USE_V2_RUNNER = bool(
     int(os.environ.get("VLLM_OMNI_USE_V2_MODEL_RUNNER", os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
 )
+
+_KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS = {
+    "num_cached_tokens",
+    "num_external_computed_tokens",
+}
+
+
+def _make_engine_core_output(**kwargs):
+    output, unknown = make_filtered_call(
+        EngineCoreOutput,
+        known_extra_fields=_KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS,
+        **kwargs,
+    )
+    if unknown:
+        logger.warning("Unknown fields passed to EngineCoreOutput: %s", sorted(unknown))
+    return output
+
+
+def _get_request_num_cached_tokens(request) -> int:
+    return max(getattr(request, "num_cached_tokens", 0), 0)
+
+
+def _set_request_num_cached_tokens_if_present(request, value: int) -> None:
+    if hasattr(request, "num_cached_tokens"):
+        request.num_cached_tokens = value
 
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -127,8 +153,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = num_computed_tokens
+            if getattr(request, "num_cached_tokens", 0) < 0:
+                _set_request_num_cached_tokens_if_present(request, num_computed_tokens)
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
@@ -158,8 +184,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting.pop_request()
                 continue
             # Count the number of prefix cached tokens.
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = request.num_computed_tokens
+            if getattr(request, "num_cached_tokens", 0) < 0:
+                _set_request_num_cached_tokens_if_present(request, request.num_computed_tokens)
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
@@ -201,8 +227,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
-            if request.num_cached_tokens < 0:
-                request.num_cached_tokens = 0
+            if getattr(request, "num_cached_tokens", 0) < 0:
+                _set_request_num_cached_tokens_if_present(request, 0)
             token_budget -= num_new_tokens
             scheduled_new_reqs.append(request)
 
@@ -515,12 +541,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
-                num_cached = request.num_cached_tokens
+                num_cached = _get_request_num_cached_tokens(request)
                 if num_cached < 0:
                     logger.warning("Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, req_id)
                     num_cached = 0
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    _make_engine_core_output(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
@@ -532,7 +558,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=num_cached,
-                        num_external_computed_tokens=request.num_external_computed_tokens,
+                        num_external_computed_tokens=getattr(request, "num_external_computed_tokens", 0),
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
@@ -554,14 +580,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
-                num_cached = request.num_cached_tokens
+                num_cached = _get_request_num_cached_tokens(request)
                 if num_cached < 0:
                     logger.warning(
                         "Negative num_cached_tokens (%d) for request %s, clamping to 0", num_cached, request.request_id
                     )
                     num_cached = 0
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    _make_engine_core_output(
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
