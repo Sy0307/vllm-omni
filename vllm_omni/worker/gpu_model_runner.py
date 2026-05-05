@@ -1390,7 +1390,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         if decode_req_ids:
             first_req_id = decode_req_ids[0]
             first_sp = getattr(self.requests[first_req_id], "sampling_params", None)
-            seed = getattr(first_sp, "seed", None) if first_sp is not None else None
+            extra_args = getattr(first_sp, "extra_args", None) if first_sp is not None else None
+            seed = extra_args.get("qwen3_tts_request_seed") if isinstance(extra_args, dict) else None
             if len(decode_req_ids) > 1 and seed is not None:
                 other_seeds = {
                     getattr(getattr(self.requests[rid], "sampling_params", None), "seed", None)

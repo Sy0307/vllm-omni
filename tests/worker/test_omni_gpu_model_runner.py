@@ -210,13 +210,38 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
     assert torch.allclose(inputs_embeds, before)
 
 
-def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
+def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 
     monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.requests["r1"].sampling_params = SimpleNamespace(seed=42)
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((2, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
+
+    assert runner.talker_mtp.calls[0]["generator"] is None
+
+
+def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=42,
+        extra_args={"qwen3_tts_request_seed": 42},
+    )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
