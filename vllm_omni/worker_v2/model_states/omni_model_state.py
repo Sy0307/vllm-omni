@@ -44,6 +44,12 @@ def _default_mrope_positions(
     input_tokens: list[int],
     mm_features: list,
 ) -> tuple[torch.Tensor, int]:
+    """Return 3D sequential positions with zero delta.
+
+    For non-vision Omni models (e.g. TTS Talker), all 3 M-RoPE
+    dimensions use the same sequential positions. Delta=0 keeps decode
+    positions sequential, identical to the 1D case but broadcast to 3 dims.
+    """
     n = len(input_tokens)
     pos = torch.arange(n, dtype=torch.long)
     return pos.unsqueeze(0).expand(3, -1), 0

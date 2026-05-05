@@ -76,8 +76,22 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.supports_mm_inputs = False
             self.encoder_cache = None
 
+    # ------------------------------------------------------------------
+    # CUDA Graph: conditionally exclude FULL mode
+    # ------------------------------------------------------------------
+
     def capture_model(self) -> int:
-        """Exclude FULL graph when Omni needs Python post-forward hooks."""
+        """Handle CUDA graph capture for Omni models.
+
+        Exclude FULL mode for tuple-returning models because
+        ``run_fullgraph`` bypasses Python-level tuple intercept.
+
+        For PIECEWISE capture, the warmup pass runs with
+        ``CUDAGraphMode.NONE`` which hits ``torch.empty_like(hidden_states)``
+        in the cudagraph framework.  If the model returns a tuple, that call
+        crashes.  We temporarily wrap the model's forward to extract only the
+        tensor part during capture, then restore the original forward.
+        """
         if self._exclude_full_graph:
             mgr = self.cudagraph_manager
             if CUDAGraphMode.FULL in mgr._capture_descs:
@@ -238,7 +252,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_inputs["inputs_embeds"] = None
             assert intermediate_tensors is not None
 
-        # FULL graph reads the static inputs_embeds buffer filled here.
+        # ★ PRE-FORWARD: per-request preprocess + batched MTP.
+        # Runs for ALL graph modes (FULL, PIECEWISE, NONE).
+        # For FULL graph: OmniModelState provides a static inputs_embeds
+        # buffer that was captured by the graph.  Preprocess writes
+        # in-place to this buffer, and FULL graph replay reads the
+        # updated values from the same tensor address.
         if not dummy_run:
             self.model_state.run_preprocess(input_batch, model_inputs)
 
