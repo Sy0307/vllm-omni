@@ -619,6 +619,7 @@ class CodePredictorWrapper(nn.Module):
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
+        seed: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
         bsz = int(layer0_code.shape[0])
@@ -656,6 +657,17 @@ class CodePredictorWrapper(nn.Module):
 
         # Use captured device graph if available, otherwise call compiled fn.
         device_graph_entry = self._device_graphs.get(padded_bsz)
+
+        generator: torch.Generator | None = None
+
+        def _get_generator(sample_device: torch.device) -> torch.Generator | None:
+            nonlocal generator
+            if seed is None:
+                return None
+            if generator is None:
+                generator = torch.Generator(device=sample_device)
+                generator.manual_seed(int(seed))
+            return generator
 
         # Prepare sampling parameters
         stored_mode = self._wrapper_config.sampling_mode == "stored"
@@ -703,7 +715,7 @@ class CodePredictorWrapper(nn.Module):
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = torch.multinomial(probs, num_samples=1)
+                code = torch.multinomial(probs, num_samples=1, generator=_get_generator(probs.device))
             else:
                 # "per_call" mode: temperature-scaled + top-k
                 if use_sampling:
@@ -712,7 +724,7 @@ class CodePredictorWrapper(nn.Module):
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = torch.multinomial(probs, num_samples=1)
+                    code = torch.multinomial(probs, num_samples=1, generator=_get_generator(probs.device))
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 

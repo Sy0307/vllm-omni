@@ -1669,6 +1669,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         temperature: float | None = None,
         top_k: int | None = None,
         top_p: float | None = None,
+        seed: int | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
@@ -1706,6 +1707,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            seed=seed,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.

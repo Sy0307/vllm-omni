@@ -268,6 +268,61 @@ class TestCodePredictorDtypeAlignment:
         assert result.shape == (bsz, num_groups)
         assert result.dtype == torch.long
 
+    def test_forward_seed_controls_sampling(self, mocker: MockerFixture, loaded_target_classes) -> None:
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+        predictor._wrapper_config.use_cuda_graphs = False
+
+        bsz = 1
+        hidden = talker_config.hidden_size
+        torch.manual_seed(123)
+        layer0_code = torch.zeros(bsz, dtype=torch.long)
+        layer0_embed = torch.randn(bsz, hidden)
+        last_talker_hidden = torch.randn(bsz, hidden)
+
+        first = predictor(
+            layer0_code=layer0_code,
+            layer0_embed=layer0_embed,
+            last_talker_hidden=last_talker_hidden,
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            seed=1234,
+        )
+        second = predictor(
+            layer0_code=layer0_code,
+            layer0_embed=layer0_embed,
+            last_talker_hidden=last_talker_hidden,
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            seed=1234,
+        )
+        different = predictor(
+            layer0_code=layer0_code,
+            layer0_embed=layer0_embed,
+            last_talker_hidden=last_talker_hidden,
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            seed=4321,
+        )
+
+        assert torch.equal(first, second)
+        assert not torch.equal(first[:, 1:], different[:, 1:])
+
 
 class TestCodePredictorModelDtype:
     """Test the inner model forward with different dtypes."""
