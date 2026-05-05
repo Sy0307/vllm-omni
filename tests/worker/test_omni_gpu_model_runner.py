@@ -78,7 +78,7 @@ class CaptureTalkerMTP(torch.nn.Module):
         temperature=None,
         top_k=None,
         top_p=None,
-        seed=None,
+        generator=None,
     ):
         self.calls.append(
             {
@@ -86,7 +86,7 @@ class CaptureTalkerMTP(torch.nn.Module):
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,
-                "seed": seed,
+                "generator": generator,
             }
         )
         codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
@@ -244,9 +244,10 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
             "temperature": 0.2,
             "top_k": 9,
             "top_p": 0.55,
-            "seed": 42,
+            "generator": runner.talker_mtp.calls[0]["generator"],
         }
     ]
+    assert runner.talker_mtp.calls[0]["generator"] is not None
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):

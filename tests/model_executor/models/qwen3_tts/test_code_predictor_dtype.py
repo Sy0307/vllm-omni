@@ -268,7 +268,7 @@ class TestCodePredictorDtypeAlignment:
         assert result.shape == (bsz, num_groups)
         assert result.dtype == torch.long
 
-    def test_forward_seed_controls_sampling(self, mocker: MockerFixture, loaded_target_classes) -> None:
+    def test_forward_generator_controls_sampling(self, mocker: MockerFixture, loaded_target_classes) -> None:
         _, _, code_predictor_wrapper, _, _ = loaded_target_classes
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
@@ -289,6 +289,13 @@ class TestCodePredictorDtypeAlignment:
         layer0_embed = torch.randn(bsz, hidden)
         last_talker_hidden = torch.randn(bsz, hidden)
 
+        first_generator = torch.Generator(device=layer0_code.device)
+        first_generator.manual_seed(1234)
+        second_generator = torch.Generator(device=layer0_code.device)
+        second_generator.manual_seed(1234)
+        different_generator = torch.Generator(device=layer0_code.device)
+        different_generator.manual_seed(4321)
+
         first = predictor(
             layer0_code=layer0_code,
             layer0_embed=layer0_embed,
@@ -297,7 +304,7 @@ class TestCodePredictorDtypeAlignment:
             temperature=0.9,
             top_k=50,
             top_p=1.0,
-            seed=1234,
+            generator=first_generator,
         )
         second = predictor(
             layer0_code=layer0_code,
@@ -307,7 +314,7 @@ class TestCodePredictorDtypeAlignment:
             temperature=0.9,
             top_k=50,
             top_p=1.0,
-            seed=1234,
+            generator=second_generator,
         )
         different = predictor(
             layer0_code=layer0_code,
@@ -317,7 +324,7 @@ class TestCodePredictorDtypeAlignment:
             temperature=0.9,
             top_k=50,
             top_p=1.0,
-            seed=4321,
+            generator=different_generator,
         )
 
         assert torch.equal(first, second)
