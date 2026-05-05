@@ -84,6 +84,29 @@ class OmniModelState(DefaultModelState):
         encoder_cache: EncoderCache | None,
         device: torch.device,
     ) -> None:
+        # DefaultModelState.__init__ calls get_rope_state() which asserts
+        # isinstance(model, SupportsMRoPE).  Two categories of Omni models:
+        #
+        # 1. Models that implement SupportsMRoPE (e.g. Qwen3-Omni Thinker):
+        #    get_rope_state() succeeds normally, _safe_get_rope is a no-op.
+        #    These models get correct 3D M-RoPE positions from the runner.
+        #
+        # 2. Models that do NOT implement SupportsMRoPE (e.g. Qwen3-TTS
+        #    Talker, Code2Wav, FishSpeech): get_rope_state() would assert.
+        #    These models compute their own position encoding internally
+        #    (via model.forward kwargs or fixed 1D positions from
+        #    InputBatch.positions), so rope_state = None is correct —
+        #    DefaultModelState.prepare_inputs returns {} when rope_state
+        #    is None, and upstream execute_model falls back to
+        #    InputBatch.positions (1D sequential).
+        # Patch get_rope_state to handle Omni models that declare
+        # M-RoPE in config (mrope_section) but do not implement the
+        # SupportsMRoPE interface.  For these models we create a
+        # RopeState with 3D sequential positions (matching V1 MR).
+        #
+        # The patch is applied via a class-level lock to prevent
+        # concurrent OmniModelState instances (e.g. different stages
+        # in a thread pool) from overwriting each other's patch.
         from vllm.v1.worker.gpu.model_states import default as _default_mod
 
         with _rope_patch_lock:
