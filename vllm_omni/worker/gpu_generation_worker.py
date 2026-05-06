@@ -8,7 +8,7 @@ from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import CompilationTimes, init_worker_distributed_environment
+from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -22,7 +22,12 @@ logger = init_logger(__name__)
 VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
 
 
-def _make_compilation_times(language_model_time: float, **kwargs) -> CompilationTimes:
+def _make_compilation_times(language_model_time: float, **kwargs):
+    try:
+        from vllm.v1.worker.gpu_worker import CompilationTimes
+    except ImportError:
+        return language_model_time
+
     values = {"language_model": language_model_time, "encoder": 0.0, **kwargs}
     result, unknown = make_filtered_namedtuple(CompilationTimes, **values)
     if unknown:

@@ -124,30 +124,29 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_reqs: int,
         num_toks: int,
         uniform_tok_count: int,
-        is_profile: bool,
+        use_eager: bool,
     ):
-        if is_profile:
-            return (
-                BatchExecutionDescriptor(
-                    cg_mode=CUDAGraphMode.NONE,
-                    num_tokens=num_toks,
-                    num_reqs=num_reqs,
-                ),
-                None,
+        if use_eager:
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_toks,
+                num_reqs=num_reqs,
             )
+        else:
+            batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
         if self.dp_size > 1:
             from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
 
             return sync_cudagraph_and_dp_padding(
                 self.cudagraph_manager,
-                self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count),
+                batch_desc,
                 num_toks,
                 num_reqs,
                 uniform_tok_count,
                 self.dp_size,
                 self.dp_rank,
             )
-        return self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count), None
+        return batch_desc, None
 
     @torch.inference_mode()
     def execute_model(
@@ -171,23 +170,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        # Encoder-decoder models: disable compilation when encoder inputs
+        # are scheduled (dynamic cross-attention cache updates).
+        skip_compiled = self.is_encoder_decoder and bool(scheduler_output.scheduled_encoder_inputs)
         batch_desc, num_tokens_across_dp = self._dispatch_batch_descriptor(
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
-            is_profile=is_profile,
+            use_eager=is_profile or skip_compiled,
         )
-
-        # Encoder-decoder models: disable compilation when encoder inputs
-        # are scheduled (dynamic cross-attention cache updates).
-        skip_compiled = False
-        if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-            skip_compiled = True
-            batch_desc = BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.NONE,
-                num_tokens=num_toks,
-                num_reqs=num_reqs,
-            )
 
         if batch_desc.num_tokens == 0:
             return self.kv_connector.no_forward(scheduler_output)

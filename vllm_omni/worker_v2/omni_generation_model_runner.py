@@ -161,7 +161,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
-            is_profile=is_profile,
+            use_eager=is_profile,
         )
 
         if batch_desc.num_tokens == 0:
