@@ -8,6 +8,7 @@ buffer and lifecycle hooks.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -21,7 +22,7 @@ from vllm.v1.worker.gpu.model_runner import (
     get_uniform_token_count,
 )
 
-from vllm_omni.core.sched.output import OmniCachedRequestData
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_model_runner import (
@@ -84,14 +85,31 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             return
 
         updated = False
+        released_chunks: list[OmniNewRequestData] = []
 
-        for req_id in cached.req_ids:
+        for i, req_id in enumerate(cached.req_ids):
             new_ids = new_prompt_ids.get(req_id)
             if new_ids is None:
                 continue
 
             req_idx = self.req_states.req_id_to_index.get(req_id)
             if req_idx is None:
+                block_ids = cached.new_block_ids[i]
+                released_chunks.append(
+                    OmniNewRequestData(
+                        req_id=req_id,
+                        prompt_token_ids=new_ids,
+                        mm_features=[],
+                        sampling_params=None,
+                        pooling_params=None,
+                        block_ids=block_ids if block_ids is not None else tuple(),
+                        num_computed_tokens=0,
+                        lora_request=None,
+                        prompt_embeds=None,
+                        prefill_token_ids=new_ids,
+                        additional_information=cached.additional_information.get(req_id),
+                    )
+                )
                 continue
 
             self.model_state.intermediate_buffer.remove_request(req_idx)
@@ -108,8 +126,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
             updated = True
 
+        if released_chunks:
+            self.add_requests(SimpleNamespace(scheduled_new_reqs=released_chunks))
         if updated:
             self.req_states.apply_staged_writes()
+
+    def _release_generation_slots(self, input_batch: Any) -> None:
+        for i in range(input_batch.num_reqs):
+            req_id = input_batch.req_ids[i]
+            req_idx = int(input_batch.idx_mapping_np[i])
+            self.model_state.remove_request(req_idx)
+            self._remove_request(req_id)
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
@@ -300,6 +327,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # stays RUNNING until the orchestrator marks it done via
         # chunk_transfer_adapter.finished_requests.
         sampled_token_ids: list[list[int]] = [[] for _ in range(len(req_ids))]
+        self._release_generation_slots(input_batch)
 
         # model_output is guaranteed to be OmniOutput here — the
         # make_omni_output failure path sets _gen_model_output = None
