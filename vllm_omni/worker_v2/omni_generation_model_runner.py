@@ -132,6 +132,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.req_states.apply_staged_writes()
 
     def _release_generation_slots(self, input_batch: Any) -> None:
+        if not getattr(self.model_config, "async_chunk", False):
+            return
         model_state = getattr(self, "model_state", None)
         remove_request = getattr(self, "_remove_request", None)
         if model_state is None or remove_request is None:

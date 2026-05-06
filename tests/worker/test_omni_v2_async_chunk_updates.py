@@ -113,7 +113,7 @@ def test_async_chunk_update_readds_released_cached_request():
     assert added[0].additional_information == {"fresh": "value"}
 
 
-def test_generation_sample_releases_runner_slot_after_chunk_output():
+def _make_runner_for_sample(async_chunk):
     runner = object.__new__(OmniGenerationModelRunner)
     runner._gen_model_output = OmniOutput(
         text_hidden_states=torch.zeros(1, 1),
@@ -126,6 +126,7 @@ def test_generation_sample_releases_runner_slot_after_chunk_output():
     )
     runner._gen_kv_connector_output = None
     runner.execute_model_state = object()
+    runner.model_config = SimpleNamespace(async_chunk=async_chunk)
     runner.req_states = _ReqStates()
     runner.model_state = SimpleNamespace(
         intermediate_buffer=_IntermediateBuffer(),
@@ -133,6 +134,21 @@ def test_generation_sample_releases_runner_slot_after_chunk_output():
     )
     removed = []
     runner._remove_request = lambda req_id: removed.append(req_id) or True
+    return runner, removed
+
+
+def test_generation_sample_keeps_runner_slot_without_async_chunk():
+    runner, removed = _make_runner_for_sample(async_chunk=False)
+
+    output = runner.sample_tokens()
+
+    assert output.req_ids == ["r1"]
+    assert removed == []
+    assert runner.model_state.intermediate_buffer.buffers[0] == {"stale": "value", "req_id": "r1"}
+
+
+def test_generation_sample_releases_runner_slot_after_chunk_output():
+    runner, removed = _make_runner_for_sample(async_chunk=True)
 
     output = runner.sample_tokens()
 
@@ -144,4 +160,5 @@ def test_generation_sample_releases_runner_slot_after_chunk_output():
 if __name__ == "__main__":
     test_async_chunk_update_clears_stale_intermediate_buffer()
     test_async_chunk_update_readds_released_cached_request()
+    test_generation_sample_keeps_runner_slot_without_async_chunk()
     test_generation_sample_releases_runner_slot_after_chunk_output()
