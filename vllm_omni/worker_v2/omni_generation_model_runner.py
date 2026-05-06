@@ -132,11 +132,15 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.req_states.apply_staged_writes()
 
     def _release_generation_slots(self, input_batch: Any) -> None:
+        model_state = getattr(self, "model_state", None)
+        remove_request = getattr(self, "_remove_request", None)
+        if model_state is None or remove_request is None:
+            return
         for i in range(input_batch.num_reqs):
             req_id = input_batch.req_ids[i]
             req_idx = int(input_batch.idx_mapping_np[i])
-            self.model_state.remove_request(req_idx)
-            self._remove_request(req_id)
+            model_state.remove_request(req_idx)
+            remove_request(req_id)
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
