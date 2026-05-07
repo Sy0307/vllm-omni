@@ -8,6 +8,15 @@ TALKER_CODEC_START_TOKEN_ID = 8293
 TALKER_CODEC_END_TOKEN_ID = 8294
 
 
+def _get_output_token_ids(output: object) -> list[int]:
+    token_ids = getattr(output, "cumulative_token_ids", None)
+    if token_ids is None:
+        token_ids = getattr(output, "token_ids", None)
+    if token_ids is None:
+        raise AttributeError("Completion output has neither cumulative_token_ids nor token_ids")
+    return list(token_ids)
+
+
 def thinker2talker(
     stage_list,
     engine_input_source,
@@ -79,7 +88,7 @@ def talker2code2wav(
     code2wav_inputs = []
     for talker_output in talker_outputs:
         output = talker_output.outputs[0]
-        token_ids = list(output.cumulative_token_ids)
+        token_ids = _get_output_token_ids(output)
         if token_ids and token_ids[0] == TALKER_CODEC_START_TOKEN_ID:
             token_ids = token_ids[1:]
         if token_ids and token_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
