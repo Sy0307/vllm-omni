@@ -53,3 +53,21 @@ def test_bookkeeping_compat_does_not_reflect_per_call():
 
     source = inspect.getsource(GPUARModelRunner._bookkeeping_sync_compat)
     assert "inspect.signature" not in source
+
+
+def test_sample_tokens_passes_spec_decode_metadata_to_bookkeeping_compat():
+    import ast
+    import inspect
+
+    source = inspect.getsource(GPUARModelRunner.sample_tokens)
+    tree = ast.parse(source)
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_bookkeeping_sync_compat"
+    ]
+    assert len(calls) == 1
+    assert any(isinstance(arg, ast.Name) and arg.id == "spec_decode_metadata" for arg in calls[0].args)

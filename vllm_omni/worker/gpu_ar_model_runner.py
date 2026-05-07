@@ -721,7 +721,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         logits,
         hidden_states,
         total_num_scheduled_tokens,
-        spec_decode_metadata,
+        spec_decode_metadata=None,
     ):
         if self._bookkeeping_accepts_spec_decode_metadata:
             return self._bookkeeping_sync(
@@ -878,6 +878,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+                spec_decode_metadata,
             )
 
         if propose_drafts_after_bookkeeping:
