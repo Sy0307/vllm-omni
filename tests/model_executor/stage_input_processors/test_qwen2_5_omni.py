@@ -14,14 +14,14 @@ from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _stage_list_with_output(output):
-    return [SimpleNamespace(engine_outputs=[SimpleNamespace(outputs=[output])])]
+def _source_outputs(output):
+    return [SimpleNamespace(outputs=[output])]
 
 
 def test_talker2code2wav_accepts_completion_output_token_ids():
     output = SimpleNamespace(token_ids=[TALKER_CODEC_START_TOKEN_ID, 11, 22, TALKER_CODEC_END_TOKEN_ID])
 
-    prompts = talker2code2wav(_stage_list_with_output(output), [0])
+    prompts = talker2code2wav(_source_outputs(output))
 
     assert [prompt["prompt_token_ids"] for prompt in prompts] == [[11, 22]]
 
@@ -32,6 +32,6 @@ def test_talker2code2wav_prefers_cumulative_token_ids_when_present():
         cumulative_token_ids=[TALKER_CODEC_START_TOKEN_ID, 33, 44, TALKER_CODEC_END_TOKEN_ID],
     )
 
-    prompts = talker2code2wav(_stage_list_with_output(output), [0])
+    prompts = talker2code2wav(_source_outputs(output))
 
     assert [prompt["prompt_token_ids"] for prompt in prompts] == [[33, 44]]

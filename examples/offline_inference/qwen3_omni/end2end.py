@@ -295,7 +295,10 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni.from_cli_args(args, model=model_name)
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -387,6 +390,10 @@ def main(args):
         elif stage_outputs.final_output_type == "audio":
             request_id = output.request_id
             audio_tensor = output.outputs[0].multimodal_output["audio"]
+            if isinstance(audio_tensor, list):
+                audio_tensor = torch.cat(
+                    [(t if isinstance(t, torch.Tensor) else torch.tensor(t)).flatten() for t in audio_tensor]
+                )
             if not isinstance(audio_tensor, torch.Tensor):
                 print(f"Request ID: {request_id}, Skipping audio save: no tensor audio output")
             else:
