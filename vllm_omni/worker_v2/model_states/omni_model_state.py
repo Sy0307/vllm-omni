@@ -335,7 +335,8 @@ class OmniModelState(DefaultModelState):
             emb_slice = embeds[start : start + n_tok]
 
             try:
-                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **buf)
+                info = {key: value for key, value in buf.items() if isinstance(key, str)}
+                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
             except Exception:
                 logger.warning(
                     "preprocess failed for req_idx=%d (req_id=%s); skipping preprocess for this request",
@@ -413,11 +414,19 @@ class OmniModelState(DefaultModelState):
                 batch_step,
             )
 
-        audio_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
+        audio_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         for j, (i, start, _) in enumerate(mtp_batches):
             embeds[start : start + 1] = new_emb[j : j + 1]
             req_idx = int(input_batch.idx_mapping_np[i])
-            self.intermediate_buffer.update(req_idx, {audio_key: codes[j : j + 1]}, gpu_keys)
+            if isinstance(audio_key, tuple) and len(audio_key) == 2:
+                updates = {audio_key[0]: {audio_key[1]: codes[j : j + 1]}}
+            elif isinstance(audio_key, str):
+                updates = {audio_key: codes[j : j + 1]}
+            else:
+                raise TypeError(
+                    f"talker_mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
+                )
+            self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
     # ------------------------------------------------------------------
     # Post-forward: per-request postprocess
@@ -447,7 +456,8 @@ class OmniModelState(DefaultModelState):
             start = int(input_batch.query_start_loc_np[i])
             n_tok = int(input_batch.num_scheduled_tokens[i])
             h_slice = hidden_states[start : start + n_tok]
-            updates = self.model.postprocess(h_slice, **buf)
+            info = {key: value for key, value in buf.items() if isinstance(key, str) and key != "hidden_states"}
+            updates = self.model.postprocess(h_slice, **info)
             if updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 

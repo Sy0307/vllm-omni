@@ -47,6 +47,10 @@ def _make_execute_model_state(**kwargs):
     return state
 
 
+def _needs_capture_tensor_unwrap(model: Any) -> bool:
+    return bool(getattr(model, "_returns_tuple", False) or getattr(model, "model_stage", None) == "thinker")
+
+
 class OmniGPUModelRunner(GPUModelRunner):
     """Thin layer over v2 ``GPUModelRunner`` for Omni lifecycle hooks."""
 
@@ -69,7 +73,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             finally:
                 _mr_module.init_model_state = _orig
         self._last_aux_output = None
-        self._model_returns_tuple = getattr(self.model, "_returns_tuple", False)
+        self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
         self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
 
         # Preprocess models own embedding buffers; encoder_runner sizing would mismatch.
@@ -108,6 +112,8 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             def _capture_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
                 output = original_forward(*args, **kwargs)
+                if isinstance(output, OmniOutput):
+                    return output.text_hidden_states
                 if isinstance(output, tuple):
                     return output[0]
                 return output
