@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.worker_v2.forward_compat import add_forward_compat_kwargs
 from vllm_omni.worker_v2.omni_model_runner import (
     OmniGPUModelRunner,
     _make_execute_model_state,
@@ -229,6 +230,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             "intermediate_tensors": intermediate_tensors,
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        add_forward_compat_kwargs(model_inputs, input_batch, self.sampler)
 
         batch_descriptor = BatchDescriptor(
             num_tokens=input_batch.num_tokens_after_padding,

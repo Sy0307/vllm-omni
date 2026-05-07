@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu.model_runner import (
 
 from vllm_omni.compat import make_filtered_namedtuple
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker_v2.forward_compat import add_forward_compat_kwargs
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
@@ -238,6 +239,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             "intermediate_tensors": intermediate_tensors,
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        add_forward_compat_kwargs(model_inputs, input_batch, self.sampler)
         if not self.is_first_pp_rank:
             model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
