@@ -59,8 +59,10 @@ def test_build_thinker_to_talker_latent_masks_multimodal_token_embeddings():
     )
 
 
-def test_build_talker_decode_reply_cache_uses_remaining_thinker_states_only():
+def test_build_talker_decode_reply_cache_appends_text_eos_pad():
     model = object.__new__(Qwen2_5OmniForConditionalGeneration)
+    model.embed_text_eos_token = torch.tensor([[100.0, 101.0]])
+    model.embed_text_pad_token = torch.tensor([[200.0, 201.0]])
     thinker_result = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
 
     reply = model._build_talker_decode_reply_cache(
@@ -75,6 +77,8 @@ def test_build_talker_decode_reply_cache_uses_remaining_thinker_states_only():
             [
                 [2.0, 2.0],
                 [3.0, 3.0],
+                [100.0, 101.0],
+                [200.0, 201.0],
             ]
         ),
     )

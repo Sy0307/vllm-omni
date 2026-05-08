@@ -725,8 +725,16 @@ class Qwen2_5OmniForConditionalGeneration(
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """Match origin Qwen2.5 bridge: consume the remaining thinker states."""
-        return thinker_result[1:].to(dtype=dtype, device=device)
+        """Match HF thinker_reply_part: remaining text states plus EOS/PAD."""
+        reply = thinker_result[1:].to(dtype=dtype, device=device)
+        terminal = torch.cat(
+            [
+                self.embed_text_eos_token.to(dtype=dtype, device=device),
+                self.embed_text_pad_token.to(dtype=dtype, device=device),
+            ],
+            dim=0,
+        )
+        return torch.cat([reply, terminal], dim=0)
 
     def talker_preprocess(
         self,
