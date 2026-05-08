@@ -78,7 +78,7 @@ def talker2code2wav(
         token_ids = _get_output_token_ids(output)
         if token_ids and token_ids[0] == TALKER_CODEC_START_TOKEN_ID:
             token_ids = token_ids[1:]
-        if token_ids and token_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
+        if token_ids and token_ids[-1] in (TALKER_CODEC_PAD_TOKEN_ID, TALKER_CODEC_END_TOKEN_ID):
             token_ids = token_ids[:-1]
         if not token_ids:
             continue

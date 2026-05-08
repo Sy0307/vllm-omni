@@ -7,6 +7,7 @@ import pytest
 
 from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
     TALKER_CODEC_END_TOKEN_ID,
+    TALKER_CODEC_PAD_TOKEN_ID,
     TALKER_CODEC_START_TOKEN_ID,
     talker2code2wav,
 )
@@ -35,3 +36,11 @@ def test_talker2code2wav_prefers_cumulative_token_ids_when_present():
     prompts = talker2code2wav(_source_outputs(output))
 
     assert [prompt["prompt_token_ids"] for prompt in prompts] == [[33, 44]]
+
+
+def test_talker2code2wav_strips_terminal_codec_pad():
+    output = SimpleNamespace(cumulative_token_ids=[TALKER_CODEC_START_TOKEN_ID, 55, 66, TALKER_CODEC_PAD_TOKEN_ID])
+
+    prompts = talker2code2wav(_source_outputs(output))
+
+    assert [prompt["prompt_token_ids"] for prompt in prompts] == [[55, 66]]

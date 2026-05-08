@@ -1005,7 +1005,7 @@ class TestQwen2_5OmniPipeline:
 
         s = _PIPELINE_REGISTRY["qwen2_5_omni"].get_stage(1)
         assert s.input_sources == (0,)
-        assert s.sampling_constraints["stop_token_ids"] == [8294]
+        assert s.sampling_constraints["stop_token_ids"] == [8292, 8294]
         assert s.custom_process_input_func is not None
 
     def test_code2wav(self):
