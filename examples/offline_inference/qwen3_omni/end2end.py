@@ -11,7 +11,6 @@ from typing import NamedTuple
 
 import numpy as np
 import soundfile as sf
-import torch
 import vllm
 from PIL import Image
 from vllm import SamplingParams
@@ -22,6 +21,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -242,7 +242,7 @@ def get_use_audio_in_video_query() -> QueryResult:
             "prompt": prompt,
             "multi_modal_data": {
                 "video": asset.np_ndarrays,
-                "audio": (audio, 16000),
+                "audio": audio,
             },
             "mm_processor_kwargs": {
                 "use_audio_in_video": True,
@@ -329,7 +329,6 @@ def main(args):
         seed=SEED,
         detokenize=True,
         repetition_penalty=1.1,
-        stop_token_ids=[0],
     )
 
     all_sampling_params = [
@@ -390,19 +389,25 @@ def main(args):
         elif stage_outputs.final_output_type == "audio":
             request_id = output.request_id
             audio_tensor = output.outputs[0].multimodal_output["audio"]
+            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+
+            # Convert to numpy array and ensure correct format
+            # In async_chunk mode, audio may arrive as a list of chunks
             if isinstance(audio_tensor, list):
+                import torch
+
                 audio_tensor = torch.cat(
                     [(t if isinstance(t, torch.Tensor) else torch.tensor(t)).flatten() for t in audio_tensor]
                 )
-            if not isinstance(audio_tensor, torch.Tensor):
-                print(f"Request ID: {request_id}, Skipping audio save: no tensor audio output")
-            else:
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-                audio_numpy = audio_tensor.float().detach().cpu().numpy()
-                if audio_numpy.ndim > 1:
-                    audio_numpy = audio_numpy.flatten()
-                sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+            audio_numpy = audio_tensor.float().detach().cpu().numpy()
+
+            # Ensure audio is 1D (flatten if needed)
+            if audio_numpy.ndim > 1:
+                audio_numpy = audio_numpy.flatten()
+
+            # Save audio file with explicit WAV format
+            sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
+            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
         processed_count += 1
         if profiler_enabled and processed_count >= total_requests:
@@ -461,12 +466,6 @@ def parse_args():
         type=int,
         default=65536,
         help="Threshold for using shared memory in bytes (default: 65536)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Output directory for generated audio files.",
     )
     parser.add_argument(
         "--output-wav",
@@ -562,6 +561,7 @@ def parse_args():
         help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
