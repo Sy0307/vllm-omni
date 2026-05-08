@@ -46,6 +46,17 @@ def test_reconstruct_raw_model_output_keeps_aux_tuple_without_multimodal_outputs
     assert raw == (hidden, aux)
 
 
+def test_reconstruct_raw_model_output_ignores_empty_multimodal_outputs():
+    hidden = torch.randn(3, 4)
+    raw = OmniARModelRunner._reconstruct_raw_model_output(
+        hidden_states=hidden,
+        multimodal_outputs={},
+        aux=None,
+    )
+
+    assert raw is hidden
+
+
 def test_build_pooler_output_basic():
     """Verify _build_pooler_output_from_cpu slices per-request hidden + mm."""
     hidden = torch.randn(6, 8)

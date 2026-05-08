@@ -181,7 +181,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         multimodal_outputs: dict[str, Any] | None,
         aux: Any | None,
     ) -> Any:
-        if multimodal_outputs is not None:
+        if multimodal_outputs:
             return OmniOutput(
                 text_hidden_states=hidden_states,
                 multimodal_outputs=multimodal_outputs,

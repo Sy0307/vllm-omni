@@ -295,7 +295,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             self._last_multimodal_outputs = None
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
-                self._last_multimodal_outputs = model_output.multimodal_outputs or {}
+                if model_output.multimodal_outputs:
+                    self._last_multimodal_outputs = model_output.multimodal_outputs
             elif isinstance(model_output, tuple) and len(model_output) == 2:
                 hidden_states, self._last_aux_output = model_output
                 if hasattr(self.model, "_last_captured_layers"):
