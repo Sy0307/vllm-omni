@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     OmniARModelRunner,
@@ -188,6 +189,37 @@ def test_build_pooler_output_flattens_nested_payload_for_msgspec():
     assert "codes" not in pooler[0]
     assert pooler[0]["codes.audio"].shape == (2, 16)
     assert pooler[1]["codes.audio"].shape == (2, 16)
+
+
+def test_build_pooler_output_preserves_qwen3_nested_payload():
+    hidden = torch.randn(4, 4)
+    mm = {
+        "hidden_states": {
+            "layers": {
+                0: torch.randn(4, 4),
+                24: torch.randn(4, 4),
+            },
+        },
+        "embed": {
+            "tts_bos": [torch.randn(1, 1, 4)],
+            "tts_eos": [torch.randn(1, 1, 4)],
+            "tts_pad": [torch.randn(1, 1, 4)],
+        },
+    }
+
+    mm_cpu = _async_copy_mm(mm, total_tokens=4)
+    pooler = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden,
+        mm_cpu,
+        query_start_loc_np=np.array([0, 2]),
+        num_scheduled_tokens=np.array([2, 2], dtype=np.int32),
+        num_reqs=2,
+    )
+
+    payload = unflatten_payload(pooler[0])
+    assert payload["hidden_states"]["layers"][0].shape == (2, 4)
+    assert payload["hidden_states"]["layers"][24].shape == (2, 4)
+    assert payload["embed"]["tts_bos"].shape == (1, 1, 4)
 
 
 def test_clamp_sampling_prompt_token_ids_to_logits_vocab():

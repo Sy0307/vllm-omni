@@ -206,17 +206,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
             end = start + int(num_scheduled_tokens[i])
             payload: dict[str, Any] = {"hidden": hidden_cpu[start:end]}
             for k, v in mm_cpu.items():
-                if isinstance(v, torch.Tensor) and v.shape[0] == total:
-                    payload[k] = v[start:end].contiguous()
-                elif isinstance(v, dict):
-                    payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
-                elif isinstance(v, list):
-                    elem = v[i] if i < len(v) else v[0]
-                    if isinstance(elem, torch.Tensor):
-                        elem = elem.clone()
-                    payload[k] = elem
-                else:
-                    payload[k] = v
+                payload[k] = _slice_pooler_value(
+                    v,
+                    req_index=i,
+                    start=start,
+                    end=end,
+                    total_tokens=total,
+                )
             pooler.append(flatten_payload(payload))
         return pooler
 
@@ -345,6 +341,16 @@ def _async_copy_tensor(x: torch.Tensor) -> torch.Tensor:
     return x.to("cpu", non_blocking=True)
 
 
+def _async_copy_mm_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _async_copy_tensor(value)
+    if isinstance(value, dict):
+        return {key: _async_copy_mm_value(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_async_copy_mm_value(val) for val in value]
+    return value
+
+
 def _async_copy_mm(mm_outputs: dict | None, total_tokens: int) -> dict[str, Any]:
     """Non-blocking D2H copy of multimodal output tensors."""
     if not mm_outputs:
@@ -352,20 +358,47 @@ def _async_copy_mm(mm_outputs: dict | None, total_tokens: int) -> dict[str, Any]
     cpu: dict[str, Any] = {}
     for k, v in mm_outputs.items():
         try:
-            if isinstance(v, torch.Tensor) and v.shape[0] == total_tokens:
-                cpu[k] = _async_copy_tensor(v)
-            elif isinstance(v, dict):
-                sub: dict[str, torch.Tensor] = {}
-                for sk, sv in v.items():
-                    if isinstance(sv, torch.Tensor) and sv.shape[0] == total_tokens:
-                        sub[str(sk)] = _async_copy_tensor(sv)
-                if sub:
-                    cpu[k] = sub
-            elif isinstance(v, list) and v:
-                cpu[k] = [(_async_copy_tensor(el) if isinstance(el, torch.Tensor) else el) for el in v]
+            cpu[k] = _async_copy_mm_value(v)
         except Exception:
             logger.exception("Error async-copying multimodal output %s", k)
     return cpu
+
+
+def _slice_pooler_value(
+    value: Any,
+    *,
+    req_index: int,
+    start: int,
+    end: int,
+    total_tokens: int,
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.dim() > 0 and value.shape[0] == total_tokens:
+            return value[start:end].contiguous()
+        return value.clone()
+    if isinstance(value, dict):
+        return {
+            key: _slice_pooler_value(
+                val,
+                req_index=req_index,
+                start=start,
+                end=end,
+                total_tokens=total_tokens,
+            )
+            for key, val in value.items()
+        }
+    if isinstance(value, list):
+        if not value:
+            return []
+        elem = value[req_index] if req_index < len(value) else value[0]
+        return _slice_pooler_value(
+            elem,
+            req_index=req_index,
+            start=start,
+            end=end,
+            total_tokens=total_tokens,
+        )
+    return value
 
 
 class OmniAsyncOutput(AsyncModelRunnerOutput):
