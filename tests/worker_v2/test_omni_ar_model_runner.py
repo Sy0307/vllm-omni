@@ -170,15 +170,40 @@ def test_clamp_sampling_prompt_token_ids_to_logits_vocab():
     assert prompt_token_ids.tolist() == [[3, 9, 9]]
 
 
-def test_resolve_logits_vocab_size_from_wrapped_talker_model():
+def test_sample_clamps_prompt_token_ids_from_actual_logits_vocab():
     runner = object.__new__(OmniARModelRunner)
-    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(vocab_size=152064))
-    runner.model = SimpleNamespace(
-        talker=SimpleNamespace(
-            get_language_model=lambda: SimpleNamespace(
-                config=SimpleNamespace(vocab_size=8449),
-            )
+
+    class Model:
+        def compute_logits(self, *_args, **_kwargs):
+            return torch.empty(1, 7)
+
+    runner.model = Model()
+    prompt_token_ids = torch.tensor([[3, 99, 152064]])
+    input_batch = SimpleNamespace(
+        vocab_size=152064,
+        sampling_metadata=SimpleNamespace(
+            no_penalties=False,
+            prompt_token_ids=prompt_token_ids,
         ),
     )
+    sample_seen_prompt_ids = []
 
-    assert runner._resolve_logits_vocab_size() == 8449
+    def sample(text_hidden, input_batch_arg, grammar_output):
+        assert grammar_output is None
+        runner.model.compute_logits(text_hidden)
+        sample_seen_prompt_ids.append(input_batch_arg.sampling_metadata.prompt_token_ids.clone())
+        return "sampler", "num_sampled", "num_rejected"
+
+    runner.sample = sample
+
+    result = runner._sample_with_prompt_token_compat(
+        torch.empty(1, 4),
+        input_batch,
+        None,
+    )
+
+    assert result == ("sampler", "num_sampled", "num_rejected")
+    assert prompt_token_ids.tolist() == [[3, 6, 6]]
+    assert sample_seen_prompt_ids[0].tolist() == [[3, 6, 6]]
+    assert runner.model.compute_logits.__func__ is Model.compute_logits
+    assert "compute_logits" not in runner.model.__dict__

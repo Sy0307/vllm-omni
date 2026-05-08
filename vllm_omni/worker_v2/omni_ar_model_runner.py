@@ -102,9 +102,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
 
         # --- Standard v2 sampling ---
-        logits_vocab_size = self._resolve_logits_vocab_size()
-        self._clamp_sampling_prompt_token_ids(input_batch, logits_vocab_size)
-        sampler_output, num_sampled, num_rejected = self.sample(text_hidden, input_batch, grammar_output)
+        sampler_output, num_sampled, num_rejected = self._sample_with_prompt_token_compat(
+            text_hidden,
+            input_batch,
+            grammar_output,
+        )
 
         if self.use_pp:
             from vllm.v1.worker.gpu.pp_utils import pp_broadcast
@@ -197,45 +199,46 @@ class OmniARModelRunner(OmniGPUModelRunner):
             pooler.append(flatten_payload(payload))
         return pooler
 
-    def _resolve_logits_vocab_size(self) -> int | None:
-        """Best-effort vocab size for sampler prompt-id compatibility."""
-        model = getattr(self, "model", None)
-        inner_model = getattr(model, "model", None)
-        talker_model = getattr(model, "talker", None)
-        candidates: list[Any] = [
-            getattr(inner_model, "config", None),
-            getattr(getattr(inner_model, "config", None), "text_config", None),
-            getattr(talker_model, "config", None),
-            getattr(getattr(talker_model, "config", None), "text_config", None),
-            getattr(model, "talker_config", None),
-            getattr(getattr(model, "talker_config", None), "text_config", None),
-            getattr(model, "config", None),
-            getattr(getattr(model, "config", None), "text_config", None),
-            getattr(model, "model_config", None),
-            getattr(getattr(self, "model_config", None), "hf_text_config", None),
-            getattr(getattr(self, "model_config", None), "hf_config", None),
-        ]
+    def _sample_with_prompt_token_compat(
+        self,
+        text_hidden: torch.Tensor,
+        input_batch: Any,
+        grammar_output: GrammarOutput | None,
+    ) -> tuple[Any, Any, Any]:
+        """Run upstream sampling while restoring V1 prompt-id compatibility.
 
-        language_model_candidates: list[Any] = []
-        for owner in (inner_model, talker_model, model):
-            language_model_getter = getattr(owner, "get_language_model", None)
-            if callable(language_model_getter):
+        Some Omni AR stages sample from a logits vocabulary smaller than the
+        tokenizer/input vocabulary.  V1 corrected ``prompt_token_ids`` after it
+        had the real logits tensor.  MR V2's upstream ``sample`` owns logits
+        computation, so wrap ``compute_logits`` for this call and clamp from the
+        actual logits shape instead of guessing from config.
+        """
+        compute_logits = getattr(self.model, "compute_logits", None)
+        if not callable(compute_logits):
+            return self.sample(text_hidden, input_batch, grammar_output)
+
+        def compute_logits_with_prompt_token_compat(*args: Any, **kwargs: Any) -> Any:
+            logits = compute_logits(*args, **kwargs)
+            logits_shape = getattr(logits, "shape", ()) if logits is not None else ()
+            logits_vocab_size = logits_shape[-1] if logits_shape else None
+            if isinstance(logits_vocab_size, int):
+                self._clamp_sampling_prompt_token_ids(input_batch, logits_vocab_size)
+            return logits
+
+        model_dict = getattr(self.model, "__dict__", {})
+        had_instance_compute_logits = isinstance(model_dict, dict) and "compute_logits" in model_dict
+        original_instance_compute_logits = model_dict.get("compute_logits") if had_instance_compute_logits else None
+        setattr(self.model, "compute_logits", compute_logits_with_prompt_token_compat)
+        try:
+            return self.sample(text_hidden, input_batch, grammar_output)
+        finally:
+            if had_instance_compute_logits:
+                setattr(self.model, "compute_logits", original_instance_compute_logits)
+            else:
                 try:
-                    language_model = language_model_getter()
-                    language_model_candidates.extend(
-                        [
-                            getattr(language_model, "config", None),
-                            getattr(getattr(language_model, "model", None), "config", None),
-                        ]
-                    )
-                except Exception:
-                    logger.debug("Unable to resolve language model vocab size", exc_info=True)
-
-        for candidate in language_model_candidates + candidates:
-            vocab_size = getattr(candidate, "vocab_size", None)
-            if isinstance(vocab_size, int) and vocab_size > 0:
-                return vocab_size
-        return None
+                    delattr(self.model, "compute_logits")
+                except AttributeError:
+                    setattr(self.model, "compute_logits", compute_logits)
 
     @staticmethod
     def _clamp_sampling_prompt_token_ids(
