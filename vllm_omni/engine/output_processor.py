@@ -64,8 +64,8 @@ class OmniRequestState(RequestState):
             if isinstance(payload, dict):
                 # Keep payload flat (dotted keys like "hidden_states.layer_0")
                 # during accumulation so that all values are tensors/scalars and
-                # the merge logic below works correctly.  Unflatten happens
-                # later in _consolidate_multimodal_tensors after concatenation.
+                # the merge logic below works correctly.  Unflatten only when
+                # attaching to the emitted CompletionOutput.
 
                 incoming: dict[str, Any] = {}
                 # TODO (Alex): Clean up and simplify key management
@@ -152,13 +152,6 @@ class OmniRequestState(RequestState):
                                 v[sk] = sv[-1]
         except Exception:
             logger.exception("Error consolidating multimodal tensors")
-
-        # Restore nested structure from flat dotted keys now that all tensor
-        # lists have been concatenated into single tensors.
-        try:
-            self.mm_accumulated = unflatten_payload(self.mm_accumulated)
-        except Exception:
-            logger.exception("Error unflattening consolidated multimodal tensors")
 
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
