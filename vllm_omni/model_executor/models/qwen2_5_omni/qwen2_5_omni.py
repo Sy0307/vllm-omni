@@ -298,12 +298,19 @@ class Qwen2_5OmniForConditionalGeneration(
             if isinstance(thinker_output, tuple):
                 embeds, text_hidden_states = thinker_output
             else:
+                embeds = thinker_inputs_embeds
                 text_hidden_states = thinker_output
 
             # Text-only path
+            text_hidden_states = text_hidden_states.reshape(-1, text_hidden_states.shape[-1])
+            latent_states = self._build_thinker_to_talker_latent(
+                text_hidden_states,
+                embeds,
+                thinker_input_ids,
+            )
             return OmniOutput(
-                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
-                multimodal_outputs=None,
+                text_hidden_states=text_hidden_states,
+                multimodal_outputs={"latent": latent_states},
             )
 
         # 2) Talker (if codec not provided)
@@ -676,6 +683,45 @@ class Qwen2_5OmniForConditionalGeneration(
             return talker_hf_config.tts_text_start_token_id
         return self.tts_text_spk_token_ids[voice_type]
 
+    def _build_thinker_to_talker_latent(
+        self,
+        text_hidden_states: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Build the hidden+token embedding latent consumed by Qwen2.5 talker."""
+        token_embeds = input_embeds
+        if token_embeds is None and input_ids is not None:
+            token_embeds = self.thinker.embed_input_ids(input_ids.reshape(-1))
+        if token_embeds is None:
+            return text_hidden_states
+
+        token_embeds = token_embeds.reshape(-1, token_embeds.shape[-1])
+        if token_embeds.shape != text_hidden_states.shape:
+            return text_hidden_states
+        return text_hidden_states + token_embeds.to(
+            dtype=text_hidden_states.dtype,
+            device=text_hidden_states.device,
+        )
+
+    def _build_talker_decode_reply_cache(
+        self,
+        thinker_result: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Match HF thinker_reply_part: remaining text states plus EOS/PAD."""
+        reply = thinker_result[1:].to(dtype=dtype, device=device)
+        terminal = torch.cat(
+            [
+                self.embed_text_eos_token.to(dtype=dtype, device=device),
+                self.embed_text_pad_token.to(dtype=dtype, device=device),
+            ],
+            dim=0,
+        )
+        return torch.cat([reply, terminal], dim=0)
+
     def talker_preprocess(
         self,
         input_ids: torch.Tensor,
@@ -746,7 +792,12 @@ class Qwen2_5OmniForConditionalGeneration(
         )
 
         if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
-            update_dict.setdefault("embed", {})["thinker_reply"] = thinker_result[1:].detach().to("cpu").contiguous()
+            thinker_reply = self._build_talker_decode_reply_cache(
+                thinker_result,
+                dtype=input_embeds.dtype,
+                device=self._module_device(self.model),
+            )
+            update_dict.setdefault("embed", {})["thinker_reply"] = thinker_reply.detach().to("cpu").contiguous()
 
         return req_input_ids, req_embeds, update_dict
 
