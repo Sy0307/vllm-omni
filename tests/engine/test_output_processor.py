@@ -152,6 +152,29 @@ def test_finish_consolidation_for_hs_delta():
     assert "foo" in s.mm_accumulated
 
 
+def test_cumulative_output_unflattens_without_mutating_accumulator():
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor({"codes.audio": torch.ones(1, 2)}, mm_type="latent")
+
+    result = s.make_request_output([1], None, None, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert torch.equal(
+        result.outputs[0].multimodal_output["codes"]["audio"],
+        torch.ones(1, 2),
+    )
+    assert "codes.audio" in s.mm_accumulated
+    assert "codes" not in s.mm_accumulated
+
+    s.add_multimodal_tensor({"codes.audio": torch.ones(1, 2) * 2}, mm_type="latent")
+    result = s.make_request_output([2], None, None, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    assert result.outputs[0].multimodal_output["codes"]["audio"].shape == (2, 2)
+    assert "codes.audio" in s.mm_accumulated
+    assert "codes" not in s.mm_accumulated
+
+
 def test_finish_consolidation_drains_mm_delta():
     """Ensure making the request output drains modality deltas (e.g., audio)."""
     s = _make_state(RequestOutputKind.DELTA)

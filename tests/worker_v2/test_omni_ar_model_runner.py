@@ -1,5 +1,7 @@
 """Unit tests for OmniARModelRunner v2."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -131,3 +133,52 @@ def test_slice_mm_payload_dict():
         num_reqs=2,
     )
     assert pooler[1]["nested"]["a"].shape == (3, 2)
+
+
+def test_build_pooler_output_flattens_nested_payload_for_msgspec():
+    hidden = torch.randn(4, 4)
+    mm_cpu = {"codes": {"audio": torch.randn(4, 16)}}
+
+    pooler = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden,
+        mm_cpu,
+        query_start_loc_np=np.array([0, 2]),
+        num_scheduled_tokens=np.array([2, 2], dtype=np.int32),
+        num_reqs=2,
+    )
+
+    assert "codes" not in pooler[0]
+    assert pooler[0]["codes.audio"].shape == (2, 16)
+    assert pooler[1]["codes.audio"].shape == (2, 16)
+
+
+def test_clamp_sampling_prompt_token_ids_to_logits_vocab():
+    prompt_token_ids = torch.tensor([[3, 99, 152064]])
+    input_batch = SimpleNamespace(
+        vocab_size=152064,
+        sampling_metadata=SimpleNamespace(
+            no_penalties=False,
+            prompt_token_ids=prompt_token_ids,
+        ),
+    )
+
+    OmniARModelRunner._clamp_sampling_prompt_token_ids(
+        input_batch,
+        logits_vocab_size=10,
+    )
+
+    assert prompt_token_ids.tolist() == [[3, 9, 9]]
+
+
+def test_resolve_logits_vocab_size_from_wrapped_talker_model():
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(vocab_size=152064))
+    runner.model = SimpleNamespace(
+        talker=SimpleNamespace(
+            get_language_model=lambda: SimpleNamespace(
+                config=SimpleNamespace(vocab_size=8449),
+            )
+        ),
+    )
+
+    assert runner._resolve_logits_vocab_size() == 8449

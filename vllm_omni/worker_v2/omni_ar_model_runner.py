@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
@@ -101,6 +102,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
         )
 
         # --- Standard v2 sampling ---
+        logits_vocab_size = self._resolve_logits_vocab_size()
+        self._clamp_sampling_prompt_token_ids(input_batch, logits_vocab_size)
         sampler_output, num_sampled, num_rejected = self.sample(text_hidden, input_batch, grammar_output)
 
         if self.use_pp:
@@ -191,8 +194,82 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     payload[k] = elem
                 else:
                     payload[k] = v
-            pooler.append(payload)
+            pooler.append(flatten_payload(payload))
         return pooler
+
+    def _resolve_logits_vocab_size(self) -> int | None:
+        """Best-effort vocab size for sampler prompt-id compatibility."""
+        model = getattr(self, "model", None)
+        inner_model = getattr(model, "model", None)
+        talker_model = getattr(model, "talker", None)
+        candidates: list[Any] = [
+            getattr(inner_model, "config", None),
+            getattr(getattr(inner_model, "config", None), "text_config", None),
+            getattr(talker_model, "config", None),
+            getattr(getattr(talker_model, "config", None), "text_config", None),
+            getattr(model, "talker_config", None),
+            getattr(getattr(model, "talker_config", None), "text_config", None),
+            getattr(model, "config", None),
+            getattr(getattr(model, "config", None), "text_config", None),
+            getattr(model, "model_config", None),
+            getattr(getattr(self, "model_config", None), "hf_text_config", None),
+            getattr(getattr(self, "model_config", None), "hf_config", None),
+        ]
+
+        language_model_candidates: list[Any] = []
+        for owner in (inner_model, talker_model, model):
+            language_model_getter = getattr(owner, "get_language_model", None)
+            if callable(language_model_getter):
+                try:
+                    language_model = language_model_getter()
+                    language_model_candidates.extend(
+                        [
+                            getattr(language_model, "config", None),
+                            getattr(getattr(language_model, "model", None), "config", None),
+                        ]
+                    )
+                except Exception:
+                    logger.debug("Unable to resolve language model vocab size", exc_info=True)
+
+        for candidate in language_model_candidates + candidates:
+            vocab_size = getattr(candidate, "vocab_size", None)
+            if isinstance(vocab_size, int) and vocab_size > 0:
+                return vocab_size
+        return None
+
+    @staticmethod
+    def _clamp_sampling_prompt_token_ids(
+        input_batch: Any,
+        logits_vocab_size: int | None,
+    ) -> None:
+        """Clamp sampler prompt IDs to the stage logits vocabulary.
+
+        V1 Omni AR runner did this after computing logits.  MR V2 samples via
+        the upstream helper, so normalize the metadata before that call.
+        """
+        if logits_vocab_size is None or logits_vocab_size <= 0:
+            return
+        if getattr(input_batch, "vocab_size", logits_vocab_size) <= logits_vocab_size:
+            return
+
+        sampling_metadata = getattr(input_batch, "sampling_metadata", None)
+        if sampling_metadata is None or getattr(sampling_metadata, "no_penalties", False):
+            return
+
+        prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            return
+
+        max_token_id = logits_vocab_size - 1
+        if isinstance(prompt_token_ids, torch.Tensor):
+            prompt_token_ids.clamp_(max=max_token_id)
+            return
+
+        if isinstance(prompt_token_ids, list):
+            sampling_metadata.prompt_token_ids = [
+                [min(int(tok), max_token_id) for tok in ids] if isinstance(ids, list) else min(int(ids), max_token_id)
+                for ids in prompt_token_ids
+            ]
 
     # ------------------------------------------------------------------
     # KV transfer

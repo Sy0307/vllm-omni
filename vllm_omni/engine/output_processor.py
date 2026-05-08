@@ -153,13 +153,6 @@ class OmniRequestState(RequestState):
         except Exception:
             logger.exception("Error consolidating multimodal tensors")
 
-        # Restore nested structure from flat dotted keys now that all tensor
-        # lists have been concatenated into single tensors.
-        try:
-            self.mm_accumulated = unflatten_payload(self.mm_accumulated)
-        except Exception:
-            logger.exception("Error unflattening consolidated multimodal tensors")
-
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
     def make_request_output(
@@ -261,11 +254,16 @@ class OmniRequestState(RequestState):
             setattr(base_output, "multimodal_output", {})
         if self.mm_accumulated:
             mm_out = getattr(base_output, "multimodal_output")
+            try:
+                output_payload = unflatten_payload(self.mm_accumulated)
+            except Exception:
+                logger.exception("Error unflattening accumulated multimodal tensors")
+                output_payload = self.mm_accumulated
             if isinstance(mm_out, dict):
-                for k, v in self.mm_accumulated.items():
+                for k, v in output_payload.items():
                     mm_out[k] = v
             else:
-                setattr(base_output, "multimodal_output", self.mm_accumulated)
+                setattr(base_output, "multimodal_output", output_payload)
 
         if self.output_kind == RequestOutputKind.DELTA:
             for modality_key in DRAINABLE_MODALITIES:
