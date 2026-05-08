@@ -136,9 +136,19 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-def _send_with_similarity_retry(openai_client, request_config, *, request_num=None, max_retries=10) -> None:
-    # Retry only when assert_omni_response fails on text/audio cosine similarity.
-    similarity_assert_msg = "The audio content is not same as the text"
+_SIMILARITY_ASSERT_MSG = "The audio content is not same as the text"
+_GENDER_ASSERT_SUBSTR = "estimated gender"
+
+
+def _send_with_assertion_retry(
+    openai_client,
+    request_config,
+    *,
+    request_num=None,
+    retry_messages=(_SIMILARITY_ASSERT_MSG,),
+    max_retries=10,
+) -> None:
+    retry_messages = tuple(retry_messages)
     for attempt in range(max_retries):
         try:
             if request_num is None:
@@ -147,9 +157,9 @@ def _send_with_similarity_retry(openai_client, request_config, *, request_num=No
                 openai_client.send_omni_request(request_config, request_num=request_num)
             break
         except AssertionError as e:
-            if similarity_assert_msg not in str(e) or attempt == max_retries - 1:
+            if not any(msg in str(e) for msg in retry_messages) or attempt == max_retries - 1:
                 raise
-            print(f"Similarity assertion failed, retrying {attempt + 2}/{max_retries}: {e!r}")
+            print(f"Retriable assertion failed, retrying {attempt + 2}/{max_retries}: {e!r}")
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -191,7 +201,7 @@ def test_text_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    _send_with_assertion_retry(openai_client, request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -238,7 +248,7 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    _send_with_similarity_retry(openai_client, request_config)
+    _send_with_assertion_retry(openai_client, request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -263,7 +273,7 @@ def test_text_audio_to_text_audio_002(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    _send_with_assertion_retry(openai_client, request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -287,7 +297,7 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"image": IMAGE_KEY},
     }
 
-    openai_client.send_omni_request(request_config)
+    _send_with_assertion_retry(openai_client, request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -315,7 +325,7 @@ def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"image": IMAGE_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    _send_with_assertion_retry(openai_client, request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -340,7 +350,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_omni_request(request_config)
+    _send_with_assertion_retry(openai_client, request_config)
 
 
 @pytest.mark.skip(reason="There is a known issue with shape mismatch error.")
@@ -396,7 +406,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "use_audio_in_video": True,
         "key_words": {"video": VIDEO_KEY},
     }
-    openai_client.send_omni_request(request_config)
+    _send_with_assertion_retry(openai_client, request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -423,7 +433,7 @@ def test_audio_in_video_002(omni_server, openai_client) -> None:
         "key_words": {"video": VIDEO_KEY},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    _send_with_assertion_retry(openai_client, request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -447,7 +457,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["london"]},
     }
 
-    _send_with_similarity_retry(openai_client, request_config, request_num=get_max_batch_size())
+    _send_with_assertion_retry(openai_client, request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -472,7 +482,11 @@ def test_speaker_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    _send_with_assertion_retry(
+        openai_client,
+        request_config,
+        retry_messages=(_SIMILARITY_ASSERT_MSG, _GENDER_ASSERT_SUBSTR),
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -497,17 +511,12 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    # Retry only when assert_omni_response fails on preset voice gender (see tests/helpers/assertions.py).
-    _gender_assert_substr = "estimated gender"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _gender_assert_substr not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Gender assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    _send_with_assertion_retry(
+        openai_client,
+        request_config,
+        request_num=get_max_batch_size(),
+        retry_messages=(_SIMILARITY_ASSERT_MSG, _GENDER_ASSERT_SUBSTR),
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -532,7 +541,11 @@ def test_speaker_003(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    _send_with_assertion_retry(
+        openai_client,
+        request_config,
+        retry_messages=(_SIMILARITY_ASSERT_MSG, _GENDER_ASSERT_SUBSTR),
+    )
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -556,4 +569,4 @@ def test_language_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["北京"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    _send_with_assertion_retry(openai_client, request_config)

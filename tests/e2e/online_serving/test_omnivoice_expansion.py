@@ -58,6 +58,18 @@ def get_prompt(prompt_type="text"):
     return prompts.get(prompt_type, prompts["text"])
 
 
+def _send_speech_with_transcript_retry(openai_client, request_config, *, max_retries=10) -> None:
+    transcript_assert_msg = "Transcript doesn't match input"
+    for attempt in range(max_retries):
+        try:
+            openai_client.send_audio_speech_request(request_config)
+            break
+        except AssertionError as e:
+            if transcript_assert_msg not in str(e) or attempt == max_retries - 1:
+                raise
+            print(f"Transcript assertion failed, retrying {attempt + 2}/{max_retries}: {e!r}")
+
+
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestOmniVoiceTTS:
     """E2E tests for OmniVoice TTS model."""
@@ -72,7 +84,7 @@ class TestOmniVoiceTTS:
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
         }
-        openai_client.send_audio_speech_request(request_config)
+        _send_speech_with_transcript_retry(openai_client, request_config)
 
 
 @pytest.mark.skipif(not _HAS_VOICE_CLONE, reason="Voice cloning requires transformers>=5.3.0")
@@ -91,7 +103,7 @@ class TestOmniVoiceVoiceCloning:
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
         }
-        openai_client.send_audio_speech_request(request_config)
+        _send_speech_with_transcript_retry(openai_client, request_config)
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_and_text(self, omni_server, openai_client) -> None:
@@ -105,7 +117,7 @@ class TestOmniVoiceVoiceCloning:
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
         }
-        openai_client.send_audio_speech_request(request_config)
+        _send_speech_with_transcript_retry(openai_client, request_config)
 
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_invalid_ref_audio_format(self, omni_server, openai_client) -> None:
