@@ -689,8 +689,34 @@ class Qwen2_5OmniForConditionalGeneration(
         input_embeds: torch.Tensor | None,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Return thinker hidden states unchanged for the talker bridge."""
-        return text_hidden_states
+        token_embeds = None
+        if input_ids is not None and getattr(self, "thinker", None) is not None:
+            flat_input_ids = input_ids.reshape(-1)
+            token_embeds = self.thinker.embed_input_ids(flat_input_ids)
+            thinker_config = getattr(self, "thinker_config", None)
+            multimodal_token_ids = [
+                int(getattr(thinker_config, attr))
+                for attr in ("audio_token_index", "image_token_index", "video_token_index")
+                if thinker_config is not None and hasattr(thinker_config, attr)
+            ]
+            if multimodal_token_ids:
+                multimodal_mask = torch.zeros_like(flat_input_ids, dtype=torch.bool)
+                for token_id in multimodal_token_ids:
+                    multimodal_mask |= flat_input_ids == token_id
+                token_embeds = token_embeds.clone()
+                token_embeds[multimodal_mask] = 0
+        elif input_embeds is not None:
+            token_embeds = input_embeds
+        if token_embeds is None:
+            return text_hidden_states
+
+        token_embeds = token_embeds.reshape(-1, token_embeds.shape[-1])
+        if token_embeds.shape != text_hidden_states.shape:
+            return text_hidden_states
+        return text_hidden_states + token_embeds.to(
+            dtype=text_hidden_states.dtype,
+            device=text_hidden_states.device,
+        )
 
     def _build_talker_decode_reply_cache(
         self,
@@ -1001,59 +1027,17 @@ class Qwen2_5OmniForConditionalGeneration(
         else:
             codec = torch.as_tensor(codec_tokens, dtype=torch.long, device=token2wav_dev).unsqueeze(0)
 
-        # Streaming with chunked process and boundary alignment
-        # (rely on token2wav.process_chunk)
-        factor = getattr(self.token2wav.token2wav.factor, "factor", 2)
-        chunk_size = 48
-        mel_dim = getattr(
-            self.token2wav.token2wav.code2wav_dit_model,
-            "mel_dim",
-            self.token2wav_config.dit_config.mel_dim,
-        )
-        total_mel = int(codec.shape[1] * factor)
-        steps = 10
-
-        # Prepare initial noise for the whole sequence
-        y_all = torch.randn((1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev)
-
-        logger.info(
-            "Currently, we do not use the chunked process, we only use the "
-            "token2wav.process_chunk for the whole sequence. "
-            "The stream mode will be implemented in the future."
-        )
-
-        chunk_ends = []
-        for i in range(codec.shape[1]):
-            chunk_code_length = i * 2 - 24
-            finished = i == (codec.shape[1] - 1)
-            if (chunk_code_length > 0 and chunk_code_length % chunk_size == 0) or finished:
-                chunk_ends.append(i)
-
-        # Number of chunks in mel domain
-        prev_generated = None
-        wav_chunks: list = []
-
         with torch.inference_mode():
-            for n, i in enumerate([0]):
-                finished = i == codec.shape[1] - 1
-                _, audio_chunk = self.token2wav.process_chunk(
-                    conditioning=cond,
-                    reference_mel=ref_mel,
-                    codec_all=codec,
-                    y_all=y_all,
-                    i=n,
-                    steps=steps,
-                    prev_generated=prev_generated if prev_generated is not None else [],
-                    finished=True,
-                )
-                prev_generated = audio_chunk
-                wav_chunks.append(audio_chunk.detach().cpu().numpy())
+            waveform = self.token2wav(
+                codec,
+                conditioning=cond,
+                reference_mel=ref_mel,
+                num_steps=10,
+            )
 
-        if len(wav_chunks) == 0:
+        if waveform is None:
             return torch.zeros(0, device=token2wav_dev)
-
-        waveform = np.concatenate(wav_chunks)
-        return torch.as_tensor(waveform, device=token2wav_dev)
+        return waveform.to(device=token2wav_dev)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""
