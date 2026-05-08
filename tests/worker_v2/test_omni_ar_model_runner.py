@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     OmniARModelRunner,
     _async_copy_mm,
@@ -17,6 +18,32 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # ---------------------------------------------------------------
 # _build_pooler_output_from_cpu (was _build_pooler_output)
 # ---------------------------------------------------------------
+
+
+def test_reconstruct_raw_model_output_preserves_omni_multimodal_outputs():
+    hidden = torch.randn(3, 4)
+    latent = torch.randn(3, 4)
+    raw = OmniARModelRunner._reconstruct_raw_model_output(
+        hidden_states=hidden,
+        multimodal_outputs={"latent": latent},
+        aux=None,
+    )
+
+    assert isinstance(raw, OmniOutput)
+    assert raw.text_hidden_states is hidden
+    assert raw.multimodal_outputs["latent"] is latent
+
+
+def test_reconstruct_raw_model_output_keeps_aux_tuple_without_multimodal_outputs():
+    hidden = torch.randn(3, 4)
+    aux = {"layers": torch.randn(3, 2)}
+    raw = OmniARModelRunner._reconstruct_raw_model_output(
+        hidden_states=hidden,
+        multimodal_outputs=None,
+        aux=aux,
+    )
+
+    assert raw == (hidden, aux)
 
 
 def test_build_pooler_output_basic():

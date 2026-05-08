@@ -56,6 +56,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     model_state: OmniModelState
     _last_aux_output: Any
+    _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
 
     def shutdown(self) -> None:
@@ -73,6 +74,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             finally:
                 _mr_module.init_model_state = _orig
         self._last_aux_output = None
+        self._last_multimodal_outputs = None
         self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
         self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
 
@@ -269,6 +271,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
             hidden_states = model_output
             self._last_aux_output = None
+            self._last_multimodal_outputs = None
         else:
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
@@ -289,8 +292,10 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # Extract hidden_states from model output.
             self._last_aux_output = None
+            self._last_multimodal_outputs = None
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
+                self._last_multimodal_outputs = model_output.multimodal_outputs or {}
             elif isinstance(model_output, tuple) and len(model_output) == 2:
                 hidden_states, self._last_aux_output = model_output
                 if hasattr(self.model, "_last_captured_layers"):

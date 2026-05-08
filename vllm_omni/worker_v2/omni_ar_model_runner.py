@@ -22,6 +22,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
@@ -94,9 +95,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Omni: reconstruct raw model output and post-process ---
         aux = self._last_aux_output
         self._last_aux_output = None
-        raw_output: Any = hidden_states
-        if aux is not None:
-            raw_output = (hidden_states, aux)
+        multimodal_outputs = self._last_multimodal_outputs
+        self._last_multimodal_outputs = None
+        raw_output = self._reconstruct_raw_model_output(
+            hidden_states=hidden_states,
+            multimodal_outputs=multimodal_outputs,
+            aux=aux,
+        )
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
@@ -168,6 +173,22 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # ------------------------------------------------------------------
     # pooler_output construction
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reconstruct_raw_model_output(
+        *,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: dict[str, Any] | None,
+        aux: Any | None,
+    ) -> Any:
+        if multimodal_outputs is not None:
+            return OmniOutput(
+                text_hidden_states=hidden_states,
+                multimodal_outputs=multimodal_outputs,
+            )
+        if aux is not None:
+            return (hidden_states, aux)
+        return hidden_states
 
     @staticmethod
     def _build_pooler_output_from_cpu(
