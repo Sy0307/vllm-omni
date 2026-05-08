@@ -136,6 +136,22 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+def _send_with_similarity_retry(openai_client, request_config, *, request_num=None, max_retries=10) -> None:
+    # Retry only when assert_omni_response fails on text/audio cosine similarity.
+    similarity_assert_msg = "The audio content is not same as the text"
+    for attempt in range(max_retries):
+        try:
+            if request_num is None:
+                openai_client.send_omni_request(request_config)
+            else:
+                openai_client.send_omni_request(request_config, request_num=request_num)
+            break
+        except AssertionError as e:
+            if similarity_assert_msg not in str(e) or attempt == max_retries - 1:
+                raise
+            print(f"Similarity assertion failed, retrying {attempt + 2}/{max_retries}: {e!r}")
+
+
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
@@ -222,7 +238,7 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "key_words": {"audio": AUDIO_KEY},
     }
 
-    openai_client.send_omni_request(request_config)
+    _send_with_similarity_retry(openai_client, request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -431,17 +447,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["london"]},
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
-    _similarity_assert_msg = "The audio content is not same as the text"
-    _max_retries = 10
-    for attempt in range(_max_retries):
-        try:
-            openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-            break
-        except AssertionError as e:
-            if _similarity_assert_msg not in str(e) or attempt == _max_retries - 1:
-                raise
-            print(f"Similarity assertion failed, retrying {attempt + 2}/{_max_retries}: {e!r}")
+    _send_with_similarity_retry(openai_client, request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
