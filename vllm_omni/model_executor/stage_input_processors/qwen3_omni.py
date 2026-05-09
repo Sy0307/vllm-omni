@@ -509,21 +509,27 @@ def thinker2talker(
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: dict[str, Any] | None,
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ):
     """
     Pooling version.
     """
+    request_is_finished = getattr(request, "is_finished", None)
+    finished = bool(is_finished or (callable(request_is_finished) and request_is_finished()))
+    terminal_payload = {
+        "codes": {"audio": []},
+        "meta": {"left_context_size": 0, "finished": torch.tensor(True, dtype=torch.bool)},
+    }
     if not isinstance(pooling_output, dict):
-        return None
+        return terminal_payload if finished else None
     talker_codes = pooling_output.get("codes", {})
     if not isinstance(talker_codes, dict):
-        return None
+        return terminal_payload if finished else None
     code_predictor_codes = talker_codes.get("audio")
     if code_predictor_codes is None:
-        return None
+        return terminal_payload if finished else None
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
@@ -531,26 +537,25 @@ def talker2code2wav_async_chunk(
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
 
-    if code_predictor_codes is None:
-        return None
     if isinstance(code_predictor_codes, torch.Tensor):
         if code_predictor_codes.numel() == 0:
-            return None
+            return terminal_payload if finished else None
     elif hasattr(code_predictor_codes, "__len__"):
         if len(code_predictor_codes) == 0:
-            return None
+            return terminal_payload if finished else None
 
     if isinstance(code_predictor_codes, torch.Tensor):
         if not code_predictor_codes.any():
-            return None
+            return terminal_payload if finished else None
     else:
         code_tensor = torch.tensor(code_predictor_codes, dtype=torch.long)
         if not code_tensor.any():
-            return None
+            return terminal_payload if finished else None
+        code_predictor_codes = code_tensor
 
     codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
     if sum(codec_codes) == 0:
-        return None
+        return terminal_payload if finished else None
 
     request_id = request.external_req_id
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
@@ -574,7 +579,7 @@ def talker2code2wav_async_chunk(
 
     return {
         "codes": {"audio": codes},
-        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(is_finished, dtype=torch.bool)},
+        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(finished, dtype=torch.bool)},
     }
 
 

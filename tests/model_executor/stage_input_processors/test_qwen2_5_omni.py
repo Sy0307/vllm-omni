@@ -44,3 +44,11 @@ def test_talker2code2wav_strips_terminal_codec_pad():
     prompts = talker2code2wav(_source_outputs(output))
 
     assert [prompt["prompt_token_ids"] for prompt in prompts] == [[55, 66]]
+
+
+def test_talker2code2wav_keeps_empty_codec_terminal_input():
+    output = SimpleNamespace(cumulative_token_ids=[TALKER_CODEC_START_TOKEN_ID, TALKER_CODEC_END_TOKEN_ID])
+
+    prompts = talker2code2wav(_source_outputs(output))
+
+    assert [prompt["prompt_token_ids"] for prompt in prompts] == [[]]

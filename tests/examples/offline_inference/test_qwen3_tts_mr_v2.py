@@ -8,17 +8,12 @@ Picks classic test examples covering all three query types (CustomVoice,
 VoiceDesign, Base) and the streaming execution path.
 """
 
-import os
 import tempfile
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_OMNI_USE_V2_RUNNER"] = "1"
-
 import pytest
+import soundfile as sf
 
 from tests.examples.helpers import EXAMPLES, run_cmd
 from tests.helpers.mark import hardware_test
@@ -34,6 +29,10 @@ BASE_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
 MIN_DURATION_S = 0.5
 EXPECTED_SAMPLE_RATE = 24000
+MR_V2_ENV = {
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_OMNI_USE_V2_RUNNER": "1",
+}
 
 
 def _assert_wav_output(output_dir: str) -> None:
@@ -66,7 +65,7 @@ def test_custom_voice():
             "--output-dir",
             output_dir,
         ]
-        run_cmd(command)
+        run_cmd(command, env=MR_V2_ENV)
         _assert_wav_output(output_dir)
 
 
@@ -85,7 +84,7 @@ def test_voice_design():
             "--output-dir",
             output_dir,
         ]
-        run_cmd(command)
+        run_cmd(command, env=MR_V2_ENV)
         _assert_wav_output(output_dir)
 
 
@@ -106,7 +105,7 @@ def test_base_icl():
             "--output-dir",
             output_dir,
         ]
-        run_cmd(command)
+        run_cmd(command, env=MR_V2_ENV)
         _assert_wav_output(output_dir)
 
 
@@ -126,5 +125,5 @@ def test_custom_voice_streaming():
             "--output-dir",
             output_dir,
         ]
-        run_cmd(command)
+        run_cmd(command, env=MR_V2_ENV)
         _assert_wav_output(output_dir)

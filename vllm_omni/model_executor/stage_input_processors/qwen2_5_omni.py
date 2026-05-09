@@ -80,8 +80,6 @@ def talker2code2wav(
             token_ids = token_ids[1:]
         if token_ids and token_ids[-1] in (TALKER_CODEC_PAD_TOKEN_ID, TALKER_CODEC_END_TOKEN_ID):
             token_ids = token_ids[:-1]
-        if not token_ids:
-            continue
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=token_ids,
