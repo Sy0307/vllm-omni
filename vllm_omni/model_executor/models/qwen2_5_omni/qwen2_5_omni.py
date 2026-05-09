@@ -869,8 +869,12 @@ class Qwen2_5OmniForConditionalGeneration(
         q = embed.get("thinker_reply", None)
         if isinstance(q, torch.Tensor) and q.numel() > 0:
             step_vec = q[0:1]
-            new_q = q[1:].detach().to("cpu").contiguous()
-            update_dict.setdefault("embed", {})["thinker_reply"] = new_q
+            # HF only advances thinker_reply_part while more than one vector
+            # remains. The final PAD vector is reused for the rest of codec
+            # generation; dropping it makes talker lose conditioning early.
+            if q.shape[0] > 1:
+                new_q = q[1:].detach().to("cpu").contiguous()
+                update_dict.setdefault("embed", {})["thinker_reply"] = new_q
         else:
             # B) per-request provided decode vector (optional)
             dv = embed.get("decode")

@@ -84,6 +84,31 @@ def test_build_talker_decode_reply_cache_appends_text_eos_pad():
     )
 
 
+def test_talker_decode_keeps_final_reply_pad_vector():
+    model = object.__new__(Qwen2_5OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model = nn.Linear(2, 2)
+
+    class _FakeTalker:
+        @staticmethod
+        def embed_input_ids(input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((input_ids.numel(), 2), dtype=torch.float32)
+
+    model.talker = _FakeTalker()
+    input_ids = torch.tensor([123], dtype=torch.long)
+    input_embeds = torch.zeros((1, 2), dtype=torch.float32)
+    final_pad = torch.tensor([[5.0, 6.0]], dtype=torch.float32)
+
+    _, out_embeds, update = model.thinker_to_talker_decode_one_step(
+        input_ids,
+        input_embeds,
+        {"embed": {"thinker_reply": final_pad}},
+    )
+
+    torch.testing.assert_close(out_embeds, final_pad)
+    assert update == {}
+
+
 class _FakeToken2Wav(nn.Module):
     def __init__(self):
         super().__init__()
