@@ -40,9 +40,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        if connector_config is None:
+            connector_extra = {}
+        elif isinstance(connector_config, dict):
+            connector_extra = connector_config.get("extra", {}) or {}
+        else:
+            connector_extra = getattr(connector_config, "extra", {}) or {}
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        self.prioritize_initial_chunks = bool(connector_extra.get("prioritize_initial_chunks", False))
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -56,6 +64,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.finished_requests: set[str] = set()
         self.request_payload = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
+        # Model-specific stage processors may keep per-request scratch state
+        # here; the adapter only owns lifecycle cleanup.
+        self.request_processing_state: dict[str, dict[str, Any]] = defaultdict(dict)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
@@ -290,6 +301,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
+            self.request_processing_state.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
@@ -327,6 +339,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+        self.request_processing_state.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
@@ -372,8 +385,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
+        if self.prioritize_initial_chunks:
+            self._prioritize_initial_ready_chunks(waiting_queue, running_queue)
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
+            # Keep the legacy PREEMPTED status here. Marking an already-running
+            # AR request as WAITING makes the scheduler rebuild it as a fresh
+            # prefill request and drops per-request model state.
             request.status = RequestStatus.PREEMPTED
             waiting_queue.prepend_requests([request])
 
@@ -443,6 +461,53 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
+
+    def _is_initial_chunk_request(self, request: Request) -> bool:
+        received_chunks = self.get_req_chunk.get(request.request_id)
+        if received_chunks is not None:
+            return int(received_chunks) <= 1
+        return int(getattr(request, "num_computed_tokens", 0) or 0) <= 0
+
+    @staticmethod
+    def _queue_remove(queue: Any, request: Request) -> None:
+        if hasattr(queue, "remove"):
+            queue.remove(request)
+        elif hasattr(queue, "remove_requests"):
+            queue.remove_requests([request])
+        else:
+            raise AttributeError("waiting queue does not support removal")
+
+    def _prioritize_initial_ready_chunks(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+    ) -> None:
+        """Prefer ready first-audio chunks without changing request lifecycle."""
+        initial_ready = [
+            request
+            for request in list(waiting_queue)
+            if request.request_id in self.requests_with_ready_chunks and self._is_initial_chunk_request(request)
+        ]
+        if initial_ready:
+            for request in initial_ready:
+                self._queue_remove(waiting_queue, request)
+            waiting_queue.prepend_requests(initial_ready)
+
+        if len(running_queue) > 1:
+            # TTFP-first policy: on overflow, keep ready first chunks ahead of
+            # follow-up chunks. This is intentionally not a neutral fairness
+            # sort; long-run tail latency must be validated by workload
+            # benchmarks, not only by unit tests.
+            initial_running = [
+                request
+                for request in running_queue
+                if request.request_id in self.requests_with_ready_chunks and self._is_initial_chunk_request(request)
+            ]
+            if initial_running:
+                initial_running_ids = {id(request) for request in initial_running}
+                running_queue[:] = initial_running + [
+                    request for request in running_queue if id(request) not in initial_running_ids
+                ]
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:

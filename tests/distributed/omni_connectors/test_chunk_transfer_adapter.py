@@ -21,6 +21,8 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+_QWEN3_TTS_CODE_BUFFER_STATE_KEY = "qwen3_tts_code_buffer"
+
 
 class DummyWaitingQueue(list):
     def prepend_requests(self, requests):
@@ -44,7 +46,13 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
-    def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
+    def _build(
+        *,
+        stage_id: int = 1,
+        model_mode: str = "ar",
+        max_num_seqs: int = 2,
+        stage_connector_config=None,
+    ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
         connector.get.return_value = None
@@ -68,7 +76,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             classmethod(lambda cls, _model_config: connector),
         )
 
-        model_config = SimpleNamespace(worker_type=model_mode)
+        model_config = SimpleNamespace(worker_type=model_mode, stage_connector_config=stage_connector_config)
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
             SimpleNamespace(model_config=model_config, scheduler_config=scheduler_config)
@@ -267,6 +275,100 @@ def test_process_and_restore_queues(build_adapter):
     assert adapter.waiting_for_chunk_running_requests == deque()
 
 
+def test_process_pending_chunks_overflow_keeps_legacy_preempted_status(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1)
+    first = _req("first", RequestStatus.WAITING_FOR_CHUNK)
+    overflow = _req("overflow", RequestStatus.WAITING_FOR_CHUNK)
+    waiting_queue = DummyWaitingQueue()
+    running_queue = [first, overflow]
+
+    adapter._finished_load_reqs.update({"first", "overflow"})
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert running_queue == [first]
+    assert waiting_queue == [overflow]
+    assert overflow.status == RequestStatus.PREEMPTED
+
+
+def test_prioritize_initial_chunks_reorders_without_demoting_running(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        max_num_seqs=2,
+        stage_connector_config={"extra": {"prioritize_initial_chunks": True}},
+    )
+    init_1 = _req("init-1", RequestStatus.WAITING)
+    init_2 = _req("init-2", RequestStatus.WAITING)
+    init_running = _req("init-running", RequestStatus.RUNNING)
+    follow_1 = _req("follow-1", RequestStatus.RUNNING)
+    follow_2 = _req("follow-2", RequestStatus.RUNNING)
+    waiting_queue = DummyWaitingQueue([init_1, init_2])
+    running_queue = [follow_1, init_running, follow_2]
+
+    adapter.requests_with_ready_chunks = {"init-1", "init-2", "init-running", "follow-1", "follow-2"}
+    adapter.get_req_chunk["init-1"] = 1
+    adapter.get_req_chunk["init-2"] = 1
+    adapter.get_req_chunk["init-running"] = 1
+    adapter.get_req_chunk["follow-1"] = 2
+    adapter.get_req_chunk["follow-2"] = 2
+
+    adapter._prioritize_initial_ready_chunks(waiting_queue, running_queue)
+
+    assert running_queue == [init_running, follow_1, follow_2]
+    assert waiting_queue == [init_1, init_2]
+    assert follow_1.status == RequestStatus.RUNNING
+    assert follow_2.status == RequestStatus.RUNNING
+
+
+def test_prioritize_initial_chunks_uses_chunk_index_not_num_computed_tokens(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        max_num_seqs=1,
+        stage_connector_config={"extra": {"prioritize_initial_chunks": True}},
+    )
+    init_req = _req("init", RequestStatus.WAITING)
+    follow_req = _req("follow", RequestStatus.RUNNING)
+    follow_req.num_computed_tokens = 0
+    waiting_queue = DummyWaitingQueue([init_req])
+    running_queue = [follow_req]
+
+    adapter.requests_with_ready_chunks = {"init", "follow"}
+    adapter.get_req_chunk["init"] = 1
+    adapter.get_req_chunk["follow"] = 2
+
+    adapter._prioritize_initial_ready_chunks(waiting_queue, running_queue)
+
+    assert running_queue == [follow_req]
+    assert waiting_queue == [init_req]
+    assert follow_req.status == RequestStatus.RUNNING
+
+
+def test_process_pending_chunks_prioritizes_initial_ready_before_overflow(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        max_num_seqs=2,
+        stage_connector_config={"extra": {"prioritize_initial_chunks": True}},
+    )
+    follow_keep = _req("follow-keep", RequestStatus.WAITING_FOR_CHUNK)
+    initial = _req("initial", RequestStatus.WAITING_FOR_CHUNK)
+    follow_overflow = _req("follow-overflow", RequestStatus.WAITING_FOR_CHUNK)
+    waiting_queue = DummyWaitingQueue()
+    running_queue = [follow_keep, initial, follow_overflow]
+
+    adapter._finished_load_reqs.update({"follow-keep", "initial", "follow-overflow"})
+    adapter.get_req_chunk["follow-keep"] = 2
+    adapter.get_req_chunk["initial"] = 1
+    adapter.get_req_chunk["follow-overflow"] = 2
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert running_queue == [initial, follow_keep]
+    assert waiting_queue == [follow_overflow]
+    assert initial.status == RequestStatus.RUNNING
+    assert follow_keep.status == RequestStatus.RUNNING
+    assert follow_overflow.status == RequestStatus.PREEMPTED
+
+
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
@@ -302,6 +404,7 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.put_req_chunk[ext_id] = 5
     adapter.request_payload[ext_id] = {"hidden": [1, 2]}
     adapter.code_prompt_token_ids[ext_id] = [[10, 20]]
+    adapter.request_processing_state[ext_id][_QWEN3_TTS_CODE_BUFFER_STATE_KEY] = torch.tensor([[10, 20]])
 
 
 def test_cleanup_clears_all_state(build_adapter):
@@ -322,6 +425,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert ext_id not in adapter.put_req_chunk
     assert ext_id not in adapter.request_payload
     assert ext_id not in adapter.code_prompt_token_ids
+    assert ext_id not in adapter.request_processing_state
 
 
 def test_cleanup_infers_external_id(build_adapter):

@@ -1318,6 +1318,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # call the custom process function
                 req_infos["request_id"] = req_id
+                prompt_len = len(req_state.prompt_token_ids) if req_state is not None else 0
+                num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                is_prefill = num_computed_tokens < prompt_len
+                req_infos["_omni_prompt_len"] = prompt_len
+                req_infos["_omni_num_computed_tokens"] = num_computed_tokens
+                req_infos["_omni_is_prefill"] = is_prefill
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
@@ -1329,7 +1335,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                if self.has_talker_mtp and span_len == 1:
+                if self.has_talker_mtp and span_len == 1 and not is_prefill:
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)

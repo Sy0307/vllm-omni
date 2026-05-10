@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
@@ -21,6 +22,16 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 )
 
 logger = init_logger(__name__)
+
+
+def _meta_to_bool(value: Any) -> bool:
+    if isinstance(value, list):
+        if len(value) > 1:
+            raise ValueError(f"Qwen3-TTS Code2Wav expected scalar bool metadata, got list of length {len(value)}")
+        value = value[0] if value else False
+    if isinstance(value, torch.Tensor):
+        value = value.reshape(-1)[0].item() if value.numel() > 0 else False
+    return bool(value)
 
 
 class Qwen3TTSCode2Wav(nn.Module):
@@ -125,19 +136,39 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
-        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+        seq_token_counts = kwargs.get("seq_token_counts")
+        if (
+            runtime_additional_information is not None
+            and len(runtime_additional_information) > 1
+            and (seq_token_counts is None or len(seq_token_counts) != len(runtime_additional_information))
+        ):
+            raise ValueError(
+                "Qwen3-TTS Code2Wav received multi-request runtime_additional_information "
+                "without explicit matching seq_token_counts. Pass seq_token_counts from the runner "
+                "so concatenated codec ids are decoded per request."
+            )
+        request_ids_list = self._split_request_ids(ids, seq_token_counts)
 
         parsed: list[tuple[int, int]] = []
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
+        finished_flags = [False] * len(request_ids_list)
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
                 meta = info.get("meta", {})
+                if "finished" in meta:
+                    finished_flags[i] = _meta_to_bool(meta["finished"])
                 if "left_context_size" in meta:
-                    left_context_size[i] = meta["left_context_size"]
+                    # left_context_size may come through serialization as an int, [int], or tensor([int]).
+                    value = meta["left_context_size"]
+                    if isinstance(value, list):
+                        value = value[0] if value else 0
+                    if isinstance(value, torch.Tensor):
+                        value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
+                    left_context_size[i] = int(value)
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
@@ -146,7 +177,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             flat = req_ids
             n = flat.numel()
             if n == 0 or n % q != 0:
-                if n > 0:
+                if n > 1 and not finished_flags[i]:
                     logger.warning(
                         "Code2Wav input_ids length %d not divisible by num_quantizers %d; skipping malformed request.",
                         n,
@@ -188,21 +219,66 @@ class Qwen3TTSCode2Wav(nn.Module):
                 pass
 
         # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # Each request decoded individually with CUDA graph replay at bs=1.
-        wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
+        # Group equal-length codec windows so Code2Wav can use batch/bucket
+        # execution for steady-state chunks while final short chunks still
+        # fall back to their own shape.
+        wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
+        groups: dict[int, list[tuple[int, torch.Tensor]]] = defaultdict(list)
+        for local_idx, codes_qf in enumerate(valid_codes_qf):
+            groups[int(codes_qf.shape[-1])].append((local_idx, codes_qf))
+
+        def decode_codes(codes_bqf: torch.Tensor) -> torch.Tensor:
             try:
-                wav = decoder.chunked_decode(
+                return decoder.chunked_decode(
                     codes_bqf,
                     chunk_size=self._decode_chunk_frames,
                     left_context_size=self._decode_left_context_frames,
-                )  # [1, 1, wav_len]
+                )  # [B, 1, wav_len] or [B, wav_len]
             except TypeError:
                 # Unit-test fakes and older decoder shims may not accept the
                 # explicit chunk kwargs; production Qwen3-TTS decoders do.
-                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+                return decoder.chunked_decode(codes_bqf)  # [B, 1, wav_len] or [B, wav_len]
+
+        def assign_decoded_wavs(wav: torch.Tensor, group: list[tuple[int, torch.Tensor]]) -> None:
+            if wav.ndim == 3 and wav.shape[1] == 1:
+                wav = wav[:, 0, :]
+            elif wav.ndim == 1:
+                wav = wav.unsqueeze(0)
+            if wav.shape[0] != len(group):
+                raise RuntimeError(
+                    f"Qwen3-TTS Code2Wav decoder returned batch size {wav.shape[0]} for input batch size {len(group)}"
+                )
+            for row, (local_idx, _) in enumerate(group):
+                wav_tensors[local_idx] = wav[row].reshape(-1)
+
+        def decode_group(group: list[tuple[int, torch.Tensor]]) -> None:
+            codes_bqf = torch.stack([codes for _, codes in group], dim=0).contiguous()
+            try:
+                assign_decoded_wavs(decode_codes(codes_bqf), group)
+                return
+            except Exception:
+                logger.warning(
+                    "Qwen3-TTS Code2Wav batch decode failed for batch=%d frames=%d; "
+                    "falling back to per-request decode.",
+                    len(group),
+                    int(codes_bqf.shape[-1]),
+                    exc_info=True,
+                )
+
+            for local_idx, codes_qf in group:
+                try:
+                    assign_decoded_wavs(decode_codes(codes_qf.unsqueeze(0).contiguous()), [(local_idx, codes_qf)])
+                except Exception:
+                    logger.error(
+                        "Qwen3-TTS Code2Wav per-request fallback decode failed for local_idx=%d frames=%d.",
+                        local_idx,
+                        int(codes_qf.shape[-1]),
+                        exc_info=True,
+                    )
+                    wav_tensors[local_idx] = torch.empty((0,), dtype=torch.float32)
+
+        for group in groups.values():
+            decode_group(group)
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -210,6 +286,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
+            if wav is None:
+                continue
             # Slice on exact codec-frame boundaries instead of proportionally.
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
@@ -302,6 +380,26 @@ class Qwen3TTSCode2Wav(nn.Module):
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
 
+        def _get_int_list_config(name: str) -> list[int] | None:
+            value = extra_cfg.get(name)
+            if value is None:
+                return None
+            if isinstance(value, str):
+                raw_values = [part.strip() for part in value.split(",") if part.strip()]
+            elif isinstance(value, (list, tuple)):
+                raw_values = list(value)
+            else:
+                raw_values = [value]
+            try:
+                parsed = [int(item) for item in raw_values]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+            if not parsed or any(item <= 0 for item in parsed):
+                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}; values must be positive")
+            return parsed
+
+        decode_capture_batch_sizes = None
+
         if isinstance(extra_cfg, dict):
             codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
             codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
@@ -318,6 +416,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
             self._decode_chunk_frames = decode_chunk_frames
             self._decode_left_context_frames = decode_left_context_frames
+            decode_capture_batch_sizes = _get_int_list_config("decode_capture_batch_sizes")
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
@@ -344,6 +443,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codec_left_context_frames=codec_left_context_frames,
                     decode_chunk_size=self._decode_chunk_frames,
                     decode_left_context=self._decode_left_context_frames,
+                    capture_batch_sizes=decode_capture_batch_sizes,
                 )
                 logger.info("Code2Wav decoder CUDA Graph enabled")
             except Exception:

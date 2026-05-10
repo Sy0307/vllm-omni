@@ -37,6 +37,8 @@ from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
 logger = init_logger(__name__)
 
+_TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
+
 
 # ---------------------------------------------------------------------------
 # Components ported from the HuggingFace Qwen3-TTS reference implementation.
@@ -560,6 +562,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
             return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
+        is_prefill_raw = info_dict.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            is_prefill = is_prefill_raw
+        else:
+            try:
+                is_prefill = int(info_dict["_omni_num_computed_tokens"]) < int(info_dict["_omni_prompt_len"])
+            except Exception:
+                is_prefill = span_len > 1
 
         text_list = info_dict.get("text")
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
@@ -576,7 +586,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         else:
             codec_streaming = task_type == "Base"
 
-        if span_len > 1:
+        if is_prefill:
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = embed.get("prefill")
             tts_pad_embed_cpu = embed.get("tts_pad")
@@ -600,7 +610,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         "tts_pad": tts_pad_embed.detach(),
                     },
                     "hidden_states": {"trailing_text": tailing_text_hidden.detach()},
-                    "meta": {"talker_prefill_offset": 0, "codec_streaming": codec_streaming},
+                    "meta": {
+                        "talker_prefill_offset": 0,
+                        "talker_text_offset": 0,
+                        "codec_streaming": codec_streaming,
+                    },
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                     info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
@@ -634,7 +648,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     take = torch.cat([take, pad_rows], dim=0)
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
                 info_update = {
-                    "meta": {"talker_prefill_offset": int(offset + span_len), "codec_streaming": codec_streaming}
+                    "meta": {
+                        "talker_prefill_offset": int(offset + span_len),
+                        "codec_streaming": codec_streaming,
+                    }
                 }
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
@@ -658,12 +675,37 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         tail = hs.get("trailing_text")
-        if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
-            text_step = tail[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
-            new_tail = tail[1:] if tail.shape[0] > 1 else tail[:0]
+        text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
+        trailing_text_update = None
+        if isinstance(tail, torch.Tensor) and tail.ndim == 2:
+            tail_len = int(tail.shape[0])
+            if text_offset < tail_len:
+                text_step = (
+                    tail[text_offset : text_offset + 1]
+                    .to(
+                        device=input_ids.device,
+                        dtype=torch.bfloat16,
+                    )
+                    .reshape(1, -1)
+                )
+                next_text_offset = text_offset + 1
+                should_compact_tail = next_text_offset >= tail_len or (
+                    next_text_offset >= _TRAILING_TEXT_COMPACT_MIN_FRAMES and next_text_offset * 2 >= tail_len
+                )
+                if should_compact_tail:
+                    if next_text_offset >= tail_len:
+                        trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
+                    else:
+                        trailing_text_update = tail[next_text_offset:].contiguous()
+                    next_text_offset = 0
+            else:
+                text_step = tts_pad_embed
+                next_text_offset = 0
+                if tail.numel() > 0:
+                    trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
         else:
             text_step = tts_pad_embed
-            new_tail = tail if isinstance(tail, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
+            next_text_offset = text_offset
 
         last_hidden = hs.get("last")
         if not isinstance(last_hidden, torch.Tensor):
@@ -677,10 +719,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
         info_update = {
-            "hidden_states": {"trailing_text": new_tail},
             "mtp_inputs": (past_hidden, text_step),
-            "meta": {"codec_streaming": codec_streaming},
+            "meta": {
+                "talker_text_offset": int(next_text_offset),
+                "codec_streaming": codec_streaming,
+            },
         }
+        if trailing_text_update is not None:
+            info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
         return input_ids, inputs_embeds_out, info_update
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:

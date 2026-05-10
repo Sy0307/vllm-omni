@@ -24,6 +24,8 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+_QWEN3_TTS_CODE_BUFFER_STATE_KEY = "qwen3_tts_code_buffer"
+
 # ------------------------------------------------------------------ #
 #  Mock helpers
 # ------------------------------------------------------------------ #
@@ -607,6 +609,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._get_req_chunk[req_id] = 3
         host._send_side_request_payload[ext_id] = {"some": "data"}
         host._code_prompt_token_ids[ext_id] = [[1, 2, 3]]
+        host._request_processing_state[ext_id][_QWEN3_TTS_CODE_BUFFER_STATE_KEY] = torch.tensor([[1, 2, 3]])
         host._cached_ic[ext_id] = 16
         host._chunk_stream_completed.add(req_id)
         host._stage_recv_req_ids.add(req_id)
@@ -622,6 +625,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(req_id, host._get_req_chunk)
         self.assertNotIn(ext_id, host._send_side_request_payload)
         self.assertNotIn(ext_id, host._code_prompt_token_ids)
+        self.assertNotIn(ext_id, host._request_processing_state)
         self.assertNotIn(ext_id, host._cached_ic)
         self.assertNotIn(req_id, host._chunk_stream_completed)
         self.assertNotIn(req_id, host._stage_recv_req_ids)
@@ -658,12 +662,14 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         # Stage-0 uses req_id directly (no ext_id mapping)
         host._put_req_chunk[req_id] = 3
         host._get_req_chunk[req_id] = 0
+        host._request_processing_state[req_id][_QWEN3_TTS_CODE_BUFFER_STATE_KEY] = torch.tensor([[1, 2, 3]])
         host._cached_ic[req_id] = 4
 
         host.cleanup_finished_request(req_id)
 
         self.assertNotIn(req_id, host._put_req_chunk)
         self.assertNotIn(req_id, host._get_req_chunk)
+        self.assertNotIn(req_id, host._request_processing_state)
         self.assertNotIn(req_id, host._cached_ic)
 
         host.shutdown_omni_connectors()
@@ -675,16 +681,19 @@ class TestCleanupFinishedRequest(unittest.TestCase):
 
         host._request_ids_mapping[req_id] = ext_id
         host._pending_save_counts[ext_id] = 1
+        host._request_processing_state[ext_id][_QWEN3_TTS_CODE_BUFFER_STATE_KEY] = torch.tensor([[1, 2, 3]])
         host._cached_ic[ext_id] = 8
 
         host.cleanup_finished_request(req_id)
 
         self.assertIn(ext_id, host._deferred_send_cleanup)
+        self.assertIn(ext_id, host._request_processing_state)
         self.assertIn(ext_id, host._cached_ic)
 
         host._decrement_pending_save_count(ext_id)
 
         self.assertNotIn(ext_id, host._deferred_send_cleanup)
+        self.assertNotIn(ext_id, host._request_processing_state)
         self.assertNotIn(ext_id, host._cached_ic)
 
         host.shutdown_omni_connectors()
@@ -707,6 +716,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._stage_recv_req_ids.add(active_req_id)
         host._send_side_request_payload[stale_ext_id] = {"stale": True}
         host._code_prompt_token_ids[stale_ext_id] = [[1, 2, 3]]
+        host._request_processing_state[stale_ext_id][_QWEN3_TTS_CODE_BUFFER_STATE_KEY] = torch.tensor([[1, 2, 3]])
 
         pruned = host.prune_inactive_requests({active_req_id})
 
@@ -725,6 +735,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(stale_req_id, host._stage_recv_req_ids)
         self.assertNotIn(stale_ext_id, host._send_side_request_payload)
         self.assertNotIn(stale_ext_id, host._code_prompt_token_ids)
+        self.assertNotIn(stale_ext_id, host._request_processing_state)
 
         host.shutdown_omni_connectors()
 

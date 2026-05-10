@@ -1,5 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import io
 import logging
 import os
 import struct
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import soundfile
 import torch
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
@@ -112,6 +114,85 @@ class TestAudioMixin:
         assert output_tensor.ndim == 2
         assert output_tensor.shape == (24000, 2)
         assert np.array_equal(output_tensor, stereo_tensor)
+
+    def test_pcm_fast_path_matches_soundfile(self, audio_mixin, mocker: MockerFixture):
+        """PCM fast path must preserve soundfile RAW PCM_16 bytes for TTS-range floats."""
+        rng = np.random.default_rng(0)
+        audio_tensor = rng.uniform(-1.2, 1.2, size=4096).astype(np.float32)
+        expected = io.BytesIO()
+        soundfile.write(
+            expected,
+            audio_tensor,
+            24000,
+            format="RAW",
+            subtype="PCM_16",
+        )
+        mock_write = mocker.patch("soundfile.write")
+
+        audio_obj = CreateAudio(
+            audio_tensor=audio_tensor,
+            response_format="pcm",
+            base64_encode=False,
+        )
+        audio_response = audio_mixin.create_audio(audio_obj)
+
+        assert audio_response.audio_data == expected.getvalue()
+        assert audio_response.media_type == "audio/pcm"
+        mock_write.assert_not_called()
+
+    def test_pcm_fast_path_matches_soundfile_stereo(self, audio_mixin):
+        rng = np.random.default_rng(1)
+        audio_tensor = rng.uniform(-1.2, 1.2, size=(4096, 2)).astype(np.float32)
+        expected = io.BytesIO()
+        soundfile.write(
+            expected,
+            audio_tensor,
+            24000,
+            format="RAW",
+            subtype="PCM_16",
+        )
+
+        audio_obj = CreateAudio(
+            audio_tensor=audio_tensor,
+            response_format="pcm",
+            base64_encode=False,
+        )
+        audio_response = audio_mixin.create_audio(audio_obj)
+
+        assert audio_response.audio_data == expected.getvalue()
+
+    def test_pcm_fast_path_matches_soundfile_half_lsb_boundaries(self, audio_mixin):
+        audio_tensor = np.array(
+            [
+                -1.0,
+                -0.999969482421875,
+                -0.5,
+                -1.52587890625e-05,
+                0.0,
+                1.52587890625e-05,
+                0.5,
+                0.999969482421875,
+                1.0,
+            ],
+            dtype=np.float32,
+        )
+        expected = io.BytesIO()
+        soundfile.write(
+            expected,
+            audio_tensor,
+            24000,
+            format="RAW",
+            subtype="PCM_16",
+        )
+
+        audio_obj = CreateAudio(
+            audio_tensor=audio_tensor,
+            response_format="pcm",
+            base64_encode=False,
+        )
+        audio_response = audio_mixin.create_audio(audio_obj)
+
+        assert audio_response.audio_data == expected.getvalue()
 
     def test_speed_adjustment_bypass(self, audio_mixin, mocker: MockerFixture):
         """Test that speed=1.0 bypasses the expensive torchaudio time stretching."""

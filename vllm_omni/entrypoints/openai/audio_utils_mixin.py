@@ -18,6 +18,17 @@ logger = init_logger(__name__)
 class AudioMixin:
     """Mixin class to add audio-related utilities."""
 
+    @staticmethod
+    def _float_audio_to_pcm16_bytes(audio_tensor: np.ndarray) -> bytes:
+        """Convert normalized float audio to RAW PCM_16 bytes.
+
+        This matches soundfile's RAW PCM_16 writer, including half-LSB
+        boundaries: clamp to [-1, 1], scale by 32768, floor, then saturate.
+        """
+        pcm = np.floor(np.clip(audio_tensor, -1.0, 1.0) * np.float32(32768.0))
+        pcm = np.clip(pcm, -32768, 32767).astype("<i2", copy=False)
+        return pcm.tobytes()
+
     def create_audio(self, audio_obj: CreateAudio) -> AudioResponse:
         """Convert audio tensor to bytes in the specified format."""
 
@@ -62,6 +73,14 @@ class AudioMixin:
             response_format = "wav"
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
+
+        if response_format == "pcm" and np.issubdtype(audio_tensor.dtype, np.floating):
+            audio_data = self._float_audio_to_pcm16_bytes(audio_tensor)
+            if base64_encode:
+                import base64
+
+                audio_data = base64.b64encode(audio_data).decode("utf-8")
+            return AudioResponse(audio_data=audio_data, media_type=media_type)
 
         with BytesIO() as buffer:
             soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)

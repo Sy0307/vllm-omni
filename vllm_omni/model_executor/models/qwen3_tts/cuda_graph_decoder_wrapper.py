@@ -23,7 +23,11 @@ class CUDAGraphDecoderWrapper:
     and replays them during inference to reduce kernel launch overhead.
 
     Usage:
-        wrapper = CUDAGraphDecoderWrapper(decoder, capture_sizes=[25, 50, 100, 200, 300])
+        wrapper = CUDAGraphDecoderWrapper(
+            decoder,
+            capture_sizes=[25, 50, 100, 200, 300],
+            capture_batch_sizes=[1, 2, 4],
+        )
         wrapper.warmup(device)
 
         # During inference:
@@ -34,21 +38,32 @@ class CUDAGraphDecoderWrapper:
         self,
         decoder: torch.nn.Module,
         capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
     ):
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
+        self.capture_batch_sizes = self._normalize_capture_batch_sizes(capture_batch_sizes)
         self.num_quantizers = num_quantizers
         self.enabled = enabled
 
-        self.graphs: dict[int, CUDAGraph] = {}
-        self.static_inputs: dict[int, torch.Tensor] = {}
-        self.static_outputs: dict[int, torch.Tensor] = {}
+        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
+        self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
 
         self._warmed_up = False
         self._device = None
+
+    @staticmethod
+    def _normalize_capture_batch_sizes(values: list[int] | None) -> list[int]:
+        if values is None:
+            return [1]
+        batch_sizes = sorted({int(value) for value in values})
+        if not batch_sizes or batch_sizes[0] <= 0:
+            raise ValueError(f"capture_batch_sizes must contain positive integers, got {values!r}")
+        return batch_sizes
 
     @staticmethod
     def compute_capture_sizes(
@@ -66,7 +81,15 @@ class CUDAGraphDecoderWrapper:
             if codec_left_context_frames > 0:
                 sizes.add(codec_chunk_frames + codec_left_context_frames)
 
-        # Non-streaming chunked decode: full chunk + last-chunk buckets
+        # Non-streaming chunked_decode() windows:
+        # - first full chunk: decode_chunk_size
+        # - later full chunks: decode_chunk_size + decode_left_context
+        # - final short chunks: <= decode_chunk_size + decode_left_context
+        #
+        # The max bucket keeps every intermediate window on graph replay via
+        # padding; the exact full-chunk bucket avoids padding the common first
+        # full chunk to the larger context window.
+        sizes.add(decode_chunk_size)
         non_stream_max = decode_chunk_size + decode_left_context
         sizes.add(non_stream_max)
 
@@ -82,6 +105,17 @@ class CUDAGraphDecoderWrapper:
             if actual_size <= size:
                 return size
         return None
+
+    def _get_padded_shape(self, actual_batch_size: int, actual_size: int) -> tuple[int, int] | None:
+        padded_batch_size = None
+        for batch_size in self.capture_batch_sizes:
+            if actual_batch_size <= batch_size:
+                padded_batch_size = batch_size
+                break
+        padded_size = self._get_padded_size(actual_size)
+        if padded_batch_size is None or padded_size is None:
+            return None
+        return padded_batch_size, padded_size
 
     def warmup(
         self,
@@ -106,28 +140,40 @@ class CUDAGraphDecoderWrapper:
                 decode_left_context=decode_left_context,
             )
 
-        logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
+        logger.info(
+            "Starting CUDA Graph warmup for batch_sizes=%s sizes=%s",
+            self.capture_batch_sizes,
+            self.capture_sizes,
+        )
 
         # Warmup runs to ensure CUDA memory is allocated
-        for size in self.capture_sizes:
-            dummy = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
-            with torch.no_grad():
-                _ = self.decoder(dummy)
+        for batch_size in self.capture_batch_sizes:
+            for size in self.capture_sizes:
+                dummy = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
+                with torch.no_grad():
+                    _ = self.decoder(dummy)
 
         torch.accelerator.synchronize(device)
 
-        for size in self.capture_sizes:
-            try:
-                self._capture(size, device, dtype)
-                logger.info("  Captured CUDA Graph for size=%d", size)
-            except Exception:
-                logger.warning("  Failed to capture graph for size=%d", size, exc_info=True)
+        for batch_size in self.capture_batch_sizes:
+            for size in self.capture_sizes:
+                try:
+                    self._capture(batch_size, size, device, dtype)
+                    logger.info("  Captured CUDA Graph for batch=%d size=%d", batch_size, size)
+                except Exception:
+                    logger.warning(
+                        "  Failed to capture graph for batch=%d size=%d",
+                        batch_size,
+                        size,
+                        exc_info=True,
+                    )
 
         self._warmed_up = True
-        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), len(self.capture_sizes))
+        total_graphs = len(self.capture_batch_sizes) * len(self.capture_sizes)
+        logger.info("CUDA Graph warmup complete: %d/%d captured", len(self.graphs), total_graphs)
 
-    def _capture(self, size: int, device: torch.device, dtype: torch.dtype):
-        static_input = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
+    def _capture(self, batch_size: int, size: int, device: torch.device, dtype: torch.dtype):
+        static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder(static_input)
         torch.accelerator.synchronize(device)
@@ -137,12 +183,13 @@ class CUDAGraphDecoderWrapper:
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder(static_input)
 
-        self.graphs[size] = graph
-        self.static_inputs[size] = static_input
-        self.static_outputs[size] = static_output
+        key = (batch_size, size)
+        self.graphs[key] = graph
+        self.static_inputs[key] = static_input
+        self.static_outputs[key] = static_output
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        if not self.enabled or not self._warmed_up or codes.shape[0] != 1:
+        if not self.enabled or not self._warmed_up:
             return self.decoder(codes)
 
         # Inner CUDA graph replay is illegal while an outer stream capture is
@@ -154,18 +201,19 @@ class CUDAGraphDecoderWrapper:
         if torch.cuda.is_current_stream_capturing():
             return self.decoder(codes)
 
+        actual_batch_size = codes.shape[0]
         actual_size = codes.shape[-1]
-        padded_size = self._get_padded_size(actual_size)
+        padded_shape = self._get_padded_shape(actual_batch_size, actual_size)
 
-        if padded_size is None or padded_size not in self.graphs:
+        if padded_shape is None or padded_shape not in self.graphs:
             return self.decoder(codes)
 
-        self.static_inputs[padded_size].zero_()
-        self.static_inputs[padded_size][:, :, :actual_size] = codes
-        self.graphs[padded_size].replay()
+        self.static_inputs[padded_shape].zero_()
+        self.static_inputs[padded_shape][:actual_batch_size, :, :actual_size] = codes
+        self.graphs[padded_shape].replay()
 
         actual_out_len = actual_size * self.decoder.total_upsample
-        return self.static_outputs[padded_size][..., :actual_out_len].clone()
+        return self.static_outputs[padded_shape][:actual_batch_size, ..., :actual_out_len].clone()
 
     def chunked_decode_with_cudagraph(
         self,

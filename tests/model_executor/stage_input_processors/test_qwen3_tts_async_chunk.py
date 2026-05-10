@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_omni.model_executor.stage_input_processors.qwen3_tts as qwen3_tts_mod
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     max_ic_for_chunk_size,
@@ -20,6 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
+_QWEN3_TTS_CODE_BUFFER_STATE_KEY = "qwen3_tts_code_buffer"
 
 
 def _req(rid, *, finished, initial_codec_chunk_frames=None):
@@ -34,21 +36,30 @@ def _req(rid, *, finished, initial_codec_chunk_frames=None):
     )
 
 
-def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1, initial_chunk_frames=0):
+def _tm(
+    *,
+    chunk_frames=25,
+    left_context=25,
+    max_num_seqs=1,
+    initial_chunk_frames=0,
+    ref_code_context_policy=None,
+    ref_code_context_tail_frames=None,
+):
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_left_context_frames": left_context,
+        "initial_codec_chunk_frames": initial_chunk_frames,
+    }
+    if ref_code_context_policy is not None:
+        extra["ref_code_context_policy"] = ref_code_context_policy
+    if ref_code_context_tail_frames is not None:
+        extra["ref_code_context_tail_frames"] = ref_code_context_tail_frames
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         scheduler_max_num_seqs=max_num_seqs,
         put_req_chunk=defaultdict(int),
         request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_left_context_frames": left_context,
-                    "initial_codec_chunk_frames": initial_chunk_frames,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -60,6 +71,21 @@ def _call(tm, rid, *, n_frames, finished=False, req_ic=None):
         request=_req(rid, finished=finished, initial_codec_chunk_frames=req_ic),
         is_finished=finished,
     )
+
+
+def _call_one_frame(tm, rid, frame=None, *, finished=False, req_ic=None):
+    if frame is None:
+        frame = _FRAME
+    return talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"codes": {"audio": torch.tensor([frame], dtype=torch.long)}},
+        request=_req(rid, finished=finished, initial_codec_chunk_frames=req_ic),
+        is_finished=finished,
+    )
+
+
+def _code_buffer(tm, rid):
+    return tm.request_processing_state[rid][_QWEN3_TTS_CODE_BUFFER_STATE_KEY]
 
 
 def test_empty_returns_none():
@@ -291,7 +317,78 @@ def test_ref_code_context_applies_to_all_streaming_chunks():
     assert payload is not None
     # ref_code (2 frames) prepended as left context on second chunk too
     assert payload.meta.left_context_size == 10 + 2
+    assert payload.meta.codec_ref_context_frames == 2
+    assert payload.meta.codec_window_frames == 35 + 2
     assert len(payload.codes.audio) == _Q * (35 + 2)
+
+
+def test_ref_code_tail_policy_limits_ref_context():
+    tm = _tm(ref_code_context_policy="tail", ref_code_context_tail_frames=2)
+    rid = "r-ref-tail"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(10)]
+    ref_code = torch.tensor(
+        [
+            [7, 7, 7, 7],
+            [8, 8, 8, 8],
+            [9, 9, 9, 9],
+        ],
+        dtype=torch.long,
+    )
+    tm.request_payload[rid] = ref_code
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=10),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.meta.left_context_size == 2
+    assert payload.meta.codec_ref_context_frames == 2
+    assert payload.meta.codec_window_frames == 12
+    expected = []
+    for value in _FRAME:
+        expected.extend([8, 9] + [value] * 10)
+    assert payload.codes.audio.tolist() == expected
+
+
+def test_ref_code_first_only_policy_skips_followup_chunks():
+    tm = _tm(ref_code_context_policy="first_only")
+    rid = "r-ref-first-only"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
+    tm.put_req_chunk[rid] = 1
+    ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    tm.request_payload[rid] = ref_code
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=10),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.meta.left_context_size == 10
+    assert payload.meta.codec_ref_context_frames == 0
+    assert payload.meta.codec_window_frames == 35
+    assert len(payload.codes.audio) == _Q * 35
+
+
+def test_ref_code_tail_policy_requires_positive_tail_frames():
+    tm = _tm(ref_code_context_policy="tail")
+    rid = "r-ref-bad-tail"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(10)]
+    ref_code = torch.tensor([[9, 9, 9, 9]], dtype=torch.long)
+    tm.request_payload[rid] = ref_code
+
+    with pytest.raises(ValueError, match="ref_code_context_tail_frames"):
+        talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+            request=_req(rid, finished=False, initial_codec_chunk_frames=10),
+            is_finished=False,
+        )
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
@@ -328,6 +425,91 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
     assert payload.meta.left_context_size == 2
     assert len(payload.codes.audio) == _Q * 12
     assert rid in tm.request_payload
+
+
+def test_async_chunk_uses_tensor_frame_buffer_before_flat_payload():
+    tm = _tm(chunk_frames=4, left_context=4)
+    rid = "r-buffer"
+
+    assert _call_one_frame(tm, rid, frame=[1, 2, 3, 4], req_ic=3) is None
+    assert _call_one_frame(tm, rid, frame=[5, 6, 7, 8], req_ic=3) is None
+    payload = _call_one_frame(tm, rid, frame=[9, 10, 11, 12], req_ic=3)
+
+    assert payload is not None
+    buffer = _code_buffer(tm, rid)
+    assert len(buffer) == 3
+    assert buffer.shape == (3, _Q)
+    assert payload.codes.audio.tolist() == [
+        1,
+        5,
+        9,
+        2,
+        6,
+        10,
+        3,
+        7,
+        11,
+        4,
+        8,
+        12,
+    ]
+    assert tm.code_prompt_token_ids[rid] == []
+
+
+def test_async_chunk_filters_padding_and_out_of_range_codec_frames():
+    tm = _tm(chunk_frames=4, left_context=4)
+    rid = "r-invalid"
+
+    assert _call_one_frame(tm, rid, frame=[0, 0, 0, 0], req_ic=2) is None
+    assert _call_one_frame(tm, rid, frame=[2150, 0, 0, 0], req_ic=2) is None
+    assert _call_one_frame(tm, rid, frame=[1, 2, 3, 4], req_ic=2) is None
+    payload = _call_one_frame(tm, rid, frame=[5, 6, 7, 8], req_ic=2)
+
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [1, 5, 2, 6, 3, 7, 4, 8]
+    buffer = _code_buffer(tm, rid)
+    assert len(buffer) == 2
+
+
+def test_async_chunk_buffer_source_ignores_stale_legacy_prompt_ids():
+    tm = _tm(chunk_frames=4, left_context=4)
+    rid = "r-buffer-source"
+    tm.code_prompt_token_ids[rid] = [[9, 9, 9, 9]]
+
+    assert _call_one_frame(tm, rid, frame=[1, 2, 3, 4], req_ic=2) is None
+    payload = _call_one_frame(tm, rid, frame=[5, 6, 7, 8], req_ic=2)
+
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [1, 5, 2, 6, 3, 7, 4, 8]
+
+
+def test_async_chunk_legacy_prompt_ids_normalize_tensor_frames(monkeypatch):
+    tm = _tm(chunk_frames=4, left_context=4)
+    rid = "r-legacy-tensors"
+    tm.code_prompt_token_ids[rid] = [
+        torch.tensor([1, 2, 3, 4], dtype=torch.long),
+        torch.tensor([5, 6, 7, 8], dtype=torch.long),
+    ]
+    calls = 0
+    orig = qwen3_tts_mod._legacy_code_prompt_tensor
+
+    def _counting_legacy_tensor(transfer_manager, request_id, legacy_cache=None):
+        nonlocal calls
+        calls += 1
+        return orig(transfer_manager, request_id)
+
+    monkeypatch.setattr(qwen3_tts_mod, "_legacy_code_prompt_tensor", _counting_legacy_tensor)
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"codes": {"audio": torch.zeros((0,))}},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [1, 5, 2, 6, 3, 7, 4, 8]
+    assert calls == 1
 
 
 def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
@@ -375,12 +557,13 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
 
 
 def test_non_async_processor_filters_out_of_range_codec_values():
-    """Frames with values >= codebook_size (e.g. stop_token_id=2150) are filtered."""
+    """Frames with invalid codec ids are filtered before Code2Wav."""
     ref_code = torch.tensor([[9, 9, 9, 9]], dtype=torch.long)
     audio_codes = torch.tensor(
         [
             [0, 0, 0, 0],  # zero-padded (filtered)
             [1, 2, 3, 4],  # valid
+            [-1, -1, -1, -1],  # negative ids (filtered)
             [2150, 0, 0, 0],  # stop token (filtered)
             [5, 6, 7, 8],  # valid
         ],

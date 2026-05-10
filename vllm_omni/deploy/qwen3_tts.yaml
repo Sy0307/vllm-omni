@@ -27,11 +27,24 @@ connectors:
       codec_chunk_frames: 25
       codec_left_context_frames: 72
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      # This is a latency-oriented default; keep audio-quality smoke coverage
+      # when changing it.
       initial_codec_chunk_frames: 1
+      # Internal Code2Wav CUDA graph batch buckets for common Stage1 batch sizes.
+      decode_capture_batch_sizes: [1, 2, 4, 8, 10]
+      # Let first-audio chunks enter Stage1 before follow-up chunks monopolize slots.
+      prioritize_initial_chunks: true
+      # Voice-clone ref_code context policy. Keep full context by default for quality.
+      # Performance experiments may opt into:
+      #   ref_code_context_policy: tail
+      #   ref_code_context_tail_frames: 32
+      ref_code_context_policy: full
 
 stages:
   - stage_id: 0
-    max_num_seqs: 10
+    # High-concurrency latency default validated for Qwen3-TTS; lower this
+    # on memory-constrained deployments.
+    max_num_seqs: 64
     gpu_memory_utilization: 0.3
     trust_remote_code: true
     enable_prefix_caching: false

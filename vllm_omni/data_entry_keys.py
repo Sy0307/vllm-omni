@@ -58,7 +58,7 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
-    finished: torch.Tensor
+    finished: bool | torch.Tensor
     stream_finished: torch.Tensor
     req_id: list[str]
     left_context_size: int
@@ -77,6 +77,9 @@ class OmniPayloadMeta(TypedDict, total=False):
     codec_streaming: bool
     ref_code_len: int
     talker_prefill_offset: int
+    talker_text_offset: int
+    codec_window_frames: int
+    codec_ref_context_frames: int
 
 
 class OmniPayload(TypedDict, total=False):
@@ -160,6 +163,9 @@ class MetaStruct(_StructBase):
     codec_streaming: bool | None = None
     ref_code_len: int | None = None
     talker_prefill_offset: int | None = None
+    talker_text_offset: int | None = None
+    codec_window_frames: int | None = None
+    codec_ref_context_frames: int | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None

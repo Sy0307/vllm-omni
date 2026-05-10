@@ -263,6 +263,25 @@ def test_batch_size_gt1_falls_back(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
+def test_batch_size_gt1_uses_configured_capture_bucket(decoder):
+    """Configured batch buckets allow batched Code2Wav chunks to hit CUDA graphs."""
+    wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25],
+        capture_batch_sizes=[1, 2],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    wrapper.warmup(DEVICE)
+    assert (2, 25) in wrapper.graphs
+
+    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = wrapper.decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
 def test_deterministic_across_calls(decoder, wrapper):
     """Same input should produce identical CUDA graph output across calls."""
     codes = _random_codes(30)
@@ -280,15 +299,15 @@ def test_deterministic_across_calls(decoder, wrapper):
 @pytest.mark.parametrize(
     "kwargs,expected_in,not_expected",
     [
-        ({}, [2, 4, 8, 16, 32, 64, 128, 256, 325], [512]),
+        ({}, [2, 4, 8, 16, 32, 64, 128, 256, 300, 325], [512]),
         (
             {"codec_chunk_frames": 33, "codec_left_context_frames": 25},
-            [2, 4, 8, 16, 32, 33, 58, 64, 128, 256, 325],
+            [2, 4, 8, 16, 32, 33, 58, 64, 128, 256, 300, 325],
             [512],
         ),
         (
             {"codec_chunk_frames": 25, "codec_left_context_frames": 25},
-            [2, 4, 8, 16, 25, 32, 50, 64, 128, 256, 325],
+            [2, 4, 8, 16, 25, 32, 50, 64, 128, 256, 300, 325],
             [512],
         ),
         (
@@ -298,7 +317,7 @@ def test_deterministic_across_calls(decoder, wrapper):
                 "decode_chunk_size": 400,
                 "decode_left_context": 17,
             },
-            [2, 4, 8, 16, 25, 32, 64, 97, 128, 256, 417],
+            [2, 4, 8, 16, 25, 32, 64, 97, 128, 256, 400, 417],
             [325, 512],
         ),
     ],
