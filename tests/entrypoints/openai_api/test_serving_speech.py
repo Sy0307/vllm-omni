@@ -170,6 +170,15 @@ def create_mock_audio_output_for_test(
     )
 
 
+def _write_custom_voice_manifest(root: Path, *, model_type: str, voices: dict) -> None:
+    payload = {
+        "schema_version": 1,
+        "model_type": model_type,
+        "voices": voices,
+    }
+    (root / "custom_voice_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
 @pytest.fixture
 def test_app(mocker: MockerFixture):
     # Mock the engine client
@@ -971,6 +980,182 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
         params = speech_server._build_tts_params(req)
         assert "voice_clone_prompt" not in params
+
+    def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
+        """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.precomputed_speakers = {
+            "alice": {
+                "name": "Alice",
+                "model_type": "qwen3_tts",
+                "mode": "icl",
+                "ref_text": "reference transcript",
+                "ref_code_length": 3,
+            }
+        }
+        speech_server.supported_speakers = {"alice"}
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Alice")
+        assert speech_server._validate_tts_request(req) is None
+        assert req.task_type == "Base"
+
+        params = speech_server._build_tts_params(req)
+        assert params["task_type"] == ["Base"]
+        assert params["speaker"] == ["alice"]
+        assert params["x_vector_only_mode"] == [False]
+        assert params["ref_text"] == ["reference transcript"]
+        assert params["ref_code_length"] == [3]
+        assert "ref_audio" not in params
+
+    def test_uploaded_qwen3_voice_wins_over_same_named_precomputed_voice(self, speech_server, mocker, tmp_path):
+        """Qwen3 uploaded voices should take precedence over same-name precomputed voices."""
+        uploaded_path = tmp_path / "alice.safetensors"
+        uploaded_path.write_bytes(b"placeholder")
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.uploaded_speakers = {
+            "alice": {
+                "name": "alice",
+                "created_at": 123,
+                "file_path": str(uploaded_path),
+                "embedding_source": "direct",
+            }
+        }
+        speech_server.precomputed_speakers = {
+            "alice": {
+                "name": "Alice",
+                "model_type": "qwen3_tts",
+                "mode": "icl",
+                "ref_text": "precomputed transcript",
+                "ref_code_length": 3,
+            }
+        }
+        mocker.patch.object(speech_server, "_get_uploaded_speaker_embedding", return_value=[0.1] * 4)
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Alice")
+        assert speech_server._validate_tts_request(req) is None
+
+        params = speech_server._build_tts_params(req)
+        assert params["speaker"] == ["alice"]
+        assert params["voice_created_at"] == [123]
+        assert params["task_type"] == ["Base"]
+        assert "voice_clone_prompt" in params
+        assert "ref_code_length" not in params
+        assert params.get("ref_text") != ["precomputed transcript"]
+
+    def test_precomputed_qwen3_missing_safetensors_is_not_registered(self, speech_server, tmp_path):
+        """Manifest entries are not supported speakers unless their safetensors load."""
+        _write_custom_voice_manifest(
+            tmp_path,
+            model_type="qwen3_tts",
+            voices={"Alice": {"file": "missing.safetensors", "mode": "xvec", "embedding_dim": 4}},
+        )
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                custom_voice_dir=str(tmp_path),
+                talker_config=SimpleNamespace(hidden_size=4),
+            )
+        )
+
+        profiles = speech_server._load_precomputed_speakers()
+        assert profiles == {}
+
+        speech_server.precomputed_speakers = profiles
+        speech_server.supported_speakers = set(profiles)
+        assert "alice" not in speech_server.supported_speakers
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Alice")
+        assert speech_server._validate_tts_request(req) is not None
+
+    def test_precomputed_qwen3_icl_without_ref_code_is_not_registered(self, speech_server, tmp_path):
+        """Qwen3 ICL profiles without ref_code cannot be exposed by the API layer."""
+        from safetensors.torch import save_file
+
+        save_file({"speaker_embedding": torch.arange(4, dtype=torch.float32)}, str(tmp_path / "alice.safetensors"))
+        _write_custom_voice_manifest(
+            tmp_path,
+            model_type="qwen3_tts",
+            voices={
+                "Alice": {
+                    "file": "alice.safetensors",
+                    "mode": "icl",
+                    "ref_text": "reference transcript",
+                    "embedding_dim": 4,
+                }
+            },
+        )
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                custom_voice_dir=str(tmp_path),
+                talker_config=SimpleNamespace(hidden_size=4),
+            )
+        )
+
+        profiles = speech_server._load_precomputed_speakers()
+        assert profiles == {}
+
+        speech_server.precomputed_speakers = profiles
+        speech_server.supported_speakers = set(profiles)
+        assert "alice" not in speech_server.supported_speakers
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Alice")
+        assert speech_server._validate_tts_request(req) is not None
+
+    def test_precomputed_voxcpm2_missing_safetensors_is_not_registered(self, speech_server, tmp_path):
+        """VoxCPM2 must not advertise a manifest-only voice that cannot hit prompt cache."""
+        _write_custom_voice_manifest(
+            tmp_path,
+            model_type="voxcpm2",
+            voices={"Bob": {"file": "missing.safetensors", "mode": "reference", "ref_audio_feat_len": 2}},
+        )
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(custom_voice_dir=str(tmp_path))
+        )
+
+        profiles = speech_server._load_precomputed_speakers()
+        assert profiles == {}
+
+        speech_server.precomputed_speakers = profiles
+        speech_server.supported_speakers = set(profiles)
+        assert "bob" not in speech_server.supported_speakers
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Bob")
+        assert speech_server._validate_tts_request(req) is not None
+        assert speech_server._validate_tts_request(OpenAICreateSpeechRequest(input="Hello")) is None
+
+    def test_prepare_voxcpm2_rejects_supported_speaker_without_voice_profile(self, speech_server, mocker):
+        """VoxCPM2 named voices must be uploaded or precomputed on the real request path."""
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server.supported_speakers = {"bob", "default"}
+        speech_server.uploaded_speakers = {}
+        speech_server.precomputed_speakers = {}
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value="generator")
+        speech_server._build_voxcpm2_prompt = mocker.AsyncMock(
+            return_value={"prompt_token_ids": [1], "additional_information": {}}
+        )
+
+        with pytest.raises(ValueError, match="Invalid voice 'bob'"):
+            asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+
+        speech_server._build_voxcpm2_prompt.assert_not_awaited()
+        speech_server.engine_client.generate.assert_not_called()
+
+    def test_prepare_voxcpm2_accepts_default_voice(self, speech_server, mocker):
+        """VoxCPM2 default voice preserves the built-in zero-shot request path."""
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server.supported_speakers = {"default"}
+        speech_server.uploaded_speakers = {}
+        speech_server.precomputed_speakers = {}
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._build_voxcpm2_prompt = mocker.AsyncMock(
+            return_value={"prompt_token_ids": [1], "additional_information": {}}
+        )
+
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="default")))
+
+        speech_server._build_voxcpm2_prompt.assert_awaited_once()
+        speech_server.engine_client.generate.assert_called_once()
 
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""

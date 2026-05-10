@@ -55,7 +55,11 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.utils.speaker_cache import (
+    get_speaker_cache,
+    iter_custom_voice_profiles,
+    load_validated_profile_tensors,
+)
 
 logger = init_logger(__name__)
 
@@ -261,6 +265,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning("Invalid SPEAKER_MAX_UPLOADED=%r; using default 1000", _raw_cap)
             self._max_uploaded_speakers = 1000
         self.uploaded_speakers: dict[str, dict] = {}
+        self.precomputed_speakers: dict[str, dict[str, Any]] = {}
         self.supported_speakers: set[str] = set()
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._speaker_cache = get_speaker_cache()
@@ -395,6 +400,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
+        self.precomputed_speakers = self._load_precomputed_speakers()
 
         # GLM-TTS lazy-cached resources (populated on first GLM-TTS request)
         self._glm_tts_text_tokenizer: object | None = None
@@ -405,6 +411,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Merge built-in speakers into the set initialized by _init_speaker_storage.
         self.supported_speakers |= self._load_supported_speakers()
+        self.supported_speakers |= set(self.precomputed_speakers)
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
@@ -569,6 +576,45 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
         return None
+
+    def _get_custom_voice_dir(self) -> str | None:
+        try:
+            value = getattr(self.engine_client.model_config.hf_config, "custom_voice_dir", None)
+        except AttributeError:
+            return None
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        if isinstance(value, str) and value:
+            return value
+        return None
+
+    def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
+        """Load precomputed voice names from ``custom_voice_dir`` for API validation."""
+        if self._tts_model_type not in ("qwen3_tts", "voxcpm2"):
+            return {}
+        custom_voice_dir = self._get_custom_voice_dir()
+        if not custom_voice_dir:
+            return {}
+
+        profiles: dict[str, dict[str, Any]] = {}
+        qwen3_embedding_dim = self._get_qwen_tts_expected_speaker_embedding_dim()
+        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type=self._tts_model_type):
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type=self._tts_model_type,
+                qwen3_embedding_dim=qwen3_embedding_dim,
+            )
+            if tensors is None:
+                continue
+            profiles[profile["voice_name_lower"]] = profile
+        if profiles:
+            logger.info(
+                "Loaded %d precomputed %s voice profile(s) from %s",
+                len(profiles),
+                self._tts_model_type,
+                custom_voice_dir,
+            )
+        return profiles
 
     def _compute_max_instructions_length(self) -> int:
         """Compute max instructions length with precedence: CLI > stage config > default.
@@ -748,11 +794,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._voxcpm2_encode("")  # lazy-init tokenizer + split_map
         ref_audio = None
         ref_sr = None
+        voice_profile = None
         if request.ref_audio is not None:
             ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
         elif uploaded_ref is not None:
             wav_np, ref_sr = uploaded_ref
             ref_audio = wav_np.tolist()
+        elif request.voice is not None:
+            voice_profile = self.precomputed_speakers.get(request.voice.lower())
         return build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
@@ -761,6 +810,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=request.ref_text,
+            voice_profile=voice_profile,
         )
 
     def _load_uploaded_audio(self, voice_name: str) -> tuple[np.ndarray, int] | None:
@@ -1205,12 +1255,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "cosyvoice3":
             return self._validate_cosyvoice3_request(request)
         if self._tts_model_type == "voxcpm2":
-            if request.max_new_tokens is not None:
-                if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
-                    return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
-                if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
-                    return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
-            return None  # VoxCPM2 accepts any text input
+            return self._validate_voxcpm2_request(request)
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
@@ -1218,6 +1263,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
         return self._validate_qwen_tts_request(request)
+
+    def _validate_voxcpm2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate VoxCPM2 request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        if request.voice is not None:
+            request.voice = request.voice.lower()
+            available_voices = set(self.uploaded_speakers) | set(self.precomputed_speakers) | {"default"}
+            if request.voice not in available_voices:
+                supported = ", ".join(sorted(available_voices)) or "none"
+                return f"Invalid voice '{request.voice}'. Supported: {supported}"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
         """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
@@ -1315,11 +1380,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
         if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
             request.task_type = "Base"
-        task_type = request.task_type or "CustomVoice"
 
         # Normalize voice to lowercase for case-insensitive matching
         if request.voice is not None:
             request.voice = request.voice.lower()
+            if request.task_type is None and request.voice in self.precomputed_speakers:
+                request.task_type = "Base"
+        task_type = request.task_type or "CustomVoice"
 
         # Validate input is not empty
         if not request.input or not request.input.strip():
@@ -1379,6 +1446,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     file_path = Path(speaker_info["file_path"])
                     if not file_path.exists():
                         return f"Data file for uploaded speaker '{request.voice}' not found on disk"
+                elif voice_lower in self.precomputed_speakers:
+                    profile = self.precomputed_speakers[voice_lower]
+                    mode = str(profile.get("mode") or "xvec").lower()
+                    ref_text = request.ref_text or profile.get("ref_text")
+                    if mode == "icl" and (not isinstance(ref_text, str) or not ref_text.strip()):
+                        return (
+                            f"Precomputed voice '{request.voice}' uses ICL mode but has no ref_text in "
+                            "the request or custom voice manifest"
+                        )
                 else:
                     # need ref_audio for built-in speaker
                     if request.ref_audio is None:
@@ -1893,13 +1969,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Speaker (voice)
         if request.voice is not None:
+            voice_lower = request.voice.lower()
             params["speaker"] = [request.voice]
-            params["voice_created_at"] = [self._voice_created_at(request.voice.lower())]
+            params["voice_created_at"] = [self._voice_created_at(voice_lower)]
 
             # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
             # If ref_text was provided at upload time, use in-context cloning; otherwise x_vector only.
-            if request.voice.lower() in self.uploaded_speakers and request.ref_audio is None:
-                speaker_info = self.uploaded_speakers[request.voice.lower()]
+            if voice_lower in self.uploaded_speakers and request.ref_audio is None:
+                speaker_info = self.uploaded_speakers[voice_lower]
 
                 # Check if this voice was uploaded with a pre-computed embedding.
                 # Populate request.speaker_embedding so the existing code path
@@ -1907,6 +1984,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 embedding = self._get_uploaded_speaker_embedding(request.voice)
                 if embedding is not None:
                     request.speaker_embedding = embedding
+                    params["speaker"] = [voice_lower]
                     params["task_type"] = ["Base"]
                     logger.info("Auto-set speaker_embedding for uploaded voice: %s", request.voice)
                 else:
@@ -1914,6 +1992,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if not audio_data:
                         raise ValueError(f"Audio file for uploaded voice '{request.voice}' is missing or corrupted")
                     stored_ref_text = speaker_info.get("ref_text")
+                    params["speaker"] = [voice_lower]
                     params["ref_audio"] = [audio_data]
                     params["task_type"] = ["Base"]
                     if stored_ref_text:
@@ -1924,6 +2003,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     logger.info(
                         "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
                     )
+            elif voice_lower in self.precomputed_speakers and request.ref_audio is None:
+                profile = self.precomputed_speakers[voice_lower]
+                mode = str(profile.get("mode") or "xvec").lower()
+                params["speaker"] = [voice_lower]
+                params["task_type"] = ["Base"]
+                params["x_vector_only_mode"] = [mode != "icl"]
+                ref_text = request.ref_text or profile.get("ref_text")
+                if isinstance(ref_text, str) and ref_text.strip():
+                    params["ref_text"] = [ref_text]
+                ref_code_length = profile.get("ref_code_length")
+                if mode == "icl" and ref_code_length:
+                    params["ref_code_length"] = [int(ref_code_length)]
+                logger.info("Using precomputed Qwen3-TTS custom voice profile: %s (mode=%s)", voice_lower, mode)
 
         elif params["task_type"][0] == "CustomVoice":
             params["speaker"] = ["Vivian"]  # Default for CustomVoice
@@ -2412,12 +2504,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "voxcpm2":
             # voxcpm2 doesn't use `_apply_uploaded_speaker` because the prompt builder needs the
             # raw waveform tuple for prefill-length accounting, not a base64 data URL.
+            validation_error = self._validate_voxcpm2_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+
             uploaded_ref: tuple[np.ndarray, int] | None = None
             if request.voice:
                 voice_lower = request.voice.lower()
-                if voice_lower not in self.uploaded_speakers and voice_lower not in self.supported_speakers:
-                    all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
-                    raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
                 if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
                     if self.uploaded_speakers[voice_lower].get("embedding_source") == "direct":
                         raise ValueError(
@@ -2430,7 +2523,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             if request.voice:
                 voice_lower = request.voice.lower()
-                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                if voice_lower in self.uploaded_speakers or voice_lower in self.precomputed_speakers:
                     additional = prompt.setdefault("additional_information", {})
                     additional["voice_name"] = voice_lower
                     additional["voice_created_at"] = self._voice_created_at(voice_lower)
