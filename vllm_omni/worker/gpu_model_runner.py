@@ -1175,6 +1175,22 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         return req_infos
 
+    def _maybe_run_batch_preprocess(self, req_ids: list[str], device: torch.device) -> None:
+        """Run an optional model-specific batch preprocess hook.
+
+        The generic runner only supplies current request ids and the runner-owned
+        intermediate buffer; model-specific code decides whether there is any
+        batchable work.
+        """
+        preprocess_batch = getattr(self.model, "preprocess_batch", None)
+        if not callable(preprocess_batch):
+            return
+        preprocess_batch(
+            req_ids=req_ids,
+            model_intermediate_buffer=self.model_intermediate_buffer,
+            device=device,
+        )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1301,6 +1317,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._update_additional_information(scheduler_output)
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
+            preprocess_device = input_ids.device if input_ids is not None else inputs_embeds.device
+            self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
+
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []

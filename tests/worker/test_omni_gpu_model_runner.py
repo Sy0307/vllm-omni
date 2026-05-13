@@ -357,3 +357,20 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def test_maybe_run_batch_preprocess_calls_optional_model_hook():
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    calls = []
+
+    class ModelWithBatchPreprocess:
+        def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device):
+            calls.append((req_ids, model_intermediate_buffer, device))
+
+    runner.model = ModelWithBatchPreprocess()
+    runner.model_intermediate_buffer = {"r1": {"x": 1}}
+    device = torch.device("cpu")
+
+    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1", "r2"], device)
+
+    assert calls == [(["r1", "r2"], runner.model_intermediate_buffer, device)]
