@@ -121,6 +121,23 @@ class TestStageConfig:
         # max_batch_size is migrated to engine_args.max_num_seqs
         assert omega_config.engine_args.max_num_seqs == 64
 
+    def test_to_omegaconf_routes_num_replicas_override_to_runtime(self):
+        """num_replicas is a runtime topology field, not an EngineArgs field."""
+        config = StageConfig(
+            stage_id=1,
+            model_stage="talker",
+            runtime_overrides={
+                "devices": "1,2",
+                "num_replicas": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.runtime.devices == "1,2"
+        assert omega_config.runtime.num_replicas == 2
+        assert "num_replicas" not in omega_config.engine_args
+
     def test_to_omegaconf_max_batch_size_deprecation(self):
         """Test that runtime.max_batch_size emits a FutureWarning."""
         import warnings
