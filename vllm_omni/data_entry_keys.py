@@ -76,6 +76,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     decode_flag: bool
     codec_streaming: bool
     ref_code_len: int
+    ref_context_size: int
+    ref_context_included: bool
     talker_prefill_offset: int
 
 
@@ -164,6 +166,8 @@ class MetaStruct(_StructBase):
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
+    ref_context_size: int | None = None
+    ref_context_included: bool | None = None
 
 
 class OmniPayloadStruct(_StructBase):

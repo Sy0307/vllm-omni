@@ -134,6 +134,23 @@ def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
+def _normalize_ref_code(ref_code: torch.Tensor, num_quantizers: int) -> torch.Tensor | None:
+    ref_code = ref_code.to(dtype=torch.long, device="cpu").contiguous()
+    if ref_code.ndim == 1:
+        if ref_code.numel() % num_quantizers != 0:
+            logger.warning(
+                "Ignoring malformed ref_code with %d elements not divisible by num_quantizers=%d",
+                ref_code.numel(),
+                num_quantizers,
+            )
+            return None
+        ref_code = ref_code.reshape(-1, num_quantizers)
+    elif ref_code.ndim != 2:
+        logger.warning("Ignoring malformed ref_code shape %s", tuple(ref_code.shape))
+        return None
+    return ref_code
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: OmniPayload | None,
@@ -244,10 +261,20 @@ def talker2code2wav_async_chunk(
     # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
     # subsequent chunks.
     ref_code = request_payload.get(request_id)
+    ref_context_size = 0
+    ref_context_request_id: str | None = None
+    ref_context_included = False
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_frames = ref_code.tolist()
-        window_frames = ref_frames + window_frames
-        left_context_size += len(ref_frames)
+        ref_code = _normalize_ref_code(ref_code, len(window_frames[0]))
+        if ref_code is not None and ref_code.numel() > 0:
+            ref_frames = ref_code.tolist()
+            ref_context_size = int(ref_code.shape[0])
+            ref_context_request_id = request_id
+            emitted_chunks = transfer_manager.put_req_chunk.get(request_id, 0)
+            if int(emitted_chunks) <= 0:
+                window_frames = ref_frames + window_frames
+                left_context_size += ref_context_size
+                ref_context_included = True
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
@@ -256,12 +283,16 @@ def talker2code2wav_async_chunk(
         dtype=torch.long,
     )
 
+    meta = MetaStruct(
+        left_context_size=left_context_size,
+        finished=torch.tensor(finished, dtype=torch.bool),
+        req_id=[ref_context_request_id] if ref_context_request_id is not None else None,
+        ref_context_size=ref_context_size if ref_context_size > 0 else None,
+        ref_context_included=ref_context_included if ref_context_size > 0 else None,
+    )
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
-        meta=MetaStruct(
-            left_context_size=left_context_size,
-            finished=torch.tensor(finished, dtype=torch.bool),
-        ),
+        meta=meta,
         speaker=extract_speaker_from_request(request),
         language=extract_language_from_request(request),
     )

@@ -59,6 +59,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._output_sample_rate = int(tok_config.output_sample_rate)
         self._total_upsample = int(self.decoder.total_upsample)
         self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
+        self._ref_context_cache: dict[str, torch.Tensor] = {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -131,13 +132,47 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
+        ref_context_size = [0] * len(request_ids_list)
+        ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
+        ref_context_included = [False] * len(request_ids_list)
+        finished_flags = [False] * len(request_ids_list)
+
+        def _meta_int(value: Any) -> int:
+            if isinstance(value, list):
+                value = value[0] if value else 0
+            if isinstance(value, torch.Tensor):
+                value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
+            return int(value or 0)
+
+        def _meta_bool(value: Any) -> bool:
+            if isinstance(value, list):
+                value = value[0] if value else False
+            if isinstance(value, torch.Tensor):
+                return bool(value.reshape(-1)[0].item()) if value.numel() > 0 else False
+            return bool(value)
+
+        def _meta_str(value: Any) -> str | None:
+            if isinstance(value, list):
+                value = value[0] if value else None
+            if isinstance(value, torch.Tensor):
+                return None
+            return str(value) if value is not None else None
+
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
                 meta = info.get("meta", {})
                 if "left_context_size" in meta:
-                    left_context_size[i] = meta["left_context_size"]
+                    left_context_size[i] = _meta_int(meta["left_context_size"])
+                if "ref_context_size" in meta:
+                    ref_context_size[i] = _meta_int(meta["ref_context_size"])
+                if "req_id" in meta:
+                    ref_context_request_ids[i] = _meta_str(meta["req_id"])
+                if "ref_context_included" in meta:
+                    ref_context_included[i] = _meta_bool(meta["ref_context_included"])
+                if "finished" in meta:
+                    finished_flags[i] = _meta_bool(meta["finished"])
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
@@ -157,6 +192,27 @@ class Qwen3TTSCode2Wav(nn.Module):
             frames = n // q
             # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
             codes_qf = flat.reshape(q, frames)
+            ref_req_id = ref_context_request_ids[i]
+            ref_ctx_frames = ref_context_size[i]
+            if ref_req_id is not None and ref_ctx_frames > 0:
+                if ref_context_included[i]:
+                    if frames < ref_ctx_frames:
+                        raise RuntimeError(
+                            "Qwen3-TTS Code2Wav got ref_context_included=True "
+                            f"but frames={frames} < ref_context_size={ref_ctx_frames}"
+                        )
+                    self._ref_context_cache[ref_req_id] = codes_qf[:, :ref_ctx_frames].contiguous()
+                else:
+                    cached_ref = self._ref_context_cache.get(ref_req_id)
+                    if cached_ref is None or cached_ref.shape[0] != q or cached_ref.shape[1] < ref_ctx_frames:
+                        raise RuntimeError(
+                            "Qwen3-TTS Code2Wav missing cached ref_code prefix "
+                            f"for request {ref_req_id!r}"
+                        )
+                    ref_prefix = cached_ref[:, :ref_ctx_frames].to(device=codes_qf.device)
+                    codes_qf = torch.cat((ref_prefix, codes_qf), dim=1)
+                    ctx_frames += int(ref_prefix.shape[1])
+                    frames += int(ref_prefix.shape[1])
             parsed.append((ctx_frames, frames))
             valid_codes_qf.append(codes_qf)
             valid_indices.append(i)
@@ -223,6 +279,10 @@ class Qwen3TTSCode2Wav(nn.Module):
             wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
+
+        for idx, req_id in enumerate(ref_context_request_ids):
+            if req_id is not None and idx < len(finished_flags) and finished_flags[idx]:
+                self._ref_context_cache.pop(req_id, None)
 
         return OmniOutput(
             text_hidden_states=None,

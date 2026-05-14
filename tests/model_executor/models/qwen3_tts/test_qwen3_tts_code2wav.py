@@ -24,6 +24,7 @@ class _FakeDecoder(nn.Module):
         super().__init__()
         self.total_upsample = total_upsample
         self.decode_calls: list[dict[str, int]] = []
+        self.decode_inputs: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
     def to(self, *args, **kwargs):
@@ -36,6 +37,7 @@ class _FakeDecoder(nn.Module):
         chunk_size: int = 300,
         left_context_size: int = 25,
     ) -> torch.Tensor:
+        self.decode_inputs.append(codes.detach().cpu().clone())
         self.decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -137,6 +139,120 @@ def test_forward_trims_context_on_exact_frame_boundaries():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(8, 24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_forward_caches_ref_prefix_and_reconstructs_followup_chunk():
+    model = _make_model()
+
+    first = torch.tensor(
+        [
+            9,
+            8,
+            1,
+            3,
+            5,
+            7,
+            9,
+            8,
+            2,
+            4,
+            6,
+            8,
+        ],
+        dtype=torch.long,
+    )
+    model.forward(
+        input_ids=first,
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 2,
+                    "ref_context_size": 2,
+                    "req_id": ["req-ref"],
+                    "ref_context_included": True,
+                }
+            }
+        ],
+    )
+    torch.testing.assert_close(
+        model.decoder.decode_inputs[-1],
+        torch.tensor([[[9, 8, 1, 3, 5, 7], [9, 8, 2, 4, 6, 8]]], dtype=torch.long),
+    )
+
+    followup_window_only = torch.tensor([3, 5, 7, 9, 4, 6, 8, 10], dtype=torch.long)
+    model.forward(
+        input_ids=followup_window_only,
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 1,
+                    "ref_context_size": 2,
+                    "req_id": ["req-ref"],
+                    "ref_context_included": False,
+                }
+            }
+        ],
+    )
+
+    torch.testing.assert_close(
+        model.decoder.decode_inputs[-1],
+        torch.tensor([[[9, 8, 3, 5, 7, 9], [9, 8, 4, 6, 8, 10]]], dtype=torch.long),
+    )
+
+
+def test_forward_raises_if_ref_prefix_cache_is_missing_for_followup_chunk():
+    model = _make_model()
+
+    with pytest.raises(RuntimeError, match="missing cached ref_code prefix"):
+        model.forward(
+            input_ids=torch.arange(8, dtype=torch.long),
+            runtime_additional_information=[
+                {
+                    "meta": {
+                        "left_context_size": 1,
+                        "ref_context_size": 2,
+                        "req_id": ["missing-ref"],
+                        "ref_context_included": False,
+                    }
+                }
+            ],
+        )
+
+
+def test_forward_clears_ref_prefix_cache_when_request_finishes():
+    model = _make_model()
+
+    model.forward(
+        input_ids=torch.tensor([9, 8, 1, 3, 9, 8, 2, 4], dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 2,
+                    "ref_context_size": 2,
+                    "req_id": ["done-ref"],
+                    "ref_context_included": True,
+                }
+            }
+        ],
+    )
+    assert "done-ref" in model._ref_context_cache
+
+    model.forward(
+        input_ids=torch.tensor([1, 3, 2, 4], dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 0,
+                    "ref_context_size": 2,
+                    "req_id": ["done-ref"],
+                    "ref_context_included": False,
+                    "finished": torch.tensor(True, dtype=torch.bool),
+                }
+            }
+        ],
+    )
+
+    assert "done-ref" not in model._ref_context_cache
 
 
 def test_forward_trims_trailing_padding_without_context():

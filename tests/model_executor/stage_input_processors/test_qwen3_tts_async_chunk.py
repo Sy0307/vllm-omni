@@ -269,11 +269,13 @@ def test_first_streaming_chunk_prepends_ref_code_context():
 
     assert payload is not None
     assert payload.meta.left_context_size == 2
+    assert payload.meta.ref_context_size == 2
+    assert payload.meta.req_id == [rid]
+    assert payload.meta.ref_context_included is True
     assert len(payload.codes.audio) == _Q * 12
 
 
-def test_ref_code_context_applies_to_all_streaming_chunks():
-    """ref_code is prepended as decoder context on every chunk, not just the first."""
+def test_followup_streaming_chunk_sends_window_only_with_ref_context_metadata():
     tm = _tm()
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
@@ -289,9 +291,13 @@ def test_ref_code_context_applies_to_all_streaming_chunks():
     )
 
     assert payload is not None
-    # ref_code (2 frames) prepended as left context on second chunk too
-    assert payload.meta.left_context_size == 10 + 2
-    assert len(payload.codes.audio) == _Q * (35 + 2)
+    # The follow-up payload only carries the codec window. Code2Wav uses the
+    # first chunk's cached ref prefix to reconstruct the old full input.
+    assert payload.meta.left_context_size == 10
+    assert payload.meta.ref_context_size == 2
+    assert payload.meta.req_id == [rid]
+    assert payload.meta.ref_context_included is False
+    assert len(payload.codes.audio) == _Q * 35
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
