@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+import vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker as qwen3_tts_talker
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
     _NORMALIZED_REF_AUDIO_KEY,
     _PRECOMPUTED_REF_CODE_KEY,
@@ -239,6 +240,82 @@ def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
     assert ref_audio_ids == [id(ref_audio), id(ref_audio)]
     assert ref_code_len == 2
     assert torch.equal(ref_code, torch.ones((2, 2), dtype=torch.long))
+
+
+def test_extract_speaker_embedding_runs_mel_on_model_device(monkeypatch):
+    model = _make_minimal_talker()
+    model.config = SimpleNamespace(
+        speaker_encoder_config=SimpleNamespace(sample_rate=24000),
+    )
+    model.parameters = lambda: iter([torch.nn.Parameter(torch.empty(0, device="meta"))])
+    seen = {}
+
+    def fake_mel_spectrogram(wav_tensor, **_kwargs):
+        seen["mel_input_device"] = wav_tensor.device
+        seen["mel_input_dtype"] = wav_tensor.dtype
+        return torch.empty((1, 128, 4), device=wav_tensor.device)
+
+    class FakeSpeakerEncoder:
+        def parameters(self):
+            return iter(())
+
+        def __call__(self, mels):
+            seen["speaker_input_device"] = mels.device
+            seen["speaker_input_dtype"] = mels.dtype
+            return torch.empty((1, 8), device=mels.device, dtype=mels.dtype)
+
+    monkeypatch.setattr(qwen3_tts_talker, "mel_spectrogram", fake_mel_spectrogram)
+    model.speaker_encoder = FakeSpeakerEncoder()
+
+    out = model._extract_speaker_embedding(np.ones(256, dtype=np.float32), 24000)
+
+    assert seen["mel_input_device"].type == "meta"
+    assert seen["mel_input_dtype"] == torch.float32
+    assert seen["speaker_input_device"].type == "meta"
+    assert seen["speaker_input_dtype"] == torch.bfloat16
+    assert out.device.type == "meta"
+    assert out.dtype == torch.bfloat16
+
+
+def test_extract_speaker_embedding_reuses_mel_buffers(monkeypatch):
+    model = _make_minimal_talker()
+    model.config = SimpleNamespace(
+        speaker_encoder_config=SimpleNamespace(sample_rate=24000),
+    )
+    model.parameters = lambda: iter([torch.nn.Parameter(torch.empty(0))])
+    seen = {"mel_filter_bank": 0, "hann_window": 0}
+
+    def fake_mel_filter_bank(*, sr, n_fft, n_mels, fmin, fmax):
+        seen["mel_filter_bank"] += 1
+        assert sr == 24000
+        assert n_fft == 1024
+        assert n_mels == 128
+        assert fmin == 0
+        assert fmax == 12000
+        return torch.ones((n_mels, n_fft // 2 + 1), dtype=torch.float32)
+
+    original_hann_window = torch.hann_window
+
+    def fake_hann_window(*args, **kwargs):
+        seen["hann_window"] += 1
+        return original_hann_window(*args, **kwargs)
+
+    class FakeSpeakerEncoder:
+        def parameters(self):
+            return iter(())
+
+        def __call__(self, mels):
+            return torch.empty((1, 8), device=mels.device, dtype=mels.dtype)
+
+    monkeypatch.setattr(qwen3_tts_talker, "mel_filter_bank", fake_mel_filter_bank)
+    monkeypatch.setattr(qwen3_tts_talker.torch, "hann_window", fake_hann_window)
+    model.speaker_encoder = FakeSpeakerEncoder()
+
+    wav = np.linspace(-0.5, 0.5, 4096, dtype=np.float32)
+    model._extract_speaker_embedding(wav, 24000)
+    model._extract_speaker_embedding(wav, 24000)
+
+    assert seen == {"mel_filter_bank": 1, "hann_window": 1}
 
 
 def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():

@@ -265,6 +265,8 @@ def mel_spectrogram(
     fmin: int,
     fmax: int | None = None,
     center: bool = False,
+    mel_basis: torch.Tensor | None = None,
+    hann_window: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculate mel spectrogram of an input signal using torchaudio mel filterbank and torch STFT."""
     if torch.min(y) < -1.0:
@@ -272,14 +274,20 @@ def mel_spectrogram(
     if torch.max(y) > 1.0:
         logger.warning("Max value of input waveform signal is %s", torch.max(y))
     device = y.device
-    mel_basis = mel_filter_bank(
-        sr=sampling_rate,
-        n_fft=n_fft,
-        n_mels=num_mels,
-        fmin=fmin,
-        fmax=fmax,
-    ).to(device)
-    hann_window = torch.hann_window(win_size).to(device)
+    if mel_basis is None:
+        mel_basis = mel_filter_bank(
+            sr=sampling_rate,
+            n_fft=n_fft,
+            n_mels=num_mels,
+            fmin=fmin,
+            fmax=fmax,
+        ).to(device)
+    elif mel_basis.device != device:
+        mel_basis = mel_basis.to(device)
+    if hann_window is None:
+        hann_window = torch.hann_window(win_size, device=device)
+    elif hann_window.device != device:
+        hann_window = hann_window.to(device)
     padding = (n_fft - hop_size) // 2
     y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
     spec = torch.stft(
@@ -435,6 +443,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
         self._speaker_cache = get_speaker_cache()
+        self._speaker_mel_buffer_cache: dict[
+            tuple[str, int, int, int, int, int, int | None],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
@@ -1171,9 +1183,22 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
             sr = target_sr
 
-        # Follow official implementation: mel_spectrogram expects 24kHz.
+        # Follow official implementation: mel_spectrogram expects 24kHz.  Move
+        # the waveform first so STFT/mel computation stays on the model device
+        # instead of materializing a CPU mel tensor and copying it for every
+        # voice-clone request.
+        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
+        mel_basis, hann_window = self._get_speaker_mel_buffers(
+            device=dev,
+            sampling_rate=24000,
+            n_fft=1024,
+            num_mels=128,
+            win_size=1024,
+            fmin=0,
+            fmax=12000,
+        )
         mels = mel_spectrogram(
-            torch.from_numpy(wav).unsqueeze(0),
+            wav_tensor,
             n_fft=1024,
             num_mels=128,
             sampling_rate=24000,
@@ -1181,9 +1206,42 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             win_size=1024,
             fmin=0,
             fmax=12000,
+            mel_basis=mel_basis,
+            hann_window=hann_window,
         ).transpose(1, 2)
-        spk = self.speaker_encoder(mels.to(dev, dtype=torch.bfloat16))[0]
+        spk = self.speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
         return spk.to(dtype=torch.bfloat16)
+
+    def _get_speaker_mel_buffers(
+        self,
+        *,
+        device: torch.device,
+        sampling_rate: int,
+        n_fft: int,
+        num_mels: int,
+        win_size: int,
+        fmin: int,
+        fmax: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = getattr(self, "_speaker_mel_buffer_cache", None)
+        if cache is None:
+            cache = {}
+            self._speaker_mel_buffer_cache = cache
+        key = (str(device), int(sampling_rate), int(n_fft), int(num_mels), int(win_size), int(fmin), fmax)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        mel_basis = mel_filter_bank(
+            sr=int(sampling_rate),
+            n_fft=int(n_fft),
+            n_mels=int(num_mels),
+            fmin=int(fmin),
+            fmax=fmax,
+        ).to(device)
+        hann_window = torch.hann_window(int(win_size), device=device)
+        cached = (mel_basis, hann_window)
+        cache[key] = cached
+        return cached
 
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
