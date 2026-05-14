@@ -302,6 +302,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     """vLLM-AR talker: step-wise layer-0 codec decoding.
     Predicts residual codebooks (1..Q-1) into `audio_codes` and streams text via `tailing_text_hidden`."""
 
+    omni_step_runner_cls = "vllm_omni.worker.qwen3_tts_stage0_step_runner.Qwen3TTSStage0StepRunner"
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # Talker backbone (Qwen3 decoder-only).
