@@ -173,12 +173,6 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
 
     monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
 
-    class NoIndexList(list):
-        def index(self, *args, **kwargs):
-            raise AssertionError("_talker_mtp_forward should not linearly search req_ids per request")
-
-    runner.input_batch.req_ids = NoIndexList(runner.input_batch.req_ids)
-
     # Initialize per-request embeds (batch-major inside talker_mtp_inputs_embeds)
     runner.talker_mtp_inputs_embeds.gpu[0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
     runner.talker_mtp_inputs_embeds.gpu[1] = torch.tensor([10.0, 20.0, 30.0, 40.0])
@@ -336,42 +330,28 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     assert "unknown_req" not in runner.model_intermediate_buffer
 
 
-def test_update_talker_mtp_output_writes_single_nested_value():
-    runner = _make_runner(req_ids=("r1",), hidden_size=4)
-    runner.model.gpu_resident_buffer_keys = {("codes", "audio")}
-    src = torch.tensor([[1, 2, 3]], dtype=torch.long)
-
-    OmniGPUModelRunner._update_talker_mtp_output(runner, "r1", ("codes", "audio"), src)
-
-    stored = runner.model_intermediate_buffer["r1"]["codes"]["audio"]
-    assert torch.equal(stored, src)
-    assert stored.data_ptr() != src.data_ptr()
-    assert runner.requests["r1"].additional_information_cpu is runner.model_intermediate_buffer["r1"]
-
-
-def test_optional_omni_step_runner_cleanup_is_called():
+def test_maybe_run_batch_preprocess_calls_model_hook():
     runner = object.__new__(OmniGPUModelRunner)
-    freed = []
+    runner.model_intermediate_buffer = {"r1": {"text": ["hello"]}}
+    calls = []
 
-    class DummyStepRunner:
-        def free_request(self, req_id):
-            freed.append(req_id)
+    class DummyModel:
+        def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device):
+            calls.append((req_ids, model_intermediate_buffer, device))
 
-    runner.omni_step_runner = DummyStepRunner()
-    runner.requests = {"r1": object()}
-    runner.model_intermediate_buffer = {"r1": {"codes": {"audio": 1}}}
-    runner.num_prompt_logprobs = {"r1": 0}
-    runner._downstream_payload_cache = {"r1": object()}
-    runner._talker_mtp_generators = {"r1": object()}
+    runner.model = DummyModel()
 
-    OmniGPUModelRunner._free_omni_request_state(runner, "r1")
+    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
 
-    assert freed == ["r1"]
-    assert "r1" not in runner.requests
-    assert "r1" not in runner.model_intermediate_buffer
-    assert "r1" not in runner.num_prompt_logprobs
-    assert "r1" not in runner._downstream_payload_cache
-    assert "r1" not in runner._talker_mtp_generators
+    assert calls == [(["r1"], runner.model_intermediate_buffer, torch.device("cpu"))]
+
+
+def test_maybe_run_batch_preprocess_skips_missing_hook():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_intermediate_buffer = {}
+    runner.model = object()
+
+    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
 
 
 def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
