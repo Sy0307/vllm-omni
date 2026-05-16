@@ -179,6 +179,52 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text[65:])
 
 
+def test_decode_batch_preprocess_matches_decode_state_updates():
+    model = _make_minimal_talker()
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+    trailing_a = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    trailing_b = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 100
+    last_a = torch.full((4,), 2.0, dtype=torch.float32)
+    last_b = torch.full((4,), 3.0, dtype=torch.float32)
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.float32)
+
+    out_ids, out_embeds, past_hidden, text_step, updates = model.preprocess_decode_batch(
+        input_ids=torch.tensor([101, 202], dtype=torch.long),
+        req_infos=[
+            {
+                "text": ["hello"],
+                "task_type": ["Base"],
+                "hidden_states": {"trailing_text": trailing_a, "last": last_a},
+                "embed": {"tts_pad": tts_pad},
+                "meta": {"talker_text_offset": 1},
+            },
+            {
+                "text": ["world"],
+                "task_type": ["CustomVoice"],
+                "hidden_states": {"trailing_text": trailing_b, "last": last_b},
+                "embed": {"tts_pad": tts_pad},
+                "meta": {"talker_text_offset": 2},
+            },
+        ],
+    )
+
+    assert out_ids.tolist() == [101, 202]
+    assert torch.equal(out_embeds.cpu(), torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16))
+    assert torch.equal(past_hidden.cpu(), torch.stack([last_a, last_b]).to(torch.bfloat16))
+    assert torch.equal(text_step[0].cpu(), trailing_a[1].to(torch.bfloat16))
+    assert torch.equal(text_step[1].cpu(), tts_pad.reshape(-1).to(torch.bfloat16))
+    assert updates[0]["meta"]["talker_text_offset"] == 2
+    assert updates[0]["meta"]["codec_streaming"] is True
+    assert "hidden_states" not in updates[0]
+    assert updates[1]["meta"]["talker_text_offset"] == 0
+    assert updates[1]["meta"]["codec_streaming"] is False
+    assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
+
+
 def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
     model = _make_minimal_talker()
     device_param = torch.nn.Parameter(torch.empty(0))
@@ -218,11 +264,11 @@ def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
     model._normalize_ref_audio = lambda raw: normalize_calls.append(raw) or (ref_audio, 16000)
 
     ref_audio_ids = []
-    model._encode_ref_audio_to_code = lambda wav, _sr: ref_audio_ids.append(id(wav)) or torch.ones(
-        (2, 2), dtype=torch.long
+    model._encode_ref_audio_to_code = lambda wav, _sr: (
+        ref_audio_ids.append(id(wav)) or torch.ones((2, 2), dtype=torch.long)
     )
-    model._extract_speaker_embedding = lambda wav, _sr: ref_audio_ids.append(id(wav)) or torch.ones(
-        4, dtype=torch.bfloat16
+    model._extract_speaker_embedding = lambda wav, _sr: (
+        ref_audio_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
     )
 
     _prompt, _trailing, _pad, ref_code_len, ref_code = model._build_prompt_embeds(
@@ -246,9 +292,12 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
     wav1 = np.arange(2048, dtype=np.float32)
     wav2 = np.arange(3072, dtype=np.float32)
     normalize_calls = []
-    model._normalize_ref_audio = lambda raw: normalize_calls.append(raw) or (
-        wav1 if raw == "a.wav" else wav2,
-        16000,
+    model._normalize_ref_audio = lambda raw: (
+        normalize_calls.append(raw)
+        or (
+            wav1 if raw == "a.wav" else wav2,
+            16000,
+        )
     )
 
     class FakeSpeechTokenizer:
@@ -421,8 +470,8 @@ def test_base_voice_clone_uses_batched_ref_code_without_serial_encode():
         AssertionError("serial encode not expected")
     )
     speaker_wav_ids = []
-    model._extract_speaker_embedding = lambda wav, _sr: speaker_wav_ids.append(id(wav)) or torch.ones(
-        4, dtype=torch.bfloat16
+    model._extract_speaker_embedding = lambda wav, _sr: (
+        speaker_wav_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
     )
 
     _prompt, _trailing, _pad, ref_code_len, out_ref_code = model._build_prompt_embeds(

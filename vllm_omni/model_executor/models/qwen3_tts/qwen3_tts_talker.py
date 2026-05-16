@@ -265,6 +265,8 @@ def mel_spectrogram(
     fmin: int,
     fmax: int | None = None,
     center: bool = False,
+    mel_basis: torch.Tensor | None = None,
+    hann_window: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculate mel spectrogram of an input signal using torchaudio mel filterbank and torch STFT."""
     if torch.min(y) < -1.0:
@@ -272,14 +274,20 @@ def mel_spectrogram(
     if torch.max(y) > 1.0:
         logger.warning("Max value of input waveform signal is %s", torch.max(y))
     device = y.device
-    mel_basis = mel_filter_bank(
-        sr=sampling_rate,
-        n_fft=n_fft,
-        n_mels=num_mels,
-        fmin=fmin,
-        fmax=fmax,
-    ).to(device)
-    hann_window = torch.hann_window(win_size).to(device)
+    if mel_basis is None:
+        mel_basis = mel_filter_bank(
+            sr=sampling_rate,
+            n_fft=n_fft,
+            n_mels=num_mels,
+            fmin=fmin,
+            fmax=fmax,
+        ).to(device)
+    elif mel_basis.device != device:
+        mel_basis = mel_basis.to(device)
+    if hann_window is None:
+        hann_window = torch.hann_window(win_size, device=device)
+    elif hann_window.device != device:
+        hann_window = hann_window.to(device)
     padding = (n_fft - hop_size) // 2
     y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
     spec = torch.stft(
@@ -733,6 +741,117 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
         return input_ids, inputs_embeds_out, info_update
 
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Batch the decode-only preprocess path for Qwen3-TTS.
+
+        This mirrors the scalar decode branch in ``preprocess()``, but performs
+        the token embedding lookup once for the whole decode batch.
+        """
+        input_ids_flat = input_ids.reshape(-1)
+        if int(input_ids_flat.numel()) != len(req_infos):
+            raise ValueError(
+                f"preprocess_decode_batch expected {len(req_infos)} input ids, got {int(input_ids_flat.numel())}"
+            )
+
+        device = input_ids_flat.device
+        dtype = torch.bfloat16
+        past_hidden_list: list[torch.Tensor] = []
+        text_step_list: list[torch.Tensor] = []
+        updates: list[dict[str, Any]] = []
+
+        for info_dict in req_infos:
+            additional_information = info_dict.get("additional_information")
+            if isinstance(additional_information, dict):
+                merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
+                for k, v in additional_information.items():
+                    merged.setdefault(k, v)
+                info_dict = merged
+
+            payload: OmniPayload = info_dict
+            embed = payload.get("embed", {})
+            hs = payload.get("hidden_states", {})
+            meta = payload.get("meta", {})
+
+            text_list = info_dict.get("text")
+            if not isinstance(text_list, list) or not text_list or not text_list[0]:
+                raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+
+            task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
+            codec_streaming_val = meta.get("codec_streaming")
+            if isinstance(codec_streaming_val, list):
+                codec_streaming_raw = codec_streaming_val[0] if codec_streaming_val else None
+            else:
+                codec_streaming_raw = codec_streaming_val
+            if isinstance(codec_streaming_raw, bool):
+                codec_streaming = codec_streaming_raw
+            else:
+                codec_streaming = task_type == "Base"
+
+            tts_pad_embed_buf = embed.get("tts_pad")
+            if not isinstance(tts_pad_embed_buf, torch.Tensor):
+                raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
+            tts_pad_embed = tts_pad_embed_buf.to(device=device, dtype=dtype).reshape(1, -1)
+
+            tail = hs.get("trailing_text")
+            text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
+            trailing_text_update = None
+            if isinstance(tail, torch.Tensor) and tail.ndim == 2:
+                tail_len = int(tail.shape[0])
+                if text_offset < tail_len:
+                    text_step = tail[text_offset : text_offset + 1].to(device=device, dtype=dtype).reshape(1, -1)
+                    next_text_offset = text_offset + 1
+                    should_compact_tail = next_text_offset >= tail_len or (
+                        next_text_offset >= _TRAILING_TEXT_COMPACT_MIN_FRAMES and next_text_offset * 2 >= tail_len
+                    )
+                    if should_compact_tail:
+                        if next_text_offset >= tail_len:
+                            trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
+                        else:
+                            trailing_text_update = tail[next_text_offset:].contiguous()
+                        next_text_offset = 0
+                else:
+                    text_step = tts_pad_embed
+                    next_text_offset = 0
+                    if tail.numel() > 0:
+                        trailing_text_update = torch.empty((0, tail.shape[1]), device=tail.device, dtype=tail.dtype)
+            else:
+                text_step = tts_pad_embed
+                next_text_offset = text_offset
+
+            last_hidden = hs.get("last")
+            if not isinstance(last_hidden, torch.Tensor):
+                raise RuntimeError("Missing hidden_states['last'] in additional_information; postprocess must run.")
+            past_hidden_list.append(last_hidden.to(device=device, dtype=dtype).reshape(1, -1))
+            text_step_list.append(text_step)
+
+            info_update: dict[str, Any] = {
+                "meta": {
+                    "talker_text_offset": int(next_text_offset),
+                    "codec_streaming": codec_streaming,
+                },
+            }
+            if trailing_text_update is not None:
+                info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
+            updates.append(info_update)
+
+        inputs_embeds_out = self.embed_input_ids(input_ids_flat.reshape(-1, 1).to(torch.long)).to(
+            device=device,
+            dtype=dtype,
+        )
+        inputs_embeds_out = inputs_embeds_out.reshape(len(req_infos), -1)
+        return (
+            input_ids_flat,
+            inputs_embeds_out,
+            torch.cat(past_hidden_list, dim=0),
+            torch.cat(text_step_list, dim=0),
+            updates,
+        )
+
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.
         # Stays on GPU - gpu_resident_buffer_keys avoids the CPU round-trip.
@@ -1171,9 +1290,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
             sr = target_sr
 
-        # Follow official implementation: mel_spectrogram expects 24kHz.
+        # Follow official implementation: mel_spectrogram expects 24kHz.  Move
+        # the waveform first so STFT/mel computation stays on the model device
+        # instead of materializing a CPU mel tensor and copying it per request.
+        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
+        mel_basis, hann_window = self._get_speaker_mel_buffers(
+            device=dev,
+            sampling_rate=24000,
+            n_fft=1024,
+            num_mels=128,
+            win_size=1024,
+            fmin=0,
+            fmax=12000,
+        )
         mels = mel_spectrogram(
-            torch.from_numpy(wav).unsqueeze(0),
+            wav_tensor,
             n_fft=1024,
             num_mels=128,
             sampling_rate=24000,
@@ -1181,9 +1312,42 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             win_size=1024,
             fmin=0,
             fmax=12000,
+            mel_basis=mel_basis,
+            hann_window=hann_window,
         ).transpose(1, 2)
-        spk = self.speaker_encoder(mels.to(dev, dtype=torch.bfloat16))[0]
+        spk = self.speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
         return spk.to(dtype=torch.bfloat16)
+
+    def _get_speaker_mel_buffers(
+        self,
+        *,
+        device: torch.device,
+        sampling_rate: int,
+        n_fft: int,
+        num_mels: int,
+        win_size: int,
+        fmin: int,
+        fmax: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = getattr(self, "_speaker_mel_buffer_cache", None)
+        if cache is None:
+            cache = {}
+            self._speaker_mel_buffer_cache = cache
+        key = (str(device), int(sampling_rate), int(n_fft), int(num_mels), int(win_size), int(fmin), fmax)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        mel_basis = mel_filter_bank(
+            sr=int(sampling_rate),
+            n_fft=int(n_fft),
+            n_mels=int(num_mels),
+            fmin=int(fmin),
+            fmax=fmax,
+        ).to(device)
+        hann_window = torch.hann_window(int(win_size), device=device)
+        cached = (mel_basis, hann_window)
+        cache[key] = cached
+        return cached
 
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
@@ -1680,9 +1844,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_len = int(ref_code_t.shape[0])
             else:
                 codes = info_dict.get("codes")
-                precomputed_ref_code = (
-                    codes.get(_PRECOMPUTED_REF_CODE_KEY) if isinstance(codes, dict) else None
-                )
+                precomputed_ref_code = codes.get(_PRECOMPUTED_REF_CODE_KEY) if isinstance(codes, dict) else None
                 ref_code_t = self._coerce_ref_code_tensor(precomputed_ref_code, device=input_ids.device)
                 if isinstance(ref_code_t, torch.Tensor):
                     ref_code_len = int(ref_code_t.shape[0])
