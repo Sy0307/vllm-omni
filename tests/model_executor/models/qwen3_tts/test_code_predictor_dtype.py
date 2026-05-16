@@ -212,6 +212,10 @@ class TestCodePredictorDtypeAlignment:
         predictor._model_dtype = torch.float16
         predictor._compiled_model_fwd = predictor.model.forward
 
+        # Ensure NPU path is not taken on non-NPU hardware
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
         # _warmup_buckets should fix the dtype mismatch
         predictor._warmup_buckets()
 
@@ -231,6 +235,9 @@ class TestCodePredictorDtypeAlignment:
         predictor = predictor.to(torch.float16)
 
         assert predictor._model_dtype is None
+        # Ensure NPU path is not taken on non-NPU hardware
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
         predictor._setup_compile()
         assert predictor._model_dtype == torch.float16
 
