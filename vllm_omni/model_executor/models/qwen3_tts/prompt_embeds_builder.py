@@ -1078,10 +1078,12 @@ class Qwen3TTSPromptEmbedsBuilder:
 
             # Speaker cache: only for uploaded (named) speakers
             _speaker_cache_key = None
+            _cache_lookup_voice = None
             if voice_clone_prompt is None and self._speaker_cache is not None:
                 _speaker_list = info_dict.get("speaker")
                 if isinstance(_speaker_list, list) and _speaker_list:
                     _voice_name = str(_speaker_list[0]).lower()
+                    _cache_lookup_voice = _voice_name
                     # Per-mode namespace — xvec and icl produce different artifacts
                     # for the same voice, so they must not share a cache slot.
                     _mode = "xvec" if xvec_only else "icl"
@@ -1103,8 +1105,17 @@ class Qwen3TTSPromptEmbedsBuilder:
                             "ref_code": ref_code_cached,
                             "ref_spk_embedding": ref_spk_embed_cached,
                             "icl_mode": _cached.get("icl_mode"),
+                            "ref_text": _cached.get("ref_text"),
                         }
                         _speaker_cache_key = None  # hit → don't store again
+
+            if voice_clone_prompt is None and _speaker_cache_key is not None:
+                ref_audio_list = info_dict.get("ref_audio")
+                if not isinstance(ref_audio_list, list) or not ref_audio_list:
+                    raise ValueError(
+                        f"Qwen3-TTS speaker '{_cache_lookup_voice}' was requested without ref_audio, "
+                        "but no precomputed cache entry was loaded"
+                    )
 
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
@@ -1207,6 +1218,8 @@ class Qwen3TTSPromptEmbedsBuilder:
                     )
                 if ref_ids is None:
                     ref_text = _as_singleton(info_dict.get("ref_text"))
+                    if (not isinstance(ref_text, str) or not ref_text.strip()) and voice_clone_prompt is not None:
+                        ref_text = _as_singleton(voice_clone_prompt.get("ref_text"))
                     if isinstance(ref_text, str) and ref_text.strip():
                         ref_ids = tok(
                             build_ref_text(ref_text),
@@ -1511,6 +1524,10 @@ class Qwen3TTSPromptEmbedsBuilder:
 
                     if ref_ids is None:
                         ref_text = _first(info.get("ref_text"), "")
+                        if (not isinstance(ref_text, str) or not ref_text.strip()) and isinstance(
+                            voice_clone_prompt, dict
+                        ):
+                            ref_text = _first(voice_clone_prompt.get("ref_text"), "")
                         if not isinstance(ref_text, str) or not ref_text.strip():
                             raise ValueError(
                                 "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."

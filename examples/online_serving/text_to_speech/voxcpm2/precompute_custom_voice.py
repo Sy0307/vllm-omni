@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,14 +20,9 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vllm_omni.utils.custom_voice_io import safe_voice_stem  # noqa: E402
+
 MANIFEST_NAME = "custom_voice_manifest.json"
-
-
-def _safe_stem(name: str) -> str:
-    stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name.strip())
-    if not stem or stem in (".", ".."):
-        raise ValueError(f"Invalid voice name: {name!r}")
-    return stem[:200]
 
 
 def _load_tts(model: str, device: torch.device):
@@ -74,7 +68,7 @@ def _write_voice(
             tensors["audio_feat"] = tts._encode_wav(ref_audio, padding_mode="left").float().cpu().contiguous()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{_safe_stem(voice_name)}.safetensors"
+    filename = f"{safe_voice_stem(voice_name)}.safetensors"
     save_file(tensors, str(output_dir / filename))
 
     manifest = _load_manifest(output_dir, model)
