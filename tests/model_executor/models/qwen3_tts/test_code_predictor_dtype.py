@@ -415,6 +415,8 @@ class TestCodePredictorWrapperConfig:
             128,
         }
         assert wrapper_cls._parse_positive_int_set([2, "4", 0]) == {2, 4}
+        with pytest.raises(ValueError, match="Invalid positive int config value 'bad'"):
+            wrapper_cls._parse_positive_int_set("2,bad")
 
         wrapper = object.__new__(wrapper_cls)
         wrapper._prefix_graph_seq_lens = {1, 2, 4, 8, 99}

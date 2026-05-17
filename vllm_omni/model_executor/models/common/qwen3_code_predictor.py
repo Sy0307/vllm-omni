@@ -591,12 +591,18 @@ class CodePredictorWrapper(nn.Module):
         elif isinstance(value, int):
             raw_values = [value]
         else:
-            raw_values = list(value)
+            try:
+                raw_values = list(value)
+            except TypeError as exc:
+                raise ValueError(f"Invalid positive int config value {value!r}") from exc
         values: set[int] = set()
         for item in raw_values:
-            value = int(item)
-            if value > 0:
-                values.add(value)
+            try:
+                parsed = int(item)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid positive int config value {item!r}") from exc
+            if parsed > 0:
+                values.add(parsed)
         return values
 
     def _prefix_seq_lens(self, max_seq: int) -> list[int]:
