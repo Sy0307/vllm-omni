@@ -132,6 +132,32 @@ def test_custom_voice_profile_file_must_stay_under_manifest_dir(tmp_path):
     assert iter_custom_voice_profiles(tmp_path, expected_model_type="qwen3_tts") == []
 
 
+def test_custom_voice_profiles_drop_stale_provenance_metadata(tmp_path):
+    from vllm_omni.utils.speaker_cache import iter_custom_voice_profiles
+
+    save_file({"speaker_embedding": torch.arange(4, dtype=torch.float32)}, str(tmp_path / "alice.safetensors"))
+    _write_manifest(
+        tmp_path,
+        model_type="qwen3_tts",
+        voices={
+            "Alice": {
+                "file": "alice.safetensors",
+                "mode": "xvec",
+                "audio_codec_config_hash": "old-hash",
+                "audio_codec_version": "old-codec",
+                "model_revision": "old-revision",
+            }
+        },
+    )
+
+    profiles = iter_custom_voice_profiles(tmp_path, expected_model_type="qwen3_tts")
+
+    assert len(profiles) == 1
+    assert "audio_codec_config_hash" not in profiles[0]
+    assert "audio_codec_version" not in profiles[0]
+    assert "model_revision" not in profiles[0]
+
+
 def test_voxcpm2_custom_voice_profiles_warm_full_prompt_cache(tmp_path):
     from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
         VoxCPM2TalkerForConditionalGeneration,

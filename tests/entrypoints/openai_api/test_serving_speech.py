@@ -1157,6 +1157,37 @@ class TestTTSMethods:
         speech_server._build_voxcpm2_prompt.assert_awaited_once()
         speech_server.engine_client.generate.assert_called_once()
 
+    def test_prepare_voxcpm2_precomputed_voice_sets_model_cache_key(self, speech_server, mocker):
+        """VoxCPM2 precomputed voices must carry voice metadata to the model cache lookup."""
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server.supported_speakers = {"alice"}
+        speech_server.uploaded_speakers = {}
+        speech_server.precomputed_speakers = {
+            "alice": {
+                "name": "Alice",
+                "model_type": "voxcpm2",
+                "mode": "reference",
+                "ref_audio_feat_len": 2,
+            }
+        }
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._build_voxcpm2_prompt = mocker.AsyncMock(
+            return_value={
+                "prompt_token_ids": [1],
+                "additional_information": {
+                    "voice_profile": speech_server.precomputed_speakers["alice"],
+                },
+            }
+        )
+
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Alice")))
+
+        prompt = speech_server.engine_client.generate.call_args.kwargs["prompt"]
+        additional = prompt["additional_information"]
+        assert additional["voice_name"] == "alice"
+        assert additional["voice_created_at"] == 0
+
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")

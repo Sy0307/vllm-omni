@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,14 +23,9 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vllm_omni.utils.custom_voice_io import safe_voice_stem  # noqa: E402
+
 MANIFEST_NAME = "custom_voice_manifest.json"
-
-
-def _safe_stem(name: str) -> str:
-    stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name.strip())
-    if not stem or stem in (".", ".."):
-        raise ValueError(f"Invalid voice name: {name!r}")
-    return stem[:200]
 
 
 def _resolve_model_dir(model: str) -> str:
@@ -92,20 +86,24 @@ def _load_speaker_encoder(model_dir: str, device: torch.device):
     return config, encoder
 
 
-def _speaker_embedding(encoder: torch.nn.Module, wav: np.ndarray, sr: int, device: torch.device) -> torch.Tensor:
-    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import mel_spectrogram
+def _speaker_embedding(
+    encoder: torch.nn.Module,
+    speaker_encoder_config: object,
+    wav: np.ndarray,
+    sr: int,
+    device: torch.device,
+) -> torch.Tensor:
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+        mel_spectrogram,
+        speaker_encoder_mel_kwargs,
+    )
 
-    wav = _resample(wav, sr, 24000)
+    mel_kwargs = speaker_encoder_mel_kwargs(speaker_encoder_config)
+    wav = _resample(wav, sr, int(mel_kwargs["sampling_rate"]))
     wav_t = torch.from_numpy(wav).to(device=device, dtype=torch.float32)
     mels = mel_spectrogram(
         wav_t.unsqueeze(0),
-        n_fft=1024,
-        num_mels=128,
-        sampling_rate=24000,
-        hop_size=256,
-        win_size=1024,
-        fmin=0,
-        fmax=12000,
+        **mel_kwargs,
     ).transpose(1, 2)
     with torch.inference_mode():
         return encoder(mels.to(device=device, dtype=torch.bfloat16))[0].float().cpu().contiguous()
@@ -168,7 +166,7 @@ def _write_voice(
         raise ValueError(f"Reference audio too short: {wav.size} samples")
 
     tensors: dict[str, torch.Tensor] = {
-        "speaker_embedding": _speaker_embedding(encoder, wav, sr, device),
+        "speaker_embedding": _speaker_embedding(encoder, config.speaker_encoder_config, wav, sr, device),
     }
     if mode == "icl":
         if not ref_text or not ref_text.strip():
@@ -176,7 +174,7 @@ def _write_voice(
         tensors["ref_code"] = _ref_code(model_dir, wav, sr, device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{_safe_stem(voice_name)}.safetensors"
+    filename = f"{safe_voice_stem(voice_name)}.safetensors"
     save_file(tensors, str(output_dir / filename))
 
     hidden_size = int(getattr(config.talker_config, "hidden_size", tensors["speaker_embedding"].numel()))

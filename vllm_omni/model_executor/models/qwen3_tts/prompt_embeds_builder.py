@@ -196,6 +196,36 @@ def mel_spectrogram(
     return _dynamic_range_compression(mel_spec)
 
 
+def _int_config_value(config: object, names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return int(value)
+    return default
+
+
+def _optional_int_config_value(config: object, names: tuple[str, ...], default: int | None) -> int | None:
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return int(value)
+    return default
+
+
+def speaker_encoder_mel_kwargs(speaker_encoder_config: object) -> dict[str, int | None]:
+    sample_rate = _int_config_value(speaker_encoder_config, ("sample_rate", "sampling_rate"), 24000)
+    n_fft = _int_config_value(speaker_encoder_config, ("n_fft", "filter_length"), 1024)
+    return {
+        "n_fft": n_fft,
+        "num_mels": _int_config_value(speaker_encoder_config, ("num_mels", "mel_dim"), 128),
+        "sampling_rate": sample_rate,
+        "hop_size": _int_config_value(speaker_encoder_config, ("hop_size", "hop_length"), 256),
+        "win_size": _int_config_value(speaker_encoder_config, ("win_size", "win_length"), n_fft),
+        "fmin": _int_config_value(speaker_encoder_config, ("fmin", "mel_fmin"), 0),
+        "fmax": _optional_int_config_value(speaker_encoder_config, ("fmax", "mel_fmax"), sample_rate // 2),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Local audio loading helpers (URL / base64 / local path).
 # ---------------------------------------------------------------------------
@@ -620,8 +650,8 @@ class Qwen3TTSPromptEmbedsBuilder:
         except StopIteration:
             pass
 
-        # Resample to 24kHz for speaker encoder.
-        target_sr = int(getattr(self._config.speaker_encoder_config, "sample_rate", 24000))
+        mel_kwargs = speaker_encoder_mel_kwargs(self._config.speaker_encoder_config)
+        target_sr = int(mel_kwargs["sampling_rate"])
         if sr != target_sr:
             resampler = self._get_resampler(int(sr), target_sr)
             wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
@@ -633,13 +663,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
         mels = mel_spectrogram(
             wav_tensor,
-            n_fft=1024,
-            num_mels=128,
-            sampling_rate=24000,
-            hop_size=256,
-            win_size=1024,
-            fmin=0,
-            fmax=12000,
+            **mel_kwargs,
         ).transpose(1, 2)
         spk = self._speaker_encoder(mels.to(dtype=torch.bfloat16))[0]
         return spk.to(dtype=torch.bfloat16)
