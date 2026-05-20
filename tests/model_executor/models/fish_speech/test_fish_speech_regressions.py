@@ -1,5 +1,6 @@
 import functools
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,28 @@ class _FakeCodec:
         wav = torch.arange(100, dtype=torch.float32).view(1, 1, 100)
         audio_lengths = torch.tensor([100], dtype=torch.long)
         return wav, audio_lengths
+
+
+class _RecordingCodec:
+    def __init__(self):
+        self.calls = []
+
+    def decode(self, codes_bqf: torch.Tensor, feature_lengths: torch.Tensor):
+        self.calls.append((tuple(codes_bqf.shape), tuple(int(x) for x in feature_lengths.tolist())))
+        batch = codes_bqf.shape[0]
+        wav_len = int(codes_bqf.shape[-1]) * 10
+        wav = torch.arange(batch * wav_len, dtype=torch.float32).view(batch, 1, wav_len)
+        audio_lengths = feature_lengths.to(torch.long) * 10
+        return wav, audio_lengths
+
+
+class _FakeOneArgCodec:
+    def from_indices(self, codes_bqf: torch.Tensor):
+        batch = codes_bqf.shape[0]
+        return torch.arange(batch * 100, dtype=torch.float32).view(batch, 1, 100)
+
+    def decode(self, codes_bqf: torch.Tensor):
+        return self.from_indices(codes_bqf)
 
 
 class _FakeTokenizer:
@@ -60,6 +83,129 @@ def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
     assert audios[0].numel() == 0
     # 2 total frames with 1 frame of left context => proportional trim removes half the samples.
     assert audios[1].shape[0] == 50
+
+
+def test_dac_decoder_supports_one_arg_codec_decode():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = _FakeOneArgCodec()
+    decoder._num_codebooks = 10
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._ensure_codec_loaded = lambda: None
+    decoder._split_request_ids = lambda ids, seq_token_counts=None: [
+        torch.arange(10, dtype=torch.long),
+        torch.arange(20, dtype=torch.long),
+    ]
+
+    out = decoder.forward(
+        input_ids=torch.arange(30, dtype=torch.long),
+        runtime_additional_information=[{}, {}],
+    )
+
+    audios = out.multimodal_outputs["model_outputs"]
+    assert len(audios) == 2
+    assert audios[0].shape[0] == 50
+    assert audios[1].shape[0] == 100
+
+
+def test_dac_decoder_uses_tensor_codes_from_runtime_info():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = _FakeCodec()
+    decoder._num_codebooks = 2
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._ensure_codec_loaded = lambda: None
+
+    out = decoder.forward(
+        input_ids=torch.tensor([0], dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "codes": {"audio": torch.tensor([[1, 2], [3, 4]], dtype=torch.long)},
+                "meta": {"left_context_size": 1},
+            }
+        ],
+    )
+
+    audios = out.multimodal_outputs["model_outputs"]
+    assert len(audios) == 1
+    # 2 total frames with 1 frame of left context => proportional trim removes half the samples.
+    assert audios[0].shape[0] == 50
+
+
+def test_dac_decoder_groups_bucketed_frame_lengths_for_stable_decode_shapes():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    codec = _RecordingCodec()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = codec
+    decoder._num_codebooks = 2
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._decode_batch_bucket_frames = [4, 50, 75]
+    decoder._ensure_codec_loaded = lambda: None
+    decoder._split_request_ids = lambda ids, seq_token_counts=None: [
+        torch.arange(2 * 46, dtype=torch.long),
+        torch.arange(2 * 45, dtype=torch.long),
+        torch.arange(2 * 4, dtype=torch.long),
+    ]
+
+    out = decoder.forward(input_ids=torch.arange(2 * (46 + 45 + 4), dtype=torch.long))
+
+    assert codec.calls == [
+        ((2, 2, 50), (46, 45)),
+        ((1, 2, 4), (4,)),
+    ]
+    audios = out.multimodal_outputs["model_outputs"]
+    assert [audio.shape[0] for audio in audios] == [460, 450, 40]
+
+
+def test_dac_decoder_splits_groups_by_padded_frame_budget():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    codec = _RecordingCodec()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = codec
+    decoder._num_codebooks = 2
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._decode_batch_bucket_frames = [50]
+    decoder._decode_batch_max_padded_frames = 100
+    decoder._decode_batch_max_batch = 0
+    decoder._ensure_codec_loaded = lambda: None
+    decoder._split_request_ids = lambda ids, seq_token_counts=None: [
+        torch.arange(2 * 46, dtype=torch.long),
+        torch.arange(2 * 45, dtype=torch.long),
+        torch.arange(2 * 47, dtype=torch.long),
+    ]
+
+    decoder.forward(input_ids=torch.arange(2 * (46 + 45 + 47), dtype=torch.long))
+
+    assert codec.calls == [
+        ((2, 2, 50), (45, 46)),
+        ((1, 2, 50), (47,)),
+    ]
+
+
+def test_dac_decoder_dtype_can_be_configured():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="unused",
+            stage_connector_config={"extra": {"fish_speech_dac_dtype": "fp16"}},
+        )
+    )
+
+    decoder = FishSpeechDACDecoder(vllm_config=cfg)
+
+    assert decoder._dac_dtype == torch.float16
 
 
 def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(monkeypatch):

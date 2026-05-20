@@ -114,7 +114,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
             )
             max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
+            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.long)
             self.talker_mtp_inputs_embeds = self._make_buffer(
                 max_batch_size, hidden_size, dtype=self.dtype, numpy=False
             )
