@@ -41,4 +41,3 @@ TORCH_LIBRARY_IMPL(vllm_omni_fish_kvcache_attn, CUDA, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("has_fish_kvcache_attn", []() { return true; });
 }
-
