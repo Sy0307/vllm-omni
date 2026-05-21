@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.attention.fish_kvcache_attn import (
@@ -14,6 +15,7 @@ from vllm_omni.attention.fish_kvcache_attn import (
     is_fish_kvcache_attn_enabled,
     is_fish_kvcache_attn_required,
     load_error,
+    prewarm_fish_kvcache_attn_workspace,
 )
 
 logger = init_logger(__name__)
@@ -48,6 +50,55 @@ def get_fish_kvcache_attn_stats() -> dict[str, Any]:
 
 def _record_fallback(reason: str) -> None:
     _FALLBACK_COUNTS[reason] += 1
+
+
+def prewarm_fish_kvcache_attn_capture_workspaces(
+    *,
+    model_config: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+    capture_sizes: list[int] | tuple[int, ...],
+) -> int:
+    """Preallocate Fish attention workspaces used during CUDA graph capture."""
+    if not _fish_kvcache_enabled() or not is_available():
+        return 0
+    if getattr(model_config, "model_arch", None) != "FishSpeechSlowARForConditionalGeneration":
+        return 0
+
+    hf_config = getattr(model_config, "hf_config", None)
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None:
+        return 0
+
+    try:
+        num_heads = int(text_config.num_attention_heads)
+        head_dim = int(text_config.head_dim)
+        max_seq_len = int(getattr(model_config, "max_model_len", 0))
+        sizes = sorted({int(size) for size in capture_sizes if int(size) > 0})
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    if num_heads <= 0 or head_dim <= 0 or max_seq_len <= 0 or not sizes:
+        return 0
+
+    # The small path uses an empty workspace keyed only by device. Prewarm it
+    # once, then prewarm every CUDA graph capture batch size for the long path.
+    small_query = torch.empty((1, num_heads, head_dim), device=device, dtype=dtype)
+    prewarm_fish_kvcache_attn_workspace(small_query, 1)
+    prewarmed = 1
+
+    for batch_size in sizes:
+        query = torch.empty((batch_size, num_heads, head_dim), device=device, dtype=dtype)
+        prewarm_fish_kvcache_attn_workspace(query, max_seq_len)
+        prewarmed += 1
+
+    logger.info(
+        "Prewarmed Fish kvcache attention workspaces for capture sizes %s (num_heads=%d head_dim=%d max_seq_len=%d)",
+        sizes,
+        num_heads,
+        head_dim,
+        max_seq_len,
+    )
+    return prewarmed
 
 
 def _dispatch_max_seq_len(attn_metadata: Any, active_batch: int, seq_lens: Any) -> int:

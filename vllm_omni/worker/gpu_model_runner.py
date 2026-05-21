@@ -95,6 +95,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._prewarm_fish_kvcache_attn_workspaces()
 
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
@@ -120,6 +121,21 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
             self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+
+    def _prewarm_fish_kvcache_attn_workspaces(self) -> None:
+        capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
+        if not capture_sizes:
+            return
+        if getattr(self.model_config, "model_arch", None) != "FishSpeechSlowARForConditionalGeneration":
+            return
+        from vllm_omni.attention.fish_kvcache_backend import prewarm_fish_kvcache_attn_capture_workspaces
+
+        prewarm_fish_kvcache_attn_capture_workspaces(
+            model_config=self.model_config,
+            device=self.device,
+            dtype=self.dtype,
+            capture_sizes=capture_sizes,
+        )
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.

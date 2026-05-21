@@ -642,6 +642,46 @@ def test_fish_kvcache_decode_workspace_miss_rejects_cuda_graph_capture(monkeypat
         fish_kvcache_attn._get_decode_workspace(q, 2048)
 
 
+def test_fish_kvcache_backend_prewarms_capture_workspaces(monkeypatch):
+    fish_kvcache_attn._WORKSPACE_CACHE.clear()
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+
+    text_config = type(
+        "TextConfig",
+        (),
+        {"num_attention_heads": 4, "head_dim": 128},
+    )()
+    hf_config = type("HFConfig", (), {"text_config": text_config})()
+    model_config = type(
+        "ModelConfig",
+        (),
+        {
+            "hf_config": hf_config,
+            "max_model_len": 2048,
+            "model_arch": "FishSpeechSlowARForConditionalGeneration",
+        },
+    )()
+
+    assert (
+        fish_kvcache_backend.prewarm_fish_kvcache_attn_capture_workspaces(
+            model_config=model_config,
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            capture_sizes=[1, 4],
+        )
+        == 3
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    q = torch.zeros((4, 4, 128), dtype=torch.float16)
+    partial_m, partial_l, partial_acc = fish_kvcache_attn._get_decode_workspace(q, 2048)
+
+    assert tuple(partial_m.shape) == (2, 16)
+    assert tuple(partial_l.shape) == (2, 16)
+    assert tuple(partial_acc.shape) == (2, 16, 128)
+
+
 def _reference_decode_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
