@@ -59,18 +59,26 @@ class _FakeModel:
 def _metadata(
     *,
     batch_size: int = 2,
+    num_actual_tokens: int | None = None,
     max_query_len: int = 1,
     max_seq_len: int = 128,
     use_cascade: bool = False,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
 ):
+    if num_actual_tokens is None:
+        num_actual_tokens = batch_size
+    if seq_lens is None:
+        seq_lens = torch.ones((batch_size,), dtype=torch.int32)
     return type(
         "Metadata",
         (),
         {
             "use_cascade": use_cascade,
-            "num_actual_tokens": batch_size,
+            "num_actual_tokens": num_actual_tokens,
             "block_table": torch.zeros((batch_size, 8), dtype=torch.int32),
-            "seq_lens": torch.ones((batch_size,), dtype=torch.int32),
+            "seq_lens": seq_lens,
+            "seq_lens_cpu_upper_bound": seq_lens_cpu_upper_bound,
             "max_query_len": max_query_len,
             "max_seq_len": max_seq_len,
         },
@@ -124,6 +132,7 @@ def test_fish_kvcache_attn_guard_rejects_unsupported_block_size(monkeypatch):
 
 
 def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
+    fish_kvcache_backend.reset_fish_kvcache_attn_stats()
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
@@ -164,6 +173,7 @@ def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
     assert hits == [(2, 32, 128)]
     assert model.layers[0].self_attn.attn.impl.original_calls == 0
     assert torch.equal(output, torch.ones_like(output))
+    assert fish_kvcache_backend.get_fish_kvcache_attn_stats()["small_hit_count"] == 1
 
 
 def test_fish_kvcache_backend_install_is_idempotent(monkeypatch):
@@ -196,6 +206,7 @@ def test_fish_kvcache_backend_install_is_idempotent(monkeypatch):
 
 
 def test_fish_kvcache_backend_falls_back_to_original_forward_on_guard_miss(monkeypatch):
+    fish_kvcache_backend.reset_fish_kvcache_attn_stats()
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
@@ -230,11 +241,290 @@ def test_fish_kvcache_backend_falls_back_to_original_forward_on_guard_miss(monke
     assert model.layers[0].self_attn.attn.impl.original_calls == 1
     assert decode_calls == []
     assert torch.equal(output, torch.full_like(output, 2))
+    stats = fish_kvcache_backend.get_fish_kvcache_attn_stats()
+    assert stats["fallback_count_by_reason"] == {"guard_miss": 1}
 
 
-def test_fish_kvcache_backend_caps_decode_max_seq_len(monkeypatch):
+def test_fish_kvcache_backend_uses_decode_seq_lens_upper_bound(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_MAX_SEQ_LEN", "1024")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+
+    guard_max_seq_lens = []
+
+    def fake_can_use(**kwargs):
+        guard_max_seq_lens.append(kwargs["max_seq_len"])
+        return True
+
+    decode_max_seq_lens = []
+
+    def fake_decode(query, key_cache, value_cache, block_table, seq_lens, out, *, scale, max_seq_len):
+        del query, key_cache, value_cache, block_table, seq_lens, scale
+        decode_max_seq_lens.append(max_seq_len)
+        out.fill_(1)
+        return out
+
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", fake_can_use)
+    monkeypatch.setattr(fish_kvcache_backend, "fish_decode_kvcache_attn", fake_decode)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    model.layers[0].self_attn.attn.impl.forward(
+        None,
+        query,
+        None,
+        None,
+        kv_cache,
+        _metadata(
+            max_query_len=1,
+            max_seq_len=16384,
+            seq_lens_cpu_upper_bound=torch.tensor([512, 768], dtype=torch.int32),
+        ),
+        output,
+    )
+
+    assert guard_max_seq_lens == [768]
+    assert decode_max_seq_lens == [768]
+
+
+def test_fish_kvcache_backend_slices_upper_bound_by_active_batch(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+
+    guard_max_seq_lens = []
+
+    def fake_can_use(**kwargs):
+        guard_max_seq_lens.append(kwargs["max_seq_len"])
+        return True
+
+    def fake_decode(query, key_cache, value_cache, block_table, seq_lens, out, *, scale, max_seq_len):
+        del query, key_cache, value_cache, block_table, seq_lens, scale, max_seq_len
+        out.fill_(1)
+        return out
+
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", fake_can_use)
+    monkeypatch.setattr(fish_kvcache_backend, "fish_decode_kvcache_attn", fake_decode)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    model.layers[0].self_attn.attn.impl.forward(
+        None,
+        query,
+        None,
+        None,
+        kv_cache,
+        _metadata(
+            batch_size=4,
+            num_actual_tokens=2,
+            max_query_len=1,
+            max_seq_len=16384,
+            seq_lens_cpu_upper_bound=torch.tensor([512, 768, 4096, 4096], dtype=torch.int32),
+        ),
+        output,
+    )
+
+    assert guard_max_seq_lens == [768]
+
+
+def test_fish_kvcache_backend_ignores_short_upper_bound_shape(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+
+    guard_max_seq_lens = []
+
+    def fake_can_use(**kwargs):
+        guard_max_seq_lens.append(kwargs["max_seq_len"])
+        return True
+
+    def fake_decode(query, key_cache, value_cache, block_table, seq_lens, out, *, scale, max_seq_len):
+        del query, key_cache, value_cache, block_table, seq_lens, scale, max_seq_len
+        out.fill_(1)
+        return out
+
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", fake_can_use)
+    monkeypatch.setattr(fish_kvcache_backend, "fish_decode_kvcache_attn", fake_decode)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    model.layers[0].self_attn.attn.impl.forward(
+        None,
+        query,
+        None,
+        None,
+        kv_cache,
+        _metadata(
+            batch_size=2,
+            max_query_len=1,
+            max_seq_len=16384,
+            seq_lens_cpu_upper_bound=torch.tensor([512], dtype=torch.int32),
+        ),
+        output,
+    )
+
+    assert guard_max_seq_lens == [16384]
+
+
+def test_fish_kvcache_backend_ignores_non_cpu_upper_bound(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+
+    guard_max_seq_lens = []
+
+    def fake_can_use(**kwargs):
+        guard_max_seq_lens.append(kwargs["max_seq_len"])
+        return True
+
+    def fake_decode(query, key_cache, value_cache, block_table, seq_lens, out, *, scale, max_seq_len):
+        del query, key_cache, value_cache, block_table, seq_lens, scale, max_seq_len
+        out.fill_(1)
+        return out
+
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", fake_can_use)
+    monkeypatch.setattr(fish_kvcache_backend, "fish_decode_kvcache_attn", fake_decode)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    model.layers[0].self_attn.attn.impl.forward(
+        None,
+        query,
+        None,
+        None,
+        kv_cache,
+        _metadata(
+            batch_size=2,
+            max_query_len=1,
+            max_seq_len=16384,
+            seq_lens_cpu_upper_bound=torch.empty((2,), device="meta", dtype=torch.int32),
+        ),
+        output,
+    )
+
+    assert guard_max_seq_lens == [16384]
+
+
+def test_fish_kvcache_backend_required_rejects_non_cpu_upper_bound(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: True)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="must be a CPU tensor"):
+        model.layers[0].self_attn.attn.impl.forward(
+            None,
+            query,
+            None,
+            None,
+            kv_cache,
+            _metadata(
+                batch_size=2,
+                max_query_len=1,
+                max_seq_len=16384,
+                seq_lens_cpu_upper_bound=torch.empty((2,), device="meta", dtype=torch.int32),
+            ),
+            output,
+        )
+
+
+def test_fish_kvcache_backend_required_rejects_underestimated_upper_bound(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: True)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="underestimates"):
+        model.layers[0].self_attn.attn.impl.forward(
+            None,
+            query,
+            None,
+            None,
+            kv_cache,
+            _metadata(
+                max_query_len=1,
+                max_seq_len=16384,
+                seq_lens=torch.tensor([512, 2048], dtype=torch.int32),
+                seq_lens_cpu_upper_bound=torch.tensor([512, 768], dtype=torch.int32),
+            ),
+            output,
+        )
+
+
+def test_fish_kvcache_backend_required_rejects_zero_installed_layers(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+
+    with pytest.raises(RuntimeError, match="installed 0 attention layers"):
+        fish_kvcache_backend.install_fish_kvcache_attn_backend(type("EmptyModel", (), {"layers": []})())
+
+
+def test_fish_kvcache_backend_required_raises_on_guard_miss(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: False)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="required"):
+        model.layers[0].self_attn.attn.impl.forward(
+            None,
+            query,
+            None,
+            None,
+            kv_cache,
+            _metadata(),
+            output,
+        )
+
+
+def test_fish_kvcache_backend_does_not_clamp_decode_without_cpu_upper_bound(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
 
@@ -272,8 +562,84 @@ def test_fish_kvcache_backend_caps_decode_max_seq_len(monkeypatch):
         output,
     )
 
-    assert guard_max_seq_lens == [1024]
-    assert decode_max_seq_lens == [1024]
+    assert guard_max_seq_lens == [16384]
+    assert decode_max_seq_lens == [16384]
+
+
+def test_fish_kvcache_attn_guard_accepts_decode_metadata_above_small_cap(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setattr(fish_kvcache_attn, "is_available", lambda: True)
+
+    assert fish_kvcache_attn.can_use_fish_kvcache_attn(
+        query=torch.empty((4, 32, 128), dtype=torch.float16),
+        key_cache=torch.empty((1024, 16, 8, 128), dtype=torch.float16),
+        value_cache=torch.empty((1024, 16, 8, 128), dtype=torch.float16),
+        block_table=torch.zeros((4, 1024), dtype=torch.int32),
+        seq_lens=torch.ones((4,), dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=16384,
+        dcp_world_size=1,
+        use_cascade=False,
+        alibi_slopes=None,
+        sliding_window=None,
+    )
+
+
+def test_fish_kvcache_decode_reuses_long_workspace(monkeypatch):
+    fish_kvcache_attn._WORKSPACE_CACHE.clear()
+    calls = []
+
+    def fake_decode(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        out,
+        scale,
+        max_seq_len,
+        partial_m,
+        partial_l,
+        partial_acc,
+    ):
+        del query, key_cache, value_cache, block_table, seq_lens, scale, max_seq_len
+        calls.append((partial_m.data_ptr(), partial_l.data_ptr(), partial_acc.data_ptr(), tuple(partial_acc.shape)))
+        return out
+
+    monkeypatch.setattr(torch.ops.vllm_omni_fish_kvcache_attn, "decode", fake_decode, raising=False)
+
+    q = torch.zeros((2, 4, 128), dtype=torch.float16)
+    k_cache = torch.zeros((128, 16, 2, 128), dtype=torch.float16)
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.zeros((2, 128), dtype=torch.int32)
+    seq_lens = torch.full((2,), 2048, dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    for _ in range(2):
+        fish_kvcache_attn.fish_decode_kvcache_attn(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            out,
+            scale=128**-0.5,
+            max_seq_len=2048,
+        )
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0][3] == (2, 8, 128)
+
+
+def test_fish_kvcache_decode_workspace_miss_rejects_cuda_graph_capture(monkeypatch):
+    fish_kvcache_attn._WORKSPACE_CACHE.clear()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    q = torch.zeros((2, 4, 128), dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="workspace was not prewarmed"):
+        fish_kvcache_attn._get_decode_workspace(q, 2048)
 
 
 def _reference_decode_attention(
@@ -310,7 +676,7 @@ def _reference_decode_attention(
     return torch.stack(outputs, dim=0).to(q.dtype)
 
 
-@pytest.mark.parametrize("seq_len", [64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("seq_len", [64, 128, 256, 512, 1024, 1025, 2048])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.skipif(
@@ -357,6 +723,49 @@ def test_fish_kvcache_native_op_matches_reference(seq_len, dtype, batch_size):
     not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
     reason="Fish kvcache CUDA extension is not available",
 )
+def test_fish_kvcache_native_op_handles_mixed_short_and_long_seq_lens():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    block_size = 16
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    seq_lens = torch.tensor([512, 2048, 1025], device=device, dtype=torch.int32)
+    max_seq_len = int(seq_lens.max().item())
+    batch_size = int(seq_lens.numel())
+    max_blocks = (max_seq_len + block_size - 1) // block_size
+    num_blocks = batch_size * max_blocks
+    scale = head_dim**-0.5
+
+    q = torch.randn((batch_size, num_q_heads, head_dim), device=device, dtype=dtype)
+    k_cache = torch.randn((num_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    v_cache = torch.randn((num_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    block_table = torch.empty((batch_size, max_blocks), device=device, dtype=torch.int32)
+    for batch_idx in range(batch_size):
+        pages = torch.arange(batch_idx * max_blocks, (batch_idx + 1) * max_blocks, device=device, dtype=torch.int32)
+        block_table[batch_idx] = pages
+
+    out = torch.empty_like(q)
+    fish_kvcache_attn.fish_decode_kvcache_attn(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        out,
+        scale=scale,
+        max_seq_len=max_seq_len,
+    )
+
+    expected = _reference_decode_attention(q, k_cache, v_cache, block_table, seq_lens, scale)
+    torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
+    reason="Fish kvcache CUDA extension is not available",
+)
 def test_fish_kvcache_native_op_can_be_captured_by_cuda_graph():
     device = torch.device("cuda")
     dtype = torch.float16
@@ -391,6 +800,58 @@ def test_fish_kvcache_native_op_can_be_captured_by_cuda_graph():
             out,
             scale=128**-0.5,
             max_seq_len=64,
+        )
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
+    reason="Fish kvcache CUDA extension is not available",
+)
+def test_fish_kvcache_native_long_op_can_be_captured_by_cuda_graph():
+    device = torch.device("cuda")
+    dtype = torch.float16
+    seq_len = 2048
+    block_size = 16
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    max_blocks = (seq_len + block_size - 1) // block_size
+
+    q = torch.randn((2, num_q_heads, head_dim), device=device, dtype=dtype)
+    k_cache = torch.randn((2 * max_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    v_cache = torch.randn((2 * max_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    block_table = torch.arange(2 * max_blocks, device=device, dtype=torch.int32).reshape(2, max_blocks)
+    seq_lens = torch.full((2,), seq_len, device=device, dtype=torch.int32)
+    out = torch.empty_like(q)
+    expected = torch.empty_like(q)
+
+    fish_kvcache_attn.fish_decode_kvcache_attn(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        expected,
+        scale=head_dim**-0.5,
+        max_seq_len=seq_len,
+    )
+    torch.accelerator.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fish_kvcache_attn.fish_decode_kvcache_attn(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            out,
+            scale=head_dim**-0.5,
+            max_seq_len=seq_len,
         )
     graph.replay()
     torch.accelerator.synchronize()
