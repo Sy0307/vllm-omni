@@ -124,6 +124,7 @@ class FishSpeechDACDecoder(nn.Module):
         self._output_sample_rate: int = DAC_SAMPLE_RATE
         self._hop_length: int = DAC_HOP_LENGTH
         self._logged_codec_stats = False
+        self._codec_decode_takes_lengths: bool | None = None
         extra_cfg = _connector_extra_config(vllm_config)
         self._dac_dtype = _get_dac_dtype(extra_cfg)
         self._decode_batch_bucket_frames = _get_int_list_config(
@@ -153,7 +154,11 @@ class FishSpeechDACDecoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._codec is not None
         decode = self._codec.decode
-        if len(inspect.signature(decode).parameters) >= 2:
+        decode_takes_lengths = getattr(self, "_codec_decode_takes_lengths", None)
+        if decode_takes_lengths is None:
+            decode_takes_lengths = len(inspect.signature(decode).parameters) >= 2
+            self._codec_decode_takes_lengths = decode_takes_lengths
+        if decode_takes_lengths:
             return decode(codes_bqf, feature_lengths)
 
         if hasattr(self._codec, "from_indices"):
@@ -263,6 +268,7 @@ class FishSpeechDACDecoder(nn.Module):
         codec = codec.to(device=device, dtype=self._dac_dtype)
         codec.eval()
         self._codec = codec
+        self._codec_decode_takes_lengths = len(inspect.signature(codec.decode).parameters) >= 2
 
         logger.info(
             "Fish Speech DAC codec loaded from %s (device=%s, dtype=%s, sample_rate=%d)",

@@ -231,6 +231,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Empty chunk with more data expected: keep polling.
                 has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
                 if not has_new_ids and not payload_finished:
+                    # The base recv loop treats False as "not ready yet" and
+                    # requeues the request. Do not mark an empty non-terminal
+                    # chunk as ready, otherwise Stage1 can consume before the
+                    # first DAC frame arrives.
                     return False
 
             # Mark as finished for consumption

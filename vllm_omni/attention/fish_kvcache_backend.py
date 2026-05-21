@@ -210,8 +210,9 @@ def _forward_with_fish_kvcache(
             )
             return output
 
-        _record_fallback("guard_miss")
-        if is_fish_kvcache_attn_required():
+        is_decode_request = int(attn_metadata.max_query_len) == 1
+        _record_fallback("guard_miss" if is_decode_request else "non_decode")
+        if is_decode_request and is_fish_kvcache_attn_required():
             raise RuntimeError(
                 "Fish kvcache attention is required but guard rejected the request: "
                 f"query_shape={tuple(q.shape)} query_dtype={q.dtype} "
@@ -258,13 +259,13 @@ def install_fish_kvcache_attn_backend(model: Any) -> int:
     if not _fish_kvcache_enabled():
         return 0
     if not is_available():
-        _record_fallback("native_unavailable")
+        _record_fallback("implementation_unavailable")
         if is_fish_kvcache_attn_required():
             raise RuntimeError(
-                f"VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED=1 but native extension is unavailable: {load_error()!r}"
+                f"VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED=1 but Fish kvcache attention is unavailable: {load_error()!r}"
             )
         logger.warning(
-            "VLLM_OMNI_FISH_KVCACHE_ATTN=1 but native extension is unavailable: %r",
+            "VLLM_OMNI_FISH_KVCACHE_ATTN=1 but Fish kvcache attention is unavailable: %r",
             load_error(),
         )
         return 0

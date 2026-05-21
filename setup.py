@@ -15,45 +15,6 @@ from setuptools import setup
 from setuptools_scm import get_version
 
 
-def get_ext_modules():
-    """Return optional native extensions.
-
-    Fish Speech's decode-only kvcache attention kernel is opt-in so default
-    installs do not require a local CUDA compiler or PyTorch headers.
-    """
-    if os.environ.get("VLLM_OMNI_BUILD_FISH_KVCACHE_ATTN", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return [], {}
-
-    try:
-        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-    except Exception as exc:
-        raise RuntimeError(
-            "VLLM_OMNI_BUILD_FISH_KVCACHE_ATTN=1 requires PyTorch with CUDA extension build support"
-        ) from exc
-
-    root = Path(__file__).parent
-    sources = [
-        root / "vllm_omni" / "csrc" / "fish_kvcache_attn.cpp",
-        root / "vllm_omni" / "csrc" / "fish_kvcache_attn_kernel.cu",
-    ]
-    ext_modules = [
-        CUDAExtension(
-            name="vllm_omni._C",
-            sources=[str(path.relative_to(root)) for path in sources],
-            extra_compile_args={
-                "cxx": ["-O3"],
-                "nvcc": ["-O3"],
-            },
-        )
-    ]
-    return ext_modules, {"build_ext": BuildExtension}
-
-
 def uninstall_onnxruntime() -> None:
     """
     Uninstall onnxruntime package if it exists.
@@ -275,12 +236,9 @@ def get_install_requires() -> list[str]:
 if __name__ == "__main__":
     # Get platform-specific dependencies
     install_requires = get_install_requires()
-    ext_modules, cmdclass = get_ext_modules()
 
     # Setup configuration
     setup(
         version=get_vllm_omni_version(),
         install_requires=install_requires,
-        ext_modules=ext_modules,
-        cmdclass=cmdclass,
     )

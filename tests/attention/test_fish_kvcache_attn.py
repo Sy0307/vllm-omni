@@ -523,6 +523,38 @@ def test_fish_kvcache_backend_required_raises_on_guard_miss(monkeypatch):
         )
 
 
+def test_fish_kvcache_backend_required_allows_prefill_fallback(monkeypatch):
+    fish_kvcache_backend.reset_fish_kvcache_attn_stats()
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
+    monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
+    monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: False)
+
+    model = _FakeModel()
+    assert fish_kvcache_backend.install_fish_kvcache_attn_backend(model) == 1
+
+    query = torch.zeros((2, 32, 128), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 8, 16, 8, 128), dtype=torch.float16)
+
+    result = model.layers[0].self_attn.attn.impl.forward(
+        None,
+        query,
+        None,
+        None,
+        kv_cache,
+        _metadata(max_query_len=2, max_seq_len=2),
+        output,
+    )
+
+    assert result is output
+    assert model.layers[0].self_attn.attn.impl.original_calls == 1
+    assert torch.equal(output, torch.full_like(output, 2))
+    stats = fish_kvcache_backend.get_fish_kvcache_attn_stats()
+    assert stats["fallback_count_by_reason"] == {"non_decode": 1}
+
+
 def test_fish_kvcache_backend_does_not_clamp_decode_without_cpu_upper_bound(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
@@ -606,7 +638,7 @@ def test_fish_kvcache_decode_reuses_long_workspace(monkeypatch):
         calls.append((partial_m.data_ptr(), partial_l.data_ptr(), partial_acc.data_ptr(), tuple(partial_acc.shape)))
         return out
 
-    monkeypatch.setattr(torch.ops.vllm_omni_fish_kvcache_attn, "decode", fake_decode, raising=False)
+    monkeypatch.setattr(fish_kvcache_attn.fish_kvcache_triton, "fish_decode_kvcache_attn_triton", fake_decode)
 
     q = torch.zeros((2, 4, 128), dtype=torch.float16)
     k_cache = torch.zeros((128, 16, 2, 128), dtype=torch.float16)
@@ -629,7 +661,7 @@ def test_fish_kvcache_decode_reuses_long_workspace(monkeypatch):
 
     assert len(calls) == 2
     assert calls[0] == calls[1]
-    assert calls[0][3] == (2, 8, 128)
+    assert calls[0][3] == (0,)
 
 
 def test_fish_kvcache_decode_workspace_miss_rejects_cuda_graph_capture(monkeypatch):
@@ -677,9 +709,9 @@ def test_fish_kvcache_backend_prewarms_capture_workspaces(monkeypatch):
     q = torch.zeros((4, 4, 128), dtype=torch.float16)
     partial_m, partial_l, partial_acc = fish_kvcache_attn._get_decode_workspace(q, 2048)
 
-    assert tuple(partial_m.shape) == (2, 16)
-    assert tuple(partial_l.shape) == (2, 16)
-    assert tuple(partial_acc.shape) == (2, 16, 128)
+    assert tuple(partial_m.shape) == (0,)
+    assert tuple(partial_l.shape) == (0,)
+    assert tuple(partial_acc.shape) == (0,)
 
 
 def _reference_decode_attention(
@@ -721,7 +753,7 @@ def _reference_decode_attention(
 @pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
-    reason="Fish kvcache CUDA extension is not available",
+    reason="Fish kvcache Triton attention is not available",
 )
 def test_fish_kvcache_native_op_matches_reference(seq_len, dtype, batch_size):
     torch.manual_seed(0)
@@ -761,7 +793,7 @@ def test_fish_kvcache_native_op_matches_reference(seq_len, dtype, batch_size):
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
-    reason="Fish kvcache CUDA extension is not available",
+    reason="Fish kvcache Triton attention is not available",
 )
 def test_fish_kvcache_native_op_handles_mixed_short_and_long_seq_lens():
     torch.manual_seed(0)
@@ -804,7 +836,7 @@ def test_fish_kvcache_native_op_handles_mixed_short_and_long_seq_lens():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
-    reason="Fish kvcache CUDA extension is not available",
+    reason="Fish kvcache Triton attention is not available",
 )
 def test_fish_kvcache_native_op_can_be_captured_by_cuda_graph():
     device = torch.device("cuda")
@@ -849,7 +881,7 @@ def test_fish_kvcache_native_op_can_be_captured_by_cuda_graph():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
-    reason="Fish kvcache CUDA extension is not available",
+    reason="Fish kvcache Triton attention is not available",
 )
 def test_fish_kvcache_native_long_op_can_be_captured_by_cuda_graph():
     device = torch.device("cuda")

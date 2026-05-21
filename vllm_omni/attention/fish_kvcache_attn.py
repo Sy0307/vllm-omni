@@ -1,27 +1,24 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 import torch
 
-_LOAD_ERROR: Exception | None = None
-_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
-_SMALL_PATH_MAX_SEQ_LEN = 1024
-_WORKSPACE_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+from vllm_omni.attention import fish_kvcache_triton
 
-try:
-    from vllm_omni import _C  # noqa: F401
-except Exception as exc:  # pragma: no cover - depends on optional extension
-    _LOAD_ERROR = exc
+_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
+_WORKSPACE_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_WORKSPACE_CACHE_LOCK = threading.Lock()
 
 
 def is_available() -> bool:
-    return _LOAD_ERROR is None and hasattr(torch.ops.vllm_omni_fish_kvcache_attn, "decode")
+    return fish_kvcache_triton.is_available()
 
 
 def load_error() -> Exception | None:
-    return _LOAD_ERROR
+    return fish_kvcache_triton.load_error()
 
 
 def is_fish_kvcache_attn_enabled() -> bool:
@@ -30,27 +27,6 @@ def is_fish_kvcache_attn_enabled() -> bool:
 
 def is_fish_kvcache_attn_required() -> bool:
     return os.environ.get("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "").lower() in _ENABLED_VALUES
-
-
-if is_available():
-
-    @torch.library.register_fake("vllm_omni_fish_kvcache_attn::decode")
-    def _decode_fake(
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-        out: torch.Tensor,
-        scale: float,
-        max_seq_len: int,
-        partial_m: torch.Tensor,
-        partial_l: torch.Tensor,
-        partial_acc: torch.Tensor,
-    ) -> torch.Tensor:
-        del q, k_cache, v_cache, block_table, seq_lens, scale, max_seq_len
-        del partial_m, partial_l, partial_acc
-        return out
 
 
 def _is_sliding_window_disabled(sliding_window: Any) -> bool:
@@ -116,20 +92,6 @@ def can_use_fish_kvcache_attn(
     return True
 
 
-def _workspace_cache_key(
-    query: torch.Tensor,
-    num_splits: int,
-) -> tuple[Any, ...]:
-    return (
-        query.device.type,
-        query.device.index,
-        num_splits,
-        int(query.shape[0]),
-        int(query.shape[1]),
-        int(query.shape[2]),
-    )
-
-
 def _is_cuda_graph_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
@@ -145,8 +107,9 @@ def _get_decode_workspace(
     query: torch.Tensor,
     max_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if max_seq_len <= _SMALL_PATH_MAX_SEQ_LEN:
-        key = (query.device.type, query.device.index, "empty")
+    del max_seq_len
+    key = (query.device.type, query.device.index, "empty")
+    with _WORKSPACE_CACHE_LOCK:
         workspace = _WORKSPACE_CACHE.get(key)
         if workspace is None:
             if _is_cuda_graph_capturing():
@@ -158,22 +121,6 @@ def _get_decode_workspace(
             )
             _WORKSPACE_CACHE[key] = workspace
         return workspace
-
-    num_splits = (int(max_seq_len) + _SMALL_PATH_MAX_SEQ_LEN - 1) // _SMALL_PATH_MAX_SEQ_LEN
-    key = _workspace_cache_key(query, num_splits)
-    workspace = _WORKSPACE_CACHE.get(key)
-    if workspace is None:
-        if _is_cuda_graph_capturing():
-            _raise_workspace_capture_miss()
-        total_rows = int(query.shape[0]) * int(query.shape[1])
-        head_dim = int(query.shape[2])
-        workspace = (
-            torch.empty((num_splits, total_rows), device=query.device, dtype=torch.float32),
-            torch.empty((num_splits, total_rows), device=query.device, dtype=torch.float32),
-            torch.empty((num_splits, total_rows, head_dim), device=query.device, dtype=torch.float32),
-        )
-        _WORKSPACE_CACHE[key] = workspace
-    return workspace
 
 
 def prewarm_fish_kvcache_attn_workspace(
@@ -195,16 +142,16 @@ def fish_decode_kvcache_attn(
     max_seq_len: int,
 ) -> torch.Tensor:
     partial_m, partial_l, partial_acc = _get_decode_workspace(query, int(max_seq_len))
-    return torch.ops.vllm_omni_fish_kvcache_attn.decode(
+    return fish_kvcache_triton.fish_decode_kvcache_attn_triton(
         query,
         key_cache,
         value_cache,
         block_table,
         seq_lens,
         out,
-        float(scale),
-        int(max_seq_len),
-        partial_m,
-        partial_l,
-        partial_acc,
+        scale=float(scale),
+        max_seq_len=int(max_seq_len),
+        partial_m=partial_m,
+        partial_l=partial_l,
+        partial_acc=partial_acc,
     )
