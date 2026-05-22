@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import math
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -200,7 +199,9 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
-        if os.environ.get("VLLM_OMNI_FISH_KVCACHE_ATTN", "").lower() in {"1", "true", "yes", "on"}:
+        from vllm_omni.attention.fish_kvcache_attn import is_fish_kvcache_attn_enabled
+
+        if is_fish_kvcache_attn_enabled():
             from vllm_omni.attention.fish_kvcache_backend import install_fish_kvcache_attn_backend
 
             install_fish_kvcache_attn_backend(self.model)

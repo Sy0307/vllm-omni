@@ -17,13 +17,13 @@ from vllm_omni.attention.fish_kvcache_attn import (
     load_error,
     prewarm_fish_kvcache_attn_workspace,
 )
+from vllm_omni.attention.fish_kvcache_config import FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN
 
 logger = init_logger(__name__)
 
 _FIRST_SMALL_HIT_LOGGED = False
 _FIRST_LONG_HIT_LOGGED = False
 _FIRST_MISS_LOGGED = False
-_SMALL_PATH_MAX_SEQ_LEN = 1024
 _SMALL_HIT_COUNT = 0
 _LONG_HIT_COUNT = 0
 _FALLBACK_COUNTS: Counter[str] = Counter()
@@ -50,6 +50,18 @@ def get_fish_kvcache_attn_stats() -> dict[str, Any]:
 
 def _record_fallback(reason: str) -> None:
     _FALLBACK_COUNTS[reason] += 1
+
+
+def _small_decode_bucket(max_seq_len: int) -> int:
+    if max_seq_len <= 64:
+        return 64
+    if max_seq_len <= 128:
+        return 128
+    if max_seq_len <= 256:
+        return 256
+    if max_seq_len <= 512:
+        return 512
+    return FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN
 
 
 def prewarm_fish_kvcache_attn_capture_workspaces(
@@ -101,34 +113,46 @@ def prewarm_fish_kvcache_attn_capture_workspaces(
     return prewarmed
 
 
-def _dispatch_max_seq_len(attn_metadata: Any, active_batch: int, seq_lens: Any) -> int:
+def _dispatch_max_seq_len(attn_metadata: Any, active_batch: int, seq_lens: Any) -> int | None:
     max_seq_len = int(attn_metadata.max_seq_len)
-    if int(attn_metadata.max_query_len) == 1:
-        upper_bound = getattr(attn_metadata, "seq_lens_cpu_upper_bound", None)
-        if upper_bound is not None:
-            try:
-                if getattr(upper_bound, "device", None) is not None and upper_bound.device.type != "cpu":
-                    if is_fish_kvcache_attn_required():
-                        raise RuntimeError("Fish kvcache attention seq_lens_cpu_upper_bound must be a CPU tensor")
-                    return max_seq_len
-                if int(upper_bound.shape[0]) < active_batch:
-                    return max_seq_len
-                upper_bound = upper_bound[:active_batch]
-                dispatch_max_seq_len = max(1, min(max_seq_len, int(upper_bound.max().item())))
-                if is_fish_kvcache_attn_required():
-                    real_max_seq_len = int(seq_lens.max().item())
-                    if dispatch_max_seq_len < real_max_seq_len:
-                        raise RuntimeError(
-                            "Fish kvcache attention seq_lens_cpu_upper_bound "
-                            f"underestimates real seq_lens: upper_bound={dispatch_max_seq_len}, "
-                            f"real={real_max_seq_len}"
-                        )
-                return dispatch_max_seq_len
-            except Exception:
-                if is_fish_kvcache_attn_required():
-                    raise
-                logger.debug("Failed to read seq_lens_cpu_upper_bound for Fish attention dispatch", exc_info=True)
-    return max_seq_len
+    if int(attn_metadata.max_query_len) != 1:
+        return max_seq_len
+
+    upper_bound = getattr(attn_metadata, "seq_lens_cpu_upper_bound", None)
+    if upper_bound is None:
+        if is_fish_kvcache_attn_required():
+            raise RuntimeError("Fish kvcache attention requires seq_lens_cpu_upper_bound for decode dispatch")
+        return None
+    try:
+        if getattr(upper_bound, "device", None) is not None and upper_bound.device.type != "cpu":
+            if is_fish_kvcache_attn_required():
+                raise RuntimeError("Fish kvcache attention seq_lens_cpu_upper_bound must be a CPU tensor")
+            return None
+        if int(upper_bound.shape[0]) < active_batch:
+            if is_fish_kvcache_attn_required():
+                raise RuntimeError(
+                    "Fish kvcache attention seq_lens_cpu_upper_bound does not cover the active decode batch: "
+                    f"upper_bound_rows={int(upper_bound.shape[0])}, active_batch={active_batch}"
+                )
+            return None
+        upper_bound = upper_bound[:active_batch]
+        real_upper_bound = max(1, int(upper_bound.max().item()))
+        if is_fish_kvcache_attn_required():
+            real_max_seq_len = int(seq_lens.max().item())
+            if real_upper_bound < real_max_seq_len:
+                raise RuntimeError(
+                    "Fish kvcache attention seq_lens_cpu_upper_bound "
+                    f"underestimates real seq_lens: upper_bound={real_upper_bound}, "
+                    f"real={real_max_seq_len}"
+                )
+        if real_upper_bound <= FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN:
+            return _small_decode_bucket(real_upper_bound)
+        return real_upper_bound
+    except Exception:
+        if is_fish_kvcache_attn_required():
+            raise
+        logger.debug("Failed to read seq_lens_cpu_upper_bound for Fish attention dispatch", exc_info=True)
+        return None
 
 
 def _forward_with_fish_kvcache(
@@ -156,7 +180,7 @@ def _forward_with_fish_kvcache(
         block_table = attn_metadata.block_table[:active_batch] if attn_metadata.block_table is not None else None
         seq_lens = attn_metadata.seq_lens[:active_batch]
         dispatch_max_seq_len = _dispatch_max_seq_len(attn_metadata, active_batch, seq_lens)
-        can_use = can_use_fish_kvcache_attn(
+        can_use = dispatch_max_seq_len is not None and can_use_fish_kvcache_attn(
             query=q,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -172,7 +196,7 @@ def _forward_with_fish_kvcache(
             output_block_scale=output_block_scale,
         )
         if can_use:
-            is_long_path = dispatch_max_seq_len > _SMALL_PATH_MAX_SEQ_LEN
+            is_long_path = dispatch_max_seq_len > FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN
             if is_long_path:
                 _LONG_HIT_COUNT += 1
             else:
@@ -211,7 +235,12 @@ def _forward_with_fish_kvcache(
             return output
 
         is_decode_request = int(attn_metadata.max_query_len) == 1
-        _record_fallback("guard_miss" if is_decode_request else "non_decode")
+        if is_decode_request and dispatch_max_seq_len is None:
+            _record_fallback("missing_cpu_upper_bound")
+        elif is_decode_request:
+            _record_fallback("guard_miss")
+        else:
+            _record_fallback("non_decode")
         if is_decode_request and is_fish_kvcache_attn_required():
             raise RuntimeError(
                 "Fish kvcache attention is required but guard rejected the request: "

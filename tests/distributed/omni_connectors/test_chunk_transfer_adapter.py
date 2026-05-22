@@ -163,18 +163,31 @@ def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapte
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-empty-tensor", RequestStatus.WAITING, external_req_id="external-empty")
 
-    payload: OmniPayload = {
+    empty_payload: OmniPayload = {
         "codes": {"audio": torch.empty((4, 0), dtype=torch.long)},
         "meta": {
             "left_context_size": 0,
             "finished": torch.tensor(False, dtype=torch.bool),
         },
     }
-    connector.get.return_value = (payload, 16)
+    ready_payload: OmniPayload = {
+        "codes": {"audio": torch.tensor([[1, 2]], dtype=torch.long)},
+        "meta": {
+            "left_context_size": 0,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.side_effect = [(empty_payload, 16), (ready_payload, 16)]
 
     assert adapter._poll_single_request(request) is False
     assert request.request_id not in adapter._finished_load_reqs
     assert request.request_id not in adapter.requests_with_ready_chunks
+    assert adapter.get_req_chunk[request.request_id] == 1
+
+    assert adapter._poll_single_request(request) is True
+    assert request.request_id in adapter._finished_load_reqs
+    assert torch.equal(request.additional_information["codes"]["audio"], ready_payload["codes"]["audio"])
+    assert adapter.get_req_chunk[request.request_id] == 2
 
 
 def test_save_async(build_adapter):

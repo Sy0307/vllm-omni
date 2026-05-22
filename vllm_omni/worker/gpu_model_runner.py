@@ -115,7 +115,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
             )
             max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.long)
+            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
                 max_batch_size, hidden_size, dtype=self.dtype, numpy=False
             )
@@ -135,6 +135,84 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=self.device,
             dtype=self.dtype,
             capture_sizes=capture_sizes,
+        )
+
+    def _attach_fish_kvcache_seq_lens_cpu_upper_bound(
+        self,
+        attn_metadata: Any,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+    ) -> None:
+        if not self._fish_kvcache_attn_active():
+            return
+
+        def attach(metadata: Any) -> None:
+            if metadata is None:
+                return
+            if isinstance(metadata, dict):
+                for value in metadata.values():
+                    attach(value)
+                return
+            if isinstance(metadata, (list, tuple)):
+                for value in metadata:
+                    attach(value)
+                return
+            setattr(metadata, "seq_lens_cpu_upper_bound", seq_lens_cpu_upper_bound)
+
+        attach(attn_metadata)
+
+    def _fish_kvcache_attn_active(self) -> bool:
+        if getattr(self.model_config, "model_arch", None) != "FishSpeechSlowARForConditionalGeneration":
+            return False
+        from vllm_omni.attention.fish_kvcache_attn import is_fish_kvcache_attn_enabled
+
+        return is_fish_kvcache_attn_enabled()
+
+    def _fish_kvcache_graph_capture_seq_len_upper_bound(
+        self,
+        *,
+        max_query_len: int,
+        for_cudagraph_capture: bool,
+    ) -> int | None:
+        if not for_cudagraph_capture or not self._fish_kvcache_attn_active() or int(max_query_len) != 1:
+            return None
+        max_model_len = int(getattr(self.model_config, "max_model_len", 0))
+        return max(max_model_len, 1024)
+
+    def _maybe_attach_fish_kvcache_seq_lens_upper_bound(
+        self,
+        *,
+        attn_metadata: Any,
+        num_reqs: int,
+        num_reqs_padded: int,
+        max_query_len: int,
+        pad_attn: bool,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+    ) -> None:
+        if not self._fish_kvcache_attn_active() or int(max_query_len) != 1:
+            return
+
+        upper_bound_rows = int(num_reqs_padded if pad_attn else num_reqs)
+        capture_upper_bound = self._fish_kvcache_graph_capture_seq_len_upper_bound(
+            max_query_len=max_query_len,
+            for_cudagraph_capture=for_cudagraph_capture,
+        )
+        if capture_upper_bound is not None:
+            self.optimistic_seq_lens_cpu[:upper_bound_rows].fill_(capture_upper_bound)
+        else:
+            if num_scheduled_tokens_np is None:
+                return
+            seq_lens_cpu_upper_bound = torch.as_tensor(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens_np,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens_cpu_upper_bound
+            if upper_bound_rows > num_reqs:
+                self.optimistic_seq_lens_cpu[num_reqs:upper_bound_rows].fill_(1)
+        self._attach_fish_kvcache_seq_lens_cpu_upper_bound(
+            attn_metadata,
+            self.optimistic_seq_lens_cpu[:upper_bound_rows],
         )
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
@@ -862,6 +940,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                )
+                self._maybe_attach_fish_kvcache_seq_lens_upper_bound(
+                    attn_metadata=attn_metadata,
+                    num_reqs=num_reqs_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_query_len,
+                    pad_attn=True,
+                    for_cudagraph_capture=is_graph_capturing,
                 )
 
         with self.maybe_dummy_run_with_lora(

@@ -7,6 +7,10 @@ from typing import Any
 import torch
 
 from vllm_omni.attention import fish_kvcache_triton
+from vllm_omni.attention.fish_kvcache_config import (
+    FISH_KVCACHE_LONG_SPLIT_TOKENS,
+    FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
+)
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _WORKSPACE_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -81,6 +85,8 @@ def can_use_fish_kvcache_attn(
         return False
     if max_seq_len <= 0:
         return False
+    if max_seq_len > block_table.shape[1] * key_cache.shape[1]:
+        return False
     if not (
         query.is_contiguous()
         and key_cache.is_contiguous()
@@ -107,17 +113,34 @@ def _get_decode_workspace(
     query: torch.Tensor,
     max_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del max_seq_len
-    key = (query.device.type, query.device.index, "empty")
+    batch_size, num_q_heads, head_dim = query.shape
+    if int(max_seq_len) <= FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN:
+        key = (query.device.type, query.device.index, "empty")
+        partial_shapes = ((0,), (0,), (0,))
+    else:
+        num_splits = (int(max_seq_len) + FISH_KVCACHE_LONG_SPLIT_TOKENS - 1) // FISH_KVCACHE_LONG_SPLIT_TOKENS
+        key = (
+            query.device.type,
+            query.device.index,
+            int(batch_size),
+            int(num_q_heads),
+            int(head_dim),
+            int(num_splits),
+        )
+        partial_shapes = (
+            (num_splits, batch_size, num_q_heads),
+            (num_splits, batch_size, num_q_heads),
+            (num_splits, batch_size, num_q_heads, head_dim),
+        )
     with _WORKSPACE_CACHE_LOCK:
         workspace = _WORKSPACE_CACHE.get(key)
         if workspace is None:
             if _is_cuda_graph_capturing():
                 _raise_workspace_capture_miss()
             workspace = (
-                torch.empty((0,), device=query.device, dtype=torch.float32),
-                torch.empty((0,), device=query.device, dtype=torch.float32),
-                torch.empty((0,), device=query.device, dtype=torch.float32),
+                torch.empty(partial_shapes[0], device=query.device, dtype=torch.float32),
+                torch.empty(partial_shapes[1], device=query.device, dtype=torch.float32),
+                torch.empty(partial_shapes[2], device=query.device, dtype=torch.float32),
             )
             _WORKSPACE_CACHE[key] = workspace
         return workspace
