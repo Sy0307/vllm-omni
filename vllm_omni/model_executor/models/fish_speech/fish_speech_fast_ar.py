@@ -334,8 +334,8 @@ class FishSpeechFastARModel(nn.Module):
 class FishSpeechFastAR(nn.Module):
     """vLLM-native Fast AR for Fish Speech (residual codebooks).
 
-    Re-prefill approach: each AR step forwards the full growing sequence
-    through the 4-layer transformer.  No KV cache needed.
+    Decode approach: each residual-codebook step forwards one token through
+    the 4-layer transformer with a per-call KV cache.
 
     Optimisations over baseline:
       1. Pre-allocated embedding buffer [B, max_seq, H].
@@ -464,22 +464,6 @@ class FishSpeechFastAR(nn.Module):
             )
             self(hidden, semantic, do_sample=False)
         torch.accelerator.synchronize(device)
-
-    @torch.inference_mode()
-    def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:
-        if self._disable_compile_for_graph:
-            model_fwd = self._compiled_model_fwd or self.model.forward
-        else:
-            model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
-        try:
-            return model_fwd(step_input, step_pos_ids)
-        except Exception as exc:
-            if model_fwd is self.model.forward or self._compile_failed:
-                raise
-            self._compile_failed = True
-            self._compiled_model_fwd = self.model.forward
-            logger.warning("Fish Speech Fast AR torch.compile fallback to eager after runtime failure: %s", exc)
-            return self.model.forward(step_input, step_pos_ids)
 
     @torch.inference_mode()
     def _run_model_one(self, input_embed: torch.Tensor, step_pos_ids: torch.Tensor, cache_pos: int) -> torch.Tensor:

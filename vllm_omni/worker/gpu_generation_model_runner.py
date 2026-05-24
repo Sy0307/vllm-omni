@@ -278,7 +278,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
             )
-            self._maybe_attach_fish_kvcache_seq_lens_upper_bound(
+            self._maybe_attach_attention_metadata_extensions(
                 attn_metadata=attn_metadata,
                 num_reqs=num_reqs,
                 num_reqs_padded=num_reqs_padded,
@@ -738,7 +738,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
-                self._maybe_attach_fish_kvcache_seq_lens_upper_bound(
+                self._maybe_attach_attention_metadata_extensions(
                     attn_metadata=attn_metadata,
                     num_reqs=num_reqs_padded,
                     num_reqs_padded=num_reqs_padded,

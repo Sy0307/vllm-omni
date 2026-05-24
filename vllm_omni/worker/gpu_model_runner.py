@@ -95,7 +95,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
-        self._prewarm_fish_kvcache_attn_workspaces()
+        self._prewarm_attention_capture_workspaces()
 
         # TODO move this model specific logic to a separate class
         # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
@@ -122,11 +122,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
             self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 
-    def _prewarm_fish_kvcache_attn_workspaces(self) -> None:
+    def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
         if not capture_sizes:
-            return
-        if getattr(self.model_config, "model_arch", None) != "FishSpeechSlowARForConditionalGeneration":
             return
         from vllm_omni.attention.fish_kvcache_backend import prewarm_fish_kvcache_attn_capture_workspaces
 
@@ -137,48 +135,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             capture_sizes=capture_sizes,
         )
 
-    def _attach_fish_kvcache_seq_lens_cpu_upper_bound(
-        self,
-        attn_metadata: Any,
-        seq_lens_cpu_upper_bound: torch.Tensor,
-    ) -> None:
-        if not self._fish_kvcache_attn_active():
-            return
-
-        def attach(metadata: Any) -> None:
-            if metadata is None:
-                return
-            if isinstance(metadata, dict):
-                for value in metadata.values():
-                    attach(value)
-                return
-            if isinstance(metadata, (list, tuple)):
-                for value in metadata:
-                    attach(value)
-                return
-            setattr(metadata, "seq_lens_cpu_upper_bound", seq_lens_cpu_upper_bound)
-
-        attach(attn_metadata)
-
-    def _fish_kvcache_attn_active(self) -> bool:
-        if getattr(self.model_config, "model_arch", None) != "FishSpeechSlowARForConditionalGeneration":
-            return False
-        from vllm_omni.attention.fish_kvcache_attn import is_fish_kvcache_attn_enabled
-
-        return is_fish_kvcache_attn_enabled()
-
-    def _fish_kvcache_graph_capture_seq_len_upper_bound(
-        self,
-        *,
-        max_query_len: int,
-        for_cudagraph_capture: bool,
-    ) -> int | None:
-        if not for_cudagraph_capture or not self._fish_kvcache_attn_active() or int(max_query_len) != 1:
-            return None
-        max_model_len = int(getattr(self.model_config, "max_model_len", 0))
-        return max(max_model_len, 1024)
-
-    def _maybe_attach_fish_kvcache_seq_lens_upper_bound(
+    def _maybe_attach_attention_metadata_extensions(
         self,
         *,
         attn_metadata: Any,
@@ -189,30 +146,19 @@ class OmniGPUModelRunner(GPUModelRunner):
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens_np: np.ndarray | None = None,
     ) -> None:
-        if not self._fish_kvcache_attn_active() or int(max_query_len) != 1:
-            return
+        from vllm_omni.attention.fish_kvcache_backend import maybe_attach_fish_kvcache_seq_lens_upper_bound
 
-        upper_bound_rows = int(num_reqs_padded if pad_attn else num_reqs)
-        capture_upper_bound = self._fish_kvcache_graph_capture_seq_len_upper_bound(
+        maybe_attach_fish_kvcache_seq_lens_upper_bound(
+            model_config=self.model_config,
+            attn_metadata=attn_metadata,
+            input_batch=self.input_batch,
+            optimistic_seq_lens_cpu=self.optimistic_seq_lens_cpu,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
             max_query_len=max_query_len,
+            pad_attn=pad_attn,
             for_cudagraph_capture=for_cudagraph_capture,
-        )
-        if capture_upper_bound is not None:
-            self.optimistic_seq_lens_cpu[:upper_bound_rows].fill_(capture_upper_bound)
-        else:
-            if num_scheduled_tokens_np is None:
-                return
-            seq_lens_cpu_upper_bound = torch.as_tensor(
-                self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens_np,
-                dtype=torch.int32,
-                device="cpu",
-            )
-            self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens_cpu_upper_bound
-            if upper_bound_rows > num_reqs:
-                self.optimistic_seq_lens_cpu[num_reqs:upper_bound_rows].fill_(1)
-        self._attach_fish_kvcache_seq_lens_cpu_upper_bound(
-            attn_metadata,
-            self.optimistic_seq_lens_cpu[:upper_bound_rows],
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
         )
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
@@ -941,7 +887,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
-                self._maybe_attach_fish_kvcache_seq_lens_upper_bound(
+                self._maybe_attach_attention_metadata_extensions(
                     attn_metadata=attn_metadata,
                     num_reqs=num_reqs_padded,
                     num_reqs_padded=num_reqs_padded,

@@ -9,6 +9,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.attention.fish_kvcache_attn import (
+    FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
     can_use_fish_kvcache_attn,
     fish_decode_kvcache_attn,
     is_available,
@@ -17,10 +18,10 @@ from vllm_omni.attention.fish_kvcache_attn import (
     load_error,
     prewarm_fish_kvcache_attn_workspace,
 )
-from vllm_omni.attention.fish_kvcache_config import FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN
 
 logger = init_logger(__name__)
 
+_FISH_SLOW_AR_ARCH = "FishSpeechSlowARForConditionalGeneration"
 _FIRST_SMALL_HIT_LOGGED = False
 _FIRST_LONG_HIT_LOGGED = False
 _FIRST_MISS_LOGGED = False
@@ -31,6 +32,10 @@ _FALLBACK_COUNTS: Counter[str] = Counter()
 
 def _fish_kvcache_enabled() -> bool:
     return is_fish_kvcache_attn_enabled()
+
+
+def is_fish_kvcache_attn_active_for_model(model_config: Any) -> bool:
+    return getattr(model_config, "model_arch", None) == _FISH_SLOW_AR_ARCH and is_fish_kvcache_attn_enabled()
 
 
 def reset_fish_kvcache_attn_stats() -> None:
@@ -74,7 +79,7 @@ def prewarm_fish_kvcache_attn_capture_workspaces(
     """Preallocate Fish attention workspaces used during CUDA graph capture."""
     if not _fish_kvcache_enabled() or not is_available():
         return 0
-    if getattr(model_config, "model_arch", None) != "FishSpeechSlowARForConditionalGeneration":
+    if not is_fish_kvcache_attn_active_for_model(model_config):
         return 0
 
     hf_config = getattr(model_config, "hf_config", None)
@@ -82,13 +87,10 @@ def prewarm_fish_kvcache_attn_capture_workspaces(
     if text_config is None:
         return 0
 
-    try:
-        num_heads = int(text_config.num_attention_heads)
-        head_dim = int(text_config.head_dim)
-        max_seq_len = int(getattr(model_config, "max_model_len", 0))
-        sizes = sorted({int(size) for size in capture_sizes if int(size) > 0})
-    except (AttributeError, TypeError, ValueError):
-        return 0
+    num_heads = int(text_config.num_attention_heads)
+    head_dim = int(text_config.head_dim)
+    max_seq_len = int(getattr(model_config, "max_model_len", 0))
+    sizes = sorted({int(size) for size in capture_sizes if int(size) > 0})
     if num_heads <= 0 or head_dim <= 0 or max_seq_len <= 0 or not sizes:
         return 0
 
@@ -111,6 +113,74 @@ def prewarm_fish_kvcache_attn_capture_workspaces(
         max_seq_len,
     )
     return prewarmed
+
+
+def _attach_seq_lens_cpu_upper_bound(attn_metadata: Any, seq_lens_cpu_upper_bound: torch.Tensor) -> None:
+    if attn_metadata is None:
+        return
+    if isinstance(attn_metadata, dict):
+        for value in attn_metadata.values():
+            _attach_seq_lens_cpu_upper_bound(value, seq_lens_cpu_upper_bound)
+        return
+    if isinstance(attn_metadata, (list, tuple)):
+        for value in attn_metadata:
+            _attach_seq_lens_cpu_upper_bound(value, seq_lens_cpu_upper_bound)
+        return
+    setattr(attn_metadata, "seq_lens_cpu_upper_bound", seq_lens_cpu_upper_bound)
+
+
+def _graph_capture_seq_len_upper_bound(
+    *,
+    model_config: Any,
+    max_query_len: int,
+    for_cudagraph_capture: bool,
+) -> int | None:
+    if not for_cudagraph_capture or int(max_query_len) != 1:
+        return None
+    max_model_len = int(getattr(model_config, "max_model_len", 0))
+    return max(max_model_len, FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN)
+
+
+def maybe_attach_fish_kvcache_seq_lens_upper_bound(
+    *,
+    model_config: Any,
+    attn_metadata: Any,
+    input_batch: Any,
+    optimistic_seq_lens_cpu: torch.Tensor,
+    num_reqs: int,
+    num_reqs_padded: int,
+    max_query_len: int,
+    pad_attn: bool,
+    for_cudagraph_capture: bool = False,
+    num_scheduled_tokens_np: Any = None,
+) -> None:
+    """Attach CPU seq-len upper bounds for the Fish-only Triton decode fastpath."""
+    if not is_fish_kvcache_attn_active_for_model(model_config) or int(max_query_len) != 1:
+        return
+
+    upper_bound_rows = int(num_reqs_padded if pad_attn else num_reqs)
+    capture_upper_bound = _graph_capture_seq_len_upper_bound(
+        model_config=model_config,
+        max_query_len=max_query_len,
+        for_cudagraph_capture=for_cudagraph_capture,
+    )
+    if capture_upper_bound is not None:
+        optimistic_seq_lens_cpu[:upper_bound_rows].fill_(capture_upper_bound)
+    else:
+        if num_scheduled_tokens_np is None:
+            return
+        seq_lens_cpu_upper_bound = torch.as_tensor(
+            input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens_np,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        optimistic_seq_lens_cpu[:num_reqs] = seq_lens_cpu_upper_bound
+        if upper_bound_rows > num_reqs:
+            optimistic_seq_lens_cpu[num_reqs:upper_bound_rows].fill_(1)
+    _attach_seq_lens_cpu_upper_bound(
+        attn_metadata,
+        optimistic_seq_lens_cpu[:upper_bound_rows],
+    )
 
 
 def _dispatch_max_seq_len(attn_metadata: Any, active_batch: int, seq_lens: Any) -> int | None:
@@ -291,7 +361,7 @@ def install_fish_kvcache_attn_backend(model: Any) -> int:
         _record_fallback("implementation_unavailable")
         if is_fish_kvcache_attn_required():
             raise RuntimeError(
-                f"VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED=1 but Fish kvcache attention is unavailable: {load_error()!r}"
+                f"VLLM_OMNI_FISH_KVCACHE_ATTN=required but Fish kvcache attention is unavailable: {load_error()!r}"
             )
         logger.warning(
             "VLLM_OMNI_FISH_KVCACHE_ATTN=1 but Fish kvcache attention is unavailable: %r",

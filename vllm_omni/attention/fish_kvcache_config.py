@@ -1,4 +1,0 @@
-from __future__ import annotations
-
-FISH_KVCACHE_LONG_SPLIT_TOKENS = 1024
-FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN = 1024

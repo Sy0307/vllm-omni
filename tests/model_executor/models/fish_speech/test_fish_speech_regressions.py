@@ -41,12 +41,23 @@ class _RecordingCodec:
 
 
 class _FakeOneArgCodec:
+    def decode(self, codes_bqf: torch.Tensor):
+        batch = codes_bqf.shape[0]
+        return torch.arange(batch * 100, dtype=torch.float32).view(batch, 1, 100)
+
+
+class _FakeFromIndicesCodec:
+    def __init__(self):
+        self.from_indices_calls = 0
+
     def from_indices(self, codes_bqf: torch.Tensor):
+        self.from_indices_calls += 1
         batch = codes_bqf.shape[0]
         return torch.arange(batch * 100, dtype=torch.float32).view(batch, 1, 100)
 
     def decode(self, codes_bqf: torch.Tensor):
-        return self.from_indices(codes_bqf)
+        del codes_bqf
+        raise AssertionError("decode() should not be used for index tensors when from_indices() exists")
 
 
 class _FakeTokenizer:
@@ -85,32 +96,6 @@ def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
     assert audios[1].shape[0] == 50
 
 
-def test_dac_decoder_supports_one_arg_codec_decode():
-    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
-    decoder = object.__new__(FishSpeechDACDecoder)
-    torch.nn.Module.__init__(decoder)
-    decoder._codec = _FakeOneArgCodec()
-    decoder._num_codebooks = 10
-    decoder._output_sample_rate = 44100
-    decoder._hop_length = 512
-    decoder._logged_codec_stats = False
-    decoder._ensure_codec_loaded = lambda: None
-    decoder._split_request_ids = lambda ids, seq_token_counts=None: [
-        torch.arange(10, dtype=torch.long),
-        torch.arange(20, dtype=torch.long),
-    ]
-
-    out = decoder.forward(
-        input_ids=torch.arange(30, dtype=torch.long),
-        runtime_additional_information=[{}, {}],
-    )
-
-    audios = out.multimodal_outputs["model_outputs"]
-    assert len(audios) == 2
-    assert audios[0].shape[0] == 50
-    assert audios[1].shape[0] == 100
-
-
 def test_dac_decoder_uses_tensor_codes_from_runtime_info():
     _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
     decoder = object.__new__(FishSpeechDACDecoder)
@@ -138,32 +123,60 @@ def test_dac_decoder_uses_tensor_codes_from_runtime_info():
     assert audios[0].shape[0] == 50
 
 
-def test_dac_decoder_groups_bucketed_frame_lengths_for_stable_decode_shapes():
+def test_dac_decoder_supports_codec_decode_without_lengths():
     _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
-    codec = _RecordingCodec()
     decoder = object.__new__(FishSpeechDACDecoder)
     torch.nn.Module.__init__(decoder)
-    decoder._codec = codec
-    decoder._num_codebooks = 2
+    decoder._codec = _FakeOneArgCodec()
+    decoder._codec_decode_takes_lengths = False
+    decoder._num_codebooks = 10
     decoder._output_sample_rate = 44100
     decoder._hop_length = 512
     decoder._logged_codec_stats = False
-    decoder._decode_batch_bucket_frames = [4, 50, 75]
     decoder._ensure_codec_loaded = lambda: None
     decoder._split_request_ids = lambda ids, seq_token_counts=None: [
-        torch.arange(2 * 46, dtype=torch.long),
-        torch.arange(2 * 45, dtype=torch.long),
-        torch.arange(2 * 4, dtype=torch.long),
+        torch.arange(10, dtype=torch.long),
+        torch.arange(20, dtype=torch.long),
     ]
 
-    out = decoder.forward(input_ids=torch.arange(2 * (46 + 45 + 4), dtype=torch.long))
+    out = decoder.forward(
+        input_ids=torch.arange(30, dtype=torch.long),
+        runtime_additional_information=[{}, {}],
+    )
 
-    assert codec.calls == [
-        ((2, 2, 50), (46, 45)),
-        ((1, 2, 4), (4,)),
-    ]
     audios = out.multimodal_outputs["model_outputs"]
-    assert [audio.shape[0] for audio in audios] == [460, 450, 40]
+    assert len(audios) == 2
+    assert audios[0].shape[0] == 50
+    assert audios[1].shape[0] == 100
+
+
+def test_dac_decoder_prefers_from_indices_for_one_arg_codec():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    codec = _FakeFromIndicesCodec()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._codec = codec
+    decoder._codec_decode_takes_lengths = False
+    decoder._num_codebooks = 10
+    decoder._output_sample_rate = 44100
+    decoder._hop_length = 512
+    decoder._logged_codec_stats = False
+    decoder._ensure_codec_loaded = lambda: None
+    decoder._split_request_ids = lambda ids, seq_token_counts=None: [
+        torch.arange(10, dtype=torch.long),
+        torch.arange(20, dtype=torch.long),
+    ]
+
+    out = decoder.forward(
+        input_ids=torch.arange(30, dtype=torch.long),
+        runtime_additional_information=[{}, {}],
+    )
+
+    audios = out.multimodal_outputs["model_outputs"]
+    assert codec.from_indices_calls == 1
+    assert len(audios) == 2
+    assert audios[0].shape[0] == 50
+    assert audios[1].shape[0] == 100
 
 
 def test_dac_decoder_splits_groups_by_padded_frame_budget():
@@ -176,7 +189,6 @@ def test_dac_decoder_splits_groups_by_padded_frame_budget():
     decoder._output_sample_rate = 44100
     decoder._hop_length = 512
     decoder._logged_codec_stats = False
-    decoder._decode_batch_bucket_frames = [50]
     decoder._decode_batch_max_padded_frames = 100
     decoder._decode_batch_max_batch = 0
     decoder._ensure_codec_loaded = lambda: None
@@ -189,8 +201,8 @@ def test_dac_decoder_splits_groups_by_padded_frame_budget():
     decoder.forward(input_ids=torch.arange(2 * (46 + 45 + 47), dtype=torch.long))
 
     assert codec.calls == [
-        ((2, 2, 50), (45, 46)),
-        ((1, 2, 50), (47,)),
+        ((2, 2, 46), (45, 46)),
+        ((1, 2, 47), (47,)),
     ]
 
 

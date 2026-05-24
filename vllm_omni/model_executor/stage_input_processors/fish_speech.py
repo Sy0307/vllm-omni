@@ -1,6 +1,5 @@
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
-import os
 from typing import Any
 
 import torch
@@ -9,10 +8,6 @@ from vllm_omni.data_entry_keys import (
     CodesStruct,
     MetaStruct,
     OmniPayloadStruct,
-)
-from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
-    compute_dynamic_initial_chunk_size,
-    max_ic_for_chunk_size,
 )
 
 
@@ -23,35 +18,24 @@ def _get_connector_extra(transfer_manager: Any) -> dict[str, Any]:
 
 
 def _use_tensor_code_payload(transfer_manager: Any) -> bool:
-    if os.environ.get("VLLM_OMNI_FISH_SPEECH_TENSOR_DAC_CODES") == "1":
-        return True
     cfg = _get_connector_extra(transfer_manager)
     return bool(cfg.get("fish_speech_tensor_codes", False))
 
 
-def _env_enabled(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() not in {"0", "false", "no", "off"}
-
-
-def _cfg_bool(cfg: dict[str, Any], key: str, env_name: str, default: bool = False) -> bool:
-    if env_name in os.environ:
-        return _env_enabled(env_name, default)
+def _cfg_bool(cfg: dict[str, Any], key: str, default: bool = False) -> bool:
     return bool(cfg.get(key, default))
 
 
-def _cfg_int(cfg: dict[str, Any], key: str, env_name: str, default: int = 0) -> int:
-    value = os.environ.get(env_name, cfg.get(key, default))
+def _cfg_int(cfg: dict[str, Any], key: str, default: int = 0) -> int:
+    value = cfg.get(key, default)
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid Fish Speech integer config {key}={value!r}") from exc
 
 
-def _cfg_float(cfg: dict[str, Any], key: str, env_name: str, default: float) -> float:
-    value = os.environ.get(env_name, cfg.get(key, default))
+def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
+    value = cfg.get(key, default)
     try:
         return float(value)
     except (TypeError, ValueError) as exc:
@@ -66,33 +50,6 @@ def _ready_codec_requests(transfer_manager: Any, min_frames: int) -> int:
     return sum(1 for value in transfer_manager.code_prompt_token_ids.values() if len(value) >= min_frames)
 
 
-def _cached_int(transfer_manager: Any, cache_name: str, request_id: str, value_fn) -> int:
-    cache = getattr(transfer_manager, cache_name, None)
-    if cache is None:
-        cache = {}
-        setattr(transfer_manager, cache_name, cache)
-    if request_id not in cache:
-        cache[request_id] = int(value_fn())
-    return int(cache[request_id])
-
-
-def _select_dynamic_initial_chunk_size(
-    transfer_manager: Any,
-    request_id: str,
-    chunk_size: int,
-) -> int:
-    return _cached_int(
-        transfer_manager,
-        "_cached_ic",
-        request_id,
-        lambda: compute_dynamic_initial_chunk_size(
-            _active_codec_requests(transfer_manager),
-            int(getattr(transfer_manager, "scheduler_max_num_seqs", 1)),
-            max_ic_for_chunk_size(chunk_size),
-        ),
-    )
-
-
 def _select_backlog_chunk_size(
     transfer_manager: Any,
     cfg: dict[str, Any],
@@ -102,7 +59,6 @@ def _select_backlog_chunk_size(
     backlog_chunk_size = _cfg_int(
         cfg,
         "fish_speech_backlog_codec_chunk_frames",
-        "VLLM_OMNI_FISH_SPEECH_BACKLOG_CODEC_CHUNK_FRAMES",
         0,
     )
     if backlog_chunk_size <= base_chunk_size:
@@ -114,7 +70,6 @@ def _select_backlog_chunk_size(
     threshold = _cfg_float(
         cfg,
         "fish_speech_backlog_load_threshold",
-        "VLLM_OMNI_FISH_SPEECH_BACKLOG_LOAD_THRESHOLD",
         0.75,
     )
     if load_factor < threshold:
@@ -123,7 +78,6 @@ def _select_backlog_chunk_size(
     ready_min = _cfg_int(
         cfg,
         "fish_speech_backlog_min_ready",
-        "VLLM_OMNI_FISH_SPEECH_BACKLOG_MIN_READY",
         max(2, min(capacity, int(capacity * threshold))),
     )
     # Include the current request even when the caller has not yet committed
@@ -217,7 +171,6 @@ def slow_ar_to_dac_decoder_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames", 0))
 
-    fixed_initial_chunk_size = configured_initial_chunk_size > 0
     initial_chunk_size = configured_initial_chunk_size
 
     # Per-request override.
@@ -230,15 +183,6 @@ def slow_ar_to_dac_decoder_async_chunk(
         entry = additional_information.entries["initial_codec_chunk_frames"]
         if entry.list_data is not None and len(entry.list_data) == 1:
             initial_chunk_size = int(entry.list_data[0])
-            fixed_initial_chunk_size = True
-
-    if not fixed_initial_chunk_size and _cfg_bool(
-        cfg,
-        "fish_speech_dynamic_initial_chunk",
-        "VLLM_OMNI_FISH_SPEECH_DYNAMIC_INITIAL_CHUNK",
-        False,
-    ):
-        initial_chunk_size = _select_dynamic_initial_chunk_size(transfer_manager, request_id, chunk_size)
 
     if chunk_size <= 0 or left_context_size_config < 0 or configured_initial_chunk_size < 0 or initial_chunk_size < 0:
         raise ValueError(
@@ -263,7 +207,6 @@ def slow_ar_to_dac_decoder_async_chunk(
     single_initial_chunk = _cfg_bool(
         cfg,
         "fish_speech_single_initial_chunk",
-        "VLLM_OMNI_FISH_SPEECH_SINGLE_INITIAL_CHUNK",
         False,
     )
     use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < steady_chunk_size

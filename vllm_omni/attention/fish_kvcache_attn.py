@@ -6,31 +6,36 @@ from typing import Any
 
 import torch
 
-from vllm_omni.attention import fish_kvcache_triton
-from vllm_omni.attention.fish_kvcache_config import (
-    FISH_KVCACHE_LONG_SPLIT_TOKENS,
-    FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
-)
+FISH_KVCACHE_LONG_SPLIT_TOKENS = 1024
+FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN = 1024
 
-_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
+_FISH_KVCACHE_ATTN_ENV = "VLLM_OMNI_FISH_KVCACHE_ATTN"
+_ENABLED_VALUES = frozenset({"1", "true", "yes", "on", "required"})
+_REQUIRED_VALUES = frozenset({"required"})
 _WORKSPACE_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _WORKSPACE_CACHE_LOCK = threading.Lock()
 
 
+def _triton_backend() -> Any:
+    from vllm_omni.attention import fish_kvcache_triton
+
+    return fish_kvcache_triton
+
+
 def is_available() -> bool:
-    return fish_kvcache_triton.is_available()
+    return _triton_backend().is_available()
 
 
 def load_error() -> Exception | None:
-    return fish_kvcache_triton.load_error()
+    return _triton_backend().load_error()
 
 
 def is_fish_kvcache_attn_enabled() -> bool:
-    return os.environ.get("VLLM_OMNI_FISH_KVCACHE_ATTN", "").lower() in _ENABLED_VALUES
+    return os.environ.get(_FISH_KVCACHE_ATTN_ENV, "").lower() in _ENABLED_VALUES
 
 
 def is_fish_kvcache_attn_required() -> bool:
-    return os.environ.get("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "").lower() in _ENABLED_VALUES
+    return os.environ.get(_FISH_KVCACHE_ATTN_ENV, "").lower() in _REQUIRED_VALUES
 
 
 def _is_sliding_window_disabled(sliding_window: Any) -> bool:
@@ -99,10 +104,7 @@ def can_use_fish_kvcache_attn(
 
 
 def _is_cuda_graph_capturing() -> bool:
-    try:
-        return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
-        return False
+    return bool(torch.cuda.is_current_stream_capturing())
 
 
 def _raise_workspace_capture_miss() -> None:
@@ -165,7 +167,7 @@ def fish_decode_kvcache_attn(
     max_seq_len: int,
 ) -> torch.Tensor:
     partial_m, partial_l, partial_acc = _get_decode_workspace(query, int(max_seq_len))
-    return fish_kvcache_triton.fish_decode_kvcache_attn_triton(
+    return _triton_backend().fish_decode_kvcache_attn_triton(
         query,
         key_cache,
         value_cache,
@@ -174,6 +176,8 @@ def fish_decode_kvcache_attn(
         out,
         scale=float(scale),
         max_seq_len=int(max_seq_len),
+        small_path_max_seq_len=FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
+        long_split_tokens=FISH_KVCACHE_LONG_SPLIT_TOKENS,
         partial_m=partial_m,
         partial_l=partial_l,
         partial_acc=partial_acc,

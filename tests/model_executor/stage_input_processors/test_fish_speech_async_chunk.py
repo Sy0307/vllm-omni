@@ -18,7 +18,6 @@ def _make_transfer_manager(
     left_context: int = 1,
     initial_chunk_frames: int = 0,
     single_initial_chunk: bool = False,
-    dynamic_initial_chunk: bool = False,
     backlog_chunk_frames: int = 0,
     backlog_load_threshold: float = 0.75,
     max_num_seqs: int = 1,
@@ -35,7 +34,6 @@ def _make_transfer_manager(
                     "initial_codec_chunk_frames": initial_chunk_frames,
                     "fish_speech_tensor_codes": tensor_payload,
                     "fish_speech_single_initial_chunk": single_initial_chunk,
-                    "fish_speech_dynamic_initial_chunk": dynamic_initial_chunk,
                     "fish_speech_backlog_codec_chunk_frames": backlog_chunk_frames,
                     "fish_speech_backlog_load_threshold": backlog_load_threshold,
                 }
@@ -161,25 +159,6 @@ def test_qwen3_style_single_initial_chunk_only_emits_first_chunk_early():
     assert second is not None
     assert second.meta.left_context_size == 2
     assert second.codes.audio.numel() == 3 * 7
-
-
-def test_dynamic_initial_chunk_follows_qwen3_load_policy():
-    transfer_manager = _make_transfer_manager(
-        chunk_frames=25,
-        left_context=25,
-        initial_chunk_frames=0,
-        single_initial_chunk=True,
-        dynamic_initial_chunk=True,
-        max_num_seqs=4,
-    )
-    for idx in range(3):
-        _seed_frames(transfer_manager, f"other-{idx}", 10)
-
-    # active=4/4 after seeding the new request -> max IC for chunk25 is 16.
-    assert _call_seeded(transfer_manager, "new", n_frames=8) is None
-    first = _call_seeded(transfer_manager, "new", n_frames=16)
-    assert first is not None
-    assert first.codes.audio.numel() == 3 * 16
 
 
 def test_backlog_chunk_size_uses_larger_post_initial_boundary():

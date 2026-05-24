@@ -92,11 +92,12 @@ def _metadata(
     )()
 
 
-@pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "required"])
 def test_fish_kvcache_enabled_values_are_consistent(monkeypatch, value):
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", value)
     assert fish_kvcache_attn.is_fish_kvcache_attn_enabled()
     assert fish_kvcache_backend._fish_kvcache_enabled()
+    assert fish_kvcache_attn.is_fish_kvcache_attn_required() is (value == "required")
 
 
 @pytest.mark.parametrize("sliding_window", [None, (-1, -1)])
@@ -481,8 +482,7 @@ def test_fish_kvcache_backend_falls_back_on_non_cpu_upper_bound(monkeypatch):
 
 
 def test_fish_kvcache_backend_required_rejects_non_cpu_upper_bound(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "required")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
     monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: True)
@@ -512,8 +512,7 @@ def test_fish_kvcache_backend_required_rejects_non_cpu_upper_bound(monkeypatch):
 
 
 def test_fish_kvcache_backend_required_rejects_underestimated_upper_bound(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "required")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
     monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: True)
@@ -543,8 +542,7 @@ def test_fish_kvcache_backend_required_rejects_underestimated_upper_bound(monkey
 
 
 def test_fish_kvcache_backend_required_rejects_missing_upper_bound(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "required")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
     monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: True)
@@ -569,8 +567,7 @@ def test_fish_kvcache_backend_required_rejects_missing_upper_bound(monkeypatch):
 
 
 def test_fish_kvcache_backend_required_rejects_zero_installed_layers(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "required")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
 
@@ -579,8 +576,7 @@ def test_fish_kvcache_backend_required_rejects_zero_installed_layers(monkeypatch
 
 
 def test_fish_kvcache_backend_required_raises_on_guard_miss(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "required")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
     monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: False)
@@ -606,8 +602,7 @@ def test_fish_kvcache_backend_required_raises_on_guard_miss(monkeypatch):
 
 def test_fish_kvcache_backend_required_allows_prefill_fallback(monkeypatch):
     fish_kvcache_backend.reset_fish_kvcache_attn_stats()
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
-    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN_REQUIRED", "1")
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "required")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
     monkeypatch.setattr(fish_kvcache_backend, "load_error", lambda: None)
     monkeypatch.setattr(fish_kvcache_backend, "can_use_fish_kvcache_attn", lambda **_: False)
@@ -733,15 +728,22 @@ def test_fish_kvcache_decode_reuses_long_workspace(monkeypatch):
         out,
         scale,
         max_seq_len,
+        small_path_max_seq_len,
+        long_split_tokens,
         partial_m,
         partial_l,
         partial_acc,
     ):
         del query, key_cache, value_cache, block_table, seq_lens, scale, max_seq_len
+        del small_path_max_seq_len, long_split_tokens
         calls.append((partial_m.data_ptr(), partial_l.data_ptr(), partial_acc.data_ptr(), tuple(partial_acc.shape)))
         return out
 
-    monkeypatch.setattr(fish_kvcache_attn.fish_kvcache_triton, "fish_decode_kvcache_attn_triton", fake_decode)
+    monkeypatch.setattr(
+        fish_kvcache_attn._triton_backend(),
+        "fish_decode_kvcache_attn_triton",
+        fake_decode,
+    )
 
     q = torch.zeros((2, 4, 128), dtype=torch.float16)
     k_cache = torch.zeros((128, 16, 2, 128), dtype=torch.float16)

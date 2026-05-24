@@ -23,7 +23,6 @@ connectors:
       codec_left_context_frames: 25
       initial_codec_chunk_frames: 4
       fish_speech_dac_dtype: fp16
-      fish_speech_dac_decode_batch_bucket_frames: 0
       fish_speech_dac_max_padded_frames: 256
       fish_speech_dac_max_batch: 0
 

@@ -4,11 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from vllm_omni.attention.fish_kvcache_config import (
-    FISH_KVCACHE_LONG_SPLIT_TOKENS,
-    FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
-)
-
 try:
     import triton
     import triton.language as tl
@@ -251,6 +246,8 @@ def fish_decode_kvcache_attn_triton(
     *,
     scale: float,
     max_seq_len: int,
+    small_path_max_seq_len: int,
+    long_split_tokens: int,
     partial_m: torch.Tensor,
     partial_l: torch.Tensor,
     partial_acc: torch.Tensor,
@@ -269,7 +266,7 @@ def fish_decode_kvcache_attn_triton(
     block_h = triton.next_power_of_2(kv_group)
     max_blocks_per_seq = block_table.shape[1]
 
-    if max_seq_len <= FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN:
+    if max_seq_len <= small_path_max_seq_len:
         _small_decode_kernel[(batch_size, num_kv_heads)](
             query,
             key_cache,
@@ -300,7 +297,7 @@ def fish_decode_kvcache_attn_triton(
         seq_lens,
         out,
         SCALE=float(scale),
-        MAX_SEQ_LEN=FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
+        MAX_SEQ_LEN=small_path_max_seq_len,
         MAX_BLOCKS_PER_SEQ=max_blocks_per_seq,
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
@@ -308,11 +305,11 @@ def fish_decode_kvcache_attn_triton(
         BLOCK_H=block_h,
         BLOCK_D=head_dim,
         BLOCK_N=_BLOCK_N,
-        GUARD_MAX_SEQ_LEN=FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN,
+        GUARD_MAX_SEQ_LEN=small_path_max_seq_len,
         num_warps=4,
         num_stages=3,
     )
-    num_splits = triton.cdiv(int(max_seq_len), FISH_KVCACHE_LONG_SPLIT_TOKENS)
+    num_splits = triton.cdiv(int(max_seq_len), long_split_tokens)
     expected_partial_acc_shape = (num_splits, batch_size, num_q_heads, head_dim)
     if tuple(partial_acc.shape) != expected_partial_acc_shape:
         raise RuntimeError(
@@ -336,9 +333,9 @@ def fish_decode_kvcache_attn_triton(
         BLOCK_H=block_h,
         BLOCK_D=head_dim,
         BLOCK_N=_BLOCK_N,
-        SPLIT_TOKENS=FISH_KVCACHE_LONG_SPLIT_TOKENS,
+        SPLIT_TOKENS=long_split_tokens,
         BATCH_SIZE=batch_size,
-        MIN_SEQ_LEN=FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN + 1,
+        MIN_SEQ_LEN=small_path_max_seq_len + 1,
         num_warps=4,
         num_stages=3,
     )
@@ -355,7 +352,7 @@ def fish_decode_kvcache_attn_triton(
         BLOCK_D=head_dim,
         BATCH_SIZE=batch_size,
         NUM_SPLITS=num_splits,
-        MIN_SEQ_LEN=FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN + 1,
+        MIN_SEQ_LEN=small_path_max_seq_len + 1,
         num_warps=4,
         num_stages=3,
     )
