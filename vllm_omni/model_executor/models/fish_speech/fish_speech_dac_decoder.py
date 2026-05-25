@@ -116,11 +116,7 @@ class FishSpeechDACDecoder(nn.Module):
         feature_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._codec is not None
-        decode_takes_lengths = getattr(self, "_codec_decode_takes_lengths", None)
-        if decode_takes_lengths is None:
-            decode_takes_lengths = len(inspect.signature(self._codec.decode).parameters) >= 2
-            self._codec_decode_takes_lengths = decode_takes_lengths
-        if decode_takes_lengths:
+        if self._codec_decode_takes_lengths:
             return self._codec.decode(codes_bqf, feature_lengths)
 
         if hasattr(self._codec, "from_indices"):

@@ -74,6 +74,7 @@ def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
     decoder = object.__new__(FishSpeechDACDecoder)
     torch.nn.Module.__init__(decoder)
     decoder._codec = _FakeCodec()
+    decoder._codec_decode_takes_lengths = True
     decoder._num_codebooks = 10
     decoder._output_sample_rate = 44100
     decoder._hop_length = 512
@@ -101,6 +102,7 @@ def test_dac_decoder_uses_tensor_codes_from_runtime_info():
     decoder = object.__new__(FishSpeechDACDecoder)
     torch.nn.Module.__init__(decoder)
     decoder._codec = _FakeCodec()
+    decoder._codec_decode_takes_lengths = True
     decoder._num_codebooks = 2
     decoder._output_sample_rate = 44100
     decoder._hop_length = 512
@@ -185,6 +187,7 @@ def test_dac_decoder_splits_groups_by_padded_frame_budget():
     decoder = object.__new__(FishSpeechDACDecoder)
     torch.nn.Module.__init__(decoder)
     decoder._codec = codec
+    decoder._codec_decode_takes_lengths = True
     decoder._num_codebooks = 2
     decoder._output_sample_rate = 44100
     decoder._hop_length = 512

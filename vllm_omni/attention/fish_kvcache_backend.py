@@ -82,16 +82,12 @@ def prewarm_fish_kvcache_attn_capture_workspaces(
     if not is_fish_kvcache_attn_active_for_model(model_config):
         return 0
 
-    hf_config = getattr(model_config, "hf_config", None)
-    text_config = getattr(hf_config, "text_config", None)
-    if text_config is None:
-        return 0
-
+    text_config = model_config.hf_config.text_config
     num_heads = int(text_config.num_attention_heads)
     head_dim = int(text_config.head_dim)
-    max_seq_len = int(getattr(model_config, "max_model_len", 0))
+    max_seq_len = int(model_config.max_model_len)
     sizes = sorted({int(size) for size in capture_sizes if int(size) > 0})
-    if num_heads <= 0 or head_dim <= 0 or max_seq_len <= 0 or not sizes:
+    if not sizes:
         return 0
 
     # The small path uses an empty workspace keyed only by device. Prewarm it
@@ -193,36 +189,30 @@ def _dispatch_max_seq_len(attn_metadata: Any, active_batch: int, seq_lens: Any) 
         if is_fish_kvcache_attn_required():
             raise RuntimeError("Fish kvcache attention requires seq_lens_cpu_upper_bound for decode dispatch")
         return None
-    try:
-        if getattr(upper_bound, "device", None) is not None and upper_bound.device.type != "cpu":
-            if is_fish_kvcache_attn_required():
-                raise RuntimeError("Fish kvcache attention seq_lens_cpu_upper_bound must be a CPU tensor")
-            return None
-        if int(upper_bound.shape[0]) < active_batch:
-            if is_fish_kvcache_attn_required():
-                raise RuntimeError(
-                    "Fish kvcache attention seq_lens_cpu_upper_bound does not cover the active decode batch: "
-                    f"upper_bound_rows={int(upper_bound.shape[0])}, active_batch={active_batch}"
-                )
-            return None
-        upper_bound = upper_bound[:active_batch]
-        real_upper_bound = max(1, int(upper_bound.max().item()))
+    if not isinstance(upper_bound, torch.Tensor) or upper_bound.device.type != "cpu":
         if is_fish_kvcache_attn_required():
-            real_max_seq_len = int(seq_lens.max().item())
-            if real_upper_bound < real_max_seq_len:
-                raise RuntimeError(
-                    "Fish kvcache attention seq_lens_cpu_upper_bound "
-                    f"underestimates real seq_lens: upper_bound={real_upper_bound}, "
-                    f"real={real_max_seq_len}"
-                )
-        if real_upper_bound <= FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN:
-            return _small_decode_bucket(real_upper_bound)
-        return real_upper_bound
-    except Exception:
-        if is_fish_kvcache_attn_required():
-            raise
-        logger.debug("Failed to read seq_lens_cpu_upper_bound for Fish attention dispatch", exc_info=True)
+            raise RuntimeError("Fish kvcache attention seq_lens_cpu_upper_bound must be a CPU tensor")
         return None
+    if int(upper_bound.shape[0]) < active_batch:
+        if is_fish_kvcache_attn_required():
+            raise RuntimeError(
+                "Fish kvcache attention seq_lens_cpu_upper_bound does not cover the active decode batch: "
+                f"upper_bound_rows={int(upper_bound.shape[0])}, active_batch={active_batch}"
+            )
+        return None
+    upper_bound = upper_bound[:active_batch]
+    real_upper_bound = max(1, int(upper_bound.max().item()))
+    if is_fish_kvcache_attn_required():
+        real_max_seq_len = int(seq_lens.max().item())
+        if real_upper_bound < real_max_seq_len:
+            raise RuntimeError(
+                "Fish kvcache attention seq_lens_cpu_upper_bound "
+                f"underestimates real seq_lens: upper_bound={real_upper_bound}, "
+                f"real={real_max_seq_len}"
+            )
+    if real_upper_bound <= FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN:
+        return _small_decode_bucket(real_upper_bound)
+    return real_upper_bound
 
 
 def _forward_with_fish_kvcache(
@@ -370,11 +360,9 @@ def install_fish_kvcache_attn_backend(model: Any) -> int:
         return 0
 
     installed = 0
-    for layer in getattr(model, "layers", []):
-        self_attn = getattr(layer, "self_attn", None)
-        attention_layer = getattr(self_attn, "attn", None)
-        impl = getattr(attention_layer, "impl", None)
-        if impl is None or getattr(impl, "_fish_kvcache_attn_installed", False):
+    for layer in model.layers:
+        impl = layer.self_attn.attn.impl
+        if getattr(impl, "_fish_kvcache_attn_installed", False):
             continue
 
         original_forward = impl.forward
