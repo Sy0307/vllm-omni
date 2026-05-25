@@ -364,7 +364,7 @@ def install_fish_kvcache_attn_backend(model: Any) -> int:
                 f"VLLM_OMNI_FISH_KVCACHE_ATTN=required but Fish kvcache attention is unavailable: {load_error()!r}"
             )
         logger.warning(
-            "VLLM_OMNI_FISH_KVCACHE_ATTN=1 but Fish kvcache attention is unavailable: %r",
+            "Fish kvcache attention is enabled but unavailable: %r",
             load_error(),
         )
         return 0

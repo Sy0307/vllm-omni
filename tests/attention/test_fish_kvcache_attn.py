@@ -92,12 +92,29 @@ def _metadata(
     )()
 
 
-@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "required"])
+def test_fish_kvcache_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_FISH_KVCACHE_ATTN", raising=False)
+
+    assert fish_kvcache_attn.is_fish_kvcache_attn_enabled()
+    assert fish_kvcache_backend._fish_kvcache_enabled()
+    assert not fish_kvcache_attn.is_fish_kvcache_attn_required()
+
+
+@pytest.mark.parametrize("value", ["", "1", "true", "yes", "on", "required"])
 def test_fish_kvcache_enabled_values_are_consistent(monkeypatch, value):
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", value)
     assert fish_kvcache_attn.is_fish_kvcache_attn_enabled()
     assert fish_kvcache_backend._fish_kvcache_enabled()
     assert fish_kvcache_attn.is_fish_kvcache_attn_required() is (value == "required")
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "disabled", "disable"])
+def test_fish_kvcache_disabled_values_are_consistent(monkeypatch, value):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", value)
+
+    assert not fish_kvcache_attn.is_fish_kvcache_attn_enabled()
+    assert not fish_kvcache_backend._fish_kvcache_enabled()
+    assert not fish_kvcache_attn.is_fish_kvcache_attn_required()
 
 
 @pytest.mark.parametrize("sliding_window", [None, (-1, -1)])

@@ -11,6 +11,7 @@ FISH_KVCACHE_SMALL_PATH_MAX_SEQ_LEN = 1024
 
 _FISH_KVCACHE_ATTN_ENV = "VLLM_OMNI_FISH_KVCACHE_ATTN"
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on", "required"})
+_DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
 _REQUIRED_VALUES = frozenset({"required"})
 _WORKSPACE_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _WORKSPACE_CACHE_LOCK = threading.Lock()
@@ -31,7 +32,13 @@ def load_error() -> Exception | None:
 
 
 def is_fish_kvcache_attn_enabled() -> bool:
-    return os.environ.get(_FISH_KVCACHE_ATTN_ENV, "").lower() in _ENABLED_VALUES
+    value = os.environ.get(_FISH_KVCACHE_ATTN_ENV)
+    if value is None:
+        return True
+    value = value.lower()
+    if value in _DISABLED_VALUES:
+        return False
+    return value in _ENABLED_VALUES or value == ""
 
 
 def is_fish_kvcache_attn_required() -> bool:

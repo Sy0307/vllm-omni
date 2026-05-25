@@ -50,10 +50,12 @@ fi
 pip install fish-speech
 ```
 
-#### Optional kvcache attention fast path
+#### Kvcache attention fast path
 
-Fish Speech S2 Pro can opt into a Triton decode-only kvcache attention fast
-path on CUDA builds. This path is disabled by default at runtime.
+Fish Speech S2 Pro uses a Triton decode-only kvcache attention fast path by
+default on CUDA builds. Set `VLLM_OMNI_FISH_KVCACHE_ATTN=0` to disable it, or
+`VLLM_OMNI_FISH_KVCACHE_ATTN=required` to fail fast if the fast path cannot be
+installed.
 
 ```bash
 # Verify fast path availability.
@@ -64,8 +66,8 @@ print(fish_kvcache_attn.is_available())
 print(fish_kvcache_attn.load_error())
 PY
 
-# Enable the runtime fast path.
-export VLLM_OMNI_FISH_KVCACHE_ATTN=1
+# Optional: disable the runtime fast path.
+export VLLM_OMNI_FISH_KVCACHE_ATTN=0
 ```
 
 #### Command
