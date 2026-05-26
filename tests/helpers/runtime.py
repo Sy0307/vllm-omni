@@ -786,9 +786,6 @@ class OpenAIClientHandler:
         if self.log_stats:
             print(message, flush=True)
 
-    def _should_transcribe_audio_speech(self, response_format: str | None) -> bool:
-        return self.run_level in {"advanced_model", "full_model"} and response_format != "pcm"
-
     def _process_stream_omni_response(self, chat_completion, *, wall_start: float) -> OmniResponse:
         """Wall clock from *before* ``chat.completions.create`` through stream drain + local decode."""
         result = OmniResponse()
@@ -1545,8 +1542,8 @@ class OpenAIClientHandler:
         Process streaming /v1/audio/speech responses into an OmniResponse.
 
         This mirrors _process_stream_omni_response but operates on low-level
-        audio bytes. Whisper transcription is only run for run levels whose
-        assertions consume transcripts.
+        audio bytes and produces an OmniResponse with audio_content filled
+        from Whisper transcription.
         """
         result = OmniResponse()
 
@@ -1582,8 +1579,9 @@ class OpenAIClientHandler:
                     raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
 
             raw_bytes = bytes(data)
-            transcript = None
-            if self._should_transcribe_audio_speech(response_format):
+            if response_format == "pcm":
+                transcript = None
+            else:
                 transcript = convert_audio_bytes_to_text(raw_bytes)
 
             # Populate OmniResponse.
@@ -1608,8 +1606,7 @@ class OpenAIClientHandler:
         Process non-streaming /v1/audio/speech responses into an OmniResponse.
 
         This mirrors _process_non_stream_omni_response but for the binary
-        audio payload returned by audio.speech.create. Whisper transcription is
-        only run for run levels whose assertions consume transcripts.
+        audio payload returned by audio.speech.create.
         """
         result = OmniResponse()
 
@@ -1622,8 +1619,9 @@ class OpenAIClientHandler:
             else:
                 raise TypeError(f"Unsupported audio speech response type: {type(response)}")
 
-            transcript = None
-            if self._should_transcribe_audio_speech(response_format):
+            if response_format == "pcm":
+                transcript = None
+            else:
                 transcript = convert_audio_bytes_to_text(raw_bytes)
 
             result.audio_bytes = raw_bytes
