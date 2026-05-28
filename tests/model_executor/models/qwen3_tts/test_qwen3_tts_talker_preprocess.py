@@ -13,11 +13,19 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
 )
 
 
-def _make_minimal_talker():
+def _make_minimal_talker(tts_pad_embed: torch.Tensor | None = None):
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
     model._ref_audio_artifact_cache_max_entries = 256
     model._ref_audio_artifact_cache = OrderedDict()
+    # The real model precomputes ``tts_pad_embed`` once in
+    # :meth:`_init_runtime_buffers` (called from ``load_weights``) and
+    # reuses the same buffer at every prefill / decode step. Tests bypass
+    # both ``__init__`` and ``load_weights`` (via ``__new__``), so inject
+    # the expected value directly here.
+    if tts_pad_embed is None:
+        tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
+    model._tts_pad_embed = tts_pad_embed
     return model
 
 
@@ -25,11 +33,10 @@ def test_single_token_prefill_uses_prefill_path():
     model = _make_minimal_talker()
     full_prompt_embeds = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     trailing_text = torch.ones((2, 4), dtype=torch.float32)
-    tts_pad = torch.full((1, 4), 0.5, dtype=torch.float32)
     ref_code = torch.arange(32, dtype=torch.long).reshape(2, 16)
 
     def fake_build_prompt_embeds(*, task_type, info_dict):
-        return full_prompt_embeds, trailing_text, tts_pad, 2, ref_code
+        return full_prompt_embeds, trailing_text, 2, ref_code
 
     model._build_prompt_embeds = fake_build_prompt_embeds
 
@@ -50,7 +57,9 @@ def test_single_token_prefill_uses_prefill_path():
     assert update["meta"]["talker_text_offset"] == 0
     assert update["meta"]["ref_code_len"] == 2
     assert torch.equal(update["embed"]["prefill"], full_prompt_embeds)
-    assert torch.equal(update["embed"]["tts_pad"], tts_pad)
+    # ``tts_pad`` is no longer round-tripped through ``info_dict`` — it is
+    # precomputed once into ``model._tts_pad_embed`` at load time.
+    assert "tts_pad" not in update["embed"]
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text)
     assert torch.equal(update["codes"]["ref"], ref_code)
     assert update["codes"]["audio"].shape == (1, 16)
@@ -60,10 +69,9 @@ def test_single_token_prefill_can_be_inferred_from_token_progress():
     model = _make_minimal_talker()
     full_prompt_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     trailing_text = torch.ones((1, 4), dtype=torch.float32)
-    tts_pad = torch.zeros((1, 4), dtype=torch.float32)
 
     def fake_build_prompt_embeds(*, task_type, info_dict):
-        return full_prompt_embeds, trailing_text, tts_pad, None, None
+        return full_prompt_embeds, trailing_text, None, None
 
     model._build_prompt_embeds = fake_build_prompt_embeds
 
@@ -82,7 +90,8 @@ def test_single_token_prefill_can_be_inferred_from_token_progress():
 
 
 def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
-    model = _make_minimal_talker()
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
@@ -90,7 +99,6 @@ def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
     model.embed_input_ids = fake_embed_input_ids
     trailing_text = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     last_hidden = torch.full((4,), 2.0, dtype=torch.float32)
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.float32)
 
     out_ids, out_embeds, update = model.preprocess(
         input_ids=torch.tensor([123], dtype=torch.long),
@@ -98,7 +106,6 @@ def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
         text=["hello"],
         task_type=["CustomVoice"],
         hidden_states={"trailing_text": trailing_text, "last": last_hidden},
-        embed={"tts_pad": tts_pad},
         meta={"talker_text_offset": 1},
         _omni_is_prefill=False,
         _omni_num_computed_tokens=2,
@@ -115,7 +122,8 @@ def test_decode_advances_trailing_text_by_offset_without_rewriting_tail():
 
 
 def test_decode_advances_trailing_text_offset_across_multiple_steps():
-    model = _make_minimal_talker()
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
@@ -124,7 +132,6 @@ def test_decode_advances_trailing_text_offset_across_multiple_steps():
     trailing_text = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     state_tail = trailing_text
     last_hidden = torch.full((4,), 2.0, dtype=torch.float32)
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.float32)
     meta = {"talker_text_offset": 0}
     seen_steps = []
 
@@ -135,7 +142,6 @@ def test_decode_advances_trailing_text_offset_across_multiple_steps():
             text=["hello"],
             task_type=["CustomVoice"],
             hidden_states={"trailing_text": state_tail, "last": last_hidden},
-            embed={"tts_pad": tts_pad},
             meta=meta,
             _omni_is_prefill=False,
             _omni_num_computed_tokens=2,
@@ -154,7 +160,8 @@ def test_decode_advances_trailing_text_offset_across_multiple_steps():
 
 
 def test_decode_compacts_long_trailing_text_after_large_offset():
-    model = _make_minimal_talker()
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
@@ -162,7 +169,6 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
     model.embed_input_ids = fake_embed_input_ids
     trailing_text = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
     last_hidden = torch.full((4,), 2.0, dtype=torch.float32)
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.float32)
 
     _, _, update = model.preprocess(
         input_ids=torch.tensor([123], dtype=torch.long),
@@ -170,7 +176,6 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
         text=["hello"],
         task_type=["CustomVoice"],
         hidden_states={"trailing_text": trailing_text, "last": last_hidden},
-        embed={"tts_pad": tts_pad},
         meta={"talker_text_offset": 64},
         _omni_is_prefill=False,
         _omni_num_computed_tokens=2,
@@ -183,7 +188,8 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
 
 
 def test_decode_batch_preprocess_matches_decode_state_updates():
-    model = _make_minimal_talker()
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
 
     def fake_embed_input_ids(input_ids):
         return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
@@ -193,7 +199,6 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     trailing_b = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 100
     last_a = torch.full((4,), 2.0, dtype=torch.float32)
     last_b = torch.full((4,), 3.0, dtype=torch.float32)
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.float32)
 
     out_ids, out_embeds, past_hidden, text_step, updates = model.preprocess_decode_batch(
         input_ids=torch.tensor([101, 202], dtype=torch.long),
@@ -202,14 +207,12 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
                 "text": ["hello"],
                 "task_type": ["Base"],
                 "hidden_states": {"trailing_text": trailing_a, "last": last_a},
-                "embed": {"tts_pad": tts_pad},
                 "meta": {"talker_text_offset": 1},
             },
             {
                 "text": ["world"],
                 "task_type": ["CustomVoice"],
                 "hidden_states": {"trailing_text": trailing_b, "last": last_b},
-                "embed": {"tts_pad": tts_pad},
                 "meta": {"talker_text_offset": 2},
             },
         ],
@@ -274,7 +277,7 @@ def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
         ref_audio_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
     )
 
-    _prompt, _trailing, _pad, ref_code_len, ref_code = model._build_prompt_embeds(
+    _prompt, _trailing, ref_code_len, ref_code = model._build_prompt_embeds(
         task_type="Base",
         info_dict={
             "text": ["hello"],
@@ -471,7 +474,7 @@ def test_base_voice_clone_uses_batched_ref_code_without_serial_encode():
         speaker_wav_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
     )
 
-    _prompt, _trailing, _pad, ref_code_len, out_ref_code = model._build_prompt_embeds(
+    _prompt, _trailing, ref_code_len, out_ref_code = model._build_prompt_embeds(
         task_type="Base",
         info_dict={
             "text": ["hello"],

@@ -453,9 +453,23 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "audio"),
             ("hidden_states", "last"),
-            ("embed", "tts_pad"),
             ("hidden_states", "trailing_text"),
         }
+
+        # ``text_proj(text_emb(tts_pad_token_id))`` is request-independent —
+        # it depends only on frozen ``text_embedding`` / ``text_projection``
+        # weights, so we precompute it once in :meth:`_init_runtime_buffers`
+        # (called from :meth:`load_weights`) and reuse the same buffer at
+        # every prefill and decode step instead of round-tripping it through
+        # the per-request ``info_dict``. Declared here as zeros so the
+        # attribute exists under ``load_format: dummy`` (which bypasses
+        # ``load_weights`` entirely and leaves the value uninitialized).
+        model_dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
+        self.register_buffer(
+            "_tts_pad_embed",
+            torch.zeros(1, int(self.talker_config.hidden_size), dtype=model_dtype),
+            persistent=False,
+        )
 
         # Tokenizer for prompt building.
         self._tokenizer = None
@@ -489,24 +503,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Bounded LRU: caller-supplied orig_sr can otherwise grow this without limit.
         self._resampler_cache: OrderedDict[tuple[int, int], AudioResampler] = OrderedDict()
         self._resampler_cache_max = 16
-        self._tts_pad_embed_cache: torch.Tensor | None = None
 
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
-
-    def _get_tts_pad_embed_cached(self, device: torch.device) -> torch.Tensor:
-        """Return a device-pinned tts_pad embedding, rebuilding once per device."""
-        cached = self._tts_pad_embed_cache
-        if cached is not None and cached.device == device:
-            return cached
-        pad_id = torch.tensor([[self.config.tts_pad_token_id]], device=device, dtype=torch.long)
-        with torch.no_grad():
-            projected = self.text_projection(self.text_embedding(pad_id))
-        cached = projected.reshape(1, -1).to(dtype=torch.bfloat16).detach()
-        self._tts_pad_embed_cache = cached
-        return cached
 
     def forward(
         self,
@@ -654,32 +655,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         else:
             codec_streaming = task_type == "Base"
 
+        # ``tts_pad_embed`` is a request-independent constant — see
+        # :meth:`_init_runtime_buffers`. Materialize once on the right
+        # device/dtype and reuse for both the prefill placeholder padding
+        # and the decode text-step fallback below.
+        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+
         if is_prefill:
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = embed.get("prefill")
-            tts_pad_embed_cpu = embed.get("tts_pad")
-            tts_pad_embed = None
-            if isinstance(tts_pad_embed_cpu, torch.Tensor) and tts_pad_embed_cpu.numel() > 0:
-                tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
             # First prefill round: prompt_embeds_cpu is not yet populated.
             # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first_prefill:
-                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
-                    self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
+                full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = self._build_prompt_embeds(
+                    task_type=task_type, info_dict=info_dict
                 )
                 # Store full prompt embeddings on CPU (large, prefill-only).
-                # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
+                # tailing_text_hidden stays on GPU (gpu_resident_buffer_keys).
                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
                 info_update: OmniPayload = {
-                    "embed": {
-                        "prefill": prompt_embeds_cpu,
-                        "tts_pad": tts_pad_embed.detach(),
-                    },
+                    "embed": {"prefill": prompt_embeds_cpu},
                     "hidden_states": {"trailing_text": tailing_text_hidden.detach()},
                     "meta": {
-                        "talker_prefill_offset": 0,
                         "talker_text_offset": 0,
                         "codec_streaming": codec_streaming,
                     },
@@ -688,41 +687,27 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
                 if ref_code_len is not None:
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
-                # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
-                # This preserves placeholder/embedding alignment.
-                offset = int(info_dict.get("_omni_num_computed_tokens", 0) or 0)
-                if offset < 0:
-                    offset = 0
-                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
+                # First prefill: source the slice offset from `_omni_num_computed_tokens`
+                # so cache-recovery (prefill replay at a later offset) lands on the right
+                # slice of the stored embeddings. Subsequent chunks below advance from
+                # `talker_prefill_offset` written here.
+                offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
-                if tts_pad_embed is None:
-                    raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
-                offset = int(meta.get("talker_prefill_offset", 0) or 0)
-                if offset < 0:
-                    offset = 0
-                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update = {
-                    "meta": {
-                        "talker_prefill_offset": int(offset + span_len),
-                        "codec_streaming": codec_streaming,
-                    }
-                }
+                offset = max(0, int(meta.get("talker_prefill_offset", 0) or 0))
+                info_update = {"meta": {"codec_streaming": codec_streaming}}
+
+            # Always return a span_len slice; if the scheduled placeholder is longer than what
+            # the prompt actually fills, pad with tts_pad_embed (preserves placeholder/embedding alignment).
+            s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
+            e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
+            take = prompt_embeds_cpu[s:e]
+            if int(take.shape[0]) < span_len:
+                pad_n = int(span_len - int(take.shape[0]))
+                pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
+                take = torch.cat([take, pad_rows], dim=0)
+            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
             input_ids_out = input_ids.clone()
@@ -736,13 +721,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_update.setdefault("codes", {})["audio"] = zeros
             return input_ids_out, prompt_embeds, info_update
 
-        # Decode: span_len == 1. Buffers are GPU-resident so .to() is a no-op.
-        tts_pad_embed_buf = embed.get("tts_pad")
-        if isinstance(tts_pad_embed_buf, torch.Tensor):
-            tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
-        else:
-            # Defensive: rebuild from text_embedding when prefill state was evicted.
-            tts_pad_embed = self._get_tts_pad_embed_cached(input_ids.device)
+        # Decode: span_len == 1
+        # Pop one text-step vector from tailing_text_hidden queue.
+        # ``tts_pad_embed`` was materialized above from :attr:`_tts_pad_embed`
+        # (request-independent buffer) — no per-request fetch needed.
 
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
@@ -820,6 +802,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         device = input_ids_flat.device
         dtype = torch.bfloat16
+        # Request-independent constant (see :meth:`_init_runtime_buffers`) —
+        # compute once for the batch instead of fetching it per request from
+        # ``info_dict["embed"]["tts_pad"]``.
+        tts_pad_embed = self._tts_pad_embed.to(device=device, dtype=dtype).reshape(1, -1)
         past_hidden_list: list[torch.Tensor] = []
         text_step_list: list[torch.Tensor] = []
         updates: list[dict[str, Any]] = []
@@ -833,7 +819,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 info_dict = merged
 
             payload: OmniPayload = info_dict
-            embed = payload.get("embed", {})
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
@@ -851,11 +836,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 codec_streaming = codec_streaming_raw
             else:
                 codec_streaming = task_type == "Base"
-
-            tts_pad_embed_buf = embed.get("tts_pad")
-            if not isinstance(tts_pad_embed_buf, torch.Tensor):
-                raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
-            tts_pad_embed = tts_pad_embed_buf.to(device=device, dtype=dtype).reshape(1, -1)
 
             tail = hs.get("trailing_text")
             text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
@@ -1722,7 +1702,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         *,
         task_type: str,
         info_dict: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
         non_streaming_mode_val = info_dict.get("non_streaming_mode")
@@ -1757,14 +1737,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             instruct_embed = self.text_projection(self.text_embedding(instruct_ids))
 
         # tts special token embeds (projected into talker hidden).
+        # ``tts_pad_embed`` is precomputed in :meth:`_init_runtime_buffers`
+        # (request-independent), so we only need bos/eos here.
         tts_tokens = torch.tensor(
-            [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+            [[self.config.tts_bos_token_id, self.config.tts_eos_token_id]],
             device=input_ids.device,
             dtype=input_ids.dtype,
         )
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.text_projection(self.text_embedding(tts_tokens)).chunk(
-            3, dim=1
-        )
+        tts_bos_embed, tts_eos_embed = self.text_projection(self.text_embedding(tts_tokens)).chunk(2, dim=1)
+        tts_pad_embed = self._tts_pad_embed.to(device=input_ids.device, dtype=tts_bos_embed.dtype).reshape(1, 1, -1)
 
         # Codec prefill tags.
         language_id = None
@@ -2193,7 +2174,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return (
             talker_prompt.squeeze(0),  # [prompt_len, H]
             trailing_text_hidden.squeeze(0),  # [T, H]
-            tts_pad_embed.squeeze(0),  # [1, H]
             ref_code_len,
             ref_code_prompt.contiguous() if isinstance(ref_code_prompt, torch.Tensor) else None,
         )
@@ -2259,6 +2239,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         device = self.vllm_config.device_config.device
         self.encoder.to(device=device, dtype=torch.bfloat16)
 
+        self._init_runtime_buffers()
+
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
         return loaded
@@ -2282,6 +2264,24 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if len(cache) > self._resampler_cache_max:
             cache.popitem(last=False)
         return cache[key]
+
+    @torch.no_grad()
+    def _init_runtime_buffers(self) -> None:
+        """Populate request-independent runtime buffers from frozen weights.
+
+        Currently this only computes :attr:`_tts_pad_embed`
+        (``text_proj(text_emb(tts_pad_token_id))``), which the prefill
+        prompt builder and every decode step mix into the input embedding
+        in place of an actual text token. The value depends only on the
+        ``text_embedding`` / ``text_projection`` weights and is therefore
+        the same for every request — computing it once here avoids
+        recomputing (and round-tripping through ``info_dict``) on each
+        forward call.
+        """
+        device = next(self.parameters()).device
+        pad_ids = torch.tensor([[int(self.config.tts_pad_token_id)]], device=device, dtype=torch.long)
+        pad_proj = self.text_projection(self.text_embedding(pad_ids)).reshape(1, -1)
+        self._tts_pad_embed.copy_(pad_proj.to(device=self._tts_pad_embed.device, dtype=self._tts_pad_embed.dtype))
 
     # -------------------- GPU-side MTP fast-path --------------------
 
