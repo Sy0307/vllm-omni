@@ -4,33 +4,97 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    NORMALIZED_REF_AUDIO_KEY,
+    PRECOMPUTED_REF_CODE_KEY,
+    PRECOMPUTED_REF_IDS_KEY,
+    PRECOMPUTED_TEXT_IDS_KEY,
+    Qwen3TTSPromptEmbedsBuilder,
+)
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-    _NORMALIZED_REF_AUDIO_KEY,
-    _PRECOMPUTED_REF_CODE_KEY,
-    _PRECOMPUTED_REF_IDS_KEY,
-    _PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSTalkerForConditionalGeneration,
 )
 
 
-def _make_minimal_talker(tts_pad_embed: torch.Tensor | None = None):
+def _make_minimal_talker(
+    tts_pad_embed: torch.Tensor | None = None,
+    *,
+    build_prompt_embeds=None,
+):
+    """Construct a bare ``Qwen3TTSTalkerForConditionalGeneration`` for preprocess tests.
+
+    Skips ``__init__`` and ``load_weights`` (so we don't need real config /
+    checkpoint files) and pre-populates the minimum set of attributes the
+    preprocess / decode paths read: the persistent ``tts_pad`` buffer and a
+    stub :class:`Qwen3TTSPromptEmbedsBuilder` with a configurable
+    ``build_prompt_embeds`` (defaults to raising, since most preprocess
+    tests don't exercise the builder).
+    """
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
-    model._ref_audio_artifact_cache_max_entries = 256
-    model._ref_audio_artifact_cache = OrderedDict()
-    # The real model precomputes ``tts_pad_embed`` once in
-    # :meth:`_init_runtime_buffers` (called from ``load_weights``) and
-    # reuses the same buffer at every prefill / decode step. Tests bypass
-    # both ``__init__`` and ``load_weights`` (via ``__new__``), so inject
-    # the expected value directly here.
     if tts_pad_embed is None:
         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
     model._tts_pad_embed = tts_pad_embed
+
+    def _default_raise(**_kwargs):
+        raise AssertionError("build_prompt_embeds was not stubbed in this test")
+
+    model._prompt_builder = SimpleNamespace(
+        build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
+    )
     return model
 
 
+def _make_minimal_builder(
+    *,
+    config: SimpleNamespace | None = None,
+    talker_config: SimpleNamespace | None = None,
+    tts_pad_embed: torch.Tensor | None = None,
+):
+    """Construct a bare :class:`Qwen3TTSPromptEmbedsBuilder` instance.
+
+    Bypasses ``__init__`` so we don't need a real model checkpoint; tests
+    populate the attributes they actually exercise.
+    """
+    builder = Qwen3TTSPromptEmbedsBuilder.__new__(Qwen3TTSPromptEmbedsBuilder)
+    builder._config = config or SimpleNamespace(
+        tts_bos_token_id=100,
+        tts_eos_token_id=101,
+        tts_pad_token_id=102,
+    )
+    builder._talker_config = talker_config or SimpleNamespace(
+        codec_nothink_id=10,
+        codec_think_bos_id=11,
+        codec_think_eos_id=12,
+        codec_think_id=13,
+        codec_language_id={},
+        codec_pad_id=7,
+        codec_bos_id=8,
+        num_code_groups=2,
+        spk_is_dialect={},
+    )
+    builder._model_path = ""
+    builder._text_embedding = None
+    builder._text_projection = lambda x: x
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+    builder._residual_code_embeddings = lambda: []
+    builder._speaker_encoder = None
+    builder._tts_pad_embed_buffer = (
+        tts_pad_embed if tts_pad_embed is not None else torch.zeros((1, 4), dtype=torch.bfloat16)
+    )
+    builder._encode_ref_audio_batch_fn = lambda wavs, sr, *, device: (_ for _ in ()).throw(
+        AssertionError("encode_ref_audio_batch_fn not stubbed")
+    )
+    builder._speaker_cache = None
+    builder._text_tokenizer = None
+    builder._ref_audio_artifact_cache_max_entries = 256
+    builder._ref_audio_artifact_cache = OrderedDict()
+    builder._resampler_cache = OrderedDict()
+    builder._resampler_cache_max = 16
+    return builder
+
+
 def test_single_token_prefill_uses_prefill_path():
-    model = _make_minimal_talker()
     full_prompt_embeds = torch.arange(12, dtype=torch.float32).reshape(3, 4)
     trailing_text = torch.ones((2, 4), dtype=torch.float32)
     ref_code = torch.arange(32, dtype=torch.long).reshape(2, 16)
@@ -38,7 +102,7 @@ def test_single_token_prefill_uses_prefill_path():
     def fake_build_prompt_embeds(*, task_type, info_dict):
         return full_prompt_embeds, trailing_text, 2, ref_code
 
-    model._build_prompt_embeds = fake_build_prompt_embeds
+    model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)
 
     input_ids = torch.tensor([123], dtype=torch.long)
     out_ids, out_embeds, update = model.preprocess(
@@ -66,14 +130,13 @@ def test_single_token_prefill_uses_prefill_path():
 
 
 def test_single_token_prefill_can_be_inferred_from_token_progress():
-    model = _make_minimal_talker()
     full_prompt_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     trailing_text = torch.ones((1, 4), dtype=torch.float32)
 
     def fake_build_prompt_embeds(*, task_type, info_dict):
         return full_prompt_embeds, trailing_text, None, None
 
-    model._build_prompt_embeds = fake_build_prompt_embeds
+    model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)
 
     out_ids, out_embeds, update = model.preprocess(
         input_ids=torch.tensor([123], dtype=torch.long),
@@ -231,53 +294,49 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
 
 
+def _stub_text_embedding(device_param: torch.nn.Parameter):
+    """Build a lambda that emulates ``nn.Embedding`` for the ``_device()`` helper.
+
+    ``Qwen3TTSPromptEmbedsBuilder._device()`` calls
+    ``next(self._text_embedding.parameters()).device``, so the stub needs a
+    ``parameters()`` attribute *and* must be callable as an embedding.
+    """
+    fn = lambda ids: torch.ones((*ids.shape, 4), device=ids.device)  # noqa: E731
+    fn.parameters = lambda: iter([device_param])  # type: ignore[attr-defined]
+    return fn
+
+
 def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
-    model = _make_minimal_talker()
+    builder = _make_minimal_builder()
     device_param = torch.nn.Parameter(torch.empty(0))
-    model.parameters = lambda: iter([device_param])
-    model.config = SimpleNamespace(
-        tts_bos_token_id=100,
-        tts_eos_token_id=101,
-        tts_pad_token_id=102,
-    )
-    model.talker_config = SimpleNamespace(
-        codec_nothink_id=10,
-        codec_think_bos_id=11,
-        codec_think_eos_id=12,
-        codec_think_id=13,
-        codec_language_id={},
-        codec_pad_id=7,
-        codec_bos_id=8,
-        num_code_groups=2,
-        spk_is_dialect={},
-    )
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
 
     class FakeTokenizer:
         def __call__(self, *_args, **_kwargs):
             return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
 
-    model._get_tokenizer = lambda: FakeTokenizer()
-    model.text_embedding = lambda ids: torch.ones((*ids.shape, 4), device=ids.device)
-    model.text_projection = lambda embeds: embeds
-    model.embed_input_ids = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
-    model._generate_icl_prompt = lambda **kwargs: (
+    builder._text_tokenizer = FakeTokenizer()
+
+    builder._generate_icl_prompt = lambda **kwargs: (
         torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
         torch.ones((1, 4), device=kwargs["ref_code"].device),
     )
 
     normalize_calls = []
     ref_audio = np.arange(1024, dtype=np.float32)
-    model._normalize_ref_audio = lambda raw: normalize_calls.append(raw) or (ref_audio, 16000)
+    builder.normalize_ref_audio = lambda raw: normalize_calls.append(raw) or (ref_audio, 16000)
 
     ref_audio_ids = []
-    model._encode_ref_audio_batch = lambda wavs, sr, *, device: (
+    builder._encode_ref_audio_batch_fn = lambda wavs, sr, *, device: (
         [ref_audio_ids.append(id(w)) or torch.ones((2, 2), dtype=torch.long) for w in wavs]
     )
-    model._extract_speaker_embedding = lambda wav, _sr: (
+    builder.extract_speaker_embedding = lambda wav, _sr: (
         ref_audio_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
     )
 
-    _prompt, _trailing, ref_code_len, ref_code = model._build_prompt_embeds(
+    _prompt, _trailing, ref_code_len, ref_code = builder.build_prompt_embeds(
         task_type="Base",
         info_dict={
             "text": ["hello"],
@@ -294,11 +353,11 @@ def test_base_voice_clone_normalizes_ref_audio_once_for_ref_code_and_speaker():
 
 
 def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
-    model = _make_minimal_talker()
+    builder = _make_minimal_builder()
     wav1 = np.arange(2048, dtype=np.float32)
     wav2 = np.arange(3072, dtype=np.float32)
     normalize_calls = []
-    model._normalize_ref_audio = lambda raw: (
+    builder.normalize_ref_audio = lambda raw: (
         normalize_calls.append(raw)
         or (
             wav1 if raw == "a.wav" else wav2,
@@ -315,7 +374,7 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
             torch.full((3, 2), 22, dtype=torch.long),
         ]
 
-    model._encode_ref_audio_batch = _fake_encode_batch
+    builder._encode_ref_audio_batch_fn = _fake_encode_batch
 
     class FakeTextTokenizer:
         def __init__(self):
@@ -326,7 +385,7 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
             return {"input_ids": [[idx + 1, idx + 2, idx + 3] for idx, _ in enumerate(texts)]}
 
     text_tok = FakeTextTokenizer()
-    model._get_tokenizer = lambda: text_tok
+    builder._text_tokenizer = text_tok
     buf = {
         "r1": {
             "task_type": ["Base"],
@@ -344,7 +403,7 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
         },
     }
 
-    model.preprocess_batch(
+    builder.preprocess_batch(
         req_ids=["r1", "r2"],
         model_intermediate_buffer=buf,
         device=torch.device("cpu"),
@@ -356,30 +415,30 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
     assert wavs[0] is wav1
     assert wavs[1] is wav2
     assert sr == 16000
-    assert torch.equal(buf["r1"]["codes"][_PRECOMPUTED_REF_CODE_KEY], torch.full((2, 2), 11))
-    assert torch.equal(buf["r2"]["codes"][_PRECOMPUTED_REF_CODE_KEY], torch.full((3, 2), 22))
-    assert buf["r1"][_NORMALIZED_REF_AUDIO_KEY][0] is wav1
-    assert buf["r2"][_NORMALIZED_REF_AUDIO_KEY][0] is wav2
+    assert torch.equal(buf["r1"]["codes"][PRECOMPUTED_REF_CODE_KEY], torch.full((2, 2), 11))
+    assert torch.equal(buf["r2"]["codes"][PRECOMPUTED_REF_CODE_KEY], torch.full((3, 2), 22))
+    assert buf["r1"][NORMALIZED_REF_AUDIO_KEY][0] is wav1
+    assert buf["r2"][NORMALIZED_REF_AUDIO_KEY][0] is wav2
     assert len(text_tok.calls) == 2
-    assert torch.equal(buf["r1"][_PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([1, 2, 3]))
-    assert torch.equal(buf["r2"][_PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([2, 3, 4]))
-    assert torch.equal(buf["r1"][_PRECOMPUTED_REF_IDS_KEY], torch.tensor([1, 2, 3]))
-    assert torch.equal(buf["r2"][_PRECOMPUTED_REF_IDS_KEY], torch.tensor([2, 3, 4]))
+    assert torch.equal(buf["r1"][PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([1, 2, 3]))
+    assert torch.equal(buf["r2"][PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([2, 3, 4]))
+    assert torch.equal(buf["r1"][PRECOMPUTED_REF_IDS_KEY], torch.tensor([1, 2, 3]))
+    assert torch.equal(buf["r2"][PRECOMPUTED_REF_IDS_KEY], torch.tensor([2, 3, 4]))
 
 
 def test_base_voice_clone_batch_preprocess_reuses_singleton_normalized_audio_without_speech_tokenizer():
-    model = _make_minimal_talker()
+    builder = _make_minimal_builder()
     wav = np.arange(2048, dtype=np.float32)
-    model._normalize_ref_audio = lambda raw: (wav, 16000)
-    model._ensure_speech_tokenizer_loaded = lambda: (_ for _ in ()).throw(
-        AssertionError("singleton should not load speech tokenizer")
+    builder.normalize_ref_audio = lambda raw: (wav, 16000)
+    builder._encode_ref_audio_batch_fn = lambda wavs, sr, *, device: (_ for _ in ()).throw(
+        AssertionError("singleton should not call encode_ref_audio_batch")
     )
 
     class FakeTextTokenizer:
         def __call__(self, texts, *, padding=False):
             return {"input_ids": [[7, 8, 9] for _ in texts]}
 
-    model._get_tokenizer = lambda: FakeTextTokenizer()
+    builder._text_tokenizer = FakeTextTokenizer()
     buf = {
         "r1": {
             "task_type": ["Base"],
@@ -390,22 +449,27 @@ def test_base_voice_clone_batch_preprocess_reuses_singleton_normalized_audio_wit
         }
     }
 
-    model.preprocess_batch(
+    builder.preprocess_batch(
         req_ids=["r1"],
         model_intermediate_buffer=buf,
         device=torch.device("cpu"),
     )
 
-    assert buf["r1"][_NORMALIZED_REF_AUDIO_KEY][0] is wav
-    assert torch.equal(buf["r1"][_PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([7, 8, 9]))
-    assert torch.equal(buf["r1"][_PRECOMPUTED_REF_IDS_KEY], torch.tensor([7, 8, 9]))
+    assert buf["r1"][NORMALIZED_REF_AUDIO_KEY][0] is wav
+    assert torch.equal(buf["r1"][PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([7, 8, 9]))
+    assert torch.equal(buf["r1"][PRECOMPUTED_REF_IDS_KEY], torch.tensor([7, 8, 9]))
 
 
 def test_base_voice_clone_batch_preprocess_skips_after_initial_prefill_state_exists():
-    model = _make_minimal_talker()
-    model._normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("normalize not expected"))
-    model._get_tokenizer = lambda: (_ for _ in ()).throw(AssertionError("tokenizer not expected"))
-    model._ensure_speech_tokenizer_loaded = lambda: (_ for _ in ()).throw(
+    builder = _make_minimal_builder()
+    builder.normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("normalize not expected"))
+
+    class _RaisingTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("tokenizer not expected")
+
+    builder._text_tokenizer = _RaisingTokenizer()
+    builder._encode_ref_audio_batch_fn = lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("speech tokenizer not expected")
     )
     buf = {
@@ -419,70 +483,53 @@ def test_base_voice_clone_batch_preprocess_skips_after_initial_prefill_state_exi
         }
     }
 
-    model.preprocess_batch(
+    builder.preprocess_batch(
         req_ids=["r1"],
         model_intermediate_buffer=buf,
         device=torch.device("cpu"),
     )
 
-    assert _PRECOMPUTED_TEXT_IDS_KEY not in buf["r1"]
-    assert _NORMALIZED_REF_AUDIO_KEY not in buf["r1"]
+    assert PRECOMPUTED_TEXT_IDS_KEY not in buf["r1"]
+    assert NORMALIZED_REF_AUDIO_KEY not in buf["r1"]
 
 
 def test_base_voice_clone_uses_batched_ref_code_without_serial_encode():
-    model = _make_minimal_talker()
+    builder = _make_minimal_builder()
     device_param = torch.nn.Parameter(torch.empty(0))
-    model.parameters = lambda: iter([device_param])
-    model.config = SimpleNamespace(
-        tts_bos_token_id=100,
-        tts_eos_token_id=101,
-        tts_pad_token_id=102,
-    )
-    model.talker_config = SimpleNamespace(
-        codec_nothink_id=10,
-        codec_think_bos_id=11,
-        codec_think_eos_id=12,
-        codec_think_id=13,
-        codec_language_id={},
-        codec_pad_id=7,
-        codec_bos_id=8,
-        num_code_groups=2,
-        spk_is_dialect={},
-    )
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
 
     class FakeTokenizer:
         def __call__(self, *_args, **_kwargs):
             return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
 
-    model._get_tokenizer = lambda: FakeTokenizer()
-    model.text_embedding = lambda ids: torch.ones((*ids.shape, 4), device=ids.device)
-    model.text_projection = lambda embeds: embeds
-    model.embed_input_ids = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
-    model._generate_icl_prompt = lambda **kwargs: (
+    builder._text_tokenizer = FakeTokenizer()
+    builder._generate_icl_prompt = lambda **kwargs: (
         torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
         torch.ones((1, 4), device=kwargs["ref_code"].device),
     )
 
     ref_audio = np.arange(2048, dtype=np.float32)
     ref_code = torch.arange(4, dtype=torch.long).reshape(2, 2)
-    model._normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("serial normalize not expected"))
-    model._encode_ref_audio_to_code = lambda _wav, _sr: (_ for _ in ()).throw(
+    builder.normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("serial normalize not expected"))
+    builder.encode_ref_audio_to_code = lambda _wav, _sr: (_ for _ in ()).throw(
         AssertionError("serial encode not expected")
     )
     speaker_wav_ids = []
-    model._extract_speaker_embedding = lambda wav, _sr: (
+    builder.extract_speaker_embedding = lambda wav, _sr: (
         speaker_wav_ids.append(id(wav)) or torch.ones(4, dtype=torch.bfloat16)
     )
 
-    _prompt, _trailing, ref_code_len, out_ref_code = model._build_prompt_embeds(
+    _prompt, _trailing, ref_code_len, out_ref_code = builder.build_prompt_embeds(
         task_type="Base",
         info_dict={
             "text": ["hello"],
             "ref_audio": ["ref.wav"],
             "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
             "non_streaming_mode": [False],
-            "codes": {_PRECOMPUTED_REF_CODE_KEY: ref_code},
-            _NORMALIZED_REF_AUDIO_KEY: (ref_audio, 16000),
+            "codes": {PRECOMPUTED_REF_CODE_KEY: ref_code},
+            NORMALIZED_REF_AUDIO_KEY: (ref_audio, 16000),
         },
     )
 
