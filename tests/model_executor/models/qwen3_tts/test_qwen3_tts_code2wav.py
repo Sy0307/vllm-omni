@@ -244,6 +244,26 @@ def test_forward_reuses_cached_ref_context_for_followup_chunk():
     assert "rid" not in model._ref_context_cache
 
 
+def test_forward_fails_fast_when_ref_context_cache_is_missing():
+    model = _make_model()
+
+    followup_codes = torch.tensor([5, 6, 7, 15, 16, 17], dtype=torch.long)
+    with pytest.raises(ValueError, match="Missing Qwen3-TTS ref context cache"):
+        model.forward(
+            input_ids=followup_codes,
+            runtime_additional_information=[
+                {
+                    "meta": {
+                        "left_context_size": 3,
+                        "ref_context_size": 2,
+                        "ref_context_request_id": "rid",
+                        "ref_context_included": False,
+                    }
+                }
+            ],
+        )
+
+
 def test_ref_context_cache_evicts_lru_entries_when_requests_abort():
     model = _make_model()
     model._ref_context_cache_max_entries = 2
