@@ -1050,10 +1050,28 @@ class Qwen3TTSPromptEmbedsBuilder:
                     ref_audio_wav, ref_audio_sr = self.normalize_ref_audio(ref_audio_list[0])
                 return ref_audio_wav, ref_audio_sr
 
-            # Per-ref-audio artifact cache: pre-populated by preprocess_batch
-            # via REF_AUDIO_CACHE_KEY; fall back to compute-on-miss here so
-            # serial prefill paths still benefit.
+            # Per-ref-audio artifact cache: usually pre-populated by
+            # preprocess_batch. Fall back to on-demand key creation for
+            # paths it skips but that still extract an ECAPA spk_embed
+            # from ref_audio: x_vector_only_mode, precomputed ref_code
+            # with no ref_spk_embedding, voice_clone_prompt.icl_mode=False.
             ref_audio_cache_key = info_dict.pop(REF_AUDIO_CACHE_KEY, None)
+            if not (isinstance(ref_audio_cache_key, str) and ref_audio_cache_key):
+                normalized = info_dict.get(NORMALIZED_REF_AUDIO_KEY)
+                wav_peek: np.ndarray | None = None
+                sr_peek: int | None = None
+                if isinstance(normalized, tuple) and len(normalized) == 2 and isinstance(normalized[0], np.ndarray):
+                    wav_peek, sr_peek = normalized[0], int(normalized[1])
+                else:
+                    ref_audio_list = info_dict.get("ref_audio")
+                    if isinstance(ref_audio_list, list) and ref_audio_list:
+                        try:
+                            wav_peek, sr_peek = self.normalize_ref_audio(ref_audio_list[0])
+                            info_dict[NORMALIZED_REF_AUDIO_KEY] = (wav_peek, int(sr_peek))
+                        except Exception:
+                            wav_peek = None
+                if isinstance(wav_peek, np.ndarray) and sr_peek is not None:
+                    ref_audio_cache_key = self.make_ref_audio_cache_key(wav_peek, sr_peek)
             cached_artifacts = None
             if isinstance(ref_audio_cache_key, str) and ref_audio_cache_key:
                 cached_artifacts = self.get_ref_audio_artifacts(ref_audio_cache_key)
