@@ -111,6 +111,12 @@ _TTS_LANGUAGES: set[str] = {
 }
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
+_TTS_REF_AUDIO_PROFILE_ENABLED = os.environ.get("VLLM_OMNI_TTS_REF_AUDIO_PROFILE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
@@ -1762,7 +1768,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 allowed_local_media_path=model_config.allowed_local_media_path,
                 allowed_media_domains=model_config.allowed_media_domains,
             )
+        fetch_start_s = time.perf_counter()
         wav_np, sr = await connector.fetch_audio_async(ref_audio_str)
+        fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
@@ -1778,7 +1786,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"Reference audio too long ({duration:.1f}s). "
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
             )
-        return wav_np.tolist(), sr
+        tolist_start_s = time.perf_counter()
+        wav_list = wav_np.tolist()
+        tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
+        if _TTS_REF_AUDIO_PROFILE_ENABLED:
+            logger.info(
+                "[SpeechRefAudioProfile] fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
+                fetch_decode_ms,
+                tolist_ms,
+                len(wav_np),
+                sr,
+                duration,
+            )
+        return wav_list, sr
 
     async def _generate_audio_chunks(
         self,

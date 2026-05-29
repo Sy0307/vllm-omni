@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import Counter, OrderedDict
 from collections.abc import Iterable
 from typing import Any
@@ -88,6 +89,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_decoded_frames = 0
         self._batch_stats_actual_frames: Counter[int] = Counter()
         self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
+        self._ref_context_profile_enabled = os.environ.get("VLLM_OMNI_QWEN3_REF_AUDIO_PROFILE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -463,6 +470,11 @@ class Qwen3TTSCode2Wav(nn.Module):
                     bucket_frames=target_frames,
                     actual_frames=actual_frames,
                 )
+                first_ref_indices = [valid_indices[j] for j, _ in group_chunk if ref_context_included[valid_indices[j]]]
+                profile_first_ref = self._ref_context_profile_enabled and bool(first_ref_indices)
+                if profile_first_ref and codes_bqf.is_cuda:
+                    torch.accelerator.synchronize(codes_bqf.device)
+                decode_start_s = time.perf_counter() if profile_first_ref else 0.0
                 try:
                     if use_variable_length_batch:
                         wav_batch = decoder.batched_chunked_decode(
@@ -482,6 +494,18 @@ class Qwen3TTSCode2Wav(nn.Module):
                     # Unit-test fakes and older decoder shims may not accept the
                     # explicit chunk kwargs; production Qwen3-TTS decoders do.
                     wav_batch = decoder.chunked_decode(codes_bqf)  # [B, 1, wav_len]
+                if profile_first_ref:
+                    if codes_bqf.is_cuda:
+                        torch.accelerator.synchronize(codes_bqf.device)
+                    logger.info(
+                        "Code2Wav ref context profile: step=first_chunk_decode "
+                        "batch=%d target_frames=%d actual_frames=%s ref_context_sizes=%s ms=%.3f",
+                        len(group_chunk),
+                        target_frames,
+                        actual_frames,
+                        [ref_context_size[idx] for idx in first_ref_indices],
+                        (time.perf_counter() - decode_start_s) * 1000.0,
+                    )
 
                 if wav_batch.dim() == 3 and wav_batch.shape[1] == 1:
                     wav_rows = wav_batch[:, 0, :]
