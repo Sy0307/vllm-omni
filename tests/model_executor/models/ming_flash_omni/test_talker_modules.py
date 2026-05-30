@@ -56,15 +56,12 @@ def test_attention_cached_rope_trig_matches_freqs_rope() -> None:
         1.0 if xpos_scale is None else xpos_scale,
         1.0 if xpos_scale is None else xpos_scale**-1.0,
     )
-    direct_rope = (*cached_rope, True)
 
     with torch.no_grad():
         original = attn(x, rope=rope)
         cached = attn(x, rope=cached_rope)
-        direct = attn(x, rope=direct_rope)
 
     assert torch.allclose(original, cached, rtol=1e-5, atol=1e-6)
-    assert torch.allclose(original, direct, rtol=1e-5, atol=1e-6)
 
 
 def test_qwen2_attention_packed_qkv_matches_separate_projections() -> None:

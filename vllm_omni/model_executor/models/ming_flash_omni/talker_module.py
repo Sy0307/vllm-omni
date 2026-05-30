@@ -88,41 +88,6 @@ def _apply_rotary_pos_emb_from_trig(
     return t.type(orig_dtype)
 
 
-def _apply_rotary_pos_emb_from_trig_direct(
-    t: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    scale: torch.Tensor | float = 1,
-) -> torch.Tensor:
-    rot_dim, seq_len, orig_dtype = cos.shape[-1], t.shape[-2], t.dtype
-
-    cos = cos[:, -seq_len:, :]
-    sin = sin[:, -seq_len:, :]
-    scale = scale[:, -seq_len:, :] if torch.is_tensor(scale) else scale
-
-    if t.ndim == 4 and cos.ndim == 3:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        if torch.is_tensor(scale):
-            scale = scale.unsqueeze(1)
-
-    t_rot, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
-    x1 = t_rot[..., 0::2]
-    x2 = t_rot[..., 1::2]
-    cos = cos[..., 0::2]
-    sin = sin[..., 0::2]
-    if torch.is_tensor(scale):
-        scale = scale[..., 0::2]
-
-    out1 = (x1 * cos * scale) + ((-x2) * sin * scale)
-    out2 = (x2 * cos * scale) + (x1 * sin * scale)
-    out = torch.stack((out1, out2), dim=-1).flatten(-2)
-    if t_unrotated.shape[-1] > 0:
-        out = torch.cat((out, t_unrotated), dim=-1)
-
-    return out.type(orig_dtype)
-
-
 ########################################################################
 # DiT Modules
 # Ported from:
@@ -314,10 +279,9 @@ class Attention(nn.Module):
             if rope is not None:
                 if len(rope) == 4:
                     cos, sin, q_xpos_scale, k_xpos_scale = rope
-                    apply_rope_fn = _apply_rotary_pos_emb_from_trig
-                elif len(rope) == 5:
-                    cos, sin, q_xpos_scale, k_xpos_scale, _direct = rope
-                    apply_rope_fn = _apply_rotary_pos_emb_from_trig_direct
+
+                    def apply_rope(t: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
+                        return _apply_rotary_pos_emb_from_trig(t, cos, sin, scale)
                 else:
                     freqs, xpos_scale = rope
                     q_xpos_scale, k_xpos_scale = (
@@ -326,10 +290,6 @@ class Attention(nn.Module):
 
                     def apply_rope(t: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
                         return apply_rotary_pos_emb(t, freqs, scale)
-                if len(rope) in (4, 5):
-
-                    def apply_rope(t: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
-                        return apply_rope_fn(t, cos, sin, scale)
 
                 if self.pe_attn_head is not None:
                     on = self.pe_attn_head
@@ -471,7 +431,6 @@ class DiT(nn.Module):
             self.spk_embedder = None
         self.hidden_size = hidden_size
         self.use_precomputed_rope_trig = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG")
-        self.use_direct_rope = _env_flag_enabled("VLLM_OMNI_MING_TALKER_DIRECT_ROPE")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -489,8 +448,6 @@ class DiT(nn.Module):
         q_xpos_scale, k_xpos_scale = (
             (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
         )
-        if self.use_direct_rope:
-            return freqs.cos(), freqs.sin(), q_xpos_scale, k_xpos_scale, True
         return freqs.cos(), freqs.sin(), q_xpos_scale, k_xpos_scale
 
     def forward(

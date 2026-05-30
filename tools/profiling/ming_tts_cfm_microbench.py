@@ -798,7 +798,6 @@ def run_rope_trig_compare(generator, inputs, args, llm_config, talker_cfg) -> di
     generator._llm_decode_graph_enabled = True
 
     generator._cfm.model.use_precomputed_rope_trig = False
-    generator._cfm.model.use_direct_rope = False
     generator._sampler_pools.clear()
     torch.manual_seed(0)
     _run(generator, inputs, args, force_original=False)
@@ -807,7 +806,6 @@ def run_rope_trig_compare(generator, inputs, args, llm_config, talker_cfg) -> di
     baseline_latents, baseline_timers = _run(generator, inputs, args, force_original=False)
 
     generator._cfm.model.use_precomputed_rope_trig = True
-    generator._cfm.model.use_direct_rope = False
     generator._sampler_pools.clear()
     torch.manual_seed(0)
     _run(generator, inputs, args, force_original=False)
@@ -816,29 +814,13 @@ def run_rope_trig_compare(generator, inputs, args, llm_config, talker_cfg) -> di
     opt_latents, opt_timers = _run(generator, inputs, args, force_original=False)
     diff = (_cat_all_latents(baseline_latents) - _cat_all_latents(opt_latents)).float().abs()
 
-    generator._cfm.model.use_precomputed_rope_trig = True
-    generator._cfm.model.use_direct_rope = True
-    generator._sampler_pools.clear()
-    torch.manual_seed(0)
-    _run(generator, inputs, args, force_original=False)
-
-    torch.manual_seed(1234)
-    direct_latents, direct_timers = _run(generator, inputs, args, force_original=False)
-    direct_diff = (_cat_all_latents(baseline_latents) - _cat_all_latents(direct_latents)).float().abs()
-
     samples = {
         "freqs_rope": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
         "cached_trig_rope": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
-        "cached_trig_direct_rope": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
     }
     for idx in range(args.repeats):
-        for name, precompute_trig, direct_rope in (
-            ("freqs_rope", False, False),
-            ("cached_trig_rope", True, False),
-            ("cached_trig_direct_rope", True, True),
-        ):
-            generator._cfm.model.use_precomputed_rope_trig = precompute_trig
-            generator._cfm.model.use_direct_rope = direct_rope
+        for name, enabled in (("freqs_rope", False), ("cached_trig_rope", True)):
+            generator._cfm.model.use_precomputed_rope_trig = enabled
             generator._sampler_pools.clear()
             torch.manual_seed(1000 + idx)
             _latents, timers = _run(generator, inputs, args, force_original=False)
@@ -863,11 +845,8 @@ def run_rope_trig_compare(generator, inputs, args, llm_config, talker_cfg) -> di
         "equivalence": {
             "max_abs_latent_diff": float(diff.max().item()),
             "mean_abs_latent_diff": float(diff.mean().item()),
-            "direct_max_abs_latent_diff": float(direct_diff.max().item()),
-            "direct_mean_abs_latent_diff": float(direct_diff.mean().item()),
             "baseline_timers": baseline_timers,
             "optimized_timers": opt_timers,
-            "direct_timers": direct_timers,
         },
         "timers": _summarize_samples(samples),
     }
