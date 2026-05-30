@@ -40,7 +40,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     eager_attention_forward,
 )
 from vllm.logger import init_logger
-from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
+from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
@@ -60,6 +60,32 @@ def _record_function(name: str):
     if not _PROFILE_RANGES_ENABLED:
         return nullcontext()
     return torch.profiler.record_function(name)
+
+
+def _apply_rotary_pos_emb_from_trig(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    scale: torch.Tensor | float = 1,
+) -> torch.Tensor:
+    rot_dim, seq_len, orig_dtype = cos.shape[-1], t.shape[-2], t.dtype
+
+    cos = cos[:, -seq_len:, :]
+    sin = sin[:, -seq_len:, :]
+    scale = scale[:, -seq_len:, :] if torch.is_tensor(scale) else scale
+
+    if t.ndim == 4 and cos.ndim == 3:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        if torch.is_tensor(scale):
+            scale = scale.unsqueeze(1)
+
+    t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
+    t = (t * cos * scale) + (rotate_half(t) * sin * scale)
+    if t_unrotated.shape[-1] > 0:
+        t = torch.cat((t, t_unrotated), dim=-1)
+
+    return t.type(orig_dtype)
 
 
 ########################################################################
@@ -225,7 +251,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
-        rope: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        rope: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         batch_size = x.shape[0]
 
@@ -251,18 +277,27 @@ class Attention(nn.Module):
 
         with _record_function("ming.attn.rope"):
             if rope is not None:
-                freqs, xpos_scale = rope
-                q_xpos_scale, k_xpos_scale = (
-                    (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-                )
+                if len(rope) == 4:
+                    cos, sin, q_xpos_scale, k_xpos_scale = rope
+
+                    def apply_rope(t: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
+                        return _apply_rotary_pos_emb_from_trig(t, cos, sin, scale)
+                else:
+                    freqs, xpos_scale = rope
+                    q_xpos_scale, k_xpos_scale = (
+                        (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+                    )
+
+                    def apply_rope(t: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
+                        return apply_rotary_pos_emb(t, freqs, scale)
 
                 if self.pe_attn_head is not None:
                     on = self.pe_attn_head
-                    query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
-                    key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
+                    query[:, :on, :, :] = apply_rope(query[:, :on, :, :], q_xpos_scale)
+                    key[:, :on, :, :] = apply_rope(key[:, :on, :, :], k_xpos_scale)
                 else:
-                    query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-                    key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+                    query = apply_rope(query, q_xpos_scale)
+                    key = apply_rope(key, k_xpos_scale)
 
         if self.attn_mask_enabled and mask is not None:
             valid_sample_indices = mask.any(dim=1)
@@ -329,7 +364,7 @@ class DiTBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None,
-        rope: tuple[torch.Tensor, torch.Tensor | None] | None,
+        rope: tuple[torch.Tensor, ...] | None,
     ) -> torch.Tensor:
         with _record_function("ming.dit_block.norm1"):
             normed = self.norm1(x)
@@ -395,6 +430,7 @@ class DiT(nn.Module):
         else:
             self.spk_embedder = None
         self.hidden_size = hidden_size
+        self.use_precomputed_rope_trig = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -402,6 +438,17 @@ class DiT(nn.Module):
             [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **kwargs) for _ in range(depth)]
         )
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
+
+    def _maybe_precompute_rope_trig(
+        self, rope: tuple[torch.Tensor, torch.Tensor | None]
+    ) -> tuple[torch.Tensor, ...]:
+        if not self.use_precomputed_rope_trig:
+            return rope
+        freqs, xpos_scale = rope
+        q_xpos_scale, k_xpos_scale = (
+            (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+        )
+        return freqs.cos(), freqs.sin(), q_xpos_scale, k_xpos_scale
 
     def forward(
         self,
@@ -421,7 +468,7 @@ class DiT(nn.Module):
             x = torch.cat([y, x], dim=1)
         else:
             x = torch.cat([self.spk_embedder(spk_emb), y, x], dim=1)
-        rope = self.rotary_embed.forward_from_seq_len(x.shape[1])
+        rope = self._maybe_precompute_rope_trig(self.rotary_embed.forward_from_seq_len(x.shape[1]))
 
         for block in self.blocks:
             x = block(x, None, rope)
@@ -469,7 +516,7 @@ class DiT(nn.Module):
         t: torch.Tensor,
         c_emb: torch.Tensor,
         latent_history_emb: torch.Tensor,
-        rope: tuple[torch.Tensor, torch.Tensor | None],
+        rope: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         """Forward with CFG and step-invariant embeddings precomputed."""
         x = torch.cat([x, x], dim=0)
@@ -491,7 +538,7 @@ class DiT(nn.Module):
         t_emb: torch.Tensor,
         c_emb: torch.Tensor,
         latent_history_emb: torch.Tensor,
-        rope: tuple[torch.Tensor, torch.Tensor | None],
+        rope: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         """Forward with CFG and precomputed timestep/condition embeddings."""
         x = self.x_embedder(x)
@@ -587,7 +634,9 @@ class CFM(nn.Module):
             else:
                 null_llm_cond_emb = null_cond_bias.view(1, 1, -1).expand_as(llm_cond_emb)
             cfg_llm_cond_emb = torch.cat([llm_cond_emb, null_llm_cond_emb], dim=0)
-            rope = self.model.rotary_embed.forward_from_seq_len(1 + cfg_lat_cond_emb.shape[1] + y0.shape[1])
+            rope = self.model._maybe_precompute_rope_trig(
+                self.model.rotary_embed.forward_from_seq_len(1 + cfg_lat_cond_emb.shape[1] + y0.shape[1])
+            )
             if self.use_precomputed_temb:
                 t_emb = self.model.t_embedder(t[:-1]).unsqueeze(1)
 

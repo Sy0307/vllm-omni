@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from transformers import Qwen2Config, Qwen2Model
+from x_transformers.x_transformers import RotaryEmbedding
 
 from vllm_omni.model_executor.models.ming_flash_omni.talker_module import (
     CFM,
@@ -42,6 +43,25 @@ def test_attention_packed_qkv_matches_separate_projections() -> None:
 
     assert attn.to_qkv is not None
     assert torch.allclose(separate, packed, rtol=1e-5, atol=1e-6)
+
+
+def test_attention_cached_rope_trig_matches_freqs_rope() -> None:
+    attn = Attention(dim=_DIT_HIDDEN, heads=_NUM_HEADS).eval()
+    x = torch.randn(2, 5, _DIT_HIDDEN)
+    rope = RotaryEmbedding(_DIT_HIDDEN // _NUM_HEADS).forward_from_seq_len(x.shape[1])
+    freqs, xpos_scale = rope
+    cached_rope = (
+        freqs.cos(),
+        freqs.sin(),
+        1.0 if xpos_scale is None else xpos_scale,
+        1.0 if xpos_scale is None else xpos_scale**-1.0,
+    )
+
+    with torch.no_grad():
+        original = attn(x, rope=rope)
+        cached = attn(x, rope=cached_rope)
+
+    assert torch.allclose(original, cached, rtol=1e-5, atol=1e-6)
 
 
 def test_qwen2_attention_packed_qkv_matches_separate_projections() -> None:
