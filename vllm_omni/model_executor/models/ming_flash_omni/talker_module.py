@@ -1266,6 +1266,13 @@ class MingLLMDecodeGraphExecutor:
             device=sample_inputs_embeds.device,
             dtype=torch.long,
         )
+        self._cache_position_table: torch.Tensor | None = None
+        if _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_CACHE_POSITION"):
+            self._cache_position_table = torch.arange(
+                2048,
+                device=sample_inputs_embeds.device,
+                dtype=torch.long,
+            )
         self._graph = torch.cuda.CUDAGraph()
         self._output: torch.Tensor | None = None
         self._shape = tuple(sample_inputs_embeds.shape)
@@ -1277,14 +1284,19 @@ class MingLLMDecodeGraphExecutor:
 
     def _set_inputs(self, inputs_embeds: torch.Tensor, cache_position_start: int) -> None:
         self._input_ph.copy_(inputs_embeds)
-        self._cache_pos_ph.copy_(
-            torch.arange(
-                cache_position_start,
-                cache_position_start + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-                dtype=torch.long,
+        if self._cache_position_table is not None:
+            self._cache_pos_ph.copy_(
+                self._cache_position_table[cache_position_start : cache_position_start + inputs_embeds.shape[1]]
             )
-        )
+        else:
+            self._cache_pos_ph.copy_(
+                torch.arange(
+                    cache_position_start,
+                    cache_position_start + inputs_embeds.shape[1],
+                    device=inputs_embeds.device,
+                    dtype=torch.long,
+                )
+            )
 
     def _run_model(self):
         return self._model(
