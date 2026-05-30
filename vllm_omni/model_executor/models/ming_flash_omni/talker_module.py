@@ -81,7 +81,10 @@ def _apply_rotary_pos_emb_from_trig(
             scale = scale.unsqueeze(1)
 
     t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
-    t = (t * cos * scale) + (rotate_half(t) * sin * scale)
+    if torch.is_tensor(scale) or scale != 1:
+        t = (t * cos * scale) + (rotate_half(t) * sin * scale)
+    else:
+        t = (t * cos) + (rotate_half(t) * sin)
     if t_unrotated.shape[-1] > 0:
         t = torch.cat((t, t_unrotated), dim=-1)
 
