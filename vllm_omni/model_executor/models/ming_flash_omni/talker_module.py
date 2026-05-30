@@ -866,6 +866,42 @@ class CFMGraphExecutorPool:
             self.release(executor)
 
 
+class VAEStreamDecodeGraphExecutor:
+    """CUDA graph executor for one stateless AudioVAE stream decode shape."""
+
+    def __init__(self, audio_vae: AudioVAE) -> None:
+        self.audio_vae = audio_vae
+        self.initialized = False
+        self.latent_placeholder: torch.Tensor | None = None
+        self.waveform_placeholder: torch.Tensor | None = None
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    def execute(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self.initialized:
+            self._initialize_graph(latent)
+
+        assert self.latent_placeholder is not None
+        assert self.waveform_placeholder is not None
+        assert self.graph is not None
+        self.latent_placeholder.copy_(latent)
+        self.graph.replay()
+        waveform = torch.empty_like(self.waveform_placeholder)
+        waveform.copy_(self.waveform_placeholder)
+        return waveform
+
+    def _initialize_graph(self, latent: torch.Tensor) -> None:
+        self.latent_placeholder = torch.empty_like(latent)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.waveform_placeholder, _, _ = self.audio_vae.decode(
+                self.latent_placeholder,
+                use_cache=False,
+                stream_state=(None, None, None),
+                last_chunk=True,
+            )
+        self.initialized = True
+
+
 ########################################################################
 # Audio Postprocess
 # Adapted from:
@@ -1419,9 +1455,11 @@ class MingAudioGenerator:
         self._pack_qkv_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FUSED_QKV")
         self._qkv_packed = False
         self._llm_decode_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH")
+        self._vae_stream_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_VAE_STREAM_GRAPH")
         self._llm_decode_graphs: dict[int, MingLLMDecodeGraphExecutor] = {}
         self._reusable_kv_caches: dict[tuple[int, str, torch.dtype], StaticCache] = {}
         self._reusable_kv_cache_lock = Lock()
+        self._vae_stream_decode_graphs: dict[tuple[int, torch.device, torch.dtype], VAEStreamDecodeGraphExecutor] = {}
 
     def _maybe_pack_qkv_projections(self) -> None:
         if not self._pack_qkv_enabled or self._qkv_packed:
@@ -1855,6 +1893,23 @@ class MingAudioGenerator:
         raise NotImplementedError(f"his_patch_size ({self.his_patch_size}) < patch_size ({self.patch_size})")
 
     # VAE streaming decode
+    def _vae_stream_decode_step(self, vae_input: torch.Tensor) -> torch.Tensor:
+        if not self._vae_stream_graph_enabled or vae_input.device.type != "cuda":
+            speech, _, _ = self._audio_vae.decode(
+                vae_input,
+                use_cache=False,
+                stream_state=(None, None, None),
+                last_chunk=True,
+            )
+            return speech
+
+        key = (vae_input.shape[1], vae_input.device, vae_input.dtype)
+        executor = self._vae_stream_decode_graphs.get(key)
+        if executor is None:
+            executor = VAEStreamDecodeGraphExecutor(self._audio_vae)
+            self._vae_stream_decode_graphs[key] = executor
+        return executor.execute(vae_input)
+
     def _stream_decode(self, latents: list[torch.Tensor]) -> torch.Tensor:
         sr = int(self._audio_vae.config.sample_rate)
         decode_pad: torch.Tensor | None = None
@@ -1872,12 +1927,7 @@ class MingAudioGenerator:
                 pad_frames = 0
 
             # Stateless, no KV cache accum intentionally.
-            speech, _, _ = self._audio_vae.decode(
-                vae_input,
-                use_cache=False,
-                stream_state=(None, None, None),
-                last_chunk=True,
-            )
+            speech = self._vae_stream_decode_step(vae_input)
 
             total_frames = vae_input.shape[1]
             dcs = speech.shape[-1] // total_frames

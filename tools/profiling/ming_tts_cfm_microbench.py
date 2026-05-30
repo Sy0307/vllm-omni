@@ -581,12 +581,17 @@ def run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
     sr = int(generator._audio_vae.config.sample_rate)
 
     with torch.no_grad():
+        generator._vae_stream_graph_enabled = False
         stream_wav = generator.decode_to_waveform(latents, stream_decode=True)
+        generator._vae_stream_graph_enabled = True
+        graph_stream_wav = generator.decode_to_waveform(latents, stream_decode=True)
+        generator._vae_stream_graph_enabled = False
         full_raw_wav = generator.decode_to_waveform(latents, stream_decode=False)
         full_trimmed_wav = generator.trim_trailing_silence(full_raw_wav)
 
     samples = {
         "stream_decode_ms": [],
+        "graph_stream_decode_ms": [],
         "full_decode_raw_ms": [],
         "full_decode_trimmed_ms": [],
     }
@@ -594,9 +599,17 @@ def run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
         torch.cuda.synchronize(args.device)
         t0 = time.perf_counter()
         with torch.no_grad():
+            generator._vae_stream_graph_enabled = False
             generator.decode_to_waveform(latents, stream_decode=True)
         torch.cuda.synchronize(args.device)
         t1 = time.perf_counter()
+
+        with torch.no_grad():
+            generator._vae_stream_graph_enabled = True
+            generator.decode_to_waveform(latents, stream_decode=True)
+            generator._vae_stream_graph_enabled = False
+        torch.cuda.synchronize(args.device)
+        t_graph = time.perf_counter()
 
         with torch.no_grad():
             raw = generator.decode_to_waveform(latents, stream_decode=False)
@@ -609,8 +622,9 @@ def run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
         t3 = time.perf_counter()
 
         samples["stream_decode_ms"].append((t1 - t0) * 1000.0)
-        samples["full_decode_raw_ms"].append((t2 - t1) * 1000.0)
-        samples["full_decode_trimmed_ms"].append((t3 - t1) * 1000.0)
+        samples["graph_stream_decode_ms"].append((t_graph - t1) * 1000.0)
+        samples["full_decode_raw_ms"].append((t2 - t_graph) * 1000.0)
+        samples["full_decode_trimmed_ms"].append((t3 - t_graph) * 1000.0)
 
     return {
         "mode": "vae_stream_full_compare",
@@ -632,8 +646,10 @@ def run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
         "ar_timers": ar_timers,
         "audio": {
             "stream_seconds": float(stream_wav.shape[-1]) / sr,
+            "graph_stream_seconds": float(graph_stream_wav.shape[-1]) / sr,
             "full_raw_seconds": float(full_raw_wav.shape[-1]) / sr,
             "full_trimmed_seconds": float(full_trimmed_wav.shape[-1]) / sr,
+            "stream_vs_graph_stream": _waveform_diff(stream_wav, graph_stream_wav),
             "stream_vs_full_raw": _waveform_diff(stream_wav, full_raw_wav),
             "stream_vs_full_trimmed": _waveform_diff(stream_wav, full_trimmed_wav),
         },
