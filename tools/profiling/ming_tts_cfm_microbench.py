@@ -34,10 +34,6 @@ def _cat_latents(latents: list[list[torch.Tensor]]) -> torch.Tensor:
     return torch.cat(latents[0], dim=1)
 
 
-def _cat_all_latents(latents: list[list[torch.Tensor]]) -> torch.Tensor:
-    return torch.cat([torch.cat(row, dim=1) for row in latents], dim=0)
-
-
 def _waveform_diff(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float | int]:
     ref = reference.detach().float().flatten()
     cand = candidate.detach().float().flatten()
@@ -790,69 +786,6 @@ def run_prepared_cfg_compare(generator, inputs, args, llm_config, talker_cfg) ->
     }
 
 
-def run_final_layer_tail_compare(generator, inputs, args, llm_config, talker_cfg) -> dict:
-    """Compare applying DiT final_layer to only the retained patch tokens."""
-    generator._pack_qkv_enabled = True
-    generator._qkv_packed = False
-    generator._cfm.use_preembedded_cfg = True
-    generator._cfm.use_precomputed_temb = True
-    generator._llm_decode_graph_enabled = True
-
-    generator._cfm.model.use_final_layer_tail = False
-    generator._sampler_pools.clear()
-    torch.manual_seed(0)
-    _run(generator, inputs, args, force_original=False)
-
-    torch.manual_seed(1234)
-    baseline_latents, baseline_timers = _run(generator, inputs, args, force_original=False)
-
-    generator._cfm.model.use_final_layer_tail = True
-    generator._sampler_pools.clear()
-    torch.manual_seed(0)
-    _run(generator, inputs, args, force_original=False)
-
-    torch.manual_seed(1234)
-    tail_latents, tail_timers = _run(generator, inputs, args, force_original=False)
-    diff = (_cat_all_latents(baseline_latents) - _cat_all_latents(tail_latents)).float().abs()
-
-    samples = {
-        "full_final_layer": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
-        "tail_final_layer": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
-    }
-    for idx in range(args.repeats):
-        for name, enabled in (("full_final_layer", False), ("tail_final_layer", True)):
-            generator._cfm.model.use_final_layer_tail = enabled
-            generator._sampler_pools.clear()
-            torch.manual_seed(1000 + idx)
-            _latents, timers = _run(generator, inputs, args, force_original=False)
-            for key in samples[name]:
-                samples[name][key].append(float(timers[key]))
-
-    return {
-        "mode": "final_layer_tail_compare",
-        "model": {
-            "llm_layers": llm_config.num_hidden_layers,
-            "llm_hidden": llm_config.hidden_size,
-            "cfm_steps": talker_cfg["steps"],
-            "dit_depth": talker_cfg["flowmodel"]["depth"],
-            "aggregator_depth": talker_cfg["aggregator"]["depth"],
-        },
-        "workload": {
-            "batch_size": args.batch_size,
-            "input_tokens": inputs.shape[1],
-            "profile_steps": args.steps,
-            "repeats": args.repeats,
-        },
-        "equivalence": {
-            "max_abs_latent_diff": float(diff.max().item()),
-            "mean_abs_latent_diff": float(diff.mean().item()),
-            "baseline_timers": baseline_timers,
-            "tail_timers": tail_timers,
-        },
-        "timers": _summarize_samples(samples),
-    }
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="/home/admin/workspace/remote_workspace/models/Ming-flash-omni-2.0")
@@ -868,7 +801,6 @@ def main() -> None:
     parser.add_argument("--compare-llm-decode-graph", action="store_true")
     parser.add_argument("--compare-llm-decode-graph-ar", action="store_true")
     parser.add_argument("--compare-vae-stream-full", action="store_true")
-    parser.add_argument("--compare-final-layer-tail", action="store_true")
     args = parser.parse_args()
 
     dtype = torch.bfloat16
@@ -925,14 +857,6 @@ def main() -> None:
 
     if args.compare_vae_stream_full:
         summary = run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
-        text = json.dumps(summary, indent=2, sort_keys=True)
-        if args.output:
-            Path(args.output).write_text(text)
-        print(text)
-        return
-
-    if args.compare_final_layer_tail:
-        summary = run_final_layer_tail_compare(generator, inputs, args, llm_config, talker_cfg)
         text = json.dumps(summary, indent=2, sort_keys=True)
         if args.output:
             Path(args.output).write_text(text)

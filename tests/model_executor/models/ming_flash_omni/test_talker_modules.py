@@ -122,36 +122,6 @@ class TestDiTDummyForward:
         # CFG doubles the batch and trims the output to the patch window.
         assert out.shape == (2 * bsz, _PATCH_SIZE, _LATENT_DIM)
 
-    def test_preembedded_tail_final_layer_matches_full_final_layer(self) -> None:
-        dit = _make_dit().eval()
-        bsz = 2
-        x = torch.randn(bsz, _PATCH_SIZE, _LATENT_DIM)
-        t = torch.zeros(())
-        c = torch.randn(bsz, 1, _LLM_HIDDEN)
-        latent_history = torch.randn(bsz, _HIS_PATCH_SIZE, _LATENT_DIM)
-
-        cfg_lat_cond = torch.cat([latent_history, latent_history], dim=0)
-        cfg_llm_cond = torch.cat([c, torch.zeros_like(c)], dim=0)
-
-        with torch.no_grad():
-            cfg_lat_cond_emb = dit.x_embedder(cfg_lat_cond)
-            cfg_llm_cond_emb = dit.c_embedder(cfg_llm_cond)
-            rope = dit.rotary_embed.forward_from_seq_len(1 + cfg_lat_cond_emb.shape[1] + x.shape[1])
-            full = dit.forward_with_preembedded_cfg(x, t, cfg_llm_cond_emb, cfg_lat_cond_emb, rope)
-            t_emb = dit.t_embedder(t.reshape(1)).unsqueeze(1)
-            full_temb = dit.forward_with_preembedded_cfg_temb(
-                x, t_emb, cfg_llm_cond_emb, cfg_lat_cond_emb, rope
-            )
-
-            dit.use_final_layer_tail = True
-            tail = dit.forward_with_preembedded_cfg(x, t, cfg_llm_cond_emb, cfg_lat_cond_emb, rope)
-            tail_temb = dit.forward_with_preembedded_cfg_temb(
-                x, t_emb, cfg_llm_cond_emb, cfg_lat_cond_emb, rope
-            )
-
-        assert torch.allclose(full, tail, rtol=1e-5, atol=1e-6)
-        assert torch.allclose(full_temb, tail_temb, rtol=1e-5, atol=1e-6)
-
 
 class TestAggregatorDummyForward:
     """Aggregator with dummy weights maps latent patch -> LLM hidden."""
