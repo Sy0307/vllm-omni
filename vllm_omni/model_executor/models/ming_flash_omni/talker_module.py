@@ -434,7 +434,6 @@ class DiT(nn.Module):
             self.spk_embedder = None
         self.hidden_size = hidden_size
         self.use_precomputed_rope_trig = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG")
-        self.use_final_layer_token_slice = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FINAL_LAYER_SLICE")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -461,7 +460,6 @@ class DiT(nn.Module):
         c: torch.Tensor,
         latent_history: torch.Tensor,
         spk_emb: torch.Tensor | None = None,
-        output_patch_len: int | None = None,
     ) -> torch.Tensor:
         x = torch.cat([latent_history, x], dim=1)
         x = self.x_embedder(x)
@@ -477,8 +475,6 @@ class DiT(nn.Module):
 
         for block in self.blocks:
             x = block(x, None, rope)
-        if self.use_final_layer_token_slice and output_patch_len is not None:
-            x = x[:, -output_patch_len:, :]
         x = self.final_layer(x)
         return x
 
@@ -499,9 +495,8 @@ class DiT(nn.Module):
             t = t.repeat(x.shape[0])
         if spk_emb is not None:
             spk_emb = torch.cat([spk_emb, spk_emb], dim=0)
-        patch_len = x.shape[1]
-        model_out = self.forward(x, t, c, latent_history, spk_emb, output_patch_len=patch_len)
-        return model_out if self.use_final_layer_token_slice else model_out[:, -patch_len:, :]
+        model_out = self.forward(x, t, c, latent_history, spk_emb)
+        return model_out[:, -x.shape[1] :, :]
 
     def forward_with_prepared_cfg(
         self,
@@ -515,9 +510,8 @@ class DiT(nn.Module):
         x = torch.cat([x, x], dim=0)
         if t.ndim == 0:
             t = t.repeat(x.shape[0])
-        patch_len = x.shape[1]
-        model_out = self.forward(x, t, c, latent_history, spk_emb, output_patch_len=patch_len)
-        return model_out if self.use_final_layer_token_slice else model_out[:, -patch_len:, :]
+        model_out = self.forward(x, t, c, latent_history, spk_emb)
+        return model_out[:, -x.shape[1] :, :]
 
     def forward_with_preembedded_cfg(
         self,
@@ -538,10 +532,8 @@ class DiT(nn.Module):
 
         for block in self.blocks:
             x = block(x, None, rope)
-        if self.use_final_layer_token_slice:
-            x = x[:, -patch_len:, :]
         x = self.final_layer(x)
-        return x if self.use_final_layer_token_slice else x[:, -patch_len:, :]
+        return x[:, -patch_len:, :]
 
     def forward_with_preembedded_cfg_temb(
         self,
@@ -559,10 +551,8 @@ class DiT(nn.Module):
 
         for block in self.blocks:
             x = block(x, None, rope)
-        if self.use_final_layer_token_slice:
-            x = x[:, -patch_len:, :]
         x = self.final_layer(x)
-        return x if self.use_final_layer_token_slice else x[:, -patch_len:, :]
+        return x[:, -patch_len:, :]
 
 
 #########################################################################################
@@ -1118,7 +1108,6 @@ class Aggregator(nn.Module):
         self.word_embedder = nn.Embedding(1, hidden_size)
         self.x_embedder = nn.Linear(in_channels, hidden_size)
         self.hidden_size = hidden_size
-        self.use_final_layer_token_slice = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FINAL_LAYER_SLICE")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -1138,11 +1127,8 @@ class Aggregator(nn.Module):
             mask = torch.cat([mask_pad, mask], dim=-1)
         for block in self.blocks:
             x = block(x, mask, rope)
-        if self.use_final_layer_token_slice:
-            x = x[:, :1, :]
         x = self.final_layer(x)
-        if not self.use_final_layer_token_slice:
-            x = x[:, :1, :]
+        x = x[:, :1, :]
         return x
 
 
