@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from transformers import Qwen2Config, Qwen2Model
@@ -12,6 +14,8 @@ from vllm_omni.model_executor.models.ming_flash_omni.talker_module import (
     Aggregator,
     Attention,
     DiT,
+    MingAudioGenerator,
+    _env_flag_enabled,
     pack_qwen2_attention_qkv_projections,
 )
 
@@ -30,6 +34,52 @@ _AGG_HIDDEN = 32
 _NUM_HEADS = 4
 _DEPTH = 2
 _STEPS = 5
+
+
+def test_env_flag_enabled_default_true_allows_explicit_opt_out(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_TEST_FASTPATH", raising=False)
+
+    assert _env_flag_enabled("VLLM_OMNI_TEST_FASTPATH", default=True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_TEST_FASTPATH", "0")
+
+    assert _env_flag_enabled("VLLM_OMNI_TEST_FASTPATH", default=True) is False
+
+
+def test_env_flag_enabled_default_false_preserves_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_TEST_FASTPATH", raising=False)
+
+    assert _env_flag_enabled("VLLM_OMNI_TEST_FASTPATH", default=False) is False
+
+    monkeypatch.setenv("VLLM_OMNI_TEST_FASTPATH", "1")
+
+    assert _env_flag_enabled("VLLM_OMNI_TEST_FASTPATH", default=False) is True
+
+
+def test_ming_cfm_zero_diff_fastpaths_default_on(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MING_TALKER_PREEMBED_CFG", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MING_TALKER_PRECOMPUTE_TEMB", raising=False)
+
+    dit = _make_dit()
+    cfm = CFM(dit, steps=_STEPS)
+
+    assert dit.use_precomputed_rope_trig is True
+    assert cfm.use_preembedded_cfg is True
+    assert cfm.use_precomputed_temb is True
+
+
+def test_ming_cfm_zero_diff_fastpaths_can_opt_out(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG", "0")
+    monkeypatch.setenv("VLLM_OMNI_MING_TALKER_PREEMBED_CFG", "0")
+    monkeypatch.setenv("VLLM_OMNI_MING_TALKER_PRECOMPUTE_TEMB", "0")
+
+    dit = _make_dit()
+    cfm = CFM(dit, steps=_STEPS)
+
+    assert dit.use_precomputed_rope_trig is False
+    assert cfm.use_preembedded_cfg is False
+    assert cfm.use_precomputed_temb is False
 
 
 def test_attention_packed_qkv_matches_separate_projections() -> None:
@@ -108,6 +158,59 @@ def _make_aggregator() -> Aggregator:
         mlp_ratio=2.0,
         llm_input_dim=_LLM_HIDDEN,
     )
+
+
+def _make_generator() -> MingAudioGenerator:
+    llm_config = Qwen2Config(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+    )
+    llm_config._attn_implementation = "sdpa"
+    model = Qwen2Model(llm_config).eval()
+    dit = _make_dit()
+    cfm = CFM(dit, steps=_STEPS)
+    aggregator = _make_aggregator()
+    stop_head = torch.nn.Linear(32, 2)
+    return MingAudioGenerator(
+        SimpleNamespace(steps=_STEPS, patch_size=_PATCH_SIZE),
+        llm_config,
+        model,
+        cfm,
+        aggregator,
+        stop_head,
+        audio_vae=None,
+        patch_size=_PATCH_SIZE,
+        his_patch_size=_HIS_PATCH_SIZE,
+        latent_dim=_LATENT_DIM,
+        cfg_strength=2.0,
+        use_cuda_graphs=False,
+    )
+
+
+def test_ming_generator_zero_diff_fastpaths_default_on(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_MING_TALKER_FUSED_QKV", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH", raising=False)
+
+    generator = _make_generator()
+
+    assert generator._pack_qkv_enabled is True
+    assert generator._llm_decode_graph_enabled is True
+
+
+def test_ming_generator_zero_diff_fastpaths_can_opt_out(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MING_TALKER_FUSED_QKV", "0")
+    monkeypatch.setenv("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH", "0")
+
+    generator = _make_generator()
+
+    assert generator._pack_qkv_enabled is False
+    assert generator._llm_decode_graph_enabled is False
 
 
 class TestDiTDummyForward:
@@ -225,6 +328,9 @@ class TestCFMSampleDummy:
 
     def test_prepared_cfg_paths_match_original_cfg(self) -> None:
         cfm = CFM(_make_dit(), steps=_STEPS, sway_sampling_coef=-1.0).eval()
+        cfm.use_prepared_cfg = False
+        cfm.use_preembedded_cfg = False
+        cfm.use_precomputed_temb = False
         bsz = 2
         llm_cond = torch.randn(bsz, 1, _LLM_HIDDEN)
         lat_cond = torch.randn(bsz, _HIS_PATCH_SIZE, _LATENT_DIM)
@@ -238,10 +344,14 @@ class TestCFMSampleDummy:
             prepared = cfm.sample(llm_cond, lat_cond, y0, t, sde_args, None)
             cfm.use_prepared_cfg = False
             cfm.use_preembedded_cfg = True
+            cfm.use_precomputed_temb = False
             preembedded = cfm.sample(llm_cond, lat_cond, y0, t, sde_args, None)
+            cfm.use_precomputed_temb = True
+            precomputed_temb = cfm.sample(llm_cond, lat_cond, y0, t, sde_args, None)
 
         assert torch.equal(original, prepared)
         assert torch.equal(original, preembedded)
+        assert torch.equal(original, precomputed_temb)
 
     def test_sample_zero_cfg_reduces_to_unguided(self) -> None:
         """With cfg=0 the guidance term drops, but output shape is still valid."""

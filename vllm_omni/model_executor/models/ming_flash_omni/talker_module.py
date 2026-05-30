@@ -52,8 +52,16 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _PROFILE_RANGES_ENABLED = os.environ.get("VLLM_OMNI_MING_TALKER_PROFILE_RANGES", "").strip().lower() in _TRUE_ENV_VALUES
 
 
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
+def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in _TRUE_ENV_VALUES:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _record_function(name: str):
@@ -433,7 +441,9 @@ class DiT(nn.Module):
         else:
             self.spk_embedder = None
         self.hidden_size = hidden_size
-        self.use_precomputed_rope_trig = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG")
+        self.use_precomputed_rope_trig = _env_flag_enabled(
+            "VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG", default=True
+        )
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -596,8 +606,8 @@ class CFM(nn.Module):
         self.steps = steps
         self.sway_sampling_coef = sway_sampling_coef
         self.use_prepared_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREPARED_CFG")
-        self.use_preembedded_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREEMBED_CFG")
-        self.use_precomputed_temb = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_TEMB")
+        self.use_preembedded_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREEMBED_CFG", default=True)
+        self.use_precomputed_temb = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_TEMB", default=True)
 
     def prepare_timesteps(self, t: torch.Tensor) -> torch.Tensor:
         if self.sway_sampling_coef is None:
@@ -626,6 +636,9 @@ class CFM(nn.Module):
             sde_args: [cfg_strength, sigma, temperature]
             sde_rnd: random noise for SDE steps (steps, B, patch_size, latent_dim)
         """
+
+        if not timesteps_are_swayed:
+            t = self.prepare_timesteps(t)
 
         if self.use_preembedded_cfg:
             lat_cond_emb = self.model.x_embedder(lat_cond)
@@ -680,9 +693,6 @@ class CFM(nn.Module):
                 pred_cfg = self.model.forward_with_cfg(x, fn_t, llm_cond, lat_cond, None)
                 pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
                 return pred + (pred - null_pred) * sde_args[0]
-
-        if not timesteps_are_swayed:
-            t = self.prepare_timesteps(t)
 
         for step in range(self.steps):
             dt = t[step + 1] - t[step]
@@ -1472,9 +1482,9 @@ class MingAudioGenerator:
         # For FA2, let it see a full-length seq Q
         # trailing latent frames prepended on each decode call
         self._vae_decode_pad_frames = 32
-        self._pack_qkv_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FUSED_QKV")
+        self._pack_qkv_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FUSED_QKV", default=True)
         self._qkv_packed = False
-        self._llm_decode_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH")
+        self._llm_decode_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH", default=True)
         self._vae_stream_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_VAE_STREAM_GRAPH")
         self._llm_decode_graphs: dict[int, MingLLMDecodeGraphExecutor] = {}
         self._reusable_kv_caches: dict[tuple[int, str, torch.dtype], StaticCache] = {}
