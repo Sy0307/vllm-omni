@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +17,15 @@ from transformers.utils import is_flash_attn_2_available
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_PROFILE_RANGES_ENABLED = os.environ.get("VLLM_OMNI_MING_TALKER_PROFILE_RANGES", "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _record_function(name: str):
+    if not _PROFILE_RANGES_ENABLED:
+        return nullcontext()
+    return torch.profiler.record_function(name)
 
 
 class AudioVAEConfig(PretrainedConfig):
@@ -73,30 +85,34 @@ class ISTFT(nn.Module):
             raise ValueError("Padding must be 'center' or 'same'.")
 
         B, N, T = spec.shape
-        ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
-        ifft = ifft * self.window[None, :, None]
+        with _record_function("ming.vae.istft.irfft"):
+            ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+        with _record_function("ming.vae.istft.window_mul"):
+            ifft = ifft * self.window[None, :, None]
 
         output_size = (T - 1) * self.hop_length + self.win_length
-        y = torch.nn.functional.fold(
-            ifft,
-            output_size=(1, output_size),
-            kernel_size=(1, self.win_length),
-            stride=(1, self.hop_length),
-        )[:, 0, 0, :]
-
-        y, audio_buffer = self._buffer_process(y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming)
-
-        window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
-        window_envelope = (
-            torch.nn.functional.fold(
-                window_sq,
+        with _record_function("ming.vae.istft.fold_audio"):
+            y = torch.nn.functional.fold(
+                ifft,
                 output_size=(1, output_size),
                 kernel_size=(1, self.win_length),
                 stride=(1, self.hop_length),
+            )[:, 0, 0, :]
+
+        y, audio_buffer = self._buffer_process(y, audio_buffer, pad, last_chunk=last_chunk, streaming=streaming)
+
+        with _record_function("ming.vae.istft.window_envelope"):
+            window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
+            window_envelope = (
+                torch.nn.functional.fold(
+                    window_sq,
+                    output_size=(1, output_size),
+                    kernel_size=(1, self.win_length),
+                    stride=(1, self.hop_length),
+                )
+                .squeeze(0)
+                .squeeze(0)
             )
-            .squeeze(0)
-            .squeeze(0)
-        )
 
         window_envelope, window_buffer = self._buffer_process(
             window_envelope, window_buffer, pad, last_chunk=last_chunk, streaming=streaming
@@ -105,7 +121,8 @@ class ISTFT(nn.Module):
 
         if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             assert (window_envelope > 1e-11).all()
-        y = y / window_envelope
+        with _record_function("ming.vae.istft.normalize"):
+            y = y / window_envelope
 
         return y, audio_buffer, window_buffer
 
@@ -118,17 +135,20 @@ class ISTFTHead(nn.Module):
         self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding)
 
     def forward(self, x, audio_buffer=None, window_buffer=None, streaming=False, last_chunk=False):
-        x_pred = self.out(x)
-        x_pred = x_pred.transpose(1, 2)
-        mag, p = x_pred.chunk(2, dim=1)
-        mag = torch.exp(mag)
-        mag = torch.clip(mag, max=1e2)
-        x = torch.cos(p)
-        y = torch.sin(p)
-        S = mag * (x + 1j * y)
-        audio, audio_buffer, window_buffer = self.istft(
-            S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
-        )
+        with _record_function("ming.vae.head.linear"):
+            x_pred = self.out(x)
+        with _record_function("ming.vae.head.polar"):
+            x_pred = x_pred.transpose(1, 2)
+            mag, p = x_pred.chunk(2, dim=1)
+            mag = torch.exp(mag)
+            mag = torch.clip(mag, max=1e2)
+            x = torch.cos(p)
+            y = torch.sin(p)
+            S = mag * (x + 1j * y)
+        with _record_function("ming.vae.head.istft"):
+            audio, audio_buffer, window_buffer = self.istft(
+                S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
+            )
         return audio.unsqueeze(1), x_pred, audio_buffer, window_buffer
 
 
@@ -215,15 +235,18 @@ class Decoder(nn.Module):
     def low_level_reconstruct(self, x, past_key_values=None, use_cache=False, stream_state=None, last_chunk=False):
         upsample_state, audio_buffer, window_buffer = stream_state
         bsz, device, dtype = x.size(0), x.device, x.dtype
-        x = self.fc1(x)
+        with _record_function("ming.vae.decoder.fc1"):
+            x = self.fc1(x)
         if self.patch_size != -1:
             if use_cache:
-                x, upsample_state = self.upsampling(x, state=upsample_state, is_last=last_chunk)
+                with _record_function("ming.vae.decoder.streaming_upsample"):
+                    x, upsample_state = self.upsampling(x, state=upsample_state, is_last=last_chunk)
                 if x is None:
                     stream_state = (upsample_state, audio_buffer, window_buffer)
                     return torch.empty(bsz, 1, 0, device=device, dtype=dtype), stream_state, past_key_values
             else:
-                x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
+                with _record_function("ming.vae.decoder.full_upsample"):
+                    x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
 
         hidden_states_list = []
 
@@ -249,7 +272,8 @@ class Decoder(nn.Module):
                 past_key_values = outputs.past_key_values
                 x = x[:, fill_len:, :]
 
-        outputs = self.decoder(inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache)
+        with _record_function("ming.vae.decoder.qwen"):
+            outputs = self.decoder(inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache)
         hidden_states_list.append(outputs.last_hidden_state)
         past_key_values = outputs.past_key_values
 
@@ -258,13 +282,14 @@ class Decoder(nn.Module):
         else:
             full_hidden_state = hidden_states_list[0]
 
-        x_out, _, audio_buffer, window_buffer = self.head(
-            full_hidden_state,
-            streaming=use_cache,
-            audio_buffer=audio_buffer,
-            window_buffer=window_buffer,
-            last_chunk=last_chunk,
-        )
+        with _record_function("ming.vae.decoder.head"):
+            x_out, _, audio_buffer, window_buffer = self.head(
+                full_hidden_state,
+                streaming=use_cache,
+                audio_buffer=audio_buffer,
+                window_buffer=window_buffer,
+                last_chunk=last_chunk,
+            )
 
         stream_state = (upsample_state, audio_buffer, window_buffer)
         return x_out, stream_state, past_key_values
