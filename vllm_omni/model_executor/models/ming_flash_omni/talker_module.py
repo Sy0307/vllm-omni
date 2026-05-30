@@ -598,6 +598,7 @@ class CFM(nn.Module):
         self.use_prepared_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREPARED_CFG")
         self.use_preembedded_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREEMBED_CFG")
         self.use_precomputed_temb = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_TEMB")
+        self.use_inplace_ode_update = _env_flag_enabled("VLLM_OMNI_MING_TALKER_INPLACE_ODE_UPDATE")
 
     def prepare_timesteps(self, t: torch.Tensor) -> torch.Tensor:
         if self.sway_sampling_coef is None:
@@ -686,7 +687,12 @@ class CFM(nn.Module):
 
         for step in range(self.steps):
             dt = t[step + 1] - t[step]
-            y0 = y0 + fn(t[step], y0) * dt
+            pred = fn(t[step], y0)
+            if self.use_inplace_ode_update and sde_rnd is None:
+                pred.mul_(dt)
+                y0.add_(pred)
+            else:
+                y0 = y0 + pred * dt
             if sde_rnd is not None:
                 y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
 
