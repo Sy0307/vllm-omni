@@ -367,6 +367,7 @@ class DiT(nn.Module):
         else:
             self.spk_embedder = None
         self.hidden_size = hidden_size
+        self.use_final_layer_tail = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FINAL_LAYER_TAIL")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -454,6 +455,8 @@ class DiT(nn.Module):
 
         for block in self.blocks:
             x = block(x, None, rope)
+        if self.use_final_layer_tail:
+            return self.final_layer(x[:, -patch_len:, :])
         x = self.final_layer(x)
         return x[:, -patch_len:, :]
 
@@ -473,6 +476,8 @@ class DiT(nn.Module):
 
         for block in self.blocks:
             x = block(x, None, rope)
+        if self.use_final_layer_tail:
+            return self.final_layer(x[:, -patch_len:, :])
         x = self.final_layer(x)
         return x[:, -patch_len:, :]
 
