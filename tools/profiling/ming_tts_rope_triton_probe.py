@@ -44,8 +44,9 @@ def _rope_kernel(
     h = tmp % heads
     b = tmp // heads
 
-    pair_d = tl.where(d % 2 == 0, d + 1, d - 1)
-    sign = tl.where(d % 2 == 0, -1.0, 1.0)
+    half = dim // 2
+    pair_d = tl.where(d < half, d + half, d - half)
+    sign = tl.where(d < half, -1.0, 1.0)
 
     x0 = tl.load(x + b * stride_b + h * stride_h + s * stride_s + d * stride_d, mask=mask, other=0.0)
     x1 = tl.load(x + b * stride_b + h * stride_h + s * stride_s + pair_d * stride_d, mask=mask, other=0.0)
