@@ -22,6 +22,7 @@
 # --------------------------------------------------------
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import cached_property
 from queue import Queue
@@ -48,10 +49,17 @@ from .audio_vae import AudioVAE
 logger = init_logger(__name__)
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_PROFILE_RANGES_ENABLED = os.environ.get("VLLM_OMNI_MING_TALKER_PROFILE_RANGES", "").strip().lower() in _TRUE_ENV_VALUES
 
 
 def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _record_function(name: str):
+    if not _PROFILE_RANGES_ENABLED:
+        return nullcontext()
+    return torch.profiler.record_function(name)
 
 
 ########################################################################
@@ -150,7 +158,12 @@ class FeedForward(nn.Module):
         self.ff = nn.Sequential(project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ff(x)
+        with _record_function("ming.feed_forward.in_proj_gelu"):
+            x = self.ff[0](x)
+        with _record_function("ming.feed_forward.dropout"):
+            x = self.ff[1](x)
+        with _record_function("ming.feed_forward.out_proj"):
+            return self.ff[2](x)
 
 
 class Attention(nn.Module):
@@ -216,12 +229,13 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         batch_size = x.shape[0]
 
-        if self.to_qkv is None:
-            query = self.to_q(x)
-            key = self.to_k(x)
-            value = self.to_v(x)
-        else:
-            query, key, value = self.to_qkv(x).chunk(3, dim=-1)
+        with _record_function("ming.attn.qkv_proj"):
+            if self.to_qkv is None:
+                query = self.to_q(x)
+                key = self.to_k(x)
+                value = self.to_v(x)
+            else:
+                query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
@@ -229,22 +243,26 @@ class Attention(nn.Module):
         key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
-        if self.q_norm is not None:
-            query = self.q_norm(query)
-        if self.k_norm is not None:
-            key = self.k_norm(key)
+        with _record_function("ming.attn.qk_norm"):
+            if self.q_norm is not None:
+                query = self.q_norm(query)
+            if self.k_norm is not None:
+                key = self.k_norm(key)
 
-        if rope is not None:
-            freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+        with _record_function("ming.attn.rope"):
+            if rope is not None:
+                freqs, xpos_scale = rope
+                q_xpos_scale, k_xpos_scale = (
+                    (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+                )
 
-            if self.pe_attn_head is not None:
-                on = self.pe_attn_head
-                query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
-                key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
-            else:
-                query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-                key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+                if self.pe_attn_head is not None:
+                    on = self.pe_attn_head
+                    query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
+                    key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
+                else:
+                    query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+                    key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
         if self.attn_mask_enabled and mask is not None:
             valid_sample_indices = mask.any(dim=1)
@@ -259,7 +277,8 @@ class Attention(nn.Module):
         else:
             attn_mask = None
 
-        x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        with _record_function("ming.attn.sdpa"):
+            x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         if self.attn_mask_enabled and mask is not None:
             final_output[valid_sample_indices] = x
             x = final_output
@@ -267,8 +286,9 @@ class Attention(nn.Module):
         x = x.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
         x = x.to(query.dtype)
 
-        x = self.to_out[0](x)
-        x = self.to_out[1](x)
+        with _record_function("ming.attn.out_proj"):
+            x = self.to_out[0](x)
+            x = self.to_out[1](x)
 
         if mask is not None:
             mask = mask.unsqueeze(-1)
@@ -311,8 +331,14 @@ class DiTBlock(nn.Module):
         mask: torch.Tensor | None,
         rope: tuple[torch.Tensor, torch.Tensor | None] | None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), mask=mask, rope=rope)
-        x = x + self.mlp(self.norm2(x))
+        with _record_function("ming.dit_block.norm1"):
+            normed = self.norm1(x)
+        with _record_function("ming.dit_block.attn"):
+            x = x + self.attn(normed, mask=mask, rope=rope)
+        with _record_function("ming.dit_block.norm2"):
+            normed = self.norm2(x)
+        with _record_function("ming.dit_block.mlp"):
+            x = x + self.mlp(normed)
         return x
 
 
@@ -325,8 +351,10 @@ class FinalLayer(nn.Module):
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm_final(x)
-        x = self.linear(x)
+        with _record_function("ming.final_layer.norm"):
+            x = self.norm_final(x)
+        with _record_function("ming.final_layer.linear"):
+            x = self.linear(x)
         return x
 
 

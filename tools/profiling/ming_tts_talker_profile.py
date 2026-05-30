@@ -225,6 +225,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--vae-decode-mode", choices=("stream", "full"), default="stream")
+    parser.add_argument("--disable-cfm-graph", action="store_true")
     args = parser.parse_args()
 
     dtype = torch.bfloat16
@@ -233,6 +234,8 @@ def main() -> None:
 
     print("loading model...")
     talker_cfg, llm_config, model, _audio_vae, generator = load_talker(args.model_path, args.device, dtype)
+    if args.disable_cfm_graph:
+        generator._use_cuda_graphs = False
     inputs = build_inputs(model, args.model_path, args.batch_size, args.device, dtype)
     print(
         json.dumps(
