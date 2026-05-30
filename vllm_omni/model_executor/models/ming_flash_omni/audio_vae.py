@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from threading import Lock
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,10 @@ logger = init_logger(__name__)
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 _PROFILE_RANGES_ENABLED = os.environ.get("VLLM_OMNI_MING_TALKER_PROFILE_RANGES", "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
 
 
 def _record_function(name: str):
@@ -209,6 +214,52 @@ class StreamingLinearUpsample(nn.Module):
         return final_out, state
 
 
+class QwenDecoderGraphExecutor:
+    """CUDA graph executor for one stateless AudioVAE Qwen decoder shape."""
+
+    def __init__(self, decoder: Qwen2Model) -> None:
+        self.decoder = decoder
+        self.initialized = False
+        self.input_placeholder: torch.Tensor | None = None
+        self.hidden_placeholder: torch.Tensor | None = None
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.lock = Lock()
+
+    def execute(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        with self.lock:
+            if not self.initialized:
+                self._initialize_graph(inputs_embeds)
+
+            assert self.input_placeholder is not None
+            assert self.hidden_placeholder is not None
+            assert self.graph is not None
+            self.input_placeholder.copy_(inputs_embeds)
+            self.graph.replay()
+            hidden_states = torch.empty_like(self.hidden_placeholder)
+            hidden_states.copy_(self.hidden_placeholder)
+            return hidden_states
+
+    def _initialize_graph(self, inputs_embeds: torch.Tensor) -> None:
+        device = inputs_embeds.device
+        self.input_placeholder = torch.empty_like(inputs_embeds)
+        self.input_placeholder.copy_(inputs_embeds)
+        self.graph = torch.cuda.CUDAGraph()
+
+        graph_stream = torch.cuda.Stream(device=device)
+        graph_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.no_grad(), torch.cuda.stream(graph_stream):
+            for _ in range(3):
+                self.decoder(inputs_embeds=self.input_placeholder, use_cache=False)
+        torch.cuda.current_stream(device).wait_stream(graph_stream)
+        torch.accelerator.synchronize(device)
+
+        with torch.no_grad(), torch.cuda.graph(self.graph):
+            outputs = self.decoder(inputs_embeds=self.input_placeholder, use_cache=False)
+            self.hidden_placeholder = outputs.last_hidden_state
+        torch.accelerator.synchronize(device)
+        self.initialized = True
+
+
 class Decoder(nn.Module):
     def __init__(self, decoder_args, output_dim=320, latent_dim=64, patch_size=-1):
         super().__init__()
@@ -231,6 +282,33 @@ class Decoder(nn.Module):
         self.patch_size = patch_size
         if self.patch_size != -1:
             self.upsampling = StreamingLinearUpsample(scale_factor=patch_size)
+        self._qwen_decode_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_VAE_QWEN_GRAPH")
+        self._qwen_decode_graphs: dict[tuple[tuple[int, ...], torch.device, torch.dtype], QwenDecoderGraphExecutor] = {}
+        self._qwen_decode_graphs_lock = Lock()
+
+    def _can_use_qwen_decode_graph(
+        self,
+        x: torch.Tensor,
+        past_key_values,
+        use_cache: bool,
+    ) -> bool:
+        return (
+            self._qwen_decode_graph_enabled
+            and not self.training
+            and not use_cache
+            and past_key_values is None
+            and x.device.type == "cuda"
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _execute_qwen_decode_graph(self, x: torch.Tensor) -> torch.Tensor:
+        key = (tuple(x.shape), x.device, x.dtype)
+        with self._qwen_decode_graphs_lock:
+            executor = self._qwen_decode_graphs.get(key)
+            if executor is None:
+                executor = QwenDecoderGraphExecutor(self.decoder)
+                self._qwen_decode_graphs[key] = executor
+        return executor.execute(x)
 
     def low_level_reconstruct(self, x, past_key_values=None, use_cache=False, stream_state=None, last_chunk=False):
         upsample_state, audio_buffer, window_buffer = stream_state
@@ -273,9 +351,13 @@ class Decoder(nn.Module):
                 x = x[:, fill_len:, :]
 
         with _record_function("ming.vae.decoder.qwen"):
-            outputs = self.decoder(inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache)
-        hidden_states_list.append(outputs.last_hidden_state)
-        past_key_values = outputs.past_key_values
+            if self._can_use_qwen_decode_graph(x, past_key_values, use_cache):
+                hidden_states_list.append(self._execute_qwen_decode_graph(x))
+                past_key_values = None
+            else:
+                outputs = self.decoder(inputs_embeds=x, past_key_values=past_key_values, use_cache=use_cache)
+                hidden_states_list.append(outputs.last_hidden_state)
+                past_key_values = outputs.past_key_values
 
         if len(hidden_states_list) > 1:
             full_hidden_state = torch.cat(hidden_states_list, dim=1)

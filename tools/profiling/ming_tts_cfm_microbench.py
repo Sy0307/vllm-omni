@@ -664,6 +664,95 @@ def run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
     }
 
 
+def run_vae_qwen_graph_compare(generator, inputs, args, llm_config, talker_cfg) -> dict:
+    generator._pack_qkv_enabled = True
+    generator._qkv_packed = False
+    generator._cfm.use_preembedded_cfg = True
+    generator._sampler_pools.clear()
+
+    torch.manual_seed(1234)
+    latents_by_request, ar_timers = _run(generator, inputs[:1], args, force_original=False)
+    latents = latents_by_request[0]
+    sr = int(generator._audio_vae.config.sample_rate)
+    vae_decoder = generator._audio_vae.decoder
+    original_enabled = vae_decoder._qwen_decode_graph_enabled
+
+    try:
+        with torch.no_grad():
+            generator._vae_stream_graph_enabled = False
+            vae_decoder._qwen_decode_graph_enabled = False
+            vae_decoder._qwen_decode_graphs.clear()
+            baseline_wav = generator.decode_to_waveform(latents, stream_decode=True)
+
+            vae_decoder._qwen_decode_graph_enabled = True
+            vae_decoder._qwen_decode_graphs.clear()
+            graph_wav = generator.decode_to_waveform(latents, stream_decode=True)
+
+        samples = {
+            "stream_decode_ms": [],
+            "qwen_graph_stream_decode_ms": [],
+        }
+        graph_shapes: list[str] = []
+        for _idx in range(args.repeats):
+            vae_decoder._qwen_decode_graph_enabled = False
+            vae_decoder._qwen_decode_graphs.clear()
+            torch.cuda.synchronize(args.device)
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                generator.decode_to_waveform(latents, stream_decode=True)
+            torch.cuda.synchronize(args.device)
+            t1 = time.perf_counter()
+
+            vae_decoder._qwen_decode_graph_enabled = True
+            vae_decoder._qwen_decode_graphs.clear()
+            with torch.no_grad():
+                generator.decode_to_waveform(latents, stream_decode=True)
+            torch.cuda.synchronize(args.device)
+            t2 = time.perf_counter()
+
+            samples["stream_decode_ms"].append((t1 - t0) * 1000.0)
+            samples["qwen_graph_stream_decode_ms"].append((t2 - t1) * 1000.0)
+            graph_shapes = [str(key[0]) for key in vae_decoder._qwen_decode_graphs]
+    finally:
+        vae_decoder._qwen_decode_graph_enabled = original_enabled
+        vae_decoder._qwen_decode_graphs.clear()
+        generator._vae_stream_graph_enabled = False
+
+    return {
+        "mode": "vae_qwen_graph_compare",
+        "model": {
+            "llm_layers": llm_config.num_hidden_layers,
+            "llm_hidden": llm_config.hidden_size,
+            "cfm_steps": talker_cfg["steps"],
+            "dit_depth": talker_cfg["flowmodel"]["depth"],
+            "aggregator_depth": talker_cfg["aggregator"]["depth"],
+            "sample_rate": sr,
+        },
+        "workload": {
+            "batch_size": 1,
+            "input_tokens": inputs.shape[1],
+            "profile_steps": len(latents),
+            "latent_frames": int(sum(lat.shape[1] for lat in latents)),
+            "repeats": args.repeats,
+        },
+        "ar_timers": ar_timers,
+        "audio": {
+            "baseline_seconds": float(baseline_wav.shape[-1]) / sr,
+            "qwen_graph_seconds": float(graph_wav.shape[-1]) / sr,
+            "stream_vs_qwen_graph": _waveform_diff(baseline_wav, graph_wav),
+        },
+        "graph_shapes": graph_shapes,
+        "timers": {
+            name: {
+                "mean": _mean(values),
+                "stdev": _stdev(values),
+                "samples": values,
+            }
+            for name, values in samples.items()
+        },
+    }
+
+
 def run_fused_qkv_compare(generator, inputs, args, llm_config, talker_cfg) -> dict:
     generator._pack_qkv_enabled = False
     generator._qkv_packed = False
@@ -883,6 +972,7 @@ def main() -> None:
     parser.add_argument("--compare-llm-decode-graph", action="store_true")
     parser.add_argument("--compare-llm-decode-graph-ar", action="store_true")
     parser.add_argument("--compare-vae-stream-full", action="store_true")
+    parser.add_argument("--compare-vae-qwen-graph", action="store_true")
     parser.add_argument("--compare-rope-trig", action="store_true")
     args = parser.parse_args()
 
@@ -940,6 +1030,14 @@ def main() -> None:
 
     if args.compare_vae_stream_full:
         summary = run_vae_stream_full_compare(generator, inputs, args, llm_config, talker_cfg)
+        text = json.dumps(summary, indent=2, sort_keys=True)
+        if args.output:
+            Path(args.output).write_text(text)
+        print(text)
+        return
+
+    if args.compare_vae_qwen_graph:
+        summary = run_vae_qwen_graph_compare(generator, inputs, args, llm_config, talker_cfg)
         text = json.dumps(summary, indent=2, sort_keys=True)
         if args.output:
             Path(args.output).write_text(text)
