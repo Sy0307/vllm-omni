@@ -1105,6 +1105,7 @@ class Aggregator(nn.Module):
         self.word_embedder = nn.Embedding(1, hidden_size)
         self.x_embedder = nn.Linear(in_channels, hidden_size)
         self.hidden_size = hidden_size
+        self.use_precomputed_rope_trig = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_ROPE_TRIG")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -1113,12 +1114,23 @@ class Aggregator(nn.Module):
         )
         self.final_layer = FinalLayer(hidden_size, llm_input_dim)
 
+    def _maybe_precompute_rope_trig(
+        self, rope: tuple[torch.Tensor, torch.Tensor | None]
+    ) -> tuple[torch.Tensor, ...]:
+        if not self.use_precomputed_rope_trig:
+            return rope
+        freqs, xpos_scale = rope
+        q_xpos_scale, k_xpos_scale = (
+            (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+        )
+        return freqs.cos(), freqs.sin(), q_xpos_scale, k_xpos_scale
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.x_embedder(x)
         cls_embed = self.word_embedder(torch.zeros((x.shape[0], 1), dtype=torch.long, device=x.device))
         x = torch.cat([cls_embed, x], dim=1)
 
-        rope = self.rotary_embed.forward_from_seq_len(x.shape[1])
+        rope = self._maybe_precompute_rope_trig(self.rotary_embed.forward_from_seq_len(x.shape[1]))
         if mask is not None:
             mask_pad = mask.clone().detach()[:, :1]
             mask = torch.cat([mask_pad, mask], dim=-1)
