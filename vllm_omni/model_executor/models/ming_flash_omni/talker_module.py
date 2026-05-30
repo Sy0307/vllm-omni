@@ -1419,6 +1419,7 @@ class MingAudioGenerator:
         self._pack_qkv_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FUSED_QKV")
         self._qkv_packed = False
         self._llm_decode_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH")
+        self._vae_stream_cache_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_VAE_STREAM_CACHE")
         self._llm_decode_graphs: dict[int, MingLLMDecodeGraphExecutor] = {}
         self._reusable_kv_caches: dict[tuple[int, str, torch.dtype], StaticCache] = {}
         self._reusable_kv_cache_lock = Lock()
@@ -1708,6 +1709,8 @@ class MingAudioGenerator:
             raise RuntimeError("AudioVAE not loaded. Cannot decode audio latents to waveform.")
 
         if stream_decode:
+            if self._vae_stream_cache_enabled:
+                return self._stream_decode_with_cache(latents)
             return self._stream_decode(latents)
 
         all_lat = torch.cat(latents, dim=1)
@@ -1855,6 +1858,38 @@ class MingAudioGenerator:
         raise NotImplementedError(f"his_patch_size ({self.his_patch_size}) < patch_size ({self.patch_size})")
 
     # VAE streaming decode
+    def _stream_decode_with_cache(self, latents: list[torch.Tensor]) -> torch.Tensor:
+        sr = int(self._audio_vae.config.sample_rate)
+        past_key_values = None
+        stream_state: tuple | None = (None, None, None)
+        sil_cache: dict | None = None
+        wav_chunks: list[torch.Tensor] = []
+
+        for i, lat in enumerate(latents):
+            last_chunk = i == (len(latents) - 1)
+            speech, stream_state, past_key_values = self._audio_vae.decode(
+                lat,
+                past_key_values=past_key_values,
+                use_cache=True,
+                stream_state=stream_state,
+                last_chunk=last_chunk,
+            )
+            speech_chunk = speech[0].detach().float()
+            speech_chunk, sil_cache = silence_holder(
+                speech_chunk,
+                sr,
+                sil_cache=sil_cache,
+                last_chunk=last_chunk,
+            )
+            if speech_chunk.numel() > 0:
+                wav_chunks.append(speech_chunk)
+
+        if not wav_chunks:
+            device = next(self._model.parameters()).device
+            dtype = next(self._model.parameters()).dtype
+            return torch.zeros((1, 1, 0), device=device, dtype=dtype)
+        return torch.cat(wav_chunks, dim=-1).unsqueeze(0)
+
     def _stream_decode(self, latents: list[torch.Tensor]) -> torch.Tensor:
         sr = int(self._audio_vae.config.sample_rate)
         decode_pad: torch.Tensor | None = None
