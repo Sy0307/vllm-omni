@@ -103,7 +103,8 @@ class ISTFT(nn.Module):
         )
         window_envelope = window_envelope.squeeze()
 
-        assert (window_envelope > 1e-11).all()
+        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+            assert (window_envelope > 1e-11).all()
         y = y / window_envelope
 
         return y, audio_buffer, window_buffer

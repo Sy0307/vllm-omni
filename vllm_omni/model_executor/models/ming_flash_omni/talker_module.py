@@ -890,15 +890,32 @@ class VAEStreamDecodeGraphExecutor:
         return waveform
 
     def _initialize_graph(self, latent: torch.Tensor) -> None:
+        device = latent.device
         self.latent_placeholder = torch.empty_like(latent)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        self.latent_placeholder.copy_(latent)
+
+        graph_stream = torch.cuda.Stream(device=device)
+        graph_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.no_grad(), torch.cuda.stream(graph_stream):
+            for _ in range(3):
+                self.audio_vae.decode(
+                    self.latent_placeholder,
+                    use_cache=False,
+                    stream_state=(None, None, None),
+                    last_chunk=True,
+                )
+        torch.cuda.current_stream(device).wait_stream(graph_stream)
+        torch.cuda.synchronize(device)
+
+        with torch.no_grad(), torch.cuda.graph(self.graph):
             self.waveform_placeholder, _, _ = self.audio_vae.decode(
                 self.latent_placeholder,
                 use_cache=False,
                 stream_state=(None, None, None),
                 last_chunk=True,
             )
+        torch.cuda.synchronize(device)
         self.initialized = True
 
 
