@@ -1108,6 +1108,7 @@ class Aggregator(nn.Module):
         self.word_embedder = nn.Embedding(1, hidden_size)
         self.x_embedder = nn.Linear(in_channels, hidden_size)
         self.hidden_size = hidden_size
+        self.use_cls_embed_fastpath = _env_flag_enabled("VLLM_OMNI_MING_TALKER_AGG_CLS_FASTPATH")
 
         self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
 
@@ -1118,7 +1119,10 @@ class Aggregator(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.x_embedder(x)
-        cls_embed = self.word_embedder(torch.zeros((x.shape[0], 1), dtype=torch.long, device=x.device))
+        if self.use_cls_embed_fastpath:
+            cls_embed = self.word_embedder.weight[:1].unsqueeze(0).expand(x.shape[0], -1, -1)
+        else:
+            cls_embed = self.word_embedder(torch.zeros((x.shape[0], 1), dtype=torch.long, device=x.device))
         x = torch.cat([cls_embed, x], dim=1)
 
         rope = self.rotary_embed.forward_from_seq_len(x.shape[1])
