@@ -533,11 +533,15 @@ def run_llm_decode_graph_ar_compare(generator, inputs, args, llm_config, talker_
         "static_cache": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
         "llm_decode_graph": {"llm_decode_ms": [], "cfm_step_ms": [], "collect_ms": []},
     }
+    torch.manual_seed(0)
+    generator._llm_decode_graph_enabled = True
+    generator._llm_decode_graphs.clear()
+    _run(generator, inputs, args, force_original=False)
+
     for idx in range(args.repeats):
         for name, enabled in (("static_cache", False), ("llm_decode_graph", True)):
             torch.manual_seed(1000 + idx)
             generator._llm_decode_graph_enabled = enabled
-            generator._llm_decode_graphs.clear()
             _latents, timers = _run(generator, inputs, args, force_original=False)
             for key in samples[name]:
                 samples[name][key].append(float(timers[key]))
