@@ -192,6 +192,22 @@ def decode_first(
     return elapsed * 1000.0, audio_s
 
 
+def warm_vae_qwen_decode_graph(generator: MingAudioGenerator, steps: int, device: str) -> bool:
+    decoder = generator._audio_vae.decoder if generator._audio_vae is not None else None
+    if decoder is None or not getattr(decoder, "_qwen_decode_graph_enabled", False):
+        return False
+
+    dtype = next(generator._model.parameters()).dtype
+    latents = [
+        torch.zeros(1, generator.patch_size, generator.latent_dim, device=device, dtype=dtype)
+        for _ in range(steps)
+    ]
+    with torch.no_grad():
+        generator.decode_to_waveform(latents, stream_decode=True)
+    _sync(device)
+    return True
+
+
 def static_cache_semantics_probe(generator: MingAudioGenerator, inputs_embeds: torch.Tensor, device: str) -> dict[str, float]:
     """Compare static-cache decode to the current no-cache mode.
 
@@ -256,6 +272,7 @@ def main() -> None:
     # Warm graph captures for B=1 and the requested batch, outside profiler.
     run_ar_profile(generator, inputs[:1], max_steps=2, use_static_cache=True, device=args.device)
     run_ar_profile(generator, inputs, max_steps=2, use_static_cache=True, device=args.device)
+    vae_qwen_graph_warmed = warm_vae_qwen_decode_graph(generator, args.steps, args.device)
     _sync(args.device)
 
     with profile(
@@ -292,6 +309,7 @@ def main() -> None:
         "vae_decode_mode": args.vae_decode_mode,
         "input_tokens": inputs.shape[1],
         "timers": timers,
+        "vae_qwen_graph_warmed": vae_qwen_graph_warmed,
         "vae_decode_one_request_ms": vae_ms,
         "audio_s_first_request": audio_s,
         "kv_probe": kv_probe,
