@@ -692,10 +692,9 @@ def run_vae_qwen_graph_compare(generator, inputs, args, llm_config, talker_cfg) 
             "stream_decode_ms": [],
             "qwen_graph_stream_decode_ms": [],
         }
-        graph_shapes: list[str] = []
+        graph_shapes = [str(key[0]) for key in vae_decoder._qwen_decode_graphs]
         for _idx in range(args.repeats):
             vae_decoder._qwen_decode_graph_enabled = False
-            vae_decoder._qwen_decode_graphs.clear()
             torch.cuda.synchronize(args.device)
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -704,7 +703,6 @@ def run_vae_qwen_graph_compare(generator, inputs, args, llm_config, talker_cfg) 
             t1 = time.perf_counter()
 
             vae_decoder._qwen_decode_graph_enabled = True
-            vae_decoder._qwen_decode_graphs.clear()
             with torch.no_grad():
                 generator.decode_to_waveform(latents, stream_decode=True)
             torch.cuda.synchronize(args.device)
@@ -712,7 +710,6 @@ def run_vae_qwen_graph_compare(generator, inputs, args, llm_config, talker_cfg) 
 
             samples["stream_decode_ms"].append((t1 - t0) * 1000.0)
             samples["qwen_graph_stream_decode_ms"].append((t2 - t1) * 1000.0)
-            graph_shapes = [str(key[0]) for key in vae_decoder._qwen_decode_graphs]
     finally:
         vae_decoder._qwen_decode_graph_enabled = original_enabled
         vae_decoder._qwen_decode_graphs.clear()
