@@ -550,10 +550,15 @@ class CFM(nn.Module):
         """
 
         if self.use_preembedded_cfg:
-            cfg_lat_cond = torch.cat([lat_cond, lat_cond], dim=0)
-            cfg_llm_cond = torch.cat([llm_cond, torch.zeros_like(llm_cond)], dim=0)
-            cfg_lat_cond_emb = self.model.x_embedder(cfg_lat_cond)
-            cfg_llm_cond_emb = self.model.c_embedder(cfg_llm_cond)
+            lat_cond_emb = self.model.x_embedder(lat_cond)
+            cfg_lat_cond_emb = torch.cat([lat_cond_emb, lat_cond_emb], dim=0)
+            llm_cond_emb = self.model.c_embedder(llm_cond)
+            null_cond_bias = self.model.c_embedder.cond_embedder.bias
+            if null_cond_bias is None:
+                null_llm_cond_emb = self.model.c_embedder(torch.zeros_like(llm_cond))
+            else:
+                null_llm_cond_emb = null_cond_bias.view(1, 1, -1).expand_as(llm_cond_emb)
+            cfg_llm_cond_emb = torch.cat([llm_cond_emb, null_llm_cond_emb], dim=0)
             rope = self.model.rotary_embed.forward_from_seq_len(1 + cfg_lat_cond_emb.shape[1] + y0.shape[1])
             if self.use_precomputed_temb:
                 t_emb = self.model.t_embedder(t[:-1]).unsqueeze(1)
