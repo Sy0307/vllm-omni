@@ -11,6 +11,9 @@ from vllm_omni.model_executor.models.ming_flash_omni.talker_module import (
     Aggregator,
     CFMGraphExecutor,
     CFMGraphExecutorPool,
+    MingAudioGenerator,
+    MingTalkerBatchPolicy,
+    MingTalkerSlotTable,
     DiT,
 )
 
@@ -144,3 +147,308 @@ class TestCFMGraphExecutorPool:
         assert inputs_embeds.shape == (1, 1, _LLM_HIDDEN)
         assert stop_out.shape == (1, 2)
         assert pool.pool.qsize() == 2
+
+
+class TestMingAudioGeneratorBatch:
+    def test_generate_latents_batch_returns_one_latent_list_per_request(self) -> None:
+        config, cfm, aggregator, stop_head, device = _build_pipeline()
+        class TinyLLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty((), device=device, dtype=_DTYPE))
+
+            def forward(self, *, inputs_embeds, **kwargs):
+                return SimpleNamespace(last_hidden_state=inputs_embeds)
+
+        generator = MingAudioGenerator(
+            config=config,
+            llm_config=SimpleNamespace(num_hidden_layers=1, num_attention_heads=1, hidden_size=_LLM_HIDDEN, num_key_value_heads=1),
+            model=TinyLLM(),
+            cfm=cfm,
+            aggregator=aggregator,
+            stop_head=stop_head,
+            audio_vae=None,
+            patch_size=_PATCH_SIZE,
+            his_patch_size=_HIS_PATCH_SIZE,
+            latent_dim=_LATENT_DIM,
+            cfg_strength=2.0,
+            use_cuda_graphs=True,
+        )
+
+        single = torch.randn(1, 3, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        single_latents = generator.generate_latents_batch(single, max_steps=2, use_static_cache=False)
+        torch.accelerator.synchronize()
+        assert len(single_latents) == 1
+
+        inputs_embeds = torch.randn(2, 3, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        latents = generator.generate_latents_batch(inputs_embeds, max_steps=2, use_static_cache=False)
+        torch.accelerator.synchronize()
+
+        assert len(latents) == 2
+        assert all(len(item) == 2 for item in latents)
+        assert all(lat.shape == (1, _PATCH_SIZE, _LATENT_DIM) for item in latents for lat in item)
+
+
+
+    def test_generate_latents_batch_compacts_finished_rows(self) -> None:
+        config, cfm, aggregator, stop_head, device = _build_pipeline()
+
+        class TinyLLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty((), device=device, dtype=_DTYPE))
+
+            def forward(self, *, inputs_embeds, **kwargs):
+                return SimpleNamespace(last_hidden_state=inputs_embeds)
+
+        class StopAfterFirst(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, x):
+                out = torch.zeros(x.shape[0], 2, device=x.device, dtype=x.dtype)
+                out[:, 0] = 1.0
+                if self.calls == 0:
+                    out[0, 1] = 2.0
+                self.calls += 1
+                return out
+
+        generator = MingAudioGenerator(
+            config=config,
+            llm_config=SimpleNamespace(num_hidden_layers=1, num_attention_heads=1, hidden_size=_LLM_HIDDEN, num_key_value_heads=1),
+            model=TinyLLM(),
+            cfm=cfm,
+            aggregator=aggregator,
+            stop_head=StopAfterFirst(),
+            audio_vae=None,
+            patch_size=_PATCH_SIZE,
+            his_patch_size=_HIS_PATCH_SIZE,
+            latent_dim=_LATENT_DIM,
+            cfg_strength=2.0,
+            use_cuda_graphs=False,
+        )
+
+        inputs_embeds = torch.randn(2, 3, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        latents = generator.generate_latents_batch(
+            inputs_embeds, max_steps=3, min_new_token=-1, use_static_cache=False
+        )
+        torch.accelerator.synchronize()
+
+        assert len(latents[0]) == 1
+        assert len(latents[1]) == 3
+
+
+
+    def test_generate_latents_batch_compacts_finished_rows_with_static_cache(self, monkeypatch) -> None:
+        config, cfm, aggregator, stop_head, device = _build_pipeline()
+
+        class TinyCache:
+            def __init__(self):
+                self.selected = []
+            def get_seq_length(self):
+                return 3
+            def batch_select_indices(self, indices):
+                self.selected.append(indices.detach().cpu().tolist())
+
+        class TinyLLM(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty((), device=device, dtype=_DTYPE))
+            def forward(self, *, inputs_embeds, **kwargs):
+                return SimpleNamespace(last_hidden_state=inputs_embeds)
+
+        class StopAfterFirst(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+            def forward(self, x):
+                out = torch.zeros(x.shape[0], 2, device=x.device, dtype=x.dtype)
+                out[:, 0] = 1.0
+                if self.calls == 0:
+                    out[0, 1] = 2.0
+                self.calls += 1
+                return out
+
+        generator = MingAudioGenerator(
+            config=config,
+            llm_config=SimpleNamespace(num_hidden_layers=1, num_attention_heads=1, hidden_size=_LLM_HIDDEN, num_key_value_heads=1),
+            model=TinyLLM(),
+            cfm=cfm,
+            aggregator=aggregator,
+            stop_head=StopAfterFirst(),
+            audio_vae=None,
+            patch_size=_PATCH_SIZE,
+            his_patch_size=_HIS_PATCH_SIZE,
+            latent_dim=_LATENT_DIM,
+            cfg_strength=2.0,
+            use_cuda_graphs=False,
+        )
+        cache = TinyCache()
+        monkeypatch.setattr(generator, "_init_batched_kv_cache", lambda *args, **kwargs: (cache, 2048))
+
+        inputs_embeds = torch.randn(2, 3, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        latents = generator.generate_latents_batch(
+            inputs_embeds, max_steps=3, min_new_token=-1, use_static_cache=True
+        )
+        torch.accelerator.synchronize()
+
+        assert len(latents[0]) == 1
+        assert len(latents[1]) == 3
+        assert cache.selected == [[1]]
+
+
+class TestMingTalkerBatchPolicy:
+    def test_policy_dispatches_on_full_batch_or_wait_budget(self) -> None:
+        policy = MingTalkerBatchPolicy(max_batch_size=8, max_wait_ms=20.0)
+
+        assert policy.should_dispatch(0, 100.0) is False
+        assert policy.should_dispatch(4, 5.0) is False
+        assert policy.should_dispatch(8, 0.0) is True
+        assert policy.should_dispatch(2, 20.0) is True
+
+    def test_policy_chooses_bucket_without_exceeding_max_batch(self) -> None:
+        policy = MingTalkerBatchPolicy(max_batch_size=8, bucket_sizes=(1, 2, 4, 8, 16))
+
+        assert policy.choose_bucket(0) == 0
+        assert policy.choose_bucket(1) == 1
+        assert policy.choose_bucket(3) == 4
+        assert policy.choose_bucket(9) == 8
+
+
+class TestMingTalkerSlotTable:
+    def test_slot_table_allocates_reuses_and_frees_slots(self) -> None:
+        table = MingTalkerSlotTable(max_slots=2)
+
+        first = table.allocate("r1")
+        assert table.allocate("r1") == first
+        second = table.allocate("r2")
+        assert {first, second} == {0, 1}
+
+        table.free("r1")
+        reused = table.allocate("r3")
+
+        assert reused == first
+        assert set(table.active_request_ids()) == {"r2", "r3"}
+
+    def test_slot_table_reports_compact_active_indices(self) -> None:
+        table = MingTalkerSlotTable(max_slots=4)
+        table.allocate("r1")
+        table.allocate("r2")
+        table.allocate("r3")
+        table.free("r2")
+
+        assert table.active_request_ids() == ["r1", "r3"]
+        assert table.active_slots() == [0, 2]
+
+
+class TestMingTalkerBatchCompatibility:
+    def test_can_batch_additional_info_rejects_mismatched_params(self) -> None:
+        from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+            MingFlashOmniTalkerForConditionalGeneration,
+        )
+
+        talker = object.__new__(MingFlashOmniTalkerForConditionalGeneration)
+        compatible = [{"text": "a", "max_decode_steps": 10}, {"text": "b", "max_decode_steps": 10}]
+        incompatible = [{"text": "a", "max_decode_steps": 10}, {"text": "b", "max_decode_steps": 11}]
+
+        assert talker._can_batch_additional_info(compatible) is True
+        assert talker._can_batch_additional_info(incompatible) is False
+
+
+def test_ming_inner_cfm_graph_env_overrides_enforce_eager(monkeypatch):
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        _resolve_inner_cfm_graph_enabled,
+    )
+
+    monkeypatch.setenv("VLLM_OMNI_MING_TALKER_CFM_GRAPH", "1")
+
+    assert _resolve_inner_cfm_graph_enabled(enforce_eager=True) is True
+
+
+def test_ming_inner_cfm_graph_defaults_to_not_enforce_eager(monkeypatch):
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        _resolve_inner_cfm_graph_enabled,
+    )
+
+    monkeypatch.delenv("VLLM_OMNI_MING_TALKER_CFM_GRAPH", raising=False)
+
+    assert _resolve_inner_cfm_graph_enabled(enforce_eager=True) is False
+    assert _resolve_inner_cfm_graph_enabled(enforce_eager=False) is True
+
+
+def test_ming_full_vae_decode_env_changes_default_stream_decode(monkeypatch):
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        MingFlashOmniTalkerForConditionalGeneration,
+    )
+
+    talker = object.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.cfg_strength = 2.0
+    monkeypatch.setenv("VLLM_OMNI_MING_TTS_FULL_VAE_DECODE", "1")
+
+    params = talker._resolve_generation_params({})
+
+    assert params.stream_decode is False
+
+
+def test_ming_explicit_stream_decode_overrides_full_vae_decode_env(monkeypatch):
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        MingFlashOmniTalkerForConditionalGeneration,
+    )
+
+    talker = object.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.cfg_strength = 2.0
+    monkeypatch.setenv("VLLM_OMNI_MING_TTS_FULL_VAE_DECODE", "1")
+
+    params = talker._resolve_generation_params({"stream_decode": True})
+
+    assert params.stream_decode is True
+
+
+
+def test_decode_batch_latents_transfers_batched_waveform_to_cpu_once():
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        MingFlashOmniTalkerForConditionalGeneration,
+    )
+
+    class FakeWaveform:
+        def __init__(self, tensor, counter):
+            self.tensor = tensor
+            self.counter = counter
+            self.shape = tensor.shape
+
+        def detach(self):
+            return self
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            self.counter["cpu"] += 1
+            return self.tensor.cpu()
+
+        def __getitem__(self, idx):
+            return FakeWaveform(self.tensor[idx], self.counter)
+
+    class FakeAudioVAE:
+        def __init__(self):
+            self.config = SimpleNamespace(sample_rate=44100)
+            self.counter = {"cpu": 0}
+
+        def decode(self, batch_latents, **kwargs):
+            waveform = FakeWaveform(torch.zeros(batch_latents.shape[0], 1, 8), self.counter)
+            return waveform, None, None
+
+    talker = object.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.audio_vae = FakeAudioVAE()
+    latents = [[torch.zeros(1, 2, 3)] for _ in range(4)]
+
+    audios, sample_rate = talker.decode_batch_latents_for_runner(latents, stream_decode=True)
+
+    assert sample_rate == 44100
+    assert len(audios) == 4
+    assert talker.audio_vae.counter["cpu"] == 1

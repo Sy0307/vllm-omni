@@ -21,14 +21,23 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
+import os
+from dataclasses import dataclass
 from functools import cached_property
 from queue import Queue
 from threading import Lock
+from types import MethodType
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase, Qwen2Config, Qwen2Model, StaticCache
+from transformers.models.qwen2.modeling_qwen2 import (
+    ALL_ATTENTION_FUNCTIONS,
+    Qwen2Attention,
+    apply_rotary_pos_emb as qwen2_apply_rotary_pos_emb,
+    eager_attention_forward,
+)
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
@@ -38,6 +47,12 @@ from .audio_vae import AudioVAE
 
 logger = init_logger(__name__)
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
+
 
 ########################################################################
 # DiT Modules
@@ -46,6 +61,67 @@ logger = init_logger(__name__)
 # Ported from:
 # https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/talker_module/dit.py
 ########################################################################
+
+
+
+
+@dataclass(slots=True)
+class MingTalkerSlot:
+    req_id: str | None = None
+
+
+class MingTalkerSlotTable:
+    def __init__(self, max_slots: int) -> None:
+        if max_slots <= 0:
+            raise ValueError(f"max_slots must be positive, got {max_slots}")
+        self.slots = [MingTalkerSlot() for _ in range(max_slots)]
+        self.req_to_slot: dict[str, int] = {}
+        self.free_slots = list(range(max_slots - 1, -1, -1))
+
+    def allocate(self, req_id: str) -> int:
+        existing = self.req_to_slot.get(req_id)
+        if existing is not None:
+            return existing
+        if not self.free_slots:
+            raise RuntimeError("Ming Talker slot table exhausted")
+        slot = self.free_slots.pop()
+        self.req_to_slot[req_id] = slot
+        self.slots[slot] = MingTalkerSlot(req_id)
+        return slot
+
+    def free(self, req_id: str) -> None:
+        slot = self.req_to_slot.pop(req_id, None)
+        if slot is None:
+            return
+        self.slots[slot] = MingTalkerSlot()
+        self.free_slots.append(slot)
+
+    def active_slots(self) -> list[int]:
+        return [idx for idx, slot in enumerate(self.slots) if slot.req_id is not None]
+
+    def active_request_ids(self) -> list[str]:
+        return [self.slots[idx].req_id for idx in self.active_slots()]
+
+
+@dataclass(slots=True)
+class MingTalkerBatchPolicy:
+    max_batch_size: int = 8
+    max_wait_ms: float = 20.0
+    bucket_sizes: tuple[int, ...] = (1, 2, 4, 8, 16)
+
+    def choose_bucket(self, queued: int) -> int:
+        if queued <= 0:
+            return 0
+        capped = min(queued, self.max_batch_size)
+        for bucket in self.bucket_sizes:
+            if capped <= bucket:
+                return min(bucket, self.max_batch_size)
+        return self.max_batch_size
+
+    def should_dispatch(self, queued: int, oldest_wait_ms: float) -> bool:
+        if queued <= 0:
+            return False
+        return queued >= self.max_batch_size or oldest_wait_ms >= self.max_wait_ms
 
 
 class RMSNorm(nn.Module):
@@ -97,6 +173,7 @@ class Attention(nn.Module):
         self.to_q = nn.Linear(dim, self.inner_dim)
         self.to_k = nn.Linear(dim, self.inner_dim)
         self.to_v = nn.Linear(dim, self.inner_dim)
+        self.to_qkv: nn.Linear | None = None
         if qk_norm is None:
             self.q_norm = None
             self.k_norm = None
@@ -113,6 +190,24 @@ class Attention(nn.Module):
         self.pe_attn_head = pe_attn_head
         self.attn_mask_enabled = attn_mask_enabled
 
+    def pack_qkv(self) -> None:
+        if self.to_qkv is not None:
+            return
+        if self.to_q.bias is None or self.to_k.bias is None or self.to_v.bias is None:
+            raise ValueError("Ming fused QKV packing expects q/k/v bias tensors")
+        qkv = nn.Linear(
+            self.dim,
+            self.inner_dim * 3,
+            bias=True,
+            device=self.to_q.weight.device,
+            dtype=self.to_q.weight.dtype,
+        )
+        with torch.no_grad():
+            qkv.weight.copy_(torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0))
+            qkv.bias.copy_(torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias], dim=0))
+        qkv.requires_grad_(False)
+        self.to_qkv = qkv
+
     def forward(
         self,
         x: torch.Tensor,
@@ -121,9 +216,12 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         batch_size = x.shape[0]
 
-        query = self.to_q(x)
-        key = self.to_k(x)
-        value = self.to_v(x)
+        if self.to_qkv is None:
+            query = self.to_q(x)
+            key = self.to_k(x)
+            value = self.to_v(x)
+        else:
+            query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
@@ -322,6 +420,62 @@ class DiT(nn.Module):
         model_out = self.forward(x, t, c, latent_history, spk_emb)
         return model_out[:, -x.shape[1] :, :]
 
+    def forward_with_prepared_cfg(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        c: torch.Tensor,
+        latent_history: torch.Tensor,
+        spk_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward with CFG when step-invariant CFG inputs are pre-expanded."""
+        x = torch.cat([x, x], dim=0)
+        if t.ndim == 0:
+            t = t.repeat(x.shape[0])
+        model_out = self.forward(x, t, c, latent_history, spk_emb)
+        return model_out[:, -x.shape[1] :, :]
+
+    def forward_with_preembedded_cfg(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        c_emb: torch.Tensor,
+        latent_history_emb: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> torch.Tensor:
+        """Forward with CFG and step-invariant embeddings precomputed."""
+        x = torch.cat([x, x], dim=0)
+        patch_len = x.shape[1]
+        x = self.x_embedder(x)
+        if t.ndim == 0:
+            t = t.repeat(x.shape[0])
+        t = self.t_embedder(t).unsqueeze(1)
+        x = torch.cat([t + c_emb, latent_history_emb, x], dim=1)
+
+        for block in self.blocks:
+            x = block(x, None, rope)
+        x = self.final_layer(x)
+        return x[:, -patch_len:, :]
+
+    def forward_with_preembedded_cfg_temb(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        c_emb: torch.Tensor,
+        latent_history_emb: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> torch.Tensor:
+        """Forward with CFG and precomputed timestep/condition embeddings."""
+        x = self.x_embedder(x)
+        patch_len = x.shape[1]
+        x = torch.cat([x, x], dim=0)
+        x = torch.cat([t_emb + c_emb, latent_history_emb, x], dim=1)
+
+        for block in self.blocks:
+            x = block(x, None, rope)
+        x = self.final_layer(x)
+        return x[:, -patch_len:, :]
+
 
 #########################################################################################
 # CFM
@@ -363,6 +517,14 @@ class CFM(nn.Module):
         self.model = model
         self.steps = steps
         self.sway_sampling_coef = sway_sampling_coef
+        self.use_prepared_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREPARED_CFG")
+        self.use_preembedded_cfg = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PREEMBED_CFG")
+        self.use_precomputed_temb = _env_flag_enabled("VLLM_OMNI_MING_TALKER_PRECOMPUTE_TEMB")
+
+    def prepare_timesteps(self, t: torch.Tensor) -> torch.Tensor:
+        if self.sway_sampling_coef is None:
+            return t
+        return t + self.sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
     @torch.no_grad()
     def sample(
@@ -372,7 +534,9 @@ class CFM(nn.Module):
         y0: torch.Tensor,
         t: torch.Tensor,
         sde_args: torch.Tensor,
-        sde_rnd: torch.Tensor,
+        sde_rnd: torch.Tensor | None,
+        *,
+        timesteps_are_swayed: bool = False,
     ):
         """Sample audio latent via ODE/SDE integration with CFG.
 
@@ -385,30 +549,87 @@ class CFM(nn.Module):
             sde_rnd: random noise for SDE steps (steps, B, patch_size, latent_dim)
         """
 
-        def fn(fn_t, x):
-            pred_cfg = self.model.forward_with_cfg(x, fn_t, llm_cond, lat_cond, None)
-            pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
-            return pred + (pred - null_pred) * sde_args[0]
+        if self.use_preembedded_cfg:
+            cfg_lat_cond = torch.cat([lat_cond, lat_cond], dim=0)
+            cfg_llm_cond = torch.cat([llm_cond, torch.zeros_like(llm_cond)], dim=0)
+            cfg_lat_cond_emb = self.model.x_embedder(cfg_lat_cond)
+            cfg_llm_cond_emb = self.model.c_embedder(cfg_llm_cond)
+            rope = self.model.rotary_embed.forward_from_seq_len(1 + cfg_lat_cond_emb.shape[1] + y0.shape[1])
+            if self.use_precomputed_temb:
+                t_emb = self.model.t_embedder(t[:-1]).unsqueeze(1)
 
-        if self.sway_sampling_coef is not None:
-            t = t + self.sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+            def fn(fn_t, x):
+                if self.use_precomputed_temb:
+                    step_t_emb = t_emb[step : step + 1]
+                    return self._guided_prediction_from_cfg(
+                        self.model.forward_with_preembedded_cfg_temb(
+                            x,
+                            step_t_emb,
+                            cfg_llm_cond_emb,
+                            cfg_lat_cond_emb,
+                            rope,
+                        ),
+                        sde_args[0],
+                    )
+                pred_cfg = self.model.forward_with_preembedded_cfg(
+                    x,
+                    fn_t,
+                    cfg_llm_cond_emb,
+                    cfg_lat_cond_emb,
+                    rope,
+                )
+                return self._guided_prediction_from_cfg(pred_cfg, sde_args[0])
+
+        elif self.use_prepared_cfg:
+            cfg_lat_cond = torch.cat([lat_cond, lat_cond], dim=0)
+            cfg_llm_cond = torch.cat([llm_cond, torch.zeros_like(llm_cond)], dim=0)
+
+            def fn(fn_t, x):
+                pred_cfg = self.model.forward_with_prepared_cfg(x, fn_t, cfg_llm_cond, cfg_lat_cond, None)
+                pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+                return pred + (pred - null_pred) * sde_args[0]
+
+        else:
+
+            def fn(fn_t, x):
+                pred_cfg = self.model.forward_with_cfg(x, fn_t, llm_cond, lat_cond, None)
+                pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+                return pred + (pred - null_pred) * sde_args[0]
+
+        if not timesteps_are_swayed:
+            t = self.prepare_timesteps(t)
 
         for step in range(self.steps):
             dt = t[step + 1] - t[step]
             y0 = y0 + fn(t[step], y0) * dt
-            y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
+            if sde_rnd is not None:
+                y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
 
         return y0
+
+    @staticmethod
+    def _guided_prediction_from_cfg(pred_cfg: torch.Tensor, cfg_strength: torch.Tensor) -> torch.Tensor:
+        pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
+        return pred + (pred - null_pred) * cfg_strength
 
 
 class CFMGraphExecutor:
     """CUDA graph-accelerated executor for CFM + Aggregator + StopHead pipeline."""
 
-    def __init__(self, config, cfm, aggregator, stop_head: nn.Linear):
+    def __init__(
+        self,
+        config,
+        cfm,
+        aggregator,
+        stop_head: nn.Linear,
+        *,
+        deterministic_sde_noise: bool = False,
+    ):
         self.config = config
         self.cfm = cfm
         self.aggregator = aggregator
         self.stop_head = stop_head
+        self.deterministic_sde_noise = deterministic_sde_noise
         self.initialized = False
 
         self.last_hidden_state_placeholder = None
@@ -430,14 +651,24 @@ class CFMGraphExecutor:
         sigma: float = 0.25,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.deterministic_sde_noise and temperature != 0.0:
+            raise ValueError("deterministic CFM graph executor requires temperature=0.0")
         bat_size, his_patch_size, z_dim = his_lat.shape
         randn_tensor = torch.randn(
             (bat_size, self.config.patch_size, z_dim), device=input_tensor.device, dtype=input_tensor.dtype
         )
-        t = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
-        sde_rnd = torch.randn(
-            (self.config.steps, *randn_tensor.shape), device=input_tensor.device, dtype=input_tensor.dtype
-        )
+        sde_shape = (self.config.steps, *randn_tensor.shape)
+        sde_rnd = None
+        if self.deterministic_sde_noise:
+            # Preserve the RNG stream used by the original temperature=0 path.
+            # The sampled noise is mathematically multiplied by zero, so it is
+            # consumed for determinism but intentionally kept out of the graph.
+            _unused_sde_rnd = torch.randn(sde_shape, device=input_tensor.device, dtype=input_tensor.dtype)
+            del _unused_sde_rnd
+        else:
+            sde_rnd = torch.randn(
+                sde_shape, device=input_tensor.device, dtype=input_tensor.dtype
+            )
 
         if not self.initialized:
             self._initialize_graph(input_tensor, his_lat, randn_tensor, sde_rnd)
@@ -445,11 +676,12 @@ class CFMGraphExecutor:
         self.last_hidden_state_placeholder.copy_(input_tensor)
         self.his_lat_placeholder.copy_(his_lat)
         self.randn_like_placeholder.copy_(randn_tensor)
-        self.t_placeholder.copy_(t)
         self.sde_args_placeholder[0] = cfg_strength
         self.sde_args_placeholder[1] = sigma
         self.sde_args_placeholder[2] = temperature
-        self.sde_rnd_placeholder.copy_(sde_rnd)
+        if self.sde_rnd_placeholder is not None:
+            assert sde_rnd is not None
+            self.sde_rnd_placeholder.copy_(sde_rnd)
 
         self.graph.replay()
 
@@ -469,14 +701,16 @@ class CFMGraphExecutor:
         input_tensor: torch.Tensor,
         his_lat: torch.Tensor,
         randn_tensor: torch.Tensor,
-        sde_rnd: torch.Tensor,
+        sde_rnd: torch.Tensor | None,
     ) -> None:
         self.last_hidden_state_placeholder = torch.empty_like(input_tensor)
         self.his_lat_placeholder = torch.empty_like(his_lat)
         self.randn_like_placeholder = torch.empty_like(randn_tensor)
-        self.t_placeholder = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
+        self.t_placeholder = self.cfm.prepare_timesteps(
+            get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
+        )
         self.sde_args_placeholder = torch.empty(3, device=input_tensor.device, dtype=input_tensor.dtype)
-        self.sde_rnd_placeholder = torch.empty_like(sde_rnd)
+        self.sde_rnd_placeholder = torch.empty_like(sde_rnd) if sde_rnd is not None else None
 
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
@@ -487,6 +721,7 @@ class CFMGraphExecutor:
                 self.t_placeholder,
                 self.sde_args_placeholder,
                 self.sde_rnd_placeholder,
+                timesteps_are_swayed=True,
             )
             self.inputs_embeds_placeholder = self.aggregator(self.gen_lat_placeholder)
             self.stop_out_placeholder = self.stop_head(self.last_hidden_state_placeholder[:, -1, :]).softmax(dim=-1)
@@ -497,17 +732,33 @@ class CFMGraphExecutor:
 class CFMGraphExecutorPool:
     """Thread-safe pool of CFMGraphExecutors for concurrent inference."""
 
-    def __init__(self, config, cfm, aggregator, stop_head: nn.Linear, pool_size: int = 1):
+    def __init__(
+        self,
+        config,
+        cfm,
+        aggregator,
+        stop_head: nn.Linear,
+        pool_size: int = 1,
+        *,
+        deterministic_sde_noise: bool = False,
+    ):
         self.config = config
         self.cfm = cfm
         self.aggregator = aggregator
         self.stop_head = stop_head
         self.pool_size = pool_size
+        self.deterministic_sde_noise = deterministic_sde_noise
         self.pool = Queue(maxsize=pool_size)
         self.lock = Lock()
 
         for _ in range(pool_size):
-            executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)
+            executor = CFMGraphExecutor(
+                config,
+                cfm,
+                aggregator,
+                stop_head,
+                deterministic_sde_noise=deterministic_sde_noise,
+            )
             self.pool.put(executor)
 
     def acquire(self) -> CFMGraphExecutor:
@@ -743,6 +994,201 @@ class Aggregator(nn.Module):
         return x
 
 
+def pack_attention_qkv_projections(module: nn.Module) -> int:
+    packed = 0
+    for child in module.modules():
+        if isinstance(child, Attention):
+            child.pack_qkv()
+            packed += 1
+    return packed
+
+
+def _qwen2_attention_forward_with_packed_qkv(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: StaticCache | None = None,
+    cache_position: torch.LongTensor | None = None,
+    **kwargs,
+):
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    q_out = self.q_proj.out_features
+    k_out = self.k_proj.out_features
+    v_out = self.v_proj.out_features
+    query_states, key_states, value_states = self.qkv_proj(hidden_states).split((q_out, k_out, v_out), dim=-1)
+    query_states = query_states.view(hidden_shape).transpose(1, 2)
+    key_states = key_states.view(hidden_shape).transpose(1, 2)
+    value_states = value_states.view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = qwen2_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation,
+        eager_attention_forward,
+    )
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
+def pack_qwen2_attention_qkv_projections(module: nn.Module) -> int:
+    packed = 0
+    for child in module.modules():
+        if not isinstance(child, Qwen2Attention):
+            continue
+        if hasattr(child, "qkv_proj"):
+            continue
+        if child.q_proj.bias is None or child.k_proj.bias is None or child.v_proj.bias is None:
+            raise ValueError("Ming Qwen2 fused QKV packing expects q/k/v bias tensors")
+        qkv = nn.Linear(
+            child.config.hidden_size,
+            child.q_proj.out_features + child.k_proj.out_features + child.v_proj.out_features,
+            bias=True,
+            device=child.q_proj.weight.device,
+            dtype=child.q_proj.weight.dtype,
+        )
+        with torch.no_grad():
+            qkv.weight.copy_(torch.cat([child.q_proj.weight, child.k_proj.weight, child.v_proj.weight], dim=0))
+            qkv.bias.copy_(torch.cat([child.q_proj.bias, child.k_proj.bias, child.v_proj.bias], dim=0))
+        qkv.requires_grad_(False)
+        child.qkv_proj = qkv
+        child.forward = MethodType(_qwen2_attention_forward_with_packed_qkv, child)
+        packed += 1
+    return packed
+
+
+def _snapshot_static_cache(
+    past_key_values: StaticCache,
+) -> list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]]:
+    snapshot = []
+    for layer in getattr(past_key_values, "layers", []):
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        cumulative_length = getattr(layer, "cumulative_length", None)
+        snapshot.append(
+            (
+                keys.detach().clone() if keys is not None else None,
+                values.detach().clone() if values is not None else None,
+                cumulative_length.detach().clone() if cumulative_length is not None else None,
+            )
+        )
+    return snapshot
+
+
+def _restore_static_cache(
+    past_key_values: StaticCache,
+    snapshot: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]],
+) -> None:
+    for layer, (keys, values, cumulative_length) in zip(getattr(past_key_values, "layers", []), snapshot):
+        if keys is not None:
+            layer.keys.copy_(keys)
+        if values is not None:
+            layer.values.copy_(values)
+        if cumulative_length is not None:
+            layer.cumulative_length.copy_(cumulative_length)
+
+
+class MingLLMDecodeGraphExecutor:
+    def __init__(
+        self,
+        model: Qwen2Model,
+        past_key_values: StaticCache,
+        sample_inputs_embeds: torch.Tensor,
+        cache_position_start: int,
+    ) -> None:
+        if sample_inputs_embeds.device.type != "cuda":
+            raise ValueError("Ming LLM decode graph requires CUDA tensors")
+        self._model = model
+        self._past_key_values = past_key_values
+        self._input_ph = torch.empty_like(sample_inputs_embeds)
+        self._cache_pos_ph = torch.empty(
+            (sample_inputs_embeds.shape[1],),
+            device=sample_inputs_embeds.device,
+            dtype=torch.long,
+        )
+        self._graph = torch.cuda.CUDAGraph()
+        self._output: torch.Tensor | None = None
+        self._shape = tuple(sample_inputs_embeds.shape)
+        self._capture(sample_inputs_embeds, cache_position_start)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._shape
+
+    def _set_inputs(self, inputs_embeds: torch.Tensor, cache_position_start: int) -> None:
+        self._input_ph.copy_(inputs_embeds)
+        self._cache_pos_ph.copy_(
+            torch.arange(
+                cache_position_start,
+                cache_position_start + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+                dtype=torch.long,
+            )
+        )
+
+    def _run_model(self):
+        return self._model(
+            past_key_values=self._past_key_values,
+            inputs_embeds=self._input_ph,
+            use_cache=True,
+            cache_position=self._cache_pos_ph,
+        )
+
+    def _capture(self, sample_inputs_embeds: torch.Tensor, cache_position_start: int) -> None:
+        device = sample_inputs_embeds.device
+        cache_snapshot = _snapshot_static_cache(self._past_key_values)
+        rng_state = torch.cuda.get_rng_state(device)
+        self._set_inputs(sample_inputs_embeds, cache_position_start)
+
+        graph_stream = torch.cuda.Stream(device=device)
+        graph_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.no_grad(), torch.cuda.stream(graph_stream):
+            for _ in range(3):
+                self._run_model()
+        torch.cuda.current_stream(device).wait_stream(graph_stream)
+        torch.cuda.synchronize(device)
+        _restore_static_cache(self._past_key_values, cache_snapshot)
+        torch.cuda.set_rng_state(rng_state, device)
+
+        with torch.no_grad(), torch.cuda.graph(self._graph):
+            graph_outputs = self._run_model()
+            self._output = graph_outputs.last_hidden_state[:, -1:, :]
+        torch.cuda.synchronize(device)
+        _restore_static_cache(self._past_key_values, cache_snapshot)
+        torch.cuda.set_rng_state(rng_state, device)
+
+    def replay(self, inputs_embeds: torch.Tensor, cache_position_start: int) -> torch.Tensor:
+        if tuple(inputs_embeds.shape) != self._shape:
+            raise ValueError(f"LLM decode graph shape mismatch: {tuple(inputs_embeds.shape)} != {self._shape}")
+        self._set_inputs(inputs_embeds, cache_position_start)
+        self._graph.replay()
+        if self._output is None:
+            raise RuntimeError("Ming LLM decode graph output was not captured")
+        return self._output
+
+
 ########################################################################
 # Prompt Builder
 # Adapted from:
@@ -888,13 +1334,47 @@ class MingAudioGenerator:
         # For FA2, let it see a full-length seq Q
         # trailing latent frames prepended on each decode call
         self._vae_decode_pad_frames = 32
+        self._pack_qkv_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_FUSED_QKV")
+        self._qkv_packed = False
+        self._llm_decode_graph_enabled = _env_flag_enabled("VLLM_OMNI_MING_TALKER_LLM_DECODE_GRAPH")
+        self._llm_decode_graphs: dict[int, MingLLMDecodeGraphExecutor] = {}
+        self._reusable_kv_caches: dict[tuple[int, str, torch.dtype], StaticCache] = {}
+        self._reusable_kv_cache_lock = Lock()
+
+    def _maybe_pack_qkv_projections(self) -> None:
+        if not self._pack_qkv_enabled or self._qkv_packed:
+            return
+        packed_talker = pack_attention_qkv_projections(self._cfm) + pack_attention_qkv_projections(self._aggregator)
+        packed_llm = pack_qwen2_attention_qkv_projections(self._model)
+        logger.info(
+            "Packed Ming Talker fused QKV projections for %d CFM/Aggregator and %d LLM attention modules",
+            packed_talker,
+            packed_llm,
+        )
+        self._qkv_packed = True
 
     @cached_property
-    def _sampler_pool(self) -> CFMGraphExecutorPool | None:
-        device = next(self._model.parameters()).device
-        if self._use_cuda_graphs and device.type == "cuda":
-            return CFMGraphExecutorPool(self._config, self._cfm, self._aggregator, self._stop_head, pool_size=1)
-        return None
+    def _sampler_pools(self) -> dict[tuple[int, bool], CFMGraphExecutorPool]:
+        return {}
+
+    def _get_sampler_pool(
+        self, batch_size: int, device: torch.device, deterministic_sde_noise: bool
+    ) -> CFMGraphExecutorPool | None:
+        if not self._use_cuda_graphs or device.type != "cuda":
+            return None
+        key = (batch_size, deterministic_sde_noise)
+        pool = self._sampler_pools.get(key)
+        if pool is None:
+            pool = CFMGraphExecutorPool(
+                self._config,
+                self._cfm,
+                self._aggregator,
+                self._stop_head,
+                pool_size=1,
+                deterministic_sde_noise=deterministic_sde_noise,
+            )
+            self._sampler_pools[key] = pool
+        return pool
 
     def duration_capped_steps(self, text_len: int, requested_max_steps: int) -> int:
         """Apply the original Ming duration heuristic as a cap on decode steps."""
@@ -930,6 +1410,7 @@ class MingAudioGenerator:
             cfg = self.cfg_strength
         device = next(self._model.parameters()).device
         dtype = next(self._model.parameters()).dtype
+        self._maybe_pack_qkv_projections()
 
         his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
         past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
@@ -984,8 +1465,11 @@ class MingAudioGenerator:
         if cfg is None:
             cfg = self.cfg_strength
 
-        if self._sampler_pool is not None:
-            return self._sampler_pool.execute(last_hidden_state, his_lat, cfg, sigma, temperature)
+        self._maybe_pack_qkv_projections()
+        deterministic_sde_noise = temperature == 0.0
+        sampler_pool = self._get_sampler_pool(his_lat.shape[0], last_hidden_state.device, deterministic_sde_noise)
+        if sampler_pool is not None:
+            return sampler_pool.execute(last_hidden_state, his_lat, cfg, sigma, temperature)
 
         bat_size, _, z_dim = his_lat.shape
         randn_tensor = torch.randn(
@@ -993,23 +1477,148 @@ class MingAudioGenerator:
             device=last_hidden_state.device,
             dtype=last_hidden_state.dtype,
         )
-        t = get_epss_timesteps(self._config.steps, device=last_hidden_state.device, dtype=last_hidden_state.dtype)
-        sde_rnd = torch.randn(
-            (self._config.steps, *randn_tensor.shape),
-            device=last_hidden_state.device,
-            dtype=last_hidden_state.dtype,
+        t = self._cfm.prepare_timesteps(
+            get_epss_timesteps(self._config.steps, device=last_hidden_state.device, dtype=last_hidden_state.dtype)
         )
+        sde_shape = (self._config.steps, *randn_tensor.shape)
+        sde_rnd = None
+        if deterministic_sde_noise:
+            # Keep the same RNG progression as the original temperature=0 path
+            # while avoiding zero-contribution SDE work in CFM.sample.
+            _unused_sde_rnd = torch.randn(
+                sde_shape,
+                device=last_hidden_state.device,
+                dtype=last_hidden_state.dtype,
+            )
+            del _unused_sde_rnd
+        else:
+            sde_rnd = torch.randn(
+                sde_shape,
+                device=last_hidden_state.device,
+                dtype=last_hidden_state.dtype,
+            )
         sde_args = torch.tensor(
             [cfg, sigma, temperature],
             device=last_hidden_state.device,
             dtype=last_hidden_state.dtype,
         )
 
-        gen_lat = self._cfm.sample(last_hidden_state, his_lat, randn_tensor, t, sde_args, sde_rnd)
+        gen_lat = self._cfm.sample(
+            last_hidden_state,
+            his_lat,
+            randn_tensor,
+            t,
+            sde_args,
+            sde_rnd,
+            timesteps_are_swayed=True,
+        )
         inputs_embeds = self._aggregator(gen_lat)
         stop_out = self._stop_head(last_hidden_state[:, -1, :]).softmax(dim=-1)
 
         return gen_lat, inputs_embeds, stop_out
+
+    @torch.no_grad()
+    def generate_latents_batch(
+        self,
+        inputs_embeds: torch.Tensor,
+        *,
+        prompt_wav_lat: torch.Tensor | None = None,
+        min_new_token: int = 10,
+        max_steps: int = 1000,
+        cfg: float | None = None,
+        sigma: float = 0.25,
+        temperature: float = 0.0,
+        use_static_cache: bool = True,
+    ) -> list[list[torch.Tensor]]:
+        if cfg is None:
+            cfg = self.cfg_strength
+        device = next(self._model.parameters()).device
+        dtype = next(self._model.parameters()).dtype
+        batch_size = inputs_embeds.shape[0]
+        self._maybe_pack_qkv_projections()
+
+        if prompt_wav_lat is not None:
+            raise NotImplementedError("batched prompt_wav_lat is not supported yet")
+
+        all_latents: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        active_indices = torch.arange(batch_size, device=device)
+        current_inputs_embeds = inputs_embeds
+        his_lat = torch.zeros(batch_size, self.his_patch_size, self.latent_dim, device=device, dtype=dtype)
+        use_active_compaction = True
+
+        past_key_values, max_cache_len = self._init_batched_kv_cache(
+            batch_size, use_static_cache, device, dtype
+        )
+        prefill_len = inputs_embeds.shape[1]
+
+        for step in range(min(max_steps, max_cache_len - prefill_len)):
+            last_hs = self.llm_step(
+                current_inputs_embeds,
+                step=step,
+                past_key_values=past_key_values,
+                use_static_cache=use_static_cache,
+            )
+            gen_lat, next_inputs_embeds, stop_out = self.cfm_sample_step(
+                last_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
+            )
+            for row, original_idx in enumerate(active_indices.tolist()):
+                all_latents[original_idx].append(gen_lat[row : row + 1])
+
+            should_stop = stop_out[:, 1] > 0.5
+            if step <= min_new_token:
+                should_stop = torch.zeros_like(should_stop, dtype=torch.bool)
+            if bool(torch.all(should_stop)):
+                break
+
+            if use_active_compaction and bool(torch.any(should_stop)):
+                keep = ~should_stop
+                active_indices = active_indices[keep]
+                if active_indices.numel() == 0:
+                    break
+                current_inputs_embeds = next_inputs_embeds[keep]
+                his_lat = self._update_his_lat(his_lat, gen_lat)[keep]
+                if past_key_values is not None:
+                    self._select_cache_batch(past_key_values, torch.nonzero(keep, as_tuple=False).flatten())
+            else:
+                current_inputs_embeds = next_inputs_embeds
+                his_lat = self._update_his_lat(his_lat, gen_lat)
+
+        return all_latents
+
+    @staticmethod
+    def _select_cache_batch(past_key_values: StaticCache, keep_indices: torch.Tensor) -> None:
+        try:
+            past_key_values.batch_select_indices(keep_indices)
+            return
+        except AttributeError:
+            pass
+
+        for layer in getattr(past_key_values, "layers", []):
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if keys is not None:
+                layer.keys = keys.index_select(0, keep_indices).contiguous()
+            if values is not None:
+                layer.values = values.index_select(0, keep_indices).contiguous()
+
+    def _init_batched_kv_cache(
+        self, batch_size: int, use_static_cache: bool, device: torch.device, dtype: torch.dtype
+    ) -> tuple[StaticCache | None, int]:
+        max_cache_len = 2048
+        if not use_static_cache:
+            return None, max_cache_len
+        if self._llm_decode_graph_enabled and device.type == "cuda":
+            cache = self._get_reusable_kv_cache(batch_size, device, dtype, max_cache_len)
+            self._reset_static_cache(cache)
+            return cache, max_cache_len
+        cache = StaticCache(
+            config=self._llm_config,
+            max_batch_size=batch_size,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=dtype,
+        )
+        return cache, max_cache_len
 
     def decode_to_waveform(self, latents: list[torch.Tensor], stream_decode: bool = True) -> torch.Tensor:
         """Decode accumulated latents to waveform via AudioVAE."""
@@ -1041,6 +1650,11 @@ class MingAudioGenerator:
             )
         else:
             past_seen_tokens = past_key_values.get_seq_length()
+            if isinstance(past_seen_tokens, torch.Tensor):
+                past_seen_tokens = int(past_seen_tokens.max().item())
+            graph_hidden = self._llm_decode_graph_step(inputs_embeds, past_key_values, past_seen_tokens)
+            if graph_hidden is not None:
+                return graph_hidden
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
@@ -1053,6 +1667,35 @@ class MingAudioGenerator:
                 cache_position=cache_position,
             )
         return outputs.last_hidden_state[:, -1:, :]
+
+    def _llm_decode_graph_step(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: StaticCache,
+        cache_position_start: int,
+    ) -> torch.Tensor | None:
+        if not self._llm_decode_graph_enabled or inputs_embeds.device.type != "cuda":
+            return None
+
+        key = id(past_key_values)
+        graph = self._llm_decode_graphs.get(key)
+        if graph is not None and graph.shape != tuple(inputs_embeds.shape):
+            self._llm_decode_graphs.pop(key, None)
+            return None
+        if graph is None:
+            logger.info(
+                "Capturing Ming Talker LLM decode CUDA graph for shape=%s cache_position_start=%d",
+                tuple(inputs_embeds.shape),
+                cache_position_start,
+            )
+            graph = MingLLMDecodeGraphExecutor(
+                self._model,
+                past_key_values,
+                inputs_embeds,
+                cache_position_start,
+            )
+            self._llm_decode_graphs[key] = graph
+        return graph.replay(inputs_embeds, cache_position_start)
 
     def _init_his_lat(
         self, prompt_wav_lat: torch.Tensor | None, device: torch.device, dtype: torch.dtype
@@ -1072,6 +1715,10 @@ class MingAudioGenerator:
         max_cache_len = 2048
         if not use_static_cache:
             return None, max_cache_len
+        if self._llm_decode_graph_enabled and device.type == "cuda":
+            cache = self._get_reusable_kv_cache(1, device, dtype, max_cache_len)
+            self._reset_static_cache(cache)
+            return cache, max_cache_len
         cache = StaticCache(
             config=self._llm_config,
             max_batch_size=1,
@@ -1080,6 +1727,43 @@ class MingAudioGenerator:
             dtype=dtype,
         )
         return cache, max_cache_len
+
+    def _get_reusable_kv_cache(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        max_cache_len: int,
+    ) -> StaticCache:
+        key = (batch_size, str(device), dtype)
+        with self._reusable_kv_cache_lock:
+            cache = self._reusable_kv_caches.get(key)
+            if cache is None:
+                cache = StaticCache(
+                    config=self._llm_config,
+                    max_batch_size=batch_size,
+                    max_cache_len=max_cache_len,
+                    device=device,
+                    dtype=dtype,
+                )
+                self._reusable_kv_caches[key] = cache
+            return cache
+
+    @staticmethod
+    def _reset_static_cache(cache: StaticCache) -> None:
+        if hasattr(cache, "reset"):
+            cache.reset()
+            return
+        for layer in getattr(cache, "layers", []):
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            cumulative_length = getattr(layer, "cumulative_length", None)
+            if keys is not None:
+                keys.zero_()
+            if values is not None:
+                values.zero_()
+            if cumulative_length is not None:
+                cumulative_length.zero_()
 
     def _update_his_lat(self, his_lat: torch.Tensor, gen_lat: torch.Tensor) -> torch.Tensor:
         if self.his_patch_size == self.patch_size:

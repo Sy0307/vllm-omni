@@ -284,8 +284,8 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         campplus_model: str | None = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         self.llm_config = llm_config
+        super().__init__(**kwargs)
         self.flowmodel = flowmodel or {}
         self.aggregator = aggregator or {}
         self.steps = steps
