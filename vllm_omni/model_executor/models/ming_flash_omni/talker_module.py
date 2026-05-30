@@ -599,11 +599,12 @@ class CFM(nn.Module):
         if not timesteps_are_swayed:
             t = self.prepare_timesteps(t)
 
+        dt = t[1:] - t[:-1]
         for step in range(self.steps):
-            dt = t[step + 1] - t[step]
-            y0 = y0 + fn(t[step], y0) * dt
+            step_dt = dt[step]
+            y0 = y0 + fn(t[step], y0) * step_dt
             if sde_rnd is not None:
-                y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (dt.abs() ** 0.5) * sde_rnd[step]
+                y0 = y0 + sde_args[1] * (sde_args[2] ** 0.5) * (step_dt.abs() ** 0.5) * sde_rnd[step]
 
         return y0
 
