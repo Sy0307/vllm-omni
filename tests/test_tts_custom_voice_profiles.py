@@ -97,11 +97,11 @@ def test_qwen3_icl_profile_without_ref_code_is_not_downgraded(tmp_path):
 
 
 def test_qwen3_prompt_len_uses_precomputed_ref_code_length():
-    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-        Qwen3TTSTalkerForConditionalGeneration,
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+        Qwen3TTSPromptEmbedsBuilder,
     )
 
-    prompt_len = Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+    prompt_len = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
         additional_information={
             "text": ["hello"],
             "task_type": ["Base"],
