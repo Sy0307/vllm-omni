@@ -1,9 +1,13 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import base64
+import hashlib
+import io
 import json
 import logging
 import os
 import struct
+import wave
 from inspect import Signature, signature
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,6 +181,18 @@ def _write_custom_voice_manifest(root: Path, *, model_type: str, voices: dict) -
         "voices": voices,
     }
     (root / "custom_voice_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _wav_data_url(samples: np.ndarray, sample_rate: int) -> str:
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:audio/wav;base64,{encoded}"
 
 
 @pytest.fixture
@@ -981,6 +997,24 @@ class TestTTSMethods:
         params = speech_server._build_tts_params(req)
         assert "voice_clone_prompt" not in params
 
+    @pytest.mark.asyncio
+    async def test_resolve_ref_audio_reuses_decoded_audio_for_same_source(self, speech_server):
+        wav = np.linspace(-0.5, 0.5, 48000, dtype=np.float32)
+        ref_audio = _wav_data_url(wav, 24000)
+        speech_server.model_config.allowed_local_media_path = ""
+        speech_server.model_config.allowed_media_domains = None
+
+        first = await speech_server._resolve_ref_audio(ref_audio)
+        second = await speech_server._resolve_ref_audio(ref_audio)
+
+        assert first[1] == 24000
+        assert second[1] == 24000
+        assert first[0] is second[0]
+        assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
+        assert speech_server._get_resolved_ref_audio_artifact_key(
+            ref_audio
+        ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
+
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
         speech_server._tts_model_type = "qwen3_tts"
@@ -1007,11 +1041,14 @@ class TestTTSMethods:
         assert params["ref_code_length"] == [3]
         assert "ref_audio" not in params
 
-    def test_uploaded_qwen3_voice_wins_over_same_named_precomputed_voice(self, speech_server, mocker, tmp_path):
+    def test_uploaded_qwen3_voice_wins_over_same_named_precomputed_voice(self, speech_server, tmp_path):
         """Qwen3 uploaded voices should take precedence over same-name precomputed voices."""
+        from safetensors.torch import save_file
+
         uploaded_path = tmp_path / "alice.safetensors"
-        uploaded_path.write_bytes(b"placeholder")
+        save_file({"speaker_embedding": torch.tensor([0.1] * 4)}, str(uploaded_path))
         speech_server._tts_model_type = "qwen3_tts"
+        speech_server.uploaded_speakers_dir = tmp_path
         speech_server.uploaded_speakers = {
             "alice": {
                 "name": "alice",
@@ -1029,7 +1066,6 @@ class TestTTSMethods:
                 "ref_code_length": 3,
             }
         }
-        mocker.patch.object(speech_server, "_get_uploaded_speaker_embedding", return_value=[0.1] * 4)
 
         req = OpenAICreateSpeechRequest(input="Hello", voice="Alice")
         assert speech_server._validate_tts_request(req) is None
@@ -2712,6 +2748,95 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
+        """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
+        wav_list = [0.0] * 48000
+        artifact_key = "a" * 40
+        ref_audio = "data:audio/wav;base64,same"
+        qwen3_tts_server._put_resolved_ref_audio(
+            hashlib.sha1(ref_audio.encode("utf-8")).hexdigest(),
+            wav_list,
+            24000,
+            artifact_key,
+        )
+        qwen3_tts_server._ref_audio_model_artifact_ready.add(artifact_key)
+        qwen3_tts_server._codec_frame_rate = 25.0
+        qwen3_tts_server._tts_tokenizer = lambda _text, padding=False: {"input_ids": list(range(10))}
+        qwen3_tts_server.engine_client.model_config.hf_config.talker_config = SimpleNamespace(
+            codec_language_id={},
+            spk_is_dialect={},
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="Base",
+            ref_audio=ref_audio,
+            ref_text="reference",
+        )
+        request_id, _generator, tts_params = asyncio.run(
+            qwen3_tts_server._prepare_speech_generation(request, request_id="req-hot")
+        )
+
+        assert request_id == "req-hot"
+        assert "ref_audio" not in tts_params
+        assert tts_params["_qwen3_tts_ref_audio_cache_key"] == [artifact_key]
+        assert tts_params["ref_code_length"] == [50]
+        prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"] is tts_params
+
+    def test_qwen3_ref_audio_artifact_ready_is_evicted_with_resolve_cache(self, qwen3_tts_server):
+        qwen3_tts_server._ref_audio_resolve_cache_max_entries = 1
+        qwen3_tts_server._ref_audio_resolve_cache_max_bytes = 1_000_000
+
+        qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
+        qwen3_tts_server._ref_audio_model_artifact_ready.add("artifact-a")
+        qwen3_tts_server._put_resolved_ref_audio("ref-b", [0.0] * 8, 24000, "artifact-b")
+
+        assert "artifact-a" not in qwen3_tts_server._ref_audio_model_artifact_ready
+        assert "artifact-b" in {entry[3] for entry in qwen3_tts_server._ref_audio_resolve_cache.values()}
+
+    @pytest.mark.asyncio
+    async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_error(self, qwen3_tts_server):
+        async def failing_generator():
+            raise ValueError("boom")
+            yield  # pragma: no cover
+
+        qwen3_tts_server._request_ref_audio_artifact_keys["req-fail"] = "artifact-fail"
+
+        with pytest.raises(ValueError, match="boom"):
+            await anext(qwen3_tts_server._generate_audio_chunks(failing_generator(), "req-fail"))
+
+        assert "req-fail" not in qwen3_tts_server._request_ref_audio_artifact_keys
+        assert "artifact-fail" not in qwen3_tts_server._ref_audio_model_artifact_ready
+
+    @pytest.mark.asyncio
+    async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+        async def pcm_generator():
+            yield SimpleNamespace(
+                multimodal_output={
+                    "audio": torch.zeros(16, dtype=torch.float32),
+                    "sr": 24000,
+                }
+            )
+            await asyncio.sleep(0)
+
+        qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = "artifact-close"
+
+        stream = qwen3_tts_server._generate_audio_chunks(pcm_generator(), "req-close")
+        assert await anext(stream)
+        await stream.aclose()
+
+        assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
+        assert "artifact-close" not in qwen3_tts_server._ref_audio_model_artifact_ready
+
+    def test_qwen3_ref_audio_artifact_ready_requires_live_resolve_cache_entry(self, qwen3_tts_server):
+        qwen3_tts_server._request_ref_audio_artifact_keys["req-evicted"] = "artifact-evicted"
+
+        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-evicted")
+
+        assert "req-evicted" not in qwen3_tts_server._request_ref_audio_artifact_keys
+        assert "artifact-evicted" not in qwen3_tts_server._ref_audio_model_artifact_ready
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""

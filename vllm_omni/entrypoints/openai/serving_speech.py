@@ -8,6 +8,7 @@ import os
 import re
 import struct
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -111,12 +112,9 @@ _TTS_LANGUAGES: set[str] = {
 }
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
-_TTS_REF_AUDIO_PROFILE_ENABLED = os.environ.get("VLLM_OMNI_TTS_REF_AUDIO_PROFILE", "").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
+_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
@@ -274,6 +272,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.precomputed_speakers: dict[str, dict[str, Any]] = {}
         self.supported_speakers: set[str] = set()
         self._ref_audio_data_url_cache: dict[str, str] = {}
+        self._ref_audio_resolve_cache: OrderedDict[str, tuple[list[float], int, int, str]] = OrderedDict()
+        self._ref_audio_resolve_cache_bytes = 0
+        self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
+        self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
+        self._ref_audio_model_artifact_ready: set[str] = set()
+        self._request_ref_audio_artifact_keys: dict[str, str] = {}
         self._speaker_cache = get_speaker_cache()
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
@@ -1759,6 +1763,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
         gated by ``--allowed-local-media-path``).
         """
+        cache_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        cached = self._ref_audio_resolve_cache.get(cache_key)
+        if cached is not None:
+            self._ref_audio_resolve_cache.move_to_end(cache_key)
+            wav_list, sr, _, _ = cached
+            logger.debug(
+                "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
+                len(wav_list),
+                sr,
+                len(wav_list) / sr if sr > 0 else 0.0,
+            )
+            return wav_list, sr
+
         # In diffusion mode, model_config may not be available
         if self._diffusion_mode:
             connector = MediaConnector()
@@ -1775,6 +1792,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
         sr = int(sr)
+        artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
         if duration < _REF_AUDIO_MIN_DURATION:
             raise ValueError(
@@ -1789,16 +1807,80 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tolist_start_s = time.perf_counter()
         wav_list = wav_np.tolist()
         tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
-        if _TTS_REF_AUDIO_PROFILE_ENABLED:
-            logger.info(
-                "[SpeechRefAudioProfile] fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
-                fetch_decode_ms,
-                tolist_ms,
-                len(wav_np),
-                sr,
-                duration,
-            )
+        logger.debug(
+            "Resolved ref_audio: fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
+            fetch_decode_ms,
+            tolist_ms,
+            len(wav_np),
+            sr,
+            duration,
+        )
+        self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
         return wav_list, sr
+
+    @staticmethod
+    def _make_ref_audio_artifact_cache_key(wav: np.ndarray, sr: int) -> str:
+        wav_f32 = wav.astype(np.float32, copy=False).reshape(-1)
+        h = hashlib.sha1()
+        h.update(int(sr).to_bytes(4, byteorder="little", signed=False))
+        h.update(int(wav_f32.size).to_bytes(8, byteorder="little", signed=False))
+        h.update(wav_f32.tobytes(order="C"))
+        return h.hexdigest()
+
+    def _get_resolved_ref_audio_artifact_key(self, ref_audio_str: str) -> str | None:
+        source_key = hashlib.sha1(ref_audio_str.encode("utf-8")).hexdigest()
+        cached = self._ref_audio_resolve_cache.get(source_key)
+        if cached is None:
+            return None
+        self._ref_audio_resolve_cache.move_to_end(source_key)
+        return cached[3]
+
+    def _put_resolved_ref_audio(self, cache_key: str, wav_list: list[float], sr: int, artifact_key: str) -> None:
+        if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:
+            return
+        # Approximate list[float] storage. CPython float objects add per-element
+        # overhead, so max_entries remains the hard cache cap.
+        size = len(wav_list) * 40
+        if size > self._ref_audio_resolve_cache_max_bytes:
+            return
+        previous = self._ref_audio_resolve_cache.pop(cache_key, None)
+        if previous is not None:
+            self._ref_audio_resolve_cache_bytes -= previous[2]
+            if previous[3] != artifact_key:
+                self._discard_ref_audio_artifact_ready_if_unreferenced(previous[3])
+        self._ref_audio_resolve_cache[cache_key] = (wav_list, int(sr), size, artifact_key)
+        self._ref_audio_resolve_cache_bytes += size
+        while len(self._ref_audio_resolve_cache) > self._ref_audio_resolve_cache_max_entries:
+            _, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
+            self._ref_audio_resolve_cache_bytes -= old_size
+            self._discard_ref_audio_artifact_ready_if_unreferenced(old_artifact_key)
+        while self._ref_audio_resolve_cache_bytes > self._ref_audio_resolve_cache_max_bytes:
+            _, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
+            self._ref_audio_resolve_cache_bytes -= old_size
+            self._discard_ref_audio_artifact_ready_if_unreferenced(old_artifact_key)
+
+    def _discard_ref_audio_artifact_ready_if_unreferenced(self, artifact_key: str) -> None:
+        if artifact_key and all(entry[3] != artifact_key for entry in self._ref_audio_resolve_cache.values()):
+            self._ref_audio_model_artifact_ready.discard(artifact_key)
+
+    def _qwen3_tts_can_use_ref_audio_artifact_only(self, tts_params: dict[str, Any], artifact_key: str | None) -> bool:
+        if self._tts_model_type != "qwen3_tts":
+            return False
+        if not artifact_key or artifact_key not in self._ref_audio_model_artifact_ready:
+            return False
+        return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
+
+    def _track_ref_audio_artifact_warmup(self, request_id: str, artifact_key: str | None) -> None:
+        if artifact_key:
+            self._request_ref_audio_artifact_keys[request_id] = artifact_key
+
+    def _mark_ref_audio_artifact_ready_for_request(self, request_id: str) -> None:
+        artifact_key = self._request_ref_audio_artifact_keys.pop(request_id, None)
+        if artifact_key and any(entry[3] == artifact_key for entry in self._ref_audio_resolve_cache.values()):
+            self._ref_audio_model_artifact_ready.add(artifact_key)
+
+    def _discard_ref_audio_artifact_warmup(self, request_id: str) -> None:
+        self._request_ref_audio_artifact_keys.pop(request_id, None)
 
     async def _generate_audio_chunks(
         self,
@@ -1829,6 +1911,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         first_chunk = True
         first_audio_chunk_s: float | None = None
         stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
+        artifact_ready = False
 
         try:
             async for res in generator:
@@ -1883,6 +1966,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if first_audio_chunk_s is None:
                         first_audio_chunk_s = time.perf_counter()
                     yield self.create_audio(audio_obj).audio_data
+            self._mark_ref_audio_artifact_ready_for_request(request_id)
+            artifact_ready = True
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             if first_audio_chunk_s is not None:
                 first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
@@ -1936,6 +2021,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
+        finally:
+            if not artifact_ready:
+                self._discard_ref_audio_artifact_warmup(request_id)
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
@@ -2446,6 +2534,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        request_id = request_id or f"speech-{random_uuid()}"
+        qwen3_ref_audio_warmup_artifact_key: str | None = None
+
         # If this is a streaming request, we need to coerce
         # cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
@@ -2591,7 +2682,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     ref_audio_source = tts_params["ref_audio"][0]
                 if ref_audio_source is not None and isinstance(ref_audio_source, str):
                     wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
-                    tts_params["ref_audio"] = [[wav_list, sr]]
+                    artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio_source)
+                    if artifact_key:
+                        tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]
+                    ref_code_length = self._estimate_ref_code_len([wav_list, sr])
+                    if self._tts_model_type == "qwen3_tts" and ref_code_length is not None:
+                        tts_params["ref_code_length"] = [int(ref_code_length)]
+                    if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
+                        logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
+                    else:
+                        tts_params["ref_audio"] = [[wav_list, sr]]
+                        if self._tts_model_type == "qwen3_tts":
+                            qwen3_ref_audio_warmup_artifact_key = artifact_key
 
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = tokens_input(prompt_token_ids=[1] * ph_len)
@@ -2619,7 +2721,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             prompt = {"prompt": request.input}
 
-        request_id = request_id or f"speech-{random_uuid()}"
         if self._is_fish_speech:
             model_type = "fish_speech"
         elif self._tts_model_type == "covo_audio":
@@ -2756,6 +2857,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list=sampling_params_list,
             output_modalities=["audio"],
         )
+        self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(self, generator, request_id: str):
@@ -2770,8 +2872,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
-        async for chunk in self._generate_pcm_chunks(generator, request_id):
-            yield chunk
+        try:
+            async for chunk in self._generate_pcm_chunks(generator, request_id):
+                yield chunk
+        finally:
+            self._discard_ref_audio_artifact_warmup(request_id)
 
     async def _generate_audio_bytes(
         self,
@@ -2780,101 +2885,108 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str | None = None,
     ) -> tuple[bytes | str, str]:
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+        artifact_ready = False
 
-        # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
-        # async_chunk=false). The engine surfaces each yield as its own
-        # RequestOutput, so we need to accumulate across the async-for loop —
-        # final_output alone only carries the last (often empty) sentinel.
-        is_moss = self._tts_model_type == "moss_tts_nano"
-        moss_chunks: list[Any] = []
-        moss_sample_rate: int | None = None
+        try:
+            # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
+            # async_chunk=false). The engine surfaces each yield as its own
+            # RequestOutput, so we need to accumulate across the async-for loop —
+            # final_output alone only carries the last (often empty) sentinel.
+            is_moss = self._tts_model_type == "moss_tts_nano"
+            moss_chunks: list[Any] = []
+            moss_sample_rate: int | None = None
 
-        final_output: OmniRequestOutput | None = None
-        async for res in generator:
-            final_output = res
-            if not is_moss:
-                continue
-            try:
-                step_audio, step_key = self._extract_audio_output(res)
-            except Exception:
-                continue
-            if step_key is None:
-                continue
-            chunk = step_audio[step_key]
-            candidates = chunk if isinstance(chunk, list) else [chunk]
-            for cand in candidates:
-                if hasattr(cand, "numel") and cand.numel() > 0:
-                    moss_chunks.append(cand)
-            sr_step = step_audio.get("sr")
-            if sr_step is not None:
-                sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
-                moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
+            final_output: OmniRequestOutput | None = None
+            async for res in generator:
+                final_output = res
+                if not is_moss:
+                    continue
+                try:
+                    step_audio, step_key = self._extract_audio_output(res)
+                except Exception:
+                    continue
+                if step_key is None:
+                    continue
+                chunk = step_audio[step_key]
+                candidates = chunk if isinstance(chunk, list) else [chunk]
+                for cand in candidates:
+                    if hasattr(cand, "numel") and cand.numel() > 0:
+                        moss_chunks.append(cand)
+                sr_step = step_audio.get("sr")
+                if sr_step is not None:
+                    sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
+                    moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
 
-        if final_output is None:
-            raise ValueError("No output generated from the model.")
+            if final_output is None:
+                raise ValueError("No output generated from the model.")
 
-        audio_output, audio_key = self._extract_audio_output(final_output)
-        if audio_key is None:
-            raise ValueError("TTS model did not produce audio output.")
+            audio_output, audio_key = self._extract_audio_output(final_output)
+            if audio_key is None:
+                raise ValueError("TTS model did not produce audio output.")
 
-        audio_tensor = audio_output[audio_key]
-        sr_raw = audio_output.get("sr", 24000)
-        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-        sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+            audio_tensor = audio_output[audio_key]
+            sr_raw = audio_output.get("sr", 24000)
+            sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+            sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-        if is_moss:
-            # Prefer the engine's own consolidated audio when present. After the
-            # vllm 0.20 rebase non-stream requests resolve to FINAL_ONLY, so
-            # final_output already carries the full concatenated waveform; the
-            # delta-accumulator below is kept as a fallback for DELTA-style
-            # engines that surface chunks one yield at a time.
-            if isinstance(audio_tensor, list):
-                non_empty_final = [c for c in audio_tensor if hasattr(c, "numel") and c.numel() > 0]
-                final_audio = torch.cat(non_empty_final, dim=-1) if non_empty_final else None
-            elif hasattr(audio_tensor, "numel") and audio_tensor.numel() > 0:
-                final_audio = audio_tensor
-            else:
-                final_audio = None
+            if is_moss:
+                # Prefer the engine's own consolidated audio when present. After the
+                # vllm 0.20 rebase non-stream requests resolve to FINAL_ONLY, so
+                # final_output already carries the full concatenated waveform; the
+                # delta-accumulator below is kept as a fallback for DELTA-style
+                # engines that surface chunks one yield at a time.
+                if isinstance(audio_tensor, list):
+                    non_empty_final = [c for c in audio_tensor if hasattr(c, "numel") and c.numel() > 0]
+                    final_audio = torch.cat(non_empty_final, dim=-1) if non_empty_final else None
+                elif hasattr(audio_tensor, "numel") and audio_tensor.numel() > 0:
+                    final_audio = audio_tensor
+                else:
+                    final_audio = None
 
-            if final_audio is not None:
-                audio_tensor = final_audio
-            elif moss_chunks:
-                audio_tensor = torch.cat(moss_chunks, dim=-1)
-            else:
-                audio_tensor = np.zeros((0,), dtype=np.float32)
-            if moss_sample_rate is not None:
-                sample_rate = moss_sample_rate
-        elif isinstance(audio_tensor, list):
-            async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
-            if async_chunk:
-                non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
-                audio_tensor = (
-                    torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
-                )
-            else:
-                audio_history = audio_tensor
-                audio_tensor = np.zeros((0,), dtype=np.float32)
-                # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
-                for candidate in reversed(audio_history):
-                    if candidate.numel() > 0:
-                        audio_tensor = candidate
-                        break
-        if hasattr(audio_tensor, "float"):
-            audio_tensor = audio_tensor.float().detach().cpu().numpy()
+                if final_audio is not None:
+                    audio_tensor = final_audio
+                elif moss_chunks:
+                    audio_tensor = torch.cat(moss_chunks, dim=-1)
+                else:
+                    audio_tensor = np.zeros((0,), dtype=np.float32)
+                if moss_sample_rate is not None:
+                    sample_rate = moss_sample_rate
+            elif isinstance(audio_tensor, list):
+                async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
+                if async_chunk:
+                    non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+                    audio_tensor = (
+                        torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
+                    )
+                else:
+                    audio_history = audio_tensor
+                    audio_tensor = np.zeros((0,), dtype=np.float32)
+                    # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
+                    for candidate in reversed(audio_history):
+                        if candidate.numel() > 0:
+                            audio_tensor = candidate
+                            break
+            if hasattr(audio_tensor, "float"):
+                audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
-        if audio_tensor.ndim > 1:
-            audio_tensor = audio_tensor.squeeze()
+            if audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.squeeze()
 
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=sample_rate,
-            response_format=request.response_format or "wav",
-            speed=request.speed or 1.0,
-            stream_format=request.stream_format,
-            base64_encode=base64_encode,
-        )
-        audio_response: AudioResponse = self.create_audio(audio_obj)
-        return audio_response.audio_data, audio_response.media_type
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=sample_rate,
+                response_format=request.response_format or "wav",
+                speed=request.speed or 1.0,
+                stream_format=request.stream_format,
+                base64_encode=base64_encode,
+            )
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+            self._mark_ref_audio_artifact_ready_for_request(request_id)
+            artifact_ready = True
+            return audio_response.audio_data, audio_response.media_type
+        finally:
+            if not artifact_ready:
+                self._discard_ref_audio_artifact_warmup(request_id)
 
     async def _create_diffusion_speech(
         self,

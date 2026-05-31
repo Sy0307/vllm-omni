@@ -1,7 +1,5 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
-import os
-import time
 from typing import Any
 
 import torch
@@ -26,13 +24,6 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = init_logger(__name__)
-
-_REF_CONTEXT_PROFILE_ENABLED = os.environ.get("VLLM_OMNI_QWEN3_REF_AUDIO_PROFILE", "").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
 
 
 def talker2code2wav(
@@ -294,41 +285,17 @@ def talker2code2wav_async_chunk(
             ref_context_request_id = request_id
             emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
             if emitted_chunks <= 0:
-                tolist_start_s = time.perf_counter() if _REF_CONTEXT_PROFILE_ENABLED else 0.0
                 ref_frames = ref_context.tolist()
                 window_frames = ref_frames + window_frames
                 ref_context_included = True
-                if _REF_CONTEXT_PROFILE_ENABLED:
-                    tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
-                    logger.info(
-                        "Qwen3-TTS ref context profile: request_id=%s step=first_ref_tolist "
-                        "ref_frames=%d window_frames=%d ms=%.3f",
-                        request_id,
-                        ref_context_size,
-                        len(window_frames),
-                        tolist_ms,
-                    )
             left_context_size += ref_context_size
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
-    serialize_start_s = time.perf_counter() if _REF_CONTEXT_PROFILE_ENABLED else 0.0
     code_predictor_codes = torch.tensor(
         [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
         dtype=torch.long,
     )
-    if _REF_CONTEXT_PROFILE_ENABLED:
-        serialize_ms = (time.perf_counter() - serialize_start_s) * 1000.0
-        logger.info(
-            "Qwen3-TTS ref context profile: request_id=%s step=window_serialize "
-            "frames=%d q=%d ref_context_size=%d ref_included=%s ms=%.3f",
-            request_id,
-            num_frames,
-            num_quantizers,
-            ref_context_size,
-            ref_context_included,
-            serialize_ms,
-        )
 
     meta = MetaStruct(
         left_context_size=left_context_size,

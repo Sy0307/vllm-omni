@@ -26,6 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 from vllm_omni.utils.custom_voice_io import safe_voice_stem  # noqa: E402
 
 MANIFEST_NAME = "custom_voice_manifest.json"
+_SPEAKER_ENCODER_SAMPLE_RATE = 24000
+_SPEAKER_ENCODER_NUM_MELS = 128
+_SPEAKER_ENCODER_N_FFT = 1024
+_SPEAKER_ENCODER_HOP_SIZE = 256
+_SPEAKER_ENCODER_WIN_SIZE = 1024
+_SPEAKER_ENCODER_FMIN = 0
+_SPEAKER_ENCODER_FMAX = 12000
 
 
 def _resolve_model_dir(model: str) -> str:
@@ -93,17 +100,28 @@ def _speaker_embedding(
     sr: int,
     device: torch.device,
 ) -> torch.Tensor:
-    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-        _speaker_encoder_mel_kwargs,
-        mel_spectrogram,
-    )
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import mel_spectrogram
 
-    mel_kwargs = _speaker_encoder_mel_kwargs(speaker_encoder_config)
-    wav = _resample(wav, sr, int(mel_kwargs["sampling_rate"]))
+    target_sr = int(getattr(speaker_encoder_config, "sample_rate", _SPEAKER_ENCODER_SAMPLE_RATE))
+    mel_dim = int(getattr(speaker_encoder_config, "mel_dim", _SPEAKER_ENCODER_NUM_MELS))
+    if target_sr != _SPEAKER_ENCODER_SAMPLE_RATE or mel_dim != _SPEAKER_ENCODER_NUM_MELS:
+        raise ValueError(
+            "Unsupported Qwen3-TTS speaker encoder mel config for precompute: "
+            f"sample_rate={target_sr}, mel_dim={mel_dim}. "
+            f"Expected sample_rate={_SPEAKER_ENCODER_SAMPLE_RATE}, mel_dim={_SPEAKER_ENCODER_NUM_MELS} "
+            "to match the serving-time speaker embedding path."
+        )
+    wav = _resample(wav, sr, target_sr)
     wav_t = torch.from_numpy(wav).to(device=device, dtype=torch.float32)
     mels = mel_spectrogram(
         wav_t.unsqueeze(0),
-        **mel_kwargs,
+        n_fft=_SPEAKER_ENCODER_N_FFT,
+        num_mels=_SPEAKER_ENCODER_NUM_MELS,
+        sampling_rate=_SPEAKER_ENCODER_SAMPLE_RATE,
+        hop_size=_SPEAKER_ENCODER_HOP_SIZE,
+        win_size=_SPEAKER_ENCODER_WIN_SIZE,
+        fmin=_SPEAKER_ENCODER_FMIN,
+        fmax=_SPEAKER_ENCODER_FMAX,
     ).transpose(1, 2)
     with torch.inference_mode():
         return encoder(mels.to(device=device, dtype=torch.bfloat16))[0].float().cpu().contiguous()
