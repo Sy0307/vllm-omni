@@ -2683,7 +2683,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if ref_audio_source is not None and isinstance(ref_audio_source, str):
                     wav_list, sr = await self._resolve_ref_audio(ref_audio_source)
                     artifact_key = self._get_resolved_ref_audio_artifact_key(ref_audio_source)
-                    if artifact_key:
+                    if self._tts_model_type == "qwen3_tts" and artifact_key:
                         tts_params[_QWEN3_TTS_REF_AUDIO_CACHE_KEY] = [artifact_key]
                     ref_code_length = self._estimate_ref_code_len([wav_list, sr])
                     if self._tts_model_type == "qwen3_tts" and ref_code_length is not None:
