@@ -644,6 +644,20 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         hidden_size = self.vllm_config.model_config.get_hidden_size()
         return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, hidden_size)
 
+    @staticmethod
+    def _split_input_ids_for_requests(
+        input_ids: torch.Tensor,
+        seq_token_counts: list[int] | None = None,
+    ) -> list[torch.Tensor]:
+        ids = input_ids.reshape(-1)
+        if seq_token_counts is not None and len(seq_token_counts) > 1:
+            boundaries = [0]
+            for count in seq_token_counts:
+                boundaries.append(boundaries[-1] + int(count))
+            n = ids.numel()
+            return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
+        return [ids]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -652,6 +666,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         inputs_embeds: torch.Tensor | None = None,
         additional: dict | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
+        seq_token_counts: list[int] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | bytes:
         """
@@ -699,32 +714,34 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
                 device = input_ids.device
 
             dummy_audio = torch.zeros(1000, device=device, dtype=torch.float32)
+            num_outputs = len(seq_token_counts) if seq_token_counts else 1
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [dummy_audio]},
+                multimodal_outputs={"model_outputs": [dummy_audio] * num_outputs},
             )
 
         # ----- synchronous (full-sequence) path -----
         if isinstance(input_ids, torch.Tensor):
-            input_tokens = input_ids.flatten()
+            request_token_chunks = self._split_input_ids_for_requests(input_ids, seq_token_counts)
         else:
             input_tokens = input_ids if isinstance(input_ids, list) else [input_ids]
+            request_token_chunks = [torch.as_tensor(input_tokens, dtype=torch.long)]
 
         prompt_wav = self._default_prompt_wav
 
         if not os.path.exists(prompt_wav):
             raise FileNotFoundError(f"Token2Wav: prompt_wav file not found: {prompt_wav}")
 
-        waveform_tensor = self.token2wav(input_tokens, prompt_wav=prompt_wav, return_bytes=False)
-
-        if waveform_tensor.dim() == 2 and waveform_tensor.shape[0] == 1:
-            waveform_tensor = waveform_tensor.squeeze(0)
-
-        waveform_tensor_cpu = waveform_tensor.detach().cpu().contiguous()
+        waveform_outputs = []
+        for input_tokens in request_token_chunks:
+            waveform_tensor = self.token2wav(input_tokens, prompt_wav=prompt_wav, return_bytes=False)
+            if waveform_tensor.dim() == 2 and waveform_tensor.shape[0] == 1:
+                waveform_tensor = waveform_tensor.squeeze(0)
+            waveform_outputs.append(waveform_tensor.detach().cpu().contiguous())
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": [waveform_tensor_cpu]},
+            multimodal_outputs={"model_outputs": waveform_outputs},
         )
 
     # ------------------------------------------------------------------
