@@ -91,7 +91,10 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
 
       gpu_memory_utilization: 0.18  # Token2Wav needs less memory
-      enforce_eager: false       # Enable vLLM compile/CUDA Graph for Token2Wav
+      # Token2Wav runs full-sequence flow/HiFT synthesis with Python control
+      # flow and CPU output materialization, so keep vLLM CUDA Graph disabled
+      # for this stage. Stage 0 remains graph/compile enabled.
+      enforce_eager: true
       trust_remote_code: true
       async_scheduling: false
       enable_prefix_caching: false
