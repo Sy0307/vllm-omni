@@ -29,6 +29,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.adalayernorm import (
@@ -39,6 +40,23 @@ from vllm_omni.diffusion.layers.adalayernorm import (
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
+
+
+def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "QuantizationConfig | None":
+    """Return quant_config only if it is safe to propagate here, else None.
+
+    Dual-stream transformer_blocks, norm modulation layers, and norm_out are
+    kept at full precision for FP8 (see #2728). Offline quantization (e.g.
+    INC/AutoRound W4A16) needs the config propagated so packed weights load
+    correctly.
+    """
+    if quant_config is None:
+        return None
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+
+    if isinstance(quant_config, INCConfig):
+        return quant_config
+    return None
 
 
 class ColumnParallelApproxGELU(nn.Module):
@@ -381,7 +399,7 @@ class FluxSingleTransformerBlock(nn.Module):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle(dim, quant_config=quant_config, prefix=f"{prefix}.norm")
+        self.norm = AdaLayerNormZeroSingle(dim, quant_config=_safe_quant_config(quant_config), prefix=f"{prefix}.norm")
         self.proj_mlp = ReplicatedLinear(
             dim,
             self.mlp_hidden_dim,
@@ -510,6 +528,7 @@ class FluxTransformer2DModel(nn.Module):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -523,10 +542,10 @@ class FluxTransformer2DModel(nn.Module):
 
     def __init__(
         self,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig | None = None,
         patch_size: int = 1,
         in_channels: int = 64,
-        out_channels: int = None,
+        out_channels: int | None = None,
         num_layers: int = 19,
         num_single_layers: int = 38,
         attention_head_dim: int = 128,
@@ -568,7 +587,7 @@ class FluxTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
-                    quant_config=quant_config,
+                    quant_config=_safe_quant_config(quant_config),
                     prefix=f"transformer_blocks.{i}",
                 )
                 for i in range(num_layers)
@@ -593,7 +612,7 @@ class FluxTransformer2DModel(nn.Module):
             self.inner_dim,
             elementwise_affine=False,
             eps=1e-6,
-            quant_config=quant_config,
+            quant_config=_safe_quant_config(quant_config),
             prefix="norm_out",
         )
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)

@@ -8,6 +8,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_test
+
 
 class TestPreLookaheadLayer:
     """Tests for PreLookaheadLayer."""
@@ -18,6 +20,8 @@ class TestPreLookaheadLayer:
 
         return PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_forward_shape(self, layer):
         """Test that output shape matches input shape."""
         batch, seq_len, channels = 2, 10, 512
@@ -27,6 +31,8 @@ class TestPreLookaheadLayer:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_forward_with_context(self, layer):
         """Test forward with context for streaming."""
         batch, seq_len, channels = 1, 10, 512
@@ -38,6 +44,8 @@ class TestPreLookaheadLayer:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_residual_connection(self, layer):
         """Test that residual connection is applied."""
         batch, seq_len, channels = 1, 5, 512
@@ -59,6 +67,8 @@ class TestDiTAttention:
 
         return DiTAttention(dim=512, heads=8, dim_head=64, dropout=0.0)
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, attention):
         """Test attention output shape."""
         batch, seq_len, dim = 2, 16, 512
@@ -68,6 +78,8 @@ class TestDiTAttention:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_with_mask(self, attention):
         """Test attention with mask."""
         batch, seq_len, dim = 2, 16, 512
@@ -81,6 +93,8 @@ class TestDiTAttention:
         # Masked positions should be zero
         assert torch.allclose(out[:, -3:], torch.zeros_like(out[:, -3:]))
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_qkv_projections(self, attention):
         """Test that Q/K/V projections exist and have correct dimensions."""
         assert hasattr(attention, "to_q")
@@ -100,6 +114,8 @@ class TestDiTBlock:
 
         return DiTBlock(dim=512, heads=8, dim_head=64, ff_mult=4, dropout=0.0)
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, block):
         """Test block output shape."""
         batch, seq_len, dim = 2, 16, 512
@@ -110,6 +126,8 @@ class TestDiTBlock:
 
         assert out.shape == x.shape
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_adalayernorm_modulation(self, block):
         """Test that AdaLayerNorm modulates based on timestep."""
         batch, seq_len, dim = 1, 8, 512
@@ -144,6 +162,8 @@ class TestDiT:
             long_skip_connection=True,
         )
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_forward_shape(self, dit):
         """Test DiT forward output shape."""
         batch, mel_dim, seq_len = 1, 80, 32
@@ -158,6 +178,8 @@ class TestDiT:
 
         assert out.shape == (batch, mel_dim, seq_len)
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_timestep_embedding(self, dit):
         """Test that different timesteps produce different outputs."""
         batch, mel_dim, seq_len = 1, 80, 16
@@ -190,6 +212,8 @@ class TestCFM:
 
         return DummyEstimator()
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
     def test_causal_conditional_cfm_forward(self, dummy_estimator):
         """Test CausalConditionalCFM forward pass."""
         from omegaconf import DictConfig
@@ -228,6 +252,8 @@ class TestCFM:
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
 
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_float32_uses_sdpa(self):
         """Test that float32 inputs use SDPA fallback."""
         from vllm_omni.diffusion.attention.layer import Attention
@@ -267,7 +293,13 @@ def test_code2wav_forward_finalizes_hift_tail():
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
     model.hift = DummyHiFT()
-    model._forward_mel = lambda **_: torch.ones((1, 80, 8), dtype=torch.float32)
+    forward_mel_calls = []
+
+    def fake_forward_mel(**kwargs):
+        forward_mel_calls.append(kwargs)
+        return torch.ones((1, 80, 8), dtype=torch.float32)
+
+    model._forward_mel = fake_forward_mel
 
     out = model.forward(
         token=torch.tensor([[1, 2, 3]], dtype=torch.int32),
@@ -278,3 +310,4 @@ def test_code2wav_forward_finalizes_hift_tail():
 
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
+    assert forward_mel_calls[0]["token_offset_tokens"] == 0
