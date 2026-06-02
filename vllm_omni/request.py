@@ -39,6 +39,11 @@ class OmniRequest(Request):
     ):
         prompt_embeds_tensor = self._maybe_decode_prompt_embeds(prompt_embeds)
         super().__init__(prompt_embeds=prompt_embeds_tensor, *args, **kwargs)
+        # vLLM 0.21 no longer exposes these fields on Request/EngineCoreOutput,
+        # but Omni schedulers still use them internally for compatibility with
+        # older prefix-cache accounting paths.
+        self.num_cached_tokens = -1
+        self.num_external_computed_tokens = 0
         # Preserve serialized prompt embeddings payload (optional)
         self.prompt_embeds_payload: PromptEmbedsPayload | None = (
             prompt_embeds if isinstance(prompt_embeds, PromptEmbedsPayload) else None

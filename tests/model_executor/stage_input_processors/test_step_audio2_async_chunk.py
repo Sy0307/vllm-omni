@@ -47,6 +47,9 @@ def test_step_audio2_async_chunk_uses_decode_only_tokens_not_prompt_history():
     assert payload is not None
     assert payload["code_predictor_codes"] == [1, 2]
     assert payload["left_context_size"] == 1
+    assert payload["req_id"] == "rid-decode-only"
+    assert payload["stream_finished"] is True
+    assert payload["token_offset"] == 0
     assert payload["finished"].item() is True
 
 
@@ -94,6 +97,9 @@ def test_step_audio2_async_chunk_emits_non_last_chunk_and_advances_consumed_by_c
 
     assert payload is not None
     assert payload["left_context_size"] == 0
+    assert payload["req_id"] == "rid-ready"
+    assert payload["stream_finished"] is False
+    assert payload["token_offset"] == 0
     assert payload["finished"].item() is False
     assert payload["code_predictor_codes"] == list(range(required))
     assert transfer_manager.code_prompt_token_ids["rid-ready"] == list(range(chunk_size))
@@ -122,8 +128,10 @@ def test_step_audio2_async_chunk_emits_eof_when_finished_with_no_remaining_audio
         request=request,
     )
 
-    assert payload == {
-        "code_predictor_codes": [],
-        "left_context_size": 1,
-        "finished": torch.tensor(True, dtype=torch.bool),
-    }
+    assert payload is not None
+    assert payload["code_predictor_codes"] == []
+    assert payload["left_context_size"] == 1
+    assert payload["req_id"] == "rid-eof"
+    assert payload["stream_finished"] is True
+    assert payload["token_offset"] == 3
+    assert torch.equal(payload["finished"], torch.tensor(True, dtype=torch.bool))

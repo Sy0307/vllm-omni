@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage input processor for Step-Audio2: Thinker → Token2Wav transition."""
 
+import os
 from typing import Any
 
 import torch
@@ -15,6 +16,10 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 )
 
 logger = init_logger(__name__)
+
+
+def _debug_async_enabled() -> bool:
+    return os.environ.get("STEP_AUDIO2_DEBUG_ASYNC", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _ensure_list(x):
@@ -95,21 +100,47 @@ def thinker2token2wav_async_chunk(
     request_id = request.external_req_id
     consumed = len(transfer_manager.code_prompt_token_ids[request_id])
     available = len(audio_tokens) - consumed
+    if _debug_async_enabled():
+        logger.info(
+            "[StepAudio2 async] processor req=%s finished=%s generated=%d audio=%d "
+            "consumed=%d available=%d",
+            request_id,
+            finished,
+            len(generated_ids),
+            len(audio_tokens),
+            consumed,
+            available,
+        )
 
     if finished:
         # Last chunk: send all remaining tokens
         if available <= 0:
             # No audio tokens at all (text-only response) — send EOF marker
+            if _debug_async_enabled():
+                logger.info("[StepAudio2 async] processor send EOF req=%s consumed=%d", request_id, consumed)
             return {
                 "code_predictor_codes": [],
                 "left_context_size": 1,  # 1 = last chunk
+                "req_id": request_id,
+                "stream_finished": True,
+                "token_offset": consumed,
                 "finished": torch.tensor(True, dtype=torch.bool),
             }
         remaining_tokens = audio_tokens[consumed:]
         transfer_manager.code_prompt_token_ids[request_id].extend(remaining_tokens)
+        if _debug_async_enabled():
+            logger.info(
+                "[StepAudio2 async] processor send final req=%s tokens=%d offset=%d",
+                request_id,
+                len(remaining_tokens),
+                consumed,
+            )
         return {
             "code_predictor_codes": remaining_tokens,
             "left_context_size": 1,  # 1 = last chunk
+            "req_id": request_id,
+            "stream_finished": True,
+            "token_offset": consumed,
             "finished": torch.tensor(True, dtype=torch.bool),
         }
     else:
@@ -120,9 +151,20 @@ def thinker2token2wav_async_chunk(
         chunk_tokens = audio_tokens[consumed : consumed + required]
         # Only consume chunk_size tokens; the lookahead portion is re-used
         transfer_manager.code_prompt_token_ids[request_id].extend(audio_tokens[consumed : consumed + chunk_size])
+        if _debug_async_enabled():
+            logger.info(
+                "[StepAudio2 async] processor send chunk req=%s tokens=%d offset=%d consume=%d",
+                request_id,
+                len(chunk_tokens),
+                consumed,
+                chunk_size,
+            )
         return {
             "code_predictor_codes": chunk_tokens,
             "left_context_size": 0,  # 0 = not last chunk
+            "req_id": request_id,
+            "stream_finished": False,
+            "token_offset": consumed,
             "finished": torch.tensor(False, dtype=torch.bool),
         }
 

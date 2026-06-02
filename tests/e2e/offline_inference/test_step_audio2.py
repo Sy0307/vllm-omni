@@ -237,6 +237,62 @@ def test_has_audio_output():
 
 
 @pytest.mark.core_model
+def test_text_processor_does_not_create_empty_audio_payload():
+    """Pure text prompts should stay text-only until real audio is present."""
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2MultiModalProcessor,
+        StepAudio2Processor,
+    )
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+    encoded = StepAudio2Processor(DummyTokenizer())("hello")
+
+    assert "audio_mels" not in encoded
+    assert "audio_lens" not in encoded
+    assert StepAudio2MultiModalProcessor._get_mm_fields_config(object(), encoded, {}) == {}
+
+
+@pytest.mark.core_model
+def test_text_prompt_does_not_register_audio_replacements():
+    """Pure text prompts should not enter the audio placeholder path."""
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2MultiModalProcessor,
+    )
+
+    class EmptyMMItems:
+        def get(self, key, default=None):
+            return default
+
+    updates = StepAudio2MultiModalProcessor._get_prompt_updates(
+        object(),
+        EmptyMMItems(),
+        {},
+        object(),
+    )
+
+    assert updates == []
+
+
+@pytest.mark.core_model
+def test_empty_audio_placeholder_is_ignored():
+    """Empty processor placeholders should not run the audio encoder."""
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import (
+        StepAudio2ThinkerForConditionalGeneration,
+    )
+
+    parsed = StepAudio2ThinkerForConditionalGeneration._parse_and_validate_audio_input(
+        object(),
+        audio_mels=torch.empty((0, 128, 0)),
+        audio_lens=torch.empty((0,), dtype=torch.int32),
+    )
+
+    assert parsed is None
+
+
+@pytest.mark.core_model
 @pytest.mark.parametrize("test_config", test_params)
 @create_new_process_for_each_test()
 def test_audio_to_text_and_audio(step_audio2_runner: type[StepAudio2OmniRunner], test_config: tuple[str, str]) -> None:

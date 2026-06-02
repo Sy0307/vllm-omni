@@ -876,7 +876,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
             logits,
             hidden_states,
             scheduler_output.total_num_scheduled_tokens,
-            spec_decode_metadata,
         )
 
         with record_function_or_nullcontext("draft_token"):

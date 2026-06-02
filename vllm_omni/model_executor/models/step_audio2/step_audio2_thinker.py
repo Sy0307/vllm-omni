@@ -10,7 +10,9 @@ This file contains:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import librosa
@@ -18,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
 from transformers.processing_utils import ProcessorMixin
@@ -45,12 +48,18 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_MODEL_CONFIG,
     DEFAULT_TOKEN_CONFIG,
+    STEP_AUDIO2_AUDIO_END,
     STEP_AUDIO2_AUDIO_PATCH_TOKEN_ID,
+    STEP_AUDIO2_AUDIO_START,
+    STEP_AUDIO2_AUDIO_VOCAB_SIZE,
 )
 
 if TYPE_CHECKING:
@@ -389,8 +398,6 @@ class StepAudio2Processor(ProcessorMixin):
         encoded = self.tokenizer(text, **tok_kwargs)
 
         if audio is None:
-            encoded["audio_mels"] = torch.empty((0, 128, 0))
-            encoded["audio_lens"] = torch.tensor([], dtype=torch.int32)
             return encoded
 
         audio_list = list(audio) if isinstance(audio, (list, tuple)) else [audio]
@@ -479,6 +486,9 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         Use flat_from_sizes to keep one mm item per audio, so downstream mm_kwargs
         alignment does not collapse to a single item.
         """
+        if "audio_mels" not in hf_inputs and "audio_lens" not in hf_inputs:
+            return {}
+
         audio_lens = hf_inputs.get("audio_lens", torch.empty(0))
         if isinstance(audio_lens, torch.Tensor):
             lens_tensor = audio_lens.flatten()
@@ -500,12 +510,14 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        audio_items = mm_items.get("audio", [])
+        num_audio_items = len(audio_items) if audio_items else 0
+        if num_audio_items == 0:
+            return []
+
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
         audio_token = getattr(processor, "audio_token", "<audio_patch>")
-
-        audio_items = mm_items.get("audio", [])
-        num_audio_items = len(audio_items) if audio_items else 0
 
         out_mm_data = out_mm_kwargs.get_data()
         audio_lens = out_mm_data.get("audio_lens")
@@ -523,15 +535,12 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
                     feature_lens.append(feature_len)
 
         # CRITICAL: Align feature_lens with mm_items['audio'] count
-        if num_audio_items > 0:
-            if len(feature_lens) < num_audio_items:
-                default_feature_len = 250
-                pad_count = num_audio_items - len(feature_lens)
-                feature_lens.extend([default_feature_len] * pad_count)
-            elif len(feature_lens) > num_audio_items:
-                feature_lens = feature_lens[:num_audio_items]
-        elif not feature_lens:
-            feature_lens = [250]
+        if len(feature_lens) < num_audio_items:
+            default_feature_len = 250
+            pad_count = num_audio_items - len(feature_lens)
+            feature_lens.extend([default_feature_len] * pad_count)
+        elif len(feature_lens) > num_audio_items:
+            feature_lens = feature_lens[:num_audio_items]
 
         def get_replacement_audio(item_idx: int):
             """Generate replacement tokens for audio placeholder.
@@ -564,6 +573,7 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         """Call HF processor and post-process outputs"""
         mm_data = dict(mm_data)
         audios = mm_data.pop("audios", [])
+        has_audio = bool(audios) or bool(mm_data.get("audio"))
 
         mm_kwargs = mm_kwargs or {}
         tok_kwargs = tok_kwargs or {}
@@ -584,9 +594,9 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             tok_kwargs=tok_kwargs,
         )
 
-        if "audio_mels" not in hf_inputs:
+        if has_audio and "audio_mels" not in hf_inputs:
             hf_inputs["audio_mels"] = torch.empty((0, 128, 0))
-        if "audio_lens" not in hf_inputs:
+        if has_audio and "audio_lens" not in hf_inputs:
             hf_inputs["audio_lens"] = torch.tensor([], dtype=torch.int32)
 
         return hf_inputs
@@ -611,6 +621,10 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         Adaptor (512 → LLM dim) →
         Qwen2 LLM (vocab=64012)
     """
+
+    # Step-Audio2 passes generated audio token IDs to Token2Wav; downstream
+    # processors do not consume hidden-state pooler output.
+    skip_pooler_output = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -669,6 +683,20 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
             kernel_size=kernel_size,
             stride=adapter_stride,
         )
+        self._audio_logits_slice_enabled = os.getenv("VLLM_OMNI_STEP_AUDIO2_AUDIO_LOGITS_SLICE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._audio_sampler_slice_enabled = os.getenv("VLLM_OMNI_STEP_AUDIO2_AUDIO_SAMPLER_SLICE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._audio_slice_sampler = Sampler() if self._audio_sampler_slice_enabled else None
+        self.prefer_model_sampler = self._audio_sampler_slice_enabled
 
         from transformers import PretrainedConfig
 
@@ -710,6 +738,10 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_lens = kwargs.get("audio_lens", None)
 
         if audio_mels is None:
+            return None
+        if isinstance(audio_mels, torch.Tensor) and audio_mels.numel() == 0:
+            return None
+        if isinstance(audio_lens, torch.Tensor) and audio_lens.numel() == 0:
             return None
 
         if isinstance(audio_mels, torch.Tensor):
@@ -809,16 +841,19 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         if intermediate_tensors is not None:
             inputs_embeds = None
         elif inputs_embeds is None:
-            audio_embeddings = self.get_multimodal_embeddings(**kwargs)
-            inputs_embeds = self.get_input_embeddings(input_ids, audio_embeddings)
+            with record_function("step_audio2.forward.get_multimodal_embeddings"):
+                audio_embeddings = self.get_multimodal_embeddings(**kwargs)
+            with record_function("step_audio2.forward.get_input_embeddings"):
+                inputs_embeds = self.get_input_embeddings(input_ids, audio_embeddings)
             input_ids = None
 
-        hidden_states = self.language_model(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )
+        with record_function("step_audio2.forward.language_model"):
+            hidden_states = self.language_model(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
 
         return OmniOutput(
             text_hidden_states=hidden_states,
@@ -828,8 +863,120 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata: Any = None,
     ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(hidden_states)
+        if self._should_use_audio_logits_slice(hidden_states, sampling_metadata):
+            with record_function("step_audio2.compute_logits.audio_slice"):
+                return self._compute_audio_slice_logits(hidden_states)
+        with record_function("step_audio2.compute_logits.full"):
+            return self.language_model.compute_logits(hidden_states)
+
+    def _should_use_audio_logits_slice(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: Any,
+    ) -> bool:
+        if not self._audio_logits_slice_enabled:
+            return False
+        if sampling_metadata is None:
+            return False
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+        if not isinstance(output_token_ids, list):
+            return False
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != len(output_token_ids):
+            return False
+        # Step-Audio2 TTS emits one text/control token followed by four audio
+        # tokens. Only use sliced audio projection when every active row is
+        # about to sample one of those four audio-token positions.
+        return all((len(tokens) % 5) in {1, 2, 3, 4} for tokens in output_token_ids)
+
+    def _compute_audio_slice_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        lm_head = getattr(self.language_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            return self.language_model.compute_logits(hidden_states)
+
+        weight = lm_head.weight
+        vocab_size = weight.shape[0]
+        if STEP_AUDIO2_AUDIO_END >= vocab_size:
+            return self.language_model.compute_logits(hidden_states)
+
+        audio_weight = weight[STEP_AUDIO2_AUDIO_START : STEP_AUDIO2_AUDIO_END + 1]
+        bias = getattr(lm_head, "bias", None)
+        audio_bias = None
+        if bias is not None:
+            audio_bias = bias[STEP_AUDIO2_AUDIO_START : STEP_AUDIO2_AUDIO_END + 1]
+        audio_logits = F.linear(hidden_states, audio_weight, audio_bias)
+
+        logits = audio_logits.new_full((hidden_states.shape[0], vocab_size), float("-inf"))
+        logits[:, STEP_AUDIO2_AUDIO_START : STEP_AUDIO2_AUDIO_END + 1] = audio_logits
+        return logits
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput | None:
+        if not self._should_use_audio_sampler_slice(logits, sampling_metadata):
+            return None
+
+        assert self._audio_slice_sampler is not None
+        audio_logits = logits[:, STEP_AUDIO2_AUDIO_START : STEP_AUDIO2_AUDIO_END + 1]
+        compact_metadata = self._compact_audio_sampling_metadata(sampling_metadata)
+        with record_function("step_audio2.sample.audio_slice"):
+            sampler_output = self._audio_slice_sampler(audio_logits, compact_metadata)
+        sampler_output.sampled_token_ids.add_(STEP_AUDIO2_AUDIO_START)
+        return sampler_output
+
+    def _should_use_audio_sampler_slice(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        if not self._audio_sampler_slice_enabled:
+            return False
+        if self._audio_slice_sampler is None:
+            return False
+        if sampling_metadata.max_num_logprobs is not None or sampling_metadata.logprob_token_ids:
+            return False
+        if logits.ndim != 2 or STEP_AUDIO2_AUDIO_END >= logits.shape[-1]:
+            return False
+        return self._should_use_audio_logits_slice(logits, sampling_metadata)
+
+    def _compact_audio_sampling_metadata(
+        self,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplingMetadata:
+        vocab_size = STEP_AUDIO2_AUDIO_VOCAB_SIZE
+
+        prompt_token_ids = sampling_metadata.prompt_token_ids
+        if prompt_token_ids is not None:
+            prompt_token_ids = prompt_token_ids.clone()
+            audio_mask = (prompt_token_ids >= STEP_AUDIO2_AUDIO_START) & (prompt_token_ids <= STEP_AUDIO2_AUDIO_END)
+            prompt_token_ids.sub_(STEP_AUDIO2_AUDIO_START)
+            prompt_token_ids.masked_fill_(~audio_mask, vocab_size)
+
+        output_token_ids = []
+        for tokens in sampling_metadata.output_token_ids:
+            output_token_ids.append(
+                [
+                    token_id - STEP_AUDIO2_AUDIO_START
+                    for token_id in tokens
+                    if STEP_AUDIO2_AUDIO_START <= token_id <= STEP_AUDIO2_AUDIO_END
+                ]
+            )
+
+        top_k = sampling_metadata.top_k
+        if top_k is not None:
+            top_k = torch.clamp(top_k, max=vocab_size)
+
+        return replace(
+            sampling_metadata,
+            top_k=top_k,
+            prompt_token_ids=prompt_token_ids,
+            output_token_ids=output_token_ids,
+            allowed_token_ids_mask=None,
+            bad_words_token_ids={},
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with name mapping from HuggingFace to vLLM structure"""

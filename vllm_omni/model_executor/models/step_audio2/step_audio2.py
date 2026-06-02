@@ -6,6 +6,7 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from .step_audio2_thinker import (
     StepAudio2DummyInputsBuilder,
@@ -90,6 +91,7 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
         self.make_empty_intermediate_tensors = (
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
+        self.prefer_model_sampler = bool(getattr(self.model, "prefer_model_sampler", False))
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -163,9 +165,19 @@ class StepAudio2ForConditionalGeneration(nn.Module, SupportsMultiModal, Supports
             **kwargs,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata | None = None,
+    ) -> torch.Tensor | None:
         """Compute logits from hidden states"""
-        return self.model.compute_logits(hidden_states)
+        return self.model.compute_logits(hidden_states, sampling_metadata=sampling_metadata)
+
+    def sample(self, logits: torch.Tensor, sampling_metadata):
+        sample = getattr(self.model, "sample", None)
+        if callable(sample):
+            return sample(logits, sampling_metadata)
+        return None
 
     def load_weights(self, weights):
         """Load weights"""

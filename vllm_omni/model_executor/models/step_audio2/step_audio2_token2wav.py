@@ -1,5 +1,6 @@
 import io
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +35,10 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 )
 
 logger = init_logger(__name__)
+
+
+def _debug_async_enabled() -> bool:
+    return os.environ.get("STEP_AUDIO2_DEBUG_ASYNC", "").lower() in {"1", "true", "yes", "on"}
 
 
 def fade_in_out(
@@ -139,6 +144,29 @@ class StepAudio2Token2WavCore(nn.Module):
         self._models_loaded = True
         logger.info("Token2Wav models loaded successfully")
 
+    def warmup_prompt(self, prompt_wav: str) -> None:
+        """Load Token2Wav and prepare prompt artifacts without changing RNG state."""
+        if not os.path.exists(prompt_wav):
+            return
+
+        cpu_rng_state = torch.random.get_rng_state()
+        default_dtype = torch.get_default_dtype()
+        cuda_rng_states = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            cuda_rng_states = torch.cuda.get_rng_state_all()
+
+        try:
+            torch.set_default_dtype(torch.float32)
+            with torch.amp.autocast(str(self.device.type), enabled=False):
+                self._ensure_models_loaded()
+                if prompt_wav not in self.cache:
+                    self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
+        finally:
+            torch.set_default_dtype(default_dtype)
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_states is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_states)
+
     @property
     def audio_tokenizer(self):
         """Lazy-loaded audio tokenizer"""
@@ -210,7 +238,10 @@ class StepAudio2Token2WavCore(nn.Module):
         return prompt_speech_tokens, prompt_speech_tokens_lens, spk_emb, prompt_mels, prompt_mels_lens
 
     def forward(
-        self, generated_speech_tokens: list, prompt_wav: str, return_bytes: bool = True
+        self,
+        generated_speech_tokens: list | torch.Tensor,
+        prompt_wav: str,
+        return_bytes: bool = True,
     ) -> torch.Tensor | bytes:
         """
         Convert audio tokens to waveform
@@ -227,7 +258,20 @@ class StepAudio2Token2WavCore(nn.Module):
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         prompt_speech_tokens, prompt_speech_tokens_lens, spk_emb, prompt_mels, prompt_mels_lens = self.cache[prompt_wav]
 
-        generated_speech_tokens = torch.tensor([generated_speech_tokens], dtype=torch.int32, device=self.device)
+        if isinstance(generated_speech_tokens, torch.Tensor):
+            if generated_speech_tokens.dim() == 1:
+                generated_speech_tokens = generated_speech_tokens.unsqueeze(0)
+            generated_speech_tokens = generated_speech_tokens.to(
+                device=self.device,
+                dtype=torch.int32,
+                non_blocking=True,
+            )
+        else:
+            generated_speech_tokens = torch.tensor(
+                [generated_speech_tokens],
+                dtype=torch.int32,
+                device=self.device,
+            )
         generated_speech_tokens_lens = torch.tensor(
             [generated_speech_tokens.shape[1]], dtype=torch.int32, device=self.device
         )
@@ -378,6 +422,8 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def setup_stream_for(self, prompt_wav: str, state: _StreamState) -> None:
         """Initialise flow + HiFT caches into *state* (no self mutation)."""
+        debug_async = _debug_async_enabled()
+        start_time = time.perf_counter() if debug_async else 0.0
         if prompt_wav not in self.cache:
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         prompt_speech_tokens, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
@@ -388,21 +434,29 @@ class StepAudio2Token2WavCore(nn.Module):
             )
 
         pre_lookahead = DEFAULT_STREAM_CONFIG.pre_lookahead_len
-        state.stream_cache = self.flow.setup_cache(
-            torch.cat(
-                [prompt_speech_tokens, prompt_speech_tokens[:, :pre_lookahead]],
-                dim=1,
-            ),
-            prompt_mels,
-            spk_emb,
-            n_timesteps=self.n_timesteps,
-        )
+        setup_cache_start = time.perf_counter() if debug_async else 0.0
+        with torch.amp.autocast(str(self.device.type), enabled=False):
+            state.stream_cache = self.flow.setup_cache(
+                torch.cat(
+                    [prompt_speech_tokens, prompt_speech_tokens[:, :pre_lookahead]],
+                    dim=1,
+                ),
+                prompt_mels,
+                spk_emb,
+                n_timesteps=self.n_timesteps,
+            )
         state.hift_cache_dict = {
             "mel": torch.zeros(1, prompt_mels.shape[2], 0, device=self.device),
             "source": torch.zeros(1, 1, 0, device=self.device),
             "speech": torch.zeros(1, 0, device=self.device),
         }
         state.setup_done = True
+        if debug_async:
+            logger.info(
+                "[StepAudio2 async] setup_stream_for done setup_cache=%.3fs total=%.3fs",
+                time.perf_counter() - setup_cache_start,
+                time.perf_counter() - start_time,
+            )
 
     def stream_chunk_for(
         self,
@@ -414,6 +468,8 @@ class StepAudio2Token2WavCore(nn.Module):
         """Process one chunk using *state* (no self mutation except speech_window)."""
         if state.stream_cache is None:
             raise ValueError("stream_cache not initialised – call setup_stream_for() first")
+        debug_async = _debug_async_enabled()
+        start_time = time.perf_counter() if debug_async else 0.0
 
         if prompt_wav not in self.cache:
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
@@ -421,6 +477,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
         token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
 
+        flow_start = time.perf_counter() if debug_async else 0.0
         with torch.amp.autocast(
             str(self.device.type),
             dtype=torch.float16 if self.float16 else torch.float32,
@@ -432,6 +489,7 @@ class StepAudio2Token2WavCore(nn.Module):
                 last_chunk=last_chunk,
                 n_timesteps=self.n_timesteps,
             )
+        flow_elapsed = time.perf_counter() - flow_start if debug_async else 0.0
 
         # Trim estimator attention cache to avoid unbounded growth
         keep = DEFAULT_STREAM_CONFIG.estimator_cache_keep
@@ -451,7 +509,9 @@ class StepAudio2Token2WavCore(nn.Module):
         hift_cache_speech = state.hift_cache_dict["speech"]
 
         mel = torch.cat([hift_cache_mel, chunk_mel], dim=2)
+        hift_start = time.perf_counter() if debug_async else 0.0
         speech, source = self.hift(mel, hift_cache_source)
+        hift_elapsed = time.perf_counter() - hift_start if debug_async else 0.0
 
         if hift_cache_speech.shape[-1] > 0:
             speech = fade_in_out(speech, hift_cache_speech, self.speech_window)
@@ -464,6 +524,17 @@ class StepAudio2Token2WavCore(nn.Module):
 
         if not last_chunk:
             speech = speech[:, : -self.source_cache_len]
+
+        if debug_async:
+            logger.info(
+                "[StepAudio2 async] stream_chunk_for done tokens=%d last=%s flow=%.3fs hift=%.3fs total=%.3fs samples=%d",
+                len(audio_tokens),
+                last_chunk,
+                flow_elapsed,
+                hift_elapsed,
+                time.perf_counter() - start_time,
+                speech.numel(),
+            )
 
         return speech.squeeze(0)
 
@@ -490,9 +561,9 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
 
+        model_name_or_path = vllm_config.model_config.model
         model_path = getattr(self.config, "token2wav_path", None)
         if model_path is None:
-            model_name_or_path = vllm_config.model_config.model
             # Resolve HF repo names to local cache path
             if not os.path.isdir(model_name_or_path):
                 from huggingface_hub import snapshot_download
@@ -509,16 +580,28 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         self.token2wav = StepAudio2Token2WavCore(model_path=model_path, float16=float16, device=device)
 
         self.have_multimodal_outputs = True
+        # Token2Wav is a flow/vocoder stage. It consumes codec token IDs and
+        # does not use vLLM attention metadata or KV slot mappings.
+        self.skip_vllm_attention_metadata = True
         # Required for the runner to pass async_chunk info via
         # runtime_additional_information on every forward step.
         self.enable_update_additional_information = True
 
-        # Per-request streaming states (ordered list matching batch order).
-        self._stream_states: list[_StreamState] = []
+        # Per-request streaming states. Async chunk payloads include req_id
+        # when they come from the StepAudio2 stage input processor; a legacy
+        # single-slot fallback is kept for older payloads that only carry
+        # left_context_size.
+        self._stream_states_by_req: dict[str, _StreamState] = {}
+        self._legacy_stream_state: _StreamState | None = None
 
         # Resolve default prompt wav path from model directory.
         # Priority: env var > {model_dir}/assets/default_female.wav > bare filename (cwd)
         self._default_prompt_wav = self._resolve_prompt_wav(model_name_or_path)
+        if os.path.exists(self._default_prompt_wav):
+            try:
+                self.token2wav.warmup_prompt(self._default_prompt_wav)
+            except Exception as exc:
+                logger.warning("Token2Wav prompt warmup failed; first request will warm lazily: %s", exc)
 
         self.make_empty_intermediate_tensors = lambda: None
 
@@ -595,7 +678,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         # [{}]), so a bare truthiness check would incorrectly enter this
         # branch in synchronous mode.
         if runtime_additional_information and any(
-            "left_context_size" in info for info in runtime_additional_information
+            "left_context_size" in info or "stream_finished" in info for info in runtime_additional_information
         ):
             return self._forward_async_chunk(input_ids, runtime_additional_information, **kwargs)
 
@@ -623,19 +706,16 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
         # ----- synchronous (full-sequence) path -----
         if isinstance(input_ids, torch.Tensor):
-            if input_ids.dim() == 1:
-                input_ids_list = input_ids.cpu().tolist()
-            else:
-                input_ids_list = input_ids[0].cpu().tolist()
+            input_tokens = input_ids.flatten()
         else:
-            input_ids_list = input_ids if isinstance(input_ids, list) else [input_ids]
+            input_tokens = input_ids if isinstance(input_ids, list) else [input_ids]
 
         prompt_wav = self._default_prompt_wav
 
         if not os.path.exists(prompt_wav):
             raise FileNotFoundError(f"Token2Wav: prompt_wav file not found: {prompt_wav}")
 
-        waveform_tensor = self.token2wav(input_ids_list, prompt_wav=prompt_wav, return_bytes=False)
+        waveform_tensor = self.token2wav(input_tokens, prompt_wav=prompt_wav, return_bytes=False)
 
         if waveform_tensor.dim() == 2 and waveform_tensor.shape[0] == 1:
             waveform_tensor = waveform_tensor.squeeze(0)
@@ -659,41 +739,54 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
     ) -> OmniOutput:
         """Handle one async_chunk forward step (batch=1).
 
-        The end-of-stream flag is encoded as ``left_context_size == 1``
-        (the only field the framework transparently forwards from the
-        async_chunk payload to ``request.additional_information``).
+        Newer StepAudio2 async payloads include ``req_id`` and
+        ``stream_finished``. ``left_context_size == 1`` remains the legacy
+        end-of-stream marker.
         """
         # --- batch=1 guard ---
-        batch_size = sum(1 for info in runtime_additional_information if "left_context_size" in info)
+        batch_size = sum(
+            1
+            for info in runtime_additional_information
+            if "left_context_size" in info or "stream_finished" in info
+        )
         if batch_size != 1:
             raise RuntimeError(
                 f"Token2Wav async_chunk only supports batch=1, got {batch_size}. "
                 "Batch>1 requires framework support for batch_req_ids."
             )
 
-        info = next(info for info in runtime_additional_information if "left_context_size" in info)
-        last_chunk = info.get("left_context_size", 0) == 1
+        info = next(
+            info
+            for info in runtime_additional_information
+            if "left_context_size" in info or "stream_finished" in info
+        )
+        last_chunk = bool(info.get("stream_finished", False)) or info.get("left_context_size", 0) == 1
+        req_id = info.get("req_id")
+        req_key = str(req_id) if req_id is not None else None
 
-        # --- Manage single stream state ---
-        # If the previous request was preempted (setup_done but not finished),
-        # its stale caches must be discarded before we start a new session.
-        if self._stream_states and not self._stream_states[0].finished:
-            state = self._stream_states[0]
-            if state.setup_done and not last_chunk:
-                # Heuristic: a non-last chunk arriving into an already-active
-                # state that we did NOT set up this call means a new request
-                # reused the slot.  For a genuinely continuing request the
-                # state is fine; we cannot distinguish without request IDs,
-                # so we only forcibly reset on an explicit new-session signal
-                # (setup_done=True but stream_cache already consumed all
-                # previous data -- detected below when stream_chunk fails).
-                pass
-        if not self._stream_states or self._stream_states[0].finished:
-            self._stream_states = [_StreamState()]
-        state = self._stream_states[0]
+        if req_key is not None:
+            state = self._stream_states_by_req.get(req_key)
+            if state is None or state.finished:
+                state = _StreamState()
+                self._stream_states_by_req[req_key] = state
+        else:
+            if self._legacy_stream_state is None or self._legacy_stream_state.finished:
+                self._legacy_stream_state = _StreamState()
+            state = self._legacy_stream_state
 
         # --- Extract audio tokens ---
         audio_tokens = input_ids.flatten().cpu().tolist()
+        if _debug_async_enabled():
+            logger.info(
+                "[StepAudio2 async] forward req=%s tokens=%d last=%s offset=%s first=%s last_ids=%s setup_states=%d",
+                req_key,
+                len(audio_tokens),
+                last_chunk,
+                info.get("token_offset"),
+                audio_tokens[:5],
+                audio_tokens[-5:],
+                len(self._stream_states_by_req),
+            )
 
         # Empty chunk (e.g. EOF with no audio tokens)
         if not audio_tokens:
@@ -701,6 +794,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
                 self.token2wav.reset_stream_for(state)
             else:
                 state.finished = True
+            if req_key is not None:
+                self._stream_states_by_req.pop(req_key, None)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [torch.zeros(1, dtype=torch.float32)]},
@@ -728,6 +823,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
         if last_chunk:
             self.token2wav.reset_stream_for(state)
+            if req_key is not None:
+                self._stream_states_by_req.pop(req_key, None)
 
         return OmniOutput(
             text_hidden_states=None,
