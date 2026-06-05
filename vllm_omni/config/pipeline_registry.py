@@ -73,6 +73,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.dreamzero.pipeline",
         "DREAMZERO_PIPELINE",
     ),
+    "pi0": (
+        "vllm_omni.model_executor.models.pi0.pipeline",
+        "PI0_PIPELINE",
+    ),
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
