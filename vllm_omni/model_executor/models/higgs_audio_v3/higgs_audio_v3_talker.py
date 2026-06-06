@@ -278,8 +278,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 info_dicts = kwargs.get("runtime_additional_information")
             hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)
 
-        # Audio feedback at decode: replace continuation token embeddings
-        if input_ids is not None and inputs_embeds is None:
+        # Audio feedback at decode only: replace continuation token embeddings.
+        # Must NOT run during prefill — prefill bs can be >> buffer capacity,
+        # triggering buffer growth that wipes in-flight decode state, and
+        # buffer indices don't correspond to decode slot indices.
+        if input_ids is not None and inputs_embeds is None and not is_prefill:
             hidden_states = self._apply_audio_feedback(hidden_states, input_ids)
 
         residual: torch.Tensor | None = None
@@ -411,11 +414,14 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._decode_last_codes = self._decode_last_codes.to(hidden_states.device)
             self._decode_has_codes = self._decode_has_codes.to(hidden_states.device)
         if bs > self._decode_last_codes.shape[0]:
-            new_size = max(bs, self._decode_last_codes.shape[0] * 2)
-            self._decode_last_codes = torch.zeros(
-                new_size, self.num_codebooks, dtype=torch.long, device=hidden_states.device
-            )
-            self._decode_has_codes = torch.zeros(new_size, dtype=torch.bool, device=hidden_states.device)
+            old_size = self._decode_last_codes.shape[0]
+            new_size = max(bs, old_size * 2)
+            new_codes = torch.zeros(new_size, self.num_codebooks, dtype=torch.long, device=hidden_states.device)
+            new_has = torch.zeros(new_size, dtype=torch.bool, device=hidden_states.device)
+            new_codes[:old_size] = self._decode_last_codes
+            new_has[:old_size] = self._decode_has_codes
+            self._decode_last_codes = new_codes
+            self._decode_has_codes = new_has
 
         # Compute audio embeddings from last_codes for ALL rows (graph-safe)
         codes_slice = self._decode_last_codes[:bs]  # [bs, N]
@@ -560,14 +566,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     this_codes[: last_eos_idx + 1] = eos_stream
                     num_remaining_delays = num_codebooks - last_eos_idx - 1
 
-            if num_remaining_delays is not None and num_remaining_delays <= 0:
-                # Ramp-down complete — terminate
-                state["num_delay"] = 0
-                state["num_remaining_delays"] = None
-                state["should_terminate"] = True
-                new_codes_flat.append(torch.full_like(this_codes, -1))
-                continue
-
+            # Always emit current codes first, then check termination.
+            # Previous logic discarded the last ramp-down frame (done-before-emit),
+            # causing T < Q when EOC fires early, crashing Stage1.
             state["num_delay"] = num_delay
             state["num_remaining_delays"] = num_remaining_delays
             state["last_codes"] = this_codes.clone()
@@ -579,6 +580,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             else:
                 state["audio_out_ids"] = torch.cat([state["audio_out_ids"], this_codes.unsqueeze(-1)], dim=-1)
             new_codes_flat.append(this_codes)
+
+            if num_remaining_delays is not None and num_remaining_delays <= 0:
+                state["should_terminate"] = True
 
         # Build full codes tensor [batch_size, num_codebooks]
         # -1 marks "no audio code at this position"
