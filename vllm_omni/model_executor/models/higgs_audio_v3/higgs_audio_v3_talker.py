@@ -250,7 +250,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if input_ids is not None:
             self._last_step_input_ids = input_ids
 
-        # Stash query_start_loc for _apply_audio_mode_bias
+        # Stash query_start_loc and max_query_len for prefill detection
+        _max_query_len = None
         try:
             from vllm.forward_context import get_forward_context
 
@@ -264,13 +265,19 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 self._last_step_query_start_loc = qsl.detach().clone()
             else:
                 self._last_step_query_start_loc = None
+            _max_query_len = getattr(attn, "max_query_len", None)
         except Exception:
             self._last_step_query_start_loc = None
 
-        # Prefill-only operations: ref audio substitution and audio feedback
-        # require Python dict/list ops that break CUDA graph capture.
-        # Detect prefill (sequence length > batch size heuristic) vs decode.
-        is_prefill = input_ids is not None and inputs_embeds is None and int(input_ids.numel()) > 1
+        # Detect prefill vs decode using attn_metadata.max_query_len.
+        # max_query_len == 1 means pure decode (even with N concurrent
+        # requests, each contributes exactly 1 token). numel > 1 is NOT
+        # reliable because decode with N>1 concurrent requests gives
+        # input_ids.numel() == N.
+        if _max_query_len is not None:
+            is_prefill = int(_max_query_len) > 1
+        else:
+            is_prefill = input_ids is not None and inputs_embeds is None and int(input_ids.numel()) > 1
         if is_prefill:
             # Voice clone: replace -100 placeholder positions with ref audio embeddings
             info_dicts = kwargs.get("model_intermediate_buffer")

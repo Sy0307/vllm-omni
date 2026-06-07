@@ -1162,22 +1162,43 @@ class TestBufferGrowthPreservesState:
 
 
 class TestPrefillGuard:
-    """Bug #2: _apply_audio_feedback must NOT run during prefill."""
+    """Bug #2: _apply_audio_feedback must NOT run during prefill.
 
-    def test_forward_skips_audio_feedback_during_prefill(self):
-        """During prefill (numel > 1), _apply_audio_feedback must be skipped."""
-        # Simulate: is_prefill=True (numel > 1), input_ids not None, inputs_embeds None
-        input_ids = torch.tensor([1, 2, 3, 4, 5])  # numel=5 > 1 → prefill
-        is_prefill = input_ids is not None and int(input_ids.numel()) > 1
+    The prefill detection uses attn_metadata.max_query_len (== 1 for decode,
+    > 1 for prefill). This correctly handles concurrent decode (N requests,
+    each contributing 1 token → numel=N but max_query_len=1).
+    """
 
-        # The guard condition from the fixed code
-        should_apply = input_ids is not None and not is_prefill
-        assert should_apply is False, "Audio feedback should be skipped during prefill"
+    @staticmethod
+    def _is_prefill_via_max_query_len(max_query_len: int | None, input_ids: torch.Tensor) -> bool:
+        """Mirror the actual detection logic in forward()."""
+        if max_query_len is not None:
+            return int(max_query_len) > 1
+        return input_ids is not None and int(input_ids.numel()) > 1
 
-    def test_forward_applies_audio_feedback_during_decode(self):
-        """During decode (numel == 1), _apply_audio_feedback must run."""
-        input_ids = torch.tensor([42])  # numel=1 → decode
-        is_prefill = input_ids is not None and int(input_ids.numel()) > 1
+    def test_prefill_detected_via_max_query_len(self):
+        """Prefill: max_query_len > 1 → is_prefill=True."""
+        input_ids = torch.tensor([1, 2, 3, 4, 5])
+        assert self._is_prefill_via_max_query_len(5, input_ids) is True
 
-        should_apply = input_ids is not None and not is_prefill
-        assert should_apply is True, "Audio feedback should run during decode"
+    def test_single_decode_detected_via_max_query_len(self):
+        """Single-request decode: max_query_len=1 → is_prefill=False."""
+        input_ids = torch.tensor([42])
+        assert self._is_prefill_via_max_query_len(1, input_ids) is False
+
+    def test_concurrent_decode_not_misclassified(self):
+        """Multi-request decode: numel=4 but max_query_len=1 → is_prefill=False.
+
+        This is the regression caught by reviewer: with c=4 concurrent decode
+        requests, input_ids.numel()==4 but each request contributes exactly 1
+        token, so max_query_len==1 and audio feedback must still apply.
+        """
+        input_ids = torch.tensor([42, 43, 44, 45])  # 4 concurrent decode
+        assert self._is_prefill_via_max_query_len(1, input_ids) is False
+
+    def test_fallback_when_max_query_len_unavailable(self):
+        """When attn_metadata is unavailable, fall back to numel heuristic."""
+        prefill_ids = torch.tensor([1, 2, 3])
+        assert self._is_prefill_via_max_query_len(None, prefill_ids) is True
+        decode_ids = torch.tensor([42])
+        assert self._is_prefill_via_max_query_len(None, decode_ids) is False
