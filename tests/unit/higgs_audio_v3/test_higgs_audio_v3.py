@@ -410,6 +410,8 @@ class TestAudioFeedback:
             model = type("M", (), {"embed_tokens": lambda self, ids: torch.zeros(ids.shape[0], 16)})()
 
         t = FakeTalker()
+        t._decode_last_codes = torch.zeros(256, 8, dtype=torch.long)
+        t._decode_has_codes = torch.zeros(256, dtype=torch.bool)
         t._apply_audio_feedback = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_audio_feedback.__get__(t)
         return t
 
@@ -427,6 +429,8 @@ class TestAudioFeedback:
         t = self._make_feedback_talker()
         audio_id = t._audio_continuation_id
         t._audio_state[1] = {"last_codes": torch.zeros(8, dtype=torch.long)}
+        t._decode_last_codes[1] = torch.zeros(8, dtype=torch.long)
+        t._decode_has_codes[1] = True
         input_ids = torch.tensor([1, audio_id, 3])
         hidden = torch.zeros(3, 16)
         result = t._apply_audio_feedback(hidden, input_ids)
@@ -440,7 +444,7 @@ class TestAudioFeedback:
         """Audio position without state should not be replaced."""
         t = self._make_feedback_talker()
         audio_id = t._audio_continuation_id
-        # No state for row 0
+        # No state for row 0 — _decode_has_codes[0] defaults to False
         input_ids = torch.tensor([audio_id])
         hidden = torch.zeros(1, 16)
         result = t._apply_audio_feedback(hidden, input_ids)
@@ -965,10 +969,16 @@ def _simulate_delay_state_machine(
         state["num_delay"] = num_delay
         state["num_remaining_delays"] = num_remaining_delays
         state["last_codes"] = this_codes.clone()
-        emitted.append(this_codes)
 
         if num_remaining_delays is not None and num_remaining_delays <= 0:
+            t_so_far = len(emitted) + 1  # +1 for current frame
+            if t_so_far - 1 >= num_codebooks:
+                pass  # discard: enough frames without this one
+            else:
+                emitted.append(this_codes)
             state["should_terminate"] = True
+        else:
+            emitted.append(this_codes)
 
     return emitted
 
@@ -995,8 +1005,8 @@ class TestRampDownOffByOne:
         emitted = _simulate_delay_state_machine(steps)
         assert len(emitted) >= Q, f"EOC at step 0: expected >= {Q} emitted frames, got {len(emitted)}"
 
-    def test_eoc_at_step1_emits_at_least_9_frames(self):
-        """EOC on cb0 at step 1 must produce >= 9 emitted frames."""
+    def test_eoc_at_step1_emits_enough_frames(self):
+        """EOC on cb0 at step 1 must produce >= Q emitted frames."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
 
         Q = 8
@@ -1008,7 +1018,7 @@ class TestRampDownOffByOne:
             steps.append(codes)
 
         emitted = _simulate_delay_state_machine(steps)
-        assert len(emitted) >= Q + 1, f"EOC at step 1: expected >= {Q + 1} emitted frames, got {len(emitted)}"
+        assert len(emitted) >= Q, f"EOC at step 1: expected >= {Q} emitted frames, got {len(emitted)}"
 
     def test_eoc_after_full_rampup_emits_enough(self):
         """EOC after all codebooks are active produces T >> Q."""

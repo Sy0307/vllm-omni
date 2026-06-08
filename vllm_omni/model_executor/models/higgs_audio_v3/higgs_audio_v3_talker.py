@@ -573,9 +573,6 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     this_codes[: last_eos_idx + 1] = eos_stream
                     num_remaining_delays = num_codebooks - last_eos_idx - 1
 
-            # Always emit current codes first, then check termination.
-            # Previous logic discarded the last ramp-down frame (done-before-emit),
-            # causing T < Q when EOC fires early, crashing Stage1.
             state["num_delay"] = num_delay
             state["num_remaining_delays"] = num_remaining_delays
             state["last_codes"] = this_codes.clone()
@@ -586,10 +583,21 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 state["audio_out_ids"] = this_codes.unsqueeze(-1).clone()
             else:
                 state["audio_out_ids"] = torch.cat([state["audio_out_ids"], this_codes.unsqueeze(-1)], dim=-1)
-            new_codes_flat.append(this_codes)
 
             if num_remaining_delays is not None and num_remaining_delays <= 0:
+                # Ramp-down complete. The last frame is mostly EOC codes
+                # that the codec decodes as artifacts (EOC→0 is a valid
+                # codebook entry, not silence). Discard it to preserve
+                # audio quality — UNLESS doing so would leave fewer than
+                # Q frames, which crashes Stage1's _revert_delay_pattern.
+                t_so_far = state["audio_out_ids"].shape[-1]
+                if t_so_far - 1 >= num_codebooks:
+                    new_codes_flat.append(torch.full_like(this_codes, -1))
+                else:
+                    new_codes_flat.append(this_codes)
                 state["should_terminate"] = True
+            else:
+                new_codes_flat.append(this_codes)
 
         # Build full codes tensor [batch_size, num_codebooks]
         # -1 marks "no audio code at this position"
