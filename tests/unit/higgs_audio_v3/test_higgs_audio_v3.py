@@ -966,19 +966,16 @@ def _simulate_delay_state_machine(
                 this_codes[: last_eos_idx + 1] = eos_stream
                 num_remaining_delays = num_codebooks - last_eos_idx - 1
 
+        if num_remaining_delays is not None and num_remaining_delays <= 0:
+            state["num_delay"] = 0
+            state["num_remaining_delays"] = None
+            state["should_terminate"] = True
+            continue
+
         state["num_delay"] = num_delay
         state["num_remaining_delays"] = num_remaining_delays
         state["last_codes"] = this_codes.clone()
-
-        if num_remaining_delays is not None and num_remaining_delays <= 0:
-            t_so_far = len(emitted) + 1  # +1 for current frame
-            if t_so_far - 1 >= num_codebooks:
-                pass  # discard: enough frames without this one
-            else:
-                emitted.append(this_codes)
-            state["should_terminate"] = True
-        else:
-            emitted.append(this_codes)
+        emitted.append(this_codes)
 
     return emitted
 
@@ -990,8 +987,8 @@ class TestRampDownOffByOne:
     Stage1's _revert_delay_pattern receives T >= Q = 8.
     """
 
-    def test_eoc_at_step0_emits_8_frames(self):
-        """EOC on cb0 at step 0 must produce exactly Q=8 emitted frames."""
+    def test_eoc_at_step0_terminates(self):
+        """EOC on cb0 at step 0 terminates; T < Q is handled by Stage1 defensive try/except."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
 
         Q = 8
@@ -1003,7 +1000,7 @@ class TestRampDownOffByOne:
             steps.append(codes)
 
         emitted = _simulate_delay_state_machine(steps)
-        assert len(emitted) >= Q, f"EOC at step 0: expected >= {Q} emitted frames, got {len(emitted)}"
+        assert len(emitted) == Q - 1, f"EOC at step 0: expected {Q - 1} emitted frames, got {len(emitted)}"
 
     def test_eoc_at_step1_emits_enough_frames(self):
         """EOC on cb0 at step 1 must produce >= Q emitted frames."""
@@ -1044,7 +1041,7 @@ class TestRampDownOffByOne:
         steps = []
         for s in range(20):
             codes = torch.randint(0, 1024, (Q,))
-            if s == 0:
+            if s == 1:
                 codes[0] = EOC_ID
             steps.append(codes)
 
@@ -1053,7 +1050,7 @@ class TestRampDownOffByOne:
         assert (last >= 0).all(), f"Last ramp-down frame contains negative values: {last.tolist()}"
 
     def test_emitted_frames_revertible_by_stage1(self):
-        """Emitted frames from EOC-at-step-0 must be revertible by _revert_delay_pattern."""
+        """Emitted frames from EOC-at-step-1 must be revertible by _revert_delay_pattern."""
         from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import EOC_ID
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
             _revert_delay_pattern,
@@ -1063,7 +1060,7 @@ class TestRampDownOffByOne:
         steps = []
         for s in range(20):
             codes = torch.randint(0, 1024, (Q,))
-            if s == 0:
+            if s == 1:
                 codes[0] = EOC_ID
             steps.append(codes)
 
