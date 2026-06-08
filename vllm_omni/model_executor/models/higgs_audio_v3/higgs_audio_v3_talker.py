@@ -285,11 +285,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 info_dicts = kwargs.get("runtime_additional_information")
             hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)
 
-        # Audio feedback at decode only: replace continuation token embeddings.
-        # Must NOT run during prefill — prefill bs can be >> buffer capacity,
-        # triggering buffer growth that wipes in-flight decode state, and
-        # buffer indices don't correspond to decode slot indices.
-        if input_ids is not None and inputs_embeds is None and not is_prefill:
+        # Audio feedback: replace continuation token embeddings with audio
+        # embeddings from the last decoded frame (CUDA-graph safe).
+        if input_ids is not None and inputs_embeds is None:
             hidden_states = self._apply_audio_feedback(hidden_states, input_ids)
 
         residual: torch.Tensor | None = None
