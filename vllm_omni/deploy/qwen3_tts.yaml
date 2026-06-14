@@ -13,6 +13,7 @@
 #     set true to disable that path in eager mode. NPU platform flips stage 0 to true where
 #     cudagraph is not yet verified.
 async_chunk: true
+streaming_text_enabled: true
 
 connectors:
   connector_of_shared_memory:
