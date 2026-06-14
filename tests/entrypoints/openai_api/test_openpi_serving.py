@@ -295,6 +295,68 @@ def test_infer_extracts_actions_from_generic_multimodal_output():
     assert engine_client.generate_kwargs["request_id"] == "robot-session-a-0"
 
 
+def test_infer_returns_timing_response_when_requested():
+    class FakeEngineClient:
+        def get_diffusion_od_config(self):
+            return SimpleNamespace(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+
+        async def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            yield SimpleNamespace(
+                multimodal_output={
+                    "actions": [[1.0, 2.0, 3.0]],
+                    "policy_timing": {"sample_actions_ms": 9.0, "total_ms": 11.0},
+                }
+            )
+
+    engine_client = FakeEngineClient()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    response = asyncio.run(
+        serving.infer(
+            {"prompt": "pick up", "return_timing": True},
+            session_id="session-a",
+            reset=True,
+        )
+    )
+
+    assert set(response) == {"actions", "policy_timing", "server_timing"}
+    np.testing.assert_allclose(response["actions"], np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+    assert response["policy_timing"] == {"sample_actions_ms": 9.0, "total_ms": 11.0}
+    assert response["server_timing"]["infer_ms"] >= 0.0
+    assert response["server_timing"]["policy_time_ms"] >= 0.0
+
+    sampling_params = engine_client.generate_kwargs["sampling_params_list"][0]
+    assert sampling_params.extra_args["return_timing"] is True
+    assert "return_timing" not in sampling_params.extra_args["robot_obs"]
+
+
+def test_infer_reads_policy_timing_from_custom_output_when_requested():
+    class FakeEngineClient:
+        def get_diffusion_od_config(self):
+            return SimpleNamespace(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+
+        async def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            yield SimpleNamespace(
+                multimodal_output={"actions": [[1.0, 2.0, 3.0]]},
+                custom_output={"policy_timing": {"sample_actions_ms": 7.0}},
+            )
+
+    engine_client = FakeEngineClient()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    response = asyncio.run(
+        serving.infer(
+            {"prompt": "pick up", "return_timing": True},
+            session_id="session-a",
+            reset=True,
+        )
+    )
+
+    assert response["policy_timing"] == {"sample_actions_ms": 7.0}
+
+
 def test_infer_preserves_dict_actions_from_multimodal_output():
     class FakeEngineClient:
         def get_diffusion_od_config(self):

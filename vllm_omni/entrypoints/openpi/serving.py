@@ -9,6 +9,7 @@ The loaded policy model owns dataset transforms inside its pipeline.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -20,7 +21,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ActionOutput = np.ndarray | dict[str, np.ndarray]
+ActionOutput = np.ndarray | dict[str, Any]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -122,8 +123,16 @@ class ServingRealtimeRobotOpenPI:
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
         # Build request, run inference through AsyncOmni
-        request = self._build_request(obs, session_id=session_id, reset=reset)
+        request_obs = dict(obs)
+        return_timing = self._pop_return_timing(request_obs)
+        request = self._build_request(
+            request_obs,
+            session_id=session_id,
+            reset=reset,
+            return_timing=return_timing,
+        )
         result = None
+        infer_t0 = time.perf_counter()
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
         # final output, matching other non-streaming OpenAI serving paths.
@@ -136,12 +145,27 @@ class ServingRealtimeRobotOpenPI:
         if result is None:
             raise RuntimeError("Robot OpenPI request produced no output.")
 
-        return self._extract_actions(result)
+        infer_ms = (time.perf_counter() - infer_t0) * 1000.0
+        actions = self._extract_actions(result)
+        if not return_timing:
+            return actions
+        return {
+            "actions": actions,
+            "policy_timing": self._extract_policy_timing(result),
+            "server_timing": {
+                "infer_ms": float(infer_ms),
+                "policy_time_ms": float(infer_ms),
+            },
+        }
 
     def _next_request_id(self, session_id: str) -> str:
         return f"robot-{session_id}-{next(self._request_counter)}"
 
-    def _build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
+    @staticmethod
+    def _pop_return_timing(obs: dict) -> bool:
+        return bool(obs.pop("__return_timing__", False) or obs.pop("return_timing", False))
+
+    def _build_request(self, obs: dict, *, session_id: str, reset: bool, return_timing: bool = False) -> Any:
         """Build engine request from raw robot obs.
 
         Returns an `OmniDiffusionRequest` payload consumed by
@@ -154,6 +178,7 @@ class ServingRealtimeRobotOpenPI:
             "reset": reset,
             "session_id": session_id,
             "robot_obs": obs,
+            "return_timing": bool(return_timing),
         }
 
         prompt = obs.get("prompt", "")
@@ -176,3 +201,15 @@ class ServingRealtimeRobotOpenPI:
         if isinstance(actions, Mapping):
             return {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
         return np.asarray(actions, dtype=np.float32)
+
+    def _extract_policy_timing(self, result: Any) -> dict[str, Any]:
+        multimodal_output = getattr(result, "multimodal_output", None)
+        timing = multimodal_output.get("policy_timing") if isinstance(multimodal_output, Mapping) else None
+        if not isinstance(timing, Mapping):
+            custom_output = getattr(result, "custom_output", None)
+            if not isinstance(custom_output, Mapping):
+                custom_output = getattr(result, "_custom_output", None)
+            timing = custom_output.get("policy_timing") if isinstance(custom_output, Mapping) else None
+        if not isinstance(timing, Mapping):
+            return {}
+        return {str(key): _to_builtin_container(value) for key, value in timing.items()}

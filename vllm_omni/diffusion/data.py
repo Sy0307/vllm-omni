@@ -987,6 +987,12 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi0Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif cfg.get("type") == "pi05" or model_type == "pi05" or "Pi05ForActionPrediction" in architectures:
+                    # pi0.5 VLA — LeRobot/SGLang configs use ``type: "pi05"``.
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi05Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry

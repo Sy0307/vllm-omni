@@ -12,6 +12,7 @@ Protocol (compatible with OpenPI policy clients):
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from fastapi import WebSocket
@@ -45,6 +46,21 @@ def _pack(obj: Any) -> bytes:
 
 def _unpack(data: bytes) -> Any:
     return _get_msgpack_numpy().unpackb(data)
+
+
+def _inject_pack_timing(response: Any, *, started_at: float) -> bytes:
+    if not isinstance(response, dict):
+        return _pack(response)
+    server_timing = response.get("server_timing")
+    if not isinstance(server_timing, dict):
+        return _pack(response)
+
+    server_timing["serve_time_ms"] = (time.perf_counter() - started_at) * 1000.0
+    server_timing["server_response_timestamp_s"] = time.time()
+    # Packing time cannot be included in the packed payload without packing
+    # twice, which would perturb the latency being measured.
+    server_timing["ws_pack_ms"] = None
+    return _pack(response)
 
 
 class RobotRealtimeConnection:
@@ -107,8 +123,12 @@ class RobotRealtimeConnection:
                 if "bytes" not in msg or not msg["bytes"]:
                     continue
 
+                server_t0 = time.perf_counter()
+                server_recv_timestamp_s = time.time()
                 try:
+                    unpack_t0 = time.perf_counter()
                     obs = self._unpack_request(msg["bytes"])
+                    ws_unpack_ms = (time.perf_counter() - unpack_t0) * 1000.0
                 except Exception:
                     logger.exception("Invalid robot OpenPI request payload")
                     try:
@@ -142,7 +162,16 @@ class RobotRealtimeConnection:
                             session_id=session_id,
                             reset=self._call_count <= 1,
                         )
-                        await self.websocket.send_bytes(_pack(actions))
+                        if isinstance(actions, dict) and isinstance(actions.get("server_timing"), dict):
+                            actions["server_timing"].update(
+                                {
+                                    "ws_unpack_ms": float(ws_unpack_ms),
+                                    "server_recv_timestamp_s": float(server_recv_timestamp_s),
+                                }
+                            )
+                            await self.websocket.send_bytes(_inject_pack_timing(actions, started_at=server_t0))
+                        else:
+                            await self.websocket.send_bytes(_pack(actions))
                 except Exception:
                     logger.exception("Error handling request")
                     try:

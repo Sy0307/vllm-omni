@@ -96,6 +96,29 @@ def test_pack_and_unpack_delegate_to_openpi_msgpack_numpy(monkeypatch):
     ]
 
 
+def test_inject_pack_timing_packs_response_once(monkeypatch):
+    calls = []
+
+    def fake_pack(obj):
+        calls.append(obj)
+        return b"packed"
+
+    monkeypatch.setattr(openpi_connection, "_pack", fake_pack)
+
+    payload = openpi_connection._inject_pack_timing(
+        {"actions": [0.0], "server_timing": {"infer_ms": 1.0}},
+        started_at=0.0,
+    )
+
+    assert payload == b"packed"
+    assert len(calls) == 1
+    server_timing = calls[0]["server_timing"]
+    assert server_timing["infer_ms"] == 1.0
+    assert server_timing["ws_pack_ms"] is None
+    assert server_timing["serve_time_ms"] >= 0.0
+    assert server_timing["server_response_timestamp_s"] > 0.0
+
+
 def test_handle_connection_returns_structured_error_for_invalid_payload(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
     monkeypatch.setattr(
@@ -268,3 +291,41 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     serving.reset.assert_called_once_with({})
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []
+
+
+def test_handle_connection_injects_timing_for_timing_response(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(
+        openpi_connection,
+        "_unpack",
+        lambda _data: {"prompt": "pick up the object", "return_timing": True},
+    )
+
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"request"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    serving = _serving_mock()
+    serving.infer = AsyncMock(
+        return_value={
+            "actions": [0.0],
+            "policy_timing": {"sample_actions_ms": 12.0},
+            "server_timing": {"infer_ms": 13.0, "policy_time_ms": 13.0},
+        }
+    )
+    connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
+
+    asyncio.run(connection.handle_connection())
+
+    response = websocket.sent_bytes[1]
+    assert response["actions"] == [0.0]
+    assert response["policy_timing"]["sample_actions_ms"] == 12.0
+    assert response["server_timing"]["infer_ms"] == 13.0
+    assert response["server_timing"]["policy_time_ms"] == 13.0
+    assert response["server_timing"]["ws_unpack_ms"] >= 0.0
+    assert response["server_timing"]["ws_pack_ms"] is None
+    assert response["server_timing"]["serve_time_ms"] >= 0.0
+    assert response["server_timing"]["server_recv_timestamp_s"] > 0.0
+    assert response["server_timing"]["server_response_timestamp_s"] > 0.0
