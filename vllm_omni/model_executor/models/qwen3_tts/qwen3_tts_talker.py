@@ -714,6 +714,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_update.setdefault("codes", {})["audio"] = zeros
             return input_ids_out, prompt_embeds, info_update
 
+        if span_len > 1:
+            inputs_embeds_out = (
+                self.embed_input_ids(input_ids.reshape(-1, 1).to(torch.long))
+                .to(device=input_ids.device, dtype=dtype)
+                .reshape(span_len, -1)
+            )
+            return input_ids, inputs_embeds_out, {"meta": {"codec_streaming": codec_streaming}}
+
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
         # ``tts_pad_embed`` was materialized above from :attr:`_tts_pad_embed`
