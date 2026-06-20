@@ -77,6 +77,22 @@ def test_build_pooler_output_basic():
     assert pooler[0]["audio"].shape == (3, 2)
 
 
+def test_build_pooler_output_hidden_slice_has_owned_storage():
+    hidden = torch.randn(67, 2048)
+
+    pooler = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden,
+        {},
+        query_start_loc_np=np.array([66]),
+        num_scheduled_tokens=np.array([1], dtype=np.int32),
+        num_reqs=1,
+    )
+
+    slice_hidden = pooler[0]["hidden"]
+    assert slice_hidden.is_contiguous()
+    assert slice_hidden.untyped_storage().nbytes() == slice_hidden.numel() * slice_hidden.element_size()
+
+
 def test_build_pooler_output_empty_mm():
     hidden = torch.randn(4, 8)
 

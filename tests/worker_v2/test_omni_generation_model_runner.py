@@ -1,11 +1,11 @@
 """Tests for OmniGenerationModelRunner.sample_tokens (V2).
 
-Covers the core pooler_output construction paths via _build_pooler_output:
+Covers the core multimodal_outputs construction paths via _build_pooler_output:
   - OmniOutput with batched tensor multimodal_outputs → per-request slicing
   - OmniOutput with list multimodal_outputs → direct mapping (including None)
   - OmniOutput with dict scalar values → broadcast to all requests
   - None model output → returns None
-  - Non-dict multimodal_outputs → [None] * num_reqs
+  - Non-dict multimodal_outputs → [{}] * num_reqs
   - sampled_token_ids always emits empty lists per request (no token sampling)
   - req_states.num_computed_tokens updated to prompt_len after sample_tokens
 """
@@ -109,8 +109,9 @@ class TestSampleTokensTensorOutput(unittest.TestCase):
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
         assert isinstance(result, OmniModelRunnerOutput)
-        assert len(result.pooler_output) == 1
-        assert result.pooler_output[0]["model_outputs"].shape == (4, 8)
+        assert result.pooler_output is None
+        assert len(result.multimodal_outputs) == 1
+        assert result.multimodal_outputs[0]["model_outputs"].shape == (4, 8)
 
     def test_multi_request(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -119,9 +120,10 @@ class TestSampleTokensTensorOutput(unittest.TestCase):
         runner = _make_runner(output, num_reqs=3)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert len(result.pooler_output) == 3
+        assert result.pooler_output is None
+        assert len(result.multimodal_outputs) == 3
         for i in range(3):
-            assert result.pooler_output[i]["model_outputs"].shape == (2, 5)
+            assert result.multimodal_outputs[i]["model_outputs"].shape == (2, 5)
 
 
 class TestSampleTokensListOutput(unittest.TestCase):
@@ -132,8 +134,9 @@ class TestSampleTokensListOutput(unittest.TestCase):
         runner = _make_runner(output, num_reqs=1)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert len(result.pooler_output) == 1
-        assert result.pooler_output[0]["model_outputs"].shape == (3, 2)
+        assert result.pooler_output is None
+        assert len(result.multimodal_outputs) == 1
+        assert result.multimodal_outputs[0]["model_outputs"].shape == (3, 2)
 
     def test_list_with_none(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -142,8 +145,8 @@ class TestSampleTokensListOutput(unittest.TestCase):
         runner = _make_runner(output, num_reqs=1)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert len(result.pooler_output) == 1
-        assert result.pooler_output[0]["model_outputs"] is None
+        assert result.pooler_output is None
+        assert result.multimodal_outputs == [{}]
 
 
 class TestSampleTokensDictOutput(unittest.TestCase):
@@ -154,10 +157,11 @@ class TestSampleTokensDictOutput(unittest.TestCase):
         runner = _make_runner(output, num_reqs=2)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert len(result.pooler_output) == 2
-        assert result.pooler_output[0]["audio"].shape == (16000,)
-        assert result.pooler_output[1]["audio"].shape == (16000,)
-        assert result.pooler_output[0]["sr"] == 24000
+        assert result.pooler_output is None
+        assert len(result.multimodal_outputs) == 2
+        assert result.multimodal_outputs[0]["audio"].shape == (16000,)
+        assert result.multimodal_outputs[1]["audio"].shape == (16000,)
+        assert result.multimodal_outputs[0]["sr"] == 24000
 
     def test_dict_with_list_values(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -166,9 +170,10 @@ class TestSampleTokensDictOutput(unittest.TestCase):
         runner = _make_runner(output, num_reqs=2)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert len(result.pooler_output) == 2
-        assert result.pooler_output[0]["chunks"].shape == (10,)
-        assert result.pooler_output[1]["chunks"].shape == (20,)
+        assert result.pooler_output is None
+        assert len(result.multimodal_outputs) == 2
+        assert result.multimodal_outputs[0]["chunks"].shape == (10,)
+        assert result.multimodal_outputs[1]["chunks"].shape == (20,)
 
 
 class TestSampleTokensNoneOutput(unittest.TestCase):
@@ -181,7 +186,7 @@ class TestSampleTokensNoneOutput(unittest.TestCase):
 
 
 class TestNonDictMultimodalOutputs(unittest.TestCase):
-    """When multimodal_outputs is None or non-dict, pooler_output is [None]*num_reqs."""
+    """When multimodal_outputs is None or non-dict, per-request output is empty."""
 
     def test_none_multimodal_outputs(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -190,9 +195,8 @@ class TestNonDictMultimodalOutputs(unittest.TestCase):
         runner = _make_runner(output, num_reqs=2)
         result = OmniGenerationModelRunner.sample_tokens(runner)
 
-        assert len(result.pooler_output) == 2
-        assert result.pooler_output[0] is None
-        assert result.pooler_output[1] is None
+        assert result.pooler_output is None
+        assert result.multimodal_outputs == [{}, {}]
 
 
 class TestSampledTokenIds(unittest.TestCase):

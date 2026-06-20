@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -18,13 +19,12 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
-from vllm_omni.data_entry_keys import flatten_payload
-from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics

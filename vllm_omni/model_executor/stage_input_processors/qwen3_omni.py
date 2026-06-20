@@ -802,42 +802,60 @@ def thinker2talker_token_only(
 
 def _eof_payload(transfer_manager: Any) -> OmniPayloadStruct:
     """Return an EOF marker payload when the request is finished with no codes."""
-    return {
-        "codes": {"audio": []},
-        "meta": {"left_context_size": 0, "finished": torch.tensor(True)},
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty((0,), dtype=torch.long)),
+        meta=MetaStruct(
+            left_context_size=0,
+            finished=torch.tensor(True, dtype=torch.bool),
+            is_segment_finished=torch.tensor(True, dtype=torch.bool),
+        ),
+    )
+
+
+def _filter_qwen3_async_codec_rows(
+    code_predictor_codes: torch.Tensor,
+    output_token_ids: list[int],
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Keep only real codec rows before sending an async Code2Wav chunk.
+
+    Talker can expose rows for placeholder / terminal positions. Those rows are
+    not valid codec ids and must not be written into vLLM V2 int32 token state.
+    Async chunks cannot rely on request.output_token_ids as the row mask here,
+    so keep the contract local to Code2Wav: every emitted row must be in the
+    codec id range.
+    """
+    code_predictor_codes = code_predictor_codes.detach().to(dtype=torch.long, device="cpu")
+    # In async-chunk mode, request.output_token_ids is not a reliable codec-row
+    # mask at this point in the pipeline. Keep the contract local to Code2Wav:
+    # only real codec ids in [0, codebook_size) may enter the token buffer.
+    if code_predictor_codes.ndim != 2 or code_predictor_codes.numel() == 0:
+        return code_predictor_codes[:0], {
+            "raw_rows": int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim > 0 else 0,
+            "aligned_rows": 0,
+            "valid_rows": 0,
+            "trailing_placeholder_count": 0,
+        }
+    row_valid_mask = (code_predictor_codes.max(dim=1).values < _QWEN3_CODEC_CODEBOOK_SIZE) & (
+        code_predictor_codes.min(dim=1).values >= 0
+    )
+    filtered = code_predictor_codes[row_valid_mask]
+    return filtered, {
+        "raw_rows": int(code_predictor_codes.shape[0]),
+        "aligned_rows": int(code_predictor_codes.shape[0]),
+        "valid_rows": int(filtered.shape[0]),
+        "trailing_placeholder_count": 0,
     }
 
 
-def talker2code2wav_async_chunk(
+def _build_qwen3_async_code2wav_payload_from_buffer(
     transfer_manager: Any,
-    multimodal_output: OmniPayload | dict[str, Any],
-    request: OmniEngineCoreRequest,
-    is_finished: bool = False,
+    request_id: str,
+    *,
+    is_finished: bool,
 ) -> OmniPayloadStruct | None:
-    """
-    Multimodal output version.
-    """
-    if not isinstance(multimodal_output, Mapping):
-        if is_finished:
-            return _eof_payload(transfer_manager)
-        return None
-    talker_codes = multimodal_output.get("codes", {})
-    if not isinstance(talker_codes, dict):
-        if is_finished:
-            return _eof_payload(transfer_manager)
-        return None
-    code_predictor_codes = talker_codes.get("audio")
-    if code_predictor_codes is None:
-        if is_finished:
-            return _eof_payload(transfer_manager)
-        return None
-
-    if code_predictor_codes.numel() == 0:
-        if is_finished:
-            return _eof_payload(transfer_manager)
-        return None
-
-    if not code_predictor_codes.any():
+    token_frames = transfer_manager.code_prompt_token_ids[request_id]
+    length = len(token_frames)
+    if length == 0:
         if is_finished:
             return _eof_payload(transfer_manager)
         return None
@@ -849,6 +867,119 @@ def talker2code2wav_async_chunk(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
+    chunk_id = transfer_manager.put_req_chunk[request_id]
+    if configured_initial_chunk_size > 0 and chunk_id == 0:
+        previous_emit = 0
+        target_emit = min(length, configured_initial_chunk_size) if is_finished else configured_initial_chunk_size
+    elif configured_initial_chunk_size > 0:
+        previous_emit = configured_initial_chunk_size + (chunk_id - 1) * chunk_size_config
+        target_emit = length if is_finished else configured_initial_chunk_size + chunk_id * chunk_size_config
+    else:
+        previous_emit = chunk_id * chunk_size_config
+        target_emit = length if is_finished else (chunk_id + 1) * chunk_size_config
+
+    if length < target_emit:
+        return None
+    if target_emit <= previous_emit:
+        if is_finished:
+            return _eof_payload(transfer_manager)
+        return None
+
+    context_length = target_emit - previous_emit
+    left_context_size = max(0, min(previous_emit, left_context_size_config))
+    window_start = max(0, target_emit - context_length - left_context_size)
+    window_frames = token_frames[window_start:target_emit]
+    codes = torch.stack(window_frames, dim=0).transpose(0, 1).reshape(-1)
+
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=codes),
+        meta=MetaStruct(
+            left_context_size=left_context_size,
+            finished=torch.tensor(is_finished, dtype=torch.bool),
+            is_segment_finished=torch.tensor(is_finished, dtype=torch.bool),
+        ),
+    )
+
+
+def talker2code2wav_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: OmniPayload | dict[str, Any],
+    request: OmniEngineCoreRequest,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """
+    Multimodal output version.
+    """
+    request_id = request.external_req_id
+    if not isinstance(multimodal_output, Mapping):
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
+    talker_codes = multimodal_output.get("codes", {})
+    if not isinstance(talker_codes, dict):
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
+    code_predictor_codes = talker_codes.get("audio")
+    if code_predictor_codes is None:
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
+
+    if code_predictor_codes.numel() == 0:
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
+
+    if not code_predictor_codes.any():
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
+
+    raw_shape = tuple(code_predictor_codes.shape)
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+    code_predictor_codes, codec_stats = _filter_qwen3_async_codec_rows(
+        code_predictor_codes,
+        list(output_token_ids),
+    )
+    seen_codec_rows = getattr(transfer_manager, "qwen3_omni_async_seen_codec_rows", None)
+    if seen_codec_rows is None:
+        seen_codec_rows = {}
+        transfer_manager.qwen3_omni_async_seen_codec_rows = seen_codec_rows
+    prev_seen_rows = int(seen_codec_rows.get(request_id, 0))
+    cur_rows = int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim > 0 else 0
+    if cur_rows > prev_seen_rows:
+        code_predictor_codes = code_predictor_codes[prev_seen_rows:]
+        seen_codec_rows[request_id] = cur_rows
+    else:
+        code_predictor_codes = code_predictor_codes[:0]
+    if code_predictor_codes.numel() == 0:
+        logger.debug(
+            "talker2code2wav_async_chunk: no valid codec rows after filtering "
+            "(raw_shape=%s output_ids_len=%d aligned_rows=%s valid_rows=%s placeholders=%s) for req=%s",
+            raw_shape,
+            len(output_token_ids),
+            codec_stats["aligned_rows"],
+            codec_stats["valid_rows"],
+            codec_stats["trailing_placeholder_count"],
+            getattr(request, "request_id", None),
+        )
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
+
     sampling_params = getattr(request, "sampling_params", None)
     stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
     stop_token_id = getattr(sampling_params, "stop_token_id", None)
@@ -857,44 +988,19 @@ def talker2code2wav_async_chunk(
     first_codebook = int(code_predictor_codes[0, 0].item())
     if first_codebook in stop_token_ids:
         logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
-        if is_finished:
-            return _eof_payload(transfer_manager)
-        return None
+        return _build_qwen3_async_code2wav_payload_from_buffer(
+            transfer_manager,
+            request_id,
+            is_finished=is_finished,
+        )
 
-    request_id = request.external_req_id
-    chunk_id = transfer_manager.put_req_chunk[request_id]
-    transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
-
-    if configured_initial_chunk_size > 0:
-        if chunk_id == 0:
-            chunk_size_config = configured_initial_chunk_size
-        else:
-            length -= configured_initial_chunk_size
-
-    chunk_length = length % chunk_size_config
-    if chunk_length != 0 and not is_finished:
-        return None
-
-    context_length = chunk_length if chunk_length != 0 else chunk_size_config
-    # ensure left context does not exceed available length
-    if configured_initial_chunk_size > 0 and chunk_id == 1:
-        left_context_size = configured_initial_chunk_size
-        end_index = length + configured_initial_chunk_size
-    else:
-        left_context_size = max(0, min(length - context_length, left_context_size_config))
-        end_index = min(length, left_context_size + context_length)
-
-    codes = (
-        torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
-    )
-
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=codes),
-        meta=MetaStruct(
-            left_context_size=left_context_size,
-            finished=torch.tensor(is_finished, dtype=torch.bool),
-        ),
+    token_frames = transfer_manager.code_prompt_token_ids[request_id]
+    for row in code_predictor_codes:
+        token_frames.append(row.to(torch.long).cpu().reshape(-1))
+    return _build_qwen3_async_code2wav_payload_from_buffer(
+        transfer_manager,
+        request_id,
+        is_finished=is_finished,
     )
 
 

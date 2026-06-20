@@ -72,6 +72,21 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def _codec_ids_from_payload_or_input(
+    input_ids: torch.Tensor,
+    runtime_info: dict[str, Any] | None,
+) -> torch.Tensor:
+    """Prefer connector-delivered codec ids over scheduler placeholders."""
+    if isinstance(runtime_info, dict):
+        codes = runtime_info.get("codes")
+        audio = codes.get("audio") if isinstance(codes, dict) else runtime_info.get("codes.audio")
+        if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+            return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+        if isinstance(audio, (list, tuple)) and audio:
+            return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+    return input_ids.reshape(-1).to(dtype=torch.long)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -421,9 +436,47 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 3: Code2Wav ==========
         elif self.model_stage == "code2wav":
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
+            runtime_infos = runtime_additional_information or []
 
             # Extract codec codes from input
-            if input_ids.shape[0] % 16 == 0:
+            if runtime_infos:
+                if seq_token_counts is not None:
+                    request_input_ids = list(torch.split(input_ids.reshape(-1), seq_token_counts, dim=0))
+                else:
+                    request_input_ids = [input_ids.reshape(-1)]
+                request_ids = [
+                    _codec_ids_from_payload_or_input(
+                        ids,
+                        runtime_infos[idx] if idx < len(runtime_infos) else None,
+                    )
+                    for idx, ids in enumerate(request_input_ids)
+                ]
+                seq_token_counts = [int(ids.numel()) for ids in request_ids]
+                max_seq_len = max((count + 15) // 16 for count in seq_token_counts)
+                codes = torch.zeros(
+                    (len(request_ids), 16, max_seq_len),
+                    device=input_ids.device,
+                    dtype=input_ids.dtype,
+                )
+                for idx, ids in enumerate(request_ids):
+                    if ids.numel() % 16 != 0:
+                        if ids.numel() > 0:
+                            logger.warning_once(
+                                "Code2Wav input length is not divisible by 16; padding with zeros. "
+                                "This is expected only during cudagraph warmup."
+                            )
+                        pad = (16 - ids.numel() % 16) % 16
+                        if pad:
+                            ids = torch.cat(
+                                [
+                                    ids,
+                                    torch.zeros(pad, dtype=torch.long, device=input_ids.device),
+                                ]
+                            )
+                    seq_len = ids.numel() // 16
+                    if seq_len > 0:
+                        codes[idx, :, :seq_len] = ids.reshape(16, seq_len)
+            elif input_ids.shape[0] % 16 == 0:
                 if seq_token_counts is not None:
                     max_seq_len = max(seq_token_counts) // 16
                     batch_size = len(seq_token_counts)
@@ -457,8 +510,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Generate audio from codec codes
             # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
             left_context_size = []
-            if runtime_additional_information is not None:
-                for info in runtime_additional_information:
+            if runtime_infos:
+                for info in runtime_infos:
                     meta = info.get("meta", {})
                     if "left_context_size" in meta:
                         left_context_size.append(meta["left_context_size"])
@@ -1140,20 +1193,23 @@ class Qwen3OmniMoeForConditionalGeneration(
         assistant_hidden = self.talker.text_projection(thinker_embed[im_start_index:segment_end_index]).to(
             tts_pad_embed.device
         )  # [t, d]
+        if assistant_hidden.shape[0] < 4:
+            pad_rows = torch.zeros(
+                (4 - assistant_hidden.shape[0], self.config.talker_config.text_config.hidden_size),
+                device=assistant_hidden.device,
+                dtype=assistant_hidden.dtype,
+            )
+            assistant_hidden_bootstrap = torch.cat((assistant_hidden, pad_rows), dim=0)
+        else:
+            assistant_hidden_bootstrap = assistant_hidden
 
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
         assistant_text_hidden = torch.cat(
             (
-                assistant_hidden[:3],
+                assistant_hidden_bootstrap[:3],
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
-                assistant_hidden[3:4]
-                if assistant_hidden.shape[0] > 3
-                else torch.zeros(
-                    (1, assistant_hidden.shape[1]),
-                    device=assistant_hidden.device,
-                    dtype=assistant_hidden.dtype,
-                ),  # First text
+                assistant_hidden_bootstrap[3:4],
             ),
             dim=0,
         )

@@ -90,3 +90,17 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+def test_async_chunk_reserved_running_slots_counts_parked_live_requests_once() -> None:
+    sched = _make_scheduler(stage_id=1)
+    r1 = SimpleNamespace(request_id="r1")
+    r2 = SimpleNamespace(request_id="r2")
+    stale = SimpleNamespace(request_id="stale")
+    sched.requests = {"r1": object(), "r2": object()}
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[r1, r1, stale],
+        _held_non_active=[r2, stale],
+    )
+
+    assert sched._get_async_chunk_reserved_running_slots() == 2

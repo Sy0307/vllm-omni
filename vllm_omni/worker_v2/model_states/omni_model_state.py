@@ -210,7 +210,11 @@ class OmniModelState(DefaultModelState):
         if for_capture:
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = int(input_batch.seq_lens[:num_reqs].max().item())
+            seq_lens_cpu_upper_bound = getattr(input_batch, "seq_lens_cpu_upper_bound", None)
+            if seq_lens_cpu_upper_bound is not None:
+                max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
+            else:
+                max_seq_len = int(input_batch.seq_lens[:num_reqs].max().item())
 
         return build_attn_metadata(
             attn_groups=attn_groups,

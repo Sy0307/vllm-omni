@@ -46,6 +46,22 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
+    def _get_async_chunk_reserved_running_slots(self) -> int:
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return 0
+        live_requests = self.requests
+        reserved_ids: set[str] = set()
+        for request in getattr(adapter, "waiting_for_chunk_running_requests", ()):  # parked running queue
+            req_id = getattr(request, "request_id", None)
+            if req_id in live_requests:
+                reserved_ids.add(req_id)
+        for request in getattr(adapter, "_held_non_active", ()):  # bounded active-window hold queue
+            req_id = getattr(request, "request_id", None)
+            if req_id in live_requests:
+                reserved_ids.add(req_id)
+        return len(reserved_ids)
+
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
