@@ -327,8 +327,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.req_states.num_computed_tokens.stage_write_elem(req_idx, prompt_len)
         self.req_states.num_computed_tokens.apply_write()
 
-        # Build pooler_output from OmniOutput.multimodal_outputs (dict).
-        pooler_output = self._build_pooler_output(model_output, num_reqs)
+        # Build multimodal outputs from OmniOutput.multimodal_outputs (dict).
+        multimodal_outputs = self._build_pooler_output(model_output, num_reqs)
 
         req_ids = input_batch.req_ids
 
@@ -344,13 +344,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # OmniGenerationScheduler indexes this as mm_outputs[req_index], and for the
         # final (code2wav) stage it becomes the user-facing outputs[0].multimodal_output.
         # Must be a per-request list (not the raw dict), matching the V1 runner.
-        multimodal_outputs = [_ensure_tensor_values(p) if p else {} for p in pooler_output]
+        multimodal_outputs = [_ensure_tensor_values(p) if p else {} for p in multimodal_outputs]
 
         return OmniModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
             sampled_token_ids=sampled_token_ids,
-            pooler_output=pooler_output,
+            # Match the V1 generation runner contract: final generation stages
+            # publish audio only through multimodal_outputs.  If the same
+            # payload is also exposed as pooling_output, OutputProcessor routes
+            # it through the pooling path and can duplicate accumulated audio.
+            pooler_output=None,
             multimodal_outputs=multimodal_outputs,
             kv_connector_output=kv_connector_output,
         )

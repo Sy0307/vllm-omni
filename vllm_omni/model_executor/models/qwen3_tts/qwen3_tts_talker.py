@@ -399,6 +399,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # CPU-to-GPU round-trips on every decode step.
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "audio"),
+            ("codes", "ref"),
+            ("embed", "prefill"),
             ("hidden_states", "last"),
             ("hidden_states", "trailing_text"),
         }
@@ -674,9 +676,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
                     self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
-                # Store full prompt embeddings on CPU (large, prefill-only).
-                # tailing_text_hidden stays on GPU (gpu_resident_buffer_keys).
-                prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+                prompt_embeds_cpu = full_prompt_embeds.detach().contiguous()
                 info_update: OmniPayload = {
                     "embed": {"prefill": prompt_embeds_cpu},
                     "hidden_states": {"trailing_text": tailing_text_hidden.detach()},
@@ -686,7 +686,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     },
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                    info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
+                    info_update.setdefault("codes", {})["ref"] = ref_code.detach().contiguous()
                 if ref_code_len is not None:
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
                 # First prefill: source the slice offset from `_omni_num_computed_tokens`
@@ -706,7 +706,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             take = prompt_embeds_cpu[s:e]
             if int(take.shape[0]) < span_len:
                 pad_n = int(span_len - int(take.shape[0]))
-                pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
+                pad_rows = tts_pad_embed.reshape(1, -1).expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
             prompt_embeds = take.to(device=input_ids.device, dtype=dtype)
             info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)

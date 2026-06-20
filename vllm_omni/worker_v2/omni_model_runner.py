@@ -118,7 +118,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                     del mgr._capture_descs[CUDAGraphMode.FULL]
                     for i, descs in enumerate(mgr._candidates):
                         mgr._candidates[i] = [d for d in descs if d.cg_mode != CUDAGraphMode.FULL]
-                    logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
+                    logger.info(
+                        "Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured."
+                    )
             else:
                 logger.warning(
                     "CudaGraphManager lacks _capture_descs/_candidates; cannot exclude "

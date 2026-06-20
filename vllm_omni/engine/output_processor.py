@@ -607,10 +607,21 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
+                mm_type = getattr(eco, "output_type", None) or default_mm_type
+
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
-                    mm_type = getattr(eco, "output_type", None) or default_mm_type
                     req_state.add_multimodal_tensor(mm_output, mm_type)
+
+                # Omni AR stages carry hidden/multimodal payloads in
+                # pooling_output while also producing text token IDs.  If this
+                # reaches upstream unchanged, vLLM treats it as a pooling
+                # output and skips detokenizer.update(), so FINAL_ONLY text
+                # completions become empty.  Capture the payload here and clear
+                # pooling_output to force the normal text path.
+                if eco.pooling_output is not None and req_state.detokenizer is not None:
+                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    eco.pooling_output = None
 
             # Route: if no detokenizer and no pooling output, handle locally
             # to avoid upstream's assert on detokenizer.
@@ -620,35 +631,56 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 upstream_outputs.append(eco)
 
         # Handle multimodal-only outputs (generation stages) locally.
-        self._process_mm_only_outputs(mm_only_outputs)
+        mm_request_outputs, mm_reqs_to_abort = self._process_mm_only_outputs(
+            mm_only_outputs,
+            engine_core_timestamp=engine_core_timestamp,
+            iteration_stats=iteration_stats,
+        )
 
         # Delegate text/pooling outputs to upstream.
-        return super().process_outputs(
+        upstream_processed = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
+        )
+        return OutputProcessorOutput(
+            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
         )
 
     def _process_mm_only_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
-    ) -> None:
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
+    ) -> tuple[list[RequestOutput | PoolingRequestOutput], list[str]]:
         """Handle outputs from generation stages that have no detokenizer.
 
         These cannot go through upstream process_outputs because it asserts
         detokenizer is not None when pooling_output is None.
         """
+        request_outputs: list[RequestOutput | PoolingRequestOutput] = []
+        reqs_to_abort: list[str] = []
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
 
+            self._update_stats_from_output(
+                req_state,
+                eco,
+                engine_core_timestamp,
+                iteration_stats,
+            )
+
             new_token_ids = eco.new_token_ids
             finish_reason = eco.finish_reason
             stop_reason = eco.stop_reason
             kv_transfer_params = eco.kv_transfer_params
-            routed_experts = eco.routed_experts
-            req_state.num_cached_tokens = eco.num_cached_tokens
+            if eco.routed_experts is not None:
+                req_state.routed_experts_chunks.append(eco.routed_experts)
+
+            req_state.num_cached_tokens = getattr(eco, "num_cached_tokens", 0)
             req_state.is_prefilling = False
 
             if request_output := req_state.make_request_output(
@@ -657,13 +689,35 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                routed_experts,
             ):
+                if req_state.streaming_input:
+                    request_output.finished = False
+
                 if req_state.queue is not None:
                     req_state.queue.put(request_output)
+                else:
+                    request_outputs.append(request_output)
 
             if finish_reason is not None:
-                self._finish_request(req_state)
+                if req_state.streaming_input:
+                    if req_state.input_chunk_queue:
+                        update = req_state.input_chunk_queue.popleft()
+                        req_state.apply_streaming_update(update)
+                    else:
+                        req_state.input_chunk_queue = None
+                else:
+                    self._finish_request(req_state)
+                    if not getattr(eco, "finished", True):
+                        reqs_to_abort.append(eco.request_id)
+                    self._update_stats_from_finished(
+                        req_state,
+                        finish_reason,
+                        iteration_stats,
+                    )
+                    if self.tracing_enabled:
+                        self.do_tracing(eco, req_state, iteration_stats)
+
+        return request_outputs, reqs_to_abort
 
     def _update_stats_from_output(
         self,

@@ -14,7 +14,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreEventType, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -29,6 +29,12 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
+)
+from vllm_omni.engine import (
+    OmniEngineCoreOutput as EngineCoreOutput,
+)
+from vllm_omni.engine import (
+    OmniEngineCoreOutputs as EngineCoreOutputs,
 )
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
@@ -260,9 +266,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
+        original_max_num_running_reqs = self.max_num_running_reqs
+        reserved_running_slots = self._get_async_chunk_reserved_running_slots() if self.chunk_transfer_adapter else 0
+        if reserved_running_slots:
+            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_running_reqs = original_max_num_running_reqs
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:

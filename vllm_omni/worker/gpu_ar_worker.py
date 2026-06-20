@@ -112,15 +112,23 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
+        model_stage = getattr(self.model_config, "model_stage", None)
+        stage_id = getattr(self.model_config, "stage_id", None)
+
         if VLLM_OMNI_USE_V2_RUNNER or self.use_v2_model_runner:
             from vllm_omni.worker_v2.omni_ar_model_runner import (
                 OmniARModelRunner,
             )
 
-            logger.info("Using MR v2 OmniARModelRunner for omni AR stage.")
+            logger.info(
+                "Using MR v2 OmniARModelRunner for omni AR stage (stage_id=%s model_stage=%s).",
+                stage_id,
+                model_stage,
+            )
             self.use_v2_model_runner = True
             self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
         else:
+            self.use_v2_model_runner = False
             self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:

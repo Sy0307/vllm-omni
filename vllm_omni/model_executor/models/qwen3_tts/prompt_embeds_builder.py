@@ -164,10 +164,6 @@ def mel_spectrogram(
     hann_window: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Mel spectrogram via torch STFT and a (cached) mel filterbank."""
-    if torch.min(y) < -1.0:
-        logger.warning("Min value of input waveform signal is %s", torch.min(y))
-    if torch.max(y) > 1.0:
-        logger.warning("Max value of input waveform signal is %s", torch.max(y))
     device = y.device
     if mel_basis is None:
         mel_basis = _cached_mel_filter_bank(sampling_rate, n_fft, num_mels, fmin, fmax).to(device)
@@ -335,6 +331,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
         self._ref_audio_artifact_cache_max_entries = int(ref_audio_artifact_cache_max_entries)
         self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
+        self._long_tensor_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
 
         # Bounded LRU; caller-supplied orig_sr can otherwise grow this without limit.
         self._resampler_cache: OrderedDict[tuple[int, int], AudioResampler] = OrderedDict()
@@ -349,6 +346,17 @@ class Qwen3TTSPromptEmbedsBuilder:
     def _pad_embed(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return the pad-token embedding on the requested device/dtype, shape ``[1, 1, H]``."""
         return self._tts_pad_embed_buffer.to(device=device, dtype=dtype).reshape(1, 1, -1)
+
+    def _long_tensor(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        key = (str(device), tuple(int(v) for v in values))
+        cached = self._long_tensor_cache.get(key)
+        if cached is None or cached.device != device:
+            cached = torch.tensor([list(key[1])], device=device, dtype=torch.long)
+            self._long_tensor_cache[key] = cached
+        return cached
 
     def _get_resampler(self, orig_sr: int, target_sr: int) -> AudioResampler:
         key = (int(orig_sr), int(target_sr))
@@ -852,9 +860,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         codec_embed_sum = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)  # [1,T,H]
         codec_embed_sum = torch.cat(
             [
-                self._codec_embed(
-                    torch.tensor([[self._talker_config.codec_bos_id]], device=codec_embed_sum.device, dtype=torch.long)
-                ),
+                self._codec_embed(self._long_tensor([self._talker_config.codec_bos_id], codec_embed_sum.device)),
                 codec_embed_sum,
             ],
             dim=1,
@@ -950,11 +956,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         # tts special token embeds (projected into talker hidden).
         # ``tts_pad_embed`` is precomputed (request-independent), so we only
         # need bos/eos here.
-        tts_tokens = torch.tensor(
-            [[config.tts_bos_token_id, config.tts_eos_token_id]],
-            device=input_ids.device,
-            dtype=input_ids.dtype,
-        )
+        tts_tokens = self._long_tensor([config.tts_bos_token_id, config.tts_eos_token_id], input_ids.device)
         tts_bos_embed, tts_eos_embed = text_projection(text_embedding(tts_tokens)).chunk(2, dim=1)
         tts_pad_embed = self._pad_embed(input_ids.device, tts_bos_embed.dtype)
 
@@ -992,9 +994,9 @@ class Qwen3TTSPromptEmbedsBuilder:
                 ]
             ]
 
-        codec_input_0 = codec_embed(torch.tensor(codec_prefill_list, device=input_ids.device, dtype=torch.long))
+        codec_input_0 = codec_embed(self._long_tensor(codec_prefill_list[0], input_ids.device))
         codec_input_1 = codec_embed(
-            torch.tensor([[talker_config.codec_pad_id, talker_config.codec_bos_id]], device=input_ids.device)
+            self._long_tensor([talker_config.codec_pad_id, talker_config.codec_bos_id], input_ids.device)
         )
 
         # Speaker embedding/token (task-dependent)
@@ -1290,7 +1292,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                             talker_prompt,
                             text_all + codec_embed(pad_ids),
                             tts_pad_embed
-                            + codec_embed(torch.tensor([[talker_config.codec_bos_id]], device=input_ids.device)),
+                            + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
                         ],
                         dim=1,
                     )
@@ -1343,8 +1345,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     [
                         talker_prompt,
                         text_all + codec_embed(pad_ids),
-                        tts_pad_embed
-                        + codec_embed(torch.tensor([[talker_config.codec_bos_id]], device=input_ids.device)),
+                        tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
                     ],
                     dim=1,
                 )
@@ -1382,8 +1383,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     [
                         talker_prompt,
                         text_all + codec_embed(pad_ids),
-                        tts_pad_embed
-                        + codec_embed(torch.tensor([[talker_config.codec_bos_id]], device=input_ids.device)),
+                        tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
                     ],
                     dim=1,
                 )

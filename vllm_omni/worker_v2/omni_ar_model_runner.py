@@ -218,7 +218,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         for i in range(num_reqs):
             start = int(query_start_loc_np[i])
             end = start + int(num_scheduled_tokens[i])
-            payload: dict[str, Any] = {"hidden": hidden_cpu[start:end]}
+            payload: dict[str, Any] = {"hidden": hidden_cpu[start:end].clone()}
             for k, v in mm_cpu.items():
                 payload[k] = _slice_pooler_value(
                     v,
@@ -557,8 +557,6 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._num_reqs,
             )
             self.model_runner_output.pooler_output = pooler_output
-            self.model_runner_output.multimodal_outputs = [
-                _ensure_tensor_values(p) if p else {} for p in pooler_output
-            ]
+            self.model_runner_output.multimodal_outputs = [_ensure_tensor_values(p) if p else {} for p in pooler_output]
 
         return self.model_runner_output
