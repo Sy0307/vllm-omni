@@ -1,7 +1,7 @@
 """WebSocket handler for streaming text input TTS.
 
-Accepts text incrementally via WebSocket, buffers and splits at sentence
-boundaries, and generates audio per sentence using the existing TTS pipeline.
+Accepts text incrementally via WebSocket, buffers it until input.done, and
+generates audio once for the buffered input using the existing TTS pipeline.
 
 Protocol:
     Client -> Server:
@@ -58,8 +58,8 @@ class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
     Each WebSocket connection is an independent session. Text arrives
-    incrementally, is split at sentence boundaries, and audio is generated
-    per sentence using the existing OmniOpenAIServingSpeech pipeline.
+    incrementally, is buffered until input.done, and audio is generated once
+    for the buffered input using the existing OmniOpenAIServingSpeech pipeline.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
