@@ -1452,6 +1452,21 @@ class TestTTSMethods:
         # x_vector_only_mode should not be set when explicit ref_audio is provided
         assert "x_vector_only_mode" not in params
 
+    def test_build_tts_params_explicit_ref_audio_ignores_unknown_voice_name(self, speech_server):
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            voice="clone_16",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,ZXhwbGljaXQ=",
+            ref_text="reference text",
+        )
+
+        params = speech_server._build_tts_params(req)
+
+        assert "speaker" not in params
+        assert "ref_text" in params
+        assert params["task_type"] == ["Base"]
+
     def test_get_uploaded_audio_data(self, speech_server, mocker: MockerFixture):
         """Returns a data URL by loading audio via safetensors + re-encoding WAV."""
         mocker.patch("pathlib.Path.exists", return_value=True)
