@@ -30,9 +30,20 @@ the entries declared here.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+
+PipelineRegistryEntry = tuple[str, str | Callable[[], str]]
+
+
+def _moss_tts_local_pipeline_name() -> str:
+    native_flag = os.environ.get("MOSS_TTS_LOCAL_NATIVE", "0").strip().lower()
+    if native_flag in ("1", "true", "yes", "on"):
+        return "MOSS_TTS_LOCAL_NATIVE_PIPELINE"
+    return "MOSS_TTS_LOCAL_PIPELINE"
+
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
-_OMNI_PIPELINES: dict[str, tuple[str, str]] = {
+_OMNI_PIPELINES: dict[str, PipelineRegistryEntry] = {
     # model_type -> (module_path, variable_name)
     "qwen2_5_omni": (
         "vllm_omni.model_executor.models.qwen2_5_omni.pipeline",
@@ -149,7 +160,7 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     ),
     "moss_tts_local": (
         "vllm_omni.model_executor.models.moss_tts_local.pipeline",
-        "MOSS_TTS_LOCAL_NATIVE_PIPELINE" if os.environ.get("MOSS_TTS_LOCAL_NATIVE") == "1" else "MOSS_TTS_LOCAL_PIPELINE",
+        _moss_tts_local_pipeline_name,
     ),
     "minicpmo_4_5": (
         "vllm_omni.model_executor.models.minicpmo_4_5.pipeline",

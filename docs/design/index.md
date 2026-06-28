@@ -12,6 +12,7 @@ This section contains design documents and architecture specifications for vLLM-
 - [Ray-based Execution](feature/ray_based_execution.md)
 - [Adding Step Execution Support for Diffusion Pipelines](feature/diffusion_step_execution.md)
 - [Continuous Batching for Step-Wise Diffusion](feature/diffusion_continuous_batching.md)
+- [MOSS-TTS Local Serving Defaults](moss_tts_local_best_practices.md)
 
 ## Infrastructure Design Documents
 
