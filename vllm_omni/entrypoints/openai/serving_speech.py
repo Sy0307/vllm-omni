@@ -81,6 +81,7 @@ _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _MOSS_TTS_FULL_MODEL_STAGES = {"moss_tts", "moss_tts_codec"}
+_MOSS_TTS_LOCAL_MODEL_STAGES = {"moss_tts_local"}
 _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
@@ -99,6 +100,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
     | _MOSS_TTS_FULL_MODEL_STAGES
+    | _MOSS_TTS_LOCAL_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
@@ -688,6 +690,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "moss_tts_nano"
         if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:
             return "moss_tts"
+        if model_stage in _MOSS_TTS_LOCAL_MODEL_STAGES:
+            return "moss_tts_local"
         if model_stage in _HIGGS_AUDIO_V2_TTS_MODEL_STAGES:
             return "higgs_audio_v2"
         if model_stage in _HIGGS_V3_TTS_MODEL_STAGES:
@@ -3430,6 +3434,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "moss_tts_nano"
         elif self._tts_model_type == "moss_tts":
             model_type = "moss_tts"
+        elif self._tts_model_type == "moss_tts_local":
+            model_type = "moss_tts_local"
         elif self._tts_model_type == "higgs_audio_v2":
             model_type = "higgs_audio_v2"
         elif self._tts_model_type == "glm_tts":
