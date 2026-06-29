@@ -9,8 +9,6 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.qwen3_tts.codec_decode_service import (
-    AsyncCodecDecodeService,
-    DynamicBatchingCodecDecodeService,
     PyTorchCodecDecodeService,
     ShmCodecDecodeService,
     is_codec_handle_tensor,
@@ -445,157 +443,6 @@ def test_pytorch_codec_decode_service_batches_requests_and_records_stats():
     assert service.stats.bucket_groups[(2, 3)] == 1
 
 
-def test_async_codec_decode_service_cpu_fallback_returns_future():
-    decoder = _FakeDecoder()
-    service = AsyncCodecDecodeService(
-        decoder=decoder,
-        num_quantizers=_NUM_QUANTIZERS,
-        decode_chunk_frames=300,
-        decode_left_context_frames=25,
-        decode_variable_chunk_batch_min_frames=300,
-        decode_batch_max_size=0,
-        device=torch.device("cpu"),
-    )
-    group_chunks = [
-        [
-            (0, torch.arange(6, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3)),
-            (1, torch.arange(6, 12, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3)),
-        ]
-    ]
-
-    future = service.decode_group_chunks_async(group_chunks)
-    wav_rows = future.wait()
-
-    assert decoder.decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
-        }
-    ]
-    assert sorted(wav_rows) == [0, 1]
-    torch.testing.assert_close(wav_rows[0], torch.arange(18, dtype=torch.float32))
-    torch.testing.assert_close(wav_rows[1], torch.arange(1000, 1018, dtype=torch.float32))
-    assert service.stats.submitted_requests == 2
-    assert service.stats.decoded_batches == 1
-
-
-def test_dynamic_batching_codec_decode_service_merges_two_submissions():
-    decoder = _FakeDecoder()
-    service = DynamicBatchingCodecDecodeService(
-        decoder=decoder,
-        num_quantizers=_NUM_QUANTIZERS,
-        decode_chunk_frames=300,
-        decode_left_context_frames=25,
-        decode_variable_chunk_batch_min_frames=300,
-        decode_batch_max_size=0,
-        max_queue_delay_us=50_000,
-        max_queue_jobs=2,
-    )
-    try:
-        future0 = service.decode_group_chunks_async(
-            [[(0, torch.arange(6, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3))]]
-        )
-        future1 = service.decode_group_chunks_async(
-            [[(0, torch.arange(6, 12, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3))]]
-        )
-
-        wav_rows0 = future0.wait()
-        wav_rows1 = future1.wait()
-    finally:
-        service.shutdown()
-
-    assert decoder.decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
-        }
-    ]
-    torch.testing.assert_close(wav_rows0[0], torch.arange(18, dtype=torch.float32))
-    torch.testing.assert_close(wav_rows1[0], torch.arange(1000, 1018, dtype=torch.float32))
-    assert service.stats.submitted_requests == 2
-    assert service.stats.decoded_batches == 1
-    assert service.stats.dynamic_batches == 1
-
-
-def test_dynamic_batching_codec_decode_service_pads_to_fixed_bucket():
-    decoder = _FakeDecoder()
-    service = DynamicBatchingCodecDecodeService(
-        decoder=decoder,
-        num_quantizers=_NUM_QUANTIZERS,
-        decode_chunk_frames=300,
-        decode_left_context_frames=25,
-        decode_variable_chunk_batch_min_frames=300,
-        decode_batch_max_size=8,
-        decode_batch_bucket_frames=[97],
-        max_queue_delay_us=50_000,
-        max_queue_jobs=2,
-    )
-    try:
-        future0 = service.decode_group_chunks_async(
-            [[(0, torch.arange(_NUM_QUANTIZERS * 73, dtype=torch.long).reshape(_NUM_QUANTIZERS, 73))]]
-        )
-        future1 = service.decode_group_chunks_async(
-            [[(0, torch.arange(_NUM_QUANTIZERS * 97, dtype=torch.long).reshape(_NUM_QUANTIZERS, 97))]]
-        )
-
-        wav_rows0 = future0.wait()
-        wav_rows1 = future1.wait()
-    finally:
-        service.shutdown()
-
-    assert decoder.decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 97),
-        }
-    ]
-    assert decoder.batched_decode_calls == []
-    torch.testing.assert_close(wav_rows0[0], torch.arange(394, dtype=torch.float32))
-    torch.testing.assert_close(wav_rows1[0], torch.arange(1000, 1394, dtype=torch.float32))
-    assert service.stats.submitted_requests == 2
-    assert service.stats.decoded_batches == 1
-    assert service.stats.dynamic_batches == 1
-
-
-def test_dynamic_batching_codec_decode_service_worker_disables_grad():
-    class GradModeDecoder(_FakeDecoder):
-        def __init__(self):
-            super().__init__()
-            self.grad_enabled: bool | None = None
-
-        def chunked_decode(self, codes, *, chunk_size=300, left_context_size=25):
-            self.grad_enabled = torch.is_grad_enabled()
-            return super().chunked_decode(
-                codes,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-            )
-
-    decoder = GradModeDecoder()
-    service = DynamicBatchingCodecDecodeService(
-        decoder=decoder,
-        num_quantizers=_NUM_QUANTIZERS,
-        decode_chunk_frames=300,
-        decode_left_context_frames=25,
-        decode_variable_chunk_batch_min_frames=300,
-        decode_batch_max_size=0,
-        max_queue_delay_us=0,
-        max_queue_jobs=1,
-    )
-    try:
-        future = service.decode_group_chunks_async(
-            [[(0, torch.arange(6, dtype=torch.long).reshape(_NUM_QUANTIZERS, 3))]]
-        )
-        future.wait()
-    finally:
-        service.shutdown()
-
-    assert decoder.grad_enabled is False
-
-
 def test_shm_codec_decode_service_returns_resolvable_handle(tmp_path):
     decoder = _FakeDecoder()
     service = ShmCodecDecodeService(
@@ -716,71 +563,10 @@ def test_forward_can_use_pytorch_codec_decode_service():
     torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
 
 
-def test_forward_can_use_async_codec_decode_service():
-    model = _make_model()
-    model._decode_async_codec_enabled = True
-
-    out = model.forward(
-        input_ids=torch.arange(12, dtype=torch.long),
-        seq_token_counts=[6, 6],
-        runtime_additional_information=[
-            {"meta": {"left_context_size": 0}},
-            {"meta": {"left_context_size": 1}},
-        ],
-    )
-
-    assert model.decoder.decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
-        }
-    ]
-    assert isinstance(model._decode_service, AsyncCodecDecodeService)
-    assert model._decode_service.stats.submitted_requests == 2
-    assert model._decode_service.stats.decoded_batches == 1
-    audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
-
-
-def test_forward_can_use_dynamic_batching_codec_decode_service():
-    model = _make_model()
-    model._decode_dynamic_batching_enabled = True
-    model._decode_dynamic_max_queue_delay_us = 0
-
-    try:
-        out = model.forward(
-            input_ids=torch.arange(12, dtype=torch.long),
-            seq_token_counts=[6, 6],
-            runtime_additional_information=[
-                {"meta": {"left_context_size": 0}},
-                {"meta": {"left_context_size": 1}},
-            ],
-        )
-    finally:
-        if isinstance(model._decode_service, DynamicBatchingCodecDecodeService):
-            model._decode_service.shutdown()
-
-    assert model.decoder.decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
-        }
-    ]
-    assert isinstance(model._decode_service, DynamicBatchingCodecDecodeService)
-    assert model._decode_service.stats.submitted_requests == 2
-    assert model._decode_service.stats.decoded_batches == 1
-    audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
-
-
 def test_forward_can_return_deferred_audio_handles():
     model = _make_model()
     model._decode_deferred_output_enabled = True
-    model._decode_dynamic_max_queue_delay_us = 0
+    model._decode_deferred_max_queue_delay_us = 0
 
     try:
         out = model.forward(
@@ -1158,48 +944,14 @@ def test_decode_service_can_be_configured():
     assert model._decode_service_enabled is True
 
 
-def test_async_codec_decode_can_be_configured():
-    model = _make_model(
-        async_chunk=True,
-        stage_connector_config={
-            "extra": {
-                "decode_async_codec": True,
-            }
-        },
-    )
-
-    _load_weights_noop(model)
-
-    assert model._decode_async_codec_enabled is True
-    assert model._decode_service_enabled is True
-
-
-def test_dynamic_batching_codec_decode_can_be_configured():
-    model = _make_model(
-        async_chunk=True,
-        stage_connector_config={
-            "extra": {
-                "decode_dynamic_batching": True,
-                "decode_dynamic_max_queue_delay_us": 1234,
-                "decode_dynamic_max_queue_jobs": 7,
-            }
-        },
-    )
-
-    _load_weights_noop(model)
-
-    assert model._decode_dynamic_batching_enabled is True
-    assert model._decode_service_enabled is True
-    assert model._decode_dynamic_max_queue_delay_us == 1234
-    assert model._decode_dynamic_max_queue_jobs == 7
-
-
 def test_deferred_codec_decode_can_be_configured():
     model = _make_model(
         async_chunk=True,
         stage_connector_config={
             "extra": {
                 "decode_deferred_output": True,
+                "decode_deferred_max_queue_delay_us": 1234,
+                "decode_deferred_max_queue_jobs": 7,
             }
         },
     )
@@ -1208,6 +960,8 @@ def test_deferred_codec_decode_can_be_configured():
 
     assert model._decode_deferred_output_enabled is True
     assert model._decode_service_enabled is True
+    assert model._decode_deferred_max_queue_delay_us == 1234
+    assert model._decode_deferred_max_queue_jobs == 7
 
 
 def test_invalid_decode_batch_max_size_is_rejected():

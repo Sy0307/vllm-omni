@@ -15,8 +15,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .codec_decode_service import (
-    AsyncCodecDecodeService,
-    DynamicBatchingCodecDecodeService,
     PyTorchCodecDecodeService,
     ShmCodecDecodeService,
     empty_codec_handle_tensor,
@@ -114,18 +112,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
         self._batch_stats_raw_bucket_groups: Counter[tuple[int, int]] = Counter()
         self._decode_service_enabled = False
-        self._decode_async_codec_enabled = False
-        self._decode_dynamic_batching_enabled = False
         self._decode_deferred_output_enabled = False
-        self._decode_dynamic_max_queue_delay_us = 1000
-        self._decode_dynamic_max_queue_jobs = 32
-        self._decode_service: (
-            PyTorchCodecDecodeService
-            | AsyncCodecDecodeService
-            | DynamicBatchingCodecDecodeService
-            | ShmCodecDecodeService
-            | None
-        ) = None
+        self._decode_deferred_max_queue_delay_us = 1000
+        self._decode_deferred_max_queue_jobs = 32
+        self._decode_service: PyTorchCodecDecodeService | ShmCodecDecodeService | None = None
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -239,23 +229,14 @@ class Qwen3TTSCode2Wav(nn.Module):
     def _get_decode_service(
         self,
         decoder: nn.Module,
-    ) -> (
-        PyTorchCodecDecodeService | AsyncCodecDecodeService | DynamicBatchingCodecDecodeService | ShmCodecDecodeService
-    ):
-        if self._decode_deferred_output_enabled:
-            expected_cls = ShmCodecDecodeService
-        elif self._decode_dynamic_batching_enabled:
-            expected_cls = DynamicBatchingCodecDecodeService
-        elif self._decode_async_codec_enabled:
-            expected_cls = AsyncCodecDecodeService
-        else:
-            expected_cls = PyTorchCodecDecodeService
+    ) -> PyTorchCodecDecodeService | ShmCodecDecodeService:
+        expected_cls = ShmCodecDecodeService if self._decode_deferred_output_enabled else PyTorchCodecDecodeService
         if (
             self._decode_service is None
             or self._decode_service.decoder is not decoder
             or not isinstance(self._decode_service, expected_cls)
         ):
-            if isinstance(self._decode_service, (DynamicBatchingCodecDecodeService, ShmCodecDecodeService)):
+            if isinstance(self._decode_service, ShmCodecDecodeService):
                 self._decode_service.shutdown()
             kwargs = {
                 "decoder": decoder,
@@ -269,20 +250,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             if self._decode_deferred_output_enabled:
                 self._decode_service = ShmCodecDecodeService(
                     **kwargs,
-                    max_queue_delay_us=self._decode_dynamic_max_queue_delay_us,
-                    max_queue_jobs=self._decode_dynamic_max_queue_jobs,
-                    device=self.vllm_config.device_config.device,
-                )
-            elif self._decode_dynamic_batching_enabled:
-                self._decode_service = DynamicBatchingCodecDecodeService(
-                    **kwargs,
-                    max_queue_delay_us=self._decode_dynamic_max_queue_delay_us,
-                    max_queue_jobs=self._decode_dynamic_max_queue_jobs,
-                    device=self.vllm_config.device_config.device,
-                )
-            elif self._decode_async_codec_enabled:
-                self._decode_service = AsyncCodecDecodeService(
-                    **kwargs,
+                    max_queue_delay_us=self._decode_deferred_max_queue_delay_us,
+                    max_queue_jobs=self._decode_deferred_max_queue_jobs,
                     device=self.vllm_config.device_config.device,
                 )
             else:
@@ -692,33 +661,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={"audio_handle": audio_handles, "sr": [sr_tensor] * num_req},
             )
 
-        if self._decode_dynamic_batching_enabled:
-            service = self._get_decode_service(decoder)
-            assert isinstance(service, DynamicBatchingCodecDecodeService)
-            futures = [
-                service.decode_group_chunks_async(
-                    group_chunks,
-                    record_batch=_record_service_batch,
-                )
-                for _, group_chunks in decode_group_batches
-            ]
-            for future in futures:
-                _fill_wav_rows(future.wait())
-        elif self._decode_async_codec_enabled:
-            service = self._get_decode_service(decoder)
-            assert isinstance(service, AsyncCodecDecodeService)
-            futures = [
-                service.decode_group_chunks_async(
-                    group_chunks,
-                    record_batch=_record_service_batch,
-                )
-                for _, group_chunks in decode_group_batches
-            ]
-            for future in futures:
-                _fill_wav_rows(future.wait())
-        else:
-            for bucket_frames, group_chunks in decode_group_batches:
-                _decode_group_chunks(bucket_frames, group_chunks)
+        for bucket_frames, group_chunks in decode_group_batches:
+            _decode_group_chunks(bucket_frames, group_chunks)
 
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
             self.log_decode_batch_stats()
@@ -955,41 +899,29 @@ class Qwen3TTSCode2Wav(nn.Module):
                 "decode_service_enabled",
                 self._decode_service_enabled,
             )
-            self._decode_async_codec_enabled = _get_bool_config(
-                "decode_async_codec",
-                self._decode_async_codec_enabled,
-            )
-            self._decode_dynamic_batching_enabled = _get_bool_config(
-                "decode_dynamic_batching",
-                self._decode_dynamic_batching_enabled,
-            )
             self._decode_deferred_output_enabled = _get_bool_config(
                 "decode_deferred_output",
                 self._decode_deferred_output_enabled,
             )
-            self._decode_dynamic_max_queue_delay_us = _get_int_config(
-                "decode_dynamic_max_queue_delay_us",
-                self._decode_dynamic_max_queue_delay_us,
+            self._decode_deferred_max_queue_delay_us = _get_int_config(
+                "decode_deferred_max_queue_delay_us",
+                self._decode_deferred_max_queue_delay_us,
             )
-            if self._decode_dynamic_max_queue_delay_us < 0:
+            if self._decode_deferred_max_queue_delay_us < 0:
                 raise ValueError(
                     "Invalid Qwen3-TTS Code2Wav config "
-                    f"decode_dynamic_max_queue_delay_us={self._decode_dynamic_max_queue_delay_us}"
+                    f"decode_deferred_max_queue_delay_us={self._decode_deferred_max_queue_delay_us}"
                 )
-            self._decode_dynamic_max_queue_jobs = _get_int_config(
-                "decode_dynamic_max_queue_jobs",
-                self._decode_dynamic_max_queue_jobs,
+            self._decode_deferred_max_queue_jobs = _get_int_config(
+                "decode_deferred_max_queue_jobs",
+                self._decode_deferred_max_queue_jobs,
             )
-            if self._decode_dynamic_max_queue_jobs <= 0:
+            if self._decode_deferred_max_queue_jobs <= 0:
                 raise ValueError(
                     "Invalid Qwen3-TTS Code2Wav config "
-                    f"decode_dynamic_max_queue_jobs={self._decode_dynamic_max_queue_jobs}"
+                    f"decode_deferred_max_queue_jobs={self._decode_deferred_max_queue_jobs}"
                 )
-            if (
-                self._decode_async_codec_enabled
-                or self._decode_dynamic_batching_enabled
-                or self._decode_deferred_output_enabled
-            ):
+            if self._decode_deferred_output_enabled:
                 self._decode_service_enabled = True
         else:
             decode_cudagraph_capture_sizes = None
@@ -1000,7 +932,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_enable_tf32 = False
 
         self._decode_dtype = decode_dtype
-        if isinstance(self._decode_service, (DynamicBatchingCodecDecodeService, ShmCodecDecodeService)):
+        if isinstance(self._decode_service, ShmCodecDecodeService):
             self._decode_service.shutdown()
         self._decode_service = None
         self.decoder.to(device=device, dtype=decode_dtype)
