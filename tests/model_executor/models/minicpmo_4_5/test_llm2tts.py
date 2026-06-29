@@ -40,6 +40,7 @@ def _make_thinker_output(
     request_id: str = "req-0",
     latent: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
+    multimodal_output: dict[str, object] | None = None,
 ):
     """Construct a minimal mock of a thinker engine output entry.
 
@@ -48,8 +49,11 @@ def _make_thinker_output(
       - per-output: ``multimodal_output`` (dict), ``hidden_states`` (opt),
         ``text``, ``token_ids``
     """
+    mm_output = dict(multimodal_output or {})
+    if latent is not None:
+        mm_output["latent"] = latent
     output = SimpleNamespace(
-        multimodal_output={"latent": latent} if latent is not None else {},
+        multimodal_output=mm_output,
         token_ids=output_token_ids,
         text=text,
     )
@@ -220,6 +224,61 @@ class TestTtsRegionDetection:
         ai, _ = self._run([10, 11], [20, 21, 22])
         assert "tts_token_ids" not in ai
         assert "tts_hidden_states" not in ai
+
+
+class TestNativeDuplexHandoff:
+    @staticmethod
+    def _special() -> dict[str, int]:
+        return {
+            "unit_token_id": 151683,
+            "unit_end_token_id": 151684,
+            "listen_token_id": 151705,
+            "speak_token_id": 151706,
+            "tts_bos_token_id": 151703,
+            "tts_eos_token_id": 151704,
+            "tts_pad_token_id": 151722,
+            "chunk_eos_token_id": 151718,
+            "chunk_tts_eos_token_id": 151721,
+            "turn_eos_token_id": 151717,
+        }
+
+    def _run_native(self, output_token_ids: list[int]):
+        prompt_ids = [151684, 151684, 151683] + [151698] * 10
+        total = len(prompt_ids) + len(output_token_ids)
+        hidden = torch.arange(total * _HIDDEN_DIM, dtype=torch.float32).reshape(total, _HIDDEN_DIM)
+        mm_output = {
+            "duplex_prompt_token_ids": prompt_ids,
+            "meta": self._special(),
+        }
+        return llm2tts(
+            [
+                _make_thinker_output(
+                    prompt_token_ids=prompt_ids,
+                    output_token_ids=output_token_ids,
+                    text="native",
+                    hidden_states=hidden,
+                    multimodal_output=mm_output,
+                )
+            ],
+            prompt=None,
+        )
+
+    def test_native_duplex_valid_speak_handoff_is_forwarded(self) -> None:
+        out = self._run_native([151705, 151706, 108386, 104256, 151718])
+
+        assert len(out) == 1
+        assert out[0]["model_intermediate_buffer"]["ids"]["tts"] == [108386, 104256]
+
+    def test_native_duplex_without_tts_handoff_is_not_forwarded(self) -> None:
+        out = self._run_native([57960, 3, 854, 58736, 854, 58736])
+
+        assert out == []
+
+    def test_native_duplex_turn_eos_stops_handoff_after_inclusive_boundary(self) -> None:
+        out = self._run_native([151705, 151706, 108386, 151717, 84921, 279, 151718])
+
+        assert len(out) == 1
+        assert out[0]["model_intermediate_buffer"]["ids"]["tts"] == [108386, 151717]
 
 
 class TestPromptAndMultiModal:
