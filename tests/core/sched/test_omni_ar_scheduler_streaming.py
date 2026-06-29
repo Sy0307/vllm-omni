@@ -90,3 +90,23 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+def test_duplex_segment_boundary_uses_current_stage_stop_overrides() -> None:
+    sched = _make_scheduler(stage_id=1)
+    request = _make_request()
+    request.resumable = True
+    request.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "session_config": {
+                "duplex_stage_sampling_params": {
+                    "0": {"stop_token_ids": [111]},
+                    "1": {"stop_token_ids": [151645]},
+                }
+            },
+        }
+    }
+
+    assert sched._duplex_stage_stop_token_ids(request) == {151645}
+    assert sched._is_duplex_segment_boundary(request, [151645]) is True
