@@ -393,12 +393,16 @@ class OmniBase(PDDisaggregationMixin):
 
         req_state = self.request_states.get(req_id)
         if req_state is None:
-            logger.debug(
-                "[%s] dropping output for unknown req %s",
-                self.__class__.__name__,
-                req_id,
-            )
-            return True, None, None, None
+            if req_id.startswith("duplex-"):
+                req_state = ClientRequestState(req_id)
+                self.request_states[req_id] = req_state
+            else:
+                logger.debug(
+                    "[%s] dropping output for unknown req %s",
+                    self.__class__.__name__,
+                    req_id,
+                )
+                return True, None, None, None
 
         req_state.stage_id = stage_id
 
@@ -604,6 +608,7 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
         return OmniRequestOutput(
             request_id=req_id or "",
+            finished=finished,
             stage_id=stage_id,
             final_output_type=output_type,
             request_output=engine_outputs,
@@ -616,7 +621,6 @@ class OmniBase(PDDisaggregationMixin):
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
-            finished=finished,
         )
 
     def shutdown(self, timeout: float | None = None) -> None:

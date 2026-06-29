@@ -215,6 +215,9 @@ class OmniRequestState(RequestState):
         try:
             for k, v in list(self.mm_accumulated.tensors.items()):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    if k == "duplex_prompt_token_ids":
+                        self.mm_accumulated.tensors[k] = v[-1]
+                        continue
                     try:
                         self.mm_accumulated.tensors[k] = _cat_tensors(v, strategy)
                     except RuntimeError:
