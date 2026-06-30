@@ -2975,9 +2975,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Speaker (voice)
         if request.voice is not None:
             voice_lower = request.voice.lower()
-            if request.ref_audio is None:
-                params["speaker"] = [request.voice]
-                params["voice_created_at"] = [self._voice_created_at(voice_lower)]
+            params["speaker"] = [request.voice]
+            params["voice_created_at"] = [self._voice_created_at(voice_lower)]
 
             # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
             # If ref_text was provided at upload time, use in-context cloning; otherwise x_vector only.
