@@ -29,7 +29,7 @@ class MiniCPMO45DuplexPolicy:
     SAMPLES_PER_AUDIO_TOKEN = 1600
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 64
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
-    NATURAL_CHUNK_BOUNDARY_CHARS = frozenset("。.!！?？\n")
+    NATURAL_CHUNK_BOUNDARY_CHARS = frozenset("。!！?？\n")
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:
@@ -81,7 +81,9 @@ class MiniCPMO45DuplexPolicy:
     @staticmethod
     def text_ends_incomplete_chinese_question_prefix(text: str) -> bool:
         stripped = text.rstrip()
-        return bool(stripped) and stripped.endswith(("什", "甚"))
+        return bool(stripped) and stripped.endswith(
+            ("什", "甚", "为什", "怎么", "是不", "可以", "能不", "什么时", "哪里", "哪一")
+        )
 
     @classmethod
     def token_ids_from_tokenizer(cls, tokenizer: Any) -> dict[str, int]:

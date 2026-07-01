@@ -2564,14 +2564,16 @@ class OmniDuplexSessionHandler:
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
-            if self._session_auto_responds(session) and session.active_request_id != request_id:
-                if profile_logs:
-                    logger.info(
-                        "[drain] exit inactive auto-response request: request_id=%s active_request_id=%s",
-                        request_id,
-                        session.active_request_id,
-                    )
-                return None
+            if self._session_auto_responds(session):
+                active_request_id = session.active_request_id
+                if active_request_id is not None and active_request_id != request_id:
+                    if profile_logs:
+                        logger.info(
+                            "[drain] exit inactive auto-response request: request_id=%s active_request_id=%s",
+                            request_id,
+                            active_request_id,
+                        )
+                    return None
             if expected_epoch is not None and session.epoch != expected_epoch:
                 if profile_logs:
                     logger.info("[drain] exit epoch-change: request_id=%s", request_id)
@@ -3080,8 +3082,7 @@ class OmniDuplexSessionHandler:
             and 151645 in token_ids
             and not audio_chunks
             and raw_audio_samples is not None
-            and offset_before is not None
-            and raw_audio_samples == offset_before
+            and (raw_audio_samples == 0 or raw_audio_samples == offset_before)
             and tts_eos_key not in self._data_plane_tts_eos_done
         )
         if stage_tts_eos and tts_eos_key:
