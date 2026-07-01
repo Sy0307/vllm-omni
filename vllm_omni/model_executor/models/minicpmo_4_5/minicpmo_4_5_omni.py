@@ -719,15 +719,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 {key: round(value, 4) for key, value in special_scores.items()},
             )
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
-            if self._minicpmo45_recent_tokens_end_natural_boundary(recent_tokens, token_ids):
-                if MiniCPMO45DuplexPolicy.profile_logs_enabled():
-                    logger.info(
-                        "MiniCPM-o native duplex natural chunk_eos: row=%s recent_len=%d recent_tail=%s",
-                        row_idx,
-                        len(recent_tokens),
-                        recent_tokens[-8:],
-                    )
-                return int(chunk_eos_id)
             max_speak_tokens = int(
                 getattr(
                     self,
