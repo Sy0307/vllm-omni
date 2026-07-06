@@ -126,11 +126,12 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
 def test_generation_stage_mm_only_output_is_returned_without_queue():
     processor, _ = _make_generation_processor_state()
     audio = torch.ones(1, 320)
+    sr = torch.tensor(24000, dtype=torch.int32)
 
     output = OmniEngineCoreOutput(
         request_id="r",
         new_token_ids=[],
-        multimodal_output={"model_outputs": audio},
+        multimodal_output={"model_outputs": audio, "sr": sr},
         finish_reason=FinishReason.STOP,
     )
 
@@ -143,3 +144,33 @@ def test_generation_stage_mm_only_output_is_returned_without_queue():
     assert completion.text == ""
     assert "audio" in completion.multimodal_output
     assert torch.equal(completion.multimodal_output["audio"], audio)
+    assert completion.multimodal_output["sr"].item() == 24000
+
+
+def test_generation_stage_accumulates_mm_until_terminal_output():
+    processor, _ = _make_generation_processor_state()
+    audio = torch.ones(1, 320)
+    sr = torch.tensor(24000, dtype=torch.int32)
+
+    output = OmniEngineCoreOutput(
+        request_id="r",
+        new_token_ids=[],
+        multimodal_output={"model_outputs": audio, "sr": sr},
+        finish_reason=None,
+    )
+    terminal = OmniEngineCoreOutput(
+        request_id="r",
+        new_token_ids=[],
+        finish_reason=FinishReason.STOP,
+    )
+
+    processed = processor.process_outputs([output])
+    assert processed.request_outputs == []
+
+    processed = processor.process_outputs([terminal])
+
+    assert len(processed.request_outputs) == 1
+    completion = processed.request_outputs[0].outputs[0]
+    assert "audio" in completion.multimodal_output
+    assert torch.equal(completion.multimodal_output["audio"], audio)
+    assert completion.multimodal_output["sr"].item() == 24000

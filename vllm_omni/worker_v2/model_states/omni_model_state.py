@@ -248,7 +248,19 @@ class OmniModelState(DefaultModelState):
         for plugin in self.plugins:
             plugin.on_add_request(req_index, new_req_data)
 
-    def remove_request(self, req_index: int) -> None:
+    def _resolve_req_index(self, req_index_or_id: int | str) -> int | None:
+        if isinstance(req_index_or_id, int):
+            return req_index_or_id
+
+        for idx, buffer in enumerate(self.intermediate_buffer.buffers):
+            if buffer.get("req_id") == req_index_or_id:
+                return idx
+        return None
+
+    def remove_request(self, req_index: int | str) -> None:
+        req_index = self._resolve_req_index(req_index)
+        if req_index is None:
+            return
         self.intermediate_buffer.remove_request(req_index)
         for plugin in self.plugins:
             plugin.on_remove_request(req_index)

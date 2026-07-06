@@ -11,6 +11,8 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     OmniARModelRunner,
     _async_copy_mm,
+    _partition_pooler_outputs,
+    _uses_async_output,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -56,6 +58,43 @@ def test_reconstruct_raw_model_output_ignores_empty_multimodal_outputs():
     )
 
     assert raw is hidden
+
+
+def test_uses_async_output_defaults_true_when_upstream_flag_is_absent():
+    assert _uses_async_output(SimpleNamespace())
+
+
+def test_uses_async_output_respects_legacy_flag_when_present():
+    assert not _uses_async_output(SimpleNamespace(use_async_scheduling=False))
+
+
+def test_partition_pooler_outputs_splits_async_chunk_payload():
+    payload = {
+        "hidden": torch.randn(2, 4),
+        "codes.audio": torch.ones(2, 3),
+        "audio": torch.randn(160),
+        "sr": torch.tensor(24000),
+    }
+
+    inter_stage, client = _partition_pooler_outputs([payload], async_chunk=True)
+
+    assert inter_stage is not None
+    assert client is not None
+    assert set(inter_stage[0]) == {"hidden", "codes.audio"}
+    assert inter_stage[0]["hidden"] is payload["hidden"]
+    assert inter_stage[0]["codes.audio"] is payload["codes.audio"]
+    assert set(client[0]) == {"audio", "sr"}
+    assert client[0]["audio"] is payload["audio"]
+    assert client[0]["sr"] is payload["sr"]
+
+
+def test_partition_pooler_outputs_keeps_full_payload_without_async_chunk():
+    payload = {"hidden": torch.randn(2, 4), "audio": torch.randn(160)}
+
+    inter_stage, client = _partition_pooler_outputs([payload], async_chunk=False)
+
+    assert inter_stage == [payload]
+    assert client == [payload]
 
 
 def test_build_pooler_output_basic():

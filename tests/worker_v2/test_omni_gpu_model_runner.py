@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner, _needs_capture_tensor_unwrap
@@ -135,3 +136,108 @@ def test_capture_model_unwraps_omni_outputs():
         assert runner.capture_model() == 5
 
     assert runner.model.forward is original_forward
+
+
+def test_capture_model_excludes_full_graph_without_assuming_candidate_descriptors():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(forward=lambda: torch.ones(1, 2))
+    runner._model_returns_tuple = False
+    runner._exclude_full_graph = True
+    piecewise = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
+    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+    manager = SimpleNamespace(
+        _capture_descs={
+            CUDAGraphMode.FULL: [full],
+            CUDAGraphMode.PIECEWISE: [piecewise],
+        },
+        _candidates=[
+            [1, 2, 4],
+            [piecewise, full],
+        ],
+    )
+    runner.cudagraph_manager = manager
+
+    with patch.object(type(runner).__bases__[0], "capture_model", return_value=7):
+        assert runner.capture_model() == 7
+
+    assert CUDAGraphMode.FULL not in manager._capture_descs
+    assert manager._candidates[0] == [1, 2, 4]
+    assert manager._candidates[1] == [piecewise]
+
+
+def test_capture_model_excludes_full_graph_when_candidates_are_dict():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(forward=lambda: torch.ones(1, 2))
+    runner._model_returns_tuple = False
+    runner._exclude_full_graph = True
+    piecewise = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
+    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+    manager = SimpleNamespace(
+        _capture_descs={
+            CUDAGraphMode.FULL: [full],
+            CUDAGraphMode.PIECEWISE: [piecewise],
+        },
+        _candidates={
+            CUDAGraphMode.FULL: [full],
+            CUDAGraphMode.PIECEWISE: [piecewise, full],
+            "sizes": [1, 2, 4],
+        },
+    )
+    runner.cudagraph_manager = manager
+
+    with patch.object(type(runner).__bases__[0], "capture_model", return_value=9):
+        assert runner.capture_model() == 9
+
+    assert CUDAGraphMode.FULL not in manager._capture_descs
+    assert CUDAGraphMode.FULL not in manager._candidates
+    assert manager._candidates[CUDAGraphMode.PIECEWISE] == [piecewise]
+    assert manager._candidates["sizes"] == [1, 2, 4]
+
+
+def test_dispatch_batch_descriptor_passes_lora_count_to_cudagraph_manager():
+    runner = object.__new__(OmniGPUModelRunner)
+    batch_desc = SimpleNamespace(num_tokens=8, num_reqs=2)
+    runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock(return_value=batch_desc))
+    runner.dp_size = 1
+
+    assert runner._dispatch_batch_descriptor(
+        num_reqs=2,
+        num_toks=8,
+        uniform_tok_count=4,
+        num_active_loras=0,
+        use_eager=False,
+    ) == (batch_desc, None)
+
+    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, 0)
+
+
+def test_dispatch_batch_descriptor_passes_lora_count_to_dp_sync():
+    runner = object.__new__(OmniGPUModelRunner)
+    batch_desc = SimpleNamespace(num_tokens=8, num_reqs=2)
+    runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock(return_value=batch_desc))
+    runner.dp_size = 2
+    runner.dp_rank = 1
+
+    with patch(
+        "vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding",
+        return_value=("synced", "tokens"),
+    ) as sync:
+        assert runner._dispatch_batch_descriptor(
+            num_reqs=2,
+            num_toks=8,
+            uniform_tok_count=4,
+            num_active_loras=3,
+            use_eager=False,
+        ) == ("synced", "tokens")
+
+    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, 3)
+    sync.assert_called_once_with(
+        runner.cudagraph_manager,
+        batch_desc,
+        8,
+        2,
+        4,
+        2,
+        1,
+        num_active_loras=3,
+    )

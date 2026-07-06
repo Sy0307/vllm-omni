@@ -24,9 +24,28 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _uses_async_output(runner: Any) -> bool:
+    # vLLM 0.24's GPUModelRunner.sample_tokens() always returns AsyncOutput and
+    # no longer exposes use_async_scheduling. Older runners still carry the flag.
+    return bool(getattr(runner, "use_async_scheduling", True))
+
+
+def _partition_pooler_outputs(
+    pooler_output: list[dict[str, Any]],
+    *,
+    async_chunk: bool,
+) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
+    if not pooler_output:
+        return None, None
+    if async_chunk:
+        return partition_payload_list(pooler_output)
+    return pooler_output, pooler_output
 
 
 class OmniARModelRunner(OmniGPUModelRunner):
@@ -157,6 +176,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             kv_connector_output=kv_connector_output,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
+        model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
         # --- Async D2H via OmniAsyncOutput ---
         async_output = OmniAsyncOutput(
@@ -180,7 +200,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             input_batch.query_start_loc,
         )
 
-        if self.use_async_scheduling:
+        if _uses_async_output(self):
             return async_output
         return async_output.get_output()
 
@@ -556,7 +576,15 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._num_scheduled_tokens,
                 self._num_reqs,
             )
-            self.model_runner_output.pooler_output = pooler_output
-            self.model_runner_output.multimodal_outputs = [_ensure_tensor_values(p) if p else {} for p in pooler_output]
+            async_chunk = bool(getattr(self.model_runner_output, "_async_chunk", False))
+            pooler_inter, pooler_client = _partition_pooler_outputs(
+                pooler_output,
+                async_chunk=async_chunk,
+            )
+            self.model_runner_output.pooler_output = None if async_chunk else pooler_output
+            self.model_runner_output.inter_stage_outputs = pooler_inter
+            self.model_runner_output.multimodal_outputs = (
+                [_ensure_tensor_values(p) if p else {} for p in pooler_client] if pooler_client else None
+            )
 
         return self.model_runner_output

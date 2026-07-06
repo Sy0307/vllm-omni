@@ -161,7 +161,8 @@ class TestSampleTokensDictOutput(unittest.TestCase):
         assert len(result.multimodal_outputs) == 2
         assert result.multimodal_outputs[0]["audio"].shape == (16000,)
         assert result.multimodal_outputs[1]["audio"].shape == (16000,)
-        assert result.multimodal_outputs[0]["sr"] == 24000
+        assert torch.is_tensor(result.multimodal_outputs[0]["sr"])
+        assert result.multimodal_outputs[0]["sr"].item() == 24000
 
     def test_dict_with_list_values(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -258,6 +259,32 @@ class TestMultimodalOutputsPassthrough(unittest.TestCase):
 
         # No multimodal data -> one empty dict per request.
         assert result.multimodal_outputs == [{}]
+
+
+class TestBlockTableWrites(unittest.TestCase):
+    def test_skips_no_kv_block_table_without_fused_writer(self):
+        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+        runner = object.__new__(OmniGenerationModelRunner)
+        block_tables = MagicMock()
+        block_tables.fused_writer = None
+        runner.block_tables = block_tables
+
+        runner._apply_block_table_staged_writes_if_available()
+
+        block_tables.apply_staged_writes.assert_not_called()
+
+    def test_applies_block_table_writes_when_writer_exists(self):
+        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+        runner = object.__new__(OmniGenerationModelRunner)
+        block_tables = MagicMock()
+        block_tables.fused_writer = object()
+        runner.block_tables = block_tables
+
+        runner._apply_block_table_staged_writes_if_available()
+
+        block_tables.apply_staged_writes.assert_called_once_with()
 
 
 if __name__ == "__main__":

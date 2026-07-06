@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.lora_utils import get_num_active_loras_for_dispatch
 from vllm.v1.worker.gpu.model_runner import (
     BatchDescriptor,
     BatchExecutionDescriptor,
@@ -115,9 +116,23 @@ class OmniGPUModelRunner(GPUModelRunner):
             # of an AttributeError; the worst case is FULL graphs not being excluded.
             if hasattr(mgr, "_capture_descs") and hasattr(mgr, "_candidates"):
                 if CUDAGraphMode.FULL in mgr._capture_descs:
-                    del mgr._capture_descs[CUDAGraphMode.FULL]
-                    for i, descs in enumerate(mgr._candidates):
-                        mgr._candidates[i] = [d for d in descs if d.cg_mode != CUDAGraphMode.FULL]
+                    mgr._capture_descs = {
+                        mode: descs for mode, descs in mgr._capture_descs.items() if mode != CUDAGraphMode.FULL
+                    }
+
+                    def _without_full(descs: Any) -> Any:
+                        if not isinstance(descs, (list, tuple)):
+                            return descs
+                        return [d for d in descs if getattr(d, "cg_mode", None) != CUDAGraphMode.FULL]
+
+                    if isinstance(mgr._candidates, dict):
+                        mgr._candidates = {
+                            mode: _without_full(descs)
+                            for mode, descs in mgr._candidates.items()
+                            if mode != CUDAGraphMode.FULL
+                        }
+                    else:
+                        mgr._candidates = [_without_full(descs) for descs in mgr._candidates]
                     logger.info(
                         "Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured."
                     )
@@ -154,6 +169,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_reqs: int,
         num_toks: int,
         uniform_tok_count: int,
+        num_active_loras: int,
         use_eager: bool,
     ):
         if use_eager:
@@ -163,7 +179,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 num_reqs=num_reqs,
             )
         else:
-            batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
+            batch_desc = self.cudagraph_manager.dispatch(
+                num_reqs,
+                num_toks,
+                uniform_tok_count,
+                num_active_loras,
+            )
         if self.dp_size > 1:
             from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
 
@@ -175,6 +196,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 uniform_tok_count,
                 self.dp_size,
                 self.dp_rank,
+                num_active_loras=num_active_loras,
             )
         return batch_desc, None
 
@@ -200,6 +222,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        num_active_loras = 0
+        if self.lora_config:
+            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+            num_active_loras = get_num_active_loras_for_dispatch(
+                self.lora_config,
+                self.lora_state,
+                req_ids,
+                dummy_run,
+            )
         # Encoder-decoder models: disable compilation when encoder inputs
         # are scheduled (dynamic cross-attention cache updates).
         skip_compiled = self.is_encoder_decoder and bool(scheduler_output.scheduled_encoder_inputs)
@@ -207,6 +238,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
+            num_active_loras=num_active_loras,
             use_eager=is_profile or skip_compiled,
         )
 

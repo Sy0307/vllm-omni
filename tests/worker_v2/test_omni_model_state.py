@@ -159,6 +159,25 @@ def test_remove_request_clears_buffer():
     assert state.intermediate_buffer.buffers[0] == {}
 
 
+def test_remove_request_accepts_req_id():
+    state = _make_state()
+    req = _make_new_req_data("r1")
+
+    with patch.object(type(state).__bases__[0], "add_request", return_value=None):
+        state.add_request(0, req)
+
+    state.remove_request("r1")
+    assert state.intermediate_buffer.buffers[0] == {}
+
+
+def test_remove_request_ignores_unknown_req_id():
+    state = _make_state()
+
+    state.remove_request("missing")
+
+    assert state.intermediate_buffer.buffers == [{}, {}, {}, {}]
+
+
 def test_remove_request_dispatches_to_plugins():
     plugin = _SpyPlugin()
     state = _make_state(plugins=[plugin])

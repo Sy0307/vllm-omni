@@ -184,7 +184,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self._handle_async_chunk_updates(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
+            self._apply_block_table_staged_writes_if_available()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 return self.kv_connector.no_forward(scheduler_output)
 
@@ -196,6 +196,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
+            num_active_loras=0,
             use_eager=is_profile,
         )
 
@@ -362,6 +363,21 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _apply_block_table_staged_writes_if_available(self) -> None:
+        """Flush block-table writes only when this stage has a writer.
+
+        Generation stages such as Code2Wav do not use KV cache or attention
+        metadata. Newer vLLM BlockTable implementations assert that a fused
+        writer exists before applying staged writes; no-KV generation stages
+        legitimately do not have one.
+        """
+        block_tables = getattr(self, "block_tables", None)
+        if block_tables is None:
+            return
+        if getattr(block_tables, "fused_writer", None) is None:
+            return
+        block_tables.apply_staged_writes()
 
     @staticmethod
     def _build_pooler_output(
