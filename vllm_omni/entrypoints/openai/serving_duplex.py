@@ -1156,6 +1156,8 @@ class OmniDuplexSessionHandler:
                         "sample_rate_hz": sample_rate_hz,
                         "force_listen": force_listen,
                     }
+                    # Speech/silence tag for the Stage0 turn-ended latch.
+                    payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
                     defer_native_append = False
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
@@ -2002,14 +2004,19 @@ class OmniDuplexSessionHandler:
 
         fmt = payload.get("format")
         audio = payload.get("audio")
-        if fmt == "pcm_f32le" and isinstance(audio, str):
+        if fmt in {"pcm_f32le", "pcm16"} and isinstance(audio, str):
             try:
                 raw = base64.b64decode(audio, validate=True)
             except (binascii.Error, ValueError):
                 return True
-            if len(raw) < 4 or len(raw) % 4 != 0:
-                return True
-            samples = np.frombuffer(raw, dtype=np.float32)
+            if fmt == "pcm_f32le":
+                if len(raw) < 4 or len(raw) % 4 != 0:
+                    return True
+                samples = np.frombuffer(raw, dtype=np.float32)
+            else:
+                if len(raw) < 2 or len(raw) % 2 != 0:
+                    return True
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             if samples.size == 0:
                 return False
             rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
