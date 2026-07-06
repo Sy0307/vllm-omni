@@ -332,6 +332,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._duplex_force_listen_applied_segments: set[tuple[str, int]] = set()
+        # Sessions whose turn ended (last terminator <|turn_eos|>) and have not
+        # received new speech; force listen on their silence chunks.
+        self._duplex_turn_ended_sessions: set[str] = set()
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -442,6 +445,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         except (TypeError, ValueError):
             return None
 
+    def _request_duplex_session_id(self, req_id: str) -> str | None:
+        info = self._request_duplex_intermediate_info(req_id)
+        if not isinstance(info, dict):
+            return None
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        session_id = duplex.get("session_id")
+        return session_id if isinstance(session_id, str) and session_id else None
+
     def _publish_duplex_row_sessions(self, duplex_rows: list[int]) -> None:
         """Expose row -> duplex session id so the model sampler can record
         per-session state (e.g. the segment's sampled terminator token, which
@@ -474,11 +487,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if not callable(token_id_fn):
             return
         try:
-            listen_id = int(token_id_fn().get("listen_token_id", -1))
+            token_ids_map = token_id_fn()
+            listen_id = int(token_ids_map.get("listen_token_id", -1))
+            turn_eos_id = int(token_ids_map.get("turn_eos_token_id", -1))
         except Exception:
             return
         if listen_id < 0 or listen_id >= logits.shape[-1]:
             return
+        helper = getattr(self.model, "_minicpmo45_duplex_data_plane_helper", None)
+        helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
         req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         for row_idx in duplex_rows:
@@ -490,6 +507,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 continue
             force_listen = payload.get("force_listen") is True
             force_speak = not force_listen and payload.get("force_speak") is True
+            # Turn-ended latch: after <|turn_eos|>, force listen on silence until
+            # new speech, so the model does not re-open a turn and repeat itself.
+            if not force_speak and turn_eos_id >= 0:
+                session_id = self._request_duplex_session_id(req_id)
+                if session_id:
+                    is_speech = payload.get("is_speech")
+                    if is_speech is True:
+                        self._duplex_turn_ended_sessions.discard(session_id)
+                    else:
+                        prev_term = None
+                        if isinstance(helper_sessions, dict):
+                            state = helper_sessions.get(session_id)
+                            prev_term = getattr(state, "pending_terminator_token", None)
+                        if prev_term == turn_eos_id:
+                            self._duplex_turn_ended_sessions.add(session_id)
+                    if session_id in self._duplex_turn_ended_sessions and is_speech is not True:
+                        force_listen = True
             if not force_listen and not force_speak:
                 continue
             seq = self._request_duplex_seq(req_id)

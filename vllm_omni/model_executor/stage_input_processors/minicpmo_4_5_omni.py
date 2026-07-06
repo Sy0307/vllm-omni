@@ -185,6 +185,19 @@ def _native_duplex_segment_output_ids(
     return output_ids[sent_len:], output_text[sent_text_len:]
 
 
+def _reset_native_tts_handoff(streaming_context) -> None:
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
+        return
+    state = bridge_states.get("minicpmo45_tts_handoff")
+    if not isinstance(state, dict):
+        return
+    state["sent_output_len"] = 0
+    state["sent_text_len"] = 0
+    state["acc_tts_ids"] = []
+    state["acc_tts_hidden"] = []
+
+
 def _accumulate_native_tts_handoff(streaming_context, new_ids, new_hidden):
     """Hand the talker the FULL accumulated condition on every handoff.
 
@@ -444,7 +457,10 @@ def llm2tts(
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+        native_turn_end_handoff = False
         if is_native_duplex_handoff:
+            turn_eos_id = special_token_ids.get("turn_eos_token_id")
+            native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             handoff_ids, handoff_hidden = _accumulate_native_tts_handoff(
                 _streaming_context,
                 handoff_ids,
@@ -459,6 +475,8 @@ def llm2tts(
                     )
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        if native_turn_end_handoff:
+            _reset_native_tts_handoff(_streaming_context)
 
         scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
             tts_token_ids_slice,
