@@ -193,7 +193,8 @@ def _reset_native_tts_handoff(streaming_context) -> None:
     if not isinstance(state, dict):
         return
     state["sent_output_len"] = 0
-    state["sent_text_len"] = 0
+    # Keep sent_text_len: the official model reports cumulative text across
+    # turns on the same resumable request, while token handoff restarts.
     state["acc_tts_ids"] = []
     state["acc_tts_hidden"] = []
 
@@ -444,12 +445,20 @@ def llm2tts(
         )
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
+            meta = model_intermediate_buffer.setdefault("meta", {})
+            meta["native_duplex_segment_text"] = thinker_text
+            meta.setdefault("override_keys", []).extend(
+                [
+                    "llm_output_text",
+                    ["meta", "native_duplex_segment_text"],
+                ]
+            )
             if turn_eos_id is not None:
                 # The talker detects turn end from <|turn_eos|> inside the
                 # handed condition (official conditions on its embedding).
-                model_intermediate_buffer.setdefault("meta", {})["turn_eos_token_id"] = int(turn_eos_id)
+                meta["turn_eos_token_id"] = int(turn_eos_id)
             if native_segment_end:
-                model_intermediate_buffer.setdefault("meta", {})["segment_end"] = True
+                meta["segment_end"] = True
         req_mm_data = multi_modal_data.get(llm_output.request_id)
         ref_audio = _extract_first_audio_ref(req_mm_data)
         if ref_audio is not None:

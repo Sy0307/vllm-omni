@@ -13,6 +13,8 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     tts2t2w,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_extract_first_audio_ref_accepts_dict_stereo_audio():
     ref = _extract_first_audio_ref(
@@ -706,14 +708,14 @@ def _native_duplex_meta():
     }
 
 
-def _native_duplex_handoff(request_id, prompt_ids, cumulative_output_ids):
+def _native_duplex_handoff(request_id, prompt_ids, cumulative_output_ids, *, text="hello"):
     latent = torch.arange(
         (len(prompt_ids) + len(cumulative_output_ids)) * 4,
         dtype=torch.float16,
     ).reshape(-1, 4)
     output = SimpleNamespace(
         token_ids=cumulative_output_ids,
-        text="hello",
+        text=text,
         multimodal_output={
             "latent": latent,
             "duplex_prompt_token_ids": list(prompt_ids),
@@ -744,6 +746,9 @@ def test_llm2tts_native_duplex_hands_off_segment_deltas():
     info1 = converted1[0]["model_intermediate_buffer"]
     assert info1["ids"]["output"] == seg1_output
     assert info1["llm_output_text"] == ["hello"]
+    assert info1["meta"]["native_duplex_segment_text"] == "hello"
+    assert "llm_output_text" in info1["meta"]["override_keys"]
+    assert ["meta", "native_duplex_segment_text"] in info1["meta"]["override_keys"]
     assert converted1[0]["prompt_token_ids"] == [21, 22]
     assert info1["meta"]["segment_end"] is True
 
@@ -758,6 +763,7 @@ def test_llm2tts_native_duplex_hands_off_segment_deltas():
     # Cumulative text "hello" was fully delivered with segment 1; only the
     # delta (empty here) rides along with segment 2.
     assert info2["llm_output_text"] == [""]
+    assert info2["meta"]["native_duplex_segment_text"] == ""
     assert converted2[0]["prompt_token_ids"] == [31]
     assert info2["meta"]["segment_end"] is True
 
@@ -786,6 +792,28 @@ def test_llm2tts_native_duplex_accumulates_tts_condition_across_handoffs():
     info2 = converted2[0]["model_intermediate_buffer"]
     assert info2["ids"]["tts"] == [21, 22, 31]
     assert len(info2["hidden_states"]["tts"]) == 3
+
+
+def test_llm2tts_native_duplex_preserves_text_cursor_across_turn_reset():
+    streaming_context = SimpleNamespace(bridge_states={})
+
+    seg1_output = [9304, 21, 9310]
+    handoff1 = _native_duplex_handoff("duplex-turn-text", [101, 102], seg1_output, text="hello")
+    converted1 = llm2tts([handoff1], prompt=[{}], _streaming_context=streaming_context)
+    info1 = converted1[0]["model_intermediate_buffer"]
+    assert info1["meta"]["native_duplex_segment_text"] == "hello"
+
+    seg2_output = [9304, 31, 9310]
+    handoff2 = _native_duplex_handoff(
+        "duplex-turn-text",
+        [101, 102, *seg1_output],
+        seg2_output,
+        text="hellohello",
+    )
+    converted2 = llm2tts([handoff2], prompt=[{}], _streaming_context=streaming_context)
+    info2 = converted2[0]["model_intermediate_buffer"]
+    assert info2["ids"]["tts"] == [31, 9310]
+    assert info2["meta"]["native_duplex_segment_text"] == "hello"
 
 
 def test_llm2tts_never_aliases_thinker_token_list():

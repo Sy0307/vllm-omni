@@ -29,7 +29,7 @@ class MiniCPMO45DuplexPolicy:
     SAMPLES_PER_AUDIO_TOKEN = 1600
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 64
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
-    NATURAL_CHUNK_BOUNDARY_CHARS = frozenset("。!！?？\n")
+    NATURAL_CHUNK_BOUNDARY_CHARS = frozenset("。，,；;!！?？\n")
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:
