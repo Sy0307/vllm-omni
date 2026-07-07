@@ -687,10 +687,47 @@ def test_minicpmo_stage0_runtime_generates_tts_handoff_from_loaded_stage(monkeyp
     assert omni_payload["ids"]["output"] == [42]
     assert omni_payload["hidden_states"]["output"].shape == (1, 2)
     assert handoff_payload["llm_output_text"] == ["hello"]
+    assert handoff_payload["meta"]["native_duplex_segment_text"] == "hello"
     assert "tts_token_ids" not in result
     assert "tts_hidden_states" not in result
     assert "omni_payload" not in result
     assert stage_model.thinker.forward_inputs
+
+
+def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_condition_text():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Talker:
+        _ar_last_chunk_flags = [False]
+
+        def __call__(self, **kwargs):
+            del kwargs
+            return None, torch.zeros(8, dtype=torch.float32)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "tts"
+    model.config = SimpleNamespace(hidden_size=4)
+    model.talker = _Talker()
+
+    output = model.forward(
+        input_ids=torch.zeros(1, dtype=torch.long),
+        positions=torch.zeros(1, dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "minicpmo45_native_duplex": True,
+                "llm_output_text": ["你好，你有什莫想聊的吗？你好，你有什莫想聊的吗？"],
+                "meta": {
+                    "native_duplex_segment_text": "你好，你有什莫想聊的吗？",
+                },
+            }
+        ],
+    )
+
+    text_bytes = output.multimodal_outputs["meta.llm_output_text_utf8"].detach().cpu().tolist()
+    assert bytes(text_bytes).decode("utf-8") == "你好，你有什莫想聊的吗？"
+    assert int(output.multimodal_outputs["meta.audio_text_total_chars"].item()) == len("你好，你有什莫想聊的吗？")
 
 
 def test_minicpmo_stage0_decode_uses_runner_sampled_token():

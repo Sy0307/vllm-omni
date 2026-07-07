@@ -13,6 +13,7 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import DuplexControlResultMessage, ErrorMessage, OutputMessage
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -144,6 +145,62 @@ def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
     assert msg.timeout == 1
     assert result["unsupported_count"] == 1
     assert result["stage_results"][0]["result"]["supported"] is False
+
+
+def _duplex_streaming_req_state(*, segment_finished: bool = True):
+    req_state = OrchestratorRequestState(request_id="req", final_stage_id=1)
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = segment_finished
+    req_state.streaming.bridge_states["duplex"] = {"session_id": "sid"}
+    return req_state
+
+
+def test_duplex_model_listen_segment_uses_raw_streaming_new_token_ids():
+    req_state = _duplex_streaming_req_state()
+
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace()],
+        new_token_ids=[151705],
+    )
+
+    assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
+
+
+@pytest.mark.parametrize("attr", ["token_ids", "cumulative_token_ids"])
+def test_duplex_model_listen_segment_does_not_use_output_level_history(attr):
+    req_state = _duplex_streaming_req_state()
+
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace()],
+        **{attr: [42, 151705]},
+    )
+
+    assert not Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
+
+
+@pytest.mark.parametrize("attr", ["token_ids", "cumulative_token_ids"])
+def test_duplex_model_listen_segment_uses_completion_token_ids(attr):
+    req_state = _duplex_streaming_req_state()
+
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace(**{attr: [42, 151705]})],
+    )
+
+    assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
+
+
+def test_duplex_model_listen_segment_uses_completion_stop_reason():
+    req_state = _duplex_streaming_req_state()
+
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace(stop_reason=151705)],
+    )
+
+    assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
 
 
 def test_open_duplex_session_raises_on_stage_control_error(mocker: MockerFixture):

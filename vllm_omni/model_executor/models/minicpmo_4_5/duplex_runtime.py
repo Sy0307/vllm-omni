@@ -575,6 +575,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             "type": MiniCPMO45DuplexPolicy.TTS_HANDOFF_TYPE,
             "omni_payload": omni_payload,
             "llm_output_text": [text],
+            "meta": {
+                "native_duplex_segment_text": text,
+                "override_keys": [
+                    "llm_output_text",
+                    ["meta", "native_duplex_segment_text"],
+                ],
+            },
             "end_of_turn": end_of_turn,
             "session_id": state.session_id,
         }
@@ -1191,10 +1198,18 @@ class MiniCPMO45Stage0DuplexRuntime:
         if isinstance(handoff, dict):
             return handoff
         if "omni_payload" in native:
+            text = native.get("text", "")
             return {
                 "type": MiniCPMO45DuplexPolicy.TTS_HANDOFF_TYPE,
                 "omni_payload": native.get("omni_payload"),
-                "llm_output_text": [native.get("text", "")],
+                "llm_output_text": [text],
+                "meta": {
+                    "native_duplex_segment_text": text if isinstance(text, str) else "",
+                    "override_keys": [
+                        "llm_output_text",
+                        ["meta", "native_duplex_segment_text"],
+                    ],
+                },
                 "end_of_turn": bool(native.get("end_of_turn", False)),
             }
         return None
