@@ -380,6 +380,7 @@ class OmniDuplexSessionHandler:
         self._data_plane_sent_segment_texts: dict[str, str] = {}
         self._auto_response_waiting_for_speech: set[str] = set()
         self._data_plane_tts_eos_done: set[str] = set()
+        self._data_plane_terminal_request_ids: set[str] = set()
         self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
         # session_id -> (response_id, silence continuation units already sent)
         self._native_response_continuations: dict[str, tuple[str, int]] = {}
@@ -575,9 +576,10 @@ class OmniDuplexSessionHandler:
             if session is None:
                 return
             append_epoch = session.epoch
+            request_id = self._native_stage0_request_id(session, append_epoch)
             response_bound = final or precreate_response
             if response_bound:
-                session.active_request_id = self._native_stage0_request_id(session, append_epoch)
+                session.active_request_id = request_id
             if final:
                 actor.transition("generating")
             if precreate_response and session.active_response_id is None:
@@ -2133,11 +2135,17 @@ class OmniDuplexSessionHandler:
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
         await self._send_runtime_control_if_needed(send_json, result, session=session)
+        request_id, response_stage_id = (
+            self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
+        )
+        if request_id is not None:
+            self._data_plane_terminal_request_ids.discard(request_id)
+            self._data_plane_tts_eos_done.discard(request_id)
         if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1" and isinstance(result, dict):
             dp_outputs = result.get("data_plane_outputs")
             logger.info(
                 "[append-result] request_info=%s n_dp_outputs=%s keys=%s",
-                self._data_plane_request_info(result),
+                (request_id, response_stage_id),
                 len(dp_outputs) if isinstance(dp_outputs, list) else None,
                 sorted(result.keys()),
             )
@@ -2522,6 +2530,13 @@ class OmniDuplexSessionHandler:
             return None, False
         close_reason: str | None = None
         emitted_response = False
+        request_id, _ = self._data_plane_request_info(result)
+        if request_id is not None and request_id in self._data_plane_terminal_request_ids:
+            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+                logger.info("native data-plane output ignored after terminal request_id=%s", request_id)
+            return None, False
+        if request_id is not None and session.active_request_id is None:
+            session.active_request_id = request_id
         for native_result in self._data_plane_native_results(result, session=session):
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
@@ -2571,6 +2586,10 @@ class OmniDuplexSessionHandler:
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
+            if request_id in self._data_plane_terminal_request_ids:
+                if profile_logs:
+                    logger.info("[drain] exit terminal data-plane request: request_id=%s", request_id)
+                return None
             if self._session_auto_responds(session):
                 active_request_id = session.active_request_id
                 if active_request_id is not None and active_request_id != request_id:
@@ -2671,6 +2690,10 @@ class OmniDuplexSessionHandler:
         if native_result.get("passive_stage") is True:
             return close_reason, emitted_response
         data_plane_request_id = native_result.get("data_plane_request_id")
+        if isinstance(data_plane_request_id, str) and data_plane_request_id in self._data_plane_terminal_request_ids:
+            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+                logger.info("native event ignored after terminal data-plane request_id=%s", data_plane_request_id)
+            return close_reason, emitted_response
         active_request_matches = (
             session.active_request_id == data_plane_request_id
             or (self._session_auto_responds(session) and session.active_request_id is None)
@@ -2783,6 +2806,8 @@ class OmniDuplexSessionHandler:
             session.turn_state = DuplexTurnState.IDLE
             if data_plane_request_id == session.active_request_id:
                 session.active_request_id = None
+            if isinstance(data_plane_request_id, str):
+                self._data_plane_terminal_request_ids.add(data_plane_request_id)
             emitted_response = True
             model_listen = native_result.get("model_listen")
             if not isinstance(model_listen, bool):
@@ -2823,9 +2848,6 @@ class OmniDuplexSessionHandler:
                 session.end_response(commit_text=False)
                 if self._session_auto_responds(session):
                     self._auto_response_waiting_for_speech.add(session.session_id)
-                if self._session_auto_responds(session) and isinstance(data_plane_request_id, str):
-                    self._data_plane_audio_offsets.pop(data_plane_request_id, None)
-                    self._data_plane_sent_segment_texts.pop(data_plane_request_id, None)
                 await send_json(
                     {
                         "type": "response.done",
@@ -2930,9 +2952,13 @@ class OmniDuplexSessionHandler:
         await send_json(payload)
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
-            if isinstance(data_plane_request_id, str):
+            if isinstance(data_plane_request_id, str) and not self._session_auto_responds(session):
                 self._data_plane_audio_offsets.pop(data_plane_request_id, None)
                 self._data_plane_sent_segment_texts.pop(data_plane_request_id, None)
+            if isinstance(data_plane_request_id, str):
+                if data_plane_request_id == session.active_request_id:
+                    session.active_request_id = None
+                self._data_plane_terminal_request_ids.add(data_plane_request_id)
             should_commit = self._should_commit_response_to_history(response_id)
             committed_message = session.end_response(commit_text=should_commit)
             if self._session_auto_responds(session):
@@ -3125,15 +3151,7 @@ class OmniDuplexSessionHandler:
             # Deliberately no reset at segment or response boundaries: any
             # reset re-attaches the text on the next same-text continuation
             # batch and duplicates the transcript.
-            delta_text = text if isinstance(text, str) else ""
-            if data_plane_request_id is not None and delta_text:
-                sent_text = self._data_plane_sent_segment_texts.get(data_plane_request_id)
-                self._data_plane_sent_segment_texts[data_plane_request_id] = delta_text
-                if isinstance(sent_text, str) and sent_text:
-                    if delta_text == sent_text:
-                        delta_text = ""
-                    elif delta_text.startswith(sent_text):
-                        delta_text = delta_text[len(sent_text) :]
+            delta_text = self._data_plane_segment_text_delta(data_plane_request_id, text)
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)
             audio_text_marks = self._data_plane_audio_text_marks(mm_output)
@@ -3185,6 +3203,11 @@ class OmniDuplexSessionHandler:
                     native_result["audio_text_marks_are_cumulative"] = True
                 yield native_result
             return
+        if data_plane_request_id is not None and session is not None and self._session_auto_responds(session):
+            # Some MiniCPM-o flush batches carry cumulative text but no new
+            # audio. They must advance the cursor or the next audio batch will
+            # re-emit the already-seen prefix as transcript text.
+            self._data_plane_segment_text_delta(data_plane_request_id, text)
         if (
             finished
             and session is not None
@@ -3365,6 +3388,21 @@ class OmniDuplexSessionHandler:
             if token_id is not None:
                 out.append(token_id)
         return out
+
+    def _data_plane_segment_text_delta(self, request_id: str | None, text: object) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        if request_id is None:
+            return text
+        sent_text = self._data_plane_sent_segment_texts.get(request_id)
+        self._data_plane_sent_segment_texts[request_id] = text
+        if not isinstance(sent_text, str) or not sent_text:
+            return text
+        if text == sent_text:
+            return ""
+        if text.startswith(sent_text):
+            return text[len(sent_text) :]
+        return text
 
     @staticmethod
     def _coerce_data_plane_int(value: object) -> int | None:

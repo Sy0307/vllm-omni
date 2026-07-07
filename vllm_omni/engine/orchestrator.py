@@ -1841,7 +1841,7 @@ class Orchestrator:
         if cls._coerce_int(stop_reason) == listen_id:
             return True
 
-        token_ids = cls._completion_token_ids(completion)
+        token_ids = cls._duplex_listen_segment_token_ids(output, completion, req_state)
         return bool(token_ids and token_ids[-1] == listen_id)
 
     async def _emit_duplex_model_listen_output(
@@ -1939,16 +1939,38 @@ class Orchestrator:
         return out
 
     @classmethod
+    def _duplex_listen_segment_token_ids(
+        cls,
+        output: Any,
+        completion: Any,
+        req_state: OrchestratorRequestState,
+    ) -> list[int]:
+        token_ids = cls._completion_token_ids(completion)
+        if token_ids:
+            return token_ids
+        return cls._raw_streaming_segment_token_ids(output, req_state)
+
+    @classmethod
     def _completion_token_ids(cls, completion: Any) -> list[int]:
         if completion is None:
             return []
-        for candidate in (
-            getattr(completion, "token_ids", None),
-            getattr(completion, "cumulative_token_ids", None),
-        ):
-            token_ids = cls._coerce_int_list(candidate)
+        for attr in ("token_ids", "cumulative_token_ids"):
+            token_ids = cls._coerce_int_list(getattr(completion, attr, None))
             if token_ids:
                 return token_ids
+        return []
+
+    @classmethod
+    def _raw_streaming_segment_token_ids(
+        cls,
+        output: Any,
+        req_state: OrchestratorRequestState,
+    ) -> list[int]:
+        if not (req_state.streaming.enabled and req_state.streaming.segment_finished):
+            return []
+        token_ids = cls._coerce_int_list(getattr(output, "new_token_ids", None))
+        if token_ids:
+            return token_ids
         return []
 
     @classmethod

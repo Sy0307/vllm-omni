@@ -526,9 +526,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             talker_info = {}
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-            tts_text = talker_info.get("llm_output_text", "")
+            meta_info = talker_info.get("meta") if isinstance(talker_info.get("meta"), dict) else {}
+            if talker_info.get("minicpmo45_native_duplex") is True:
+                # ids/hidden_states may be accumulated for the talker KV stream,
+                # but displayed transcript belongs to the current thinker segment.
+                tts_text = meta_info.get("native_duplex_segment_text", "")
+            else:
+                tts_text = talker_info.get("llm_output_text", "")
             if isinstance(tts_text, list):
-                tts_text = tts_text[0] if tts_text else ""
+                tts_text = tts_text[-1] if talker_info.get("minicpmo45_native_duplex") is True and tts_text else (
+                    tts_text[0] if tts_text else ""
+                )
             if not isinstance(tts_text, str):
                 tts_text = ""
 
