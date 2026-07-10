@@ -62,7 +62,7 @@ def maybe_load_minicpmo_native_duplex_target(
     if existing is not None:
         return existing
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex_runtime import (
+    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         MiniCPMO45Stage1DuplexRuntime,
     )

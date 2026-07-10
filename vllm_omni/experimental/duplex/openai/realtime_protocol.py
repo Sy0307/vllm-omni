@@ -1735,10 +1735,10 @@ class NativeRealtimeSessionProtocol:
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "audio.cancelled":
             response_id = event.get("response_id")
-            if not isinstance(response_id, str) or not response_id:
-                response_id = self._active_response_id or self._last_response_id
             payloads: list[dict[str, object]] = []
             if event.get("reason") == "output_audio_buffer_clear":
+                if not isinstance(response_id, str) or not response_id:
+                    response_id = self._active_response_id or self._last_response_id
                 payloads.append(
                     {
                         "type": "output_audio_buffer.cleared",
@@ -1747,13 +1747,12 @@ class NativeRealtimeSessionProtocol:
                 )
                 if not isinstance(response_id, str) or not response_id:
                     return payloads
+            elif not isinstance(response_id, str) or not response_id:
+                response_id = self._active_response_id
             if not isinstance(response_id, str) or not response_id:
-                return [
-                    {
-                        "type": "response.cancelled",
-                        "event": event,
-                    }
-                ]
+                return payloads
+            if response_id in self._done_response_ids:
+                return payloads
             committed_ms = event.get("committed_ms")
             if isinstance(committed_ms, int | float):
                 item_id = self._response_item_id(response_id)
@@ -2489,7 +2488,7 @@ class NativeRealtimeSessionProtocol:
                 self._conversation_item_done_response_ids.add(done_key)
                 payloads.append(self._conversation_item_done_event(item))
         done_event = self._realtime_response_done_event(
-            event,
+            {**event, "response_id": response_id},
             status=status,
             status_details=status_details,
         )

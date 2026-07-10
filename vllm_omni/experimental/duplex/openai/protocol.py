@@ -332,6 +332,7 @@ class DuplexSession:
     pending_audio: list[DuplexAudioChunk] = field(default_factory=list)
     active_request_id: str | None = None
     active_response_id: str | None = None
+    active_response_turn_id: int | None = None
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     playback: DuplexPlaybackCursor = field(default_factory=DuplexPlaybackCursor)
@@ -426,8 +427,9 @@ class DuplexSession:
         self.touch()
         return DuplexCommittedInput(message=message, turn_id=self.turn_id, epoch=self.epoch)
 
-    def begin_response(self) -> str:
+    def begin_response(self, *, turn_id: int | None = None) -> str:
         self.active_response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
+        self.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
         self.assistant_text_buffer.clear()
         self.assistant_audio_text_marks.clear()
         self.last_assistant_full_message = None
@@ -512,6 +514,7 @@ class DuplexSession:
         self.assistant_text_buffer.clear()
         self.active_request_id = None
         self.active_response_id = None
+        self.active_response_turn_id = None
         self.turn_state = DuplexTurnState.IDLE
         self.touch()
         return message
@@ -748,6 +751,7 @@ class DuplexSession:
         self.assistant_audio_text_marks.clear()
         self.active_request_id = None
         self.active_response_id = None
+        self.active_response_turn_id = None
         self.turn_state = DuplexTurnState.BARGE_IN
         self.touch()
         return self.epoch
@@ -760,6 +764,7 @@ class DuplexSession:
     def close(self) -> None:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
+        self.active_response_turn_id = None
         self.touch()
 
     def is_idle_expired(self, now: float | None = None) -> bool:
@@ -775,6 +780,7 @@ class DuplexSession:
             "turn_id": self.turn_id,
             "active_request_id": self.active_request_id,
             "active_response_id": self.active_response_id,
+            "active_response_turn_id": self.active_response_turn_id,
             "model": self.config.model,
             "modalities": list(self.config.modalities),
             "instructions": self.config.instructions,

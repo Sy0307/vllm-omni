@@ -1,13 +1,18 @@
 import pytest
 
-from vllm_omni.engine.duplex import (
+from vllm_omni.engine.orchestrator import _duplex_force_listen_count
+from vllm_omni.experimental.duplex.engine import (
     DuplexAdapterPattern,
     DuplexInputMode,
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeManager,
     SessionMode,
     duplex_data_plane_request_info,
+    duplex_new_user_turn_prefix_reserve,
     duplex_scheduler_token_budget,
+)
+from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+    MiniCPMO45DuplexPolicy,
 )
 
 
@@ -31,11 +36,9 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
 
     assert update.seq == 1
     assert new_epoch == 1
-    # Stage0 owns the single long-lived resumable request holding the
-    # conversation KV/context: barge-in tears down only downstream stages.
-    assert stale_request_ids == ["req-stage1"]
-    assert set(session.stage_bindings) == {0}
-    assert session.stage_bindings[0].request_id == "req-stage0"
+    assert stale_request_ids == ["req-stage0", "req-stage1"]
+    assert session.stage_bindings == {}
+    assert session.input_seq == 0
     assert session.pending_inputs == []
 
 
@@ -98,6 +101,28 @@ def test_duplex_runtime_pending_inputs_store_metadata_not_raw_payload():
         "sample_rate_hz": 16000,
     }
     assert session.pending_inputs == [update]
+
+
+def test_duplex_runtime_tracks_turn_local_append_sequence():
+    manager = DuplexSessionRuntimeManager()
+    session = manager.open_session(
+        "sid-turn-seq",
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+
+    first = session.append_input({"is_speech": True}, mode=DuplexInputMode.APPEND_AUDIO_CHUNK)
+    second = session.append_input({"is_speech": True}, mode=DuplexInputMode.APPEND_AUDIO_CHUNK)
+    third = session.append_input(
+        {"is_speech": True, "new_user_turn": True},
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+    )
+    fourth = session.append_input({"is_speech": True}, mode=DuplexInputMode.APPEND_AUDIO_CHUNK)
+
+    assert [first.seq, second.seq, third.seq, fourth.seq] == [1, 2, 3, 4]
+    assert [first.turn_seq, second.turn_seq, third.turn_seq, fourth.turn_seq] == [1, 2, 1, 2]
+    assert [first.turn_id, second.turn_id, third.turn_id, fourth.turn_id] == [0, 0, 1, 1]
 
 
 def test_duplex_runtime_rejects_unsupported_append_mode():
@@ -201,3 +226,50 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
         )
         == 16
     )
+
+
+def test_duplex_new_user_turn_prefix_reserve_uses_precomputed_count():
+    assert duplex_new_user_turn_prefix_reserve({"extra_body": {"duplex_new_user_turn_prefix_tokens": 7}}) == 7
+
+
+def test_duplex_new_user_turn_prefix_reserve_uses_variant_count():
+    assert (
+        duplex_new_user_turn_prefix_reserve(
+            {
+                "extra_body": {
+                    "duplex_new_user_turn_prefix_tokens": 99,
+                    "duplex_new_user_turn_prefix_tokens_by_variant": {
+                        MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE: 5,
+                    },
+                }
+            },
+            variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+        )
+        == 5
+    )
+
+
+def test_minicpmo_new_user_turn_prefix_variants_match_hf_duplex_streaming_prefill():
+    # MiniCPMODuplex.streaming_prefill feeds only <unit> plus media per
+    # append. Chat-role prefixes are used by the simplex streaming path and
+    # must not be injected into native full-duplex KV mid-session.
+    assert (
+        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(
+            MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE
+        )
+        == ""
+    )
+    assert (
+        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS)
+        == ""
+    )
+    assert (
+        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_LISTEN_ONLY) == ""
+    )
+
+
+def test_duplex_force_listen_default_matches_hf_zero():
+    assert _duplex_force_listen_count(None) == 0
+    assert _duplex_force_listen_count({}) == 0
+    assert _duplex_force_listen_count({"force_listen_count": 3}) == 3
+    assert _duplex_force_listen_count({"force_listen_count": "bad"}) == 0

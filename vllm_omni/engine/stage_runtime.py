@@ -58,6 +58,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    resolve_sampling_param_token_names,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -396,6 +397,11 @@ class StageRuntime:
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
+                if replica_metadata.stage_type != "diffusion" and stage_vllm_config is not None:
+                    replica_metadata.default_sampling_params = resolve_sampling_param_token_names(
+                        replica_metadata.default_sampling_params,
+                        stage_vllm_config,
+                    )
 
                 replicas.append(
                     ReplicaInitPlan(
