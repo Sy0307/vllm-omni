@@ -130,6 +130,7 @@ from vllm.sequence import IntermediateTensors
 try:
     from vllm.transformers_utils.tokenizer import encode_tokens
 except ImportError:
+
     def encode_tokens(tokenizer, prompt: str) -> list[int]:
         return tokenizer.encode(prompt, add_special_tokens=False)
 
@@ -3781,7 +3782,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex_worker_adapter import (
+        from vllm_omni.experimental.duplex.models.minicpmo45.worker_adapter import (
             patch_minicpmo_remote_config,
         )
 

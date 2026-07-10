@@ -18,10 +18,12 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    AppendDuplexInputMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     OutputMessage,
     ShutdownRequestMessage,
+    SignalDuplexTurnMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import (
@@ -31,6 +33,7 @@ from vllm_omni.engine.orchestrator import (
     _infer_stage_audio_sample_rate,
 )
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.experimental.duplex.engine import DuplexInputMode, DuplexRuntimeCapabilities, SessionMode
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -170,6 +173,31 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
         normalized_kwargs = dict(kwargs or {})
         self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
         return self.rpc_result
+
+
+class FakeSignalStageClient(FakeStageClient):
+    async def collective_rpc_async(
+        self,
+        *,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized_kwargs = dict(kwargs or {})
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        if method == "signal_duplex_turn_async":
+            return {
+                "supported": True,
+                "session_id": normalized_kwargs.get("session_id"),
+                "event": normalized_kwargs.get("event"),
+            }
+        return await super().collective_rpc_async(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=normalized_kwargs,
+        )
 
 
 class FakeOutputProcessor:
@@ -722,6 +750,123 @@ async def test_run_abort(orchestrator_factory) -> None:
         assert "req-abort" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_duplex_barge_in_signals_bound_stage_replicas_before_releasing_downstream() -> None:
+    stage0 = FakeSignalStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeSignalStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    rpc_q: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_q,
+        stage_pools=stage_pools,
+    )
+    session = orchestrator.duplex_sessions.open_session(
+        "sid-stage-signal",
+        session_mode=SessionMode.DUPLEX,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    session.bind_stage_request(0, "req-stage0", replica_id=0)
+    session.bind_stage_request(1, "req-stage1", replica_id=0)
+    session.append_input(
+        {"is_speech": True, "new_user_turn": True},
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+    )
+    interrupted_epoch = session.epoch
+    interrupted_turn_id = session.turn_id
+
+    await orchestrator._handle_signal_duplex_turn(
+        SignalDuplexTurnMessage(
+            control_id="ctrl-signal",
+            session_id="sid-stage-signal",
+            event="barge_in",
+            payload={"reason": "test"},
+        )
+    )
+
+    signal_calls = [
+        call
+        for client in (stage0, stage1)
+        for call in client.collective_rpc_calls
+        if call[0] == "signal_duplex_turn_async"
+    ]
+    assert [call[3]["session_id"] for call in signal_calls] == ["sid-stage-signal", "sid-stage-signal"]
+    assert [call[3]["event"] for call in signal_calls] == ["barge_in", "barge_in"]
+    assert [call[3]["epoch"] for call in signal_calls] == [interrupted_epoch, interrupted_epoch]
+    assert [call[3]["payload"]["turn_id"] for call in signal_calls] == [interrupted_turn_id, interrupted_turn_id]
+    assert session.stage_bindings == {}
+    result = rpc_q.get_nowait()
+    assert result.ok is True
+
+
+@pytest.mark.asyncio
+async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=stage_pools,
+    )
+    session = orchestrator.duplex_sessions.open_session(
+        "sid-bridge-turn",
+        session_mode=SessionMode.DUPLEX,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+        session_config={"voice": "test"},
+    )
+
+    await orchestrator._handle_append_duplex_input(
+        AppendDuplexInputMessage(
+            control_id="append-1",
+            session_id="sid-bridge-turn",
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+            payload={"is_speech": True},
+        )
+    )
+    req_state1 = orchestrator._ensure_duplex_stage_request_state(session, stage_id=0)
+    assert req_state1 is not None
+    duplex_state1 = req_state1.streaming.bridge_states["duplex"]
+    assert duplex_state1["session_id"] == "sid-bridge-turn"
+    assert duplex_state1["epoch"] == 0
+    assert duplex_state1["turn_id"] == 0
+    assert duplex_state1["session_config"] == {"voice": "test"}
+
+    await orchestrator._handle_append_duplex_input(
+        AppendDuplexInputMessage(
+            control_id="append-2",
+            session_id="sid-bridge-turn",
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+            payload={"is_speech": True, "new_user_turn": True},
+        )
+    )
+    req_state2 = orchestrator._ensure_duplex_stage_request_state(session, stage_id=0)
+    assert req_state2 is req_state1
+    duplex_state2 = req_state2.streaming.bridge_states["duplex"]
+    assert duplex_state2["turn_id"] == 1
+    assert duplex_state2["epoch"] == 0
+    assert [call[0].request_id for call in stage0.add_request_calls] == [
+        "duplex-sid-bridge-turn-e0-stage0",
+        "duplex-sid-bridge-turn-e0-stage0",
+    ]
 
 
 # ---------------------------------------------------------------------------

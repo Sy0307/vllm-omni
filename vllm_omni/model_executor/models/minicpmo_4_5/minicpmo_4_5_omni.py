@@ -14,6 +14,7 @@
 
 from collections.abc import Iterable
 from functools import cached_property
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -27,7 +28,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex_policy import MiniCPMO45DuplexPolicy
+from vllm_omni.experimental.duplex.models.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -76,7 +77,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex_worker_adapter import (
+        from vllm_omni.experimental.duplex.models.minicpmo45.worker_adapter import (
             patch_minicpmo_remote_config,
         )
 
@@ -269,7 +270,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         state = helper.sessions.get(session_id)
         if state is None:
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex_runtime import (
+            from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
                 _MiniCPMO45Stage0SessionState,
             )
 
@@ -293,6 +294,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             audio_waveform,
             seq=seq,
             final=bool(duplex.get("final")),
+            new_speech=payload.get("is_speech") is True,
+            new_user_turn=payload.get("new_user_turn") is True,
+            new_user_turn_prefix_variant=payload.get("new_user_turn_prefix_variant"),
         )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
@@ -372,7 +376,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         if helper is not None:
             return helper
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex_runtime import MiniCPMO45Stage0DuplexRuntime
+        from vllm_omni.experimental.duplex.models.minicpmo45.runtime import MiniCPMO45Stage0DuplexRuntime
 
         model_path = getattr(getattr(self.vllm_config, "model_config", None), "model", None)
         device = str(self._module_device(self.thinker if self.thinker is not None else self))
@@ -534,8 +538,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             else:
                 tts_text = talker_info.get("llm_output_text", "")
             if isinstance(tts_text, list):
-                tts_text = tts_text[-1] if talker_info.get("minicpmo45_native_duplex") is True and tts_text else (
-                    tts_text[0] if tts_text else ""
+                tts_text = (
+                    tts_text[-1]
+                    if talker_info.get("minicpmo45_native_duplex") is True and tts_text
+                    else (tts_text[0] if tts_text else "")
                 )
             if not isinstance(tts_text, str):
                 tts_text = ""
@@ -554,6 +560,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if isinstance(talker_result, tuple) and len(talker_result) == 2:
                 mel_spec, waveform = talker_result
                 mm_out = {}
+                duplex_info = talker_info.get("duplex") if isinstance(talker_info.get("duplex"), dict) else {}
+                if talker_info.get("minicpmo45_native_duplex") is True and isinstance(duplex_info, dict):
+                    turn_id = duplex_info.get("turn_id")
+                    if isinstance(turn_id, int):
+                        mm_out["meta.duplex_turn_id"] = torch.tensor([turn_id], dtype=torch.int32, device=device)
+                    epoch = duplex_info.get("epoch")
+                    if isinstance(epoch, int):
+                        mm_out["meta.duplex_epoch"] = torch.tensor([epoch], dtype=torch.int32, device=device)
                 chunk_flags = getattr(self.talker, "_ar_last_chunk_flags", [True])
                 chunk_is_last = bool(chunk_flags[-1]) if chunk_flags else True
                 mm_out["meta.tts_is_last_chunk"] = torch.tensor(
@@ -561,7 +575,15 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     dtype=torch.int32,
                     device=device,
                 )
-                if isinstance(tts_text, str) and tts_text:
+                turn_end_flags = getattr(self.talker, "_ar_turn_end_flags", [False])
+                turn_ended = bool(turn_end_flags[-1]) if turn_end_flags else False
+                if talker_info.get("minicpmo45_native_duplex") is True:
+                    mm_out["meta.turn_end"] = torch.tensor(
+                        [int(turn_ended)],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                if isinstance(tts_text, str) and (tts_text or talker_info.get("minicpmo45_native_duplex") is True):
                     mm_out["meta.llm_output_text_utf8"] = torch.tensor(
                         list(tts_text.encode("utf-8")),
                         dtype=torch.uint8,
@@ -735,18 +757,37 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 )
                 or MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
             )
-            if len(recent_tokens) >= max(1, max_speak_tokens - 1):
+            request_max_tokens = self._minicpmo45_duplex_row_request_max_tokens(row_idx)
+            effective_max_speak_tokens = max_speak_tokens
+            if request_max_tokens is not None:
+                effective_max_speak_tokens = min(effective_max_speak_tokens, request_max_tokens)
+            if len(recent_tokens) >= max(1, effective_max_speak_tokens - 1):
                 if MiniCPMO45DuplexPolicy.profile_logs_enabled():
                     logger.info(
                         "MiniCPM-o native duplex force chunk_eos: row=%s "
-                        "recent_len=%d max_speak_tokens=%d chunk_eos_id=%s "
+                        "recent_len=%d max_speak_tokens=%d request_max_tokens=%s "
+                        "effective_max_speak_tokens=%d chunk_eos_id=%s "
                         "recent_tail=%s",
                         row_idx,
                         len(recent_tokens),
                         max_speak_tokens,
+                        request_max_tokens,
+                        effective_max_speak_tokens,
                         chunk_eos_id,
                         recent_tokens[-8:],
                     )
+                return int(chunk_eos_id)
+
+            # Match the released StreamDecoder: first sample the original
+            # distribution only to preserve the model's own chunk boundary.
+            # If it does not choose chunk_eos, mask that token before the
+            # normal text/listen/turn sampling pass below.
+            if getattr(sampling_metadata, "all_greedy", False):
+                boundary_sample = int(torch.argmax(logits, dim=-1).item())
+            else:
+                boundary_probs = F.softmax(logits, dim=-1)
+                boundary_sample = int(torch.multinomial(boundary_probs, num_samples=1, generator=generator).item())
+            if boundary_sample == chunk_eos_id:
                 return int(chunk_eos_id)
 
         logits = logits.clone()
@@ -755,22 +796,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             valid_forbidden = [token_id for token_id in forbidden if 0 <= token_id < logits.shape[-1]]
             if valid_forbidden:
                 logits[:, valid_forbidden] = float("-inf")
-
-        self._minicpmo45_mask_incomplete_chinese_question_boundary(logits, recent_tokens, token_ids)
-
-        turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        if (
-            0 <= turn_eos_id < logits.shape[-1]
-            and not self._minicpmo45_recent_tokens_reach_chunk_boundary_minimum(recent_tokens, token_ids)
-        ):
-            logits[:, turn_eos_id] = float("-inf")
-            if MiniCPMO45DuplexPolicy.profile_logs_enabled():
-                logger.info(
-                    "MiniCPM-o native duplex suppress early turn_eos: row=%s recent_len=%d recent_tail=%s",
-                    row_idx,
-                    len(recent_tokens),
-                    recent_tokens[-8:],
-                )
 
         special_ids = self._minicpmo45_native_special_token_ids(token_ids)
         repetition_penalty = 1.05
@@ -795,43 +820,102 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if listen_top_k is not None:
                 listen_rank = int((logits[0] > logits[0, listen_id]).sum().item())
                 if listen_rank < int(listen_top_k):
-                    return int(listen_id)
+                    return self._finalize_minicpmo45_native_duplex_sample(
+                        row_idx,
+                        int(listen_id),
+                        token_ids,
+                    )
 
         temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
-            return int(torch.argmax(logits, dim=-1).item())
+            return self._finalize_minicpmo45_native_duplex_sample(
+                row_idx,
+                int(torch.argmax(logits, dim=-1).item()),
+                token_ids,
+            )
 
         logits = logits / temperature
         logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
+        return self._finalize_minicpmo45_native_duplex_sample(
+            row_idx,
+            int(torch.multinomial(probs, num_samples=1, generator=generator).item()),
+            token_ids,
+        )
+
+    def _minicpmo45_duplex_state_for_row(self, row_idx: int):
+        row_sessions = getattr(self, "_minicpmo45_duplex_row_sessions", None)
+        session_id = row_sessions.get(row_idx) if isinstance(row_sessions, dict) else None
+        if not session_id:
+            return None
+        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+        sessions = getattr(helper, "sessions", None) if helper is not None else None
+        return sessions.get(session_id) if isinstance(sessions, dict) else None
+
+    def _minicpmo45_duplex_payload_for_row(self, row_idx: int) -> dict[str, Any] | None:
+        row_payloads = getattr(self, "_minicpmo45_duplex_row_payloads", None)
+        payload = row_payloads.get(row_idx) if isinstance(row_payloads, dict) else None
+        return payload if isinstance(payload, dict) else None
+
+    def _minicpmo45_duplex_row_request_max_tokens(self, row_idx: int) -> int | None:
+        row_max_tokens = getattr(self, "_minicpmo45_duplex_row_max_tokens", None)
+        value = row_max_tokens.get(row_idx) if isinstance(row_max_tokens, dict) else None
+        try:
+            max_tokens = int(value)
+        except (TypeError, ValueError):
+            return None
+        return max_tokens if max_tokens > 0 else None
+
+    def _finalize_minicpmo45_native_duplex_sample(
+        self,
+        row_idx: int,
+        sampled: int,
+        token_ids: dict[str, int],
+    ) -> int:
+        listen_id = token_ids.get("listen_token_id", -1)
+        tts_bos_id = token_ids.get("tts_bos_token_id", -1)
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
+        if (
+            sampled == listen_id
+            and 0 <= tts_bos_id
+            and state is not None
+            and not getattr(state, "current_turn_ended", True)
+            and not force_listen
+        ):
+            return int(tts_bos_id)
+        return int(sampled)
 
     def _record_minicpmo45_duplex_terminator(self, row_idx: int, sampled: int, token_ids: dict[str, int]) -> None:
-        """Remember the segment's sampled terminator for the next append.
+        """Remember sampled unit state for the next append.
 
         The scheduler session update discards the final sampled token of a
         segment before the next streaming update, but the official duplex
         format feeds it (terminator + </unit>) into the KV at every unit
-        boundary, and the model's listen/speak policy depends on seeing its
-        own past decisions. The duplex prefill re-injects it."""
-        terminators = {
-            token_ids.get("listen_token_id", -1),
-            token_ids.get("chunk_eos_token_id", -1),
-            token_ids.get("chunk_tts_eos_token_id", -1),
-            token_ids.get("turn_eos_token_id", -1),
-        }
-        if sampled not in terminators:
+        boundary, and the model's listen/speak policy depends on seeing its own
+        past decisions. Non-terminators clear the turn-ended latch."""
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        if state is None:
             return
-        row_sessions = getattr(self, "_minicpmo45_duplex_row_sessions", None)
-        session_id = row_sessions.get(row_idx) if isinstance(row_sessions, dict) else None
-        if not session_id:
-            return
-        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
-        state = helper.sessions.get(session_id) if helper is not None else None
-        if state is not None:
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
+        listen_id = token_ids.get("listen_token_id", -1)
+        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
+        chunk_tts_eos_id = token_ids.get("chunk_tts_eos_token_id", -1)
+        turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id, turn_eos_id}
+        if sampled in terminators:
             state.pending_terminator_token = int(sampled)
+            state.last_terminator_token = int(sampled)
+            if sampled == turn_eos_id or (sampled == listen_id and force_listen):
+                state.current_turn_ended = True
+            return
+        state.pending_terminator_token = None
+        state.last_terminator_token = None
+        state.current_turn_ended = False
 
     def _minicpmo45_listen_decode_params(self) -> tuple[float, int | None]:
         """Listen-token decode controls, matching official StreamDecoder.decode.
@@ -878,107 +962,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     logger.info("MiniCPM-o native duplex sampler could not load tokenizer: %s", exc)
         self._minicpmo45_tokenizer_cache = tokenizer
         return tokenizer
-
-    def _minicpmo45_recent_text(self, recent_tokens: list[int], token_ids: dict[str, int]) -> str | None:
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        text_tokens = [token_id for token_id in recent_tokens if token_id not in special_ids]
-        if not text_tokens:
-            return None
-        tokenizer = self._minicpmo45_tokenizer()
-        decode = getattr(tokenizer, "decode", None)
-        if not callable(decode):
-            return None
-        try:
-            text = decode(text_tokens[-8:], skip_special_tokens=True)
-        except TypeError:
-            text = decode(text_tokens[-8:])
-        return text if isinstance(text, str) else None
-
-    def _minicpmo45_natural_boundary_token_ids(self) -> set[int]:
-        cached = getattr(self, "_minicpmo45_natural_boundary_token_ids_cache", None)
-        if isinstance(cached, set):
-            return cached
-        tokenizer = self._minicpmo45_tokenizer()
-        encode = getattr(tokenizer, "encode", None)
-        boundary_ids: set[int] = set()
-        if callable(encode):
-            for char in MiniCPMO45DuplexPolicy.NATURAL_CHUNK_BOUNDARY_CHARS:
-                try:
-                    ids = list(encode(char, add_special_tokens=False))
-                except TypeError:
-                    ids = list(encode(char))
-                if len(ids) == 1:
-                    try:
-                        token_id = int(ids[0])
-                    except (TypeError, ValueError):
-                        continue
-                    if token_id >= 0:
-                        boundary_ids.add(token_id)
-        self._minicpmo45_natural_boundary_token_ids_cache = boundary_ids
-        return boundary_ids
-
-    def _minicpmo45_mask_incomplete_chinese_question_boundary(
-        self,
-        logits: torch.Tensor,
-        recent_tokens: list[int],
-        token_ids: dict[str, int],
-    ) -> None:
-        text = self._minicpmo45_recent_text(recent_tokens, token_ids)
-        if not isinstance(text, str) or not MiniCPMO45DuplexPolicy.text_ends_incomplete_chinese_question_prefix(text):
-            return
-        boundary_ids = [
-            token_id for token_id in self._minicpmo45_natural_boundary_token_ids() if 0 <= token_id < logits.shape[-1]
-        ]
-        if not boundary_ids:
-            return
-        logits[:, boundary_ids] = float("-inf")
-        if MiniCPMO45DuplexPolicy.profile_logs_enabled():
-            logger.info(
-                "MiniCPM-o native duplex mask incomplete Chinese question boundary: text_tail=%r token_ids=%s",
-                text[-8:],
-                boundary_ids,
-            )
-
-    def _minicpmo45_recent_tokens_end_natural_boundary(
-        self,
-        recent_tokens: list[int],
-        token_ids: dict[str, int],
-    ) -> bool:
-        min_tokens = int(
-            getattr(
-                self,
-                "min_new_speak_tokens_before_chunk_boundary",
-                MiniCPMO45DuplexPolicy.DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY,
-            )
-            or MiniCPMO45DuplexPolicy.DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY
-        )
-        if min_tokens <= 0:
-            min_tokens = 1
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        text_tokens = [token_id for token_id in recent_tokens if token_id not in special_ids]
-        if len(text_tokens) < min_tokens:
-            return False
-        text = self._minicpmo45_recent_text(recent_tokens, token_ids)
-        return isinstance(text, str) and MiniCPMO45DuplexPolicy.text_ends_natural_chunk_boundary(text)
-
-    def _minicpmo45_recent_tokens_reach_chunk_boundary_minimum(
-        self,
-        recent_tokens: list[int],
-        token_ids: dict[str, int],
-    ) -> bool:
-        min_tokens = int(
-            getattr(
-                self,
-                "min_new_speak_tokens_before_chunk_boundary",
-                MiniCPMO45DuplexPolicy.DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY,
-            )
-            or MiniCPMO45DuplexPolicy.DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY
-        )
-        if min_tokens <= 0:
-            min_tokens = 1
-        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
-        text_tokens = [token_id for token_id in recent_tokens if token_id not in special_ids]
-        return len(text_tokens) >= min_tokens
 
     def _minicpmo45_native_duplex_token_ids(self) -> dict[str, int]:
         cached = getattr(self, "_minicpmo45_native_duplex_token_ids_cache", None)
