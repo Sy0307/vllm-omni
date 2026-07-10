@@ -28,7 +28,6 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
-from vllm_omni.engine.duplex import duplex_data_plane_request_info
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
@@ -36,6 +35,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniEngineDeadError,
 )
 from vllm_omni.errors import client_error_metadata
+from vllm_omni.experimental.duplex.engine import duplex_data_plane_request_info
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput

@@ -8,8 +8,8 @@ from typing import Any
 import numpy as np
 from vllm.multimodal.media import MediaConnector
 
-from vllm_omni.entrypoints.openai.protocol.duplex import DuplexSessionConfig
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex_policy import MiniCPMO45DuplexPolicy
+from vllm_omni.experimental.duplex.models.minicpmo45.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.experimental.duplex.openai.protocol import DuplexSessionConfig
 
 
 class MiniCPMO45PcmAppendBuffer:
@@ -19,11 +19,17 @@ class MiniCPMO45PcmAppendBuffer:
         self._buffer = bytearray()
         self._sample_rate_hz: int | None = None
         self._force_listen = False
+        self._force_speak = False
+        self._is_speech = False
+        self._new_user_turn = False
 
     def clear(self) -> None:
         self._buffer.clear()
         self._sample_rate_hz = None
         self._force_listen = False
+        self._force_speak = False
+        self._is_speech = False
+        self._new_user_turn = False
 
     def clear_force_listen(self) -> None:
         self._force_listen = False
@@ -56,6 +62,9 @@ class MiniCPMO45PcmAppendBuffer:
         self._sample_rate_hz = sample_rate_hz
         self._buffer.extend(raw)
         self._force_listen = self._force_listen or bool(payload.get("force_listen", False))
+        self._force_speak = self._force_speak or bool(payload.get("force_speak", False))
+        self._is_speech = self._is_speech or bool(payload.get("is_speech", False))
+        self._new_user_turn = self._new_user_turn or bool(payload.get("new_user_turn", False))
         if not allow_emit:
             return None
 
@@ -84,7 +93,15 @@ class MiniCPMO45PcmAppendBuffer:
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
         out["force_listen"] = self._force_listen
-        self._force_listen = False
+        out["force_speak"] = self._force_speak
+        out["is_speech"] = self._is_speech
+        if self._new_user_turn:
+            out["new_user_turn"] = True
+        if not self._buffer:
+            self._force_listen = False
+            self._force_speak = False
+            self._is_speech = False
+            self._new_user_turn = False
         return out
 
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
@@ -96,7 +113,11 @@ class MiniCPMO45PcmAppendBuffer:
             "format": "pcm_f32le",
             "sample_rate_hz": self._sample_rate_hz or 16000,
             "force_listen": self._force_listen,
+            "force_speak": self._force_speak,
+            "is_speech": self._is_speech,
         }
+        if self._new_user_turn:
+            payload["new_user_turn"] = True
         return self.append(payload, chunk_period_ms=chunk_period_ms, flush=True)
 
 
@@ -140,6 +161,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
                     instructions=config.instructions,
                     ref_sample_count=None,
                 )
+                cls._apply_new_user_turn_prefix_tokens(extra_body, model_config=model_config)
                 config.extra_body = extra_body
                 return
             wav_np, sr = cls._load_local_ref_audio(default_ref)
@@ -163,6 +185,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             instructions=config.instructions,
             ref_sample_count=len(wav_np),
         )
+        cls._apply_new_user_turn_prefix_tokens(extra_body, model_config=model_config)
         config.extra_body = extra_body
         config.ref_audio = None
 
@@ -225,6 +248,34 @@ class MiniCPMO45NativeDuplexServingAdapter:
             return
         ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
         extra_body["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+
+    @classmethod
+    def _apply_new_user_turn_prefix_tokens(
+        cls,
+        extra_body: dict[str, object],
+        *,
+        model_config: Any,
+    ) -> None:
+        if "duplex_new_user_turn_prefix_tokens" in extra_body:
+            return
+        tokenizer = cls._load_native_tokenizer(model_config)
+        if tokenizer is None:
+            return
+        try:
+            prefix_ids = tokenizer.encode(MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(), add_special_tokens=False)
+            variant_counts = {
+                variant: len(
+                    tokenizer.encode(
+                        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(variant),
+                        add_special_tokens=False,
+                    )
+                )
+                for variant in MiniCPMO45DuplexPolicy.new_user_turn_prefix_variants()
+            }
+        except Exception:
+            return
+        extra_body["duplex_new_user_turn_prefix_tokens"] = len(prefix_ids)
+        extra_body["duplex_new_user_turn_prefix_tokens_by_variant"] = variant_counts
 
     @staticmethod
     def _native_stage0_stop_token_ids(model_config: Any) -> list[int]:

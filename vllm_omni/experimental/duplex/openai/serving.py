@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
@@ -18,16 +18,15 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex import duplex_data_plane_request_info
-from vllm_omni.entrypoints.openai.duplex_adapters import (
+from vllm_omni.experimental.duplex.engine import duplex_data_plane_request_info
+from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+    MiniCPMO45DuplexPolicy,
+)
+from vllm_omni.experimental.duplex.openai.adapters import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
 )
-from vllm_omni.entrypoints.openai.native_realtime_protocol import (
-    REALTIME_OUTPUT_AUDIO_FORMATS,
-    NativeRealtimeSessionProtocol,
-)
-from vllm_omni.entrypoints.openai.protocol.duplex import (
+from vllm_omni.experimental.duplex.openai.protocol import (
     DuplexCapabilities,
     DuplexCommittedInput,
     DuplexOverlapPolicy,
@@ -40,13 +39,45 @@ from vllm_omni.entrypoints.openai.protocol.duplex import (
     DuplexTurnEventType,
     DuplexTurnState,
 )
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.experimental.duplex.openai.realtime_protocol import (
+    REALTIME_OUTPUT_AUDIO_FORMATS,
+    NativeRealtimeSessionProtocol,
+)
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 logger = init_logger(__name__)
 
 _DEFAULT_CONFIG_TIMEOUT_S = 10.0
 _DEFAULT_IDLE_TIMEOUT_S = 300.0
 _MAX_EVENT_BYTES = 15 * 1024 * 1024
+
+
+def should_enable_duplex_endpoint(
+    stage_configs: list | None,
+    *,
+    config_path: str | None = None,
+) -> bool:
+    """Enable duplex routes only for deployments that explicitly opt in."""
+    if stage_configs:
+        for stage in stage_configs:
+            session_mode = (
+                stage.get("session_mode") if isinstance(stage, dict) else getattr(stage, "session_mode", None)
+            )
+            if session_mode == "duplex":
+                return True
+    if config_path:
+        try:
+            from omegaconf import OmegaConf
+
+            raw_config = OmegaConf.load(config_path)
+            session_mode = raw_config.get("session_mode") if hasattr(raw_config, "get") else None
+            if session_mode == "duplex":
+                return True
+        except Exception as exc:
+            logger.warning("Failed to inspect duplex session_mode from %s: %s", config_path, exc)
+    return False
 
 
 @dataclass
@@ -272,10 +303,10 @@ class DuplexSessionActor:
             "runtime.control",
         }:
             return False
-        if (
-            (self.closing or self.session.state == DuplexSessionState.CLOSED)
-            and event_type not in {"response.listen", "runtime.control"}
-        ):
+        if (self.closing or self.session.state == DuplexSessionState.CLOSED) and event_type not in {
+            "response.listen",
+            "runtime.control",
+        }:
             return True
         epoch = payload.get("epoch")
         return isinstance(epoch, int) and epoch != self.session.epoch
@@ -374,11 +405,12 @@ class OmniDuplexSessionHandler:
         )
         self._turn_controller = DuplexTurnController()
         self._data_plane_audio_offsets: dict[str, int] = {}
-        # request_id -> the current talker segment's text already attached to
-        # an emitted audio result; reset at each segment end so streaming
-        # batches of one segment never re-deliver the same text.
+        # request_id -> cumulative text cursor already exposed with audio.
+        # Auto-response streams keep it across segment boundaries.
         self._data_plane_sent_segment_texts: dict[str, str] = {}
+        self._data_plane_segment_text_metadata_request_ids: set[str] = set()
         self._auto_response_waiting_for_speech: set[str] = set()
+        self._auto_response_new_turn_prefix_variants: dict[str, str] = {}
         self._data_plane_tts_eos_done: set[str] = set()
         self._data_plane_terminal_request_ids: set[str] = set()
         self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
@@ -406,11 +438,13 @@ class OmniDuplexSessionHandler:
         native_audio_buffer = MiniCPMO45PcmAppendBuffer()
         native_response_emitted = False
         native_input_since_commit = False
+        native_speech_since_commit = False
         native_committed_audio_payload: dict[str, object] | None = None
         native_deferred_response_create = False
 
         async def send_json(payload: dict[str, object]) -> None:
-            nonlocal native_input_since_commit, native_response_emitted, native_committed_audio_payload
+            nonlocal native_input_since_commit, native_response_emitted, native_speech_since_commit
+            nonlocal native_committed_audio_payload
             nonlocal native_deferred_response_create
             payload_type = payload.get("type")
             deferred_overlap_payload: dict[str, object] | None = None
@@ -464,6 +498,7 @@ class OmniDuplexSessionHandler:
                             had_pending_overlap_audio = native_audio_buffer.has_pending()
                             native_audio_buffer.clear()
                             native_input_since_commit = False
+                            native_speech_since_commit = False
                             if had_pending_overlap_audio and realtime_protocol is not None:
                                 await realtime_protocol.discard_pending_input_audio(
                                     audio_end_ms=actor.overlap_speech_ms
@@ -481,6 +516,7 @@ class OmniDuplexSessionHandler:
                         native_committed_audio_payload = None
                         native_deferred_response_create = False
                         native_input_since_commit = False
+                        native_speech_since_commit = False
             await actor.send_json(payload)
             if deferred_overlap_payload is not None and session is not None and not actor.closing:
                 await start_native_append(deferred_overlap_payload, final=True, precreate_response=True)
@@ -576,14 +612,18 @@ class OmniDuplexSessionHandler:
             if session is None:
                 return
             append_epoch = session.epoch
+            append_turn_id = self._payload_turn_id(payload)
+            if append_turn_id is None:
+                append_turn_id = session.turn_id
             request_id = self._native_stage0_request_id(session, append_epoch)
             response_bound = final or precreate_response
             if response_bound:
                 session.active_request_id = request_id
+                session.active_response_turn_id = append_turn_id
             if final:
                 actor.transition("generating")
             if precreate_response and session.active_response_id is None:
-                response_id = session.begin_response()
+                response_id = session.begin_response(turn_id=append_turn_id)
                 self._remember_response_conversation_mode(session, response_id)
                 await send_json(
                     self._response_created_payload(
@@ -738,6 +778,7 @@ class OmniDuplexSessionHandler:
                     native_audio_buffer.clear()
                     native_response_emitted = False
                     native_input_since_commit = False
+                    native_speech_since_commit = False
                     native_committed_audio_payload = None
                     native_deferred_response_create = False
                     await actor.cancel_append_tasks()
@@ -791,6 +832,7 @@ class OmniDuplexSessionHandler:
                     native_audio_buffer.clear()
                     native_response_emitted = False
                     native_input_since_commit = False
+                    native_speech_since_commit = False
                     native_committed_audio_payload = None
                     native_deferred_response_create = False
                     await actor.cancel_append_tasks()
@@ -817,6 +859,7 @@ class OmniDuplexSessionHandler:
                 if event_type == "input_audio_buffer.clear":
                     native_audio_buffer.clear()
                     native_input_since_commit = False
+                    native_speech_since_commit = False
                     native_committed_audio_payload = None
                     native_deferred_response_create = False
                     drained = actor.drain_input_queue()
@@ -896,6 +939,7 @@ class OmniDuplexSessionHandler:
                         actor.active_response_task,
                         send_json,
                         reason=cancel_reason,
+                        rebuild_runtime_history_after_truncate=True,
                     )
                     had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
                     if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
@@ -903,6 +947,14 @@ class OmniDuplexSessionHandler:
                         old_response_id = session.active_response_id
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, old_response_id, committed_ms)
+                        if not await self._signal_runtime_history_rebuild_after_truncate(
+                            session,
+                            old_response_id,
+                            committed_ms,
+                            reason=cancel_reason,
+                            send_json=send_json,
+                        ):
+                            continue
                         new_epoch, old_playback = self._advance_barge_in_epoch(session)
                         await send_json(
                             {
@@ -921,6 +973,14 @@ class OmniDuplexSessionHandler:
                         old_epoch = session.epoch
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, actor.last_response_id, committed_ms)
+                        if not await self._signal_runtime_history_rebuild_after_truncate(
+                            session,
+                            actor.last_response_id,
+                            committed_ms,
+                            reason=cancel_reason,
+                            send_json=send_json,
+                        ):
+                            continue
                         new_epoch, old_playback = self._advance_barge_in_epoch(session)
                         await send_json(
                             {
@@ -940,6 +1000,14 @@ class OmniDuplexSessionHandler:
                         old_response_id = session.active_response_id
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, old_response_id, committed_ms)
+                        if not await self._signal_runtime_history_rebuild_after_truncate(
+                            session,
+                            old_response_id,
+                            committed_ms,
+                            reason=cancel_reason,
+                            send_json=send_json,
+                        ):
+                            continue
                         new_epoch, old_playback = self._advance_barge_in_epoch(session)
                         await send_json(
                             {
@@ -973,7 +1041,8 @@ class OmniDuplexSessionHandler:
                         cancelled = True
                     if not cancelled:
                         await self._cancel_pending_input(session, send_json, reason="barge_in")
-                    asyncio.create_task(self._signal_runtime_session(session, "barge_in", event, send_json))
+                    if not await self._signal_runtime_session(session, "barge_in", event, send_json):
+                        continue
                     actor.active_response_task = None
                     actor.transition("open")
                     continue
@@ -1191,6 +1260,8 @@ class OmniDuplexSessionHandler:
                                 payload["force_listen"] = True
                                 actor.transition("generating")
                             else:
+                                event["force_barge_in"] = True
+                                self._mark_barge_in_new_user_turn_payload(payload)
                                 playback_was_active = actor.assistant_playback_active()
                                 buffer_overlap_audio = True
                                 defer_native_append = False
@@ -1198,6 +1269,7 @@ class OmniDuplexSessionHandler:
                                 actor.overlap_speech_ms = 0
                                 native_response_emitted = False
                                 native_input_since_commit = False
+                                native_speech_since_commit = False
                                 await actor.cancel_append_tasks()
                                 had_native_stream = session.session_id in self._native_data_plane_tasks
                                 cancelled = await self._cancel_active_response(
@@ -1205,6 +1277,7 @@ class OmniDuplexSessionHandler:
                                     actor.active_response_task,
                                     send_json,
                                     reason="barge_in",
+                                    rebuild_runtime_history_after_truncate=True,
                                 )
                                 had_native_stream = (
                                     await self._cancel_native_data_plane_stream(session) or had_native_stream
@@ -1214,6 +1287,14 @@ class OmniDuplexSessionHandler:
                                     old_response_id = session.active_response_id
                                     committed_ms = session.playback.committed_ms
                                     self._commit_played_response_history(session, old_response_id, committed_ms)
+                                    if not await self._signal_runtime_history_rebuild_after_truncate(
+                                        session,
+                                        old_response_id,
+                                        committed_ms,
+                                        reason="barge_in",
+                                        send_json=send_json,
+                                    ):
+                                        continue
                                     new_epoch, old_playback = self._advance_barge_in_epoch(session)
                                     await send_json(
                                         {
@@ -1232,6 +1313,14 @@ class OmniDuplexSessionHandler:
                                     old_epoch = session.epoch
                                     committed_ms = session.playback.committed_ms
                                     self._commit_played_response_history(session, actor.last_response_id, committed_ms)
+                                    if not await self._signal_runtime_history_rebuild_after_truncate(
+                                        session,
+                                        actor.last_response_id,
+                                        committed_ms,
+                                        reason="barge_in",
+                                        send_json=send_json,
+                                    ):
+                                        continue
                                     new_epoch, old_playback = self._advance_barge_in_epoch(session)
                                     await send_json(
                                         {
@@ -1246,7 +1335,8 @@ class OmniDuplexSessionHandler:
                                         }
                                     )
                                     cancelled = True
-                                asyncio.create_task(self._signal_runtime_session(session, "barge_in", event, send_json))
+                                if not await self._signal_runtime_session(session, "barge_in", event, send_json):
+                                    continue
                                 actor.active_response_task = None
                         elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
                             event, payload, session=session
@@ -1265,7 +1355,19 @@ class OmniDuplexSessionHandler:
                                 }
                             )
                             continue
-                        if self._should_force_listen_for_auto_response_overlap(session, actor, event, payload):
+                        new_user_turn_payload = self._mark_auto_response_new_user_turn_payload(
+                            session,
+                            actor,
+                            event,
+                            payload,
+                        )
+                        if new_user_turn_payload:
+                            native_audio_buffer.clear_force_listen()
+                        if self._should_skip_auto_response_waiting_silence(session, actor, event, payload):
+                            continue
+                        if not new_user_turn_payload and self._should_force_listen_for_auto_response_overlap(
+                            session, actor, event, payload
+                        ):
                             # Auto-response keeps a long-lived native Stage0 stream.
                             # While assistant audio is still active, silence from the
                             # browser should advance the model in listen mode rather
@@ -1276,6 +1378,9 @@ class OmniDuplexSessionHandler:
                             continue
                         session.mark_user_input_activity()
                         native_input_since_commit = True
+                        native_speech_since_commit = native_speech_since_commit or self._input_looks_like_speech(
+                            event, payload, session=session
+                        )
                         try:
                             buffered_payload = native_audio_buffer.append(
                                 payload,
@@ -1310,6 +1415,7 @@ class OmniDuplexSessionHandler:
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
                         native_input_since_commit = False
+                        native_speech_since_commit = False
                         native_audio_buffer.clear()
                         native_committed_audio_payload = None
                         native_deferred_response_create = False
@@ -1365,6 +1471,7 @@ class OmniDuplexSessionHandler:
                             if actor.overlap_speech_ms <= session.config.overlap_short_ack_ms:
                                 native_audio_buffer.clear()
                                 native_input_since_commit = False
+                                native_speech_since_commit = False
                                 native_committed_audio_payload = None
                                 native_deferred_response_create = False
                                 if realtime_protocol is not None:
@@ -1399,6 +1506,7 @@ class OmniDuplexSessionHandler:
                                 native_committed_audio_payload = deferred_payload
                                 native_deferred_response_create = should_create_response
                                 native_input_since_commit = False
+                                native_speech_since_commit = False
                                 signal_runtime_background("input.commit", event)
                                 committed = self._commit_native_audio_input(
                                     session,
@@ -1415,6 +1523,52 @@ class OmniDuplexSessionHandler:
                                 committed_payload["response_create_deferred"] = should_create_response
                                 await send_json(committed_payload)
                                 continue
+                        if (
+                            self._session_auto_responds(session)
+                            and native_speech_since_commit
+                            and session.active_response_id is None
+                        ):
+                            final_payload = native_audio_buffer.flush(
+                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000
+                            )
+                            if native_committed_audio_payload is not None:
+                                if final_payload is not None:
+                                    final_payload = self._merge_native_audio_payloads(
+                                        native_committed_audio_payload,
+                                        final_payload,
+                                    )
+                                else:
+                                    final_payload = native_committed_audio_payload
+                                native_committed_audio_payload = None
+                                native_deferred_response_create = False
+                            if final_payload is None:
+                                final_payload = self._native_silence_unit_payload()
+                            native_input_since_commit = False
+                            native_speech_since_commit = False
+                            signal_runtime_background("input.commit", event)
+                            data_plane_turn_id = session.turn_id
+                            committed = self._commit_native_audio_input(
+                                session,
+                                realtime_item_id=event.get("realtime_item_id"),
+                                transcript=event.get("transcript"),
+                            )
+                            await send_json(
+                                self._native_audio_committed_payload(
+                                    session,
+                                    committed=committed,
+                                    realtime_item_id=event.get("realtime_item_id"),
+                                    transcript=event.get("transcript"),
+                                )
+                            )
+                            await start_native_append(
+                                {
+                                    **final_payload,
+                                    "duplex_turn_id": data_plane_turn_id,
+                                },
+                                final=True,
+                                precreate_response=True,
+                            )
+                            continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
                         if (
                             native_response_in_progress()
@@ -1442,6 +1596,7 @@ class OmniDuplexSessionHandler:
                             committed_payload = native_committed_audio_payload
                             native_committed_audio_payload = None
                             native_input_since_commit = False
+                            native_speech_since_commit = False
                             native_deferred_response_create = False
                             await start_native_append(committed_payload, final=True, precreate_response=True)
                             continue
@@ -1528,6 +1683,7 @@ class OmniDuplexSessionHandler:
                         "input.commit",
                     }:
                         native_input_since_commit = False
+                        native_speech_since_commit = False
                     if committed is None and event_type != "response.create":
                         if self._uses_native_input_append(session):
                             committed = (
@@ -1613,6 +1769,7 @@ class OmniDuplexSessionHandler:
                 )
                 if actor.runtime_opened and not actor.runtime_closed and session.state != DuplexSessionState.CLOSED:
                     await self._close_runtime_session(session, reason="disconnect")
+                self._cleanup_duplex_session_state(session)
                 self._registry.close(session.session_id)
             await actor.output_queue.put(None)
             with suppress(Exception):
@@ -1671,9 +1828,66 @@ class OmniDuplexSessionHandler:
         response_id: str | None,
         committed_ms: int,
     ) -> None:
-        if not response_id or committed_ms <= 0:
+        if not response_id or committed_ms < 0:
             return
         session.truncate_history_item(f"item_{response_id}", audio_end_ms=committed_ms)
+
+    async def _signal_runtime_history_rebuild_after_truncate(
+        self,
+        session: DuplexSession,
+        response_id: str | None,
+        committed_ms: int,
+        *,
+        reason: str,
+        send_json=None,
+    ) -> bool:
+        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
+        if not response_id or committed_ms < 0:
+            if profile_logs:
+                logger.info(
+                    "skip duplex runtime history rebuild after truncate: session=%s "
+                    "response_id=%s committed_ms=%s reason=%s",
+                    session.session_id,
+                    response_id,
+                    committed_ms,
+                    reason,
+                )
+            return True
+        signal_event = {
+            "type": "turn.signal",
+            "event": "conversation.item.truncate",
+            "payload": {
+                "item_id": f"item_{response_id}",
+                "audio_end_ms": int(committed_ms),
+                "history": list(session.history),
+                "playback": session.playback.as_dict(),
+                "reason": reason,
+            },
+        }
+        if profile_logs:
+            logger.info(
+                "signal duplex runtime history rebuild after truncate: session=%s "
+                "response_id=%s committed_ms=%s reason=%s history_len=%d",
+                session.session_id,
+                response_id,
+                committed_ms,
+                reason,
+                len(session.history),
+            )
+        result = await self._signal_runtime_session(
+            session,
+            "conversation.item.truncate",
+            signal_event,
+            send_json,
+        )
+        if profile_logs:
+            logger.info(
+                "duplex runtime history rebuild after truncate result: session=%s response_id=%s ok=%s",
+                session.session_id,
+                response_id,
+                result,
+            )
+        return result
 
     def _remember_response_conversation_mode(self, session: DuplexSession, response_id: str) -> None:
         mode = session.config.extra_body.pop("realtime_response_conversation", None)
@@ -1938,6 +2152,13 @@ class OmniDuplexSessionHandler:
         merged["audio"] = base64.b64encode(first_raw + second_raw).decode("ascii")
         merged["sample_rate_hz"] = first_rate
         merged["force_listen"] = bool(first.get("force_listen", False)) or bool(second.get("force_listen", False))
+        merged["force_speak"] = bool(first.get("force_speak", False)) or bool(second.get("force_speak", False))
+        merged["is_speech"] = bool(first.get("is_speech", False)) or bool(second.get("is_speech", False))
+        if bool(first.get("new_user_turn", False)) or bool(second.get("new_user_turn", False)):
+            merged["new_user_turn"] = True
+            prefix_variant = first.get("new_user_turn_prefix_variant") or second.get("new_user_turn_prefix_variant")
+            if isinstance(prefix_variant, str):
+                merged["new_user_turn_prefix_variant"] = prefix_variant
         return merged
 
     @classmethod
@@ -1972,14 +2193,136 @@ class OmniDuplexSessionHandler:
     ) -> bool:
         if not self._session_auto_responds(session):
             return False
+        if event.get("force_barge_in") is True:
+            return False
+        if event.get("force_speak") is True:
+            self._auto_response_waiting_for_speech.discard(session.session_id)
+            self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
+            return False
         if event.get("force_listen") is True or payload.get("force_listen") is True:
             return True
-        if self._input_looks_like_speech(event, payload, session=session):
-            self._auto_response_waiting_for_speech.discard(session.session_id)
-            return False
+        looks_like_speech = self._input_looks_like_speech(event, payload, session=session)
         if session.session_id in self._auto_response_waiting_for_speech:
+            return False
+        if actor.assistant_playback_active():
             return True
+        if looks_like_speech:
+            self._auto_response_waiting_for_speech.discard(session.session_id)
+            self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
+            return False
         return False
+
+    def _should_skip_auto_response_waiting_silence(
+        self,
+        session: DuplexSession,
+        actor: DuplexSessionActor,
+        event: dict[str, object],
+        payload: dict[str, object],
+    ) -> bool:
+        if not self._session_auto_responds(session):
+            return False
+        if session.session_id not in self._auto_response_waiting_for_speech:
+            return False
+        if event.get("force_barge_in") is True or event.get("force_speak") is True:
+            return False
+        if event.get("force_listen") is True:
+            return False
+        return not self._input_looks_like_speech(event, payload, session=session)
+
+    def _mark_auto_response_waiting_for_speech(
+        self,
+        session: DuplexSession,
+        *,
+        prefix_variant: str,
+    ) -> None:
+        if not self._session_auto_responds(session):
+            return
+        self._auto_response_waiting_for_speech.add(session.session_id)
+        self._auto_response_new_turn_prefix_variants[session.session_id] = prefix_variant
+
+    @staticmethod
+    def _mark_barge_in_new_user_turn_payload(payload: dict[str, object]) -> None:
+        payload["new_user_turn"] = True
+        payload.setdefault(
+            "new_user_turn_prefix_variant",
+            MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
+        )
+
+    def _mark_auto_response_new_user_turn_payload(
+        self,
+        session: DuplexSession,
+        actor: DuplexSessionActor,
+        event: dict[str, object],
+        payload: dict[str, object],
+    ) -> bool:
+        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
+        if not self._session_auto_responds(session):
+            return False
+        if event.get("force_listen") is True:
+            if profile_logs:
+                logger.info(
+                    "MiniCPM-o auto-response skip new user turn: session=%s reason=event_force_listen",
+                    session.session_id,
+                )
+            return False
+        force_barge_in = event.get("force_barge_in") is True
+        if force_barge_in:
+            prefix_variant = self._auto_response_new_turn_prefix_variants.pop(
+                session.session_id,
+                MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
+            )
+        else:
+            if session.session_id not in self._auto_response_waiting_for_speech:
+                if profile_logs:
+                    logger.info(
+                        "MiniCPM-o auto-response skip new user turn: session=%s reason=waiting_latch_unset "
+                        "payload_flags={is_speech:%s,force_listen:%s}",
+                        session.session_id,
+                        payload.get("is_speech"),
+                        payload.get("force_listen"),
+                    )
+                return False
+            if actor.assistant_playback_active():
+                if profile_logs:
+                    logger.info(
+                        "MiniCPM-o auto-response skip new user turn: session=%s reason=playback_active "
+                        "payload_flags={is_speech:%s,force_listen:%s}",
+                        session.session_id,
+                        payload.get("is_speech"),
+                        payload.get("force_listen"),
+                    )
+                return False
+            if not self._input_looks_like_speech(event, payload, session=session):
+                if profile_logs:
+                    logger.info(
+                        "MiniCPM-o auto-response skip new user turn: session=%s reason=input_not_speech "
+                        "payload_flags={is_speech:%s,force_listen:%s}",
+                        session.session_id,
+                        payload.get("is_speech"),
+                        payload.get("force_listen"),
+                    )
+                return False
+            prefix_variant = self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
+        self._auto_response_waiting_for_speech.discard(session.session_id)
+        payload["force_listen"] = False
+        if prefix_variant:
+            payload.setdefault("new_user_turn_prefix_variant", prefix_variant)
+        payload["new_user_turn"] = True
+        if profile_logs:
+            logger.info(
+                "MiniCPM-o auto-response mark new user turn: session=%s "
+                "playback_active=%s payload_flags={is_speech:%s,force_listen:%s,force_speak:%s,"
+                "force_barge_in:%s,new_user_turn:%s,prefix_variant:%s}",
+                session.session_id,
+                actor.assistant_playback_active(),
+                payload.get("is_speech"),
+                payload.get("force_listen"),
+                payload.get("force_speak"),
+                event.get("force_barge_in"),
+                payload.get("new_user_turn"),
+                payload.get("new_user_turn_prefix_variant"),
+            )
+        return True
 
     @staticmethod
     def _input_looks_like_speech(
@@ -2155,6 +2498,11 @@ class OmniDuplexSessionHandler:
             session=session,
             expected_epoch=expected_epoch,
         )
+        # A resumable data-plane append remains active even when its persistent
+        # drain task already exists. Treating only a newly-created drain as
+        # activity clears active_request_id after later appends and prevents a
+        # terminal TTS segment from scheduling the next model decision.
+        emitted_response = emitted_response or request_id is not None
         if close_reason is None and await self._start_native_data_plane_stream_task(
             send_json,
             result,
@@ -2296,7 +2644,17 @@ class OmniDuplexSessionHandler:
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
 
+    def _native_silence_unit_payload(self) -> dict[str, object]:
+        return {
+            "type": "audio",
+            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        }
+
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
+        if self._session_auto_responds(session):
+            return True
         prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
         if prev_response_id != response_id:
             count = 0
@@ -2320,9 +2678,6 @@ class OmniDuplexSessionHandler:
         if response_id is None or session.state == DuplexSessionState.CLOSED:
             self._native_response_continuations.pop(session.session_id, None)
             return
-        if self._session_auto_responds(session) and session.playback.sent_ms <= 0:
-            self._native_response_continuations.pop(session.session_id, None)
-            return
         request_id = session.active_request_id
         if request_id is None:
             self._native_response_continuations.pop(session.session_id, None)
@@ -2332,19 +2687,14 @@ class OmniDuplexSessionHandler:
         prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
         if prev_response_id != response_id:
             count = 0
-        if count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
+        auto_response = self._session_auto_responds(session)
+        if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
         self._native_response_continuations[session.session_id] = (response_id, count + 1)
-        payload = {
-            "type": "audio",
-            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        }
-        if count + 1 >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
-            # Last chance before the cap: make the model speak rather than
-            # leaving the response open forever.
-            payload["force_speak"] = True
+        payload = self._native_silence_unit_payload()
+        payload["duplex_turn_id"] = (
+            session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+        )
 
         async def _continue() -> None:
             try:
@@ -2403,7 +2753,13 @@ class OmniDuplexSessionHandler:
             if send_json is not None:
                 await self._send_runtime_error(send_json, "runtime_signal_failed", exc, session=session)
             return False
-        if isinstance(result, dict) and self._runtime_control_failed(result):
+        if isinstance(result, dict) and self._runtime_signal_failed(result):
+            logger.warning(
+                "Duplex runtime signal failed: session=%s event=%s result=%s",
+                session.session_id,
+                event,
+                self._redact_runtime_control_result(result),
+            )
             if send_json is not None:
                 await self._send_runtime_control_error(
                     send_json,
@@ -2485,6 +2841,25 @@ class OmniDuplexSessionHandler:
             value = result.get(key)
             if isinstance(value, int | float) and value > 0:
                 return True
+        return False
+
+    @classmethod
+    def _runtime_signal_failed(cls, result: dict[str, object]) -> bool:
+        error_count = result.get("error_count")
+        if isinstance(error_count, int | float) and error_count > 0:
+            return True
+        if result.get("ok") is not False:
+            return False
+        return not cls._runtime_signal_has_data_plane_ack(result)
+
+    @classmethod
+    def _runtime_signal_has_data_plane_ack(cls, value: object) -> bool:
+        if isinstance(value, dict):
+            if value.get("data_plane_signal") is True and value.get("supported") is True:
+                return True
+            return any(cls._runtime_signal_has_data_plane_ack(child) for child in value.values())
+        if isinstance(value, list | tuple):
+            return any(cls._runtime_signal_has_data_plane_ack(item) for item in value)
         return False
 
     @classmethod
@@ -2694,9 +3069,8 @@ class OmniDuplexSessionHandler:
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
                 logger.info("native event ignored after terminal data-plane request_id=%s", data_plane_request_id)
             return close_reason, emitted_response
-        active_request_matches = (
-            session.active_request_id == data_plane_request_id
-            or (self._session_auto_responds(session) and session.active_request_id is None)
+        active_request_matches = session.active_request_id == data_plane_request_id or (
+            self._session_auto_responds(session) and session.active_request_id is None
         )
         if isinstance(data_plane_request_id, str) and not active_request_matches:
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
@@ -2803,15 +3177,30 @@ class OmniDuplexSessionHandler:
             await send_json(payload)
             return close_reason, emitted_response
         if is_listen is True:
+            non_terminal_auto_listen = (
+                self._session_auto_responds(session)
+                and session.active_response_id is not None
+                and session.active_request_id is not None
+                and native_result.get("end_of_turn") is not True
+                and (session.playback.sent_ms <= 0 or native_result.get("model_listen") is False)
+            )
+            if non_terminal_auto_listen:
+                self._maybe_continue_native_response(
+                    send_json,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                )
+                return close_reason, emitted_response
             session.turn_state = DuplexTurnState.IDLE
             if data_plane_request_id == session.active_request_id:
                 session.active_request_id = None
-            if isinstance(data_plane_request_id, str):
-                self._data_plane_terminal_request_ids.add(data_plane_request_id)
-            emitted_response = True
             model_listen = native_result.get("model_listen")
             if not isinstance(model_listen, bool):
                 model_listen = native_result.get("reason") in {None, "", "model_listen"}
+            response_id = session.active_response_id
+            if isinstance(data_plane_request_id, str):
+                self._data_plane_terminal_request_ids.add(data_plane_request_id)
+            emitted_response = True
             payload = {
                 "type": "response.listen",
                 "session_id": session.session_id,
@@ -2831,7 +3220,6 @@ class OmniDuplexSessionHandler:
                     send_json,
                     notify=False,
                 )
-            response_id = session.active_response_id
             if response_id is not None:
                 if not self._session_auto_responds(session) and self._native_response_continuations_remaining(
                     session, response_id
@@ -2847,7 +3235,10 @@ class OmniDuplexSessionHandler:
                     return close_reason, emitted_response
                 session.end_response(commit_text=False)
                 if self._session_auto_responds(session):
-                    self._auto_response_waiting_for_speech.add(session.session_id)
+                    self._mark_auto_response_waiting_for_speech(
+                        session,
+                        prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+                    )
                 await send_json(
                     {
                         "type": "response.done",
@@ -2868,6 +3259,26 @@ class OmniDuplexSessionHandler:
         has_text = isinstance(text, str) and bool(text)
         has_audio = isinstance(audio, str) and bool(audio)
         if not has_text and not has_audio and not end_of_turn:
+            tts_segment_ended = (
+                native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
+            )
+            if tts_segment_ended and self._session_auto_responds(session):
+                self._maybe_continue_native_response(
+                    send_json,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                )
+            return close_reason, emitted_response
+        if end_of_turn and not has_text and not has_audio and session.active_response_id is None:
+            if isinstance(data_plane_request_id, str):
+                if data_plane_request_id == session.active_request_id:
+                    session.active_request_id = None
+                self._data_plane_terminal_request_ids.add(data_plane_request_id)
+            if self._session_auto_responds(session):
+                self._mark_auto_response_waiting_for_speech(
+                    session,
+                    prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_LISTEN_ONLY,
+                )
             return close_reason, emitted_response
         emitted_response = True
         response_created = False
@@ -2950,6 +3361,17 @@ class OmniDuplexSessionHandler:
         if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
             logger.info("native event sent: audio.delta t=%.3f", time.monotonic())
         await send_json(payload)
+        if (
+            not end_of_turn
+            and native_result.get("stage_role") == "tts"
+            and native_result.get("abort_data_plane_request") is True
+            and self._session_auto_responds(session)
+        ):
+            self._maybe_continue_native_response(
+                send_json,
+                session=session,
+                expected_epoch=expected_epoch,
+            )
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
             if isinstance(data_plane_request_id, str) and not self._session_auto_responds(session):
@@ -2962,7 +3384,10 @@ class OmniDuplexSessionHandler:
             should_commit = self._should_commit_response_to_history(response_id)
             committed_message = session.end_response(commit_text=should_commit)
             if self._session_auto_responds(session):
-                self._auto_response_waiting_for_speech.add(session.session_id)
+                self._mark_auto_response_waiting_for_speech(
+                    session,
+                    prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+                )
             if should_commit:
                 session.register_history_item(f"item_{response_id}", committed_message)
             await send_json(
@@ -3046,10 +3471,51 @@ class OmniDuplexSessionHandler:
             mm_output = dict(mm_output)
         else:
             mm_output = {}
-        if not text:
-            text = self._data_plane_llm_output_text(mm_output)
+        output_turn_id = self._data_plane_output_turn_id(mm_output)
+        output_epoch = self._data_plane_output_epoch(mm_output)
+        stale_turn = False
+        stale_epoch = False
+        if session is not None:
+            expected_turn_id = (
+                session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+            )
+            stale_turn = output_turn_id is not None and output_turn_id != expected_turn_id
+            stale_epoch = output_epoch is not None and output_epoch != session.epoch
+        if session is not None and self._session_auto_responds(session) and (stale_turn or stale_epoch):
+            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+                logger.info(
+                    "drop stale duplex data-plane output: request_id=%s output_turn_id=%s "
+                    "session_turn_id=%s active_response_turn_id=%s output_epoch=%s session_epoch=%s",
+                    data_plane_request_id,
+                    output_turn_id,
+                    session.turn_id,
+                    session.active_response_turn_id,
+                    output_epoch,
+                    session.epoch,
+                )
+            return
+        mm_text = self._data_plane_llm_output_text(mm_output)
+        if mm_text:
+            # Stage-1 audio outputs can expose cumulative completion.text while
+            # carrying the exact text for this audio segment in metadata.
+            text = mm_text
+            if data_plane_request_id is not None:
+                self._data_plane_segment_text_metadata_request_ids.add(data_plane_request_id)
+        elif (
+            data_plane_request_id is not None
+            and data_plane_request_id in self._data_plane_segment_text_metadata_request_ids
+        ):
+            # Once a data-plane request has explicit segment text metadata,
+            # keep transcript sourcing there. TTS-stage completion.text is
+            # cumulative and will duplicate transcripts if mixed back in.
+            text = ""
         profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
         finished = bool(getattr(output, "finished", False))
+        tts_is_last_chunk = self._data_plane_bool_metadata(
+            mm_output,
+            ("tts_is_last_chunk",),
+            default=False,
+        )
         token_ids = self._data_plane_completion_token_ids(completion)
         native_decision = self._data_plane_native_decision(
             completion,
@@ -3088,13 +3554,11 @@ class OmniDuplexSessionHandler:
                 "runner_local_payload_ref": False,
             }
             return
-        raw_audio_samples = None
-        offset_before = None
-        if profile_logs:
-            raw_audio = next((mm_output[k] for k in ("audio", "model_outputs", "latent") if k in mm_output), None)
-            raw_audio_samples = self._audio_num_samples(raw_audio)
-            if data_plane_request_id is not None:
-                offset_before = self._data_plane_audio_offsets.get(data_plane_request_id)
+        raw_audio = next((mm_output[k] for k in ("audio", "model_outputs", "latent") if k in mm_output), None)
+        raw_audio_samples = self._audio_num_samples(raw_audio)
+        offset_before = (
+            self._data_plane_audio_offsets.get(data_plane_request_id) if data_plane_request_id is not None else None
+        )
         audio_chunks = list(
             self._encode_data_plane_audio_chunks_with_duration(
                 mm_output,
@@ -3118,16 +3582,21 @@ class OmniDuplexSessionHandler:
             and (raw_audio_samples == 0 or raw_audio_samples == offset_before)
             and tts_eos_key not in self._data_plane_tts_eos_done
         )
-        if stage_tts_eos and tts_eos_key:
+        tts_segment_end = bool(tts_is_last_chunk or stage_tts_eos) and (
+            not tts_eos_key or tts_eos_key not in self._data_plane_tts_eos_done
+        )
+        if tts_segment_end and tts_eos_key:
             self._data_plane_tts_eos_done.add(tts_eos_key)
-        unit_end_of_turn = bool(stage_turn_end) or bool(stage_tts_eos) or (
+        unit_end_of_turn = bool(stage_turn_end) or (
             finished and not (session is not None and self._session_auto_responds(session))
         )
         if profile_logs:
             logger.info(
                 "duplex data-plane output: request_id=%s finished=%s "
                 "text_len=%d audio_chunks=%d native_decision=%s mm_keys=%s "
-                "raw_audio_samples=%s offset_before=%s offset_after=%s",
+                "raw_audio_samples=%s offset_before=%s offset_after=%s "
+                "token_ids=%s tts_is_last_chunk=%s stage_tts_eos=%s "
+                "stage_turn_end=%s tts_segment_end=%s",
                 getattr(output, "request_id", None),
                 finished,
                 len(text) if isinstance(text, str) else 0,
@@ -3141,6 +3610,11 @@ class OmniDuplexSessionHandler:
                     if data_plane_request_id is not None
                     else None
                 ),
+                token_ids,
+                tts_is_last_chunk,
+                stage_tts_eos,
+                stage_turn_end,
+                tts_segment_end,
             )
         if audio_chunks:
             # The talker streams several cumulative-audio batches per handed
@@ -3151,7 +3625,13 @@ class OmniDuplexSessionHandler:
             # Deliberately no reset at segment or response boundaries: any
             # reset re-attaches the text on the next same-text continuation
             # batch and duplicates the transcript.
-            delta_text = self._data_plane_segment_text_delta(data_plane_request_id, text)
+            delta_text = self._data_plane_segment_text_delta(
+                data_plane_request_id,
+                text,
+                turn_id=(
+                    output_turn_id if output_turn_id is not None else (session.turn_id if session is not None else None)
+                ),
+            )
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)
             audio_text_marks = self._data_plane_audio_text_marks(mm_output)
@@ -3188,6 +3668,7 @@ class OmniDuplexSessionHandler:
                     "audio_text_mark": idx == last_idx,
                     "sample_rate_hz": sample_rate_hz,
                     "end_of_turn": unit_end_of_turn and idx == last_idx,
+                    "abort_data_plane_request": tts_segment_end and idx == last_idx,
                     "uses_model_runner_scheduler": True,
                     "runner_kv_backed": True,
                     "runtime_impl": "scheduler_data_plane",
@@ -3203,16 +3684,43 @@ class OmniDuplexSessionHandler:
                     native_result["audio_text_marks_are_cumulative"] = True
                 yield native_result
             return
+        if tts_segment_end:
+            yield {
+                "supported": True,
+                "stage_role": "tts",
+                "is_listen": False,
+                "data_plane_request_id": data_plane_request_id,
+                "text": "",
+                "audio_data": "",
+                "audio_format": session.config.response_format if session is not None else "wav",
+                "audio_text_mark": False,
+                "end_of_turn": bool(stage_turn_end),
+                "abort_data_plane_request": True,
+                "uses_model_runner_scheduler": True,
+                "runner_kv_backed": True,
+                "runtime_impl": "scheduler_data_plane",
+                "owned_runtime": False,
+                "experimental_worker_control_rpc": False,
+                "runner_local_payload_ref": False,
+            }
+            return
         if data_plane_request_id is not None and session is not None and self._session_auto_responds(session):
-            # Some MiniCPM-o flush batches carry cumulative text but no new
-            # audio. They must advance the cursor or the next audio batch will
-            # re-emit the already-seen prefix as transcript text.
-            self._data_plane_segment_text_delta(data_plane_request_id, text)
+            # Text-only flushes are not client-visible transcript segments.
+            # Keep the audio-bound cursor for the next batch that carries audio.
+            if unit_end_of_turn and session.active_response_id is None:
+                if data_plane_request_id == session.active_request_id:
+                    session.active_request_id = None
+                self._data_plane_terminal_request_ids.add(data_plane_request_id)
+                self._mark_auto_response_waiting_for_speech(
+                    session,
+                    prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_LISTEN_ONLY,
+                )
+                return
         if (
             finished
             and session is not None
             and self._session_auto_responds(session)
-            and session.playback.sent_ms > 0
+            and session.active_response_id is not None
             and data_plane_request_id is not None
         ):
             yield {
@@ -3223,7 +3731,6 @@ class OmniDuplexSessionHandler:
                 "listen_source": "auto_response_segment_complete",
                 "reason": "auto_response_segment_complete",
                 "data_plane_request_id": data_plane_request_id,
-                "abort_data_plane_request": True,
                 "end_of_turn": False,
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
@@ -3234,6 +3741,8 @@ class OmniDuplexSessionHandler:
             }
             return
         if not text:
+            if session is not None and self._session_auto_responds(session):
+                return
             if finished:
                 yield {
                     "supported": True,
@@ -3252,7 +3761,7 @@ class OmniDuplexSessionHandler:
                     "runner_local_payload_ref": False,
                 }
             return
-        if session is not None and session.playback.sent_ms > 0 and unit_end_of_turn:
+        if session is not None and session.active_response_id is not None and unit_end_of_turn:
             yield {
                 "supported": True,
                 "stage_role": "tts",
@@ -3358,6 +3867,46 @@ class OmniDuplexSessionHandler:
         return out
 
     @classmethod
+    def _payload_turn_id(cls, payload: object) -> int | None:
+        if not isinstance(payload, Mapping):
+            return None
+        return cls._coerce_data_plane_int(payload.get("duplex_turn_id"))
+
+    @classmethod
+    def _data_plane_output_turn_id(cls, mm_output: dict[str, object]) -> int | None:
+        candidates: list[object] = [
+            mm_output.get("duplex_turn_id"),
+            mm_output.get("turn_id"),
+            mm_output.get("meta.duplex_turn_id"),
+            mm_output.get("meta.turn_id"),
+        ]
+        meta = mm_output.get("meta")
+        if isinstance(meta, dict):
+            candidates.extend((meta.get("duplex_turn_id"), meta.get("turn_id")))
+        for value in candidates:
+            turn_id = cls._coerce_data_plane_int(value)
+            if turn_id is not None:
+                return turn_id
+        return None
+
+    @classmethod
+    def _data_plane_output_epoch(cls, mm_output: dict[str, object]) -> int | None:
+        candidates: list[object] = [
+            mm_output.get("duplex_epoch"),
+            mm_output.get("epoch"),
+            mm_output.get("meta.duplex_epoch"),
+            mm_output.get("meta.epoch"),
+        ]
+        meta = mm_output.get("meta")
+        if isinstance(meta, dict):
+            candidates.extend((meta.get("duplex_epoch"), meta.get("epoch")))
+        for value in candidates:
+            epoch = cls._coerce_data_plane_int(value)
+            if epoch is not None:
+                return epoch
+        return None
+
+    @classmethod
     def _data_plane_completion_token_ids(cls, completion: object) -> list[int]:
         if completion is None:
             return []
@@ -3389,20 +3938,74 @@ class OmniDuplexSessionHandler:
                 out.append(token_id)
         return out
 
-    def _data_plane_segment_text_delta(self, request_id: str | None, text: object) -> str:
+    @staticmethod
+    def _data_plane_text_cursor_key(request_id: str | None, turn_id: int | None = None) -> str | None:
+        if request_id is None:
+            return None
+        if turn_id is None:
+            return request_id
+        return f"{request_id}:turn:{turn_id}"
+
+    def _data_plane_segment_text_delta(
+        self,
+        request_id: str | None,
+        text: object,
+        *,
+        turn_id: int | None = None,
+    ) -> str:
         if not isinstance(text, str) or not text:
             return ""
-        if request_id is None:
+        cursor_key = self._data_plane_text_cursor_key(request_id, turn_id)
+        if cursor_key is None:
             return text
-        sent_text = self._data_plane_sent_segment_texts.get(request_id)
-        self._data_plane_sent_segment_texts[request_id] = text
+        sent_text = self._data_plane_sent_segment_texts.get(cursor_key)
         if not isinstance(sent_text, str) or not sent_text:
-            return text
-        if text == sent_text:
-            return ""
-        if text.startswith(sent_text):
-            return text[len(sent_text) :]
-        return text
+            delta_text = text
+        elif text == sent_text:
+            delta_text = ""
+        elif text.startswith(sent_text):
+            delta_text = text[len(sent_text) :]
+        else:
+            logger.warning(
+                "Non-prefix duplex data-plane transcript for request_id=%s turn_id=%s; emitting full text",
+                request_id,
+                turn_id,
+            )
+            delta_text = text
+        self._data_plane_sent_segment_texts[cursor_key] = text
+        return delta_text
+
+    @staticmethod
+    def _data_plane_request_belongs_to_session(request_id: str, session_id: str) -> bool:
+        return request_id.startswith(f"duplex-{session_id}-") or request_id.startswith(f"chatcmpl-duplex-{session_id}-")
+
+    def _cleanup_data_plane_request_state(self, request_id: str) -> None:
+        self._data_plane_audio_offsets.pop(request_id, None)
+        for cursor_key in list(self._data_plane_sent_segment_texts):
+            if cursor_key == request_id or cursor_key.startswith(f"{request_id}:"):
+                self._data_plane_sent_segment_texts.pop(cursor_key, None)
+        self._data_plane_segment_text_metadata_request_ids.discard(request_id)
+        self._data_plane_tts_eos_done.discard(request_id)
+        self._data_plane_terminal_request_ids.discard(request_id)
+
+    def _cleanup_duplex_session_state(self, session: DuplexSession) -> None:
+        session_id = session.session_id
+        self._auto_response_waiting_for_speech.discard(session_id)
+        self._auto_response_new_turn_prefix_variants.pop(session_id, None)
+        self._native_response_continuations.pop(session_id, None)
+        active_request_id = session.active_request_id
+        if isinstance(active_request_id, str):
+            self._cleanup_data_plane_request_state(active_request_id)
+        for request_id in (
+            set(self._data_plane_audio_offsets)
+            | set(self._data_plane_sent_segment_texts)
+            | set(self._data_plane_segment_text_metadata_request_ids)
+        ):
+            if self._data_plane_request_belongs_to_session(request_id, session_id):
+                self._cleanup_data_plane_request_state(request_id)
+        for request_id in set(self._data_plane_tts_eos_done) | set(self._data_plane_terminal_request_ids):
+            if self._data_plane_request_belongs_to_session(request_id, session_id):
+                self._cleanup_data_plane_request_state(request_id)
 
     @staticmethod
     def _coerce_data_plane_int(value: object) -> int | None:
@@ -3412,6 +4015,15 @@ class OmniDuplexSessionHandler:
                 if value.numel() == 0:
                     return None
                 value = value[0].item()
+            except Exception:
+                return None
+        elif hasattr(value, "reshape") and hasattr(value, "size"):
+            try:
+                value = value.reshape(-1)
+                if int(value.size) == 0:
+                    return None
+                item = value[0]
+                value = item.item() if hasattr(item, "item") else item
             except Exception:
                 return None
         try:
@@ -3549,12 +4161,19 @@ class OmniDuplexSessionHandler:
                 return value
             try:
                 import torch
+
                 if isinstance(value, torch.Tensor):
                     if value.numel() == 0:
                         return None
                     return bool(value.reshape(-1)[-1].item())
             except Exception:
                 pass
+            if isinstance(value, np.ndarray):
+                if value.size == 0:
+                    return None
+                return bool(value.reshape(-1)[-1].item())
+            if isinstance(value, np.generic):
+                return bool(value.item())
             if isinstance(value, (list, tuple)):
                 return coerce(value[-1]) if value else None
             if isinstance(value, (int, float)):
@@ -4383,6 +5002,7 @@ class OmniDuplexSessionHandler:
         *,
         reason: str,
         notify: bool = True,
+        rebuild_runtime_history_after_truncate: bool = False,
     ) -> bool:
         has_running_task = active_task is not None and not active_task.done()
         if not has_running_task and session.active_request_id is None and session.active_response_id is None:
@@ -4402,6 +5022,14 @@ class OmniDuplexSessionHandler:
                 session.register_history_item(item_id, committed_message)
             elif committed_ms > 0:
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
+            if rebuild_runtime_history_after_truncate:
+                await self._signal_runtime_history_rebuild_after_truncate(
+                    session,
+                    old_response_id,
+                    committed_ms,
+                    reason=reason,
+                    send_json=send_json,
+                )
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
         if old_request_id is not None:
             await self._abort_request_background(
