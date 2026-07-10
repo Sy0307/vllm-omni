@@ -117,8 +117,9 @@ interruption atomically advances epoch and invalidates every old-fence output.
 
 ## Domain State
 
-The core owns one mutable `DuplexSessionState`. Other layers own resources, not
-copies of domain state.
+The core owns one authoritative `DuplexSessionState` value. The reducer returns a
+new state plus effects and never mutates its input. Other layers own resources,
+not copies of domain state.
 
 ```text
 Session: OPEN -> CLOSING -> CLOSED
