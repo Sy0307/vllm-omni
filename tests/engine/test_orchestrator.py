@@ -34,6 +34,7 @@ from vllm_omni.engine.orchestrator import (
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.duplex.engine import DuplexInputMode, DuplexRuntimeCapabilities, SessionMode
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -772,17 +773,18 @@ async def test_duplex_barge_in_signals_bound_stage_replicas_before_releasing_dow
         stage_pools=stage_pools,
     )
     session = orchestrator.duplex_sessions.open_session(
-        "sid-stage-signal",
+        DuplexFence("sid-stage-signal"),
         session_mode=SessionMode.DUPLEX,
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
         ),
     )
-    session.bind_stage_request(0, "req-stage0", replica_id=0)
-    session.bind_stage_request(1, "req-stage1", replica_id=0)
+    session.bind_stage_request(0, "req-stage0", replica_id=0, fence=session.fence)
+    session.bind_stage_request(1, "req-stage1", replica_id=0, fence=session.fence)
     session.append_input(
         {"is_speech": True, "new_user_turn": True},
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=session.fence,
     )
     interrupted_epoch = session.epoch
     interrupted_turn_id = session.turn_id
@@ -790,6 +792,7 @@ async def test_duplex_barge_in_signals_bound_stage_replicas_before_releasing_dow
     await orchestrator._handle_signal_duplex_turn(
         SignalDuplexTurnMessage(
             control_id="ctrl-signal",
+            fence=session.fence,
             session_id="sid-stage-signal",
             event="barge_in",
             payload={"reason": "test"},
@@ -826,7 +829,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         stage_pools=stage_pools,
     )
     session = orchestrator.duplex_sessions.open_session(
-        "sid-bridge-turn",
+        DuplexFence("sid-bridge-turn"),
         session_mode=SessionMode.DUPLEX,
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
@@ -837,6 +840,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     await orchestrator._handle_append_duplex_input(
         AppendDuplexInputMessage(
             control_id="append-1",
+            fence=DuplexFence("sid-bridge-turn"),
             session_id="sid-bridge-turn",
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
             payload={"is_speech": True},
@@ -853,6 +857,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     await orchestrator._handle_append_duplex_input(
         AppendDuplexInputMessage(
             control_id="append-2",
+            fence=DuplexFence("sid-bridge-turn", turn_id=1, response_seq=1),
             session_id="sid-bridge-turn",
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
             payload={"is_speech": True, "new_user_turn": True},
