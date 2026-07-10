@@ -53,7 +53,8 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.duplex.engine import (
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.omni import (
     DuplexAdapterPattern,
     DuplexInputMode,
     DuplexRuntimeCapabilities,
@@ -61,11 +62,8 @@ from vllm_omni.experimental.duplex.engine import (
     DuplexSessionRuntimeState,
     DuplexSignalSource,
     SessionMode,
-    duplex_first_append_context_reserve,
-    duplex_first_append_unit_count,
-    duplex_new_user_turn_prefix_reserve,
-    duplex_payload_is_exact_chunks,
-    duplex_scheduler_token_budget,
+    build_duplex_data_plane_prompt,
+    duplex_resource_request_id,
 )
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -227,6 +225,7 @@ class OrchestratorRequestState:
 
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+    duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
 
 
 @dataclass
@@ -534,7 +533,7 @@ class Orchestrator:
             session_mode = SessionMode(msg.session_mode)
             capabilities = self._coerce_duplex_capabilities(msg.capabilities)
             self.duplex_sessions.open_session(
-                msg.session_id,
+                msg.fence,
                 session_mode=session_mode,
                 capabilities=capabilities,
                 session_config=msg.session_config,
@@ -543,6 +542,7 @@ class Orchestrator:
             request_state = self._ensure_duplex_stage_request_state(session, stage_id=0)
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="open",
                 session_id=msg.session_id,
                 stage_results=[
@@ -565,6 +565,7 @@ class Orchestrator:
             logger.exception("[Orchestrator] open_duplex_session failed: %s", exc)
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="open",
                 session_id=msg.session_id,
                 stage_results=[],
@@ -575,29 +576,13 @@ class Orchestrator:
         stage_results: list[dict[str, object]] = []
         try:
             session = self.duplex_sessions.require(msg.session_id)
-            if msg.expected_epoch is not None and session.epoch != msg.expected_epoch:
-                await self._put_duplex_control_result(
-                    msg.control_id,
-                    operation="append",
-                    session_id=msg.session_id,
-                    stage_results=[
-                        {
-                            "stage_id": -1,
-                            "replica_id": -1,
-                            "result": {
-                                "supported": True,
-                                "stale_append_ignored": True,
-                                "expected_epoch": msg.expected_epoch,
-                                "current_epoch": session.epoch,
-                            },
-                        }
-                    ],
-                )
-                return
+            if msg.expected_epoch is not None and msg.expected_epoch != msg.fence.epoch:
+                raise ValueError("expected_epoch must match fence.epoch")
             mode = DuplexInputMode(msg.mode)
             update = session.append_input(
                 msg.payload,
                 mode=mode,
+                fence=msg.fence,
                 final=msg.final,
             )
             stage_results = await self._append_duplex_input_via_data_plane(
@@ -610,6 +595,7 @@ class Orchestrator:
             )
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="append",
                 session_id=msg.session_id,
                 stage_results=stage_results,
@@ -618,6 +604,7 @@ class Orchestrator:
             logger.exception("[Orchestrator] append_duplex_input failed: %s", exc)
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="append",
                 session_id=msg.session_id,
                 stage_results=[],
@@ -648,23 +635,18 @@ class Orchestrator:
 
         stage_id = 0
         pool = self.stage_pools[stage_id]
-        request_id = self._duplex_stage_request_id(
-            session.session_id,
-            epoch=session.epoch,
-            stage_id=stage_id,
-        )
+        request_id = self._duplex_stage_request_id(msg.fence, stage_id=stage_id)
         existing_binding = session.stage_bindings.get(stage_id)
         already_submitted = existing_binding is not None and existing_binding.request_id == request_id
         req_state = self._ensure_duplex_stage_request_state(session, stage_id=stage_id)
         if req_state is None:
             raise RuntimeError("duplex_data_plane_has_no_stage")
-        self._sync_duplex_bridge_state(req_state, session=session, turn_id=turn_id)
+        self._sync_duplex_bridge_state(req_state, session=session, fence=msg.fence)
 
         prompt = self._build_duplex_data_plane_prompt(
             request_id=request_id,
             session=session,
             seq=seq,
-            turn_id=turn_id,
             turn_seq=turn_seq,
             mode=mode,
             payload=msg.payload,
@@ -703,6 +685,7 @@ class Orchestrator:
                     "stage_request_topology": self._duplex_stage_request_topology(session),
                     "seq": seq,
                     "turn_id": turn_id,
+                    "response_seq": msg.fence.response_seq,
                     "turn_seq": turn_seq,
                     "mode": mode.value,
                     "resumable": True,
@@ -765,12 +748,8 @@ class Orchestrator:
         return params
 
     @staticmethod
-    def _duplex_stage_request_id(session_id: str, *, epoch: int, stage_id: int, seq: int | None = None) -> str:
-        suffix = f"-s{seq}" if seq is not None else ""
-        # Clean turns within an epoch resume Stage0. Barge-in advances the
-        # epoch because unplayed assistant KV must be discarded and rebuilt
-        # from committed history, so every stage request is epoch-scoped.
-        return f"duplex-{session_id}-e{epoch}-stage{stage_id}{suffix}"
+    def _duplex_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
+        return duplex_resource_request_id(fence, f"stage{stage_id}")
 
     def _ensure_duplex_stage_request_state(
         self,
@@ -780,14 +759,10 @@ class Orchestrator:
     ) -> OrchestratorRequestState | None:
         if not self.stage_pools or stage_id >= len(self.stage_pools):
             return None
-        request_id = self._duplex_stage_request_id(
-            session.session_id,
-            epoch=session.epoch,
-            stage_id=stage_id,
-        )
+        request_id = self._duplex_stage_request_id(session.fence, stage_id=stage_id)
         req_state = self.request_states.get(request_id)
         if req_state is not None:
-            self._sync_duplex_bridge_state(req_state, session=session)
+            self._sync_duplex_bridge_state(req_state, session=session, fence=session.fence)
             return req_state
         req_state = OrchestratorRequestState(
             request_id=request_id,
@@ -796,7 +771,7 @@ class Orchestrator:
             final_stage_id=len(self.stage_pools) - 1,
         )
         req_state.streaming.enabled = True
-        self._sync_duplex_bridge_state(req_state, session=session)
+        self._sync_duplex_bridge_state(req_state, session=session, fence=session.fence)
         self.request_states[request_id] = req_state
         return req_state
 
@@ -805,7 +780,7 @@ class Orchestrator:
         req_state: OrchestratorRequestState,
         *,
         session: DuplexSessionRuntimeState,
-        turn_id: int | None = None,
+        fence: DuplexFence,
     ) -> None:
         duplex_state = req_state.streaming.bridge_states.setdefault("duplex", {})
         if not isinstance(duplex_state, dict):
@@ -814,8 +789,10 @@ class Orchestrator:
         duplex_state.update(
             {
                 "session_id": session.session_id,
-                "epoch": session.epoch,
-                "turn_id": session.turn_id if turn_id is None else turn_id,
+                "fence": fence,
+                "epoch": fence.epoch,
+                "turn_id": fence.turn_id,
+                "response_seq": fence.response_seq,
                 "session_config": dict(session.session_config),
             }
         )
@@ -829,11 +806,7 @@ class Orchestrator:
         admitted on the first handoff and then updated until the final segment.
         This is deliberately not a persistent core KV lease.
         """
-        logical_request_id = self._duplex_stage_request_id(
-            session.session_id,
-            epoch=session.epoch,
-            stage_id=0,
-        )
+        logical_request_id = self._duplex_stage_request_id(session.fence, stage_id=0)
         created = logical_request_id in self.request_states
         stage_requests: list[dict[str, Any]] = []
         all_stage_actors_submitted = bool(self.stage_pools)
@@ -876,125 +849,38 @@ class Orchestrator:
         request_id: str,
         session: DuplexSessionRuntimeState,
         seq: int,
-        turn_id: int,
         turn_seq: int,
         mode: DuplexInputMode,
         payload: object,
         final: bool,
     ) -> dict[str, Any]:
-        token_budget = duplex_scheduler_token_budget(payload)
-        if seq <= 1:
-            # The first append also carries the session context (system prompt
-            # and optional reference-audio embeddings) ahead of the first unit,
-            # its first unit has no </unit> closure, and the first unit
-            # consumes the official first-chunk window (more than one chunk
-            # period), so the unit count differs from the plain chunk count.
-            token_budget += duplex_first_append_context_reserve(session.session_config)
-            first_units = duplex_first_append_unit_count(payload)
-            if first_units is not None:
-                audio_tokens_per_unit = 10
-                token_budget = (
-                    duplex_first_append_context_reserve(session.session_config)
-                    + first_units * (audio_tokens_per_unit + 2)
-                    - 1
-                )
-        if (
-            seq > 1
-            and duplex_payload_is_exact_chunks(payload)
-            and not (isinstance(payload, dict) and payload.get("new_user_turn") is True)
-        ):
-            # Every append after the first re-injects the previous segment's
-            # sampled terminator token ahead of the first unit closure.
-            token_budget += 1
-        if isinstance(payload, dict) and payload.get("new_user_turn") is True:
-            token_budget += duplex_new_user_turn_prefix_reserve(
-                session.session_config,
-                variant=payload.get("new_user_turn_prefix_variant"),
-            )
-        if final and duplex_payload_is_exact_chunks(payload):
-            # A final append closes the turn with exactly one extra worker
-            # unit (the zero-padded leftover, or one silence unit).
-            token_budget += 12
-        token_id = 0
-        extra_body = session.session_config.get("extra_body")
-        raw_token_id = session.session_config.get("duplex_scheduler_token_id")
-        if raw_token_id is None and isinstance(extra_body, dict):
-            raw_token_id = extra_body.get("duplex_scheduler_token_id")
-        try:
-            token_id = max(0, int(raw_token_id))
-        except (TypeError, ValueError):
-            token_id = 0
-        # HF MiniCPM-o defaults force_listen_count to 0. Keep explicit
-        # overrides, but do not force turn starts unless the caller opts in.
-        force_listen_count = _duplex_force_listen_count(extra_body)
-        if (
-            force_listen_count > 0
-            and turn_seq <= force_listen_count
-            and isinstance(payload, dict)
-            and payload.get("force_speak") is not True
-            and payload.get("force_listen") is not True
-        ):
-            payload = {**payload, "force_listen": True}
-        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-            payload_flags: dict[str, object] = {}
-            if isinstance(payload, dict):
-                for key in ("is_speech", "new_user_turn", "force_listen", "force_speak"):
-                    if key in payload:
-                        payload_flags[key] = payload.get(key)
-            logger.info(
-                "[Orchestrator] duplex prompt flags: session=%s req=%s seq=%s "
-                "turn_seq=%s final=%s token_budget=%s flags=%s",
-                session.session_id,
-                request_id,
-                seq,
-                turn_seq,
-                final,
-                token_budget,
-                payload_flags,
-            )
-        return {
-            "prompt_token_ids": [token_id] * token_budget,
-            "model_intermediate_buffer": {
-                "request_id": request_id,
-                "global_request_id": [session.session_id],
-                "duplex": {
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "seq": seq,
-                    "turn_id": turn_id,
-                    "turn_seq": turn_seq,
-                    "mode": mode.value,
-                    "payload": payload,
-                    "final": final,
-                    "data_plane": True,
-                    "session_config": dict(session.session_config),
-                    "scheduler_token_budget": token_budget,
-                    "scheduler_token_id": token_id,
-                },
-            },
-        }
+        return build_duplex_data_plane_prompt(
+            request_id=request_id,
+            fence=session.fence,
+            session_config=session.session_config,
+            seq=seq,
+            turn_seq=turn_seq,
+            mode=mode,
+            payload=payload,
+            final=final,
+        )
 
     async def _handle_signal_duplex_turn(self, msg: SignalDuplexTurnMessage) -> None:
         stage_results: list[dict[str, object]] = []
         try:
             session = self.duplex_sessions.require(msg.session_id)
+            session.accept_fence(msg.fence)
             if msg.event in {"barge_in", "input.cancel", "response.cancel"}:
-                bound_stage_requests = list(session.stage_bindings.items())
-                interrupted_epoch = session.epoch
-                interrupted_turn_id = session.turn_id
-                epoch, stale_request_ids = session.barge_in()
+                bound_stage_requests = [item for item in session.stage_bindings.items() if item[1].fence == msg.fence]
                 stage_results.extend(
                     await self._signal_bound_duplex_stage_replicas(
                         msg,
-                        epoch=interrupted_epoch,
-                        turn_id=interrupted_turn_id,
                         bound_stage_requests=bound_stage_requests,
                     )
                 )
+                stale_request_ids = session.release_fence(msg.fence)
                 if stale_request_ids:
                     await self._cleanup_request_ids(stale_request_ids, abort=True)
-            else:
-                epoch = session.epoch
             stage_results.append(
                 {
                     "stage_id": -1,
@@ -1003,12 +889,13 @@ class Orchestrator:
                         "supported": True,
                         "data_plane_signal": True,
                         "event": msg.event,
-                        "epoch": epoch,
+                        "fence": msg.fence,
                     },
                 }
             )
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="signal",
                 session_id=msg.session_id,
                 stage_results=stage_results,
@@ -1017,6 +904,7 @@ class Orchestrator:
             logger.exception("[Orchestrator] signal_duplex_turn failed: %s", exc)
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="signal",
                 session_id=msg.session_id,
                 stage_results=[],
@@ -1027,14 +915,12 @@ class Orchestrator:
         self,
         msg: SignalDuplexTurnMessage,
         *,
-        epoch: int,
-        turn_id: int | None = None,
         bound_stage_requests: list[tuple[int, Any]],
     ) -> list[dict[str, object]]:
         stage_results: list[dict[str, object]] = []
         payload = dict(msg.payload or {})
-        if turn_id is not None:
-            payload.setdefault("turn_id", turn_id)
+        payload.setdefault("turn_id", msg.fence.turn_id)
+        payload.setdefault("response_seq", msg.fence.response_seq)
         for stage_id, binding in bound_stage_requests:
             if stage_id < 0 or stage_id >= len(self.stage_pools):
                 continue
@@ -1048,7 +934,8 @@ class Orchestrator:
                     timeout=msg.timeout,
                     kwargs={
                         "session_id": msg.session_id,
-                        "epoch": epoch,
+                        "epoch": msg.fence.epoch,
+                        "fence": msg.fence,
                         "event": msg.event,
                         "payload": dict(payload),
                     },
@@ -1081,13 +968,14 @@ class Orchestrator:
             if session is None:
                 await self._put_duplex_control_result(
                     msg.control_id,
+                    fence=msg.fence,
                     operation="close",
                     session_id=msg.session_id,
                     stage_results=[],
                 )
                 return
             stale_request_ids = session.stage_request_ids()
-            self.duplex_sessions.close_session(msg.session_id)
+            self.duplex_sessions.close_session(msg.fence)
             if stale_request_ids:
                 await self._cleanup_request_ids(stale_request_ids, abort=True)
             stage_results.append(
@@ -1103,6 +991,7 @@ class Orchestrator:
             )
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="close",
                 session_id=msg.session_id,
                 stage_results=stage_results,
@@ -1111,6 +1000,7 @@ class Orchestrator:
             logger.exception("[Orchestrator] close_duplex_session failed: %s", exc)
             await self._put_duplex_control_result(
                 msg.control_id,
+                fence=msg.fence,
                 operation="close",
                 session_id=msg.session_id,
                 stage_results=[],
@@ -1155,6 +1045,7 @@ class Orchestrator:
         self,
         control_id: str,
         *,
+        fence: DuplexFence,
         operation: str,
         session_id: str,
         stage_results: list[dict[str, object]],
@@ -1172,6 +1063,7 @@ class Orchestrator:
         await self.rpc_async_queue.put(
             DuplexControlResultMessage(
                 control_id=control_id,
+                fence=fence,
                 operation=operation,
                 session_id=session_id,
                 ok=error_count == 0 and unsupported_count == 0,
@@ -1489,7 +1381,7 @@ class Orchestrator:
                                     if session is None:
                                         continue
                                     stale_request_ids = session.stage_request_ids()
-                                    self.duplex_sessions.close_session(session_id)
+                                    self.duplex_sessions.close_session(session.fence)
                                     affected_request_ids.extend(stale_request_ids)
                                     logger.warning(
                                         "[Orchestrator] closed duplex session %s after stage-%s replica-%s died; "
@@ -1703,7 +1595,11 @@ class Orchestrator:
         session = self._duplex_session_for_req_state(req_state)
         if session is None:
             return
-        session.bind_stage_request(stage_id, request_id, replica_id=replica_id)
+        fence = self._duplex_fence_for_req_state(req_state)
+        if fence is None:
+            raise RuntimeError("duplex stage submission is missing a DuplexFence")
+        req_state.duplex_stage_fences[stage_id] = fence
+        session.bind_stage_request(stage_id, request_id, replica_id=replica_id, fence=fence)
         if _minicpmo45_profile_logs_enabled():
             logger.info(
                 "[Orchestrator] duplex stage submit: session=%s epoch=%s stage=%s replica=%s req=%s update=%s",
@@ -1755,6 +1651,7 @@ class Orchestrator:
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
+                    fence=self._duplex_fence_for_req_state(req_state, stage_id=stage_id),
                     stage_id=stage_id,
                     replica_id=replica_id,
                     engine_outputs=output,
@@ -1938,6 +1835,24 @@ class Orchestrator:
         return isinstance(duplex_state, dict) and isinstance(duplex_state.get("session_id"), str)
 
     @classmethod
+    def _duplex_fence_for_req_state(
+        cls,
+        req_state: OrchestratorRequestState,
+        *,
+        stage_id: int | None = None,
+    ) -> DuplexFence | None:
+        if not cls._is_duplex_session_request(req_state):
+            return None
+        if stage_id is not None:
+            stage_fence = req_state.duplex_stage_fences.get(stage_id)
+            if stage_fence is not None:
+                return stage_fence
+        fence = req_state.streaming.bridge_states["duplex"].get("fence")
+        if not isinstance(fence, DuplexFence):
+            raise RuntimeError("duplex request state is missing a DuplexFence")
+        return fence
+
+    @classmethod
     def _is_duplex_model_listen_segment(
         cls,
         stage_id: int,
@@ -1991,6 +1906,7 @@ class Orchestrator:
         await self.output_async_queue.put(
             OutputMessage(
                 request_id=req_id,
+                fence=self._duplex_fence_for_req_state(req_state, stage_id=stage_id),
                 stage_id=stage_id,
                 engine_outputs=OmniRequestOutput(
                     request_id=req_id,
@@ -2338,6 +2254,7 @@ class Orchestrator:
                     await self.output_async_queue.put(
                         OutputMessage(
                             request_id=req_id,
+                            fence=self._duplex_fence_for_req_state(req_state, stage_id=next_logical),
                             stage_id=next_logical,
                             engine_outputs=error_output,
                             metrics=None,
@@ -2364,6 +2281,7 @@ class Orchestrator:
                         await self.output_async_queue.put(
                             OutputMessage(
                                 request_id=req_id,
+                                fence=self._duplex_fence_for_req_state(req_state, stage_id=next_logical),
                                 stage_id=next_logical,
                                 engine_outputs=error_output,
                                 metrics=None,
@@ -2547,6 +2465,7 @@ class Orchestrator:
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
+                    fence=self._duplex_fence_for_req_state(req_state, stage_id=final_stage_id),
                     stage_id=final_stage_id,
                     replica_id=0,
                     engine_outputs=terminal_output,

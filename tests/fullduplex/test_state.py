@@ -508,7 +508,9 @@ def test_state_events_and_history_are_frozen():
 
     with pytest.raises(FrozenInstanceError):
         state.pending_input_chunks = 1  # type: ignore[misc]
-    with pytest.raises(FrozenInstanceError):
+    # CPython 3.12 raises TypeError for an unknown slot on a frozen slotted
+    # dataclass; newer versions report FrozenInstanceError.
+    with pytest.raises((FrozenInstanceError, TypeError)):
         event.extra = True  # type: ignore[attr-defined]
     with pytest.raises(FrozenInstanceError):
         history.content = "changed"  # type: ignore[misc]

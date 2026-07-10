@@ -6,6 +6,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -32,6 +33,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
 class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     type: Literal["open_duplex_session"] = "open_duplex_session"
     control_id: str
+    fence: DuplexFence
     session_id: str
     session_mode: str = "duplex"
     capabilities: dict[str, object]
@@ -42,6 +44,7 @@ class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
 class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["append_duplex_input"] = "append_duplex_input"
     control_id: str
+    fence: DuplexFence
     session_id: str
     expected_epoch: int | None = None
     mode: str
@@ -53,6 +56,7 @@ class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
 class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     type: Literal["signal_duplex_turn"] = "signal_duplex_turn"
     control_id: str
+    fence: DuplexFence
     session_id: str
     event: str
     payload: dict[str, object]
@@ -62,6 +66,7 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     type: Literal["close_duplex_session"] = "close_duplex_session"
     control_id: str
+    fence: DuplexFence
     session_id: str
     reason: str = "client_close"
     timeout: float | None = None
@@ -121,6 +126,7 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
 class OutputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["output"] = "output"
     request_id: str
+    fence: DuplexFence | None = None
     stage_id: int
     replica_id: int | None = None
     engine_outputs: OmniRequestOutput
@@ -149,6 +155,7 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
 class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     type: Literal["duplex_control_result"] = "duplex_control_result"
     control_id: str
+    fence: DuplexFence
     operation: str
     session_id: str
     ok: bool
