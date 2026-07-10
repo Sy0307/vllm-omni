@@ -60,6 +60,495 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
     assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
 
 
+def test_duplex_turn_end_latch_survives_pending_terminator_prefill_consumption():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    state = SimpleNamespace(
+        # The runtime has already consumed pending_terminator_token while
+        # building the next prefill, but the last sampled terminator must still
+        # gate the next silence decision.
+        pending_terminator_token=None,
+        last_terminator_token=turn_eos_id,
+    )
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={"sid-native": state},
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": False},
+                "seq": 7,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, speak_id] = 10.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert torch.isneginf(logits[0, :listen_id]).all()
+    assert torch.isneginf(logits[0, listen_id + 1 :]).all()
+    assert logits[0, listen_id].item() == 0.0
+
+
+def test_duplex_turn_end_latch_clears_last_terminator_on_new_speech():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    turn_eos_id = 9
+    state = SimpleNamespace(
+        pending_terminator_token=None,
+        last_terminator_token=turn_eos_id,
+    )
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={"sid-native": state},
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True},
+                "seq": 8,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = {"sid-native"}
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    sampling_metadata = SimpleNamespace(output_token_ids=[[]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert runner._duplex_turn_ended_sessions == set()
+    assert state.last_terminator_token is None
+    assert not torch.isneginf(logits[0]).any()
+
+
+def test_duplex_speech_append_does_not_force_native_speak_on_first_step():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    tts_bos_id = 5
+    turn_eos_id = 9
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "tts_bos_token_id": tts_bos_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={
+                "sid-native": SimpleNamespace(
+                    current_turn_ended=False,
+                    pending_terminator_token=None,
+                    last_terminator_token=None,
+                )
+            },
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True},
+                "seq": 8,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, listen_id] = 30.0
+    logits[0, tts_bos_id] = -2.0
+    logits[0, 7] = 20.0
+    logits[0, speak_id] = -5.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert runner._duplex_turn_ended_sessions == set()
+    assert torch.isneginf(logits[0, listen_id])
+    assert logits[0, tts_bos_id].item() == 30.0
+    assert logits[0, 7].item() == 20.0
+    assert logits[0, speak_id].item() == -5.0
+
+
+def test_duplex_new_turn_speech_does_not_force_native_speak_on_first_step():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={
+                "sid-native": SimpleNamespace(
+                    current_turn_ended=True,
+                    pending_terminator_token=listen_id,
+                    last_terminator_token=listen_id,
+                )
+            },
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True},
+                "seq": 9,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 7] = 20.0
+    original_logits = logits.clone()
+    sampling_metadata = SimpleNamespace(output_token_ids=[[]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert torch.equal(logits, original_logits)
+
+
+def test_duplex_new_user_turn_marker_opens_turn_without_forcing_speak():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    state = SimpleNamespace(
+        current_turn_ended=False,
+        pending_terminator_token=8,
+        last_terminator_token=8,
+    )
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={"sid-native": state},
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True, "new_user_turn": True},
+                "seq": 9,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 7] = 20.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert logits[0, 7].item() == 20.0
+    assert not torch.isneginf(logits[0, 7])
+    assert not torch.isneginf(logits[0, speak_id])
+    assert state.current_turn_ended is True
+
+
+def test_duplex_new_user_turn_marker_does_not_keep_forcing_after_first_step():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    state = SimpleNamespace(
+        current_turn_ended=True,
+        pending_terminator_token=None,
+        last_terminator_token=None,
+    )
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={"sid-native": state},
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True, "new_user_turn": True},
+                "seq": 9,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, listen_id] = 5.0
+    logits[0, 7] = 20.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[speak_id, 11]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert logits[0, listen_id].item() == 5.0
+    assert logits[0, 7].item() == 20.0
+    assert not torch.isneginf(logits[0, listen_id])
+    assert not torch.isneginf(logits[0, 7])
+
+
+def test_duplex_explicit_force_speak_forces_native_speak_on_first_step():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={"sid-native": SimpleNamespace(pending_terminator_token=None, last_terminator_token=None)},
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"force_speak": True, "is_speech": True},
+                "seq": 8,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 7] = 20.0
+    logits[0, speak_id] = -5.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert torch.isneginf(logits[0, :speak_id]).all()
+    assert torch.isneginf(logits[0, speak_id + 1 :]).all()
+    assert logits[0, speak_id].item() == 0.0
+
+
+def test_duplex_explicit_force_speak_does_not_keep_forcing_after_first_step():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={
+                "sid-native": SimpleNamespace(
+                    current_turn_ended=True,
+                    pending_terminator_token=None,
+                    last_terminator_token=None,
+                )
+            },
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"force_speak": True, "is_speech": True},
+                "seq": 8,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, listen_id] = 5.0
+    logits[0, 7] = 20.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[speak_id, 11]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert logits[0, listen_id].item() == 5.0
+    assert logits[0, 7].item() == 20.0
+    assert not torch.isneginf(logits[0, listen_id])
+    assert not torch.isneginf(logits[0, 7])
+
+
+def test_duplex_speech_append_does_not_force_native_speak_after_segment_started():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-e0-stage0"
+    listen_id = 3
+    speak_id = 4
+    turn_eos_id = 9
+    runner.model = SimpleNamespace(
+        _minicpmo45_native_duplex_token_ids=lambda: {
+            "listen_token_id": listen_id,
+            "speak_token_id": speak_id,
+            "turn_eos_token_id": turn_eos_id,
+        },
+        _minicpmo45_duplex_data_plane_helper=SimpleNamespace(
+            sessions={"sid-native": SimpleNamespace(pending_terminator_token=None, last_terminator_token=None)},
+        ),
+    )
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True},
+                "seq": 8,
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {}
+    runner._duplex_turn_ended_sessions = set()
+    runner._duplex_force_listen_applied_segments = set()
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 7] = 20.0
+    sampling_metadata = SimpleNamespace(output_token_ids=[[speak_id, 11]])
+
+    GPUARModelRunner._apply_duplex_force_listen_logits(
+        runner,
+        logits,
+        sampling_metadata,
+        [0],
+    )
+
+    assert not torch.isneginf(logits[0, listen_id])
+    assert logits[0, listen_id].item() == 0.0
+    assert logits[0, 7].item() == 20.0
+    assert not torch.isneginf(logits[0, 7])
+
+
+def test_publish_duplex_row_sessions_includes_request_max_tokens():
+    runner = object.__new__(GPUARModelRunner)
+    req_id = "duplex-sid-native-stage0"
+    runner.model = SimpleNamespace()
+    runner.input_batch = SimpleNamespace(req_ids=[req_id])
+    runner.model_intermediate_buffer = {
+        req_id: {
+            "duplex": {
+                "data_plane": True,
+                "payload": {"is_speech": True},
+                "session_id": "sid-native",
+            }
+        }
+    }
+    runner.requests = {
+        req_id: SimpleNamespace(
+            sampling_params=SimpleNamespace(max_tokens=20),
+        )
+    }
+
+    GPUARModelRunner._publish_duplex_row_sessions(runner, [0])
+
+    assert runner.model._minicpmo45_duplex_row_sessions == {0: "sid-native"}
+    assert runner.model._minicpmo45_duplex_row_payloads == {0: {"is_speech": True}}
+    assert runner.model._minicpmo45_duplex_row_max_tokens == {0: 20}
+
+
 def test_runner_assisted_full_attention_metadata_request_is_opt_in():
     runner = object.__new__(GPUARModelRunner)
     runner.model = object()

@@ -30,7 +30,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.inputs.duplex_intermediate import get_stream_request_key, get_tts_handoff
+from vllm_omni.experimental.duplex.intermediate import get_stream_request_key, get_tts_handoff
 from vllm_omni.platforms import current_omni_platform
 
 try:
@@ -196,9 +196,18 @@ class _TalkerTurnState:
         "token2wav_buffer",
         "prompt_wav_path",
         "temp_prompt_wav_path",
+        "epoch",
+        "turn_id",
     )
 
-    def __init__(self, prompt_wav_path, temp_prompt_wav_path):
+    def __init__(
+        self,
+        prompt_wav_path,
+        temp_prompt_wav_path,
+        *,
+        epoch: int | None = None,
+        turn_id: int | None = None,
+    ):
         self.past_key_values = None
         self.text_start_pos = 0
         # Official seeds each turn's vocoder buffer with three silence
@@ -207,6 +216,8 @@ class _TalkerTurnState:
         self.token2wav_buffer: list[int] = [_T2W_SILENCE_TOKEN] * 3
         self.prompt_wav_path = prompt_wav_path
         self.temp_prompt_wav_path = temp_prompt_wav_path
+        self.epoch = epoch
+        self.turn_id = turn_id
 
 
 _T2W_SILENCE_TOKEN = 4218
@@ -256,11 +267,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._assets_loaded = False
         self._stream_gens: dict[str, Any] = {}
         self._talker_turn_states: dict[str, _TalkerTurnState] = {}
-        # Consumed-cursor into the accumulated handoff condition; must
-        # OUTLIVE turn states (the producer accumulates across turns).
+        # Consumed-cursor into the accumulated handoff condition for the
+        # currently open spoken turn.
         self._talker_consumed_tokens: dict[str, int] = {}
+        self._talker_request_keys: dict[str, str] = {}
         self._t2w_base_caches: dict[str, tuple[Any, Any]] = {}
         self._ar_last_chunk_flags: list[bool] = [True]
+        self._ar_turn_end_flags: list[bool] = [False]
         self._text_tokenizer = None
 
         tts_config = getattr(config, "tts_config", None)
@@ -634,12 +647,94 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _stream_request_key(self, info: dict[str, Any]) -> str:
         return get_stream_request_key(info)
 
+    @staticmethod
+    def _coerce_request_key(value: Any) -> str | None:
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if value is None:
+            return None
+        text = str(value)
+        return text if text else None
+
+    @staticmethod
+    def _coerce_epoch(value: Any) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    _coerce_turn_id = _coerce_epoch
+
+    def _stream_epoch(self, info: dict[str, Any]) -> int | None:
+        duplex = info.get("duplex")
+        if isinstance(duplex, dict):
+            epoch = self._coerce_epoch(duplex.get("epoch"))
+            if epoch is not None:
+                return epoch
+        meta = info.get("meta")
+        if isinstance(meta, dict):
+            epoch = self._coerce_epoch(meta.get("epoch"))
+            if epoch is not None:
+                return epoch
+        return self._coerce_epoch(info.get("epoch"))
+
+    def _stream_turn_id(self, info: dict[str, Any]) -> int | None:
+        duplex = info.get("duplex")
+        if isinstance(duplex, dict):
+            turn_id = self._coerce_turn_id(duplex.get("turn_id"))
+            if turn_id is not None:
+                return turn_id
+        meta = info.get("meta")
+        if isinstance(meta, dict):
+            turn_id = self._coerce_turn_id(meta.get("turn_id"))
+            if turn_id is not None:
+                return turn_id
+        return self._coerce_turn_id(info.get("turn_id"))
+
+    def _remember_talker_request_key(self, info: dict[str, Any], key: str) -> None:
+        aliases = {
+            self._coerce_request_key(info.get("request_id")),
+            self._coerce_request_key(info.get("_omni_req_id")),
+        }
+        duplex = info.get("duplex")
+        if isinstance(duplex, dict):
+            aliases.add(self._coerce_request_key(duplex.get("request_id")))
+        request_keys = getattr(self, "_talker_request_keys", None)
+        if request_keys is None:
+            request_keys = {}
+            self._talker_request_keys = request_keys
+        for alias in aliases:
+            if alias and alias != key:
+                request_keys[alias] = key
+
     def _empty_audio_chunk(self) -> torch.Tensor:
         return torch.zeros((0,), dtype=torch.float32)
 
     @staticmethod
     def _extract_tts_handoff(info: dict[str, Any]) -> tuple[Any, Any]:
         return get_tts_handoff(info)
+
+    def _native_duplex_input_ends_turn(self, info: dict[str, Any]) -> bool:
+        if info.get("minicpmo45_native_duplex") is not True:
+            return False
+        meta = info.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        if bool(info.get("turn_end") or info.get("end_of_turn") or meta.get("turn_end") or meta.get("end_of_turn")):
+            return True
+        turn_eos_id = self._coerce_epoch(meta.get("turn_eos_token_id"))
+        if turn_eos_id is None:
+            return False
+        tts_token_ids, _ = self._extract_tts_handoff(info)
+        if isinstance(tts_token_ids, torch.Tensor):
+            return bool((tts_token_ids == turn_eos_id).any().item())
+        if isinstance(tts_token_ids, np.ndarray):
+            return bool(np.any(tts_token_ids == turn_eos_id))
+        if isinstance(tts_token_ids, (list, tuple)):
+            return turn_eos_id in tts_token_ids
+        return False
 
     def _t2w_pre_lookahead(self) -> int:
         flow = getattr(self.audio_tokenizer, "flow", None)
@@ -714,9 +809,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 chunk_to_process = min(chunk_size + pre_lookahead, len(state.token2wav_buffer))
                 window = state.token2wav_buffer[:chunk_to_process]
                 pieces.append(self._t2w_stream_window(window, state.prompt_wav_path, last_chunk=False))
-                state.token2wav_buffer = state.token2wav_buffer[
-                    min(chunk_size, chunk_to_process - pre_lookahead) :
-                ]
+                state.token2wav_buffer = state.token2wav_buffer[min(chunk_size, chunk_to_process - pre_lookahead) :]
         else:
             while len(state.token2wav_buffer) >= chunk_size + pre_lookahead:
                 window = state.token2wav_buffer[: chunk_size + pre_lookahead]
@@ -735,10 +828,38 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         return pieces
 
-    def _close_turn_state(self, key: str) -> None:
+    def _close_turn_state(
+        self,
+        key: str,
+        *,
+        expected_epoch: int | None = None,
+        expected_turn_id: int | None = None,
+    ) -> bool:
+        state = self._talker_turn_states.get(key)
+        if (
+            state is not None
+            and expected_epoch is not None
+            and state.epoch is not None
+            and state.epoch != expected_epoch
+        ):
+            return False
+        if (
+            state is not None
+            and expected_turn_id is not None
+            and state.turn_id is not None
+            and state.turn_id != expected_turn_id
+        ):
+            return False
         state = self._talker_turn_states.pop(key, None)
+        self._talker_consumed_tokens.pop(key, None)
+        request_keys = getattr(self, "_talker_request_keys", None)
+        if isinstance(request_keys, dict):
+            request_keys.pop(key, None)
+            for alias, mapped_key in list(request_keys.items()):
+                if mapped_key == key:
+                    request_keys.pop(alias, None)
         if state is None:
-            return
+            return True
         if self.audio_tokenizer is not None:
             self.audio_tokenizer.stream_cache = None
             self.audio_tokenizer.hift_cache_dict = {}
@@ -748,6 +869,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 os.unlink(temp_path)
             except OSError:
                 pass
+        return True
+
+    @staticmethod
+    def _stream_identity_relation(
+        state: _TalkerTurnState | None,
+        *,
+        epoch: int | None,
+        turn_id: int | None,
+    ) -> str:
+        if state is None:
+            return "current"
+        if epoch is not None and state.epoch is not None:
+            if epoch < state.epoch:
+                return "stale"
+            if epoch > state.epoch:
+                return "newer"
+        if turn_id is not None and state.turn_id is not None:
+            if turn_id < state.turn_id:
+                return "stale"
+            if turn_id > state.turn_id:
+                return "newer"
+        return "current"
 
     def _warmup_duplex_vocoder(self) -> None:
         """Pre-compile the two token2wav stream() modes used per turn.
@@ -800,6 +943,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         audio tokens through the same per-turn Token2wav buffer/cache.
         """
         key = self._stream_request_key(info)
+        self._remember_talker_request_key(info, key)
+        stream_epoch = self._stream_epoch(info)
+        stream_turn_id = self._stream_turn_id(info)
         meta_info = info.get("meta") if isinstance(info.get("meta"), dict) else {}
         codes_info = info.get("codes") if isinstance(info.get("codes"), dict) else {}
         tts_token_ids, tts_hidden_states = self._extract_tts_handoff(info)
@@ -818,6 +964,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ids_list = []
 
         state = self._talker_turn_states.get(key)
+        identity_relation = self._stream_identity_relation(
+            state,
+            epoch=stream_epoch,
+            turn_id=stream_turn_id,
+        )
+        if identity_relation == "stale":
+            logger.info(
+                "4.5 Talker duplex drop stale handoff: key=%s state_epoch=%s state_turn_id=%s "
+                "handoff_epoch=%s handoff_turn_id=%s",
+                key,
+                getattr(state, "epoch", None),
+                getattr(state, "turn_id", None),
+                stream_epoch,
+                stream_turn_id,
+            )
+            yield self._empty_audio_chunk(), True
+            return
+        if identity_relation == "newer":
+            self._close_turn_state(key)
+            state = None
         consumed = self._talker_consumed_tokens.get(key, 0)
         if consumed > len(ids_list):
             consumed = 0
@@ -829,10 +995,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         except (TypeError, ValueError):
             turn_eos_id = None
         explicit_turn_end = bool(
-            info.get("end_of_turn")
-            or info.get("turn_end")
-            or meta_info.get("end_of_turn")
-            or meta_info.get("turn_end")
+            info.get("end_of_turn") or info.get("turn_end") or meta_info.get("end_of_turn") or meta_info.get("turn_end")
         )
         turn_end = explicit_turn_end or (turn_eos_id is not None and turn_eos_id in pending_ids)
         segment_end = bool(meta_info.get("segment_end") or meta_info.get("chunk_end") or turn_end)
@@ -864,7 +1027,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ref_audio_sr = meta_info.get("ref_audio_sr", info.get("ref_audio_sr"))
             prompt_wav_path, temp_prompt_wav_path = self._resolve_prompt_wav_path(ref_audio, ref_audio_sr)
             self._begin_turn_vocoder_cache(prompt_wav_path)
-            state = _TalkerTurnState(prompt_wav_path, temp_prompt_wav_path)
+            state = _TalkerTurnState(
+                prompt_wav_path,
+                temp_prompt_wav_path,
+                epoch=stream_epoch,
+                turn_id=stream_turn_id,
+            )
             self._talker_turn_states[key] = state
 
         if pending_ids:
@@ -959,12 +1127,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         voc_t0 = time.perf_counter()
         waveforms = self._native_duplex_vocode_tokens(
             state,
-                new_tokens,
-                turn_end=turn_end,
-                segment_end=segment_end,
-                force_flush=force_flush,
-                chunk_size=chunk_size,
-            )
+            new_tokens,
+            turn_end=turn_end,
+            segment_end=segment_end,
+            force_flush=force_flush,
+            chunk_size=chunk_size,
+        )
         self._talker_consumed_tokens[key] = len(ids_list)
         vocode_ms = (time.perf_counter() - voc_t0) * 1000
         for waveform in waveforms:
@@ -985,7 +1153,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 generate_ms,
                 vocode_ms,
                 (time.perf_counter() - unit_t0) * 1000,
-        )
+            )
         if turn_end:
             self._close_turn_state(key)
             yield self._empty_audio_chunk(), True
@@ -2022,6 +2190,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if tts_token_ids is None or tts_hidden_states is None:
             logger.warning("4.5 Talker: missing tts_token_ids or tts_hidden_states")
             self._ar_last_chunk_flags = [True]
+            self._ar_turn_end_flags = [False]
             return None, None
         tts_token_ids, tts_hidden_states = self._normalize_tts_handoff_tensors(
             tts_token_ids,
@@ -2030,6 +2199,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if self._should_stream_output(additional_information):
             request_key = self._stream_request_key(additional_information)
+            input_ends_turn = self._native_duplex_input_ends_turn(additional_information)
             if request_key not in self._stream_gens:
                 self._stream_gens[request_key] = self._create_stream_gen(additional_information)
             generator = self._stream_gens[request_key]
@@ -2042,9 +2212,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if is_last:
                 self._stream_gens.pop(request_key, None)
             self._ar_last_chunk_flags = [bool(is_last)]
+            # A TTS generator also ends at ordinary chunk boundaries. Export
+            # turn_end only on the terminal output for a condition that
+            # actually contains the model's <|turn_eos|> decision.
+            self._ar_turn_end_flags = [bool(is_last and input_ends_turn)]
             return None, waveform_chunk.reshape(-1).contiguous()
 
         self._ar_last_chunk_flags = [True]
+        self._ar_turn_end_flags = [False]
         if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
             logger.info("4.5 Talker: generating speech for %d tokens", tts_token_ids.shape[0])
         waveform = self.generate_speech(
@@ -2106,7 +2281,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
-            keys = {str(req_id)}
+            request_key = str(req_id)
+            mapped_key = getattr(self, "_talker_request_keys", {}).pop(request_key, None)
+            keys = {request_key}
+            if mapped_key:
+                keys.add(mapped_key)
             for key in list(self._stream_gens):
                 if key in keys:
                     gen = self._stream_gens.pop(key, None)
@@ -2121,6 +2300,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             for key in list(self._talker_consumed_tokens):
                 if key in keys:
                     self._talker_consumed_tokens.pop(key, None)
+
+    def signal_duplex_turn(self, **kwargs: Any) -> dict[str, Any]:
+        session_id = self._coerce_request_key(kwargs.get("session_id"))
+        event = kwargs.get("event")
+        expected_epoch = self._coerce_epoch(kwargs.get("epoch"))
+        payload = kwargs.get("payload")
+        expected_turn_id = self._coerce_turn_id(payload.get("turn_id")) if isinstance(payload, dict) else None
+        if event in {"barge_in", "input.cancel", "response.cancel"} and session_id:
+            closed = self._close_turn_state(
+                session_id,
+                expected_epoch=expected_epoch,
+                expected_turn_id=expected_turn_id,
+            )
+        else:
+            closed = True
+        result = {
+            "supported": True,
+            "stage_role": "tts",
+            "event": event,
+        }
+        if closed is False:
+            result["stale_signal_ignored"] = True
+        return result
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded = set()
