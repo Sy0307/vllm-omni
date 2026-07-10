@@ -30,19 +30,6 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.engine.duplex import (
-    DuplexAdapterPattern,
-    DuplexInputMode,
-    DuplexRuntimeCapabilities,
-    DuplexSessionRuntimeManager,
-    DuplexSessionRuntimeState,
-    DuplexSignalSource,
-    SessionMode,
-    duplex_first_append_context_reserve,
-    duplex_first_append_unit_count,
-    duplex_payload_is_exact_chunks,
-    duplex_scheduler_token_budget,
-)
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -66,6 +53,20 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.experimental.duplex.engine import (
+    DuplexAdapterPattern,
+    DuplexInputMode,
+    DuplexRuntimeCapabilities,
+    DuplexSessionRuntimeManager,
+    DuplexSessionRuntimeState,
+    DuplexSignalSource,
+    SessionMode,
+    duplex_first_append_context_reserve,
+    duplex_first_append_unit_count,
+    duplex_new_user_turn_prefix_reserve,
+    duplex_payload_is_exact_chunks,
+    duplex_scheduler_token_budget,
+)
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -133,6 +134,8 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
             if sample_rate > 0:
                 return sample_rate
     return default
+
+
 def _minicpmo45_profile_logs_enabled() -> bool:
     return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
 
@@ -187,6 +190,17 @@ def build_engine_core_request_from_tokens(
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
     )
+
+
+def _duplex_force_listen_count(extra_body: object) -> int:
+    """HF-compatible MiniCPM-o force-listen default."""
+    raw_force_listen_count = None
+    if isinstance(extra_body, dict):
+        raw_force_listen_count = extra_body.get("force_listen_count")
+    try:
+        return 0 if raw_force_listen_count is None else max(0, int(raw_force_listen_count))
+    except (TypeError, ValueError):
+        return 0
 
 
 @dataclass
@@ -590,6 +604,8 @@ class Orchestrator:
                 msg,
                 session=session,
                 seq=update.seq,
+                turn_id=update.turn_id,
+                turn_seq=update.turn_seq,
                 mode=mode,
             )
             await self._put_duplex_control_result(
@@ -614,6 +630,8 @@ class Orchestrator:
         *,
         session: DuplexSessionRuntimeState,
         seq: int,
+        turn_id: int,
+        turn_seq: int,
         mode: DuplexInputMode,
     ) -> list[dict[str, object]]:
         if not self.stage_pools:
@@ -640,11 +658,14 @@ class Orchestrator:
         req_state = self._ensure_duplex_stage_request_state(session, stage_id=stage_id)
         if req_state is None:
             raise RuntimeError("duplex_data_plane_has_no_stage")
+        self._sync_duplex_bridge_state(req_state, session=session, turn_id=turn_id)
 
         prompt = self._build_duplex_data_plane_prompt(
             request_id=request_id,
             session=session,
             seq=seq,
+            turn_id=turn_id,
+            turn_seq=turn_seq,
             mode=mode,
             payload=msg.payload,
             final=msg.final,
@@ -681,6 +702,8 @@ class Orchestrator:
                     "response_stage_id": req_state.final_stage_id,
                     "stage_request_topology": self._duplex_stage_request_topology(session),
                     "seq": seq,
+                    "turn_id": turn_id,
+                    "turn_seq": turn_seq,
                     "mode": mode.value,
                     "resumable": True,
                 },
@@ -744,14 +767,10 @@ class Orchestrator:
     @staticmethod
     def _duplex_stage_request_id(session_id: str, *, epoch: int, stage_id: int, seq: int | None = None) -> str:
         suffix = f"-s{seq}" if seq is not None else ""
-        # Stage0 owns the single long-lived resumable request per session: its
-        # KV/context must persist across epochs (barge-in) so the conversation
-        # is not dropped on every turn. Keep its id epoch-independent so that
-        # post-barge-in appends resolve to ``submit_update`` (KV continues)
-        # instead of ``submit_initial`` (fresh, context-less KV). Downstream
-        # stages stay epoch-scoped.
-        epoch_tag = "" if stage_id == 0 else f"-e{epoch}"
-        return f"duplex-{session_id}{epoch_tag}-stage{stage_id}{suffix}"
+        # Clean turns within an epoch resume Stage0. Barge-in advances the
+        # epoch because unplayed assistant KV must be discarded and rebuilt
+        # from committed history, so every stage request is epoch-scoped.
+        return f"duplex-{session_id}-e{epoch}-stage{stage_id}{suffix}"
 
     def _ensure_duplex_stage_request_state(
         self,
@@ -768,6 +787,7 @@ class Orchestrator:
         )
         req_state = self.request_states.get(request_id)
         if req_state is not None:
+            self._sync_duplex_bridge_state(req_state, session=session)
             return req_state
         req_state = OrchestratorRequestState(
             request_id=request_id,
@@ -776,14 +796,29 @@ class Orchestrator:
             final_stage_id=len(self.stage_pools) - 1,
         )
         req_state.streaming.enabled = True
-        req_state.streaming.bridge_states.setdefault("duplex", {}).update(
+        self._sync_duplex_bridge_state(req_state, session=session)
+        self.request_states[request_id] = req_state
+        return req_state
+
+    @staticmethod
+    def _sync_duplex_bridge_state(
+        req_state: OrchestratorRequestState,
+        *,
+        session: DuplexSessionRuntimeState,
+        turn_id: int | None = None,
+    ) -> None:
+        duplex_state = req_state.streaming.bridge_states.setdefault("duplex", {})
+        if not isinstance(duplex_state, dict):
+            duplex_state = {}
+            req_state.streaming.bridge_states["duplex"] = duplex_state
+        duplex_state.update(
             {
                 "session_id": session.session_id,
                 "epoch": session.epoch,
+                "turn_id": session.turn_id if turn_id is None else turn_id,
+                "session_config": dict(session.session_config),
             }
         )
-        self.request_states[request_id] = req_state
-        return req_state
 
     def _duplex_stage_request_topology(self, session: DuplexSessionRuntimeState) -> dict[str, Any]:
         """Return the session's scheduler data-plane request topology.
@@ -831,7 +866,7 @@ class Orchestrator:
             "stage_actors_become_long_lived_after_first_handoff": True,
             "downstream_stage_update_policy": "segment_payload_update",
             "logical_request_id": logical_request_id,
-            "stage_request_id_scope": "shared_logical_request_id_per_stage_runner_state",
+            "stage_request_id_scope": "epoch_scoped_logical_request_id_per_stage_runner_state",
             "stage_requests": stage_requests,
         }
 
@@ -841,6 +876,8 @@ class Orchestrator:
         request_id: str,
         session: DuplexSessionRuntimeState,
         seq: int,
+        turn_id: int,
+        turn_seq: int,
         mode: DuplexInputMode,
         payload: object,
         final: bool,
@@ -861,10 +898,19 @@ class Orchestrator:
                     + first_units * (audio_tokens_per_unit + 2)
                     - 1
                 )
-        if seq > 1 and duplex_payload_is_exact_chunks(payload):
+        if (
+            seq > 1
+            and duplex_payload_is_exact_chunks(payload)
+            and not (isinstance(payload, dict) and payload.get("new_user_turn") is True)
+        ):
             # Every append after the first re-injects the previous segment's
             # sampled terminator token ahead of the first unit closure.
             token_budget += 1
+        if isinstance(payload, dict) and payload.get("new_user_turn") is True:
+            token_budget += duplex_new_user_turn_prefix_reserve(
+                session.session_config,
+                variant=payload.get("new_user_turn_prefix_variant"),
+            )
         if final and duplex_payload_is_exact_chunks(payload):
             # A final append closes the turn with exactly one extra worker
             # unit (the zero-padded leftover, or one silence unit).
@@ -878,25 +924,34 @@ class Orchestrator:
             token_id = max(0, int(raw_token_id))
         except (TypeError, ValueError):
             token_id = 0
-        # Official duplex forces the first force_listen_count units (default
-        # 3) to listen so the model cannot answer off one second of partial
-        # audio. seq counts appends (~1 unit each); the runner applies the
-        # flag once per segment.
-        raw_force_listen_count = None
-        if isinstance(extra_body, dict):
-            raw_force_listen_count = extra_body.get("force_listen_count")
-        try:
-            force_listen_count = 3 if raw_force_listen_count is None else max(0, int(raw_force_listen_count))
-        except (TypeError, ValueError):
-            force_listen_count = 3
+        # HF MiniCPM-o defaults force_listen_count to 0. Keep explicit
+        # overrides, but do not force turn starts unless the caller opts in.
+        force_listen_count = _duplex_force_listen_count(extra_body)
         if (
             force_listen_count > 0
-            and seq <= force_listen_count
+            and turn_seq <= force_listen_count
             and isinstance(payload, dict)
             and payload.get("force_speak") is not True
             and payload.get("force_listen") is not True
         ):
             payload = {**payload, "force_listen": True}
+        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
+            payload_flags: dict[str, object] = {}
+            if isinstance(payload, dict):
+                for key in ("is_speech", "new_user_turn", "force_listen", "force_speak"):
+                    if key in payload:
+                        payload_flags[key] = payload.get(key)
+            logger.info(
+                "[Orchestrator] duplex prompt flags: session=%s req=%s seq=%s "
+                "turn_seq=%s final=%s token_budget=%s flags=%s",
+                session.session_id,
+                request_id,
+                seq,
+                turn_seq,
+                final,
+                token_budget,
+                payload_flags,
+            )
         return {
             "prompt_token_ids": [token_id] * token_budget,
             "model_intermediate_buffer": {
@@ -906,6 +961,8 @@ class Orchestrator:
                     "session_id": session.session_id,
                     "epoch": session.epoch,
                     "seq": seq,
+                    "turn_id": turn_id,
+                    "turn_seq": turn_seq,
                     "mode": mode.value,
                     "payload": payload,
                     "final": final,
@@ -922,7 +979,18 @@ class Orchestrator:
         try:
             session = self.duplex_sessions.require(msg.session_id)
             if msg.event in {"barge_in", "input.cancel", "response.cancel"}:
+                bound_stage_requests = list(session.stage_bindings.items())
+                interrupted_epoch = session.epoch
+                interrupted_turn_id = session.turn_id
                 epoch, stale_request_ids = session.barge_in()
+                stage_results.extend(
+                    await self._signal_bound_duplex_stage_replicas(
+                        msg,
+                        epoch=interrupted_epoch,
+                        turn_id=interrupted_turn_id,
+                        bound_stage_requests=bound_stage_requests,
+                    )
+                )
                 if stale_request_ids:
                     await self._cleanup_request_ids(stale_request_ids, abort=True)
             else:
@@ -954,6 +1022,57 @@ class Orchestrator:
                 stage_results=[],
                 error=str(exc),
             )
+
+    async def _signal_bound_duplex_stage_replicas(
+        self,
+        msg: SignalDuplexTurnMessage,
+        *,
+        epoch: int,
+        turn_id: int | None = None,
+        bound_stage_requests: list[tuple[int, Any]],
+    ) -> list[dict[str, object]]:
+        stage_results: list[dict[str, object]] = []
+        payload = dict(msg.payload or {})
+        if turn_id is not None:
+            payload.setdefault("turn_id", turn_id)
+        for stage_id, binding in bound_stage_requests:
+            if stage_id < 0 or stage_id >= len(self.stage_pools):
+                continue
+            replica_id = getattr(binding, "replica_id", None)
+            if replica_id is None:
+                continue
+            try:
+                result = await self.stage_pools[stage_id].collective_rpc(
+                    int(replica_id),
+                    "signal_duplex_turn_async",
+                    timeout=msg.timeout,
+                    kwargs={
+                        "session_id": msg.session_id,
+                        "epoch": epoch,
+                        "event": msg.event,
+                        "payload": dict(payload),
+                    },
+                )
+            except Exception as exc:
+                result = {
+                    "supported": False,
+                    "error": str(exc),
+                }
+            if isinstance(result, dict) and result.get("supported") is False and not result.get("error"):
+                result = {
+                    "supported": True,
+                    "ignored_unsupported_stage_signal": True,
+                    "event": msg.event,
+                    "reason": result.get("reason"),
+                }
+            stage_results.append(
+                {
+                    "stage_id": stage_id,
+                    "replica_id": int(replica_id),
+                    "result": result,
+                }
+            )
+        return stage_results
 
     async def _handle_close_duplex_session(self, msg: CloseDuplexSessionMessage) -> None:
         stage_results: list[dict[str, object]] = []
@@ -1812,6 +1931,7 @@ class Orchestrator:
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
         return request
+
     @staticmethod
     def _is_duplex_session_request(req_state: OrchestratorRequestState) -> bool:
         duplex_state = req_state.streaming.bridge_states.get("duplex")
@@ -2354,6 +2474,27 @@ class Orchestrator:
                 {},
             )[req_id] = req_state.pd_prefill_multimodal_output
 
+        decoder_key = "minicpmo45_text_decoder"
+        decoder_sentinel = object()
+        previous_decoder = decoder_sentinel
+        installed_decoder = False
+        if self._is_duplex_session_request(req_state):
+            source_processor = self.stage_pools[src_stage_id].output_processor
+            tokenizer = getattr(source_processor, "tokenizer", None)
+            decode = getattr(tokenizer, "decode", None)
+            if callable(decode):
+                previous_decoder = req_state.streaming.bridge_states.get(decoder_key, decoder_sentinel)
+
+                def _decode_minicpmo45_token_delta(token_ids, _decode=decode):
+                    ids = [int(token_id) for token_id in token_ids]
+                    try:
+                        return _decode(ids, skip_special_tokens=True)
+                    except TypeError:
+                        return _decode(ids)
+
+                req_state.streaming.bridge_states[decoder_key] = _decode_minicpmo45_token_delta
+                installed_decoder = True
+
         try:
             next_inputs = next_client.process_engine_inputs(
                 source_outputs,
@@ -2367,6 +2508,12 @@ class Orchestrator:
                 next_logical,
             )
             raise
+        finally:
+            if installed_decoder:
+                if previous_decoder is decoder_sentinel:
+                    req_state.streaming.bridge_states.pop(decoder_key, None)
+                else:
+                    req_state.streaming.bridge_states[decoder_key] = previous_decoder
 
         if not next_inputs:
             if not getattr(output, "finished", False):

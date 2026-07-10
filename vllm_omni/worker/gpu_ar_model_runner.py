@@ -9,8 +9,8 @@ from __future__ import annotations
 import gc
 import os
 import threading
-from collections.abc import Callable, Sequence
-from contextlib import nullcontext
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext, suppress
 from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple
@@ -462,18 +462,39 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if not duplex_rows:
             if getattr(self.model, "_minicpmo45_duplex_row_sessions", None):
                 self.model._minicpmo45_duplex_row_sessions = {}
+            if getattr(self.model, "_minicpmo45_duplex_row_payloads", None):
+                self.model._minicpmo45_duplex_row_payloads = {}
+            if getattr(self.model, "_minicpmo45_duplex_row_max_tokens", None):
+                self.model._minicpmo45_duplex_row_max_tokens = {}
             return
         req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
         row_sessions: dict[int, str] = {}
+        row_payloads: dict[int, dict[str, Any]] = {}
+        row_max_tokens: dict[int, int] = {}
+        requests = getattr(self, "requests", {})
         for row_idx in duplex_rows:
             if row_idx >= len(req_ids):
                 continue
-            info = self._request_duplex_intermediate_info(req_ids[row_idx])
+            req_id = req_ids[row_idx]
+            info = self._request_duplex_intermediate_info(req_id)
             duplex = info.get("duplex") if isinstance(info, dict) else None
             session_id = duplex.get("session_id") if isinstance(duplex, dict) else None
             if isinstance(session_id, str) and session_id:
                 row_sessions[row_idx] = session_id
+            payload = duplex.get("payload") if isinstance(duplex, dict) else None
+            if isinstance(payload, dict):
+                row_payloads[row_idx] = payload
+            request = requests.get(req_id) if isinstance(requests, dict) else None
+            sampling_params = getattr(request, "sampling_params", None)
+            try:
+                max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                max_tokens = 0
+            if max_tokens > 0:
+                row_max_tokens[row_idx] = max_tokens
         self.model._minicpmo45_duplex_row_sessions = row_sessions
+        self.model._minicpmo45_duplex_row_payloads = row_payloads
+        self.model._minicpmo45_duplex_row_max_tokens = row_max_tokens
 
     def _apply_duplex_force_listen_logits(
         self,
@@ -489,6 +510,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         try:
             token_ids_map = token_id_fn()
             listen_id = int(token_ids_map.get("listen_token_id", -1))
+            speak_id = int(token_ids_map.get("speak_token_id", -1))
+            tts_bos_id = int(token_ids_map.get("tts_bos_token_id", -1))
             turn_eos_id = int(token_ids_map.get("turn_eos_token_id", -1))
         except Exception:
             return
@@ -506,51 +529,94 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if not isinstance(payload, dict):
                 continue
             force_listen = payload.get("force_listen") is True
-            force_speak = not force_listen and payload.get("force_speak") is True
+            is_speech = payload.get("is_speech")
+            new_user_turn = payload.get("new_user_turn") is True
+            force_speak_start = not force_listen and payload.get("force_speak") is True
+            redirect_listen = False
             # Turn-ended latch: after <|turn_eos|>, force listen on silence until
             # new speech, so the model does not re-open a turn and repeat itself.
-            if not force_speak and turn_eos_id >= 0:
+            if turn_eos_id >= 0:
                 session_id = self._request_duplex_session_id(req_id)
                 if session_id:
-                    is_speech = payload.get("is_speech")
+                    helper_current_turn_ended = None
+                    helper_last_terminator = None
+                    if isinstance(helper_sessions, dict):
+                        state = helper_sessions.get(session_id)
+                        if state is not None:
+                            helper_current_turn_ended = getattr(state, "current_turn_ended", None)
+                            helper_last_terminator = getattr(state, "last_terminator_token", None)
                     if is_speech is True:
                         self._duplex_turn_ended_sessions.discard(session_id)
-                    else:
+                        if isinstance(helper_sessions, dict):
+                            state = helper_sessions.get(session_id)
+                            if state is not None:
+                                if new_user_turn:
+                                    with suppress(Exception):
+                                        state.current_turn_ended = True
+                                if not force_speak_start and not getattr(state, "current_turn_ended", True):
+                                    redirect_listen = True
+                                with suppress(Exception):
+                                    state.last_terminator_token = None
+                    elif not force_speak_start:
                         prev_term = None
                         if isinstance(helper_sessions, dict):
                             state = helper_sessions.get(session_id)
-                            prev_term = getattr(state, "pending_terminator_token", None)
+                            prev_term = getattr(state, "last_terminator_token", None)
+                            if prev_term is None:
+                                prev_term = getattr(state, "pending_terminator_token", None)
                         if prev_term == turn_eos_id:
                             self._duplex_turn_ended_sessions.add(session_id)
                     if session_id in self._duplex_turn_ended_sessions and is_speech is not True:
                         force_listen = True
-            if not force_listen and not force_speak:
+            if not force_listen and not force_speak_start and not redirect_listen:
                 continue
             seq = self._request_duplex_seq(req_id)
             segment_key = (req_id, seq if seq is not None else -1)
             if force_listen and segment_key in self._duplex_force_listen_applied_segments:
                 continue
             row_outputs = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
+            try:
+                prior_output_len = sum(1 for token_id in row_outputs if int(token_id) >= 0)
+            except (TypeError, ValueError):
+                prior_output_len = len(row_outputs) if hasattr(row_outputs, "__len__") else None
             if force_listen:
                 logits[row_idx, :] = float("-inf")
                 logits[row_idx, listen_id] = 0.0
                 self._duplex_force_listen_applied_segments.add(segment_key)
-            else:
-                # Response-bound segment: the reply must start (and keep
-                # going) instead of listening, mirroring the official
-                # mid-turn listen -> tts_bos replacement, so the listen token
-                # is suppressed at every step; the turn still ends through
-                # turn_eos/chunk_eos.
+                action = "force listen"
+            elif force_speak_start and prior_output_len == 0 and 0 <= speak_id < logits.shape[-1]:
+                logits[row_idx, :] = float("-inf")
+                logits[row_idx, speak_id] = 0.0
+                action = "force speak"
+            elif redirect_listen and 0 <= tts_bos_id < logits.shape[-1]:
+                # Mirror the official mid-turn decode rule: if the model
+                # would listen before the current turn ended, feed tts_bos
+                # instead. Moving listen's score to tts_bos preserves that
+                # decision better than picking an arbitrary next-best token.
+                if logits[row_idx, listen_id] > logits[row_idx, tts_bos_id]:
+                    logits[row_idx, tts_bos_id] = logits[row_idx, listen_id]
                 logits[row_idx, listen_id] = float("-inf")
+                action = "redirect listen"
+            else:
+                continue
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
                 logger.info(
-                    "MiniCPM-o duplex %s logits: req_id=%s seq=%s row=%s prior_output_len=%s listen_id=%s",
-                    "force listen" if force_listen else "force speak",
+                    "MiniCPM-o duplex %s logits: req_id=%s seq=%s row=%s "
+                    "prior_output_len=%s listen_id=%s flags={is_speech:%s,new_user_turn:%s,"
+                    "force_listen:%s,force_speak:%s} turn_state={ended:%s,last_term:%s,latch:%s}",
+                    action,
                     req_id,
                     seq,
                     row_idx,
-                    len(row_outputs) if hasattr(row_outputs, "__len__") else None,
+                    prior_output_len,
                     listen_id,
+                    is_speech,
+                    new_user_turn,
+                    payload.get("force_listen"),
+                    payload.get("force_speak"),
+                    helper_current_turn_ended,
+                    helper_last_terminator,
+                    session_id in self._duplex_turn_ended_sessions if session_id else None,
                 )
 
     @staticmethod

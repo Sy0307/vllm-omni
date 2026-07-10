@@ -78,7 +78,7 @@ class OmniWorkerMixin:
         target = self._native_duplex_sessions().get(session_id)
         if target is not None:
             try:
-                from vllm_omni.worker.native_duplex import append_native_duplex_input
+                from vllm_omni.experimental.duplex.worker import append_native_duplex_input
 
                 return append_native_duplex_input(
                     target,
@@ -191,7 +191,7 @@ class OmniWorkerMixin:
         target = self._native_duplex_sessions().get(session_id)
         if target is not None:
             try:
-                from vllm_omni.worker.native_duplex import as_native_result_dict
+                from vllm_omni.experimental.duplex.worker import as_native_result_dict
 
                 signal_fn = getattr(target, "signal_duplex_turn", None)
                 if callable(signal_fn):
@@ -221,6 +221,35 @@ class OmniWorkerMixin:
                     "event": event,
                     "payload": dict(payload or {}),
                     "implementation_level": "model_native_duplex",
+                }
+            except Exception as exc:
+                return {
+                    "supported": False,
+                    "session_id": session_id,
+                    "epoch": epoch,
+                    "event": event,
+                    "payload": dict(payload or {}),
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+        model = getattr(getattr(self, "model_runner", None), "model", None)
+        signal_fn = getattr(model, "signal_duplex_turn", None)
+        if callable(signal_fn):
+            try:
+                native = signal_fn(
+                    session_id=session_id,
+                    epoch=epoch,
+                    event=event,
+                    payload=dict(payload or {}),
+                )
+                return {
+                    "supported": True,
+                    "session_id": session_id,
+                    "epoch": epoch,
+                    "event": event,
+                    "payload": dict(payload or {}),
+                    "implementation_level": "model_native_duplex_model_signal",
+                    "native_result": native if isinstance(native, dict) else {"result": native},
                 }
             except Exception as exc:
                 return {
@@ -308,13 +337,13 @@ class OmniWorkerMixin:
         if capabilities is not None and capabilities.get("implementation_level") != "model_native_duplex":
             return None
 
-        from vllm_omni.worker.native_duplex import get_native_duplex_target
+        from vllm_omni.experimental.duplex.worker import get_native_duplex_target
 
         return get_native_duplex_target(self, capabilities)
 
     @staticmethod
     def _is_passive_native_duplex_stage(target: Any) -> bool:
-        from vllm_omni.worker.native_duplex import is_passive_native_duplex_stage
+        from vllm_omni.experimental.duplex.worker import is_passive_native_duplex_stage
 
         return is_passive_native_duplex_stage(target)
 
@@ -331,7 +360,7 @@ class OmniWorkerMixin:
         capabilities: dict[str, Any],
         session_config: dict[str, Any],
     ) -> tuple[dict[str, Any], Any]:
-        from vllm_omni.worker.native_duplex import open_native_duplex_session
+        from vllm_omni.experimental.duplex.worker import open_native_duplex_session
 
         return open_native_duplex_session(
             target,
