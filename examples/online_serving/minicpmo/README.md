@@ -30,6 +30,7 @@ Then:
 
 ```bash
 vllm-omni serve openbmb/MiniCPM-o-4_5 \
+    --omni \
     --stage-configs-path vllm_omni/model_executor/stage_configs/minicpmo45_2gpu.yaml \
     --trust-remote-code \
     --host 0.0.0.0 --port 8099
@@ -47,6 +48,7 @@ text+audio throughput horizontally.
 
 ```bash
 vllm-omni serve /path/to/MiniCPM-o-4_5 \
+    --omni \
     --stage-configs-path vllm_omni/model_executor/stage_configs/minicpmo45_4gpu_stage1_replicas.yaml \
     --trust-remote-code \
     --host 0.0.0.0 --port 8099
@@ -70,6 +72,18 @@ active request, epoch, stale-output filtering, playback commit cursor, barge-in
 cancellation, and runtime-control acknowledgements. Generic non-native sessions
 can still fall back to normal chat streaming requests; MiniCPM-o 4.5 native
 sessions use the scheduler data-plane path described below.
+
+Start the server with the duplex-specific stage config. The regular
+`minicpmo45_2gpu.yaml` config does not opt into duplex sessions and keeps the
+non-streaming Stage1 token budget.
+
+```bash
+vllm-omni serve openbmb/MiniCPM-o-4_5 \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/minicpmo45_2gpu_streaming.yaml \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8099
+```
 
 MiniCPM-o 4.5 also has an explicit experimental native mode:
 
@@ -265,14 +279,13 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 
-The script streams a real speech turn, injects a short overlap acknowledgement,
-and accepts either native speak or native listen as the first model-owned
-decision. When the first response speaks, it also injects a longer barge-in
-utterance and sends a Realtime `conversation.item.truncate` playback cursor. It
-fails if the server does not produce `response.done`, `session.closed`, native
-listen/no-response behavior, or the expected audio lifecycle for speak turns.
-Pass `--require-audio` when validating a prompt/audio pair that must trigger
-speech output.
+The script streams sequential clean speech turns and relies on `auto_response`;
+it never sends `response.create` or a serving-side barge-in signal. Pass a
+different `--turn-input-wav` for each later turn and use
+`--require-distinct-inputs` to reject repeated audio content and cross-turn
+transcript tail reuse. It fails on incomplete response/audio lifecycle events,
+stale output, cancellation, transcript delta/done mismatch, or missing audio
+when `--require-audio` is set.
 
 ## Notes
 
