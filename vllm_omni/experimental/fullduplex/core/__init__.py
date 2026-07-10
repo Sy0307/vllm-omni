@@ -31,6 +31,8 @@ from .events import (
 )
 from .identity import DuplexFence
 from .playback import PlaybackCursor, PlaybackCursorError
+from .ports import DuplexEnginePort, DuplexEventSink, EngineEvent
+from .runtime import DuplexRuntime, DuplexShutdownError
 from .state import (
     ActiveResponse,
     DuplexFenceError,
@@ -52,17 +54,22 @@ __all__ = [
     "CommittedHistoryItem",
     "DomainEvent",
     "DuplexEffect",
+    "DuplexEnginePort",
+    "DuplexEventSink",
     "DuplexFence",
     "DuplexFenceError",
     "DuplexFenceMismatchError",
     "DuplexMissingFenceError",
     "DuplexReducerError",
+    "DuplexRuntime",
+    "DuplexShutdownError",
     "DuplexSessionPhase",
     "DuplexSessionState",
     "DuplexTransitionError",
     "DuplexTurnPhase",
     "EmitProtocolEvent",
     "EngineAppendAccepted",
+    "EngineEvent",
     "EngineFailed",
     "HistoryCommitted",
     "InputChunk",
