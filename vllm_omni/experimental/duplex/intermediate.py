@@ -89,7 +89,12 @@ def get_stream_request_key(info: dict[str, Any]) -> str:
         key = key[0] if key else None
     if isinstance(key, bytes):
         key = key.decode("utf-8", errors="replace")
-    return str(key) if key is not None else str(id(info))
+    if key is None:
+        raise ValueError(
+            "MiniCPM-o duplex streaming handoff requires a stable request id; "
+            "expected global_request_id, request_id, or _omni_req_id."
+        )
+    return str(key)
 
 
 def populate_tts_handoff_from_omni_payload(info: dict[str, Any], payload: dict[str, Any]) -> None:

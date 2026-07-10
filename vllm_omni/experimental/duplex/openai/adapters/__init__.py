@@ -1,4 +1,4 @@
-from vllm_omni.entrypoints.openai.duplex_adapters.minicpmo45 import (
+from vllm_omni.experimental.duplex.openai.adapters.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
 )

@@ -961,3 +961,59 @@ def test_resolve_sampling_param_token_names_materializes_stop_ids(monkeypatch):
     assert resolved.extra_args == {"keep": True}
     assert params.stop_token_ids == [7]
     assert params.extra_args == {"stop_token_names": ["<|im_end|>"], "keep": True}
+
+
+def test_stage_runtime_plans_resolve_default_sampling_stop_token_names(monkeypatch):
+    class FakeTokenizer:
+        unk_token = "<unk>"
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|im_end|>": 151645}[token]
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_init_utils.cached_tokenizer_from_config",
+        lambda *, model_config: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_runtime.build_engine_args_dict",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_runtime.build_vllm_config",
+        lambda *args, **kwargs: (types.SimpleNamespace(model_config=types.SimpleNamespace()), object),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_runtime.inject_omni_kv_connector_config",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.engine.stage_runtime._inject_inferred_kv_tp_topology",
+        lambda *args, **kwargs: None,
+    )
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        runtime=types.SimpleNamespace(devices="0"),
+        engine_args={},
+        default_sampling_params={
+            "max_tokens": 1,
+            "extra_args": {"stop_token_names": ["<|im_end|>"]},
+        },
+    )
+    runtime = StageRuntime(
+        [stage_cfg],
+        model="dummy-model",
+        config_path="dummy.yaml",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    plans = runtime._build_logical_stage_init_plans(None, [1], {})
+
+    params = plans[0].replicas[0].metadata.default_sampling_params
+    assert params.stop_token_ids == [151645]
+    assert 151645 in params._all_stop_token_ids
+    assert params.extra_args is None
