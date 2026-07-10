@@ -172,6 +172,92 @@ def test_finish_consolidation_drains_mm_delta():
     assert AUDIO not in s.mm_accumulated  # drained
 
 
+def test_delta_drains_audio_chunk_metadata_per_step():
+    s = _make_state(RequestOutputKind.DELTA)
+    segment_text = "你好"
+    segment_utf8 = torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8)
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result1 = s.make_request_output([1], None, FinishReason.STOP, None)
+    assert result1 is not None and not isinstance(result1, PoolingRequestOutput)
+    meta1 = result1.outputs[0].multimodal_output["meta"]
+    assert bytes(meta1["llm_output_text_utf8"].tolist()).decode("utf-8") == segment_text
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(3),
+            "meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result2 = s.make_request_output([2], None, FinishReason.STOP, None)
+
+    assert result2 is not None and not isinstance(result2, PoolingRequestOutput)
+    meta2 = result2.outputs[0].multimodal_output["meta"]
+    assert bytes(meta2["llm_output_text_utf8"].tolist()).decode("utf-8") == segment_text
+    assert meta2["audio_text_total_chars"].tolist() == [len(segment_text)]
+    assert meta2["duplex_epoch"].tolist() == [8]
+    assert meta2["duplex_turn_id"].tolist() == [2]
+
+
+def test_cumulative_audio_replaces_chunk_metadata_per_step():
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    segment_text = "你好"
+    segment_utf8 = torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8)
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(5),
+            "meta.duplex_epoch": torch.tensor([7], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([1], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([0], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result1 = s.make_request_output([1], None, None, None)
+    assert result1 is not None and not isinstance(result1, PoolingRequestOutput)
+    assert result1.outputs[0].multimodal_output["audio"].shape[0] == 5
+
+    s.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(3),
+            "meta.duplex_epoch": torch.tensor([8], dtype=torch.int32),
+            "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
+            "meta.llm_output_text_utf8": segment_utf8,
+            "meta.audio_text_total_chars": torch.tensor([len(segment_text)], dtype=torch.int32),
+            "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+        },
+        mm_type=AUDIO,
+    )
+    result2 = s.make_request_output([2], None, None, None)
+
+    assert result2 is not None and not isinstance(result2, PoolingRequestOutput)
+    output = result2.outputs[0].multimodal_output
+    assert output["audio"].shape[0] == 8
+    meta = output["meta"]
+    assert bytes(meta["llm_output_text_utf8"].tolist()).decode("utf-8") == segment_text
+    assert meta["audio_text_total_chars"].tolist() == [len(segment_text)]
+    assert meta["duplex_epoch"].tolist() == [8]
+    assert meta["duplex_turn_id"].tolist() == [2]
+    assert meta["tts_is_last_chunk"].tolist() == [1]
+
+
 def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
     s = _make_state(RequestOutputKind.DELTA)
     s.add_multimodal_tensor(
@@ -187,6 +273,7 @@ def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
     assert result is not None and not isinstance(result, PoolingRequestOutput)
     assert result.finished is False
     assert result.outputs[0].finish_reason is None
+    assert result.outputs[0].multimodal_output["meta"]["tts_is_last_chunk"].tolist() == [0]
     assert torch.equal(result.outputs[0].multimodal_output[AUDIO], torch.ones(5))
 
 
@@ -221,6 +308,7 @@ def test_delta_audio_non_final_tts_chunk_accepts_nested_meta():
 
     assert result is not None and not isinstance(result, PoolingRequestOutput)
     assert result.finished is False
+    assert result.outputs[0].multimodal_output["meta"]["tts_is_last_chunk"].tolist() == [0]
 
 
 @pytest.mark.parametrize("mm_type", [AUDIO, "hidden"])

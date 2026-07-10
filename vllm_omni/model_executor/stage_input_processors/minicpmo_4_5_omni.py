@@ -1,17 +1,17 @@
 import logging
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import torch
 from vllm.inputs import TextPrompt
 
-from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.inputs.duplex_intermediate import (
+from vllm_omni.experimental.duplex.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
     set_tts_handoff,
 )
+from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = logging.getLogger(__name__)
 
@@ -156,33 +156,73 @@ def _native_duplex_segment_output_ids(
 ) -> tuple[list[int], str]:
     """Slice the cumulative thinker output down to the current segment.
 
-    Tracks how many output tokens/characters were already handed to the
-    talker in the orchestrator's streaming bridge state. A new request id
-    (new epoch after barge-in) or a shrunken output list resets the counter.
+    Tracks how many output tokens were already handed to the talker in the
+    orchestrator's streaming bridge state. Segment transcript is decoded from
+    the same token delta, not from a character cursor over cumulative text.
     """
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
         return output_ids, output_text
     state = bridge_states.setdefault("minicpmo45_tts_handoff", {})
+    duplex_state = bridge_states.get("duplex")
+    turn_id = duplex_state.get("turn_id") if isinstance(duplex_state, dict) else None
+    if not isinstance(turn_id, int):
+        turn_id = None
     if state.get("request_id") != request_id:
         state["request_id"] = request_id
         state["sent_output_len"] = 0
-        state["sent_text_len"] = 0
+        state["sent_output_ids"] = []
         state["acc_tts_ids"] = []
         state["acc_tts_hidden"] = []
     sent_len = state.get("sent_output_len", 0)
+    prev_output_ids = state.get("sent_output_ids", [])
+    prev_turn_id = state.get("turn_id")
     if not isinstance(sent_len, int) or sent_len < 0 or sent_len > len(output_ids):
         # Shrunken cumulative output = epoch reset after barge-in: the talker
         # condition history is stale too.
         sent_len = 0
         state["acc_tts_ids"] = []
         state["acc_tts_hidden"] = []
-    sent_text_len = state.get("sent_text_len", 0)
-    if not isinstance(sent_text_len, int) or sent_text_len < 0 or sent_text_len > len(output_text):
-        sent_text_len = 0
+    elif sent_len and isinstance(prev_output_ids, list):
+        prev_prefix = prev_output_ids[:sent_len]
+        current_prefix = output_ids[:sent_len]
+        if current_prefix != prev_prefix:
+            # Some runtimes restart output token ids after a turn boundary while
+            # others keep returning cumulative ids. Detect restart from the
+            # token prefix instead of clearing the cursor at turn_eos.
+            sent_len = 0
+            state["acc_tts_ids"] = []
+            state["acc_tts_hidden"] = []
+    if isinstance(prev_turn_id, int) and isinstance(turn_id, int) and prev_turn_id != turn_id:
+        # The thinker output list is cumulative across clean turns, so the
+        # output cursor must stay put. The talker condition is per assistant
+        # turn, though; carrying it across turn_id boundaries makes stage 1
+        # replay the previous turn after its consumed cursor has been reset.
+        state["acc_tts_ids"] = []
+        state["acc_tts_hidden"] = []
+    segment_ids = output_ids[sent_len:]
+    decode_token_ids = bridge_states.get("minicpmo45_text_decoder")
+    if isinstance(decode_token_ids, Callable):
+        try:
+            segment_text = str(decode_token_ids(segment_ids))
+        except Exception:
+            logger.exception("Failed to decode MiniCPM-o duplex token delta for request_id=%s", request_id)
+            segment_text = ""
+    elif sent_len == 0:
+        # Non-orchestrator unit tests and legacy callers may not install a
+        # decoder. Never slice cumulative text with a stale character cursor.
+        segment_text = output_text
+    else:
+        logger.warning(
+            "MiniCPM-o native duplex token delta decoder missing for request_id=%s; "
+            "suppressing cumulative transcript fallback",
+            request_id,
+        )
+        segment_text = ""
     state["sent_output_len"] = len(output_ids)
-    state["sent_text_len"] = len(output_text)
-    return output_ids[sent_len:], output_text[sent_text_len:]
+    state["sent_output_ids"] = list(output_ids)
+    state["turn_id"] = turn_id
+    return segment_ids, segment_text
 
 
 def _reset_native_tts_handoff(streaming_context) -> None:
@@ -192,11 +232,36 @@ def _reset_native_tts_handoff(streaming_context) -> None:
     state = bridge_states.get("minicpmo45_tts_handoff")
     if not isinstance(state, dict):
         return
-    state["sent_output_len"] = 0
-    # Keep sent_text_len: the official model reports cumulative text across
-    # turns on the same resumable request, while token handoff restarts.
+    # Keep the output cursor: the thinker can keep reporting cumulative
+    # output after turn_eos on the same resumable request. If a runtime really
+    # restarts token ids, _native_duplex_segment_output_ids detects the prefix
+    # mismatch and resets the slice cursor there.
     state["acc_tts_ids"] = []
     state["acc_tts_hidden"] = []
+
+
+def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
+        return None
+    duplex_state = bridge_states.get("duplex")
+    if not isinstance(duplex_state, dict):
+        return None
+
+    metadata: dict[str, object] = {"data_plane": True}
+    session_id = duplex_state.get("session_id")
+    if isinstance(session_id, str) and session_id:
+        metadata["session_id"] = session_id
+    epoch = duplex_state.get("epoch")
+    if isinstance(epoch, int):
+        metadata["epoch"] = epoch
+    turn_id = duplex_state.get("turn_id")
+    if isinstance(turn_id, int):
+        metadata["turn_id"] = turn_id
+    session_config = duplex_state.get("session_config")
+    if isinstance(session_config, dict):
+        metadata["session_config"] = dict(session_config)
+    return metadata
 
 
 def _accumulate_native_tts_handoff(streaming_context, new_ids, new_hidden):
@@ -260,6 +325,9 @@ def llm2tts(
       3. Decode generated text and extract TTS content
       4. Run ConditionalChatTTS pipeline
     """
+    if not source_outputs:
+        raise ValueError("source_outputs cannot be empty")
+
     llm_outputs = source_outputs
     tts_inputs = []
 
@@ -331,13 +399,16 @@ def llm2tts(
             _require_native_tts_boundary_metadata(special_token_ids)
         tts_end_ids = _native_tts_boundary_token_ids(special_token_ids)
 
-        # Plain-chat (use_tts_template) fallback: for non-duplex requests the thinker
-        # does not surface special_token_ids, so resolve the MiniCPM-o 4.5 <|tts_bos|>
-        # (151703) boundary directly and bound the spoken region at <|im_end|> (151645),
-        # mirroring the pre-duplex code path so chat-completions audio still works.
+        # Plain-chat (use_tts_template) fallback: non-duplex requests do not
+        # surface special_token_ids. Preserve the pre-duplex marker-pair
+        # detection so both MiniCPM-o 4.5 and 2.6 stop before their TTS EOS.
         if tts_bos_id is None and not is_native_duplex_handoff:
-            tts_bos_id = 151703
-            tts_end_ids = set(tts_end_ids) | {151645}
+            if 151703 in full_token_ids or 151704 in full_token_ids:
+                tts_bos_id = 151703
+                tts_end_ids = set(tts_end_ids) | {151704, 151645}
+            else:
+                tts_bos_id = 151691
+                tts_end_ids = set(tts_end_ids) | {151692, 151645}
 
         tts_bos_idx = None
         # For native duplex the resumable prompt folds every earlier unit, so
@@ -416,6 +487,34 @@ def llm2tts(
                         .to(torch.float32)
                         .contiguous()
                     )
+            elif j < len(out_ids) and out_ids[j] not in tts_end_ids:
+                # HF streaming_generate does not require an explicit <|speak|>
+                # marker. If a unit starts directly with text, the first token
+                # is fed back into the LLM but is not included in
+                # total_hidden_in_unit; TTS starts from the following token.
+                out_start = j + 1
+                out_end = len(out_ids)
+                turn_eos_id = special_token_ids.get("turn_eos_token_id")
+                for idx_t in range(out_start, len(out_ids)):
+                    token_id = out_ids[idx_t]
+                    if turn_eos_id is not None and token_id == turn_eos_id:
+                        out_end = idx_t + 1
+                        break
+                    if token_id in tts_end_ids:
+                        out_end = idx_t
+                        native_segment_end = token_id in {
+                            special_token_ids.get("chunk_eos_token_id"),
+                            special_token_ids.get("chunk_tts_eos_token_id"),
+                        }
+                        break
+                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
+                if hidden_base >= 0 and out_end > out_start:
+                    tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
+                    tts_hidden_slice = (
+                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                        .to(torch.float32)
+                        .contiguous()
+                    )
         if profile_enabled:
             logger.info(
                 "llm2tts profile req=%s prompt_tokens=%d output_tokens=%d hidden_shape=%s tts_tokens=%d total_ms=%.3f",
@@ -446,6 +545,9 @@ def llm2tts(
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             meta = model_intermediate_buffer.setdefault("meta", {})
+            data_plane_metadata = _native_duplex_data_plane_metadata(_streaming_context)
+            if data_plane_metadata is not None:
+                model_intermediate_buffer["duplex"] = data_plane_metadata
             meta["native_duplex_segment_text"] = thinker_text
             meta.setdefault("override_keys", []).extend(
                 [

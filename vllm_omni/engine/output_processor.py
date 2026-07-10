@@ -28,6 +28,27 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+DELTA_DRAINABLE_MM_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "audio_text_total_chars",
+        "duplex_epoch",
+        "duplex_turn_id",
+        "llm_output_text",
+        "llm_output_text_utf8",
+        "sample_rate",
+        "sample_rate_hz",
+        "sr",
+        "text",
+        "tts_is_last_chunk",
+    }
+)
+
+
+def _is_chunk_mm_metadata_key(key: str) -> bool:
+    if key.startswith("meta."):
+        return key.split(".", 1)[1] in DELTA_DRAINABLE_MM_METADATA_KEYS
+    return key in DELTA_DRAINABLE_MM_METADATA_KEYS
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -49,6 +70,9 @@ def _to_cpu(x: Any) -> Any:
 def _merge_payload(target: MultimodalPayload, incoming: MultimodalPayload) -> None:
     """Merge *incoming* into *target* using list-based deferred concatenation."""
     for k, v in incoming.tensors.items():
+        if _is_chunk_mm_metadata_key(k):
+            target.tensors[k] = v
+            continue
         if k not in target.tensors:
             target.tensors[k] = v
         else:
@@ -61,6 +85,9 @@ def _merge_payload(target: MultimodalPayload, incoming: MultimodalPayload) -> No
                 target.tensors[k] = v
 
     for k, v in incoming.metadata.items():
+        if _is_chunk_mm_metadata_key(k):
+            target.metadata[k] = v
+            continue
         if k not in target.metadata:
             target.metadata[k] = v
         else:
@@ -107,6 +134,63 @@ def _modality_to_type_string(modality: OutputModality) -> str:
         if "latent" in lowered:
             return "latent"
     return "text"
+
+
+def _drain_delta_multimodal_payload(payload: MultimodalPayload) -> None:
+    for modality_key in DRAINABLE_MODALITIES:
+        key = str(modality_key)
+        payload.tensors.pop(key, None)
+        payload.metadata.pop(key, None)
+
+    for meta_key in DELTA_DRAINABLE_MM_METADATA_KEYS:
+        flat_key = f"meta.{meta_key}"
+        payload.tensors.pop(flat_key, None)
+        payload.metadata.pop(flat_key, None)
+
+    meta = payload.metadata.get("meta")
+    if isinstance(meta, dict):
+        filtered_meta = {k: v for k, v in meta.items() if k not in DELTA_DRAINABLE_MM_METADATA_KEYS}
+        if filtered_meta:
+            payload.metadata["meta"] = filtered_meta
+        else:
+            payload.metadata.pop("meta", None)
+
+
+def _payload_meta_value(payload: MultimodalPayload, key: str) -> Any:
+    flat_key = f"meta.{key}"
+    if flat_key in payload.tensors:
+        return payload.tensors[flat_key]
+    if flat_key in payload.metadata:
+        return payload.metadata[flat_key]
+    meta = payload.metadata.get("meta")
+    if isinstance(meta, dict):
+        return meta.get(key)
+    return None
+
+
+def _last_scalar_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (bool, int)):
+        return int(value)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return _last_scalar_int(value[-1])
+    if isinstance(value, torch.Tensor):
+        try:
+            if value.numel() == 0:
+                return None
+            return int(value.detach().cpu().reshape(-1)[-1].item())
+        except (RuntimeError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _is_non_final_delta_audio_chunk(payload: MultimodalPayload, mm_type: str | None) -> bool:
+    if str(mm_type or "").lower() != "audio" and "audio" not in payload:
+        return False
+    return _last_scalar_int(_payload_meta_value(payload, "tts_is_last_chunk")) == 0
 
 
 class OmniRequestState(RequestState):
@@ -215,7 +299,7 @@ class OmniRequestState(RequestState):
         try:
             for k, v in list(self.mm_accumulated.tensors.items()):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
-                    if k == "duplex_prompt_token_ids":
+                    if k == "duplex_prompt_token_ids" or _is_chunk_mm_metadata_key(k):
                         self.mm_accumulated.tensors[k] = v[-1]
                         continue
                     try:
@@ -284,9 +368,17 @@ class OmniRequestState(RequestState):
                 kv_transfer_params,
             )
 
+        is_delta = self.output_kind == RequestOutputKind.DELTA
+        if (
+            is_delta
+            and finish_reason is not None
+            and _is_non_final_delta_audio_chunk(self.mm_accumulated, self.mm_type)
+        ):
+            finish_reason = None
+            stop_reason = None
+
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
-        is_delta = self.output_kind == RequestOutputKind.DELTA
 
         if not finished and final_only:
             return None
@@ -394,10 +486,10 @@ class OmniRequestState(RequestState):
                     output.cumulative_text = base_output.cumulative_text
 
                 # DELTA mode: drain modality keys (e.g. audio) so the next
-                # step only sees freshly accumulated data for those keys.
+                # step only sees freshly accumulated data for those keys and
+                # their client-facing per-chunk metadata.
                 if self.output_kind == RequestOutputKind.DELTA:
-                    for modality_key in DRAINABLE_MODALITIES:
-                        self.mm_accumulated.tensors.pop(modality_key, None)
+                    _drain_delta_multimodal_payload(self.mm_accumulated)
 
                 return output
         except (RuntimeError, TypeError, AttributeError):
