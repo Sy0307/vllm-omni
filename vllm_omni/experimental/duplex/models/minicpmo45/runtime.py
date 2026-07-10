@@ -9,8 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from vllm_omni.inputs.duplex_intermediate import populate_tts_handoff_from_omni_payload
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex_policy import MiniCPMO45DuplexPolicy
+from vllm_omni.experimental.duplex.intermediate import populate_tts_handoff_from_omni_payload
+from vllm_omni.experimental.duplex.models.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
@@ -38,6 +38,7 @@ class _MiniCPMO45Stage0SessionState:
     prepared_result: dict[str, Any] = field(default_factory=dict)
     audio_past_key_values: Any | None = None
     pending_terminator_token: int | None = None
+    last_terminator_token: int | None = None
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -282,6 +283,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         state.runner_context_len = 0
         state.last_forward_metadata.clear()
         state.audio_past_key_values = None
+        state.audio_buffer = np.zeros(0, dtype=np.float32)
+        state.audio_chunk_idx = 0
+        state.pending_terminator_token = None
+        state.last_terminator_token = None
         self._prepare_session_context(state, state.session_config)
         for message in history:
             if not isinstance(message, dict):
@@ -372,6 +377,9 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         seq: int | None = None,
         final: bool = False,
+        new_speech: bool = False,
+        new_user_turn: bool = False,
+        new_user_turn_prefix_variant: object = None,
     ) -> dict[str, Any]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -390,6 +398,17 @@ class MiniCPMO45Stage0DuplexRuntime:
             return self._stage_prefill_result(False, start_time, "session closed")
         if audio_waveform is None or len(audio_waveform) == 0:
             return self._stage_prefill_result(False, start_time, "empty audio")
+        prefix_new_user_turn = bool(new_user_turn)
+        if new_speech and state.current_turn_ended and not prefix_new_user_turn:
+            state.pending_terminator_token = None
+            state.last_terminator_token = None
+        if prefix_new_user_turn:
+            state.current_turn_ended = True
+            state.pending_terminator_token = None
+            state.last_terminator_token = None
+            state.audio_past_key_values = None
+            if hasattr(self.thinker, "audio_past_key_values"):
+                self.thinker.audio_past_key_values = None
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size()
         self._pad_first_audio_chunk_if_needed(state)
@@ -402,6 +421,11 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         embed_parts: list[Any] = []
         token_ids: list[int] = []
+        new_user_turn_prefix_ids = (
+            list(self._encode_text(MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(new_user_turn_prefix_variant)))
+            if prefix_new_user_turn
+            else []
+        )
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
@@ -451,6 +475,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
+            if prefix_new_user_turn and units_built == 0:
+                for token_id in new_user_turn_prefix_ids:
+                    embed_parts.append(self._embed_token(token_id))
+                    token_ids.append(int(token_id))
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             embed_parts.append(audio_embeds)
@@ -555,10 +583,6 @@ class MiniCPMO45Stage0DuplexRuntime:
                     generated_ids.append(token_id)
                     generated_hidden.append(hidden)
                 state.generated_ids.append(token_id)
-                if self._generated_text_ends_natural_boundary(state, generated_ids):
-                    state.context_embeds.append(self._embed_token(self.chunk_eos_token_id))
-                    state.generated_ids.append(self.chunk_eos_token_id)
-                    break
 
         state.break_requested = False
         if is_listen or not generated_ids:
@@ -891,7 +915,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_ref_audio_from_session_config(session_config: dict[str, Any]) -> Any | None:
         try:
-            from vllm_omni.worker.native_duplex import decode_native_ref_audio_from_config
+            from vllm_omni.experimental.duplex.worker import decode_native_ref_audio_from_config
 
             return decode_native_ref_audio_from_config(session_config)
         except Exception:
@@ -998,31 +1022,6 @@ class MiniCPMO45Stage0DuplexRuntime:
         if callable(decode):
             return str(decode(token_ids, skip_special_tokens=True))
         return ""
-
-    def _generated_text_ends_natural_boundary(
-        self,
-        state: _MiniCPMO45Stage0SessionState,
-        token_ids: list[int],
-    ) -> bool:
-        min_tokens = int(
-            self._native_param(
-                state,
-                "min_new_speak_tokens_before_chunk_boundary",
-                MiniCPMO45DuplexPolicy.DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY,
-            )
-            or MiniCPMO45DuplexPolicy.DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY
-        )
-        if min_tokens <= 0:
-            min_tokens = 1
-        special_ids = MiniCPMO45DuplexPolicy.native_special_token_ids(
-            self._special_token_ids(),
-            tokenizer_special_ids=getattr(self.tokenizer, "all_special_ids", []),
-        )
-        text_token_ids = [int(token_id) for token_id in token_ids if int(token_id) not in special_ids]
-        if len(text_token_ids) < min_tokens:
-            return False
-        text = self._decode_tokens(text_token_ids[-8:])
-        return MiniCPMO45DuplexPolicy.text_ends_natural_chunk_boundary(text)
 
     def _special_token_ids(self) -> dict[str, int]:
         return {

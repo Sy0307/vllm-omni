@@ -147,6 +147,8 @@ class DuplexStageBinding:
 @dataclass
 class DuplexInputAppend:
     seq: int
+    turn_id: int
+    turn_seq: int
     mode: DuplexInputMode
     payload_meta: dict[str, Any] = field(default_factory=dict)
     final: bool = False
@@ -164,6 +166,8 @@ class DuplexSessionRuntimeState:
     updated_at: float = field(default_factory=time.monotonic)
     stage_bindings: dict[int, DuplexStageBinding] = field(default_factory=dict)
     input_seq: int = 0
+    turn_id: int = 0
+    input_turn_seq: int = 0
     pending_inputs: list[DuplexInputAppend] = field(default_factory=list)
     playback: DuplexPlaybackCommitCursor = field(default_factory=DuplexPlaybackCommitCursor)
     closed: bool = False
@@ -194,8 +198,14 @@ class DuplexSessionRuntimeState:
         if mode not in self.capabilities.input_modes:
             raise ValueError(f"Duplex input mode {mode.value!r} is not supported by session {self.session_id}")
         self.input_seq += 1
+        if isinstance(payload, dict) and payload.get("new_user_turn") is True:
+            self.turn_id += 1
+            self.input_turn_seq = 0
+        self.input_turn_seq += 1
         update = DuplexInputAppend(
             seq=self.input_seq,
+            turn_id=self.turn_id,
+            turn_seq=self.input_turn_seq,
             mode=mode,
             payload_meta=self._payload_metadata(payload),
             final=final,
@@ -238,17 +248,15 @@ class DuplexSessionRuntimeState:
         self.touch()
 
     def barge_in(self) -> tuple[int, list[str]]:
-        # Stage0 is the single long-lived resumable request that owns the
-        # conversation KV/context (see Orchestrator._duplex_stage_request_topology:
-        # "stage0_long_lived_request": True). A barge-in must stop downstream
-        # output but PRESERVE stage0 so conversation memory survives the
-        # interruption, matching the official MiniCPM-o continuous design where
-        # an interruption stops current speech but keeps context. Only
-        # downstream (stage_id > 0) requests are torn down here.
-        stale_request_ids = [binding.request_id for stage_id, binding in self.stage_bindings.items() if stage_id != 0]
+        # Barge-in truncates assistant playback. Stage0's scheduler KV may
+        # already contain unplayed assistant tokens, so it must be rebuilt from
+        # committed history instead of being resumed across the epoch boundary.
+        stale_request_ids = self.stage_request_ids()
         self.epoch += 1
+        self.input_seq = 0
+        self.input_turn_seq = 0
         self.pending_inputs.clear()
-        self.stage_bindings = {stage_id: binding for stage_id, binding in self.stage_bindings.items() if stage_id == 0}
+        self.stage_bindings.clear()
         self.touch()
         return self.epoch, stale_request_ids
 
@@ -266,6 +274,8 @@ class DuplexSessionRuntimeState:
             "session_mode": self.session_mode.value,
             "epoch": self.epoch,
             "input_seq": self.input_seq,
+            "turn_id": self.turn_id,
+            "input_turn_seq": self.input_turn_seq,
             "closed": self.closed,
             "stage_bindings": {
                 stage_id: {
@@ -450,3 +460,26 @@ def duplex_first_append_context_reserve(session_config: object) -> int:
         reserve += max(0, (len(raw) // 4) // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)
         break
     return reserve
+
+
+def duplex_new_user_turn_prefix_reserve(session_config: object, *, variant: object = None) -> int:
+    """Extra scheduler slots for MiniCPM-o's native-duplex turn prefix."""
+    if not isinstance(session_config, dict):
+        return 0
+    sources: list[dict[str, Any]] = [session_config]
+    extra_body = session_config.get("extra_body")
+    if isinstance(extra_body, dict):
+        sources.append(extra_body)
+    if isinstance(variant, str) and variant:
+        for source in sources:
+            by_variant = source.get("duplex_new_user_turn_prefix_tokens_by_variant")
+            if not isinstance(by_variant, dict):
+                continue
+            exact = by_variant.get(variant)
+            if isinstance(exact, int) and exact >= 0:
+                return exact
+    for source in sources:
+        exact = source.get("duplex_new_user_turn_prefix_tokens")
+        if isinstance(exact, int) and exact >= 0:
+            return exact
+    return 0

@@ -126,7 +126,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-from vllm_omni.entrypoints.openai.serving_duplex import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -147,6 +146,10 @@ from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_reques
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
+from vllm_omni.experimental.duplex.openai.serving import (
+    OmniDuplexSessionHandler,
+    should_enable_duplex_endpoint,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
@@ -224,32 +227,6 @@ def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
             )
             if profiler is not None:
                 return True
-    return False
-
-
-def _should_enable_duplex_endpoint(
-    stage_configs: list | None,
-    *,
-    config_path: str | None = None,
-) -> bool:
-    """Enable /v1/duplex only for deployments that opt into duplex sessions."""
-    if stage_configs:
-        for stage in stage_configs:
-            session_mode = (
-                stage.get("session_mode") if isinstance(stage, dict) else getattr(stage, "session_mode", None)
-            )
-            if session_mode == "duplex":
-                return True
-    if config_path:
-        try:
-            from omegaconf import OmegaConf
-
-            raw_config = OmegaConf.load(config_path)
-            session_mode = raw_config.get("session_mode") if hasattr(raw_config, "get") else None
-            if session_mode == "duplex":
-                return True
-        except Exception as exc:
-            logger.warning("Failed to inspect duplex session_mode from %s: %s", config_path, exc)
     return False
 
 
@@ -1144,7 +1121,7 @@ async def omni_init_app_state(
     state.openai_serving_duplex = (
         OmniDuplexSessionHandler(chat_service=state.openai_serving_chat)
         if state.openai_serving_chat is not None
-        and _should_enable_duplex_endpoint(
+        and should_enable_duplex_endpoint(
             state.stage_configs,
             config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
         )

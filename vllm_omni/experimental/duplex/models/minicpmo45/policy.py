@@ -29,7 +29,10 @@ class MiniCPMO45DuplexPolicy:
     SAMPLES_PER_AUDIO_TOKEN = 1600
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 64
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
-    NATURAL_CHUNK_BOUNDARY_CHARS = frozenset("。，,；;!！?？\n")
+    NEW_USER_TURN_PREFIX_INTERRUPTED_TTS = "interrupted_tts"
+    NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE = "clean_response_done"
+    NEW_USER_TURN_PREFIX_LISTEN_ONLY = "listen_only"
+    NEW_USER_TURN_PREFIX = ""
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:
@@ -54,6 +57,25 @@ class MiniCPMO45DuplexPolicy:
             suffix = "<|audio_end|>" + suffix
         return prefix, suffix
 
+    @classmethod
+    def new_user_turn_prefix_text(cls, variant: object = None) -> str:
+        """Text prefix before the first audio unit of a new user turn.
+
+        Native full-duplex uses the released ``MiniCPMODuplex`` path, whose
+        ``streaming_prefill`` feeds only ``<unit>`` plus media per append.
+        Chat-role prefixes belong to the simplex streaming path and poison the
+        long-lived duplex KV if inserted mid-session.
+        """
+        return cls.NEW_USER_TURN_PREFIX
+
+    @classmethod
+    def new_user_turn_prefix_variants(cls) -> tuple[str, ...]:
+        return (
+            cls.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
+            cls.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+            cls.NEW_USER_TURN_PREFIX_LISTEN_ONLY,
+        )
+
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {
         "unit_token_id": "<unit>",
         "unit_end_token_id": "</unit>",
@@ -73,17 +95,6 @@ class MiniCPMO45DuplexPolicy:
     @staticmethod
     def profile_logs_enabled() -> bool:
         return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-
-    @classmethod
-    def text_ends_natural_chunk_boundary(cls, text: str) -> bool:
-        return bool(text) and text.rstrip().endswith(tuple(cls.NATURAL_CHUNK_BOUNDARY_CHARS))
-
-    @staticmethod
-    def text_ends_incomplete_chinese_question_prefix(text: str) -> bool:
-        stripped = text.rstrip()
-        return bool(stripped) and stripped.endswith(
-            ("什", "甚", "为什", "怎么", "是不", "可以", "能不", "什么时", "哪里", "哪一")
-        )
 
     @classmethod
     def token_ids_from_tokenizer(cls, tokenizer: Any) -> dict[str, int]:
