@@ -419,6 +419,7 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    session_mode: str = "turn"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
@@ -610,6 +611,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "session_mode": raw_dict.get("session_mode", "turn"),
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
@@ -896,6 +898,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
@@ -922,6 +925,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
@@ -984,6 +988,7 @@ class StageConfig:
         config_dict: dict[str, Any] = {
             "stage_id": self.stage_id,
             "stage_type": StageType(self.stage_type).value,
+            "session_mode": self.session_mode,
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
             "engine_input_source": self.input_sources,  # Legacy field name
