@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 
-from vllm_omni.experimental.fullduplex.engine.intermediate import populate_tts_handoff_from_omni_payload
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
@@ -1219,4 +1218,3 @@ class MiniCPMO45Stage0DuplexRuntime:
         native.pop("tts_hidden_states", None)
         native.pop("omni_payload", None)
         native.pop("tts_handoff", None)
-

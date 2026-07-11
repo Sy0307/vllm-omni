@@ -32,10 +32,7 @@ class ResponseLifecycleLedger:
 
     @staticmethod
     def response_id(fence: DuplexFence) -> str:
-        return (
-            f"resp-{fence.session_id}-e{fence.epoch}"
-            f"-t{fence.turn_id}-r{fence.response_seq}"
-        )
+        return f"resp-{fence.session_id}-e{fence.epoch}-t{fence.turn_id}-r{fence.response_seq}"
 
     def start(self, fence: DuplexFence) -> str:
         if fence in self._records:

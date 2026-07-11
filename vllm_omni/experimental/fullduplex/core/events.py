@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypeAlias, Union
+from typing import TypeAlias
 
 from .identity import DuplexFence
 
-InputData: TypeAlias = Union[bytes, str]
+InputData: TypeAlias = bytes | str
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,30 +156,30 @@ class CloseSessionResources:
     fence: DuplexFence
 
 
-DomainEvent: TypeAlias = Union[
-    InputStarted,
-    InputChunk,
-    InputCommitted,
-    EngineAppendAccepted,
-    HistoryCommitted,
-    ModelListening,
-    ModelSpeaking,
-    ModelTextDelta,
-    ModelAudioDelta,
-    ModelSegmentEnded,
-    ModelTurnEnded,
-    PlaybackAcknowledged,
-    InterruptRequested,
-    SessionCloseRequested,
-    EngineFailed,
-]
+DomainEvent: TypeAlias = (
+    InputStarted
+    | InputChunk
+    | InputCommitted
+    | EngineAppendAccepted
+    | HistoryCommitted
+    | ModelListening
+    | ModelSpeaking
+    | ModelTextDelta
+    | ModelAudioDelta
+    | ModelSegmentEnded
+    | ModelTurnEnded
+    | PlaybackAcknowledged
+    | InterruptRequested
+    | SessionCloseRequested
+    | EngineFailed
+)
 
-DuplexEffect: TypeAlias = Union[
-    AppendToEngine,
-    ReserveResponse,
-    EmitProtocolEvent,
-    CancelFence,
-    ResetStage1,
-    RebuildStage0Context,
-    CloseSessionResources,
-]
+DuplexEffect: TypeAlias = (
+    AppendToEngine
+    | ReserveResponse
+    | EmitProtocolEvent
+    | CancelFence
+    | ResetStage1
+    | RebuildStage0Context
+    | CloseSessionResources
+)

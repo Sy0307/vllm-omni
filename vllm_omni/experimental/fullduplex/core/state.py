@@ -139,10 +139,7 @@ def _is_stale(expected: DuplexFence, actual: DuplexFence) -> bool:
         return True
     if actual.epoch > expected.epoch:
         return False
-    no_newer_component = (
-        actual.turn_id <= expected.turn_id
-        and actual.response_seq <= expected.response_seq
-    )
+    no_newer_component = actual.turn_id <= expected.turn_id and actual.response_seq <= expected.response_seq
     return no_newer_component and actual != expected
 
 
@@ -493,10 +490,7 @@ def reduce_event(
                 event,
                 "playback cannot be acknowledged in this turn phase",
             )
-        if (
-            state.active_response is None
-            and state.last_terminal_fence != state.fence
-        ):
+        if state.active_response is None and state.last_terminal_fence != state.fence:
             raise _transition_error(state, event, "there is no response playback to acknowledge")
         try:
             playback = state.playback.acknowledge(
