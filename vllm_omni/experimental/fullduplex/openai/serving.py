@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
@@ -741,12 +742,18 @@ class OmniDuplexSessionHandler:
         def signal_runtime_background(event_name: str, payload: dict[str, object]) -> None:
             if session is None:
                 return
+            captured_fence = DuplexFence(
+                session.session_id,
+                epoch=session.epoch,
+                turn_id=session.turn_id,
+            )
             asyncio.create_task(
                 self._signal_runtime_session(
                     session,
                     event_name,
                     payload,
                     send_json,
+                    fence=captured_fence,
                 )
             )
 
@@ -2387,13 +2394,19 @@ class OmniDuplexSessionHandler:
         if not callable(open_session):
             return True
         try:
-            result = await open_session(
-                session.session_id,
-                session_mode="duplex",
-                capabilities=session.capabilities.as_dict(),
-                session_config=session.config.as_dict(),
-                timeout=self._runtime_control_timeout_s(session),
-            )
+            open_kwargs = {
+                "session_mode": "duplex",
+                "capabilities": session.capabilities.as_dict(),
+                "session_config": session.config.as_dict(),
+                "timeout": self._runtime_control_timeout_s(session),
+            }
+            if self._callable_accepts_keyword(open_session, "fence"):
+                open_kwargs["fence"] = DuplexFence(
+                    session.session_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                )
+            result = await open_session(session.session_id, **open_kwargs)
         except Exception as exc:
             logger.exception("Failed to open duplex runtime session: %s", exc)
             await self._send_runtime_error(send_json, "runtime_open_failed", exc, session=session)
@@ -2440,6 +2453,21 @@ class OmniDuplexSessionHandler:
             }
             if expected_epoch is not None and self._callable_accepts_keyword(append_input, "expected_epoch"):
                 append_kwargs["expected_epoch"] = expected_epoch
+            if self._callable_accepts_keyword(append_input, "fence"):
+                payload_turn_id = self._payload_turn_id(payload)
+                append_kwargs["fence"] = DuplexFence(
+                    session.session_id,
+                    epoch=session.epoch,
+                    turn_id=(
+                        payload_turn_id
+                        if payload_turn_id is not None
+                        else (
+                            session.active_response_turn_id
+                            if session.active_response_turn_id is not None
+                            else session.turn_id
+                        )
+                    ),
+                )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
                 append_kwargs["collect_outputs"] = False
             result = await append_input(session.session_id, **append_kwargs)
@@ -2718,17 +2746,23 @@ class OmniDuplexSessionHandler:
         event: str,
         payload: dict[str, object] | None = None,
         send_json=None,
+        *,
+        fence: DuplexFence | None = None,
     ) -> bool:
         signal_turn = getattr(self._chat_service.engine_client, "signal_duplex_turn_async", None)
         if not callable(signal_turn):
             return True
         try:
-            result = await signal_turn(
-                session.session_id,
-                event=event,
-                payload=payload,
-                timeout=self._runtime_control_timeout_s(session),
-            )
+            signal_kwargs = {
+                "event": event,
+                "payload": payload,
+                "timeout": self._runtime_control_timeout_s(session),
+            }
+            if self._callable_accepts_keyword(signal_turn, "fence"):
+                signal_kwargs["fence"] = fence or DuplexFence(
+                    session.session_id, epoch=session.epoch, turn_id=session.turn_id
+                )
+            result = await signal_turn(session.session_id, **signal_kwargs)
         except Exception as exc:
             logger.exception("Failed to signal duplex runtime session: %s", exc)
             if send_json is not None:
@@ -2758,11 +2792,17 @@ class OmniDuplexSessionHandler:
         if not callable(close_session):
             return True
         try:
-            result = await close_session(
-                session.session_id,
-                reason=reason,
-                timeout=self._runtime_control_timeout_s(session),
-            )
+            close_kwargs = {
+                "reason": reason,
+                "timeout": self._runtime_control_timeout_s(session),
+            }
+            if self._callable_accepts_keyword(close_session, "fence"):
+                close_kwargs["fence"] = DuplexFence(
+                    session.session_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                )
+            result = await close_session(session.session_id, **close_kwargs)
         except Exception as exc:
             logger.exception("Failed to close duplex runtime session: %s", exc)
             if send_json is not None:
