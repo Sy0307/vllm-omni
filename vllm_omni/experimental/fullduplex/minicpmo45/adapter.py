@@ -7,7 +7,6 @@ from typing import Any
 import numpy as np
 from vllm.multimodal.media import MediaConnector
 
-from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.core.events import (
     ModelListening,
     ModelSegmentEnded,
@@ -17,6 +16,7 @@ from vllm_omni.experimental.fullduplex.core.events import (
 )
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
 
 
 class MiniCPMO45ModelEventAdapter:
