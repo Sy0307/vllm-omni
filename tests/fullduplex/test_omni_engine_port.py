@@ -256,7 +256,7 @@ def test_placeholder_budget_is_planned_inside_omni_engine_boundary() -> None:
     assert prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 16
 
 
-def test_legacy_duplex_engine_is_only_a_reexport() -> None:
-    from vllm_omni.experimental.duplex.engine import OmniDuplexEnginePort as LegacyPort
+def test_engine_port_import_is_canonical() -> None:
+    from vllm_omni.experimental.fullduplex.engine.omni import OmniDuplexEnginePort as ImportedPort
 
-    assert LegacyPort is OmniDuplexEnginePort
+    assert ImportedPort is OmniDuplexEnginePort

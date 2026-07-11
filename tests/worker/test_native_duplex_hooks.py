@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture(autouse=True)
 def _register_test_native_duplex_provider(monkeypatch):
-    from vllm_omni.experimental.duplex import worker as native_duplex
+    from vllm_omni.experimental.fullduplex.engine import worker as native_duplex
 
     def provider(worker, capabilities):
         return getattr(worker, "_test_native_duplex_target", None)
@@ -339,7 +339,7 @@ def _minicpmo_tts_handoff_payload(
 
 
 def test_worker_minicpmo_stage0_reuses_loaded_llm_stage_without_full_model_load():
-    import vllm_omni.experimental.duplex.models.minicpmo45.runtime as duplex_runtime
+    import vllm_omni.experimental.fullduplex.minicpmo45.runtime as duplex_runtime
 
     assert not hasattr(duplex_runtime, "MiniCPMO45FullModelDuplexRuntime")
 
@@ -459,7 +459,7 @@ def test_worker_minicpmo_stage0_does_not_attach_runner_forward_without_contract_
 def test_minicpmo_stage0_open_rejects_model_local_unmarked_runner_context_method():
     import pytest
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -502,7 +502,7 @@ def test_worker_minicpmo_stage1_reuses_loaded_tts_stage_without_passive_fallback
 
 
 def test_worker_native_duplex_uses_provider_registry(monkeypatch):
-    from vllm_omni.experimental.duplex import worker as native_duplex
+    from vllm_omni.experimental.fullduplex.engine import worker as native_duplex
 
     class _RegisteredTarget:
         def open_duplex_session(self, **kwargs):
@@ -544,7 +544,7 @@ def test_worker_mixin_does_not_guess_native_target_from_plain_model_methods():
 
 
 def test_worker_mixin_delegates_native_method_adapter_to_worker_module():
-    from vllm_omni.experimental.duplex import worker as native_duplex
+    from vllm_omni.experimental.fullduplex.engine import worker as native_duplex
 
     assert hasattr(native_duplex, "NativeDuplexMethodAdapter")
     assert not hasattr(OmniWorkerMixin, "_NativeDuplexMethodAdapter")
@@ -561,7 +561,7 @@ def test_worker_mixin_delegates_native_method_adapter_to_worker_module():
 def test_minicpmo_stage0_runtime_generates_tts_handoff_from_loaded_stage(monkeypatch):
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -763,7 +763,7 @@ def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
 
 
 def test_minicpmo_stage0_decode_uses_runner_sampled_token():
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -780,7 +780,7 @@ def test_minicpmo_stage0_decode_uses_runner_sampled_token():
 
 
 def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -817,7 +817,7 @@ def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
 
 
 def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -853,7 +853,7 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -916,7 +916,7 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
 def test_minicpmo_stage0_data_plane_new_speech_keeps_turn_ended_until_model_speaks():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -981,7 +981,7 @@ def test_minicpmo_stage0_data_plane_new_speech_keeps_turn_ended_until_model_spea
 def test_minicpmo_stage0_data_plane_new_user_turn_inserts_official_prefix_after_unit_close():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1047,10 +1047,10 @@ def test_minicpmo_stage0_data_plane_new_user_turn_inserts_official_prefix_after_
 def test_minicpmo_stage0_data_plane_new_user_turn_uses_clean_done_prefix_variant():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
         MiniCPMO45DuplexPolicy,
     )
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1114,10 +1114,10 @@ def test_minicpmo_stage0_data_plane_new_user_turn_uses_clean_done_prefix_variant
 def test_minicpmo_stage0_data_plane_new_user_turn_resets_audio_cache():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
         MiniCPMO45DuplexPolicy,
     )
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1185,7 +1185,7 @@ def test_minicpmo_stage0_data_plane_new_user_turn_resets_audio_cache():
 def test_minicpmo_stage0_data_plane_first_chunk_matches_official_padding():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1259,7 +1259,7 @@ def test_minicpmo_stage0_data_plane_first_chunk_matches_official_padding():
 def test_minicpmo_stage0_context_window_preserves_system_prefix_and_recent_context():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1286,7 +1286,7 @@ def test_minicpmo_stage0_context_window_preserves_system_prefix_and_recent_conte
 def test_minicpmo_stage0_prefill_rolls_back_context_when_runner_forward_fails():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1347,7 +1347,7 @@ def test_minicpmo_stage0_prefill_rolls_back_context_when_runner_forward_fails():
 def test_minicpmo_stage0_open_requires_runner_context_by_default(monkeypatch):
     import pytest
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -1366,7 +1366,7 @@ def test_minicpmo_stage0_open_requires_runner_context_by_default(monkeypatch):
 def test_minicpmo_stage0_forward_prefers_runner_context_hook():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1423,7 +1423,7 @@ def test_minicpmo_stage0_forward_prefers_runner_context_hook():
 def test_minicpmo_stage0_forward_appends_only_new_embeds_to_runner_kv():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1480,7 +1480,7 @@ def test_minicpmo_stage0_forward_rejects_runner_without_scheduler_kv_metadata():
     import pytest
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1523,7 +1523,7 @@ def test_minicpmo_stage0_decode_requires_runner_sampled_token():
     import pytest
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1545,7 +1545,7 @@ def test_minicpmo_stage0_forward_rejects_unscheduled_vllm_forward():
     import pytest
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1579,7 +1579,7 @@ def test_minicpmo_stage0_forward_rejects_unscheduled_vllm_forward():
 def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_embeddings_is_broken():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -1617,7 +1617,7 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
 def test_minicpmo_stage1_runtime_keys_and_resets_tts_stream_by_session():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1664,7 +1664,7 @@ def test_minicpmo_stage1_runtime_keys_and_resets_tts_stream_by_session():
 def test_minicpmo_stage1_runtime_prefers_loaded_stage_forward_over_inner_talker():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1704,7 +1704,7 @@ def test_minicpmo_stage1_runtime_prefers_loaded_stage_forward_over_inner_talker(
 def test_minicpmo_stage1_runtime_squeezes_handoff_hidden_states():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1747,7 +1747,7 @@ def test_minicpmo_stage1_runtime_rejects_legacy_direct_tts_tensor_payload():
     import pytest
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1785,7 +1785,7 @@ def test_minicpmo_stage1_runtime_accepts_omni_payload_handoff():
     import torch
 
     from vllm_omni.data_entry_keys import serialize_payload
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1833,7 +1833,7 @@ def test_minicpmo_stage1_runtime_resolves_omni_payload_ref_from_payload_store():
     import torch
 
     from vllm_omni.data_entry_keys import serialize_payload
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1869,7 +1869,7 @@ def test_minicpmo_stage1_runtime_prefers_runner_local_payload_cache_for_payload_
     import torch
 
     from vllm_omni.data_entry_keys import serialize_payload
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -2421,7 +2421,7 @@ def test_worker_native_duplex_official_prepare_uses_resolved_ref_audio_payload()
 def test_minicpmo_transformers_cache_compat_supports_legacy_indexing():
     from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.worker_adapter import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.worker import (
         patch_minicpmo_transformers_compat,
     )
 
@@ -2439,7 +2439,7 @@ def test_minicpmo_transformers_cache_compat_supports_legacy_indexing():
 
 
 def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
-    from vllm_omni.experimental.duplex.models.minicpmo45.worker_adapter import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.worker import (
         patch_minicpmo_remote_config,
     )
 
@@ -2461,7 +2461,7 @@ def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
 
 
 def test_minicpmo_stage0_short_audio_buffers_without_context_mutation():
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -2876,7 +2876,7 @@ def test_minicpmo_stage0_native_sampler_preserves_model_chunk_eos():
 
 
 def test_minicpmo_stage0_native_sampler_keeps_hard_chunk_cap():
-    from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
         MiniCPMO45DuplexPolicy,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -2989,7 +2989,7 @@ def test_minicpmo_stage0_native_sampler_cuts_before_request_length_cap():
 def test_minicpmo_stage0_runtime_does_not_cut_at_punctuation():
     import torch
 
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -3232,7 +3232,7 @@ def test_minicpmo_stage0_native_sampler_uses_runner_duplex_rows():
 
 
 def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
-    from vllm_omni.experimental.duplex.models.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )

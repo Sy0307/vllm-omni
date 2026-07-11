@@ -1,7 +1,7 @@
 import pytest
 
 from vllm_omni.engine.orchestrator import _duplex_force_listen_count
-from vllm_omni.experimental.duplex.engine import (
+from vllm_omni.experimental.fullduplex.engine.omni import (
     DuplexAdapterPattern,
     DuplexInputMode,
     DuplexRuntimeCapabilities,
@@ -11,7 +11,7 @@ from vllm_omni.experimental.duplex.engine import (
     duplex_new_user_turn_prefix_reserve,
     duplex_scheduler_token_budget,
 )
-from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
