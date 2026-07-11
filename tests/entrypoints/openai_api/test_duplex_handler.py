@@ -11,21 +11,21 @@ import numpy as np
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
-from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
-from vllm_omni.experimental.duplex.openai.adapters.minicpmo45 import (
+from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
 )
-from vllm_omni.experimental.duplex.openai.protocol import (
+from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionConfig,
 )
-from vllm_omni.experimental.duplex.openai.realtime_protocol import NativeRealtimeSessionProtocol
-from vllm_omni.experimental.duplex.openai.serving import (
+from vllm_omni.experimental.fullduplex.openai.realtime_session import NativeRealtimeSessionProtocol
+from vllm_omni.experimental.fullduplex.openai.serving import (
     DuplexSessionActor,
     OmniDuplexSessionHandler,
     should_enable_duplex_endpoint,
@@ -2650,7 +2650,7 @@ async def test_minicpmo_native_duplex_resolves_ref_audio_before_runtime_open(mon
         return [0.25] * 1600, 16000
 
     monkeypatch.setattr(
-        "vllm_omni.experimental.duplex.openai.adapters.minicpmo45."
+        "vllm_omni.experimental.fullduplex.minicpmo45."
         "MiniCPMO45NativeDuplexServingAdapter.resolve_ref_audio",
         fake_resolve_ref_audio,
     )

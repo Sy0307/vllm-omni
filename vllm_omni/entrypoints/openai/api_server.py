@@ -146,7 +146,7 @@ from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_reques
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
-from vllm_omni.experimental.duplex.openai.serving import (
+from vllm_omni.experimental.fullduplex.openai.serving import (
     OmniDuplexSessionHandler,
     should_enable_duplex_endpoint,
 )

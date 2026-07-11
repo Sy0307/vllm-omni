@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from vllm_omni.experimental.duplex.intermediate import populate_tts_handoff_from_omni_payload
+from vllm_omni.experimental.fullduplex.engine.intermediate import populate_tts_handoff_from_omni_payload
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
