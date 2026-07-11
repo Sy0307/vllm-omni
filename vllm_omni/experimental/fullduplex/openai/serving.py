@@ -2138,7 +2138,7 @@ class OmniDuplexSessionHandler:
         merged["audio"] = base64.b64encode(first_raw + second_raw).decode("ascii")
         merged["sample_rate_hz"] = first_rate
         merged["force_listen"] = bool(first.get("force_listen", False)) or bool(second.get("force_listen", False))
-        merged["force_speak"] = bool(first.get("force_speak", False)) or bool(second.get("force_speak", False))
+        merged.pop("force_speak", None)
         merged["is_speech"] = bool(first.get("is_speech", False)) or bool(second.get("is_speech", False))
         if bool(first.get("new_user_turn", False)) or bool(second.get("new_user_turn", False)):
             merged["new_user_turn"] = True
@@ -2163,7 +2163,7 @@ class OmniDuplexSessionHandler:
         """
         if event.get("force_listen") is True or payload.get("force_listen") is True:
             return True
-        if event.get("force_barge_in") is True or event.get("force_speak") is True:
+        if event.get("force_barge_in") is True:
             return False
         if event.get("response_create") is not True:
             return False
@@ -2180,10 +2180,6 @@ class OmniDuplexSessionHandler:
         if not self._session_auto_responds(session):
             return False
         if event.get("force_barge_in") is True:
-            return False
-        if event.get("force_speak") is True:
-            self._auto_response_waiting_for_speech.discard(session.session_id)
-            self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
             return False
         if event.get("force_listen") is True or payload.get("force_listen") is True:
             return True
@@ -2209,7 +2205,7 @@ class OmniDuplexSessionHandler:
             return False
         if session.session_id not in self._auto_response_waiting_for_speech:
             return False
-        if event.get("force_barge_in") is True or event.get("force_speak") is True:
+        if event.get("force_barge_in") is True:
             return False
         if event.get("force_listen") is True:
             return False
@@ -2297,13 +2293,12 @@ class OmniDuplexSessionHandler:
         if profile_logs:
             logger.info(
                 "MiniCPM-o auto-response mark new user turn: session=%s "
-                "playback_active=%s payload_flags={is_speech:%s,force_listen:%s,force_speak:%s,"
+                "playback_active=%s payload_flags={is_speech:%s,force_listen:%s,"
                 "force_barge_in:%s,new_user_turn:%s,prefix_variant:%s}",
                 session.session_id,
                 actor.assistant_playback_active(),
                 payload.get("is_speech"),
                 payload.get("force_listen"),
-                payload.get("force_speak"),
                 event.get("force_barge_in"),
                 payload.get("new_user_turn"),
                 payload.get("new_user_turn_prefix_variant"),
