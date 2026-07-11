@@ -35,6 +35,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniEngineDeadError,
 )
 from vllm_omni.errors import client_error_metadata
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -263,16 +264,19 @@ class AsyncOmni(EngineClient, OmniBase):
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
+        fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Open an engine-level duplex session when the backend supports it."""
-        return await self.engine.open_duplex_session_async(
-            session_id,
-            session_mode=session_mode,
-            capabilities=capabilities,
-            session_config=session_config,
-            timeout=timeout,
-        )
+        kwargs = {
+            "session_mode": session_mode,
+            "capabilities": capabilities,
+            "session_config": session_config,
+            "timeout": timeout,
+        }
+        if fence is not None:
+            kwargs["fence"] = fence
+        return await self.engine.open_duplex_session_async(session_id, **kwargs)
 
     async def append_duplex_input_async(
         self,
@@ -282,18 +286,21 @@ class AsyncOmni(EngineClient, OmniBase):
         payload: object,
         final: bool = False,
         expected_epoch: int | None = None,
+        fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
         collect_outputs: bool = True,
     ) -> dict[str, object]:
         """Append input to an engine-level duplex session."""
-        result = await self.engine.append_duplex_input_async(
-            session_id,
-            mode=mode,
-            payload=payload,
-            final=final,
-            expected_epoch=expected_epoch,
-            timeout=timeout,
-        )
+        kwargs = {
+            "mode": mode,
+            "payload": payload,
+            "final": final,
+            "expected_epoch": expected_epoch,
+            "timeout": timeout,
+        }
+        if fence is not None:
+            kwargs["fence"] = fence
+        result = await self.engine.append_duplex_input_async(session_id, **kwargs)
         request_id, response_stage_id = self._duplex_data_plane_request_info(result)
         if request_id is None:
             return result
@@ -349,25 +356,32 @@ class AsyncOmni(EngineClient, OmniBase):
         *,
         event: str,
         payload: dict[str, object] | None = None,
+        fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Send a turn/control signal to an engine-level duplex session."""
-        return await self.engine.signal_duplex_turn_async(
-            session_id,
-            event=event,
-            payload=payload,
-            timeout=timeout,
-        )
+        kwargs = {
+            "event": event,
+            "payload": payload,
+            "timeout": timeout,
+        }
+        if fence is not None:
+            kwargs["fence"] = fence
+        return await self.engine.signal_duplex_turn_async(session_id, **kwargs)
 
     async def close_duplex_session_async(
         self,
         session_id: str,
         *,
         reason: str = "client_close",
+        fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Close an engine-level duplex session."""
-        return await self.engine.close_duplex_session_async(session_id, reason=reason, timeout=timeout)
+        kwargs = {"reason": reason, "timeout": timeout}
+        if fence is not None:
+            kwargs["fence"] = fence
+        return await self.engine.close_duplex_session_async(session_id, **kwargs)
 
     @staticmethod
     def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
