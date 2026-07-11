@@ -10,6 +10,17 @@ from uuid import uuid4
 import numpy as np
 from fastapi import WebSocket
 
+from vllm_omni.experimental.fullduplex.openai.audio import (
+    convert_input_audio_with_rate,
+    convert_output_audio,
+    decode_g711_alaw,
+    decode_g711_ulaw,
+    encode_g711_alaw,
+    encode_g711_ulaw,
+    resample_pcm16_mono,
+    wav_payload_to_pcm16,
+)
+
 try:
     from audioop import alaw2lin, lin2alaw, lin2ulaw, ulaw2lin
 except ImportError:  # pragma: no cover - audioop is removed in newer Python.
@@ -1187,6 +1198,14 @@ class NativeRealtimeSessionProtocol:
         sample_rate_hz: int | float | None = None,
         target_sample_rate_hz: int = 16000,
     ) -> tuple[object, object, int | float | None]:
+        return convert_input_audio_with_rate(
+            audio,
+            fmt,
+            sample_rate_hz=sample_rate_hz,
+            target_sample_rate_hz=target_sample_rate_hz,
+        )
+        # Compatibility implementation retained until the legacy protocol
+        # module is removed after all callers migrate.
         if not isinstance(audio, str) or not isinstance(fmt, str):
             return audio, fmt, sample_rate_hz
         normalized = fmt.lower()
@@ -1230,6 +1249,13 @@ class NativeRealtimeSessionProtocol:
         source_sample_rate_hz: int | None = None,
         target_sample_rate_hz: int | None = None,
     ) -> tuple[str, str, int | None]:
+        return convert_output_audio(
+            audio,
+            source_fmt=source_fmt,
+            target_fmt=target_fmt,
+            source_sample_rate_hz=source_sample_rate_hz,
+            target_sample_rate_hz=target_sample_rate_hz,
+        )
         target = target_fmt.lower()
         if target not in {"g711_ulaw", "g711_alaw"}:
             return audio, source_fmt, source_sample_rate_hz
@@ -1264,6 +1290,7 @@ class NativeRealtimeSessionProtocol:
 
     @staticmethod
     def _wav_payload_to_pcm16(raw: bytes) -> tuple[bytes | None, int | None]:
+        return wav_payload_to_pcm16(raw)
         try:
             import io
             import wave
@@ -1285,6 +1312,11 @@ class NativeRealtimeSessionProtocol:
 
     @staticmethod
     def _resample_pcm16_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int) -> bytes:
+        return resample_pcm16_mono(
+            raw,
+            source_rate_hz=source_rate_hz,
+            target_rate_hz=target_rate_hz,
+        )
         if source_rate_hz <= 0 or target_rate_hz <= 0 or source_rate_hz == target_rate_hz:
             return raw
         samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
@@ -1298,6 +1330,7 @@ class NativeRealtimeSessionProtocol:
 
     @staticmethod
     def _decode_g711_ulaw(raw: bytes) -> bytes:
+        return decode_g711_ulaw(raw)
         data = np.frombuffer(raw, dtype=np.uint8)
         u = np.bitwise_not(data).astype(np.int16)
         sign = u & 0x80
@@ -1310,6 +1343,7 @@ class NativeRealtimeSessionProtocol:
 
     @staticmethod
     def _decode_g711_alaw(raw: bytes) -> bytes:
+        return decode_g711_alaw(raw)
         data = np.bitwise_xor(np.frombuffer(raw, dtype=np.uint8), 0x55).astype(np.int16)
         sign = data & 0x80
         exponent = (data >> 4) & 0x07
@@ -1324,6 +1358,7 @@ class NativeRealtimeSessionProtocol:
 
     @staticmethod
     def _encode_g711_ulaw(raw: bytes) -> bytes:
+        return encode_g711_ulaw(raw)
         pcm = np.frombuffer(raw, dtype="<i2").astype(np.int32)
         pcm = np.clip(pcm, -32635, 32635)
         sign = np.where(pcm < 0, 0x80, 0)
@@ -1337,6 +1372,7 @@ class NativeRealtimeSessionProtocol:
 
     @staticmethod
     def _encode_g711_alaw(raw: bytes) -> bytes:
+        return encode_g711_alaw(raw)
         pcm = np.frombuffer(raw, dtype="<i2").astype(np.int32)
         sign = np.where(pcm >= 0, 0x80, 0x00)
         magnitude = np.abs(pcm)
