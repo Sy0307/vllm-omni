@@ -733,7 +733,7 @@ def test_minicpmo_pcm_append_buffer_flush_preserves_accumulated_speech_marker():
     assert flushed["is_speech"] is True
 
 
-def test_minicpmo_pcm_append_buffer_preserves_new_user_turn_marker():
+def test_minicpmo_pcm_append_buffer_preserves_new_user_turn_but_drops_force_speak():
     buffer = MiniCPMO45PcmAppendBuffer()
     first = {
         "type": "audio",
@@ -759,7 +759,7 @@ def test_minicpmo_pcm_append_buffer_preserves_new_user_turn_marker():
     assert emitted is not None
     assert emitted["is_speech"] is True
     assert emitted["new_user_turn"] is True
-    assert emitted["force_speak"] is True
+    assert "force_speak" not in emitted
 
 
 def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
@@ -783,7 +783,7 @@ def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
     assert merged["is_speech"] is True
 
 
-def test_minicpmo_merge_native_audio_payloads_preserves_new_user_turn_marker():
+def test_minicpmo_merge_preserves_new_user_turn_but_drops_force_speak():
     first = {
         "type": "audio",
         "audio": _pcm_f32_b64(8000, value=0.05),
@@ -807,7 +807,7 @@ def test_minicpmo_merge_native_audio_payloads_preserves_new_user_turn_marker():
     assert merged["is_speech"] is True
     assert merged["new_user_turn"] is True
     assert merged["new_user_turn_prefix_variant"] == MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE
-    assert merged["force_speak"] is True
+    assert "force_speak" not in merged
 
 
 def test_auto_response_playback_overlap_forces_listen_until_ack_or_barge_in():

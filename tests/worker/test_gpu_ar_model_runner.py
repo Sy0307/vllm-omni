@@ -374,7 +374,7 @@ def test_duplex_new_user_turn_marker_does_not_keep_forcing_after_first_step():
     assert not torch.isneginf(logits[0, 7])
 
 
-def test_duplex_explicit_force_speak_forces_native_speak_on_first_step():
+def test_duplex_client_force_speak_does_not_override_model_logits():
     runner = object.__new__(GPUARModelRunner)
     req_id = "duplex-sid-native-e0-stage0"
     listen_id = 3
@@ -416,12 +416,12 @@ def test_duplex_explicit_force_speak_forces_native_speak_on_first_step():
         [0],
     )
 
-    assert torch.isneginf(logits[0, :speak_id]).all()
-    assert torch.isneginf(logits[0, speak_id + 1 :]).all()
-    assert logits[0, speak_id].item() == 0.0
+    assert logits[0, 7].item() == 20.0
+    assert logits[0, speak_id].item() == -5.0
+    assert not torch.isneginf(logits).any()
 
 
-def test_duplex_explicit_force_speak_does_not_keep_forcing_after_first_step():
+def test_duplex_client_force_speak_is_also_ignored_after_first_step():
     runner = object.__new__(GPUARModelRunner)
     req_id = "duplex-sid-native-e0-stage0"
     listen_id = 3
