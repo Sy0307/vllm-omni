@@ -1,4 +1,4 @@
-from vllm_omni.experimental.duplex.openai.protocol import (
+from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexSessionConfig,
     DuplexSessionRegistry,

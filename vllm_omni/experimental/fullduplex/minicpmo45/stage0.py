@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from vllm_omni.experimental.duplex.intermediate import populate_tts_handoff_from_omni_payload
+from vllm_omni.experimental.fullduplex.engine.intermediate import populate_tts_handoff_from_omni_payload
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
@@ -915,7 +915,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_ref_audio_from_session_config(session_config: dict[str, Any]) -> Any | None:
         try:
-            from vllm_omni.experimental.duplex.worker import decode_native_ref_audio_from_config
+            from vllm_omni.experimental.fullduplex.engine.worker import decode_native_ref_audio_from_config
 
             return decode_native_ref_audio_from_config(session_config)
         except Exception:

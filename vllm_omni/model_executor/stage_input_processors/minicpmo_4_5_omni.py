@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 import torch
 from vllm.inputs import TextPrompt
 
-from vllm_omni.experimental.duplex.intermediate import (
+from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
     set_tts_handoff,

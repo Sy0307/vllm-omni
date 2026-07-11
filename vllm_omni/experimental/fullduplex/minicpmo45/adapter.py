@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 from vllm.multimodal.media import MediaConnector
 
-from vllm_omni.experimental.duplex.openai.protocol import DuplexSessionConfig
+from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.core.events import (
     ModelListening,
     ModelSegmentEnded,

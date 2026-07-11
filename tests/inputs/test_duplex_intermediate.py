@@ -1,6 +1,6 @@
 import pytest
 
-from vllm_omni.experimental.duplex.intermediate import get_stream_request_key
+from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key
 
 
 def test_get_stream_request_key_requires_stable_identifier():
