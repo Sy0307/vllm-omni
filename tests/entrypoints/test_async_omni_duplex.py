@@ -77,6 +77,7 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
                 "mode": "append_audio_chunk",
                 "payload": {},
                 "final": False,
+                "expected_epoch": None,
                 "timeout": 12.5,
             },
         ),
@@ -178,6 +179,11 @@ async def test_async_omni_duplex_collect_wraps_raw_response_stage_output():
     app = object.__new__(AsyncOmni)
     app.log_stats = False
     app._enable_ar_profiler = False
+    app.request_states = {}
+    app.prom_metrics = SimpleNamespace(
+        set_running=lambda value: None,
+        set_waiting=lambda value: None,
+    )
     app.engine = SimpleNamespace(
         num_stages=2,
         get_stage_metadata=lambda stage_id: SimpleNamespace(
