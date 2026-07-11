@@ -2716,7 +2716,10 @@ async def test_minicpmo_native_duplex_preserves_ref_audio_channels_until_normali
             assert ref_audio == "data:audio/wav;base64,AAAA"
             return np.tile(np.array([[0.25, -0.25], [0.5, -0.5]], dtype=np.float32), (800, 1)), 16000
 
-    monkeypatch.setattr("vllm_omni.experimental.duplex.openai.adapters.minicpmo45.MediaConnector", FakeMediaConnector)
+    monkeypatch.setattr(
+        "vllm_omni.experimental.fullduplex.minicpmo45.adapter.MediaConnector",
+        FakeMediaConnector,
+    )
 
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)
