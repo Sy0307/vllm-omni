@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import WebSocketDisconnect
-
 
 CONTROL_EVENTS = frozenset(
     {
@@ -173,10 +173,7 @@ class DuplexWebSocketActor:
 
     async def next_event(self) -> dict[str, object]:
         while True:
-            ready = [
-                (self._event_priority(event), self._event_seq(event), event)
-                for event in self._deferred_events
-            ]
+            ready = [(self._event_priority(event), self._event_seq(event), event) for event in self._deferred_events]
             self._deferred_events.clear()
             for queue in (self.control_queue, self.event_queue, self.input_queue):
                 with suppress(asyncio.QueueEmpty):
@@ -303,9 +300,7 @@ class DuplexWebSocketActor:
 
     async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
         tasks = [
-            task
-            for task, meta in self.native_append_tasks.items()
-            if not response_bound_only or meta.response_bound
+            task for task, meta in self.native_append_tasks.items() if not response_bound_only or meta.response_bound
         ]
         if not tasks:
             return False

@@ -9,7 +9,7 @@ from __future__ import annotations
 import gc
 import os
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext, suppress
 from copy import copy
 from dataclasses import replace

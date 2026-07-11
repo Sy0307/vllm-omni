@@ -1,6 +1,7 @@
 import pytest
 
 from vllm_omni.engine.orchestrator import _duplex_force_listen_count
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import (
     DuplexAdapterPattern,
     DuplexInputMode,
@@ -14,7 +15,6 @@ from vllm_omni.experimental.fullduplex.engine.omni import (
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 
 
 def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
