@@ -43,6 +43,11 @@ from vllm_omni.experimental.duplex.openai.realtime_protocol import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
     NativeRealtimeSessionProtocol,
 )
+from vllm_omni.experimental.fullduplex.openai.websocket import (
+    DuplexWebSocketActor,
+    is_control_event,
+    is_input_event,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -371,6 +376,9 @@ class DuplexSessionActor:
                 break
             drained += 1
         return drained
+
+
+DuplexSessionActor = DuplexWebSocketActor
 
 
 class OmniDuplexSessionHandler:
@@ -1787,33 +1795,11 @@ class OmniDuplexSessionHandler:
 
     @staticmethod
     def _is_duplex_control_event(event_type: str) -> bool:
-        return event_type in {
-            "session.close",
-            "close_session",
-            "input.cancel",
-            "response.cancel",
-            "barge_in",
-            "input_audio_buffer.clear",
-            "output_audio_buffer.clear",
-            "turn.signal",
-            "signal_turn",
-            "playback.ack",
-            "audio.playback_ack",
-        }
+        return is_control_event(event_type)
 
     @staticmethod
     def _is_duplex_input_event(event_type: str) -> bool:
-        return event_type in {
-            "input.text.append",
-            "input_text.append",
-            "push_text",
-            "input.audio.append",
-            "input_audio_buffer.append",
-            "push_chunk",
-            "input.commit",
-            "input_audio_buffer.commit",
-            "response.create",
-        }
+        return is_input_event(event_type)
 
     @staticmethod
     def _advance_barge_in_epoch(session: DuplexSession) -> tuple[int, dict[str, int]]:

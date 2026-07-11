@@ -4,5 +4,11 @@
 from .data_plane import DuplexDataPlaneCursors
 from .history import ResponseLifecycleLedger
 from .realtime import RealtimeEventProjector
+from .websocket import DuplexWebSocketActor
 
-__all__ = ["DuplexDataPlaneCursors", "RealtimeEventProjector", "ResponseLifecycleLedger"]
+__all__ = [
+    "DuplexDataPlaneCursors",
+    "DuplexWebSocketActor",
+    "RealtimeEventProjector",
+    "ResponseLifecycleLedger",
+]
