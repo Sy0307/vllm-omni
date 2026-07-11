@@ -18,15 +18,15 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.duplex.engine import duplex_data_plane_request_info
-from vllm_omni.experimental.duplex.models.minicpmo45.policy import (
+from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
-from vllm_omni.experimental.duplex.openai.adapters import (
+from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
 )
-from vllm_omni.experimental.duplex.openai.protocol import (
+from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexCommittedInput,
     DuplexOverlapPolicy,
@@ -39,7 +39,7 @@ from vllm_omni.experimental.duplex.openai.protocol import (
     DuplexTurnEventType,
     DuplexTurnState,
 )
-from vllm_omni.experimental.duplex.openai.realtime_protocol import (
+from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
     NativeRealtimeSessionProtocol,
 )

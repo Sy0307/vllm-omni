@@ -30,7 +30,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.experimental.duplex.intermediate import get_stream_request_key, get_tts_handoff
+from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key, get_tts_handoff
 from vllm_omni.platforms import current_omni_platform
 
 # Preserve the established external vocoder on CUDA. Ascend uses the in-tree

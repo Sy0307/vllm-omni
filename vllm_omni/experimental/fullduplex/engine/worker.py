@@ -580,7 +580,7 @@ def _bootstrap_default_providers() -> None:
     if _DEFAULT_PROVIDERS_BOOTSTRAPPED:
         return
     _DEFAULT_PROVIDERS_BOOTSTRAPPED = True
-    from vllm_omni.experimental.duplex.models.minicpmo45.worker_adapter import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.worker import (
         maybe_load_minicpmo_native_duplex_target,
     )
 

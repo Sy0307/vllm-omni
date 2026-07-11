@@ -33,7 +33,7 @@ from vllm_omni.engine.orchestrator import (
     _infer_stage_audio_sample_rate,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.duplex.engine import DuplexInputMode, DuplexRuntimeCapabilities, SessionMode
+from vllm_omni.experimental.fullduplex.engine.omni import DuplexInputMode, DuplexRuntimeCapabilities, SessionMode
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput

@@ -77,7 +77,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
-        from vllm_omni.experimental.duplex.models.minicpmo45.worker_adapter import (
+        from vllm_omni.experimental.fullduplex.minicpmo45.worker import (
             patch_minicpmo_remote_config,
         )
 
