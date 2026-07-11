@@ -565,7 +565,6 @@ def build_duplex_data_plane_prompt(
         force_listen_count > 0
         and turn_seq <= force_listen_count
         and isinstance(payload, dict)
-        and payload.get("force_speak") is not True
         and payload.get("force_listen") is not True
     ):
         payload = {**payload, "force_listen": True}

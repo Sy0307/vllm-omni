@@ -19,7 +19,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._buffer = bytearray()
         self._sample_rate_hz: int | None = None
         self._force_listen = False
-        self._force_speak = False
         self._is_speech = False
         self._new_user_turn = False
         self._turn_had_input = False
@@ -29,7 +28,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._buffer.clear()
         self._sample_rate_hz = None
         self._force_listen = False
-        self._force_speak = False
         self._is_speech = False
         self._new_user_turn = False
         self._turn_had_input = False
@@ -68,7 +66,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_input = self._turn_had_input or bool(raw)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         self._force_listen = self._force_listen or bool(payload.get("force_listen", False))
-        self._force_speak = self._force_speak or bool(payload.get("force_speak", False))
         self._is_speech = self._is_speech or bool(payload.get("is_speech", False))
         self._new_user_turn = self._new_user_turn or bool(payload.get("new_user_turn", False))
         if not allow_emit:
@@ -96,16 +93,15 @@ class MiniCPMO45PcmAppendBuffer:
         del self._buffer[:emit_bytes]
 
         out = dict(payload)
+        out.pop("force_speak", None)
         out["audio"] = base64.b64encode(emit_raw).decode("ascii")
         out["sample_rate_hz"] = sample_rate_hz
         out["force_listen"] = self._force_listen
-        out["force_speak"] = self._force_speak
         out["is_speech"] = self._is_speech
         if self._new_user_turn:
             out["new_user_turn"] = True
         if not self._buffer:
             self._force_listen = False
-            self._force_speak = False
             self._is_speech = False
             self._new_user_turn = False
         return out
@@ -119,7 +115,6 @@ class MiniCPMO45PcmAppendBuffer:
             "format": "pcm_f32le",
             "sample_rate_hz": self._sample_rate_hz or 16000,
             "force_listen": self._force_listen,
-            "force_speak": self._force_speak,
             "is_speech": self._is_speech,
         }
         if self._new_user_turn:
@@ -159,4 +154,3 @@ class MiniCPMO45PcmAppendBuffer:
 
 
 __all__ = ["MiniCPMO45CommittedInput", "MiniCPMO45PcmAppendBuffer"]
-

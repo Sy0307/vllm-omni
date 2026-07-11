@@ -510,7 +510,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         try:
             token_ids_map = token_id_fn()
             listen_id = int(token_ids_map.get("listen_token_id", -1))
-            speak_id = int(token_ids_map.get("speak_token_id", -1))
             tts_bos_id = int(token_ids_map.get("tts_bos_token_id", -1))
             turn_eos_id = int(token_ids_map.get("turn_eos_token_id", -1))
         except Exception:
@@ -531,7 +530,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             force_listen = payload.get("force_listen") is True
             is_speech = payload.get("is_speech")
             new_user_turn = payload.get("new_user_turn") is True
-            force_speak_start = not force_listen and payload.get("force_speak") is True
             redirect_listen = False
             # Turn-ended latch: after <|turn_eos|>, force listen on silence until
             # new speech, so the model does not re-open a turn and repeat itself.
@@ -553,11 +551,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 if new_user_turn:
                                     with suppress(Exception):
                                         state.current_turn_ended = True
-                                if not force_speak_start and not getattr(state, "current_turn_ended", True):
+                                if not getattr(state, "current_turn_ended", True):
                                     redirect_listen = True
                                 with suppress(Exception):
                                     state.last_terminator_token = None
-                    elif not force_speak_start:
+                    else:
                         prev_term = None
                         if isinstance(helper_sessions, dict):
                             state = helper_sessions.get(session_id)
@@ -568,7 +566,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             self._duplex_turn_ended_sessions.add(session_id)
                     if session_id in self._duplex_turn_ended_sessions and is_speech is not True:
                         force_listen = True
-            if not force_listen and not force_speak_start and not redirect_listen:
+            if not force_listen and not redirect_listen:
                 continue
             seq = self._request_duplex_seq(req_id)
             segment_key = (req_id, seq if seq is not None else -1)
@@ -584,10 +582,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logits[row_idx, listen_id] = 0.0
                 self._duplex_force_listen_applied_segments.add(segment_key)
                 action = "force listen"
-            elif force_speak_start and prior_output_len == 0 and 0 <= speak_id < logits.shape[-1]:
-                logits[row_idx, :] = float("-inf")
-                logits[row_idx, speak_id] = 0.0
-                action = "force speak"
             elif redirect_listen and 0 <= tts_bos_id < logits.shape[-1]:
                 # Mirror the official mid-turn decode rule: if the model
                 # would listen before the current turn ended, feed tts_bos
@@ -603,7 +597,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logger.info(
                     "MiniCPM-o duplex %s logits: req_id=%s seq=%s row=%s "
                     "prior_output_len=%s listen_id=%s flags={is_speech:%s,new_user_turn:%s,"
-                    "force_listen:%s,force_speak:%s} turn_state={ended:%s,last_term:%s,latch:%s}",
+                    "force_listen:%s} turn_state={ended:%s,last_term:%s,latch:%s}",
                     action,
                     req_id,
                     seq,
@@ -613,7 +607,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     is_speech,
                     new_user_turn,
                     payload.get("force_listen"),
-                    payload.get("force_speak"),
                     helper_current_turn_ended,
                     helper_last_terminator,
                     session_id in self._duplex_turn_ended_sessions if session_id else None,
