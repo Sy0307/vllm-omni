@@ -19,33 +19,22 @@ class PlaybackCursor:
 
     def __post_init__(self) -> None:
         if not 0 <= self.committed <= self.played <= self.sent <= self.generated:
-            raise PlaybackCursorError(
-                "playback positions must satisfy "
-                "0 <= committed <= played <= sent <= generated"
-            )
+            raise PlaybackCursorError("playback positions must satisfy 0 <= committed <= played <= sent <= generated")
 
     def mark_generated(self, cursor: int) -> PlaybackCursor:
         if cursor < 0:
             raise PlaybackCursorError("generated cursor cannot be negative")
         if cursor < self.generated:
-            raise PlaybackCursorError(
-                "generated cursor cannot move backwards: "
-                f"{cursor} < {self.generated}"
-            )
+            raise PlaybackCursorError(f"generated cursor cannot move backwards: {cursor} < {self.generated}")
         return replace(self, generated=cursor)
 
     def mark_sent(self, cursor: int) -> PlaybackCursor:
         if cursor < 0:
             raise PlaybackCursorError("sent cursor cannot be negative")
         if cursor < self.sent:
-            raise PlaybackCursorError(
-                f"sent cursor cannot move backwards: {cursor} < {self.sent}"
-            )
+            raise PlaybackCursorError(f"sent cursor cannot move backwards: {cursor} < {self.sent}")
         if cursor > self.generated:
-            raise PlaybackCursorError(
-                "sent cursor cannot exceed generated cursor: "
-                f"{cursor} > {self.generated}"
-            )
+            raise PlaybackCursorError(f"sent cursor cannot exceed generated cursor: {cursor} > {self.generated}")
         return replace(self, sent=cursor)
 
     def acknowledge(
@@ -64,12 +53,7 @@ class PlaybackCursor:
         next_played = max(self.played, played)
         next_committed = max(self.committed, committed)
         if next_played > self.sent:
-            raise PlaybackCursorError(
-                f"played cursor exceeds sent cursor: {next_played} > {self.sent}"
-            )
+            raise PlaybackCursorError(f"played cursor exceeds sent cursor: {next_played} > {self.sent}")
         if next_committed > next_played:
-            raise PlaybackCursorError(
-                "committed cursor cannot exceed played cursor: "
-                f"{next_committed} > {next_played}"
-            )
+            raise PlaybackCursorError(f"committed cursor cannot exceed played cursor: {next_committed} > {next_played}")
         return replace(self, played=next_played, committed=next_committed)

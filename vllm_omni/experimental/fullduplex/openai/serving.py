@@ -19,12 +19,12 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
+)
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+    MiniCPMO45DuplexPolicy,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
@@ -94,7 +94,7 @@ class DuplexAppendTaskMeta:
 
 
 @dataclass
-class DuplexSessionActor:
+class LegacyDuplexSessionActor:
     """Session-scoped actor state for duplex websocket execution.
 
     This owns the queues and background tasks that make input, output, and

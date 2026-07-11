@@ -11,12 +11,12 @@ import numpy as np
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
+)
+from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+    MiniCPMO45DuplexPolicy,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
@@ -2650,8 +2650,7 @@ async def test_minicpmo_native_duplex_resolves_ref_audio_before_runtime_open(mon
         return [0.25] * 1600, 16000
 
     monkeypatch.setattr(
-        "vllm_omni.experimental.fullduplex.minicpmo45."
-        "MiniCPMO45NativeDuplexServingAdapter.resolve_ref_audio",
+        "vllm_omni.experimental.fullduplex.minicpmo45.MiniCPMO45NativeDuplexServingAdapter.resolve_ref_audio",
         fake_resolve_ref_audio,
     )
     event = _native_session_create("sid-native-ref-audio")
