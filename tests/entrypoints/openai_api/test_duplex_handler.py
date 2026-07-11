@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
@@ -73,6 +74,7 @@ class FakeEngineClient:
         self.close_result = close_result
         self.opened: list[str] = []
         self.appended: list[tuple[str, str, object, bool]] = []
+        self.appended_fences: list[DuplexFence | None] = []
         self.opened_configs: list[dict[str, object]] = []
         self.signals: list[tuple[str, str]] = []
         self.signal_payloads: list[tuple[str, str, dict[str, object] | None]] = []
@@ -107,9 +109,11 @@ class FakeEngineClient:
         final: bool = False,
         timeout: float | None = None,
         collect_outputs: bool = True,
+        fence: DuplexFence | None = None,
     ) -> None:
         del timeout, collect_outputs
         self.appended.append((session_id, mode, payload, final))
+        self.appended_fences.append(fence)
         if self.append_results:
             return self.append_results.pop(0)
         return self.append_result if self.append_result is not None else self.control_result
@@ -136,6 +140,7 @@ class FakeEngineClient:
         event: str,
         payload: dict[str, object] | None = None,
         timeout: float | None = None,
+        fence: DuplexFence | None = None,
     ) -> None:
         del timeout
         if self.fail_signal or event in self.fail_signal_events:
@@ -1513,6 +1518,31 @@ def test_duplex_auto_response_explicit_turn_end_metadata_ends_response():
     assert terminal["end_of_turn"] is True
     assert terminal["audio_data"] == ""
     assert terminal["abort_data_plane_request"] is True
+
+
+@pytest.mark.asyncio
+async def test_native_append_propagates_current_turn_fence_to_engine():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-fenced-append",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.turn_id = 2
+    session.begin_response(turn_id=2)
+    ws = TimedWebSocket()
+
+    await handler._append_runtime_input(
+        session,
+        {"duplex_turn_id": 2, "audio": "", "format": "pcm_f32le"},
+        final=True,
+        send_json=ws.send_json,
+        mode="append_audio_chunk",
+        expected_epoch=0,
+    )
+
+    assert engine.appended_fences == [DuplexFence("sid-fenced-append", epoch=0, turn_id=2)]
 
 
 @pytest.mark.asyncio
