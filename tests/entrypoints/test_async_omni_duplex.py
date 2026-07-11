@@ -5,6 +5,7 @@ import pytest
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -130,6 +131,29 @@ async def test_async_omni_duplex_append_can_defer_data_plane_output_collection()
     )
 
     assert "data_plane_outputs" not in result
+
+
+@pytest.mark.asyncio
+async def test_async_omni_duplex_append_forwards_fence():
+    calls = []
+
+    async def append_duplex_input_async(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        return {"ok": True}
+
+    app = object.__new__(AsyncOmni)
+    app.engine = SimpleNamespace(append_duplex_input_async=append_duplex_input_async)
+    fence = DuplexFence("sid", epoch=1, turn_id=2)
+
+    await app.append_duplex_input_async(
+        "sid",
+        mode="append_audio_chunk",
+        payload={},
+        fence=fence,
+        collect_outputs=False,
+    )
+
+    assert calls[0][1]["fence"] is fence
 
 
 @pytest.mark.asyncio
