@@ -337,6 +337,162 @@ def test_realtime_duplex_demo_response_required_skips_audio_only_model_turn(monk
     assert outcome == "speak"
 
 
+def test_realtime_duplex_demo_no_hint_realtime_turn_omits_transcript_hint(monkeypatch):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    captured = {}
+
+    async def fake_send_pcm16(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        state.add(
+            {
+                "type": "response.listen",
+                "response": {"metadata": {"model_listen": True}},
+            }
+        )
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            del payload
+
+    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
+
+    response_id, outcome = asyncio.run(
+        demo._send_clean_turn(
+            FakeWebSocket(),
+            state,
+            b"\x00\x00",
+            transcript="turn label only",
+            duration_ms=None,
+            chunk_ms=200,
+            timeout_s=0.1,
+            require_audio=False,
+            validation_mode="model-policy",
+            send_transcript_hint=False,
+            realtime_input=True,
+            model_policy_settle_s=0.01,
+        )
+    )
+
+    assert response_id is None
+    assert outcome == "listen"
+    assert captured["hints"] == {}
+    assert captured["realtime_delay"] is True
+
+
+def test_realtime_duplex_demo_no_hint_gate_does_not_require_transcription_event():
+    demo = _load_demo_module()
+
+    assert demo._input_transcription_ok(0, transcript_hints_enabled=False)
+    assert not demo._input_transcription_ok(0, transcript_hints_enabled=True)
+    assert demo._input_transcription_ok(3, transcript_hints_enabled=True)
+
+
+def test_realtime_duplex_demo_model_policy_waits_for_speak_after_intermediate_listen(monkeypatch):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+
+    async def fake_send_pcm16(*args, **kwargs):
+        del args, kwargs
+        state.add(
+            {
+                "type": "response.listen",
+                "response": {"metadata": {"model_listen": True}},
+            }
+        )
+
+        async def delayed_speak():
+            await asyncio.sleep(0.01)
+            state.add({"type": "response.created", "response": {"id": "resp-delayed"}})
+            _add_response_transcript(state, "resp-delayed", transcript="延迟回答", audio=False)
+
+        asyncio.create_task(delayed_speak())
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            del payload
+
+    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
+
+    response_id, outcome = asyncio.run(
+        demo._send_clean_turn(
+            FakeWebSocket(),
+            state,
+            b"\x00\x00",
+            transcript="fixture",
+            duration_ms=None,
+            chunk_ms=200,
+            timeout_s=0.2,
+            require_audio=False,
+            validation_mode="model-policy",
+            model_policy_settle_s=0.05,
+        )
+    )
+
+    assert response_id == "resp-delayed"
+    assert outcome == "speak"
+
+
+def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_done(monkeypatch):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    send_calls = 0
+
+    async def fake_send_pcm16(*args, **kwargs):
+        nonlocal send_calls
+        del args, kwargs
+        send_calls += 1
+        if send_calls == 1:
+            state.add({"type": "input_audio_buffer.speech_started", "turn": 1})
+            state.add({"type": "response.created", "response": {"id": "resp-first"}})
+            state.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": "resp-first",
+                    "delta": "YQ==",
+                }
+            )
+            return
+
+        assert not state.response_done("resp-first")
+        state.add({"type": "input_audio_buffer.speech_started", "turn": 2})
+        _add_response_transcript(state, "resp-first", transcript="第一轮完成", audio=False)
+        state.add({"type": "response.created", "response": {"id": "resp-second"}})
+        _add_response_transcript(state, "resp-second", transcript="第二轮完成", audio=True)
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            self.messages.append(payload)
+
+    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
+    ws = FakeWebSocket()
+
+    response_ids, outcomes, overlap_ok = asyncio.run(
+        demo._send_listen_only_overlap_pair(
+            ws,
+            state,
+            b"\x00\x00",
+            b"\x01\x00",
+            transcripts=("first", "second"),
+            durations_ms=(None, None),
+            chunk_ms=200,
+            timeout_s=0.2,
+            send_transcript_hint=False,
+            realtime_input=True,
+            model_policy_settle_s=0.01,
+        )
+    )
+
+    assert response_ids == ["resp-first", "resp-second"]
+    assert outcomes == ["speak", "speak"]
+    assert overlap_ok is True
+    assert sum(demo.json.loads(message)["type"] == "input_audio_buffer.commit" for message in ws.messages) == 2
+
+
 def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
     demo = _load_demo_module()
     state = demo.DemoState()

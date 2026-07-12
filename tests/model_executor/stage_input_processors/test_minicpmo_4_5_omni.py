@@ -6,6 +6,9 @@ import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _drain_native_duplex_emitted_text,
+    _queue_native_duplex_segment_text,
+    _TalkerTurnState,
 )
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
@@ -15,6 +18,17 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_native_duplex_transcript_waits_for_buffered_vocoder_audio():
+    state = _TalkerTurnState(None, None, turn_id=1)
+
+    _queue_native_duplex_segment_text(state, "好")
+    assert _drain_native_duplex_emitted_text(state, has_audio=False) == ""
+
+    _queue_native_duplex_segment_text(state, "的，刚")
+    assert _drain_native_duplex_emitted_text(state, has_audio=True) == "好的，刚"
+    assert _drain_native_duplex_emitted_text(state, has_audio=True) == ""
 
 
 def test_extract_first_audio_ref_accepts_dict_stereo_audio():
