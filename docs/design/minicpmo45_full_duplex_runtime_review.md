@@ -508,6 +508,13 @@ The runtime work closes these observed failure classes:
 12. Model-specific code and WebSocket/protocol code accumulating in one generic
     serving module.
 13. Legacy deploy configuration bypassing the standard pipeline composition.
+14. Audio committed while an earlier response was playing being stranded after
+    that response completed. Auto-response overlap is now latched from the
+    first chunk, buffered for the whole input turn, and promoted as one final
+    new-turn append after the active response reaches its terminal event.
+15. Stage1 transcript metadata dropping text buffered by Token2Wav before the
+    first waveform was emitted. Segment text is now accumulated with the
+    vocoder turn state and drained only with the waveform that contains it.
 
 ## 13. Verification Evidence
 
@@ -649,20 +656,77 @@ The runtime now treats `turn_eos` as a flush only when a spoken Stage1 turn is
 already open; an empty terminal still reaches the reducer so model-turn identity
 advances, but it does not create an OpenAI response or synthesize audio.
 
-The final response-required contract is intentionally single-turn. It verifies
-that a pinned input can produce one complete, intelligible audio response; it
-does not claim that three arbitrary commits must all make the model speak:
+The earlier response-required contract was intentionally single-turn. The
+latest checkpoint adds a pinned three-turn semantic chain with transcript hints
+disabled and 200 ms real-time input pacing. It proves that the model understands
+the input audio, preserves clean-turn context, and completes three independent
+Realtime response lifecycles without serving-side force-speak:
 
 ```text
 PASS
-/tmp/remote_gpu_logs/0dc85a40.log
-selected speak outcomes: 1
-response.created/done/audio.done: 1/1/1
-response.audio.delta: 12
+/tmp/remote_gpu_logs/20c3f90d.log
+artifacts: /tmp/minicpmo_e2e_required_chain_textfixed
+turn outcomes: speak, speak, speak
+response.created/done/audio.done: 3/3/3
+response.audio.delta: 13
+input transcription hints/events: disabled/0
+real-time input pacing: 200 ms chunks
 all_audio_responses_have_transcript: true
-transcript: 嗯，电影当中有很多的虚构情节，但是现实当中确实是有一些这样的景观，比如说冰岛，它的冰川和火山地貌就非常独特。
-artifacts: /tmp/minicpmo_e2e_pr3907_response_required_exact_final
+transcripts:
+  1. 好的，我记住了，暗号是鲸鱼。
+  2. 你好，有什么可以帮您的吗？
+  3. 没问题，刚才的暗号是鲸鱼。
 ```
+
+The third answer depends on the first input, while the unrelated short second
+turn has its own response. This is evidence for sequential multi-turn audio
+conversation on the pinned fixtures, not a promise that arbitrary audio makes
+MiniCPM select `speak` after every commit.
+
+The listen-only overlap scenario starts turn 2 while turn 1 audio is still
+active. It does not interrupt or truncate the old response. Instead, the
+runtime buffers the overlapping user turn and promotes it after the old
+response completes:
+
+```text
+short overlap, 540 ms in 200/200/140 ms chunks:
+  PASS /tmp/remote_gpu_logs/84bd74af.log
+  artifacts: /tmp/minicpmo_e2e_overlap_textfixed
+  overlap decisions: 3, all action=listen and defer_runtime_append=true
+  response.created/done/audio.done: 2/2/2
+  cancel/truncate/stale: 0/0/0
+
+long overlap, 2383 ms in 12 chunks:
+  PASS /tmp/remote_gpu_logs/6da167a1.log
+  artifacts: /tmp/minicpmo_e2e_listen_only_overlap_long_fixed
+  overlap decisions: 12, cumulative speech_ms=2383
+  response.created/done/audio.done: 2/2/2
+  cancel/truncate/stale: 0/0/0
+```
+
+Here `listen` means that the model/session keeps accepting later audio; it is
+not a terminal response owed to each commit. The overlap scenario validates
+continuous listen-only buffering, not automatic or VAD barge-in.
+
+Whisper large-v3 was also run on the latest generated WAV files:
+
+```text
+/tmp/remote_gpu_logs/7f683913.log
+
+three-turn response-required:
+  protocol: 你好，有什么可以帮您的吗？
+  Whisper:  你好,有什么可以帮您的吗?
+
+short-overlap second response:
+  protocol: 你好，有什么可以帮你的吗？
+  Whisper:  你好,有什么可以帮你的吗?
+```
+
+The other two semantic-chain outputs were normal, non-empty 24 kHz speech;
+Whisper rendered the uncommon word `鲸鱼` as homophones. The short-overlap long
+response matched Whisper nearly verbatim. This establishes intelligible human
+speech and transcript/audio semantic alignment for the fixtures, not a MOS or
+corpus-level quality certification.
 
 The final affected regression suites passed together on the same remote H20
 checkout. They cover the async engine and runtime port, capability contract,
@@ -682,6 +746,14 @@ runtime, fence, MiniCPM adapter, stage-input, and deploy-config suites passed:
 /tmp/remote_gpu_logs/d8a2d700.log
 ```
 
+After adding no-hint real-time validation, overlap deferral, and vocoder text
+alignment coverage, the expanded focused suite passed together:
+
+```text
+423 passed
+/tmp/remote_gpu_logs/227cc4af.log
+```
+
 The no-profile server used for these runs was recorded separately:
 
 ```text
@@ -695,8 +767,8 @@ runtime now snapshots raw segment token metadata before output processing,
 routes direct listen output without Stage1, preserves its outer duplex metadata
 through async collection, and keeps a resumable request alive after a
 pre-response listen. The `model-policy` gate verifies this observable listen
-path; `response-required` remains intentionally single-turn and
-fixture-specific.
+path. `response-required` is now also verified for one pinned three-turn
+semantic chain, but remains fixture-specific.
 
 ## 14. Reviewer Reproduction
 
@@ -728,6 +800,8 @@ python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
   --turn-duration-ms 3000 \
   --turn-duration-ms 3000 \
   --require-distinct-inputs \
+  --omit-transcript-hints \
+  --realtime-input \
   --validation-mode model-policy \
   --output-dir /tmp/minicpmo45_duplex_model_policy
 ```
@@ -742,24 +816,38 @@ produce `response.listen` instead of `response.created`. Verify:
 
 ### 14.3 Run the pinned response-required fixture
 
-The H20 inputs used for this checkpoint are:
+The H20 inputs used for the latest no-hint checkpoint are:
 
 | File | SHA256 | Source duration | Validation use |
 | --- | --- | ---: | --- |
-| `minicpmo_pr3907_jiayan_16k.wav` | `2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941` | 5469 ms | response-required, first 1400 ms; model-policy, first 3000 ms |
-| `minicpmo_bajie_4s_16k.wav` | `060eb0f848cf68628232dc34810ec75e5505abe54517dd373f2e4bb8fb66362c` | 4000 ms | model-policy, first 3000 ms |
-| `minicpmo_haimian_4s_16k.wav` | `78b173badd9908a3f5bac32c2dd0d1890612a9380397be5d885bf2214bf362f2` | 4000 ms | model-policy, first 3000 ms |
+| `minicpmo_chain_1_16k.wav` | `0f01b7647dedec0fb40400af7b2a45eb7b3effb51ff568c06fdfdf6b279f70fc` | 2383 ms | remember `鲸鱼` |
+| `minicpmo_nihao.wav` | `910d953895f28d6ce4ef515e8e9ec5a75bbf95ed7851ef3e45267ba7f97055e5` | 540 ms | unrelated short middle turn |
+| `minicpmo_chain_2_16k.wav` | `df5f3072dead62bc6f9dfbc178aa6f4b1424a6c3129af3bfdf722ec01f78d014` | 3219 ms | ask for the remembered code word |
+| `minicpmo_chain_3_16k.wav` | `cdb48d3756118a00ad948961204c7696444715bbcd356cad84077938e86d9b4a` | 2778 ms | optional follow-up fixture |
+| `minicpmo_pr3907_jiayan_16k.wav` | `2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941` | 5469 ms | overlap turn 1, first 1400 ms |
 
 Verify the hashes before running:
 
 ```bash
-sha256sum turn1.wav turn2.wav turn3.wav
+sha256sum \
+  minicpmo_chain_1_16k.wav \
+  minicpmo_nihao.wav \
+  minicpmo_chain_2_16k.wav
 
 python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
   --url 'ws://127.0.0.1:8099/v1/realtime?duplex=1' \
   --model openbmb/MiniCPM-o-4_5 \
-  --input-wav turn1.wav \
-  --turns 1 \
+  --input-wav minicpmo_chain_1_16k.wav \
+  --turn-input-wav minicpmo_nihao.wav \
+  --turn-input-wav minicpmo_chain_2_16k.wav \
+  --turns 3 \
+  --turn-duration-ms 0 \
+  --turn-duration-ms 0 \
+  --turn-duration-ms 0 \
+  --chunk-ms 200 \
+  --omit-transcript-hints \
+  --realtime-input \
+  --require-distinct-inputs \
   --require-audio \
   --validation-mode response-required \
   --output-dir /tmp/minicpmo45_duplex_response_required
@@ -767,7 +855,7 @@ python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
 
 Review the per-response WAV files and verify:
 
-- one selected response ID with audio and transcript;
+- three selected response IDs with audio and transcript;
 - all model-created responses have symmetric
   `response.created`, `response.audio.done`, and `response.done` lifecycles;
 - every response containing audio has a non-empty transcript;
@@ -777,24 +865,50 @@ Review the per-response WAV files and verify:
 - no missing-fence, stale-guard-inert, timeout, forced-speak, or forced-listen
   fallback in the server log.
 
-The transcript hints carried by this demo label test turns; they are not an ASR
-oracle. Validate generated speech separately with ASR or listening when audio
-content is part of the acceptance criteria.
+`--turn-transcript` labels the local fixture and expected result only when
+`--omit-transcript-hints` is set; it is not sent to the server. Validate
+generated speech separately with ASR or listening when audio content is part of
+the acceptance criteria.
 
-### 14.4 Focused unit tests
+### 14.4 Run listen-only overlap without interruption
+
+```bash
+python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
+  --url 'ws://127.0.0.1:8099/v1/realtime?duplex=1' \
+  --model openbmb/MiniCPM-o-4_5 \
+  --input-wav minicpmo_pr3907_jiayan_16k.wav \
+  --turn-input-wav minicpmo_nihao.wav \
+  --turns 2 \
+  --first-turn-ms 1400 \
+  --chunk-ms 200 \
+  --omit-transcript-hints \
+  --realtime-input \
+  --require-distinct-inputs \
+  --require-audio \
+  --validation-mode model-policy \
+  --scenario listen-only-overlap \
+  --output-dir /tmp/minicpmo45_duplex_overlap
+```
+
+The second `input_audio_buffer.speech_started` must occur before the first
+`response.done`. Every overlap decision must be `listen` with deferred runtime
+append; the first response must not be cancelled or truncated; both responses
+must still close normally.
+
+### 14.5 Focused unit tests
 
 ```bash
 pytest -q \
   tests/fullduplex \
   tests/engine/test_duplex_runtime.py \
   tests/entrypoints/openai/test_duplex_protocol.py \
+  tests/entrypoints/openai_api/test_duplex_handler.py \
   tests/entrypoints/test_duplex_fence_propagation.py \
-  tests/fullduplex/minicpmo45 \
-  tests/model_executor/stage_input_processors/test_minicpmo_4_5_omni.py
-
-pytest -q \
+  tests/model_executor/stage_input_processors/test_minicpmo_4_5_omni.py \
+  tests/examples/test_minicpmo_realtime_web.py \
   tests/test_config_factory.py::TestStageConfig \
   tests/test_config_factory.py::TestDeployConfigLoading
+
 ```
 
 ## 15. Review Priorities

@@ -553,6 +553,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     inputs_embeds=inputs_embeds,
                     additional_information=talker_info,
                 )
+            if talker_info.get("minicpmo45_native_duplex") is True:
+                emitted_text = getattr(self.talker, "_ar_last_emitted_text", "")
+                tts_text = emitted_text if isinstance(emitted_text, str) else ""
 
             dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
 
