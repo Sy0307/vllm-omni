@@ -770,6 +770,41 @@ pre-response listen. The `model-policy` gate verifies this observable listen
 path. `response-required` is now also verified for one pinned three-turn
 semantic chain, but remains fixture-specific.
 
+The overlap-follow-up checkpoint also covered a stricter event ordering: the
+second response was created before the first response's playback acknowledgement
+arrived. Playback state is now scoped by `response_id`, so a late acknowledgement
+cannot advance the active response's cursor or commit the wrong assistant item.
+The H20 run produced three natural speak turns and three committed history items:
+
+```text
+response 1 done: generated/sent=11480/11480, played/committed=0/0
+response 1 ack:  generated/sent=11480/11480, played/committed=11480/11480
+response 2 done: generated/sent=2200/2200, played/committed=0/0
+response 2 ack:  generated/sent=2200/2200, played/committed=2200/2200
+response 3 done: generated/sent=3960/3960, played/committed=0/0
+response 3 ack:  generated/sent=3960/3960, played/committed=3960/3960
+history_committed=true for all three responses
+```
+
+The third answer was `没问题，刚才的暗号是鲸鱼。`, showing that the second
+assistant item was committed before the follow-up turn consumed history. The
+artifacts and logs for this checkpoint are:
+
+```text
+/tmp/minicpmo_e2e_overlap_response_cursor
+/tmp/remote_gpu_logs/fffabe37.log
+/tmp/remote_gpu_logs/4403e643.log
+```
+
+The expanded affected-test matrix, including response-scoped playback cursor,
+partial-history truncation, runtime, orchestrator, output processor, MiniCPM
+adapter, Stage0/Stage1 hooks, Realtime handler, and demo gates, passed on H20:
+
+```text
+532 passed
+/tmp/remote_gpu_logs/60bcad3a.log
+```
+
 ## 14. Reviewer Reproduction
 
 ### 14.1 Start the server
