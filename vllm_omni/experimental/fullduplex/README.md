@@ -31,5 +31,6 @@ names and audio codecs belong in `openai`.
 The verified MiniCPM-o checkpoint supports model-owned listen/speak on the
 normal auto-response path and clean multi-turn native audio streaming. Its
 capability contract intentionally disables explicit and automatic/VAD
-barge-in. Scheduler-native append, bounded long-session KV, and production
-multi-session concurrency remain follow-up work.
+barge-in and does not advertise multi-session support. Scheduler-native append,
+bounded long-session KV, and production multi-session concurrency remain
+follow-up work.
