@@ -1594,7 +1594,11 @@ class OmniDuplexSessionHandler:
     ) -> None:
         if not response_id or committed_ms < 0:
             return
-        session.truncate_history_item(f"item_{response_id}", audio_end_ms=committed_ms)
+        session.truncate_history_item(
+            f"item_{response_id}",
+            audio_end_ms=committed_ms,
+            playback=session.playback_for_response(response_id),
+        )
 
     async def _signal_runtime_history_rebuild_after_truncate(
         self,
@@ -4942,18 +4946,43 @@ class OmniDuplexSessionHandler:
             await send_json({"type": "error", "error": "playback.ack requires played_ms", "code": "bad_event"})
             return
         committed_cursor = int(committed_ms) if isinstance(committed_ms, int | float) else int(played_ms)
+        item_id = event.get("item_id")
+        response_id = event.get("response_id")
+        response_id = response_id if isinstance(response_id, str) and response_id else None
+        if not isinstance(item_id, str) or not item_id:
+            item_id = f"item_{response_id}" if response_id is not None else None
+        elif response_id is None and item_id.startswith("item_"):
+            response_id = item_id.removeprefix("item_")
+        if response_id is None and item_id is None and len(session.pending_history_item_ids) == 1:
+            item_id = next(iter(session.pending_history_item_ids))
+            if item_id.startswith("item_"):
+                response_id = item_id.removeprefix("item_")
+        if response_id is None and item_id is None and session.active_response_id is not None:
+            response_id = session.active_response_id
+            item_id = f"item_{response_id}"
         if event.get("truncate") is True:
-            session.acknowledge_playback(int(played_ms), committed_cursor)
-            session.truncate_playback_commit(committed_cursor)
-        else:
-            session.acknowledge_playback(
+            playback = session.acknowledge_playback(
                 int(played_ms),
                 committed_cursor,
+                response_id=response_id,
             )
-        item_id = event.get("item_id")
+            playback = session.truncate_playback_commit(
+                committed_cursor,
+                response_id=response_id,
+            )
+        else:
+            playback = session.acknowledge_playback(
+                int(played_ms),
+                committed_cursor,
+                response_id=response_id,
+            )
         committed_history = False
         if isinstance(item_id, str) and item_id:
-            committed_history = session.truncate_history_item(item_id, audio_end_ms=committed_cursor)
+            committed_history = session.truncate_history_item(
+                item_id,
+                audio_end_ms=committed_cursor,
+                playback=playback,
+            )
         elif session.pending_history_item_ids:
             # A plain playback ack has no OpenAI item id. Commit the only
             # uncommitted assistant candidate if the session has an unambiguous
@@ -4964,16 +4993,16 @@ class OmniDuplexSessionHandler:
                 committed_history = session.truncate_history_item(
                     item_id,
                     audio_end_ms=committed_cursor,
+                    playback=playback,
                 )
         elif session.active_response_id is not None:
             item_id = f"item_{session.active_response_id}"
             committed_history = session.truncate_history_item(
                 item_id,
                 audio_end_ms=committed_cursor,
+                playback=playback,
             )
         elif session.last_assistant_full_message is not None:
-            response_id = event.get("response_id")
-            item_id = f"item_{response_id}" if isinstance(response_id, str) and response_id else None
             if item_id is None and session.history_item_ids:
                 assistant_item_ids = [
                     known_item_id
@@ -4986,6 +5015,7 @@ class OmniDuplexSessionHandler:
                 committed_history = session.truncate_history_item(
                     item_id,
                     audio_end_ms=committed_cursor,
+                    playback=playback,
                 )
         await send_json(
             {
@@ -4996,10 +5026,12 @@ class OmniDuplexSessionHandler:
                 "played_ms": int(played_ms),
                 "committed_ms": committed_cursor,
                 "truncate": event.get("truncate") is True,
-                "playback": session.playback.as_dict(),
+                "playback": playback.as_dict(),
                 "history_committed": committed_history,
             }
         )
+        if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
+            session.release_response_playback(response_id)
 
     async def _cancel_active_response(
         self,

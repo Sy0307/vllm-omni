@@ -493,6 +493,60 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
     assert sum(demo.json.loads(message)["type"] == "input_audio_buffer.commit" for message in ws.messages) == 2
 
 
+def test_realtime_duplex_demo_playback_ack_identifies_and_commits_response():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    response_id = "resp-overlap-second"
+    state.add(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "metadata": {"playback": {"sent_ms": 1200}},
+            },
+        }
+    )
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            message = demo.json.loads(payload)
+            self.messages.append(message)
+            state.add(
+                {
+                    "type": "playback.acknowledged",
+                    "event": {
+                        "item_id": message.get("item_id"),
+                        "history_committed": message.get("item_id") == f"item_{response_id}",
+                    },
+                }
+            )
+
+    ws = FakeWebSocket()
+    asyncio.run(
+        demo._ack_response_playback(
+            ws,
+            state,
+            response_id,
+            timeout_s=0.1,
+            label="overlap second",
+        )
+    )
+
+    assert ws.messages == [
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 1200,
+            "committed_ms": 1200,
+        }
+    ]
+    assert state.playback_history_committed_count == 1
+
+
 def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
     demo = _load_demo_module()
     state = demo.DemoState()
