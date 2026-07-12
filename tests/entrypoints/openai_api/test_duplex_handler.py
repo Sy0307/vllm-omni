@@ -863,6 +863,51 @@ def test_auto_response_playback_overlap_forces_listen_until_ack_or_barge_in():
     assert handler._should_force_listen_for_auto_response_overlap(session, actor, {}, speech_payload) is False
 
 
+def test_auto_response_playback_overlap_defers_append_and_tracks_speech():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-auto-deferred-overlap",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+    session.begin_response()
+    session.mark_audio_sent(duration_ms=1000)
+    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
+    actor.session = session
+    payload = {
+        "type": "audio",
+        "audio": _pcm_f32_b64(8640, value=0.05),
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "is_speech": True,
+    }
+
+    assert handler._should_start_deferred_native_auto_response_overlap(session, actor, {}) is False
+    assert (
+        handler._should_start_deferred_native_auto_response_overlap(
+            session,
+            actor,
+            {"_duplex_overlap_candidate": True},
+        )
+        is True
+    )
+    decision = handler._overlap_decision(
+        session,
+        actor,
+        {"duration_ms": 540, "is_speech": True},
+        payload,
+    )
+
+    assert decision["action"] == "listen"
+    assert decision["defer_runtime_append"] is True
+    assert decision["buffer_audio"] is True
+    assert actor.overlap_speech_ms == 540
+
+
 def test_auto_response_waiting_speech_marks_payload_without_advancing_serving_turn():
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)

@@ -203,6 +203,7 @@ class _TalkerTurnState:
         "temp_prompt_wav_path",
         "epoch",
         "turn_id",
+        "pending_text",
     )
 
     def __init__(
@@ -223,6 +224,20 @@ class _TalkerTurnState:
         self.temp_prompt_wav_path = temp_prompt_wav_path
         self.epoch = epoch
         self.turn_id = turn_id
+        self.pending_text = ""
+
+
+def _queue_native_duplex_segment_text(state: _TalkerTurnState, text: object) -> None:
+    if isinstance(text, str) and text:
+        state.pending_text += text
+
+
+def _drain_native_duplex_emitted_text(state: _TalkerTurnState, *, has_audio: bool) -> str:
+    if not has_audio:
+        return ""
+    text = state.pending_text
+    state.pending_text = ""
+    return text
 
 
 _T2W_SILENCE_TOKEN = 4218
@@ -279,6 +294,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._t2w_base_caches: dict[str, tuple[Any, Any]] = {}
         self._ar_last_chunk_flags: list[bool] = [True]
         self._ar_turn_end_flags: list[bool] = [False]
+        self._ar_last_emitted_text = ""
         self._text_tokenizer = None
 
         tts_config = getattr(config, "tts_config", None)
@@ -1061,6 +1077,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
             self._talker_turn_states[key] = state
 
+        _queue_native_duplex_segment_text(
+            state,
+            meta_info.get("native_duplex_segment_text", ""),
+        )
+
         if pending_ids:
             pending_hidden = (
                 tts_hidden_states[consumed:]
@@ -1161,6 +1182,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._talker_consumed_tokens[key] = len(ids_list)
         vocode_ms = (time.perf_counter() - voc_t0) * 1000
         for waveform in waveforms:
+            self._ar_last_emitted_text = _drain_native_duplex_emitted_text(
+                state,
+                has_audio=bool(torch.as_tensor(waveform).numel()),
+            )
             if profile_enabled:
                 logger.info(
                     "4.5 Talker duplex unit timing: key=%s generate_ms=%.1f vocode_ms=%.1f total_ms=%.1f",
@@ -1181,8 +1206,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
         if turn_end:
             self._close_turn_state(key)
+            self._ar_last_emitted_text = ""
             yield self._empty_audio_chunk(), True
             return
+        self._ar_last_emitted_text = ""
         yield self._empty_audio_chunk(), True
 
     def _create_stream_gen(self, info: dict[str, Any]):

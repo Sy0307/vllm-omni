@@ -541,6 +541,10 @@ def _all_audio_responses_have_transcript(state: DemoState, response_ids: list[st
     )
 
 
+def _input_transcription_ok(count: int, *, transcript_hints_enabled: bool) -> bool:
+    return count > 0 if transcript_hints_enabled else True
+
+
 def _evaluate_transcript_integrity(
     state: DemoState,
     response_ids: list[str],
@@ -676,6 +680,29 @@ async def _wait_for(
     raise TimeoutError(f"Timed out waiting for {label}")
 
 
+async def _wait_for_model_policy_outcome(
+    state: DemoState,
+    *,
+    before_created: int,
+    before_model_listen: int,
+    timeout_s: float,
+    listen_settle_s: float,
+    label: str,
+) -> str:
+    deadline = time.monotonic() + timeout_s
+    listen_deadline: float | None = None
+    while time.monotonic() < deadline:
+        if state.count("response.created") > before_created:
+            return "speak"
+        if state.model_listen_count > before_model_listen:
+            if listen_deadline is None:
+                listen_deadline = time.monotonic() + max(0.0, listen_settle_s)
+            if time.monotonic() >= listen_deadline:
+                return "listen"
+        await asyncio.sleep(0.02)
+    raise TimeoutError(f"Timed out waiting for {label}")
+
+
 async def _send_clean_turn(
     ws,
     state: DemoState,
@@ -687,6 +714,9 @@ async def _send_clean_turn(
     timeout_s: float,
     require_audio: bool,
     validation_mode: str,
+    send_transcript_hint: bool = True,
+    realtime_input: bool = False,
+    model_policy_settle_s: float = 2.0,
 ) -> tuple[str | None, str]:
     before_created = state.count("response.created")
     before_model_listen = state.model_listen_count
@@ -706,18 +736,20 @@ async def _send_clean_turn(
         ws,
         _select_turn_audio(pcm16, duration_ms),
         chunk_ms=chunk_ms,
-        realtime_delay=False,
-        hints={"transcript": transcript},
+        realtime_delay=realtime_input,
+        hints={"transcript": transcript} if send_transcript_hint else {},
     )
     await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
     if validation_mode == "model-policy":
-        await _wait_for(
+        outcome = await _wait_for_model_policy_outcome(
             state,
-            lambda: state.count("response.created") > before_created or state.model_listen_count > before_model_listen,
+            before_created=before_created,
+            before_model_listen=before_model_listen,
             timeout_s=timeout_s,
+            listen_settle_s=model_policy_settle_s,
             label=f"{transcript} model speak/listen decision",
         )
-        if state.count("response.created") == before_created:
+        if outcome == "listen":
             return None, "listen"
     else:
         await _wait_for(
@@ -773,6 +805,157 @@ async def _send_clean_turn(
     return response_id, "speak"
 
 
+async def _ack_response_playback(
+    ws,
+    state: DemoState,
+    response_id: str,
+    *,
+    timeout_s: float,
+    label: str,
+) -> None:
+    played_ms = state.response_playback_sent_ms(response_id)
+    if played_ms <= 0:
+        return
+    before_ack = state.playback_ack_count
+    await ws.send(
+        json.dumps(
+            {
+                "type": "playback.ack",
+                "played_ms": played_ms,
+                "committed_ms": played_ms,
+            }
+        )
+    )
+    await _wait_for(
+        state,
+        lambda: state.playback_ack_count > before_ack,
+        timeout_s=timeout_s,
+        label=f"{label} playback.acknowledged",
+    )
+
+
+def _event_index_for_response(state: DemoState, event_type: str, response_id: str) -> int | None:
+    return state.first_index(
+        event_type,
+        lambda event: state._event_response_id(event) == response_id,
+    )
+
+
+def _nth_event_index(state: DemoState, event_type: str, occurrence: int) -> int | None:
+    seen = 0
+    for index, event in enumerate(state.events):
+        if event.get("type") != event_type:
+            continue
+        seen += 1
+        if seen == occurrence:
+            return index
+    return None
+
+
+async def _send_listen_only_overlap_pair(
+    ws,
+    state: DemoState,
+    first_pcm16: bytes,
+    second_pcm16: bytes,
+    *,
+    transcripts: tuple[str, str],
+    durations_ms: tuple[int | None, int | None],
+    chunk_ms: int,
+    timeout_s: float,
+    send_transcript_hint: bool,
+    realtime_input: bool,
+    model_policy_settle_s: float,
+) -> tuple[list[str | None], list[str], bool]:
+    if not realtime_input:
+        raise ValueError("listen-only-overlap requires --realtime-input")
+
+    before_first_created = state.count("response.created")
+    await _send_pcm16(
+        ws,
+        _select_turn_audio(first_pcm16, durations_ms[0]),
+        chunk_ms=chunk_ms,
+        realtime_delay=True,
+        hints={"transcript": transcripts[0]} if send_transcript_hint else {},
+    )
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+    await _wait_for(
+        state,
+        lambda: state.count("response.created") > before_first_created,
+        timeout_s=timeout_s,
+        label=f"{transcripts[0]} response.created",
+    )
+    first_response_id = state.response_ids[before_first_created]
+    await _wait_for(
+        state,
+        lambda: state.response_audio_delta_count(first_response_id) > 0,
+        timeout_s=timeout_s,
+        label=f"{transcripts[0]} response.audio.delta",
+    )
+    if state.response_done(first_response_id):
+        raise RuntimeError("first response completed before overlap input could start")
+
+    before_second_created = state.count("response.created")
+    before_second_listen = state.model_listen_count
+    overlap_started_while_active = not state.response_done(first_response_id)
+    await _send_pcm16(
+        ws,
+        _select_turn_audio(second_pcm16, durations_ms[1]),
+        chunk_ms=chunk_ms,
+        realtime_delay=True,
+        hints={"transcript": transcripts[1]} if send_transcript_hint else {},
+    )
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+
+    await _wait_for(
+        state,
+        lambda: state.response_done(first_response_id),
+        timeout_s=timeout_s,
+        label=f"{transcripts[0]} response.done",
+    )
+    await _ack_response_playback(
+        ws,
+        state,
+        first_response_id,
+        timeout_s=timeout_s,
+        label=transcripts[0],
+    )
+
+    second_outcome = await _wait_for_model_policy_outcome(
+        state,
+        before_created=before_second_created,
+        before_model_listen=before_second_listen,
+        timeout_s=timeout_s,
+        listen_settle_s=model_policy_settle_s,
+        label=f"{transcripts[1]} model speak/listen decision",
+    )
+    second_response_id: str | None = None
+    if second_outcome == "speak":
+        second_response_id = state.response_ids[before_second_created]
+        await _wait_for(
+            state,
+            lambda: state.response_done(second_response_id),
+            timeout_s=timeout_s,
+            label=f"{transcripts[1]} response.done",
+        )
+        await _ack_response_playback(
+            ws,
+            state,
+            second_response_id,
+            timeout_s=timeout_s,
+            label=transcripts[1],
+        )
+
+    second_speech_index = _nth_event_index(state, "input_audio_buffer.speech_started", 2)
+    first_done_index = _event_index_for_response(state, "response.done", first_response_id)
+    overlap_ok = (
+        overlap_started_while_active
+        and second_speech_index is not None
+        and first_done_index is not None
+        and second_speech_index < first_done_index
+    )
+    return [first_response_id, second_response_id], ["speak", second_outcome], overlap_ok
+
+
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     turn_input_paths = _turn_input_paths(
         Path(args.input_wav),
@@ -805,6 +988,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     turn_response_ids: list[str | None] = []
     turn_outcomes: list[str] = []
     validation_mode = getattr(args, "validation_mode", "response-required")
+    scenario = getattr(args, "scenario", "sequential")
+    transcript_hints_enabled = not getattr(args, "omit_transcript_hints", False)
+    realtime_input = getattr(args, "realtime_input", False)
+    listen_only_overlap_ok = scenario != "listen-only-overlap"
+    if scenario == "listen-only-overlap" and args.turns != 2:
+        raise ValueError("listen-only-overlap requires --turns 2")
 
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
         reader = asyncio.create_task(_reader(ws, state, stop))
@@ -839,20 +1028,38 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
 
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
             turn_specs = list(zip(turn_transcripts, turn_durations, strict=True))
-            for turn_index, (transcript, duration_ms) in enumerate(turn_specs):
-                response_id, outcome = await _send_clean_turn(
+            if scenario == "listen-only-overlap":
+                turn_response_ids, turn_outcomes, listen_only_overlap_ok = await _send_listen_only_overlap_pair(
                     ws,
                     state,
-                    turn_pcm16[turn_index],
-                    transcript=transcript,
-                    duration_ms=duration_ms,
+                    turn_pcm16[0],
+                    turn_pcm16[1],
+                    transcripts=(turn_specs[0][0], turn_specs[1][0]),
+                    durations_ms=(turn_specs[0][1], turn_specs[1][1]),
                     chunk_ms=args.chunk_ms,
                     timeout_s=args.timeout_s,
-                    require_audio=args.require_audio and (turn_index + 1) not in expected_empty_turns,
-                    validation_mode=validation_mode,
+                    send_transcript_hint=transcript_hints_enabled,
+                    realtime_input=realtime_input,
+                    model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                 )
-                turn_response_ids.append(response_id)
-                turn_outcomes.append(outcome)
+            else:
+                for turn_index, (transcript, duration_ms) in enumerate(turn_specs):
+                    response_id, outcome = await _send_clean_turn(
+                        ws,
+                        state,
+                        turn_pcm16[turn_index],
+                        transcript=transcript,
+                        duration_ms=duration_ms,
+                        chunk_ms=args.chunk_ms,
+                        timeout_s=args.timeout_s,
+                        require_audio=args.require_audio and (turn_index + 1) not in expected_empty_turns,
+                        validation_mode=validation_mode,
+                        send_transcript_hint=transcript_hints_enabled,
+                        realtime_input=realtime_input,
+                        model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
+                    )
+                    turn_response_ids.append(response_id)
+                    turn_outcomes.append(outcome)
 
             await ws.send(json.dumps({"type": "session.close"}))
             await _wait_for(state, lambda: state.count("session.closed") > 0, timeout_s=20, label="session.closed")
@@ -872,7 +1079,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         if validation_mode == "model-policy"
         else state.event_order_ok()
     )
-    input_transcription_ok = state.input_transcription_count > 0
+    input_transcription_ok = _input_transcription_ok(
+        state.input_transcription_count,
+        transcript_hints_enabled=transcript_hints_enabled,
+    )
     model_speak_event_ok = state.model_speak_before_audio_ok()
     realtime_audio_lifecycle_ok = state.count("response.audio.delta") > 0 and state.count("response.audio.done") > 0
     completed_response_ids = state.completed_response_ids()
@@ -966,6 +1176,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "completed_response_ids": completed_response_ids,
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
+        "scenario": scenario,
+        "listen_only_overlap_ok": listen_only_overlap_ok,
+        "transcript_hints_enabled": transcript_hints_enabled,
+        "realtime_input": realtime_input,
+        "input_chunk_ms": args.chunk_ms,
+        "model_policy_settle_ms": args.model_policy_settle_ms,
         "turn_outcomes": turn_outcomes,
         "turn_outcomes_ok": turn_outcomes_ok,
         "clean_turn_audio_ok": clean_turn_audio_ok,
@@ -997,6 +1213,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and transcript_integrity["nonempty_audio_has_transcript_ok"]
         and transcript_integrity["terminal_punctuation_ok"]
         and all_audio_responses_have_transcript
+        and listen_only_overlap_ok
         and (distinct_turn_inputs or not getattr(args, "require_distinct_inputs", False))
     )
     return result
@@ -1020,6 +1237,12 @@ def parse_args() -> argparse.Namespace:
         choices=["pcm16", "wav", "g711_ulaw", "g711_alaw"],
     )
     parser.add_argument("--chunk-ms", type=int, default=200)
+    parser.add_argument(
+        "--model-policy-settle-ms",
+        type=int,
+        default=2000,
+        help="Wait after an intermediate model-listen event for a delayed response.created.",
+    )
     parser.add_argument("--first-turn-ms", type=int, default=1400)
     parser.add_argument(
         "--turn-duration-ms",
@@ -1029,6 +1252,22 @@ def parse_args() -> argparse.Namespace:
         help="Audio duration for each turn; repeat turns times. Use 0 to send the complete WAV.",
     )
     parser.add_argument("--first-turn-transcript", default="demo input speech")
+    parser.add_argument(
+        "--omit-transcript-hints",
+        action="store_true",
+        help="Keep local turn labels but do not send transcript hints to the server.",
+    )
+    parser.add_argument(
+        "--realtime-input",
+        action="store_true",
+        help="Pace each input chunk according to its audio duration.",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=["sequential", "listen-only-overlap"],
+        default="sequential",
+        help="Run sequential turns or stream turn 2 while turn 1 audio is active without interruption.",
+    )
     parser.add_argument(
         "--validation-mode",
         choices=["model-policy", "response-required"],

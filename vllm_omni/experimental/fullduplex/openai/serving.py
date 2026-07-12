@@ -160,11 +160,13 @@ class OmniDuplexSessionHandler:
         native_response_emitted = False
         native_input_since_commit = False
         native_speech_since_commit = False
+        native_deferred_overlap_turn = False
         native_committed_audio_payload: dict[str, object] | None = None
         native_deferred_response_create = False
 
         async def send_json(payload: dict[str, object]) -> None:
             nonlocal native_input_since_commit, native_response_emitted, native_speech_since_commit
+            nonlocal native_deferred_overlap_turn
             nonlocal native_committed_audio_payload
             nonlocal native_deferred_response_create
             payload_type = payload.get("type")
@@ -197,18 +199,42 @@ class OmniDuplexSessionHandler:
                         "response.listen",
                     } and terminal_status not in {"cancelled", "failed"}
                     if can_promote_overlap and actor.overlap_speech_ms > 0:
+                        has_deferred_overlap = (
+                            native_audio_buffer.has_pending() or native_committed_audio_payload is not None
+                        )
                         should_promote_overlap = (
                             payload_type in {"response.done", "response.listen"}
                             and session is not None
                             and session.state == DuplexSessionState.OPEN
                             and self._uses_native_input_append(session)
-                            and native_audio_buffer.has_pending()
+                            and has_deferred_overlap
                             and actor.overlap_speech_ms > session.config.overlap_short_ack_ms
                         )
                         if should_promote_overlap and session is not None:
                             deferred_overlap_payload = native_audio_buffer.flush(
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                             )
+                            if native_committed_audio_payload is not None:
+                                if deferred_overlap_payload is not None:
+                                    deferred_overlap_payload = self._merge_native_audio_payloads(
+                                        native_committed_audio_payload,
+                                        deferred_overlap_payload,
+                                    )
+                                else:
+                                    deferred_overlap_payload = native_committed_audio_payload
+                                native_committed_audio_payload = None
+                            if self._session_auto_responds(session) and deferred_overlap_payload is not None:
+                                deferred_overlap_payload = dict(deferred_overlap_payload)
+                                deferred_overlap_payload["force_listen"] = False
+                                deferred_overlap_payload["new_user_turn"] = True
+                                deferred_overlap_payload.setdefault(
+                                    "new_user_turn_prefix_variant",
+                                    self._auto_response_new_turn_prefix_variants.pop(
+                                        session.session_id,
+                                        MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+                                    ),
+                                )
+                                self._auto_response_waiting_for_speech.discard(session.session_id)
                             native_input_since_commit = deferred_overlap_payload is not None
                             native_response_emitted = False
                             if realtime_protocol is not None:
@@ -238,6 +264,7 @@ class OmniDuplexSessionHandler:
                         native_deferred_response_create = False
                         native_input_since_commit = False
                         native_speech_since_commit = False
+                        native_deferred_overlap_turn = False
             await actor.send_json(payload)
             if deferred_overlap_payload is not None and session is not None and not actor.closing:
                 await start_native_append(deferred_overlap_payload, final=True, precreate_response=True)
@@ -978,12 +1005,21 @@ class OmniDuplexSessionHandler:
                     defer_native_append = False
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
-                        # Full-duplex: continuous mic chunks must FEED the ongoing
-                        # stage0 stream (the model owns speak/listen), not be routed
-                        # through the discrete-response overlap/barge-in policy.
-                        overlap_active = (not self._session_auto_responds(session)) and (
-                            native_response_in_progress()
-                            or (event.get("_duplex_overlap_candidate") is True and actor.output_generation_in_flight())
+                        if not native_input_since_commit:
+                            native_deferred_overlap_turn = self._should_start_deferred_native_auto_response_overlap(
+                                session,
+                                actor,
+                                event,
+                            )
+                        overlap_active = native_deferred_overlap_turn or (
+                            not self._session_auto_responds(session)
+                            and (
+                                native_response_in_progress()
+                                or (
+                                    event.get("_duplex_overlap_candidate") is True
+                                    and actor.output_generation_in_flight()
+                                )
+                            )
                         )
                         if overlap_active:
                             decision = self._overlap_decision(session, actor, event, payload)
@@ -1159,6 +1195,8 @@ class OmniDuplexSessionHandler:
                     continue
 
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
+                    if event_type in {"input.commit", "input_audio_buffer.commit"}:
+                        native_deferred_overlap_turn = False
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
                         native_input_since_commit = False
                         native_speech_since_commit = False
@@ -1185,8 +1223,10 @@ class OmniDuplexSessionHandler:
                             }
                         )
                         continue
-                    should_create_response = event_type == "response.create" or bool(
-                        event.get("response_create", event_type == "input.commit")
+                    should_create_response = (
+                        event_type == "response.create"
+                        or bool(event.get("response_create", event_type == "input.commit"))
+                        or (event_type == "input_audio_buffer.commit" and self._session_auto_responds(session))
                     )
                     if event_type == "response.create":
                         response_payload = event.get("response")
@@ -1714,11 +1754,13 @@ class OmniDuplexSessionHandler:
             # next turn's input and let the model finish its current response,
             # instead of auto-cancelling on every overlapping chunk. Explicit
             # barge-in (force_barge_in / overlap_action above) still interrupts.
-            actor.overlap_speech_ms = 0
+            if is_speech:
+                actor.overlap_speech_ms += max(0, duration_ms)
             return {
                 "action": "listen",
                 "reason": "auto_response_continuous",
                 "duration_ms": duration_ms,
+                "overlap_speech_ms": actor.overlap_speech_ms,
                 "buffer_audio": is_speech,
                 "defer_runtime_append": True,
             }
@@ -1983,6 +2025,19 @@ class OmniDuplexSessionHandler:
             self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
             return False
         return False
+
+    def _should_start_deferred_native_auto_response_overlap(
+        self,
+        session: DuplexSession,
+        actor: DuplexSessionActor,
+        event: Mapping[str, object],
+    ) -> bool:
+        """Latch overlap identity from the first chunk's receive-time state."""
+        return (
+            self._session_auto_responds(session)
+            and event.get("_duplex_overlap_candidate") is True
+            and actor.assistant_playback_active()
+        )
 
     def _should_skip_auto_response_waiting_silence(
         self,
