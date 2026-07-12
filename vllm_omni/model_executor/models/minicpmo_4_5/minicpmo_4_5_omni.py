@@ -294,7 +294,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             audio_waveform,
             seq=seq,
             final=bool(duplex.get("final")),
-            new_speech=payload.get("is_speech") is True,
             new_user_turn=payload.get("new_user_turn") is True,
             new_user_turn_prefix_variant=payload.get("new_user_turn_prefix_variant"),
         )

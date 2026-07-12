@@ -928,6 +928,8 @@ def test_port_from_zmq_address_parsing():
     assert _port_from_zmq_address(None) is None
     assert _port_from_zmq_address("ipc:///tmp/sock") is None
     assert _port_from_zmq_address("tcp://host:not-a-port") is None
+
+
 def test_resolve_sampling_param_token_names_materializes_stop_ids(monkeypatch):
     from vllm.sampling_params import SamplingParams
 

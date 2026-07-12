@@ -23,260 +23,52 @@ def _register_test_native_duplex_provider(monkeypatch):
     monkeypatch.setattr(native_duplex, "_NATIVE_DUPLEX_PROVIDERS", [provider])
 
 
-class _NativeDuplexModel:
-    native_duplex_uses_minicpmo_legacy_prompt_template = True
-
+class _PlainModelMethods:
     def __init__(self) -> None:
-        self.prepared = []
-        self.prefills = []
-        self.generates = []
-        self.finalize_calls = 0
-        self.stopped = []
+        self.prepare_calls = 0
 
-    def duplex_prepare(self, **kwargs):
-        self.prepared.append(kwargs)
-        return {"prompt_length": 12}
+    def prepare(self, **_kwargs):
+        self.prepare_calls += 1
 
-    def duplex_prefill(self, *, audio_waveform=None, frame_list=None, max_slice_nums=1):
-        self.prefills.append(
-            {
-                "audio_len": None if audio_waveform is None else int(len(audio_waveform)),
-                "frame_list": frame_list,
-                "max_slice_nums": max_slice_nums,
-            }
-        )
-        return {"prefill": "ok"}
-
-    def duplex_generate(self, *, force_listen=False):
-        self.generates.append({"force_listen": force_listen})
-        return {
-            "is_listen": True,
-            "text": "",
-            "audio_data": None,
-            "end_of_turn": False,
-            "kv_cache_length": 321,
-        }
-
-    def duplex_finalize(self):
-        self.finalize_calls += 1
-
-    def duplex_stop(self):
-        self.stopped.append(True)
-
-
-class _AsDuplexModel:
-    def __init__(self) -> None:
-        self.duplex = _StreamingDuplexModel()
-
-    def as_duplex(self):
-        return self.duplex
-
-
-class _AsDuplexRaisesModel:
-    def __init__(self) -> None:
-        self.prepares = []
-        self.prefills = []
-        self.generates = []
-
-    def as_duplex(self):
-        raise AssertionError("worker must not call official as_duplex wrapper")
-
-    def prepare(self, *, system_prompt_text=None, ref_audio_path=None, prompt_wav_path=None):
-        self.prepares.append(
-            {
-                "system_prompt_text": system_prompt_text,
-                "ref_audio_path": ref_audio_path,
-                "prompt_wav_path": prompt_wav_path,
-            }
-        )
-        return {"prepared": True}
-
-    def prefill(self, *, audio_waveform=None, frame_list=None, max_slice_nums=1):
-        self.prefills.append(
-            {
-                "audio_len": None if audio_waveform is None else int(len(audio_waveform)),
-                "frame_list": frame_list,
-                "max_slice_nums": max_slice_nums,
-            }
-        )
-        return {"prefilled": True}
-
-    def generate(self, *, force_listen=False):
-        self.generates.append({"force_listen": force_listen})
-        return {
-            "is_listen": False,
-            "text": "owned",
-            "audio_waveform": np.array([0.5], dtype=np.float32),
-            "end_of_turn": False,
-        }
-
-
-class _BreakableOwnedModel(_AsDuplexRaisesModel):
-    as_duplex = None
-    supports_native_duplex_method_adapter = True
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.break_set = False
-        self.prefill_break_states = []
-
-    def set_break(self):
-        self.break_set = True
-
-    def clear_break_event(self):
-        self.break_set = False
-
-    def prefill(self, *, audio_waveform=None, frame_list=None, max_slice_nums=1):
-        self.prefill_break_states.append(self.break_set)
-        if self.break_set:
-            raise RuntimeError("break must be cleared before accepting the next input chunk")
-        return super().prefill(
-            audio_waveform=audio_waveform,
-            frame_list=frame_list,
-            max_slice_nums=max_slice_nums,
-        )
-
-
-class _OwnedRuntimeMethodsModel(_AsDuplexRaisesModel):
-    as_duplex = None
-    supports_native_duplex_method_adapter = True
-
-
-class _BufferingPrefillModel(_NativeDuplexModel):
-    def duplex_prefill(self, *, audio_waveform=None, frame_list=None, max_slice_nums=1):
-        super().duplex_prefill(
-            audio_waveform=audio_waveform,
-            frame_list=frame_list,
-            max_slice_nums=max_slice_nums,
-        )
-        return {"success": False, "reason": "audio not enough", "cost_all": 0.001}
-
-
-class _PlainDuplexPrepareModel(_NativeDuplexModel):
-    native_duplex_uses_minicpmo_legacy_prompt_template = False
-
-
-class _FailingCleanupModel(_NativeDuplexModel):
-    def __init__(self) -> None:
-        super().__init__()
-        self.cleanup_calls = 0
-
-    def cleanup(self):
-        self.cleanup_calls += 1
-        raise RuntimeError("cleanup failed")
-
-
-class _StreamingDuplexModel(_NativeDuplexModel):
-    def streaming_prefill(self, *, audio_waveform=None, frame_list=None, max_slice_nums=1):
-        return self.duplex_prefill(
-            audio_waveform=audio_waveform,
-            frame_list=frame_list,
-            max_slice_nums=max_slice_nums,
-        )
-
-    def streaming_generate(self):
-        return self.duplex_generate(force_listen=False)
-
-
-class _OfficialDuplexView:
-    supports_native_duplex_method_adapter = True
-
-    def __init__(self) -> None:
-        self.prepares = []
-        self.prefills = []
-        self.generates = []
-        self.finalize_calls = 0
-        self.stop_calls = 0
-        self.cleanup_calls = 0
-
-    def prepare(self, *, system_prompt_text=None, ref_audio_path=None, prompt_wav_path=None):
-        self.prepares.append(
-            {
-                "system_prompt_text": system_prompt_text,
-                "ref_audio_path": ref_audio_path,
-                "prompt_wav_path": prompt_wav_path,
-            }
-        )
-        return "<prepared>"
-
-    def prefill(self, *, audio_waveform=None, frame_list=None, max_slice_nums=1):
-        self.prefills.append(
-            {
-                "audio_len": None if audio_waveform is None else int(len(audio_waveform)),
-                "frame_list": frame_list,
-                "max_slice_nums": max_slice_nums,
-            }
-        )
+    def prefill(self, **_kwargs):
         return {"success": True}
 
-    def generate(self, *, force_listen=False):
-        self.generates.append({"force_listen": force_listen})
+    def generate(self, **_kwargs):
+        return {"is_listen": True}
+
+
+class _ExplicitNativeDuplexTarget:
+    runtime_impl = "test_explicit_runtime"
+    owned_runtime = False
+
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.fail_close = fail_close
+        self.open_calls = []
+        self.append_calls = []
+        self.signal_calls = []
+        self.close_calls = []
+
+    def open_duplex_session(self, **kwargs):
+        self.open_calls.append(kwargs)
+        return {"opened": kwargs["session_id"]}
+
+    def append_duplex_input(self, **kwargs):
+        self.append_calls.append(kwargs)
         return {
-            "is_listen": False,
-            "text": "hi",
+            "text": "explicit",
             "audio_waveform": np.array([0.25, -0.25], dtype=np.float32),
-            "end_of_turn": True,
-            "cost_llm": 0.001,
             "cost_all": 0.002,
-            "n_tokens": 2,
         }
 
-    def finalize(self):
-        self.finalize_calls += 1
+    def signal_duplex_turn(self, **kwargs):
+        self.signal_calls.append(kwargs)
+        return {"event": kwargs["event"]}
 
-    def stop(self):
-        self.stop_calls += 1
-
-    def cleanup(self):
-        self.cleanup_calls += 1
-
-
-class _AsOfficialDuplexModel:
-    def __init__(self) -> None:
-        self.duplex = _OfficialDuplexView()
-
-    def as_duplex(self):
-        return self.duplex
-
-
-class _ConfigurableOfficialDuplexView(_OfficialDuplexView):
-    def generate(self, **kwargs):
-        self.generates.append(kwargs)
-        return {
-            "is_listen": False,
-            "text": "configured",
-            "audio_waveform": np.array([0.5], dtype=np.float32),
-            "end_of_turn": False,
-        }
-
-
-class _AsConfigurableOfficialDuplexModel:
-    def __init__(self) -> None:
-        self.duplex = _ConfigurableOfficialDuplexView()
-
-    def as_duplex(self):
-        return self.duplex
-
-
-class _OfficialPrefixDuplexView(_ConfigurableOfficialDuplexView):
-    def prepare(self, *, prefix_system_prompt=None, ref_audio=None, prompt_wav_path=None, **kwargs):
-        self.prepares.append(
-            {
-                "prefix_system_prompt": prefix_system_prompt,
-                "ref_audio": ref_audio,
-                "prompt_wav_path": prompt_wav_path,
-                "kwargs": kwargs,
-            }
-        )
-        return {"prepared": True}
-
-
-class _AsOfficialPrefixDuplexModel:
-    def __init__(self) -> None:
-        self.duplex = _OfficialPrefixDuplexView()
-
-    def as_duplex(self):
-        return self.duplex
+    def close_duplex_session(self, **kwargs):
+        self.close_calls.append(kwargs)
+        if self.fail_close:
+            raise RuntimeError("close failed")
+        return {"closed": kwargs["session_id"]}
 
 
 _USE_DEFAULT_TEST_TARGET = object()
@@ -339,9 +131,9 @@ def _minicpmo_tts_handoff_payload(
 
 
 def test_worker_minicpmo_stage0_reuses_loaded_llm_stage_without_full_model_load():
-    import vllm_omni.experimental.fullduplex.minicpmo45.runtime as duplex_runtime
+    import vllm_omni.experimental.fullduplex.minicpmo45.stage0 as stage0_runtime
 
-    assert not hasattr(duplex_runtime, "MiniCPMO45FullModelDuplexRuntime")
+    assert not hasattr(stage0_runtime, "MiniCPMO45FullModelDuplexRuntime")
 
     worker = _Worker(_SplitMiniCPMOStageModel("llm"))
 
@@ -459,7 +251,7 @@ def test_worker_minicpmo_stage0_does_not_attach_runner_forward_without_contract_
 def test_minicpmo_stage0_open_rejects_model_local_unmarked_runner_context_method():
     import pytest
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -526,7 +318,7 @@ def test_worker_native_duplex_uses_provider_registry(monkeypatch):
 
 
 def test_worker_mixin_does_not_guess_native_target_from_plain_model_methods():
-    model = _NativeDuplexModel()
+    model = _PlainModelMethods()
     worker = _Worker(model, native_duplex_target=None)
 
     target = worker._get_native_duplex_target({"implementation_level": "model_native_duplex"})
@@ -540,13 +332,13 @@ def test_worker_mixin_does_not_guess_native_target_from_plain_model_methods():
     assert target is None
     assert result["supported"] is False
     assert result["reason"] == "worker_duplex_session_not_implemented"
-    assert model.prepared == []
+    assert model.prepare_calls == 0
 
 
-def test_worker_mixin_delegates_native_method_adapter_to_worker_module():
+def test_worker_module_does_not_export_legacy_native_method_adapter():
     from vllm_omni.experimental.fullduplex.engine import worker as native_duplex
 
-    assert hasattr(native_duplex, "NativeDuplexMethodAdapter")
+    assert not hasattr(native_duplex, "NativeDuplexMethodAdapter")
     assert not hasattr(OmniWorkerMixin, "_NativeDuplexMethodAdapter")
     for helper_name in (
         "_decode_native_audio_payload",
@@ -558,10 +350,47 @@ def test_worker_mixin_delegates_native_method_adapter_to_worker_module():
         assert not hasattr(OmniWorkerMixin, helper_name)
 
 
+def test_worker_rejects_incomplete_native_duplex_provider_contract():
+    class _OpenOnlyTarget:
+        def open_duplex_session(self, **kwargs):
+            return {"opened": kwargs["session_id"]}
+
+    worker = _Worker(SimpleNamespace(), native_duplex_target=_OpenOnlyTarget())
+
+    result = worker.open_duplex_session_async(
+        "sid-incomplete-provider",
+        epoch=0,
+        capabilities={"implementation_level": "model_native_duplex"},
+        session_config={},
+    )
+
+    assert result["supported"] is False
+    assert "missing required methods" in result["error"]
+    assert "append_duplex_input" in result["error"]
+    assert "signal_duplex_turn" in result["error"]
+    assert "close_duplex_session" in result["error"]
+
+
+def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    with pytest.raises(ValueError, match="invalid native duplex ref_audio_data"):
+        MiniCPMO45Stage0DuplexRuntime._decode_ref_audio_from_session_config(
+            {
+                "extra_body": {
+                    "ref_audio_data": "a",
+                    "ref_audio_format": "pcm_f32le",
+                }
+            }
+        )
+
+
 def test_minicpmo_stage0_runtime_generates_tts_handoff_from_loaded_stage(monkeypatch):
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -764,7 +593,7 @@ def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
 
 
 def test_minicpmo_stage0_decode_uses_runner_sampled_token():
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -781,7 +610,7 @@ def test_minicpmo_stage0_decode_uses_runner_sampled_token():
 
 
 def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -818,7 +647,7 @@ def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
 
 
 def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -854,7 +683,7 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -914,10 +743,10 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     assert result["prompt_suffix_len"] == 0
 
 
-def test_minicpmo_stage0_data_plane_new_speech_reinjects_previous_listen():
+def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -969,7 +798,6 @@ def test_minicpmo_stage0_data_plane_new_speech_reinjects_previous_listen():
         state,
         np.zeros(4, dtype=np.float32),
         seq=2,
-        new_speech=True,
     )
 
     assert result["success"] is True
@@ -982,7 +810,7 @@ def test_minicpmo_stage0_data_plane_new_speech_reinjects_previous_listen():
 def test_minicpmo_stage0_data_plane_new_user_turn_inserts_official_prefix_after_unit_close():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1034,7 +862,6 @@ def test_minicpmo_stage0_data_plane_new_user_turn_inserts_official_prefix_after_
         state,
         np.zeros(4, dtype=np.float32),
         seq=2,
-        new_speech=True,
         new_user_turn=True,
     )
 
@@ -1051,7 +878,7 @@ def test_minicpmo_stage0_data_plane_new_user_turn_uses_clean_done_prefix_variant
     from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
         MiniCPMO45DuplexPolicy,
     )
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1103,7 +930,6 @@ def test_minicpmo_stage0_data_plane_new_user_turn_uses_clean_done_prefix_variant
         state,
         np.zeros(4, dtype=np.float32),
         seq=2,
-        new_speech=True,
         new_user_turn=True,
         new_user_turn_prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
     )
@@ -1118,7 +944,7 @@ def test_minicpmo_stage0_data_plane_new_user_turn_preserves_audio_cache():
     from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
         MiniCPMO45DuplexPolicy,
     )
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1174,7 +1000,6 @@ def test_minicpmo_stage0_data_plane_new_user_turn_preserves_audio_cache():
         state,
         np.zeros(4, dtype=np.float32),
         seq=2,
-        new_speech=True,
         new_user_turn=True,
         new_user_turn_prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
     )
@@ -1187,7 +1012,7 @@ def test_minicpmo_stage0_data_plane_new_user_turn_preserves_audio_cache():
 def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1262,7 +1087,7 @@ def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit(
 def test_minicpmo_stage0_context_window_preserves_system_prefix_and_recent_context():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1289,7 +1114,7 @@ def test_minicpmo_stage0_context_window_preserves_system_prefix_and_recent_conte
 def test_minicpmo_stage0_prefill_rolls_back_context_when_runner_forward_fails():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1350,7 +1175,7 @@ def test_minicpmo_stage0_prefill_rolls_back_context_when_runner_forward_fails():
 def test_minicpmo_stage0_open_requires_runner_context_by_default(monkeypatch):
     import pytest
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -1369,7 +1194,7 @@ def test_minicpmo_stage0_open_requires_runner_context_by_default(monkeypatch):
 def test_minicpmo_stage0_forward_prefers_runner_context_hook():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1426,7 +1251,7 @@ def test_minicpmo_stage0_forward_prefers_runner_context_hook():
 def test_minicpmo_stage0_forward_appends_only_new_embeds_to_runner_kv():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1483,7 +1308,7 @@ def test_minicpmo_stage0_forward_rejects_runner_without_scheduler_kv_metadata():
     import pytest
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1526,7 +1351,7 @@ def test_minicpmo_stage0_decode_requires_runner_sampled_token():
     import pytest
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1548,7 +1373,7 @@ def test_minicpmo_stage0_forward_rejects_unscheduled_vllm_forward():
     import pytest
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1582,7 +1407,7 @@ def test_minicpmo_stage0_forward_rejects_unscheduled_vllm_forward():
 def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_embeddings_is_broken():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -1620,7 +1445,7 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
 def test_minicpmo_stage1_runtime_keys_and_resets_tts_stream_by_session():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1667,7 +1492,7 @@ def test_minicpmo_stage1_runtime_keys_and_resets_tts_stream_by_session():
 def test_minicpmo_stage1_runtime_prefers_loaded_stage_forward_over_inner_talker():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1707,7 +1532,7 @@ def test_minicpmo_stage1_runtime_prefers_loaded_stage_forward_over_inner_talker(
 def test_minicpmo_stage1_runtime_squeezes_handoff_hidden_states():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1750,7 +1575,7 @@ def test_minicpmo_stage1_runtime_rejects_legacy_direct_tts_tensor_payload():
     import pytest
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1788,7 +1613,7 @@ def test_minicpmo_stage1_runtime_accepts_omni_payload_handoff():
     import torch
 
     from vllm_omni.data_entry_keys import serialize_payload
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1836,7 +1661,7 @@ def test_minicpmo_stage1_runtime_resolves_omni_payload_ref_from_payload_store():
     import torch
 
     from vllm_omni.data_entry_keys import serialize_payload
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1872,7 +1697,7 @@ def test_minicpmo_stage1_runtime_prefers_runner_local_payload_cache_for_payload_
     import torch
 
     from vllm_omni.data_entry_keys import serialize_payload
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage1 import (
         MiniCPMO45Stage1DuplexRuntime,
     )
 
@@ -1953,472 +1778,131 @@ def test_worker_put_duplex_stage_payload_stages_runtime_payload_and_runner_cache
     assert worker.model_runner.payloads["sid:0:1:stage1"] == payload
 
 
-def test_worker_native_duplex_open_calls_model_prepare():
-    model = _NativeDuplexModel()
-    worker = _Worker(model)
+def test_worker_native_duplex_uses_explicit_provider_lifecycle():
+    target = _ExplicitNativeDuplexTarget()
+    worker = _Worker(SimpleNamespace(), native_duplex_target=target)
 
-    result = worker.open_duplex_session_async(
-        "sid-native",
+    opened = worker.open_duplex_session_async(
+        "sid-explicit",
         epoch=0,
         capabilities={"implementation_level": "model_native_duplex"},
         session_config={"instructions": "Be brief."},
     )
-
-    assert result["supported"] is True
-    assert result["implementation_level"] == "model_native_duplex"
-    assert model.prepared[0]["prefix_system_prompt"].startswith("<|im_start|>system\nBe brief.")
-
-
-def test_worker_native_duplex_prepare_does_not_apply_minicpm_template_by_default():
-    model = _PlainDuplexPrepareModel()
-    worker = _Worker(model)
-
-    result = worker.open_duplex_session_async(
-        "sid-native-plain",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
-    )
-
-    assert result["supported"] is True
-    assert model.prepared[0]["prefix_system_prompt"] == "Be brief."
-    assert model.prepared[0]["suffix_system_prompt"] is None
-
-
-def test_worker_native_duplex_append_pcm_audio_runs_prefill_generate_finalize():
-    model = _NativeDuplexModel()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-native",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
-    )
-    pcm = np.zeros(16000, dtype=np.float32)
-    payload = {
-        "type": "audio",
-        "audio": base64.b64encode(pcm.tobytes()).decode("ascii"),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "force_listen": True,
-    }
-
-    result = worker.append_duplex_input_async(
-        "sid-native",
+    appended = worker.append_duplex_input_async(
+        "sid-explicit",
         epoch=0,
         seq=1,
         mode="append_audio_chunk",
-        payload=payload,
+        payload={"audio": "AAAA", "format": "pcm_f32le"},
         final=False,
     )
-
-    assert result["supported"] is True
-    assert result["native_result"]["is_listen"] is True
-    assert result["native_result"]["kv_cache_length"] == 321
-    assert model.prefills == [{"audio_len": 16000, "frame_list": None, "max_slice_nums": 1}]
-    assert model.generates == [{"force_listen": True}]
-    assert model.finalize_calls == 1
-
-
-def test_worker_native_duplex_close_stops_model_session():
-    model = _NativeDuplexModel()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-native",
+    signalled = worker.signal_duplex_turn_async(
+        "sid-explicit",
         epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
+        event="input.commit",
+        payload={"reason": "test"},
+    )
+    closed = worker.close_duplex_session_async(
+        "sid-explicit",
+        epoch=0,
+        reason="session_close",
     )
 
-    result = worker.close_duplex_session_async("sid-native", epoch=0, reason="session_close")
+    assert opened["supported"] is True
+    assert target.open_calls[0]["session_config"] == {"instructions": "Be brief."}
+    assert appended["native_result"]["text"] == "explicit"
+    assert appended["native_result"]["audio_data"] == base64.b64encode(
+        np.array([0.25, -0.25], dtype=np.float32).tobytes()
+    ).decode("ascii")
+    assert appended["native_result"]["cost_all_ms"] == 2.0
+    assert signalled["native_result"]["event"] == "input.commit"
+    assert closed["supported"] is True
+    assert "sid-explicit" not in worker._native_duplex_sessions()
 
-    assert result["supported"] is True
-    assert result["reason"] == "session_close"
-    assert model.stopped == [True]
 
-
-def test_worker_native_duplex_rejects_second_session_while_owned_runtime_busy():
-    model = _NativeDuplexModel()
-    worker = _Worker(model)
+def test_worker_native_duplex_rejects_second_session_while_runtime_busy():
+    target = _ExplicitNativeDuplexTarget()
+    worker = _Worker(SimpleNamespace(), native_duplex_target=target)
 
     first = worker.open_duplex_session_async(
         "sid-a",
         epoch=0,
         capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "first"},
+        session_config={},
     )
     second = worker.open_duplex_session_async(
         "sid-b",
         epoch=0,
         capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "second"},
+        session_config={},
     )
 
     assert first["supported"] is True
     assert second["supported"] is False
     assert second["reason"] == "native_duplex_session_busy"
     assert second["active_session_ids"] == ["sid-a"]
-    assert len(model.prepared) == 1
-
-
-def test_worker_native_duplex_prefill_buffering_does_not_generate_or_finalize():
-    model = _BufferingPrefillModel()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-buffering",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
-    )
-
-    result = worker.append_duplex_input_async(
-        "sid-buffering",
-        epoch=0,
-        seq=1,
-        mode="append_audio_chunk",
-        payload={
-            "type": "audio",
-            "audio": base64.b64encode(np.zeros(800, dtype=np.float32).tobytes()).decode("ascii"),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        },
-        final=False,
-    )
-
-    native = result["native_result"]
-    assert native["prefill_success"] is False
-    assert native["is_buffering"] is True
-    assert native["reason"] == "audio not enough"
-    assert model.generates == []
-    assert model.finalize_calls == 0
+    assert len(target.open_calls) == 1
 
 
 def test_worker_native_duplex_close_failure_keeps_target_for_retry():
-    model = _FailingCleanupModel()
-    worker = _Worker(model)
+    target = _ExplicitNativeDuplexTarget(fail_close=True)
+    worker = _Worker(SimpleNamespace(), native_duplex_target=target)
     worker.open_duplex_session_async(
-        "sid-cleanup-fails",
+        "sid-close-fails",
         epoch=0,
         capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
+        session_config={},
     )
 
-    result = worker.close_duplex_session_async("sid-cleanup-fails", epoch=0, reason="session_close")
+    result = worker.close_duplex_session_async(
+        "sid-close-fails",
+        epoch=0,
+        reason="session_close",
+    )
 
     assert result["supported"] is False
-    assert "cleanup failed" in result["error"]
-    assert "sid-cleanup-fails" in worker._native_duplex_sessions()
+    assert "close failed" in result["error"]
+    assert "sid-close-fails" in worker._native_duplex_sessions()
 
 
-def test_worker_native_duplex_does_not_call_as_duplex_when_owned_methods_exist():
-    model = _OwnedRuntimeMethodsModel()
-    worker = _Worker(model)
-
-    open_result = worker.open_duplex_session_async(
-        "sid-owned",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Use short answers."},
-    )
-    append_result = worker.append_duplex_input_async(
-        "sid-owned",
-        epoch=0,
-        seq=1,
-        mode="append_audio_chunk",
-        payload={
-            "type": "audio",
-            "audio": base64.b64encode(np.zeros(16000, dtype=np.float32).tobytes()).decode("ascii"),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        },
-        final=False,
-    )
-
-    assert open_result["supported"] is True
-    assert model.prepares == [
-        {
-            "system_prompt_text": "Use short answers.",
-            "ref_audio_path": None,
-            "prompt_wav_path": None,
-        }
-    ]
-    assert model.prefills == [{"audio_len": 16000, "frame_list": None, "max_slice_nums": 1}]
-    assert model.generates == [{"force_listen": False}]
-    assert append_result["native_result"]["text"] == "owned"
-
-
-def test_worker_native_duplex_rejects_ref_audio_path_from_session_config():
-    model = _AsDuplexRaisesModel()
-    worker = _Worker(model)
+def test_worker_native_duplex_rejects_ref_audio_path_before_open():
+    target = _ExplicitNativeDuplexTarget()
+    worker = _Worker(SimpleNamespace(), native_duplex_target=target)
 
     result = worker.open_duplex_session_async(
         "sid-untrusted-ref",
         epoch=0,
         capabilities={"implementation_level": "model_native_duplex"},
-        session_config={
-            "instructions": "Use short answers.",
-            "extra_body": {"ref_audio_path": "/tmp/ref.wav"},
-        },
+        session_config={"extra_body": {"ref_audio_path": "/tmp/ref.wav"}},
     )
 
     assert result["supported"] is False
     assert "ref_audio_path is not accepted" in result["error"]
-    assert model.prepares == []
+    assert target.open_calls == []
 
 
-def test_worker_native_duplex_rejects_generic_prepare_prefill_generate_without_opt_in():
-    model = _AsDuplexRaisesModel()
-    worker = _Worker(model)
-
-    result = worker.open_duplex_session_async(
-        "sid-generic-methods",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Use short answers."},
-    )
-
-    assert result["supported"] is False
-    assert "requires open_duplex_session or explicit native duplex methods" in result["error"]
-    assert model.prepares == []
-
-
-def test_worker_native_duplex_uses_owned_prepare_prefill_generate_without_official_wrapper():
-    model = _OwnedRuntimeMethodsModel()
-    worker = _Worker(model)
-
-    open_result = worker.open_duplex_session_async(
-        "sid-owned-direct",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Use short answers."},
-    )
-
-    assert open_result["supported"] is True
-    assert model.prepares[0]["system_prompt_text"] == "Use short answers."
-
-
-def test_worker_native_duplex_barge_in_break_is_cleared_before_next_append():
-    model = _BreakableOwnedModel()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-owned-barge",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Use short answers."},
-    )
-
-    signal_result = worker.signal_duplex_turn_async(
-        "sid-owned-barge",
-        epoch=0,
-        event="barge_in",
-        payload={"reason": "test"},
-    )
-    append_result = worker.append_duplex_input_async(
-        "sid-owned-barge",
-        epoch=1,
-        seq=1,
-        mode="append_audio_chunk",
-        payload={
-            "type": "audio",
-            "audio": base64.b64encode(np.zeros(16000, dtype=np.float32).tobytes()).decode("ascii"),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        },
-        final=False,
-    )
-
-    assert signal_result["supported"] is True
-    assert append_result["supported"] is True
-    assert model.prefill_break_states == [False]
-
-
-def test_worker_native_duplex_signal_falls_back_to_loaded_model_signal():
+def test_worker_native_duplex_does_not_fall_back_to_loaded_model_signal():
     class _SignalModel:
-        model_stage = "tts"
-
         def __init__(self):
             self.signals = []
 
         def signal_duplex_turn(self, **kwargs):
             self.signals.append(kwargs)
-            return {"supported": True, "stage_role": "tts"}
+            return {"event": kwargs["event"]}
 
     model = _SignalModel()
-    worker = _Worker(model)
+    worker = _Worker(model, native_duplex_target=None)
 
     result = worker.signal_duplex_turn_async(
-        "sid-stage-model",
+        "sid-no-session",
         epoch=2,
-        event="barge_in",
+        event="input.cancel",
         payload={"reason": "test"},
     )
 
-    assert result["supported"] is True
-    assert result["implementation_level"] == "model_native_duplex_model_signal"
-    assert model.signals == [
-        {
-            "session_id": "sid-stage-model",
-            "epoch": 2,
-            "event": "barge_in",
-            "payload": {"reason": "test"},
-        }
-    ]
-
-
-def test_worker_native_duplex_rejects_as_duplex_only_model():
-    model = _AsDuplexModel()
-    worker = _Worker(model)
-    result = worker.open_duplex_session_async(
-        "sid-streaming",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
-    )
-
     assert result["supported"] is False
-    assert model.duplex.prefills == []
-    assert model.duplex.generates == []
-
-
-def test_worker_native_duplex_supports_official_view_methods_and_normalizes_audio():
-    model = _OfficialDuplexView()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-official",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Use short answers."},
-    )
-    pcm = np.zeros(16000, dtype=np.float32)
-
-    result = worker.append_duplex_input_async(
-        "sid-official",
-        epoch=0,
-        seq=1,
-        mode="append_audio_chunk",
-        payload={
-            "type": "audio",
-            "audio": base64.b64encode(pcm.tobytes()).decode("ascii"),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-            "force_listen": True,
-        },
-        final=False,
-    )
-
-    assert model.prepares == [
-        {
-            "system_prompt_text": "Use short answers.",
-            "ref_audio_path": None,
-            "prompt_wav_path": None,
-        }
-    ]
-    assert model.prefills == [{"audio_len": 16000, "frame_list": None, "max_slice_nums": 1}]
-    assert model.generates == [{"force_listen": True}]
-    assert model.finalize_calls == 1
-    native = result["native_result"]
-    assert native["audio_data"] == base64.b64encode(np.array([0.25, -0.25], dtype=np.float32).tobytes()).decode("ascii")
-    assert native["cost_llm_ms"] == 1.0
-    assert native["cost_all_ms"] == 2.0
-    assert "audio_waveform" not in native
-
-
-def test_worker_native_duplex_close_calls_official_cleanup():
-    model = _OfficialDuplexView()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-official-cleanup",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={"instructions": "Be brief."},
-    )
-
-    result = worker.close_duplex_session_async("sid-official-cleanup", epoch=0, reason="context_full")
-
-    assert result["supported"] is True
-    assert model.stop_calls == 1
-    assert model.cleanup_calls == 1
-
-
-def test_worker_native_duplex_passes_session_generate_params():
-    model = _ConfigurableOfficialDuplexView()
-    worker = _Worker(model)
-    worker.open_duplex_session_async(
-        "sid-official-config",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={
-            "instructions": "Be brief.",
-            "extra_body": {
-                "listen_prob_scale": 0.0,
-                "listen_top_k": 0,
-                "max_new_speak_tokens_per_chunk": 3,
-                "temperature": 0.1,
-                "top_k": 5,
-                "top_p": 0.3,
-                "min_new_speak_tokens_before_chunk_boundary": 9,
-                "text_repetition_penalty": 1.2,
-                "text_repetition_window_size": 64,
-            },
-        },
-    )
-
-    result = worker.append_duplex_input_async(
-        "sid-official-config",
-        epoch=0,
-        seq=1,
-        mode="append_audio_chunk",
-        payload={
-            "type": "audio",
-            "audio": base64.b64encode(np.zeros(16000, dtype=np.float32).tobytes()).decode("ascii"),
-            "format": "pcm_f32le",
-            "sample_rate_hz": 16000,
-        },
-        final=False,
-    )
-
-    assert result["native_result"]["text"] == "configured"
-    assert model.generates == [
-        {
-            "force_listen": False,
-            "max_new_speak_tokens_per_chunk": 3,
-            "temperature": 0.1,
-            "top_k": 5,
-            "top_p": 0.3,
-            "listen_prob_scale": 0.0,
-            "listen_top_k": 0,
-            "min_new_speak_tokens_before_chunk_boundary": 9,
-            "text_repetition_penalty": 1.2,
-            "text_repetition_window_size": 64,
-        }
-    ]
-
-
-def test_worker_native_duplex_official_prepare_uses_resolved_ref_audio_payload():
-    model = _OfficialPrefixDuplexView()
-    worker = _Worker(model)
-    ref_audio = np.array([0.1, -0.1], dtype=np.float32)
-
-    result = worker.open_duplex_session_async(
-        "sid-official-prefix",
-        epoch=0,
-        capabilities={"implementation_level": "model_native_duplex"},
-        session_config={
-            "instructions": "Use short answers.",
-            "extra_body": {
-                "ref_audio_data": base64.b64encode(ref_audio.tobytes()).decode("ascii"),
-                "ref_audio_format": "pcm_f32le",
-                "ref_audio_sample_rate_hz": 16000,
-            },
-        },
-    )
-
-    assert result["supported"] is True
-    assert len(model.prepares) == 1
-    assert model.prepares[0]["prefix_system_prompt"] == "Use short answers."
-    assert model.prepares[0]["ref_audio"] == pytest.approx(ref_audio)
-    assert model.prepares[0]["prompt_wav_path"] is None
-    assert model.prepares[0]["kwargs"] == {}
+    assert result["reason"] == "worker_duplex_signal_not_implemented"
+    assert model.signals == []
 
 
 def test_minicpmo_transformers_cache_compat_supports_legacy_indexing():
@@ -2464,7 +1948,7 @@ def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
 
 
 def test_minicpmo_stage0_short_audio_buffers_without_context_mutation():
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -2992,7 +2476,7 @@ def test_minicpmo_stage0_native_sampler_cuts_before_request_length_cap():
 def test_minicpmo_stage0_runtime_does_not_cut_at_punctuation():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -3235,7 +2719,7 @@ def test_minicpmo_stage0_native_sampler_uses_runner_duplex_rows():
 
 
 def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
