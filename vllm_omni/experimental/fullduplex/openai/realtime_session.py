@@ -13,21 +13,7 @@ from fastapi import WebSocket
 from vllm_omni.experimental.fullduplex.openai.audio import (
     convert_input_audio_with_rate,
     convert_output_audio,
-    decode_g711_alaw,
-    decode_g711_ulaw,
-    encode_g711_alaw,
-    encode_g711_ulaw,
-    resample_pcm16_mono,
-    wav_payload_to_pcm16,
 )
-
-try:
-    from audioop import alaw2lin, lin2alaw, lin2ulaw, ulaw2lin
-except ImportError:  # pragma: no cover - audioop is removed in newer Python.
-    alaw2lin = None
-    lin2alaw = None
-    lin2ulaw = None
-    ulaw2lin = None
 
 
 def _is_minicpmo45_model(model: str) -> bool:
@@ -113,26 +99,6 @@ class NativeRealtimeSessionProtocol:
         self._output_audio_format = "pcm16"
         self._overlap_silence_rms = 0.003
         self._turn_detection_create_response = False
-        audio_alias_events = query_params.get("audio_alias_events") if hasattr(query_params, "get") else None
-        if audio_alias_events is None and hasattr(query_params, "get"):
-            audio_alias_events = query_params.get("response_audio_events")
-        self._emit_response_audio_alias_events = str(
-            "true" if audio_alias_events is None else audio_alias_events
-        ).lower() not in {"0", "false", "no", "off"}
-        self._emit_legacy_audio_events = str(
-            (query_params.get("legacy_audio_events") if hasattr(query_params, "get") else None)
-            or (query_params.get("vllm_omni_legacy_events") if hasattr(query_params, "get") else None)
-            or ""
-        ).lower() in {"1", "true", "yes", "on"}
-        output_audio_events = query_params.get("output_audio_events") if hasattr(query_params, "get") else None
-        if output_audio_events is None and hasattr(query_params, "get"):
-            output_audio_events = query_params.get("vllm_omni_output_audio_events")
-        self._emit_output_audio_events = self._emit_legacy_audio_events or str(output_audio_events or "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
         self._send_realtime_json = None
         self._initial_session_update = False
         self._input_speech_started = False
@@ -485,7 +451,7 @@ class NativeRealtimeSessionProtocol:
                     )
                 )
                 return None
-            audio, fmt, sample_rate_hz = self._convert_realtime_input_audio_with_rate(
+            audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
                 audio,
                 fmt,
                 sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
@@ -772,7 +738,7 @@ class NativeRealtimeSessionProtocol:
         response_id: object,
         item: dict[str, object],
     ) -> list[dict[str, object]]:
-        payloads: list[dict[str, object]] = [
+        return [
             {
                 "type": "response.output_item.added",
                 "response_id": response_id,
@@ -780,16 +746,6 @@ class NativeRealtimeSessionProtocol:
                 "item": item,
             },
         ]
-        if self._emit_legacy_audio_events:
-            payloads.append(
-                {
-                    "type": "response.output_item.created",
-                    "response_id": response_id,
-                    "output_index": 0,
-                    "item": item,
-                }
-            )
-        return payloads
 
     @staticmethod
     def _response_content_part(*, transcript: str = "") -> dict[str, object]:
@@ -962,16 +918,6 @@ class NativeRealtimeSessionProtocol:
                 self._turn_detection_create_response = create_response
         elif "turn_detection" in session_payload and session_payload.get("turn_detection") is None:
             self._turn_detection_create_response = False
-        audio_alias_events = session_payload.get("audio_alias_events")
-        if audio_alias_events is None:
-            audio_alias_events = session_payload.get("response_audio_events")
-        if isinstance(audio_alias_events, bool):
-            self._emit_response_audio_alias_events = audio_alias_events
-        output_audio_events = session_payload.get("output_audio_events")
-        if output_audio_events is None:
-            output_audio_events = session_payload.get("vllm_omni_output_audio_events")
-        if isinstance(output_audio_events, bool):
-            self._emit_output_audio_events = output_audio_events or self._emit_legacy_audio_events
         overlap_fields = self._realtime_overlap_fields(session_payload)
         overlap_silence_rms = overlap_fields.get("overlap_silence_rms")
         if isinstance(overlap_silence_rms, int | float):
@@ -1185,208 +1131,6 @@ class NativeRealtimeSessionProtocol:
             if key in source:
                 target[key] = source[key]
 
-    @staticmethod
-    def _convert_realtime_input_audio(audio: object, fmt: object) -> tuple[object, object]:
-        audio, fmt, _ = NativeRealtimeSessionProtocol._convert_realtime_input_audio_with_rate(audio, fmt)
-        return audio, fmt
-
-    @staticmethod
-    def _convert_realtime_input_audio_with_rate(
-        audio: object,
-        fmt: object,
-        *,
-        sample_rate_hz: int | float | None = None,
-        target_sample_rate_hz: int = 16000,
-    ) -> tuple[object, object, int | float | None]:
-        return convert_input_audio_with_rate(
-            audio,
-            fmt,
-            sample_rate_hz=sample_rate_hz,
-            target_sample_rate_hz=target_sample_rate_hz,
-        )
-        # Compatibility implementation retained until the legacy protocol
-        # module is removed after all callers migrate.
-        if not isinstance(audio, str) or not isinstance(fmt, str):
-            return audio, fmt, sample_rate_hz
-        normalized = fmt.lower()
-        if normalized not in {"pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"}:
-            return audio, fmt, sample_rate_hz
-        try:
-            raw = base64.b64decode(audio.strip(), validate=False)
-        except (binascii.Error, ValueError):
-            return audio, fmt, sample_rate_hz
-        if normalized == "g711_ulaw":
-            raw = ulaw2lin(raw, 2) if ulaw2lin is not None else NativeRealtimeSessionProtocol._decode_g711_ulaw(raw)
-            if not isinstance(sample_rate_hz, int | float) or sample_rate_hz <= 0:
-                sample_rate_hz = 8000
-        elif normalized == "g711_alaw":
-            raw = alaw2lin(raw, 2) if alaw2lin is not None else NativeRealtimeSessionProtocol._decode_g711_alaw(raw)
-            if not isinstance(sample_rate_hz, int | float) or sample_rate_hz <= 0:
-                sample_rate_hz = 8000
-        elif len(raw) % 2 != 0:
-            return audio, fmt, sample_rate_hz
-        if (
-            isinstance(sample_rate_hz, int | float)
-            and sample_rate_hz > 0
-            and int(sample_rate_hz) != int(target_sample_rate_hz)
-        ):
-            raw = NativeRealtimeSessionProtocol._resample_pcm16_mono(
-                raw,
-                source_rate_hz=int(sample_rate_hz),
-                target_rate_hz=int(target_sample_rate_hz),
-            )
-            sample_rate_hz = int(target_sample_rate_hz)
-        pcm16 = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-        converted = base64.b64encode(np.ascontiguousarray(pcm16, dtype="<f4").tobytes()).decode("ascii")
-        return converted, "pcm_f32le", sample_rate_hz
-
-    @staticmethod
-    def _convert_realtime_output_audio(
-        audio: str,
-        *,
-        source_fmt: str,
-        target_fmt: str,
-        source_sample_rate_hz: int | None = None,
-        target_sample_rate_hz: int | None = None,
-    ) -> tuple[str, str, int | None]:
-        return convert_output_audio(
-            audio,
-            source_fmt=source_fmt,
-            target_fmt=target_fmt,
-            source_sample_rate_hz=source_sample_rate_hz,
-            target_sample_rate_hz=target_sample_rate_hz,
-        )
-        target = target_fmt.lower()
-        if target not in {"g711_ulaw", "g711_alaw"}:
-            return audio, source_fmt, source_sample_rate_hz
-        try:
-            raw = base64.b64decode(audio, validate=False)
-        except (binascii.Error, ValueError):
-            return audio, source_fmt, source_sample_rate_hz
-        source = source_fmt.lower()
-        if source == "wav":
-            pcm_raw, wav_sample_rate_hz = NativeRealtimeSessionProtocol._wav_payload_to_pcm16(raw)
-            if pcm_raw is None:
-                return audio, source_fmt, source_sample_rate_hz
-            raw = pcm_raw
-            if source_sample_rate_hz is None:
-                source_sample_rate_hz = wav_sample_rate_hz
-        elif source not in {"pcm", "pcm16", "pcm_s16le", "s16le"}:
-            return audio, source_fmt, source_sample_rate_hz
-        if len(raw) % 2 != 0:
-            return audio, source_fmt, source_sample_rate_hz
-        target_rate = target_sample_rate_hz or 8000
-        if source_sample_rate_hz is not None:
-            raw = NativeRealtimeSessionProtocol._resample_pcm16_mono(
-                raw,
-                source_rate_hz=source_sample_rate_hz,
-                target_rate_hz=target_rate,
-            )
-        if target == "g711_ulaw":
-            encoded = lin2ulaw(raw, 2) if lin2ulaw is not None else NativeRealtimeSessionProtocol._encode_g711_ulaw(raw)
-        else:
-            encoded = lin2alaw(raw, 2) if lin2alaw is not None else NativeRealtimeSessionProtocol._encode_g711_alaw(raw)
-        return base64.b64encode(encoded).decode("ascii"), target, target_rate
-
-    @staticmethod
-    def _wav_payload_to_pcm16(raw: bytes) -> tuple[bytes | None, int | None]:
-        return wav_payload_to_pcm16(raw)
-        try:
-            import io
-            import wave
-
-            with wave.open(io.BytesIO(raw), "rb") as wav_file:
-                channels = wav_file.getnchannels()
-                sample_width = wav_file.getsampwidth()
-                sample_rate_hz = wav_file.getframerate()
-                frames = wav_file.readframes(wav_file.getnframes())
-            if sample_width != 2:
-                return None, sample_rate_hz
-            if channels <= 1:
-                return frames, sample_rate_hz
-            pcm = np.frombuffer(frames, dtype="<i2").reshape(-1, channels)
-            mono = np.mean(pcm.astype(np.float32), axis=1)
-            return np.clip(mono, -32768, 32767).astype("<i2").tobytes(), sample_rate_hz
-        except Exception:
-            return None, None
-
-    @staticmethod
-    def _resample_pcm16_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int) -> bytes:
-        return resample_pcm16_mono(
-            raw,
-            source_rate_hz=source_rate_hz,
-            target_rate_hz=target_rate_hz,
-        )
-        if source_rate_hz <= 0 or target_rate_hz <= 0 or source_rate_hz == target_rate_hz:
-            return raw
-        samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
-        if samples.size <= 1:
-            return raw
-        target_size = max(1, int(round(samples.size * target_rate_hz / source_rate_hz)))
-        source_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
-        target_x = np.linspace(0.0, 1.0, num=target_size, endpoint=True)
-        resampled = np.interp(target_x, source_x, samples)
-        return np.clip(resampled, -32768, 32767).astype("<i2").tobytes()
-
-    @staticmethod
-    def _decode_g711_ulaw(raw: bytes) -> bytes:
-        return decode_g711_ulaw(raw)
-        data = np.frombuffer(raw, dtype=np.uint8)
-        u = np.bitwise_not(data).astype(np.int16)
-        sign = u & 0x80
-        exponent = (u >> 4) & 0x07
-        mantissa = u & 0x0F
-        sample = ((mantissa << 3) + 0x84) << exponent
-        sample = sample - 0x84
-        sample = np.where(sign != 0, -sample, sample).astype("<i2")
-        return sample.tobytes()
-
-    @staticmethod
-    def _decode_g711_alaw(raw: bytes) -> bytes:
-        return decode_g711_alaw(raw)
-        data = np.bitwise_xor(np.frombuffer(raw, dtype=np.uint8), 0x55).astype(np.int16)
-        sign = data & 0x80
-        exponent = (data >> 4) & 0x07
-        mantissa = data & 0x0F
-        sample = np.where(
-            exponent == 0,
-            (mantissa << 4) + 8,
-            ((mantissa << 4) + 0x108) << (exponent - 1),
-        )
-        sample = np.where(sign != 0, sample, -sample).astype("<i2")
-        return sample.tobytes()
-
-    @staticmethod
-    def _encode_g711_ulaw(raw: bytes) -> bytes:
-        return encode_g711_ulaw(raw)
-        pcm = np.frombuffer(raw, dtype="<i2").astype(np.int32)
-        pcm = np.clip(pcm, -32635, 32635)
-        sign = np.where(pcm < 0, 0x80, 0)
-        magnitude = np.abs(pcm) + 0x84
-        exponent = np.zeros_like(magnitude)
-        for exp in range(7):
-            exponent = np.where(magnitude > (0xFF << exp), exp + 1, exponent)
-        mantissa = (magnitude >> (exponent + 3)) & 0x0F
-        encoded = np.bitwise_not(sign | (exponent << 4) | mantissa) & 0xFF
-        return encoded.astype(np.uint8).tobytes()
-
-    @staticmethod
-    def _encode_g711_alaw(raw: bytes) -> bytes:
-        return encode_g711_alaw(raw)
-        pcm = np.frombuffer(raw, dtype="<i2").astype(np.int32)
-        sign = np.where(pcm >= 0, 0x80, 0x00)
-        magnitude = np.abs(pcm)
-        exponent = np.zeros_like(magnitude)
-        for exp in range(1, 8):
-            exponent = np.where(magnitude >= (1 << (exp + 7)), exp, exponent)
-        mantissa = np.where(
-            exponent == 0,
-            (magnitude >> 4) & 0x0F,
-            (magnitude >> (exponent + 3)) & 0x0F,
-        )
-        encoded = (sign | (exponent << 4) | mantissa) ^ 0x55
-        return encoded.astype(np.uint8).tobytes()
-
     @classmethod
     def _realtime_overlap_fields(cls, session_payload: dict[str, object]) -> dict[str, object]:
         fields: dict[str, object] = {}
@@ -1493,7 +1237,7 @@ class NativeRealtimeSessionProtocol:
                 )
                 if not self._is_supported_realtime_input_format(fmt):
                     continue
-                audio, fmt, sample_rate_hz = self._convert_realtime_input_audio_with_rate(
+                audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
                     audio,
                     fmt,
                     sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
@@ -1639,41 +1383,16 @@ class NativeRealtimeSessionProtocol:
             if emit_transcript:
                 if not has_text:
                     text = ""
-                if self._emit_output_audio_events:
-                    payloads.append(
-                        {
-                            "type": "response.output_audio_transcript.delta",
-                            "response_id": response_id,
-                            "item_id": self._response_item_id(response_id),
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": text,
-                        }
-                    )
-                if self._emit_legacy_audio_events:
-                    payloads.append(
-                        {
-                            "type": "response.audio_transcript.delta",
-                            "response_id": response_id,
-                            "item_id": self._response_item_id(response_id),
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": text,
-                        }
-                    )
-                elif self._emit_response_audio_alias_events:
-                    payloads.append(
-                        {
-                            "type": "response.audio_transcript.delta",
-                            "response_id": response_id,
-                            "item_id": self._response_item_id(response_id),
-                            "output_index": 0,
-                            "content_index": 0,
-                            "delta": text,
-                        }
-                    )
-                if self._emit_legacy_audio_events:
-                    payloads.append({"type": "response.text.delta", "response_id": response_id, "delta": text})
+                payloads.append(
+                    {
+                        "type": "response.audio_transcript.delta",
+                        "response_id": response_id,
+                        "item_id": self._response_item_id(response_id),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text,
+                    }
+                )
             if event.get("end_of_turn") is True:
                 payloads.extend(self._realtime_audio_done_events(event, response_id))
                 payloads.extend(
@@ -1707,14 +1426,6 @@ class NativeRealtimeSessionProtocol:
                     "delta": text,
                 }
             )
-            if self._emit_legacy_audio_events:
-                payloads.append(
-                    {
-                        "type": "response.text.delta",
-                        "response_id": response_id,
-                        "delta": text,
-                    }
-                )
             return payloads
         if event_type == "response.done":
             response_id = event.get("response_id")
@@ -1807,14 +1518,6 @@ class NativeRealtimeSessionProtocol:
                         "item_id": item_id,
                         "content_index": 0,
                         "audio_end_ms": committed_audio_ms,
-                        "event": event,
-                    }
-                )
-            if self._emit_legacy_audio_events:
-                payloads.append(
-                    {
-                        "type": "response.cancelled",
-                        "response_id": response_id,
                         "event": event,
                     }
                 )
@@ -2294,7 +1997,7 @@ class NativeRealtimeSessionProtocol:
         target_sample_rate_hz = (
             self._output_sample_rate_hz if self._output_audio_format in {"g711_ulaw", "g711_alaw"} else None
         )
-        audio, fmt, converted_sample_rate_hz = self._convert_realtime_output_audio(
+        audio, fmt, converted_sample_rate_hz = convert_output_audio(
             audio,
             source_fmt=source_fmt,
             target_fmt=self._output_audio_format,
@@ -2323,21 +2026,6 @@ class NativeRealtimeSessionProtocol:
             self._audio_delta_response_ids.add(response_id)
             self._remember_response_audio_metadata(response_id, event)
         payloads: list[dict[str, object]] = []
-        if self._emit_output_audio_events:
-            payloads.append(
-                {
-                    "type": "response.output_audio.delta",
-                    "response_id": response_id,
-                    "item_id": item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": audio,
-                    "audio": audio,
-                    "format": fmt,
-                    **({"sample_rate_hz": int(sample_rate_hz)} if isinstance(sample_rate_hz, int | float) else {}),
-                    **({"metadata": metadata} if metadata else {}),
-                }
-            )
         if (
             isinstance(response_id, str)
             and response_id not in self._speak_response_ids
@@ -2356,20 +2044,19 @@ class NativeRealtimeSessionProtocol:
                     "metadata": event,
                 },
             )
-        if self._emit_response_audio_alias_events or self._emit_legacy_audio_events:
-            payloads.append(
-                {
-                    "type": "response.audio.delta",
-                    "response_id": response_id,
-                    "item_id": item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": audio,
-                    "format": fmt,
-                    **({"sample_rate_hz": int(sample_rate_hz)} if isinstance(sample_rate_hz, int | float) else {}),
-                    **({"metadata": metadata} if metadata else {}),
-                }
-            )
+        payloads.append(
+            {
+                "type": "response.audio.delta",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": audio,
+                "format": fmt,
+                **({"sample_rate_hz": int(sample_rate_hz)} if isinstance(sample_rate_hz, int | float) else {}),
+                **({"metadata": metadata} if metadata else {}),
+            }
+        )
         return payloads
 
     def _realtime_audio_done_events(
@@ -2387,60 +2074,26 @@ class NativeRealtimeSessionProtocol:
             return payloads
         if done_key not in self._audio_done_response_ids:
             self._audio_done_response_ids.add(done_key)
-            if self._emit_output_audio_events:
-                payloads.append(
-                    {
-                        "type": "response.output_audio.done",
-                        "response_id": response_id,
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                    }
-                )
-            if self._emit_response_audio_alias_events or self._emit_legacy_audio_events:
-                payloads.append(
-                    {
-                        "type": "response.audio.done",
-                        "response_id": response_id,
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                    }
-                )
+            payloads.append(
+                {
+                    "type": "response.audio.done",
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                }
+            )
             if transcript:
-                if self._emit_output_audio_events:
-                    payloads.append(
-                        {
-                            "type": "response.output_audio_transcript.done",
-                            "response_id": response_id,
-                            "item_id": item_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "transcript": transcript,
-                        }
-                    )
-                if self._emit_legacy_audio_events:
-                    payloads.append(
-                        {
-                            "type": "response.audio_transcript.done",
-                            "response_id": response_id,
-                            "item_id": item_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "transcript": transcript,
-                        }
-                    )
-                elif self._emit_response_audio_alias_events:
-                    payloads.append(
-                        {
-                            "type": "response.audio_transcript.done",
-                            "response_id": response_id,
-                            "item_id": item_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "transcript": transcript,
-                        }
-                    )
+                payloads.append(
+                    {
+                        "type": "response.audio_transcript.done",
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "transcript": transcript,
+                    }
+                )
         return payloads
 
     def _realtime_response_terminal_events(

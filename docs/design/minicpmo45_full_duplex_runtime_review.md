@@ -169,6 +169,14 @@ adapter. It no longer contains the model Stage0/Stage1 implementation, audio
 codecs, WebSocket actor, or Realtime schema state. Further reduction of this
 controller is possible, but is not required to replace the current engine port.
 
+The loaded-model worker boundary is an explicit provider contract. A native
+provider must implement `open_duplex_session`, `append_duplex_input`,
+`signal_duplex_turn`, and `close_duplex_session`; session open fails when any
+method is absent. The worker no longer reflects over model-local
+`prepare/prefill/generate`, guesses stop/reset/cleanup methods, or falls back to
+signalling an unrelated loaded-model object. This keeps the scheduler data-plane
+adapter as the only native MiniCPM execution path.
+
 ## 5. State Machine and Normal Turn Flow
 
 The pure reducer uses these turn phases:
@@ -284,6 +292,14 @@ response.content_part.done
 response.output_item.done
 response.done
 ```
+
+Client audio output uses one event family:
+`response.audio.delta/done` and
+`response.audio_transcript.delta/done`. The serving controller's internal
+`response.output_audio.*` events are projected at the Realtime boundary and are
+not also exposed to the client. Removed legacy/output event query and session
+switches are ignored. PCM, WAV, and G.711 conversion is implemented only in
+`openai/audio.py`.
 
 `ResponseLifecycleLedger` and per-response terminal sets make terminal events
 idempotent. `response.created` is keyed by the fenced response rather than by a
@@ -788,12 +804,13 @@ history_committed=true for all three responses
 
 The third answer was `没问题，刚才的暗号是鲸鱼。`, showing that the second
 assistant item was committed before the follow-up turn consumed history. The
-artifacts and logs for this checkpoint are:
+vLLM 0.25 rebase checkpoint committed all three response-scoped playback
+cursors and produced the same semantic follow-up. Its artifacts and logs are:
 
 ```text
-/tmp/minicpmo_e2e_overlap_response_cursor
-/tmp/remote_gpu_logs/fffabe37.log
-/tmp/remote_gpu_logs/4403e643.log
+/tmp/minicpmo_e2e_v025_rebase
+/tmp/remote_gpu_logs/7f679267.log
+/tmp/remote_gpu_logs/78a35335.log
 ```
 
 The expanded affected-test matrix, including response-scoped playback cursor,
@@ -801,9 +818,15 @@ partial-history truncation, runtime, orchestrator, output processor, MiniCPM
 adapter, Stage0/Stage1 hooks, Realtime handler, and demo gates, passed on H20:
 
 ```text
-532 passed
-/tmp/remote_gpu_logs/60bcad3a.log
+550 passed
+/tmp/remote_gpu_logs/6875d31f.log
 ```
+
+The matrix uses vLLM 0.25.0 and includes the latest-main stage-init and output
+processor tests that cover both rebase conflict resolutions. The cleanup still
+removes the ten tests that existed only to verify the deleted reflection adapter
+and worker-method fallbacks; active Stage0, Stage1, provider lifecycle,
+protocol, and E2E coverage remain in the 550-test matrix.
 
 ## 14. Reviewer Reproduction
 

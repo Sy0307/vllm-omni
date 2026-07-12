@@ -193,50 +193,7 @@ class OmniWorkerMixin:
             try:
                 from vllm_omni.experimental.fullduplex.engine.worker import as_native_result_dict
 
-                signal_fn = getattr(target, "signal_duplex_turn", None)
-                if callable(signal_fn):
-                    native = signal_fn(
-                        session_id=session_id,
-                        epoch=epoch,
-                        event=event,
-                        payload=dict(payload or {}),
-                    )
-                    return {
-                        "supported": True,
-                        "session_id": session_id,
-                        "epoch": epoch,
-                        "event": event,
-                        "payload": dict(payload or {}),
-                        "implementation_level": "model_native_duplex",
-                        "native_result": as_native_result_dict(native, target=target),
-                    }
-                if event in {"barge_in", "input.cancel", "response.cancel"}:
-                    break_fn = getattr(target, "duplex_set_break", None) or getattr(target, "set_break", None)
-                    if callable(break_fn):
-                        break_fn()
-                return {
-                    "supported": True,
-                    "session_id": session_id,
-                    "epoch": epoch,
-                    "event": event,
-                    "payload": dict(payload or {}),
-                    "implementation_level": "model_native_duplex",
-                }
-            except Exception as exc:
-                return {
-                    "supported": False,
-                    "session_id": session_id,
-                    "epoch": epoch,
-                    "event": event,
-                    "payload": dict(payload or {}),
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-        model = getattr(getattr(self, "model_runner", None), "model", None)
-        signal_fn = getattr(model, "signal_duplex_turn", None)
-        if callable(signal_fn):
-            try:
-                native = signal_fn(
+                native = target.signal_duplex_turn(
                     session_id=session_id,
                     epoch=epoch,
                     event=event,
@@ -248,8 +205,8 @@ class OmniWorkerMixin:
                     "epoch": epoch,
                     "event": event,
                     "payload": dict(payload or {}),
-                    "implementation_level": "model_native_duplex_model_signal",
-                    "native_result": native if isinstance(native, dict) else {"result": native},
+                    "implementation_level": "model_native_duplex",
+                    "native_result": as_native_result_dict(native, target=target),
                 }
             except Exception as exc:
                 return {
@@ -280,26 +237,9 @@ class OmniWorkerMixin:
         """Default worker-side duplex close hook for stages without native sessions."""
         target = self._native_duplex_sessions().get(session_id)
         if target is not None:
-            cleanup_ok = False
             try:
-                close_fn = getattr(target, "close_duplex_session", None)
-                if callable(close_fn):
-                    close_fn(session_id=session_id, epoch=epoch, reason=reason)
-                else:
-                    stop_fn = (
-                        getattr(target, "duplex_stop", None)
-                        or getattr(target, "stop", None)
-                        or getattr(target, "set_session_stop", None)
-                    )
-                    if callable(stop_fn):
-                        stop_fn()
-                    reset_fn = getattr(target, "reset_session", None)
-                    if callable(reset_fn):
-                        reset_fn()
-                cleanup_fn = getattr(target, "duplex_cleanup", None) or getattr(target, "cleanup", None)
-                if callable(cleanup_fn):
-                    cleanup_fn()
-                cleanup_ok = True
+                target.close_duplex_session(session_id=session_id, epoch=epoch, reason=reason)
+                self._native_duplex_sessions().pop(session_id, None)
                 return {
                     "supported": True,
                     "session_id": session_id,
@@ -316,9 +256,6 @@ class OmniWorkerMixin:
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 }
-            finally:
-                if cleanup_ok:
-                    self._native_duplex_sessions().pop(session_id, None)
         return {
             "supported": False,
             "session_id": session_id,

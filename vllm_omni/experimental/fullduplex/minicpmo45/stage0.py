@@ -376,7 +376,6 @@ class MiniCPMO45Stage0DuplexRuntime:
         *,
         seq: int | None = None,
         final: bool = False,
-        new_speech: bool = False,
         new_user_turn: bool = False,
         new_user_turn_prefix_variant: object = None,
     ) -> dict[str, Any]:
@@ -902,12 +901,9 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     @staticmethod
     def _decode_ref_audio_from_session_config(session_config: dict[str, Any]) -> Any | None:
-        try:
-            from vllm_omni.experimental.fullduplex.engine.worker import decode_native_ref_audio_from_config
+        from vllm_omni.experimental.fullduplex.engine.worker import decode_native_ref_audio_from_config
 
-            return decode_native_ref_audio_from_config(session_config)
-        except Exception:
-            return None
+        return decode_native_ref_audio_from_config(session_config)
 
     def _stage_ref_audio_embeddings(
         self,
