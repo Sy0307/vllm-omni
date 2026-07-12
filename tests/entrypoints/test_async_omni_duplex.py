@@ -198,6 +198,23 @@ async def test_async_omni_duplex_collect_waits_for_response_stage():
     assert outputs == [stage1_output]
 
 
+def test_async_omni_duplex_direct_output_prefers_outer_control_metadata():
+    output = OmniRequestOutput(
+        request_id="duplex-sid-e0-stage0",
+        stage_id=0,
+        request_output=SimpleNamespace(
+            outputs=[],
+            multimodal_output=SimpleNamespace(kind="processed-payload"),
+        ),
+        _multimodal_output={
+            "duplex_direct_response": True,
+            "duplex_native_decision": "listen",
+        },
+    )
+
+    assert AsyncOmni._is_direct_duplex_data_plane_response(output)
+
+
 @pytest.mark.asyncio
 async def test_async_omni_duplex_collect_wraps_raw_response_stage_output():
     app = object.__new__(AsyncOmni)

@@ -1,5 +1,6 @@
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
+    DuplexOverlapPolicy,
     DuplexSession,
     DuplexSessionConfig,
     DuplexSessionRegistry,
@@ -133,8 +134,15 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_kv_lease"] is False
     assert caps["supports_core_kv_lease"] is False
     assert caps["supports_stage_resumption"] is True
-    assert caps["supports_scheduler_native_append"] is True
+    assert caps["supports_scheduler_native_append"] is False
     assert caps["supports_core_resumable_request"] is True
     assert caps["supports_stage_connector_handoff"] is True
     assert caps["supports_audio_truncate"] is True
+    assert caps["supports_barge_in"] is False
+    assert caps["target_barge_in_latency_ms"] is None
     assert caps["stage_handoff_transport"] == "scheduler_data_plane"
+
+
+def test_duplex_overlap_policy_defaults_and_invalid_values_to_listen_only():
+    assert DuplexSessionConfig().overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
+    assert DuplexSessionConfig._normalize_overlap_policy("not-a-policy") == DuplexOverlapPolicy.LISTEN_ONLY.value

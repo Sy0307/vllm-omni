@@ -997,6 +997,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             info.get("end_of_turn") or info.get("turn_end") or meta_info.get("end_of_turn") or meta_info.get("turn_end")
         )
         turn_end = explicit_turn_end or (turn_eos_id is not None and turn_eos_id in pending_ids)
+        terminal_only_new_turn = (
+            state is None
+            and turn_end
+            and turn_eos_id is not None
+            and bool(pending_ids)
+            and all(token_id == turn_eos_id for token_id in pending_ids)
+        )
+        if terminal_only_new_turn:
+            # A model-owned empty turn can be [speak, turn_eos]. There is no
+            # spoken state to flush, so conditioning TTS on turn_eos alone
+            # would synthesize an unrelated audio-only response.
+            yield self._empty_audio_chunk(), True
+            return
         if state is None and not pending_ids:
             # No turn open and nothing new to speak: nothing to synthesize.
             yield self._empty_audio_chunk(), True

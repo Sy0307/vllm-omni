@@ -311,13 +311,13 @@ def _duplex_streaming_req_state(*, segment_finished: bool = True):
     return req_state
 
 
-def test_duplex_model_listen_segment_uses_raw_streaming_new_token_ids():
+def test_duplex_model_listen_segment_uses_raw_streaming_token_snapshot():
     req_state = _duplex_streaming_req_state()
+    req_state.streaming.segment_token_ids = [151705]
+    req_state.streaming.segment_special_token_ids = {"listen_token_id": 151705}
 
     output = SimpleNamespace(
-        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
         outputs=[SimpleNamespace()],
-        new_token_ids=[151705],
     )
 
     assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)

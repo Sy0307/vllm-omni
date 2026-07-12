@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import wave
@@ -70,6 +71,26 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
     )
 
     assert state.response_playback_sent_ms("resp-1") == 27920
+
+
+def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "session.created"})
+    for turn in range(3):
+        state.add({"type": "input_audio_buffer.speech_started", "turn": turn})
+        state.add(
+            {
+                "type": "response.listen",
+                "response": {
+                    "status": "listening",
+                    "metadata": {"model_listen": True},
+                },
+            }
+        )
+        state.add({"type": "input_audio_buffer.committed", "turn": turn})
+
+    assert state.model_policy_event_order_ok(expected_turns=3)
 
 
 def test_realtime_duplex_demo_full_turn_duration_does_not_slice_audio():
@@ -235,6 +256,18 @@ def test_realtime_duplex_demo_gate_rejects_audio_without_transcript():
     assert result["nonempty_audio_has_transcript_ok"] is False
 
 
+def test_realtime_duplex_demo_response_required_rejects_unselected_audio_only_response():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    _add_response_transcript(state, "resp-audio-only", transcript="", audio=True)
+    _add_response_transcript(state, "resp-with-text", transcript="你好", audio=True)
+
+    assert demo._all_audio_responses_have_transcript(
+        state,
+        ["resp-audio-only", "resp-with-text"],
+    ) is False
+
+
 def test_realtime_duplex_demo_gate_rejects_incomplete_model_turn_sentence():
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -249,6 +282,56 @@ def test_realtime_duplex_demo_gate_rejects_incomplete_model_turn_sentence():
     )
 
     assert result["terminal_punctuation_ok"] is False
+
+
+def test_realtime_duplex_demo_gate_accepts_short_interjection_without_punctuation():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    _add_response_transcript(state, "resp-1", transcript="哈哈")
+
+    result = demo._evaluate_transcript_integrity(
+        state,
+        ["resp-1"],
+        expected_empty_response_ids=set(),
+        require_cross_turn_independence=False,
+        require_terminal_punctuation=True,
+    )
+
+    assert result["terminal_punctuation_ok"] is True
+
+
+def test_realtime_duplex_demo_response_required_skips_audio_only_model_turn(monkeypatch):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+
+    async def fake_send_pcm16(*args, **kwargs):
+        state.add({"type": "response.created", "response": {"id": "resp-audio-only"}})
+        _add_response_transcript(state, "resp-audio-only", transcript="", audio=True)
+        state.add({"type": "response.created", "response": {"id": "resp-with-text"}})
+        _add_response_transcript(state, "resp-with-text", transcript="你好", audio=True)
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            return None
+
+    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
+
+    response_id, outcome = asyncio.run(
+        demo._send_clean_turn(
+            FakeWebSocket(),
+            state,
+            b"\x00\x00",
+            transcript="fixture",
+            duration_ms=None,
+            chunk_ms=200,
+            timeout_s=0.1,
+            require_audio=True,
+            validation_mode="response-required",
+        )
+    )
+
+    assert response_id == "resp-with-text"
+    assert outcome == "speak"
 
 
 def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):

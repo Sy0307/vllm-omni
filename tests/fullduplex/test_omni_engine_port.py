@@ -222,8 +222,12 @@ def test_resource_state_rejects_fence_regression_and_requires_explicit_fence() -
         session.bind_stage_request(0, "request")
     with pytest.raises(TypeError, match="fence"):
         session.append_input({}, mode=DuplexInputMode.APPEND_AUDIO_CHUNK)
-    with pytest.raises(TypeError, match="open_session_legacy"):
+    with pytest.raises(TypeError, match="DuplexFence"):
         manager.open_session("legacy-session")
+    with pytest.raises(TypeError, match="DuplexFence"):
+        manager.close_session("legacy-session")
+    assert not hasattr(manager, "open_session_legacy")
+    assert not hasattr(manager, "close_session_legacy")
 
 
 def test_resource_request_id_is_derived_from_fence_and_role() -> None:

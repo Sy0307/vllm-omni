@@ -95,6 +95,7 @@ class DuplexCapabilities:
     def minicpmo45_native(cls) -> DuplexCapabilities:
         return cls(
             supports_model_native_turn_policy=True,
+            supports_barge_in=False,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -103,7 +104,7 @@ class DuplexCapabilities:
             supports_core_kv_lease=False,
             supports_model_internal_state=True,
             supports_stage_resumption=True,
-            supports_scheduler_native_append=True,
+            supports_scheduler_native_append=False,
             supports_core_resumable_request=True,
             supports_stage_connector_handoff=True,
             supports_independent_io_streams=True,
@@ -119,7 +120,7 @@ class DuplexCapabilities:
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
-            target_barge_in_latency_ms=1000,
+            target_barge_in_latency_ms=None,
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -204,7 +205,7 @@ class DuplexSessionConfig:
     speed: float | None = None
     use_tts_template: bool = True
     idle_timeout_s: float = 300.0
-    overlap_policy: str = DuplexOverlapPolicy.AUTO.value
+    overlap_policy: str = DuplexOverlapPolicy.LISTEN_ONLY.value
     overlap_short_ack_ms: int = 700
     overlap_barge_in_ms: int = 1200
     overlap_silence_rms: float = 0.003
@@ -293,7 +294,7 @@ class DuplexSessionConfig:
         normalized = value.strip().lower()
         if normalized in {policy.value for policy in DuplexOverlapPolicy}:
             return normalized
-        return DuplexOverlapPolicy.AUTO.value
+        return DuplexOverlapPolicy.LISTEN_ONLY.value
 
     @staticmethod
     def _normalize_playback_commit_policy(value: str) -> str:

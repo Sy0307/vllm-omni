@@ -9,7 +9,6 @@ import os
 import time
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -84,299 +83,6 @@ def should_enable_duplex_endpoint(
         except Exception as exc:
             logger.warning("Failed to inspect duplex session_mode from %s: %s", config_path, exc)
     return False
-
-
-@dataclass
-class DuplexAppendTaskMeta:
-    epoch: int
-    mode: str
-    final: bool
-    response_bound: bool
-
-
-@dataclass
-class LegacyDuplexSessionActor:
-    """Session-scoped actor state for duplex websocket execution.
-
-    This owns the queues and background tasks that make input, output, and
-    control independently cancellable at the serving layer. Core KV lease is
-    intentionally not modeled here; scheduler/KV ownership remains in the
-    engine runner.
-    """
-
-    websocket: WebSocket
-    output_queue: asyncio.Queue[dict[str, object] | None] = field(default_factory=asyncio.Queue)
-    input_queue: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
-    control_queue: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
-    event_queue: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
-    session: DuplexSession | None = None
-    outbound_protocol: NativeRealtimeSessionProtocol | None = None
-    native_append_tasks: dict[asyncio.Task[None], DuplexAppendTaskMeta] = field(default_factory=dict)
-    active_response_task: asyncio.Task[None] | None = None
-    runtime_opened: bool = False
-    runtime_closed: bool = False
-    closing: bool = False
-    lifecycle_state: str = "opening"
-    close_reason: str | None = None
-    stale_output_dropped: int = 0
-    control_events_seen: int = 0
-    input_events_seen: int = 0
-    cancel_count: int = 0
-    overlap_speech_ms: int = 0
-    last_response_id: str | None = None
-    _next_event_seq: int = 0
-    _deferred_events: list[dict[str, object]] = field(default_factory=list)
-
-    def transition(self, state: str, *, reason: str | None = None) -> None:
-        self.lifecycle_state = state
-        if reason is not None:
-            self.close_reason = reason
-        if self.session is None:
-            return
-        if state in {"closing", "closed"}:
-            self.session.mark_closing()
-        elif state == "listening":
-            self.session.turn_state = DuplexTurnState.USER_SPEAKING
-        elif state == "generating":
-            self.session.turn_state = DuplexTurnState.ASSISTANT_GENERATING
-
-    async def enqueue_event(self, event: dict[str, object]) -> None:
-        event["_duplex_actor_seq"] = self._next_event_seq
-        self._next_event_seq += 1
-        event_type = event.get("type")
-        if event_type in {"__timeout__", "__disconnect__"}:
-            self.control_events_seen += 1
-            await self.control_queue.put(event)
-        elif isinstance(event_type, str) and OmniDuplexSessionHandler._is_duplex_control_event(event_type):
-            self.control_events_seen += 1
-            await self.control_queue.put(event)
-        elif isinstance(event_type, str) and OmniDuplexSessionHandler._is_duplex_input_event(event_type):
-            self.input_events_seen += 1
-            if self.output_generation_in_flight():
-                event["_duplex_overlap_candidate"] = True
-            await self.input_queue.put(event)
-        else:
-            await self.event_queue.put(event)
-
-    def output_generation_in_flight(self) -> bool:
-        if self.session is None:
-            return False
-        if self.assistant_playback_active():
-            return True
-        if self.lifecycle_state == "generating":
-            return True
-        if self.session.active_response_id is not None or self.session.active_request_id is not None:
-            return True
-        if self.active_response_task is not None and not self.active_response_task.done():
-            return True
-        return self.has_response_bound_append_tasks()
-
-    def assistant_playback_active(self) -> bool:
-        if self.session is None:
-            return False
-        if self.session.config.playback_commit_policy != DuplexPlaybackCommitPolicy.ACK_ONLY.value:
-            return False
-        return self.session.playback.sent_ms > self.session.playback.committed_ms
-
-    async def next_event(self) -> dict[str, object]:
-        while True:
-            ready: list[tuple[int, int, dict[str, object]]] = [
-                (self._actor_event_priority(event), self._actor_event_seq(event), event)
-                for event in self._deferred_events
-            ]
-            self._deferred_events.clear()
-            for queue in (self.control_queue, self.event_queue, self.input_queue):
-                try:
-                    event = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    continue
-                ready.append((self._actor_event_priority(event), self._actor_event_seq(event), event))
-            if ready:
-                ready.sort(key=lambda item: (item[0], item[1]))
-                selected = ready[0][2]
-                self._deferred_events.extend(event for _, _, event in ready[1:])
-                selected.pop("_duplex_actor_seq", None)
-                return selected
-
-            control_task = asyncio.create_task(self.control_queue.get())
-            event_task = asyncio.create_task(self.event_queue.get())
-            input_task = asyncio.create_task(self.input_queue.get())
-            tasks = {control_task, event_task, input_task}
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            with suppress(asyncio.CancelledError):
-                await asyncio.gather(*pending)
-
-            ready = []
-            for task in (control_task, event_task, input_task):
-                if task in done:
-                    event = task.result()
-                    ready.append((self._actor_event_priority(event), self._actor_event_seq(event), event))
-            for queue in (self.control_queue, self.event_queue, self.input_queue):
-                while True:
-                    try:
-                        event = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    ready.append((self._actor_event_priority(event), self._actor_event_seq(event), event))
-            if not ready:
-                continue
-            ready.sort(key=lambda item: (item[0], item[1]))
-            selected = ready[0][2]
-            self._deferred_events.extend(event for _, _, event in ready[1:])
-            selected.pop("_duplex_actor_seq", None)
-            return selected
-
-    @staticmethod
-    def _actor_event_seq(event: dict[str, object]) -> int:
-        value = event.get("_duplex_actor_seq")
-        return int(value) if isinstance(value, int) else 0
-
-    @staticmethod
-    def _actor_event_priority(event: dict[str, object]) -> int:
-        event_type = event.get("type")
-        if event_type in {"__timeout__", "__disconnect__"}:
-            return 0
-        if event_type in {
-            "response.cancel",
-            "barge_in",
-            "input_audio_buffer.clear",
-            "output_audio_buffer.clear",
-        }:
-            return 0
-        if event_type == "input.cancel":
-            return 2
-        if event_type in {"session.close", "close_session"}:
-            return 3
-        if isinstance(event_type, str) and OmniDuplexSessionHandler._is_duplex_input_event(event_type):
-            return 2
-        if isinstance(event_type, str) and OmniDuplexSessionHandler._is_duplex_control_event(event_type):
-            return 1
-        return 1
-
-    async def send_json(self, payload: dict[str, object]) -> None:
-        await self.output_queue.put(payload)
-
-    async def writer_loop(self) -> None:
-        while True:
-            payload = await self.output_queue.get()
-            try:
-                if payload is None:
-                    return
-                raw_realtime = payload.pop("_realtime_raw", False) is True
-                if not raw_realtime and self._is_stale_model_output(payload):
-                    self.stale_output_dropped += 1
-                    continue
-                try:
-                    if raw_realtime:
-                        await self.websocket.send_json(payload)
-                    elif self.outbound_protocol is not None:
-                        for realtime_payload in self.outbound_protocol.encode_outbound_event(payload):
-                            await self.websocket.send_json(realtime_payload)
-                    else:
-                        await self.websocket.send_json(payload)
-                except (WebSocketDisconnect, RuntimeError):
-                    return
-            finally:
-                self.output_queue.task_done()
-
-    def _is_stale_model_output(self, payload: dict[str, object]) -> bool:
-        if self.session is None:
-            return False
-        event_type = payload.get("type")
-        if event_type not in {
-            "response.created",
-            "response.listen",
-            "response.speak",
-            "response.output_item.created",
-            "response.output_item.added",
-            "response.content_part.added",
-            "response.output_audio.delta",
-            "response.audio.delta",
-            "response.output_audio.done",
-            "response.audio.done",
-            "response.output_audio_transcript.delta",
-            "response.output_audio_transcript.done",
-            "response.output_text.delta",
-            "response.output_text.done",
-            "response.text.delta",
-            "response.text.done",
-            "response.message",
-            "response.output_item.done",
-            "response.content_part.done",
-            "response.done",
-            "runtime.control",
-        }:
-            return False
-        if (self.closing or self.session.state == DuplexSessionState.CLOSED) and event_type not in {
-            "response.listen",
-            "runtime.control",
-        }:
-            return True
-        epoch = payload.get("epoch")
-        return isinstance(epoch, int) and epoch != self.session.epoch
-
-    def track_append_task(
-        self,
-        task: asyncio.Task[None],
-        *,
-        epoch: int,
-        mode: str,
-        final: bool,
-        response_bound: bool,
-    ) -> None:
-        self.native_append_tasks[task] = DuplexAppendTaskMeta(
-            epoch=epoch,
-            mode=mode,
-            final=final,
-            response_bound=response_bound,
-        )
-        task.add_done_callback(self.native_append_tasks.pop)
-
-    def has_response_bound_append_tasks(self) -> bool:
-        return any(meta.response_bound for meta in self.native_append_tasks.values())
-
-    async def cancel_append_tasks(
-        self,
-        timeout_s: float = 0.25,
-        *,
-        response_bound_only: bool = False,
-    ) -> bool:
-        if not self.native_append_tasks:
-            return False
-        tasks = [
-            task for task, meta in self.native_append_tasks.items() if not response_bound_only or meta.response_bound
-        ]
-        if not tasks:
-            return False
-        for task in tasks:
-            task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            # Keep the websocket control path responsive. The task callbacks
-            # still remove completed tasks from the tracking set.
-            pass
-        return True
-
-    def drain_input_queue(self) -> int:
-        drained = 0
-        kept: list[dict[str, object]] = []
-        for event in self._deferred_events:
-            event_type = event.get("type")
-            if isinstance(event_type, str) and OmniDuplexSessionHandler._is_duplex_input_event(event_type):
-                drained += 1
-            else:
-                kept.append(event)
-        self._deferred_events = kept
-        while True:
-            try:
-                self.input_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            drained += 1
-        return drained
 
 
 DuplexSessionActor = DuplexWebSocketActor
@@ -896,6 +602,10 @@ class OmniDuplexSessionHandler:
                     )
                     continue
 
+                if event_type == "barge_in" and not session.capabilities.supports_barge_in:
+                    await send_json(self._barge_in_unsupported_error(session))
+                    continue
+
                 if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
                     cancel_reason = (
                         "output_audio_buffer_clear" if event_type == "output_audio_buffer.clear" else "barge_in"
@@ -1071,6 +781,9 @@ class OmniDuplexSessionHandler:
                 if event_type in {"turn.signal", "signal_turn"}:
                     turn_event = event.get("event")
                     if isinstance(turn_event, str):
+                        if turn_event == "barge_in" and not session.capabilities.supports_barge_in:
+                            await send_json(self._barge_in_unsupported_error(session))
+                            continue
                         if turn_event == "session.update":
                             payload = event.get("payload")
                             if not isinstance(payload, dict):
@@ -1218,6 +931,18 @@ class OmniDuplexSessionHandler:
                             }
                         )
                         continue
+                    if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
+                        await send_json(self._barge_in_unsupported_error(session))
+                        event = dict(event)
+                        event.pop("force_barge_in", None)
+                        for key in ("overlap_action", "overlap"):
+                            value = event.get(key)
+                            if isinstance(value, str) and value.strip().lower() in {
+                                "barge_in",
+                                "interrupt",
+                                "cancel",
+                            }:
+                                event.pop(key, None)
                     if event_type == "input_audio_buffer.append":
                         fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
                         default_sample_rate_hz = 16000
@@ -1944,6 +1669,8 @@ class OmniDuplexSessionHandler:
         """
         duration_ms = self._input_audio_duration_ms(event, payload)
         is_speech = self._input_looks_like_speech(event, payload, session=session)
+        if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
+            return self._defer_unsupported_barge_in(actor, duration_ms=duration_ms, is_speech=is_speech)
         explicit = event.get("overlap_action") or event.get("overlap")
         if isinstance(explicit, str):
             normalized = explicit.strip().lower()
@@ -2039,6 +1766,9 @@ class OmniDuplexSessionHandler:
                 "defer_runtime_append": True,
             }
 
+        if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value and not session.capabilities.supports_barge_in:
+            return self._defer_unsupported_barge_in(actor, duration_ms=duration_ms, is_speech=True)
+
         actor.overlap_speech_ms += max(0, duration_ms)
         if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value:
             return {
@@ -2062,6 +1792,15 @@ class OmniDuplexSessionHandler:
                 "defer_runtime_append": True,
             }
         if actor.overlap_speech_ms >= session.config.overlap_barge_in_ms:
+            if not session.capabilities.supports_barge_in:
+                return {
+                    "action": "listen",
+                    "reason": "barge_in_unsupported",
+                    "duration_ms": duration_ms,
+                    "overlap_speech_ms": actor.overlap_speech_ms,
+                    "buffer_audio": True,
+                    "defer_runtime_append": True,
+                }
             return {
                 "action": "barge_in",
                 "reason": "long_overlap_speech",
@@ -2076,6 +1815,44 @@ class OmniDuplexSessionHandler:
             "overlap_speech_ms": actor.overlap_speech_ms,
             "buffer_audio": True,
             "defer_runtime_append": True,
+        }
+
+    @staticmethod
+    def _event_requests_barge_in(event: Mapping[str, object]) -> bool:
+        if event.get("force_barge_in") is True:
+            return True
+        explicit = event.get("overlap_action") or event.get("overlap")
+        return isinstance(explicit, str) and explicit.strip().lower() in {
+            "barge_in",
+            "interrupt",
+            "cancel",
+        }
+
+    @staticmethod
+    def _defer_unsupported_barge_in(
+        actor: DuplexSessionActor,
+        *,
+        duration_ms: int,
+        is_speech: bool,
+    ) -> dict[str, object]:
+        if is_speech:
+            actor.overlap_speech_ms += max(0, duration_ms)
+        return {
+            "action": "listen",
+            "reason": "barge_in_unsupported",
+            "duration_ms": duration_ms,
+            "overlap_speech_ms": actor.overlap_speech_ms,
+            "buffer_audio": is_speech,
+            "defer_runtime_append": True,
+        }
+
+    @staticmethod
+    def _barge_in_unsupported_error(session: DuplexSession) -> dict[str, object]:
+        return {
+            "type": "error",
+            "session_id": session.session_id,
+            "code": "barge_in_unsupported",
+            "error": "Barge-in is not supported by this duplex model",
         }
 
     @staticmethod
@@ -3208,7 +2985,7 @@ class OmniDuplexSessionHandler:
             if not isinstance(model_listen, bool):
                 model_listen = native_result.get("reason") in {None, "", "model_listen"}
             response_id = session.active_response_id
-            if isinstance(data_plane_request_id, str):
+            if isinstance(data_plane_request_id, str) and not auto_response:
                 self._data_plane_terminal_request_ids.add(data_plane_request_id)
             emitted_response = True
             payload = {
@@ -3726,25 +3503,26 @@ class OmniDuplexSessionHandler:
                     native_result["audio_text_marks_are_cumulative"] = True
                 audio_results.append(native_result)
 
-            pending_audio_key = turn_cursor_key or data_plane_request_id
+            pending_audio_key = data_plane_request_id
+            turn_text_key = turn_cursor_key or data_plane_request_id
             if session is not None and self._session_auto_responds(session):
-                if delta_text and pending_audio_key is not None:
-                    self._data_plane_turns_with_text.add(pending_audio_key)
+                if delta_text and turn_text_key is not None:
+                    self._data_plane_turns_with_text.add(turn_text_key)
                 response_turn_bound = session.active_response_id is not None or (
                     session.active_response_turn_id is not None
                     and output_turn_id is not None
                     and session.active_response_turn_id == output_turn_id
                 )
-                turn_has_text = pending_audio_key is not None and pending_audio_key in self._data_plane_turns_with_text
+                turn_has_text = turn_text_key is not None and turn_text_key in self._data_plane_turns_with_text
                 if not response_turn_bound and not turn_has_text:
                     if pending_audio_key is not None:
-                        if unit_end_of_turn:
+                        if tts_segment_end:
                             self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
                         else:
                             self._data_plane_pending_audio_without_text.setdefault(pending_audio_key, []).extend(
                                 audio_results
                             )
-                    if unit_end_of_turn:
+                    if tts_segment_end:
                         terminal_result = dict(audio_results[-1])
                         terminal_result.update(
                             {
@@ -3760,10 +3538,54 @@ class OmniDuplexSessionHandler:
                     yield from self._data_plane_pending_audio_without_text.pop(pending_audio_key, [])
             yield from audio_results
             return
+        pending_audio_key = data_plane_request_id
+        turn_text_key = turn_cursor_key or data_plane_request_id
+        if (
+            session is not None
+            and self._session_auto_responds(session)
+            and pending_audio_key is not None
+            and isinstance(text, str)
+            and text
+        ):
+            pending_audio = self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
+            if pending_audio:
+                delta_text = self._data_plane_segment_text_delta(
+                    data_plane_request_id,
+                    text,
+                    turn_id=(
+                        output_turn_id
+                        if output_turn_id is not None
+                        else (session.turn_id if session is not None else None)
+                    ),
+                )
+                if delta_text:
+                    pending_audio[0]["text"] = delta_text
+                    if turn_text_key is not None:
+                        self._data_plane_turns_with_text.add(turn_text_key)
+                    total_duration_ms = sum(
+                        max(0, int(result.get("audio_duration_ms", 0) or 0)) for result in pending_audio
+                    )
+                    if total_duration_ms > 0 and not pending_audio[-1].get("audio_text_marks"):
+                        pending_audio[-1]["audio_text_marks"] = [
+                            {
+                                "text_chars": len(delta_text),
+                                "audio_end_ms": total_duration_ms,
+                            }
+                        ]
+                        pending_audio[-1]["audio_text_marks_are_cumulative"] = True
+                    if unit_end_of_turn:
+                        pending_audio[-1]["end_of_turn"] = True
+                    if tts_segment_end:
+                        pending_audio[-1]["abort_data_plane_request"] = True
+                    yield from pending_audio
+                    return
+                self._data_plane_pending_audio_without_text[pending_audio_key] = pending_audio
         if tts_segment_end:
-            pending_audio_key = turn_cursor_key or data_plane_request_id
             if unit_end_of_turn and pending_audio_key is not None:
-                self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
+                pending_audio = self._data_plane_pending_audio_without_text.get(pending_audio_key)
+                if pending_audio:
+                    pending_audio[-1]["end_of_turn"] = True
+                    pending_audio[-1]["abort_data_plane_request"] = True
             terminal_result = {
                 "supported": True,
                 "stage_role": "tts",
@@ -3815,10 +3637,27 @@ class OmniDuplexSessionHandler:
                 pending_audio_key = turn_cursor_key or data_plane_request_id
                 if pending_audio_key is not None:
                     self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
-                self._mark_auto_response_waiting_for_speech(
-                    session,
-                    prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_LISTEN_ONLY,
-                )
+                terminal_result = {
+                    "supported": True,
+                    "stage_role": "tts",
+                    "is_listen": False,
+                    "data_plane_request_id": data_plane_request_id,
+                    "text": "",
+                    "audio_data": "",
+                    "audio_format": session.config.response_format,
+                    "audio_text_mark": False,
+                    "end_of_turn": True,
+                    "abort_data_plane_request": True,
+                    "uses_model_runner_scheduler": True,
+                    "runner_kv_backed": True,
+                    "runtime_impl": "scheduler_data_plane",
+                    "owned_runtime": False,
+                    "experimental_worker_control_rpc": False,
+                    "runner_local_payload_ref": False,
+                }
+                if output_turn_id is not None:
+                    terminal_result["model_turn_id"] = output_turn_id
+                yield terminal_result
                 return
         if (
             finished

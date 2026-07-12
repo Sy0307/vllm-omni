@@ -91,17 +91,24 @@ fence fails loudly.
 Clean turns advance `turn_id` and `response_seq` while preserving `epoch`.
 Interruption advances `epoch` atomically and invalidates all prior output.
 
-### 3.3 Keep model policy out of serving
+### 3.3 Keep normal turn sampling model-owned
 
-MiniCPM-o samples native `listen` and `speak` tokens. Serving must not make the
-model speak by rewriting probabilities, forcing a token, or converting a
-`listen` decision into a response. The generic runtime performs transport and
-lifecycle operations; the MiniCPM adapter maps model outputs to typed events.
+MiniCPM-o samples native `listen` and `speak` tokens. On the validated
+`auto_response` path, serving does not make the model speak by rewriting
+probabilities, forcing a token, or converting a `listen` decision into a
+response. The generic runtime performs transport and lifecycle operations; the
+MiniCPM adapter maps model outputs to typed events.
+
+The non-auto-response short-commit and overlap compatibility paths may set
+`force_listen`. This does not rewrite the sampled token; it prevents the
+MiniCPM continuation guard from converting a sampled `listen` transition back
+to TTS BOS. It is a serving safety override, not model-native turn policy, and
+is not used as evidence for automatic barge-in support.
 
 The implementation therefore removed the successful-run dependency on:
 
 - `listen_prob_scale=0.0` as a forced-speak workaround;
-- serving-side `force_listen`/`force_speak` turn policy;
+- serving-side `force_speak` turn policy;
 - client `response.create` in `auto_response` mode;
 - punctuation or TTS segment completion as the assistant turn boundary.
 
@@ -310,8 +317,12 @@ A future VAD, model signal, or explicit client control can emit
 
 MiniCPM-o 4.5 currently exposes model-owned `listen`/`speak`, but the validated
 official loop does not provide a reliable, explicit automatic barge-in event.
-For that reason, this PR does not enable or claim automatic/VAD barge-in. The
-fencing mechanics are unit-tested infrastructure, not an E2E capability claim.
+For that reason, its capability payload reports `supports_barge_in=false` and
+`target_barge_in_latency_ms=null`. MiniCPM sessions default to `listen_only`;
+explicit `barge_in`, `turn.signal(barge_in)`, and input-side barge-in hints are
+rejected or deferred as listen input. Generic response cancellation and the
+fencing mechanics remain unit-tested infrastructure, not an E2E barge-in
+capability claim.
 
 ## 9. Engine and Scheduler Integration
 
@@ -330,16 +341,20 @@ Stage0 -> Stage1 output identity intact.
 
 This is still a compatibility implementation over current scheduler requests.
 It does not claim a core KV lease or scheduler-native append. The capability
-surface reports that distinction explicitly so callers cannot infer a stronger
-runtime guarantee from a successful demo.
+surface reports `supports_scheduler_native_append=false` while retaining
+`supports_core_resumable_request=true`, the `scheduler_data_plane` adapter
+pattern, and scheduler data-plane stage handoff. Callers therefore cannot infer
+a stronger runtime guarantee from a successful demo.
 
 The MiniCPM duplex deployment selects the synchronous AR scheduler for both
-stages. This is deliberate, not a general recommendation. Remote validation
-showed that the async scheduler path admitted overlapping lifecycle work and
-produced four responses for a three-turn scenario. The validated native
-append/drain contract currently requires deterministic synchronous scheduling
-with `active_stream_window: 1`. Async scheduling can be re-enabled only after a
-separate scheduler-level contract and E2E test prove one response per commit.
+stages. This is deliberate, not a general recommendation. The current
+resumable-request bridge requires serialized stage admission with
+`active_stream_window: 1`; the async scheduler path previously admitted
+overlapping lifecycle work that this compatibility layer could not fence
+reliably. This does not imply one response per commit. MiniCPM owns turn policy,
+and one committed input may produce `listen`, an empty terminal model turn, or
+a spoken response. Async scheduling can be re-enabled only after a separate
+scheduler-level identity and ordering contract is validated end to end.
 
 ## 10. Deploy-Config Migration
 
@@ -545,7 +560,7 @@ an unrelated remote model auto-detection test before reaching this change:
 /tmp/remote_gpu_logs/1a327e3a.log
 ```
 
-### 13.3 New deploy-config E2E
+### 13.3 Deploy-config E2E
 
 Server startup:
 
@@ -553,7 +568,7 @@ Server startup:
 /tmp/remote_gpu_logs/1db6b37e.log
 ```
 
-Three-turn E2E:
+The original three-turn response-producing fixture run was:
 
 ```text
 PASS
@@ -594,6 +609,80 @@ All three files contain intelligible Chinese speech and agree semantically with
 the protocol transcripts. This is an audio-content sanity check, not a
 large-corpus MOS or speaker-similarity claim.
 
+This is fixture-specific evidence. MiniCPM-o owns the listen/speak decision, so
+an arbitrary WAV is not guaranteed to produce one spoken response per commit.
+The current gate separates that model policy from response-required audio
+validation:
+
+- `model-policy`: every streamed input turn must receive a model `listen` or
+  `speak` decision; an all-listen run is valid if session, commit, fence, and
+  lifecycle invariants hold.
+- `response-required`: every requested turn must select a completed response
+  containing audio and transcript. Use only a pinned fixture known to produce
+  speech; this does not claim that arbitrary speech forces the model to speak.
+
+The final H20 validation at this checkpoint used the same code with profile
+logging disabled. The distinct-input model-policy run completed three commits
+as three valid `listen` outcomes, with no timeout, stale output, cancellation,
+or truncation:
+
+```text
+PASS
+/tmp/remote_gpu_logs/52b0707e.log
+turn outcomes: listen, listen, listen
+model listen events: 4
+input commits/transcriptions: 3/3
+```
+
+The earlier three-turn response-required run exposed an audio-only empty model
+turn that the gate had skipped. Whisper large-v3 decoded its 1.28-second audio
+as unrelated speech (`料汤`) while the protocol transcript was empty. The root
+cause was Stage1 starting TTS from a terminal-only `[speak, turn_eos]` handoff.
+The runtime now treats `turn_eos` as a flush only when a spoken Stage1 turn is
+already open; an empty terminal still reaches the reducer so model-turn identity
+advances, but it does not create an OpenAI response or synthesize audio.
+
+The final response-required contract is intentionally single-turn. It verifies
+that a pinned input can produce one complete, intelligible audio response; it
+does not claim that three arbitrary commits must all make the model speak:
+
+```text
+PASS
+/tmp/remote_gpu_logs/0dc85a40.log
+selected speak outcomes: 1
+response.created/done/audio.done: 1/1/1
+response.audio.delta: 12
+all_audio_responses_have_transcript: true
+transcript: 嗯，电影当中有很多的虚构情节，但是现实当中确实是有一些这样的景观，比如说冰岛，它的冰川和火山地貌就非常独特。
+artifacts: /tmp/minicpmo_e2e_pr3907_response_required_exact_final
+```
+
+The final affected regression suites passed together on the same remote H20
+checkout. They cover the async engine and runtime port, capability contract,
+MiniCPM stage input and terminal-only behavior, demo gate, and realtime duplex
+handler:
+
+```text
+225 passed
+/tmp/remote_gpu_logs/122d06f0.log
+```
+
+The no-profile server used for these runs was recorded separately:
+
+```text
+/tmp/remote_gpu_logs/2a84346e.log
+```
+
+The earlier arbitrary-input timeout was therefore not accepted as either a
+clean E2E pass or proof that the model had simply chosen to listen. It exposed
+both a contract problem and runtime loss of a real Stage0 listen decision. The
+runtime now snapshots raw segment token metadata before output processing,
+routes direct listen output without Stage1, preserves its outer duplex metadata
+through async collection, and keeps a resumable request alive after a
+pre-response listen. The `model-policy` gate verifies this observable listen
+path; `response-required` remains intentionally single-turn and
+fixture-specific.
+
 ## 14. Reviewer Reproduction
 
 ### 14.1 Start the server
@@ -610,7 +699,7 @@ python3 -m vllm_omni.entrypoints.cli.main serve \
 
 Wait for the server to report readiness before starting the client.
 
-### 14.2 Run a distinct-input scenario
+### 14.2 Run arbitrary distinct inputs under model policy
 
 ```bash
 python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
@@ -619,23 +708,65 @@ python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
   --input-wav /path/to/turn1.wav \
   --turn-input-wav /path/to/turn2.wav \
   --turn-input-wav /path/to/turn3.wav \
+  --turns 3 \
+  --turn-duration-ms 3000 \
+  --turn-duration-ms 3000 \
+  --turn-duration-ms 3000 \
   --require-distinct-inputs \
-  --require-audio \
-  --output-dir /tmp/minicpmo45_duplex_review
+  --validation-mode model-policy \
+  --output-dir /tmp/minicpmo45_duplex_model_policy
 ```
 
-The client must not send `response.create` or a force-barge-in event. Review the
-per-response WAV files in the output directory and verify:
+The client must not send `response.create` or a force-barge-in event. A turn may
+produce `response.listen` instead of `response.created`. Verify:
 
-- three unique response IDs;
-- one `response.created`, `response.audio.done`, and `response.done` per turn;
+- every input is committed and every turn reports `listen` or `speak`;
+- any created response has a symmetric terminal lifecycle;
+- no missing-fence, stale output, cancellation, truncation, timeout, or forced
+  speak fallback occurs.
+
+### 14.3 Run the pinned response-required fixture
+
+The H20 inputs used for this checkpoint are:
+
+| File | SHA256 | Source duration | Validation use |
+| --- | --- | ---: | --- |
+| `minicpmo_pr3907_jiayan_16k.wav` | `2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941` | 5469 ms | response-required, first 1400 ms; model-policy, first 3000 ms |
+| `minicpmo_bajie_4s_16k.wav` | `060eb0f848cf68628232dc34810ec75e5505abe54517dd373f2e4bb8fb66362c` | 4000 ms | model-policy, first 3000 ms |
+| `minicpmo_haimian_4s_16k.wav` | `78b173badd9908a3f5bac32c2dd0d1890612a9380397be5d885bf2214bf362f2` | 4000 ms | model-policy, first 3000 ms |
+
+Verify the hashes before running:
+
+```bash
+sha256sum turn1.wav turn2.wav turn3.wav
+
+python3 examples/online_serving/minicpmo/realtime_duplex_demo.py \
+  --url 'ws://127.0.0.1:8099/v1/realtime?duplex=1' \
+  --model openbmb/MiniCPM-o-4_5 \
+  --input-wav turn1.wav \
+  --turns 1 \
+  --require-audio \
+  --validation-mode response-required \
+  --output-dir /tmp/minicpmo45_duplex_response_required
+```
+
+Review the per-response WAV files and verify:
+
+- one selected response ID with audio and transcript;
+- all model-created responses have symmetric
+  `response.created`, `response.audio.done`, and `response.done` lifecycles;
+- every response containing audio has a non-empty transcript;
 - transcript delta concatenation equals transcript done;
 - no previous-turn suffix in the next response;
 - audio exists before done and no audio arrives after done;
 - no missing-fence, stale-guard-inert, timeout, forced-speak, or forced-listen
   fallback in the server log.
 
-### 14.3 Focused unit tests
+The transcript hints carried by this demo label test turns; they are not an ASR
+oracle. Validate generated speech separately with ASR or listening when audio
+content is part of the acceptance criteria.
+
+### 14.4 Focused unit tests
 
 ```bash
 pytest -q \
