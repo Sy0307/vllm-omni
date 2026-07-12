@@ -277,11 +277,7 @@ class DemoState:
         first_input_index = self.first_index("input_audio_buffer.speech_started")
         if first_input_index is None:
             first_input_index = commit_indices[0] if commit_indices else None
-        if (
-            first_input_index is None
-            or len(commit_indices) < expected_turns
-            or len(decision_indices) < expected_turns
-        ):
+        if first_input_index is None or len(commit_indices) < expected_turns or len(decision_indices) < expected_turns:
             return False
         return decision_indices[0] > first_input_index
 
@@ -705,6 +701,7 @@ async def _send_clean_turn(
                 continue
             return response_id
         return None
+
     await _send_pcm16(
         ws,
         _select_turn_audio(pcm16, duration_ms),
@@ -716,8 +713,7 @@ async def _send_clean_turn(
     if validation_mode == "model-policy":
         await _wait_for(
             state,
-            lambda: state.count("response.created") > before_created
-            or state.model_listen_count > before_model_listen,
+            lambda: state.count("response.created") > before_created or state.model_listen_count > before_model_listen,
             timeout_s=timeout_s,
             label=f"{transcript} model speak/listen decision",
         )
@@ -926,9 +922,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     terminal_activity_ok = state.count("response.done") > 0 or (
         validation_mode == "model-policy" and state.model_listen_count > 0
     )
-    all_audio_responses_have_transcript = validation_mode != "response-required" or _all_audio_responses_have_transcript(
-        state,
-        completed_response_ids,
+    all_audio_responses_have_transcript = (
+        validation_mode != "response-required"
+        or _all_audio_responses_have_transcript(
+            state,
+            completed_response_ids,
+        )
     )
     result = {
         "ok": terminal_activity_ok
