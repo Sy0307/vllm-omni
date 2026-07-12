@@ -26,6 +26,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45 import (
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
+from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexCommittedInput,
@@ -978,7 +979,7 @@ class OmniDuplexSessionHandler:
                         default_sample_rate_hz = None
                     sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
                     sample_rate_hz = int(sr_raw) if isinstance(sr_raw, int | float) else default_sample_rate_hz
-                    audio, fmt, sample_rate_hz = NativeRealtimeSessionProtocol._convert_realtime_input_audio_with_rate(
+                    audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
                         audio,
                         fmt,
                         sample_rate_hz=sample_rate_hz,

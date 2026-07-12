@@ -492,6 +492,41 @@ def test_native_realtime_protocol_audio_delta_preserves_sample_rate_hz():
     assert {payload["sample_rate_hz"] for payload in audio_events} == {24000}
 
 
+def test_native_realtime_protocol_ignores_removed_legacy_event_switches():
+    ws = TimedWebSocket()
+    ws.query_params = {
+        "legacy_audio_events": "true",
+        "vllm_omni_legacy_events": "true",
+        "output_audio_events": "true",
+        "vllm_omni_output_audio_events": "true",
+    }
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+
+    payloads = protocol._from_duplex_event(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp-canonical",
+            "audio": "AAAA",
+            "text": "hello",
+            "format": "pcm",
+            "sample_rate_hz": 24000,
+            "end_of_turn": True,
+        }
+    )
+
+    event_types = {payload["type"] for payload in payloads}
+    assert "response.audio.delta" in event_types
+    assert "response.audio.done" in event_types
+    assert "response.audio_transcript.delta" in event_types
+    assert "response.audio_transcript.done" in event_types
+    assert "response.output_audio.delta" not in event_types
+    assert "response.output_audio.done" not in event_types
+    assert "response.output_audio_transcript.delta" not in event_types
+    assert "response.output_audio_transcript.done" not in event_types
+    assert "response.output_item.created" not in event_types
+    assert "response.text.delta" not in event_types
+
+
 def test_native_realtime_protocol_emits_terminal_audio_transcript_events():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]

@@ -98,8 +98,7 @@ a core persistent KV lease. Stage0 may only run when the loaded vLLM model
 runner exposes a scheduler/KV-backed
 `duplex_forward_with_runner_context` hook, but that is still a model-runner
 forward boundary rather than the RFC's long-lived request lifecycle. Internal
-legacy worker-control fallback diagnostics are not emitted as public API
-fields by default.
+runtime-control diagnostics are not emitted as public API fields by default.
 
 The worker path wraps the already loaded MiniCPM-o stage model. It must not load
 a second full `AutoModel.from_pretrained(...).to("cuda")` copy for native duplex.
@@ -125,12 +124,11 @@ events include the current Realtime-style `conversation.item.added`,
 `input_audio_buffer.speech_started/stopped`,
 `input_audio_buffer.committed`, `response.created`,
 `response.output_item.added/done`, `response.content_part.added/done`,
-`response.output_audio.delta/done`, `response.audio.delta/done`,
-`response.output_audio_transcript.delta/done`, `response.done`, and
-`rate_limits.updated`. Legacy vLLM-Omni aliases such as
-`response.output_item.created`, `response.audio_transcript.*`, and
-`response.text.*` are emitted only when `legacy_audio_events=true` or
-`vllm_omni_legacy_events=true` is set.
+`response.audio.delta/done`, `response.audio_transcript.delta/done`,
+`response.done`, and `rate_limits.updated`. The internal duplex stream uses
+`response.output_audio.*` before the Realtime projection boundary, but those
+events are not exposed as a second client event family. Removed legacy query
+and session switches are ignored.
 Connections that pass `model=` in the Realtime URL open a default session
 immediately; `session.update` can then patch that session without acting as the
 first open event. Output format negotiation accepts both flat string formats
