@@ -346,6 +346,13 @@ surface reports `supports_scheduler_native_append=false` while retaining
 pattern, and scheduler data-plane stage handoff. Callers therefore cannot infer
 a stronger runtime guarantee from a successful demo.
 
+The session registry can track more than one logical session, but this
+checkpoint has no validated admission, fairness, isolation, or capacity
+contract for concurrent MiniCPM sessions. Its capability payload therefore
+reports `supports_multi_session=false` and
+`supports_multi_session_same_replica=false`. These fields can be enabled only
+after concurrent E2E coverage proves the corresponding runtime guarantees.
+
 The MiniCPM duplex deployment selects the synchronous AR scheduler for both
 stages. This is deliberate, not a general recommendation. The current
 resumable-request bridge requires serialized stage admission with
@@ -665,6 +672,14 @@ handler:
 ```text
 225 passed
 /tmp/remote_gpu_logs/122d06f0.log
+```
+
+After correcting the multi-session capability contract, the documented focused
+runtime, fence, MiniCPM adapter, stage-input, and deploy-config suites passed:
+
+```text
+274 passed
+/tmp/remote_gpu_logs/d8a2d700.log
 ```
 
 The no-profile server used for these runs was recorded separately:
