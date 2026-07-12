@@ -128,11 +128,15 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 
 try:
-    from vllm.transformers_utils.tokenizer import encode_tokens
+    from vllm.transformers_utils.tokenizer import encode_tokens as _vllm_encode_tokens
 except ImportError:
+    _vllm_encode_tokens = None
 
-    def encode_tokens(tokenizer, prompt: str) -> list[int]:
-        return tokenizer.encode(prompt, add_special_tokens=False)
+
+def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
+    if _vllm_encode_tokens is not None:
+        return _vllm_encode_tokens(tokenizer, prompt)
+    return tokenizer.encode(prompt, add_special_tokens=False)
 
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -2528,7 +2532,7 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         prefix_extra_frames: int | None = 1,
         suffix_extra_frames: int | None = 1,
         cnn_min_length: int | None = None,
-    ):
+    ) -> BaseModelOutputWithPast | tuple[Any, ...]:
         r"""
         Forward pass of the Whisper encoder.
 
@@ -3296,7 +3300,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                     tokenization_kwargs=tokenization_kwargs,
                 )
             tokenizer = self.info.get_tokenizer()
-            prompt_ids = encode_tokens(tokenizer, prompt)
+            prompt_ids = _encode_tokens(tokenizer, prompt)
         else:
             prompt_ids = self._apply_hf_processor_tokens_only(prompt)
             if use_tts:
