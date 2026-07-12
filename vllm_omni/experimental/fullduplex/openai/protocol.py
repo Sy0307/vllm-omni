@@ -339,6 +339,7 @@ class DuplexSession:
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     playback: DuplexPlaybackCursor = field(default_factory=DuplexPlaybackCursor)
+    response_playbacks: dict[str, DuplexPlaybackCursor] = field(default_factory=dict)
     history_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
     pending_history_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -455,6 +456,7 @@ class DuplexSession:
         self.last_assistant_full_message = None
         self.last_assistant_audio_text_marks.clear()
         self.playback = DuplexPlaybackCursor()
+        self.response_playbacks[self.active_response_id] = self.playback
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
         self.touch()
         return self.active_response_id
@@ -498,16 +500,49 @@ class DuplexSession:
         self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
         self.touch()
 
-    def acknowledge_playback(self, played_ms: int, committed_ms: int | None = None) -> None:
-        self.playback.acknowledge(played_ms, committed_ms)
-        self.touch()
+    def playback_for_response(self, response_id: str | None = None) -> DuplexPlaybackCursor:
+        if response_id is None:
+            return self.playback
+        playback = self.response_playbacks.get(response_id)
+        if playback is None:
+            # A restored or legacy session may not have response-scoped state.
+            # Keep its acknowledgement isolated from the active response.
+            playback = DuplexPlaybackCursor()
+            self.response_playbacks[response_id] = playback
+        return playback
 
-    def truncate_playback_commit(self, committed_ms: int) -> None:
-        self.playback.truncate_committed(committed_ms)
+    def acknowledge_playback(
+        self,
+        played_ms: int,
+        committed_ms: int | None = None,
+        *,
+        response_id: str | None = None,
+    ) -> DuplexPlaybackCursor:
+        playback = self.playback_for_response(response_id)
+        playback.acknowledge(played_ms, committed_ms)
         self.touch()
+        return playback
+
+    def truncate_playback_commit(
+        self,
+        committed_ms: int,
+        *,
+        response_id: str | None = None,
+    ) -> DuplexPlaybackCursor:
+        playback = self.playback_for_response(response_id)
+        playback.truncate_committed(committed_ms)
+        self.touch()
+        return playback
+
+    def release_response_playback(self, response_id: str | None) -> None:
+        if response_id is None or response_id == self.active_response_id:
+            return
+        self.response_playbacks.pop(response_id, None)
 
     def clear_playback_cursor(self) -> None:
         self.playback = DuplexPlaybackCursor()
+        if self.active_response_id is not None:
+            self.response_playbacks[self.active_response_id] = self.playback
         self.touch()
 
     def end_response(
@@ -552,7 +587,11 @@ class DuplexSession:
                 self.pending_history_item_audio_text_marks[item_id] = list(self.last_assistant_audio_text_marks)
             pending_audio_ms = self.pending_history_truncations_ms.pop(item_id, None)
             if pending_audio_ms is not None:
-                self.truncate_history_item(item_id, audio_end_ms=pending_audio_ms)
+                self.truncate_history_item(
+                    item_id,
+                    audio_end_ms=pending_audio_ms,
+                    playback=self._playback_for_item_id(item_id),
+                )
             self.touch()
             return
         pending_audio_ms = self.pending_history_truncations_ms.pop(item_id, None)
@@ -561,6 +600,7 @@ class DuplexSession:
                 message,
                 audio_end_ms=pending_audio_ms,
                 marks=self.assistant_audio_text_marks or self.last_assistant_audio_text_marks,
+                playback=self._playback_for_item_id(item_id),
             )
             if self._message_text_len(message) <= 0:
                 try:
@@ -594,7 +634,14 @@ class DuplexSession:
         self.touch()
         return True
 
-    def truncate_history_item(self, item_id: str, *, audio_end_ms: int) -> bool:
+    def truncate_history_item(
+        self,
+        item_id: str,
+        *,
+        audio_end_ms: int,
+        playback: DuplexPlaybackCursor | None = None,
+    ) -> bool:
+        playback = playback or self._playback_for_item_id(item_id)
         message = self.history_item_ids.get(item_id)
         if message is None:
             pending = self.pending_history_item_ids.get(item_id)
@@ -607,6 +654,7 @@ class DuplexSession:
                 message,
                 audio_end_ms=audio_end_ms,
                 marks=self.pending_history_item_audio_text_marks.get(item_id),
+                playback=playback,
             )
             if not changed or self._message_text_len(message) <= 0:
                 if changed:
@@ -628,6 +676,7 @@ class DuplexSession:
             message,
             audio_end_ms=audio_end_ms,
             marks=self.history_item_audio_text_marks.get(item_id),
+            playback=playback,
         )
         if changed and self._message_text_len(message) <= 0:
             self.history_item_ids.pop(item_id, None)
@@ -645,6 +694,7 @@ class DuplexSession:
         *,
         audio_end_ms: int,
         marks: list[DuplexAssistantAudioTextMark] | None = None,
+        playback: DuplexPlaybackCursor | None = None,
     ) -> bool:
         content = message.get("content")
         if isinstance(content, str):
@@ -652,6 +702,7 @@ class DuplexSession:
                 audio_end_ms,
                 len(content),
                 marks=marks,
+                playback=playback,
             )
             message["content"] = content[:keep_chars].rstrip()
             self.touch()
@@ -670,6 +721,7 @@ class DuplexSession:
                         audio_end_ms,
                         len(transcript),
                         marks=marks,
+                        playback=playback,
                     )
                     part["transcript"] = transcript[:keep_chars].rstrip()
                     changed = True
@@ -680,6 +732,7 @@ class DuplexSession:
                         audio_end_ms,
                         len(text),
                         marks=marks,
+                        playback=playback,
                     )
                     part["text"] = text[:keep_chars].rstrip()
                     changed = True
@@ -731,13 +784,15 @@ class DuplexSession:
         text_len: int,
         *,
         marks: list[DuplexAssistantAudioTextMark] | None = None,
+        playback: DuplexPlaybackCursor | None = None,
     ) -> int:
         if text_len <= 0:
             return 0
         audio_end_ms = max(0, int(audio_end_ms))
         marks = marks if marks is not None else self.assistant_audio_text_marks
+        playback = playback or self.playback
         if not marks:
-            sent_ms = max(1, self.playback.sent_ms, self.playback.generated_ms)
+            sent_ms = max(1, playback.sent_ms, playback.generated_ms)
             return int(text_len * max(0.0, min(1.0, audio_end_ms / sent_ms)))
         marks = sorted(
             (mark for mark in marks if mark.audio_end_ms >= 0 and mark.text_chars >= 0),
@@ -759,11 +814,16 @@ class DuplexSession:
                 return int(previous_chars + (mark_chars - previous_chars) * max(0.0, min(1.0, ratio)))
             previous_ms = mark_ms
             previous_chars = mark_chars
-        final_ms = max(self.playback.sent_ms, self.playback.generated_ms, previous_ms)
+        final_ms = max(playback.sent_ms, playback.generated_ms, previous_ms)
         if audio_end_ms >= final_ms:
             return text_len
         ratio = (audio_end_ms - previous_ms) / max(1, final_ms - previous_ms)
         return int(previous_chars + (text_len - previous_chars) * max(0.0, min(1.0, ratio)))
+
+    def _playback_for_item_id(self, item_id: str) -> DuplexPlaybackCursor | None:
+        if not item_id.startswith("item_"):
+            return None
+        return self.response_playbacks.get(item_id.removeprefix("item_"))
 
     def barge_in(self) -> int:
         self.epoch += 1

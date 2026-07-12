@@ -2378,6 +2378,135 @@ async def test_duplex_cancel_reports_playback_committed_cursor():
 
 
 @pytest.mark.asyncio
+async def test_playback_ack_response_id_selects_matching_pending_history_item():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-playback-response-id",
+        config=DuplexSessionConfig(),
+    )
+    first_item_id = "item_resp-first"
+    second_item_id = "item_resp-second"
+    session.pending_history_item_ids[first_item_id] = {
+        "role": "assistant",
+        "content": "first response",
+    }
+    session.pending_history_item_ids[second_item_id] = {
+        "role": "assistant",
+        "content": "second response",
+    }
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": "resp-second",
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    ack = next(message for message in ws.sent if message.get("type") == "playback.acknowledged")
+    assert ack["item_id"] == second_item_id
+    assert ack["history_committed"] is True
+    assert first_item_id in session.pending_history_item_ids
+    assert second_item_id not in session.pending_history_item_ids
+
+
+@pytest.mark.asyncio
+async def test_late_playback_ack_does_not_advance_new_response_cursor():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-late-playback-ack",
+        config=DuplexSessionConfig(),
+    )
+    first_response_id = session.begin_response()
+    session.append_assistant_text("first response")
+    session.mark_audio_sent(11480, text_chars=len("first response"))
+    session.end_response(commit_text=False, preserve_request=True)
+    session.register_history_item(f"item_{first_response_id}", None)
+
+    second_response_id = session.begin_response()
+    session.mark_audio_sent(2200, text_chars=len("second response"))
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": first_response_id,
+            "item_id": f"item_{first_response_id}",
+            "played_ms": 11480,
+            "committed_ms": 11480,
+        },
+        ws.send_json,
+    )
+
+    assert session.active_response_id == second_response_id
+    assert session.playback.as_dict() == {
+        "generated_ms": 2200,
+        "sent_ms": 2200,
+        "played_ms": 0,
+        "committed_ms": 0,
+    }
+    ack = next(message for message in ws.sent if message.get("type") == "playback.acknowledged")
+    assert ack["playback"] == {
+        "generated_ms": 11480,
+        "sent_ms": 11480,
+        "played_ms": 11480,
+        "committed_ms": 11480,
+    }
+    assert first_response_id not in session.response_playbacks
+    assert session.response_playbacks[second_response_id] is session.playback
+
+
+@pytest.mark.asyncio
+async def test_late_playback_ack_truncates_history_with_matching_response_cursor():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-late-playback-history",
+        config=DuplexSessionConfig(),
+    )
+    first_response_id = session.begin_response()
+    session.append_assistant_text("abcdefghij")
+    session.mark_audio_sent(1000)
+    session.end_response(commit_text=False, preserve_request=True)
+    session.register_history_item(f"item_{first_response_id}", None)
+
+    session.begin_response()
+    session.mark_audio_sent(10000)
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": first_response_id,
+            "item_id": f"item_{first_response_id}",
+            "played_ms": 500,
+            "committed_ms": 500,
+        },
+        ws.send_json,
+    )
+
+    assert session.history[-1] == {"role": "assistant", "content": "abcde"}
+    assert first_response_id in session.response_playbacks
+
+
+@pytest.mark.asyncio
 async def test_cancel_active_response_commits_only_played_assistant_history():
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)

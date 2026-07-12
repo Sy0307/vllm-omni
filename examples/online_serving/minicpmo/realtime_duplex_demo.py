@@ -317,6 +317,18 @@ class DemoState:
                 return max(0, int(sent_ms))
         return 0
 
+    def response_playback_history_committed(self, response_id: str) -> bool:
+        item_id = f"item_{response_id}"
+        for event in self.events:
+            if event.get("type") != "playback.acknowledged":
+                continue
+            payload = event.get("event")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("item_id") == item_id and payload.get("history_committed") is True:
+                return True
+        return False
+
     def response_transcript_delta(self, response_id: str) -> str:
         return "".join(
             str(event.get("delta", ""))
@@ -784,24 +796,13 @@ async def _send_clean_turn(
     )
     if not isinstance(response_id, str):
         raise TimeoutError(f"Missing response id for {transcript}")
-    played_ms = state.response_playback_sent_ms(response_id)
-    if played_ms > 0:
-        before_ack = state.playback_ack_count
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "playback.ack",
-                    "played_ms": played_ms,
-                    "committed_ms": played_ms,
-                }
-            )
-        )
-        await _wait_for(
-            state,
-            lambda: state.playback_ack_count > before_ack,
-            timeout_s=timeout_s,
-            label=f"{transcript} playback.acknowledged",
-        )
+    await _ack_response_playback(
+        ws,
+        state,
+        response_id,
+        timeout_s=timeout_s,
+        label=transcript,
+    )
     return response_id, "speak"
 
 
@@ -821,6 +822,8 @@ async def _ack_response_playback(
         json.dumps(
             {
                 "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": f"item_{response_id}",
                 "played_ms": played_ms,
                 "committed_ms": played_ms,
             }
@@ -828,9 +831,9 @@ async def _ack_response_playback(
     )
     await _wait_for(
         state,
-        lambda: state.playback_ack_count > before_ack,
+        lambda: state.playback_ack_count > before_ack and state.response_playback_history_committed(response_id),
         timeout_s=timeout_s,
-        label=f"{label} playback.acknowledged",
+        label=f"{label} playback history committed",
     )
 
 
@@ -992,8 +995,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     transcript_hints_enabled = not getattr(args, "omit_transcript_hints", False)
     realtime_input = getattr(args, "realtime_input", False)
     listen_only_overlap_ok = scenario != "listen-only-overlap"
-    if scenario == "listen-only-overlap" and args.turns != 2:
-        raise ValueError("listen-only-overlap requires --turns 2")
+    if scenario == "listen-only-overlap" and args.turns < 2:
+        raise ValueError("listen-only-overlap requires at least two turns")
 
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
         reader = asyncio.create_task(_reader(ws, state, stop))
@@ -1042,6 +1045,24 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     realtime_input=realtime_input,
                     model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                 )
+                for turn_index in range(2, len(turn_specs)):
+                    transcript, duration_ms = turn_specs[turn_index]
+                    response_id, outcome = await _send_clean_turn(
+                        ws,
+                        state,
+                        turn_pcm16[turn_index],
+                        transcript=transcript,
+                        duration_ms=duration_ms,
+                        chunk_ms=args.chunk_ms,
+                        timeout_s=args.timeout_s,
+                        require_audio=args.require_audio and (turn_index + 1) not in expected_empty_turns,
+                        validation_mode=validation_mode,
+                        send_transcript_hint=transcript_hints_enabled,
+                        realtime_input=realtime_input,
+                        model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
+                    )
+                    turn_response_ids.append(response_id)
+                    turn_outcomes.append(outcome)
             else:
                 for turn_index, (transcript, duration_ms) in enumerate(turn_specs):
                     response_id, outcome = await _send_clean_turn(
@@ -1115,6 +1136,11 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         for response_id in observed_turn_response_ids
         if response_id not in expected_empty_response_ids
     )
+    playback_history_committed_ok = all(
+        state.response_playback_history_committed(response_id)
+        for response_id in observed_turn_response_ids
+        if state.response_playback_sent_ms(response_id) > 0
+    )
     if validation_mode == "response-required":
         full_audio_response_ok = (
             len(observed_turn_response_ids) == expected_audio_turns + len(expected_empty_turns)
@@ -1165,6 +1191,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "model_speak_delta_count": state.model_speak_delta_count,
         "playback_ack_count": state.playback_ack_count,
         "playback_history_committed_count": state.playback_history_committed_count,
+        "playback_history_committed_ok": playback_history_committed_ok,
         "truncate_count": state.truncate_count,
         "input_transcription_count": state.input_transcription_count,
         "audio_marks_seen": state.audio_marks_seen,
@@ -1213,6 +1240,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and transcript_integrity["nonempty_audio_has_transcript_ok"]
         and transcript_integrity["terminal_punctuation_ok"]
         and all_audio_responses_have_transcript
+        and playback_history_committed_ok
         and listen_only_overlap_ok
         and (distinct_turn_inputs or not getattr(args, "require_distinct_inputs", False))
     )

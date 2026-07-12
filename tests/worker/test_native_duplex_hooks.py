@@ -701,6 +701,7 @@ def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_conditi
 
     class _Talker:
         _ar_last_chunk_flags = [False]
+        _ar_last_emitted_text = "你好，你有什莫想聊的吗？"
 
         def __call__(self, **kwargs):
             del kwargs
