@@ -262,10 +262,13 @@ def test_realtime_duplex_demo_response_required_rejects_unselected_audio_only_re
     _add_response_transcript(state, "resp-audio-only", transcript="", audio=True)
     _add_response_transcript(state, "resp-with-text", transcript="你好", audio=True)
 
-    assert demo._all_audio_responses_have_transcript(
-        state,
-        ["resp-audio-only", "resp-with-text"],
-    ) is False
+    assert (
+        demo._all_audio_responses_have_transcript(
+            state,
+            ["resp-audio-only", "resp-with-text"],
+        )
+        is False
+    )
 
 
 def test_realtime_duplex_demo_gate_rejects_incomplete_model_turn_sentence():
