@@ -234,6 +234,11 @@ class StreamingInputState:
     enabled: bool = False
     # Flag of segment of streaming input finished
     segment_finished: bool = False
+    # Tokens from the current raw segment boundary. The vLLM output processor
+    # does not guarantee that EngineCoreOutput.new_token_ids survives on the
+    # processed RequestOutput used by the routing layer.
+    segment_token_ids: list[int] = field(default_factory=list)
+    segment_special_token_ids: dict[str, int] = field(default_factory=dict)
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
@@ -1331,6 +1336,17 @@ class Orchestrator:
                                 if req_state is None or not req_state.streaming.enabled:
                                     continue
                                 req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                                req_state.streaming.segment_token_ids = (
+                                    self._coerce_int_list(getattr(eco, "new_token_ids", None))
+                                    if req_state.streaming.segment_finished
+                                    else []
+                                )
+                                raw_mm = self._completion_multimodal_output(eco, None)
+                                req_state.streaming.segment_special_token_ids = (
+                                    self._duplex_special_token_ids(raw_mm)
+                                    if req_state.streaming.segment_finished
+                                    else {}
+                                )
                                 if self._is_duplex_session_request(req_state) and _minicpmo45_profile_logs_enabled():
                                     logger.info(
                                         "[Orchestrator] duplex raw output: stage=%s "
@@ -1871,7 +1887,9 @@ class Orchestrator:
 
         completion = cls._first_completion(output)
         mm_output = cls._completion_multimodal_output(output, completion)
-        listen_id = cls._duplex_special_token_ids(mm_output).get("listen_token_id")
+        special_token_ids = dict(req_state.streaming.segment_special_token_ids)
+        special_token_ids.update(cls._duplex_special_token_ids(mm_output))
+        listen_id = special_token_ids.get("listen_token_id")
         if listen_id is None:
             return False
 
@@ -1895,6 +1913,8 @@ class Orchestrator:
         completion = self._first_completion(output)
         mm_output = self._completion_multimodal_output(output, completion)
         direct_mm_output = dict(mm_output) if isinstance(mm_output, dict) else {}
+        for key, value in req_state.streaming.segment_special_token_ids.items():
+            direct_mm_output.setdefault(f"meta.{key}", value)
         direct_mm_output.setdefault("duplex_direct_response", True)
         direct_mm_output.setdefault("duplex_native_decision", "listen")
         direct_mm_output.setdefault("model_listen", True)
@@ -2010,7 +2030,7 @@ class Orchestrator:
         token_ids = cls._coerce_int_list(getattr(output, "new_token_ids", None))
         if token_ids:
             return token_ids
-        return []
+        return list(req_state.streaming.segment_token_ids)
 
     @classmethod
     def _coerce_int_list(cls, value: Any) -> list[int]:

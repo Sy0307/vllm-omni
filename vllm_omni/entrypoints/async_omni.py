@@ -470,12 +470,22 @@ class AsyncOmni(EngineClient, OmniBase):
     @classmethod
     def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
         if isinstance(output, OmniRequestOutput):
+            private_mm = getattr(output, "_multimodal_output", None)
+            if isinstance(private_mm, dict) and (
+                private_mm.get("duplex_direct_response") is True
+                or private_mm.get("duplex_native_decision") in {"listen", "speak"}
+            ):
+                return private_mm
             mm_output = output.multimodal_output
             if isinstance(mm_output, dict) and mm_output:
                 return mm_output
             inner_output = getattr(output, "request_output", None)
             if inner_output is not None and inner_output is not output:
-                return cls._duplex_multimodal_output(inner_output)
+                inner_mm = cls._duplex_multimodal_output(inner_output)
+                if inner_mm:
+                    return inner_mm
+            if isinstance(private_mm, dict):
+                return private_mm
             return mm_output if isinstance(mm_output, dict) else {}
         mm_output = getattr(output, "multimodal_output", None)
         if isinstance(mm_output, dict):

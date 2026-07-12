@@ -1,11 +1,12 @@
 """End-to-end MiniCPM-o 4.5 Realtime duplex demo client.
 
 This script is intentionally scenario-based instead of a generic chat client.
-It validates the full-duplex semantics implemented by vLLM-Omni:
+It has two explicit validation contracts:
 
-1. normal audio input -> automatic audio response -> response.done,
-2. the next user turn starts only after the previous response.done,
-3. repeated clean turns keep producing independent automatic responses.
+1. ``model-policy`` accepts either a model-owned listen decision or a complete
+   spoken response for each streamed user turn;
+2. ``response-required`` uses a known fixture and requires a complete audio
+   response with an independent transcript for every requested turn.
 
 Explicit serving-side barge-in is intentionally not part of this smoke test.
 MiniCPM-o native duplex currently exposes model-owned listen/speak switching,
@@ -17,6 +18,7 @@ Run only after a MiniCPM-o 4.5 vLLM-Omni server is up:
       --url ws://localhost:8099/v1/realtime?duplex=1 \
       --model openbmb/MiniCPM-o-4_5 \
       --input-wav input_16k_mono_pcm16.wav \
+      --validation-mode model-policy \
       --output-dir /tmp/minicpmo_duplex_demo
 """
 
@@ -254,6 +256,34 @@ class DemoState:
             return False
         indices = [indices_by_type[event_type] for event_type in ordered_types]
         return indices == sorted(indices)
+
+    def model_policy_event_order_ok(self, *, expected_turns: int) -> bool:
+        if not self.events or self.events[0].get("type") != "session.created":
+            return False
+        commit_indices = [
+            index for index, event in enumerate(self.events) if event.get("type") == "input_audio_buffer.committed"
+        ]
+        decision_indices = [
+            index
+            for index, event in enumerate(self.events)
+            if event.get("type") == "response.created"
+            or (
+                event.get("type") == "response.listen"
+                and isinstance(event.get("response"), dict)
+                and isinstance(event["response"].get("metadata"), dict)
+                and event["response"]["metadata"].get("model_listen") is True
+            )
+        ]
+        first_input_index = self.first_index("input_audio_buffer.speech_started")
+        if first_input_index is None:
+            first_input_index = commit_indices[0] if commit_indices else None
+        if (
+            first_input_index is None
+            or len(commit_indices) < expected_turns
+            or len(decision_indices) < expected_turns
+        ):
+            return False
+        return decision_indices[0] > first_input_index
 
     def model_speak_before_audio_ok(self) -> bool:
         speak_index = self.first_index("response.speak")
@@ -504,7 +534,15 @@ def _reuses_previous_turn_tail(previous: str, current: str) -> bool:
 
 def _has_terminal_punctuation(text: str) -> bool:
     stripped = text.rstrip("\"'”’）)]} ")
-    return bool(stripped) and stripped[-1] in "。！？!?…"
+    return bool(stripped) and (len(stripped) <= 4 or stripped[-1] in "。！？!?…")
+
+
+def _all_audio_responses_have_transcript(state: DemoState, response_ids: list[str]) -> bool:
+    return all(
+        state.response_audio_delta_count(response_id) == 0
+        or bool(_canonical_transcript(state.response_transcript_delta(response_id)))
+        for response_id in response_ids
+    )
 
 
 def _evaluate_transcript_integrity(
@@ -652,8 +690,21 @@ async def _send_clean_turn(
     chunk_ms: int,
     timeout_s: float,
     require_audio: bool,
-) -> str:
+    validation_mode: str,
+) -> tuple[str | None, str]:
     before_created = state.count("response.created")
+    before_model_listen = state.model_listen_count
+
+    def eligible_response_id() -> str | None:
+        for response_id in state.response_ids[before_created:]:
+            if not state.response_done(response_id):
+                continue
+            if require_audio and state.response_audio_delta_count(response_id) == 0:
+                continue
+            if require_audio and not _canonical_transcript(state.response_transcript_delta(response_id)):
+                continue
+            return response_id
+        return None
     await _send_pcm16(
         ws,
         _select_turn_audio(pcm16, duration_ms),
@@ -662,13 +713,34 @@ async def _send_clean_turn(
         hints={"transcript": transcript},
     )
     await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
-    await _wait_for(
-        state,
-        lambda: state.count("response.created") > before_created,
-        timeout_s=timeout_s,
-        label=f"{transcript} response.created",
+    if validation_mode == "model-policy":
+        await _wait_for(
+            state,
+            lambda: state.count("response.created") > before_created
+            or state.model_listen_count > before_model_listen,
+            timeout_s=timeout_s,
+            label=f"{transcript} model speak/listen decision",
+        )
+        if state.count("response.created") == before_created:
+            return None, "listen"
+    else:
+        await _wait_for(
+            state,
+            lambda: state.count("response.created") > before_created,
+            timeout_s=timeout_s,
+            label=f"{transcript} response.created",
+        )
+        await _wait_for(
+            state,
+            lambda: eligible_response_id() is not None,
+            timeout_s=timeout_s,
+            label=f"{transcript} completed response",
+        )
+    response_id = (
+        eligible_response_id()
+        if validation_mode == "response-required"
+        else (state.response_ids[before_created] if len(state.response_ids) > before_created else None)
     )
-    response_id = state.response_ids[-1] if state.response_ids else None
     if require_audio:
         await _wait_for(
             state,
@@ -702,7 +774,7 @@ async def _send_clean_turn(
             timeout_s=timeout_s,
             label=f"{transcript} playback.acknowledged",
         )
-    return response_id
+    return response_id, "speak"
 
 
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
@@ -734,7 +806,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     state = DemoState()
     stop = asyncio.Event()
     output_dir = Path(args.output_dir)
-    turn_response_ids: list[str] = []
+    turn_response_ids: list[str | None] = []
+    turn_outcomes: list[str] = []
+    validation_mode = getattr(args, "validation_mode", "response-required")
 
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
         reader = asyncio.create_task(_reader(ws, state, stop))
@@ -770,7 +844,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
             turn_specs = list(zip(turn_transcripts, turn_durations, strict=True))
             for turn_index, (transcript, duration_ms) in enumerate(turn_specs):
-                response_id = await _send_clean_turn(
+                response_id, outcome = await _send_clean_turn(
                     ws,
                     state,
                     turn_pcm16[turn_index],
@@ -779,8 +853,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     chunk_ms=args.chunk_ms,
                     timeout_s=args.timeout_s,
                     require_audio=args.require_audio and (turn_index + 1) not in expected_empty_turns,
+                    validation_mode=validation_mode,
                 )
                 turn_response_ids.append(response_id)
+                turn_outcomes.append(outcome)
 
             await ws.send(json.dumps({"type": "session.close"}))
             await _wait_for(state, lambda: state.count("session.closed") > 0, timeout_s=20, label="session.closed")
@@ -794,49 +870,68 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             _write_demo_artifacts(state, output_dir, output_audio_format=args.output_audio_format)
 
     overlap_barge_in = any(decision.get("action") == "barge_in" for decision in state.overlap_decisions)
-    event_order_ok = state.event_order_ok()
+    expected_turns = max(1, args.turns)
+    event_order_ok = (
+        state.model_policy_event_order_ok(expected_turns=expected_turns)
+        if validation_mode == "model-policy"
+        else state.event_order_ok()
+    )
     input_transcription_ok = state.input_transcription_count > 0
     model_speak_event_ok = state.model_speak_before_audio_ok()
     realtime_audio_lifecycle_ok = state.count("response.audio.delta") > 0 and state.count("response.audio.done") > 0
     completed_response_ids = state.completed_response_ids()
-    expected_turns = max(1, args.turns)
+    observed_turn_response_ids = [response_id for response_id in turn_response_ids if isinstance(response_id, str)]
     expected_empty_response_ids = {
-        turn_response_ids[turn_number - 1]
+        response_id
         for turn_number in expected_empty_turns
         if turn_number <= len(turn_response_ids)
+        and isinstance((response_id := turn_response_ids[turn_number - 1]), str)
     }
     transcript_integrity = _evaluate_transcript_integrity(
         state,
-        turn_response_ids,
+        observed_turn_response_ids,
         expected_empty_response_ids=expected_empty_response_ids,
         require_cross_turn_independence=getattr(args, "require_distinct_inputs", False),
         require_terminal_punctuation=getattr(args, "require_distinct_inputs", False),
     )
     expected_audio_turns = expected_turns - len(expected_empty_turns)
     lifecycle_counts_ok = (
-        state.count("response.created") == expected_turns
-        and state.count("response.done") == expected_turns
-        and state.count("response.audio.done") == expected_audio_turns
-        and len(state.response_ids) == expected_turns
-        and len(completed_response_ids) == expected_turns
-        and len(set(completed_response_ids)) == expected_turns
+        state.count("response.created") == state.count("response.done")
+        and len(state.response_ids) == len(completed_response_ids)
+        and len(completed_response_ids) == len(set(completed_response_ids))
+        and state.count("response.audio.done") <= state.count("response.done")
+    )
+    turn_outcomes_ok = len(turn_outcomes) == expected_turns and (
+        validation_mode == "model-policy" or all(outcome == "speak" for outcome in turn_outcomes)
     )
     clean_turn_audio_ok = all(
         state.response_audio_delta_count(response_id) > 0
-        for response_id in completed_response_ids
+        for response_id in observed_turn_response_ids
         if response_id not in expected_empty_response_ids
     )
-    full_audio_response_ok = (
-        lifecycle_counts_ok
-        and clean_turn_audio_ok
-        and model_speak_event_ok
-        and state.model_speak_delta_count > 0
-        and realtime_audio_lifecycle_ok
-        and state.audio_marks_seen
-    )
+    if validation_mode == "response-required":
+        full_audio_response_ok = (
+            len(observed_turn_response_ids) == expected_audio_turns + len(expected_empty_turns)
+            and clean_turn_audio_ok
+            and model_speak_event_ok
+            and state.model_speak_delta_count > 0
+            and realtime_audio_lifecycle_ok
+            and state.audio_marks_seen
+        )
+    else:
+        full_audio_response_ok = not observed_turn_response_ids or (
+            realtime_audio_lifecycle_ok and state.model_speak_delta_count > 0
+        )
     stale_audio_delta_count = state.stale_audio_delta_count()
+    terminal_activity_ok = state.count("response.done") > 0 or (
+        validation_mode == "model-policy" and state.model_listen_count > 0
+    )
+    all_audio_responses_have_transcript = validation_mode != "response-required" or _all_audio_responses_have_transcript(
+        state,
+        completed_response_ids,
+    )
     result = {
-        "ok": state.count("response.done") > 0
+        "ok": terminal_activity_ok
         and state.count("session.closed") > 0
         and state.cancelled_count == 0
         and not overlap_barge_in
@@ -845,6 +940,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and input_transcription_ok
         and stale_audio_delta_count == 0
         and lifecycle_counts_ok
+        and turn_outcomes_ok
         and full_audio_response_ok,
         "event_counts": {
             event_type: state.count(event_type)
@@ -866,14 +962,19 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "overlap_decisions": state.overlap_decisions,
         "overlap_barge_in": overlap_barge_in,
         "event_order_ok": event_order_ok,
+        "terminal_activity_ok": terminal_activity_ok,
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
         "lifecycle_counts_ok": lifecycle_counts_ok,
+        "validation_mode": validation_mode,
+        "turn_outcomes": turn_outcomes,
+        "turn_outcomes_ok": turn_outcomes_ok,
         "clean_turn_audio_ok": clean_turn_audio_ok,
         "full_audio_response_ok": full_audio_response_ok,
         "model_speak_event_ok": model_speak_event_ok,
         "realtime_audio_lifecycle_ok": realtime_audio_lifecycle_ok,
         "stale_audio_delta_count": stale_audio_delta_count,
+        "all_audio_responses_have_transcript": all_audio_responses_have_transcript,
         "distinct_turn_inputs": distinct_turn_inputs,
         **transcript_integrity,
         "turn_inputs": [
@@ -896,6 +997,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and transcript_integrity["empty_turns_ok"]
         and transcript_integrity["nonempty_audio_has_transcript_ok"]
         and transcript_integrity["terminal_punctuation_ok"]
+        and all_audio_responses_have_transcript
         and (distinct_turn_inputs or not getattr(args, "require_distinct_inputs", False))
     )
     return result
@@ -928,6 +1030,12 @@ def parse_args() -> argparse.Namespace:
         help="Audio duration for each turn; repeat turns times. Use 0 to send the complete WAV.",
     )
     parser.add_argument("--first-turn-transcript", default="demo input speech")
+    parser.add_argument(
+        "--validation-mode",
+        choices=["model-policy", "response-required"],
+        default="response-required",
+        help="Allow model listen decisions, or require at least one response for every committed input turn.",
+    )
     parser.add_argument(
         "--require-distinct-inputs",
         action="store_true",
