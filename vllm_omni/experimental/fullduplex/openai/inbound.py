@@ -45,12 +45,16 @@ def _frame_type(frame: dict) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _extract_audio_payload(frame: dict) -> dict | None:
+def _extract_audio_payload(frame: dict, *, default_format: str = "pcm_f32le") -> dict | None:
     """Pull a ``{format, sample_rate_hz, audio}`` payload out of a client frame.
 
     Accepts the audio base64 under ``audio``/``audio_base64``/``delta`` either at
-    the top level or nested under ``input``. Format defaults to ``pcm_f32le`` and
-    sample rate to 16 kHz — the handler normalizes client audio to that before
+    the top level or nested under ``input``. When a frame carries no per-frame
+    ``format`` the session-level ``input_audio_format`` (``default_format``) is
+    used — the OpenAI realtime dialect (and the OpenBMB demo/bridge) declare the
+    input format once on ``session.update`` and omit it on every append, so a
+    pcm16 stream would otherwise be misread as ``pcm_f32le`` and decode to NaN.
+    Sample rate defaults to 16 kHz — the handler normalizes to that before
     frames reach here.
     """
     source = frame.get("input") if isinstance(frame.get("input"), dict) else frame
@@ -62,7 +66,7 @@ def _extract_audio_payload(frame: dict) -> dict | None:
             break
     if audio is None:
         return None
-    fmt = str(source.get("format", "pcm_f32le")).lower()
+    fmt = str(source.get("format", default_format)).lower()
     if fmt in _PCM16_FORMATS:
         audio = _pcm16_b64_to_f32le_b64(audio)
         if audio is None:
@@ -122,9 +126,18 @@ class RealtimeInboundAdapter:
     bump) instead, which is the FSM-native equivalent.
     """
 
-    def __init__(self, *, chunk_period_ms: int = DEFAULT_CHUNK_PERIOD_MS) -> None:
+    def __init__(
+        self,
+        *,
+        chunk_period_ms: int = DEFAULT_CHUNK_PERIOD_MS,
+        input_audio_format: str = "pcm_f32le",
+    ) -> None:
         self._buffer = MiniCPMO45PcmAppendBuffer()
         self._chunk_period_ms = chunk_period_ms
+        # Session-level input format (OpenAI realtime `session.update`): appends
+        # normally omit a per-frame format, so this is what pcm16 streams are
+        # converted from. Without it pcm16 bytes decode as float32 -> NaN.
+        self._input_audio_format = str(input_audio_format or "pcm_f32le").lower()
         self._streaming = False
 
     async def events(self, frames: AsyncIterator[dict]) -> AsyncIterator[DomainEvent]:
@@ -150,7 +163,7 @@ class RealtimeInboundAdapter:
                 return
 
     def _on_append(self, frame: dict) -> list[DomainEvent]:
-        payload = _extract_audio_payload(frame)
+        payload = _extract_audio_payload(frame, default_format=self._input_audio_format)
         if payload is None:
             return []
         chunk = self._buffer.append(payload, chunk_period_ms=self._chunk_period_ms)

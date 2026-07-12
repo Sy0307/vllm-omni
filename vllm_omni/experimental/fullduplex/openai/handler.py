@@ -77,6 +77,7 @@ class RuntimeDuplexHandler:
         *,
         session_id: str | None = None,
         session_config: dict[str, object] | None = None,
+        input_audio_format: str = "pcm_f32le",
     ) -> str:
         session_id = session_id or self._new_session_id()
         await send_json({"type": "session.created", "session": {"id": session_id}})
@@ -121,7 +122,10 @@ class RuntimeDuplexHandler:
             reduce=reduce_continuous_event,
             initial_state=ContinuousDuplexState.open(session_id),
         )
-        inbound = RealtimeInboundAdapter(chunk_period_ms=self._chunk_period_ms)
+        inbound = RealtimeInboundAdapter(
+            chunk_period_ms=self._chunk_period_ms,
+            input_audio_format=input_audio_format,
+        )
         await runtime.run(inbound.events(recv_frames))
         return session_id
 
@@ -167,6 +171,11 @@ class RuntimeDuplexHandler:
         # into the engine session config; any other leading frame is replayed
         # into the stream unchanged.
         session_config: dict[str, object] = {}
+        # OpenAI realtime declares the input encoding once on session.update; the
+        # OpenBMB demo/bridge send pcm16 appends with no per-frame format, so this
+        # session-level value drives the pcm16->f32le conversion in the inbound
+        # adapter. Missing it makes pcm16 decode as float32 -> NaN mel -> dead engine.
+        input_audio_format = "pcm_f32le"
         replay: dict | None = None
         try:
             first = await websocket.receive_json()  # type: ignore[attr-defined]
@@ -174,6 +183,9 @@ class RuntimeDuplexHandler:
             return
         if isinstance(first, dict) and (first.get("type") or first.get("event")) == "session.update":
             session = first.get("session") if isinstance(first.get("session"), dict) else {}
+            fmt = session.get("input_audio_format")
+            if isinstance(fmt, str) and fmt:
+                input_audio_format = fmt
             session_config = await self._prepare_session_config(session)
         elif isinstance(first, dict):
             replay = first
@@ -192,7 +204,12 @@ class RuntimeDuplexHandler:
         async def send_json(frame: dict[str, object]) -> None:
             await websocket.send_json(frame)  # type: ignore[attr-defined]
 
-        await self.run(recv_frames(), send_json, session_config=session_config)
+        await self.run(
+            recv_frames(),
+            send_json,
+            session_config=session_config,
+            input_audio_format=input_audio_format,
+        )
 
 
 __all__ = ["RuntimeDuplexHandler", "SendJson"]
