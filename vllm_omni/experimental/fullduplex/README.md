@@ -9,6 +9,9 @@ steps are documented in:
 
 [`docs/design/minicpmo45_full_duplex_runtime_review.md`](../../../docs/design/minicpmo45_full_duplex_runtime_review.md)
 
+The existing JoyVL integration recipe remains available at
+[`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
+
 ## Package boundaries
 
 ```text
@@ -25,7 +28,8 @@ names and audio codecs belong in `openai`.
 
 ## Scope
 
-The verified MiniCPM-o checkpoint supports model-owned listen/speak,
-auto-response, and clean multi-turn native audio streaming. Automatic/VAD
-barge-in, scheduler-native append, bounded long-session KV, and production
+The verified MiniCPM-o checkpoint supports model-owned listen/speak on the
+normal auto-response path and clean multi-turn native audio streaming. Its
+capability contract intentionally disables explicit and automatic/VAD
+barge-in. Scheduler-native append, bounded long-session KV, and production
 multi-session concurrency remain follow-up work.

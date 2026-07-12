@@ -353,7 +353,7 @@ class DuplexSessionRuntimeManager:
         session_config: dict[str, Any] | None = None,
     ) -> DuplexSessionRuntimeState:
         if not isinstance(fence, DuplexFence):
-            raise TypeError("open_session requires DuplexFence; use open_session_legacy for compatibility")
+            raise TypeError("open_session requires DuplexFence")
         if fence.session_id in self._sessions:
             raise ValueError(f"Duplex session already exists: {fence.session_id}")
         session = DuplexSessionRuntimeState(
@@ -364,10 +364,6 @@ class DuplexSessionRuntimeManager:
         )
         self._sessions[fence.session_id] = session
         return session
-
-    def open_session_legacy(self, session_id: str, **kwargs: Any) -> DuplexSessionRuntimeState:
-        """Deprecated compatibility path for callers without typed identity."""
-        return self.open_session(DuplexFence(session_id), **kwargs)
 
     def get(self, session_id: str) -> DuplexSessionRuntimeState | None:
         return self._sessions.get(session_id)
@@ -380,16 +376,11 @@ class DuplexSessionRuntimeManager:
 
     def close_session(self, fence: DuplexFence) -> DuplexSessionRuntimeState | None:
         if not isinstance(fence, DuplexFence):
-            raise TypeError("close_session requires DuplexFence; use close_session_legacy for compatibility")
+            raise TypeError("close_session requires DuplexFence")
         session = self._sessions.pop(fence.session_id, None)
         if session is not None:
             session.close(fence)
         return session
-
-    def close_session_legacy(self, session_id: str) -> DuplexSessionRuntimeState | None:
-        """Deprecated compatibility path for callers without typed identity."""
-        session = self.get(session_id)
-        return None if session is None else self.close_session(session.fence)
 
     def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]:
         request_id_set = set(request_ids)

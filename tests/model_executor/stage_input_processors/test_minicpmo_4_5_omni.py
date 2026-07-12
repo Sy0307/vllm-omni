@@ -624,6 +624,80 @@ def test_minicpmo_native_duplex_talker_turn_end_metadata_flushes_tail(monkeypatc
     assert "duplex-metadata-tail-flush" not in model._talker_consumed_tokens
 
 
+def test_minicpmo_native_duplex_terminal_only_new_turn_does_not_start_tts(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    class _FakeEmbText:
+        weight = torch.ones((200, 4), dtype=torch.float32)
+
+        def __call__(self, ids):
+            return torch.ones((ids.numel(), 4), dtype=torch.float32)
+
+    class _FakeTTS:
+        audio_bos_token_id = 1
+        config = SimpleNamespace(num_audio_tokens=128)
+        emb_text = _FakeEmbText()
+        model = SimpleNamespace(config=SimpleNamespace(rope_theta=10000.0))
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate_chunk(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return torch.tensor([[[33]]]), None
+
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    tts = _FakeTTS()
+    model.tts_obj = tts
+    model.audio_tokenizer = SimpleNamespace()
+    model._talker_turn_states = {}
+    model._talker_consumed_tokens = {}
+
+    monkeypatch.setattr(model, "_lazy_init_tts", lambda: None)
+    monkeypatch.setattr(model, "_maybe_compile_tts_model", lambda: None)
+    monkeypatch.setattr(
+        model, "_build_tts_sampling_params", lambda: SimpleNamespace(temperature=0.8, repetition_penalty=1.05)
+    )
+    monkeypatch.setattr(model, "_tts_runtime_config", lambda: SimpleNamespace(streaming_generator_chunk=25))
+    monkeypatch.setattr(model, "_resolve_prompt_wav_path", lambda ref, sr: ("/tmp/ref.wav", None))
+    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt: None)
+    monkeypatch.setattr(model, "_t2w_pre_lookahead", lambda: 5)
+    monkeypatch.setattr(
+        model,
+        "_build_tts_condition_embeds",
+        lambda ids, hidden: torch.ones((ids.numel(), 4), dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        model,
+        "_t2w_stream_window",
+        lambda token_list, prompt_wav_path, *, last_chunk: torch.tensor([float(len(token_list))]),
+    )
+
+    outputs = list(
+        model._create_native_duplex_stream_gen(
+            {
+                "request_id": "duplex-terminal-only",
+                "duplex": {"epoch": 0, "turn_id": 1},
+                "meta": {"turn_eos_token_id": 9310},
+                "ids": {"tts": [9310]},
+                "hidden_states": {"tts": [[0.1, 0.2, 0.3, 0.4]]},
+                "codes": {"ref": None},
+                "minicpmo45_native_duplex": True,
+            }
+        )
+    )
+
+    assert tts.calls == 0
+    assert len(outputs) == 1
+    assert outputs[0][0].numel() == 0
+    assert outputs[0][1] is True
+    assert model._talker_turn_states == {}
+    assert model._talker_consumed_tokens == {}
+
+
 def test_minicpmo_native_duplex_talker_finished_request_closes_session_keyed_turn_state():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
