@@ -355,14 +355,12 @@ class AsyncOmni(EngineClient, OmniBase):
         session_id: str,
         *,
         event: str,
-        payload: dict[str, object] | None = None,
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Send a turn/control signal to an engine-level duplex session."""
         kwargs = {
             "event": event,
-            "payload": payload,
             "timeout": timeout,
         }
         if fence is not None:

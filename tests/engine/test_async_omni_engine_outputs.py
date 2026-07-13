@@ -4,8 +4,6 @@ Focuses on the critical behavior: when the orchestrator thread dies,
 subsequent attempts to collect output raise RuntimeError.
 """
 
-import asyncio
-import inspect
 import queue
 import threading
 from types import SimpleNamespace
@@ -17,7 +15,6 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import DuplexControlResultMessage, ErrorMessage, OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.omni import DuplexOutputFenceError, OmniDuplexEnginePort
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -30,7 +27,6 @@ def _make_engine(output_queue, mocker: MockerFixture, *, thread_alive: bool = Tr
     engine.orchestrator_thread = mocker.MagicMock(
         is_alive=mocker.MagicMock(return_value=thread_alive),
     )
-    engine._ensure_output_router()
     return engine
 
 
@@ -104,49 +100,6 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     assert "crashed" in msg.error
 
 
-def test_fenced_duplex_methods_require_explicit_fence() -> None:
-    for method_name in (
-        "open_duplex_session_fenced_async",
-        "append_duplex_input_fenced_async",
-        "signal_duplex_turn_fenced_async",
-        "close_duplex_session_fenced_async",
-    ):
-        signature = inspect.signature(getattr(AsyncOmniEngine, method_name))
-        assert signature.parameters["fence"].default is inspect.Parameter.empty
-
-
-@pytest.mark.asyncio
-async def test_fenced_append_registers_only_transport_routing_metadata() -> None:
-    engine = object.__new__(AsyncOmniEngine)
-    captured = []
-
-    async def control(msg, *, timeout):
-        captured.append((msg, timeout))
-        return {
-            "stage_results": [
-                {
-                    "result": {
-                        "data_plane_append": True,
-                        "request_id": "duplex-request",
-                    }
-                }
-            ]
-        }
-
-    engine._duplex_control_async = control
-    fence = DuplexFence("sid", epoch=2, turn_id=3, response_seq=4)
-
-    await engine.append_duplex_input_fenced_async(
-        fence,
-        mode="append_audio_chunk",
-        payload={},
-    )
-
-    assert captured[0][0].fence is fence
-    assert engine._typed_duplex_sessions == {"sid"}
-    assert engine._duplex_request_sessions == {"duplex-request": "sid"}
-
-
 @pytest.mark.asyncio
 async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker: MockerFixture):
     """Async variant of the fatal error message test."""
@@ -163,101 +116,11 @@ async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker:
     assert msg.fatal is True
 
 
-@pytest.mark.asyncio
-async def test_sync_generic_reader_does_not_steal_missing_fence_duplex_output(mocker: MockerFixture):
-    raw_queue = queue.Queue()
-    raw_queue.put_nowait(
-        OutputMessage(
-            request_id="duplex-request",
-            fence=None,
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="duplex-request"),
-            finished=False,
-        )
-    )
-    raw_queue.put_nowait(
-        OutputMessage(
-            request_id="generic-request",
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="generic-request"),
-            finished=False,
-        )
-    )
-    engine = _make_engine(SimpleNamespace(sync_q=raw_queue), mocker)
-    engine._typed_duplex_sessions = {"sid"}
-    engine._duplex_request_sessions = {"duplex-request": "sid"}
-
-    generic = engine.try_get_output(timeout=0.01)
-    duplex = await engine.get_duplex_output_async("sid")
-
-    assert generic.request_id == "generic-request"
-    assert duplex.request_id == "duplex-request"
-    assert duplex.fence is None
-
-
-@pytest.mark.asyncio
-async def test_missing_fence_duplex_output_reaches_port_error_path(mocker: MockerFixture):
-    raw_queue = queue.Queue()
-    raw_queue.put_nowait(
-        OutputMessage(
-            request_id="duplex-request",
-            fence=None,
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="duplex-request"),
-            finished=False,
-        )
-    )
-    engine = _make_engine(SimpleNamespace(sync_q=raw_queue), mocker)
-    engine._typed_duplex_sessions = {"sid"}
-    engine._duplex_request_sessions = {"duplex-request": "sid"}
-    port = OmniDuplexEnginePort(engine)
-    port._session_id = "sid"
-    port._request_ids = {"duplex-request"}
-
-    with pytest.raises(DuplexOutputFenceError, match="missing a DuplexFence"):
-        await asyncio.wait_for(anext(port.events()), timeout=0.1)
-
-
-@pytest.mark.asyncio
-async def test_duplex_reader_does_not_steal_generic_output_from_async_reader(mocker: MockerFixture):
-    fence = DuplexFence("sid", turn_id=1, response_seq=1)
-    raw_queue = queue.Queue()
-    raw_queue.put_nowait(
-        OutputMessage(
-            request_id="generic-request",
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="generic-request"),
-            finished=False,
-        )
-    )
-    raw_queue.put_nowait(
-        OutputMessage(
-            request_id="duplex-request",
-            fence=fence,
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="duplex-request"),
-            finished=False,
-        )
-    )
-    engine = _make_engine(SimpleNamespace(sync_q=raw_queue), mocker)
-    engine._typed_duplex_sessions = {"sid"}
-    engine._duplex_request_sessions = {"duplex-request": "sid"}
-
-    duplex = await engine.get_duplex_output_async("sid")
-    generic = await engine.try_get_output_async()
-
-    assert duplex.request_id == "duplex-request"
-    assert duplex.fence == fence
-    assert generic.request_id == "generic-request"
-
-
-def test_legacy_fenced_output_remains_on_generic_compatibility_path(mocker: MockerFixture):
-    fence = DuplexFence("legacy-session")
+def test_output_remains_on_shared_output_path(mocker: MockerFixture):
     raw_queue = queue.Queue()
     raw_queue.put_nowait(
         OutputMessage(
             request_id="legacy-duplex-request",
-            fence=fence,
             stage_id=0,
             engine_outputs=OmniRequestOutput(request_id="legacy-duplex-request"),
             finished=False,
@@ -268,7 +131,6 @@ def test_legacy_fenced_output_remains_on_generic_compatibility_path(mocker: Mock
     output = engine.try_get_output(timeout=0.01)
 
     assert output.request_id == "legacy-duplex-request"
-    assert engine._duplex_output_queues == {}
 
 
 def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
@@ -298,7 +160,6 @@ def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
     msg = request_q.get_nowait()
     assert msg.type == "open_duplex_session"
     assert msg.control_id == "ctrl-1"
-    assert msg.timeout == 1
     assert result["unsupported_count"] == 1
     assert result["stage_results"][0]["result"]["supported"] is False
 

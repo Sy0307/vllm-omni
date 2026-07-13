@@ -38,7 +38,6 @@ class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     session_mode: str = "duplex"
     capabilities: dict[str, object]
     session_config: dict[str, object] | None = None
-    timeout: float | None = None
 
 
 class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
@@ -50,7 +49,6 @@ class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
     mode: str
     payload: object
     final: bool = False
-    timeout: float | None = None
 
 
 class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
@@ -59,8 +57,6 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     fence: DuplexFence
     session_id: str
     event: str
-    payload: dict[str, object]
-    timeout: float | None = None
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
@@ -69,7 +65,6 @@ class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     fence: DuplexFence
     session_id: str
     reason: str = "client_close"
-    timeout: float | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -126,7 +121,6 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
 class OutputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["output"] = "output"
     request_id: str
-    fence: DuplexFence | None = None
     stage_id: int
     replica_id: int | None = None
     engine_outputs: OmniRequestOutput
@@ -162,4 +156,3 @@ class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     stage_results: list[dict[str, object]]
     unsupported_count: int = 0
     error_count: int = 0
-    passive_count: int = 0

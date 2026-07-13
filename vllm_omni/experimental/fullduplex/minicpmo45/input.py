@@ -2,14 +2,41 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
 
 
-@dataclass(frozen=True, slots=True)
-class MiniCPMO45CommittedInput:
-    payload: dict[str, object] | None
-    had_input: bool
-    had_speech: bool
+def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
+    extra_body = session_config.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    if any(key in session_config for key in ("ref_audio_path", "tts_ref_audio_path")) or any(
+        key in extra_body for key in ("ref_audio_path", "tts_ref_audio_path")
+    ):
+        raise ValueError("native duplex ref_audio_path is not accepted; resolve ref_audio in serving first")
+
+
+def decode_native_ref_audio_from_config(session_config: dict[str, Any]) -> np.ndarray | None:
+    validate_native_ref_audio_config(session_config)
+    extra_body = session_config.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    audio_data = extra_body.get("ref_audio_data")
+    if audio_data is None:
+        return None
+    if not isinstance(audio_data, str):
+        raise TypeError("native duplex ref_audio_data must be base64 pcm_f32le")
+    fmt = extra_body.get("ref_audio_format") or "pcm_f32le"
+    if fmt != "pcm_f32le":
+        raise ValueError(f"unsupported native duplex ref_audio_format: {fmt!r}")
+    try:
+        raw = base64.b64decode(audio_data, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid native duplex ref_audio_data") from exc
+    if len(raw) % 4:
+        raise ValueError("invalid native duplex ref_audio_data length")
+    return np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=True)
 
 
 class MiniCPMO45PcmAppendBuffer:
@@ -21,7 +48,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._force_listen = False
         self._is_speech = False
         self._new_user_turn = False
-        self._turn_had_input = False
         self._turn_had_speech = False
 
     def clear(self) -> None:
@@ -30,7 +56,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._force_listen = False
         self._is_speech = False
         self._new_user_turn = False
-        self._turn_had_input = False
         self._turn_had_speech = False
 
     def clear_force_listen(self) -> None:
@@ -63,7 +88,6 @@ class MiniCPMO45PcmAppendBuffer:
             raise ValueError("MiniCPM-o native duplex audio append sample_rate_hz changed within a session")
         self._sample_rate_hz = sample_rate_hz
         self._buffer.extend(raw)
-        self._turn_had_input = self._turn_had_input or bool(raw)
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         self._force_listen = self._force_listen or bool(payload.get("force_listen", False))
         self._is_speech = self._is_speech or bool(payload.get("is_speech", False))
@@ -121,25 +145,24 @@ class MiniCPMO45PcmAppendBuffer:
             payload["new_user_turn"] = True
         return self.append(payload, chunk_period_ms=chunk_period_ms, flush=True)
 
-    def commit(self, *, chunk_period_ms: int) -> MiniCPMO45CommittedInput:
-        """Commit the real residual PCM and reset per-client-input accounting.
+    def commit(self, *, chunk_period_ms: int) -> dict[str, object] | None:
+        """Commit the real residual PCM and reset per-client-input state.
 
         Complete model units are emitted by :meth:`append` as soon as they are
         available.  A commit at that exact boundary therefore has no payload;
         synthesizing another unit would add a model decision that does not
         exist in the official continuous streaming loop.
         """
-        had_input = self._turn_had_input
         had_speech = self._turn_had_speech
         payload = self.flush(chunk_period_ms=chunk_period_ms) if had_speech else None
         if payload is not None:
             payload["final"] = True
         self.clear()
-        return MiniCPMO45CommittedInput(
-            payload=payload,
-            had_input=had_input,
-            had_speech=had_speech,
-        )
+        return payload
 
 
-__all__ = ["MiniCPMO45CommittedInput", "MiniCPMO45PcmAppendBuffer"]
+__all__ = [
+    "MiniCPMO45PcmAppendBuffer",
+    "decode_native_ref_audio_from_config",
+    "validate_native_ref_audio_config",
+]

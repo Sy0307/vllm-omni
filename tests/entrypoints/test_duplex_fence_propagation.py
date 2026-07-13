@@ -25,8 +25,8 @@ class FenceRecordingEngine:
         self.calls.append(("append", fence))
         return {"ok": True}
 
-    async def signal_duplex_turn_async(self, session_id, *, fence=None, **kwargs):
-        del session_id, kwargs
+    async def signal_duplex_turn_async(self, session_id, *, event, fence=None, timeout=None):
+        del session_id, event, timeout
         self.calls.append(("signal", fence))
         return {"ok": True}
 

@@ -2004,10 +2004,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
 
-    def _merge_additional_information_update(self, req_id, upd):
-        logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
-        return self._update_intermediate_buffer(req_id, upd)
-
     def _update_streaming_input_additional_info(self, new_req_data, req_id):
         # For streaming input prefill case only. Update buffer from last segment input.
         cached_additional_info = self.model_intermediate_buffer.get(req_id, {})

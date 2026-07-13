@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,13 +12,3 @@ class DuplexFence:
     epoch: int = 0
     turn_id: int = 0
     response_seq: int = 0
-
-    def next_turn(self) -> DuplexFence:
-        return replace(
-            self,
-            turn_id=self.turn_id + 1,
-            response_seq=self.response_seq + 1,
-        )
-
-    def next_epoch(self) -> DuplexFence:
-        return replace(self, epoch=self.epoch + 1)
