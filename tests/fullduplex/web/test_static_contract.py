@@ -1,0 +1,56 @@
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3] / "vllm_omni" / "experimental" / "fullduplex" / "web" / "static"
+
+
+def test_page_exposes_focused_call_conversation_and_log_surfaces():
+    html = (ROOT / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="callButton"' in html
+    assert 'id="muteButton"' in html
+    assert 'id="connectionState"' in html
+    assert 'id="modelState"' in html
+    assert 'id="conversation"' in html
+    assert 'id="eventLog"' in html
+    assert "<details" in html
+    assert "Automatic barge-in" not in html
+    assert "Server VAD" not in html
+
+
+def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
+    source = (ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "new URL(config.realtimePath, window.location.href)" in source
+    assert "url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'" in source
+    assert "auto_response: true" in source
+    assert "input_audio_buffer.append" in source
+    assert "playback.ack" in source
+    assert "event.event || event" in source
+    assert "response.audio.delta" in source
+    assert "response.audio_transcript.delta" in source
+    assert "conversation.item.input_audio_transcription" in source
+    assert "force_barge_in" not in source
+    assert "server_vad" not in source
+    assert "type: 'response.create'" not in source
+    assert 'type: "response.create"' not in source
+
+
+def test_client_has_transactional_cleanup_and_visible_event_logging():
+    source = (ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "async function stopSession" in source
+    assert "track.stop()" in source
+    assert "clearInterval(sendTimer)" in source
+    assert "appendEventLog(event)" in source
+    assert "addEventListener('beforeunload'" in source
+
+
+def test_audio_worklets_define_capture_and_playback_processors():
+    capture = (ROOT / "pcm_worklet.js").read_text(encoding="utf-8")
+    playback = (ROOT / "playback_worklet.js").read_text(encoding="utf-8")
+
+    assert "registerProcessor('fullduplex-pcm-capture'" in capture
+    assert "Int16Array" in capture
+    assert "registerProcessor('fullduplex-pcm-playback'" in playback
+    assert "playback-drained" in playback
+    assert "clear" in playback

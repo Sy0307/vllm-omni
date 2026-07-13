@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-APP_JS = Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_web/static/app.js"
 DEMO_PATH = Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
 
 
@@ -389,6 +388,16 @@ def test_realtime_duplex_demo_no_hint_gate_does_not_require_transcription_event(
     assert demo._input_transcription_ok(3, transcript_hints_enabled=True)
 
 
+def test_realtime_duplex_demo_gate_rejects_server_errors():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "error", "code": "runtime_signal_failed", "error": "signal failed"})
+
+    errors = demo._unexpected_error_events(state)
+
+    assert errors == [{"type": "error", "code": "runtime_signal_failed", "error": "signal failed"}]
+
+
 def test_realtime_duplex_demo_model_policy_waits_for_speak_after_intermediate_listen(monkeypatch):
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -567,60 +576,3 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
         with wave.open(str(tmp_path / f"response_{index:02d}.wav"), "rb") as wf:
             assert wf.getframerate() == 24000
             assert wf.readframes(wf.getnframes()) == expected
-
-
-def test_realtime_web_defaults_to_streaming_playback():
-    source = APP_JS.read_text(encoding="utf-8")
-
-    assert "PLAYBACK_MODE === 'buffered'" in source
-    assert "QUERY.get('buffered') === '1'" in source
-    assert "const BUFFER_OUTPUT_AUDIO = true" not in source
-    assert "streaming-default" in source
-
-
-def test_realtime_web_streams_audio_delta_before_audio_done():
-    source = APP_JS.read_text(encoding="utf-8")
-
-    delta_case = source[source.index("case 'response.audio.delta'") : source.index("case 'response.audio.done'")]
-    assert "if (BUFFER_OUTPUT_AUDIO) bufferPlayback" in delta_case
-    assert "else {" in delta_case
-    assert "feedPlayback(pcm, sr)" in delta_case
-    assert "decodeOutputAudioDelta(e)" in delta_case
-    assert "pcm_f32le" in source
-    assert "decodeAudioData" in source
-
-    start_call = source[source.index("async function startCall()") : source.index("function stopCall()")]
-    assert "if (!BUFFER_OUTPUT_AUDIO)" in start_call
-    assert "audioWorklet.addModule('static/ttsPlaybackProcessor.js')" in start_call
-
-
-def test_realtime_web_waits_for_server_boundary_before_reopening_full_mode_mic():
-    source = APP_JS.read_text(encoding="utf-8")
-
-    assert "assistantServerBoundarySeen" in source
-
-    stopped_case = source[
-        source.index("if (data.type === 'ttsPlaybackStopped')") : source.index(
-            "if (data.type === 'ttsPlaybackUnderrun')"
-        )
-    ]
-    assert "assistantServerBoundarySeen" in stopped_case
-    assert "endAssistantOutput(ECHO_GUARD_MS)" in stopped_case
-
-    idle_timer = source[
-        source.index("assistantAudioIdleTimer = setTimeout") : source.index("function endAssistantOutput")
-    ]
-    assert "assistantShouldWaitForServerBoundary()" in idle_timer
-
-
-def test_realtime_web_drains_streaming_playback_on_response_done():
-    source = APP_JS.read_text(encoding="utf-8")
-
-    boundary_fn = source[
-        source.index("function markAssistantServerBoundary(") : source.index("function endAssistantOutput")
-    ]
-    assert "ttsNode.port.postMessage({ type: 'drain' })" in boundary_fn
-
-    done_case = source[source.index("case 'response.done'") : source.index("case 'error'")]
-    assert "markAssistantServerBoundary(e)" in done_case
-    assert "gapFillMs" in source
