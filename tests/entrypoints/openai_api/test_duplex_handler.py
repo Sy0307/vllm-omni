@@ -841,15 +841,52 @@ def _native_session_create(session_id: str = "duplex-native") -> dict[str, Any]:
     return event
 
 
-def test_minicpmo_pcm_append_buffer_flush_preserves_accumulated_speech_marker():
-    buffer = MiniCPMO45PcmAppendBuffer()
-    payload = {
+def _native_audio_payload(
+    *,
+    samples: int = 16000,
+    value: float = 0.05,
+    is_speech: bool | None = True,
+    force_listen: bool | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.05),
+        "audio": _pcm_f32_b64(samples, value=value),
         "format": "pcm_f32le",
         "sample_rate_hz": 16000,
-        "is_speech": True,
     }
+    if is_speech is not None:
+        payload["is_speech"] = is_speech
+    if force_listen is not None:
+        payload["force_listen"] = force_listen
+    return payload
+
+
+def _auto_response_context(
+    session_id: str,
+    *,
+    playback_active: bool = False,
+) -> tuple[OmniDuplexSessionHandler, DuplexSession, DuplexSessionActor]:
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id=session_id,
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    if playback_active:
+        session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+        session.begin_response()
+        session.mark_audio_sent(duration_ms=1000)
+    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
+    actor.session = session
+    return handler, session, actor
+
+
+def test_minicpmo_pcm_append_buffer_flush_preserves_accumulated_speech_marker():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    payload = _native_audio_payload(samples=8000)
 
     assert buffer.append(payload, chunk_period_ms=1000) is None
     flushed = buffer.flush(chunk_period_ms=1000)
@@ -860,23 +897,13 @@ def test_minicpmo_pcm_append_buffer_flush_preserves_accumulated_speech_marker():
 
 def test_minicpmo_pcm_append_buffer_preserves_new_user_turn_but_drops_force_speak():
     buffer = MiniCPMO45PcmAppendBuffer()
-    first = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-        "new_user_turn": True,
-        "new_user_turn_prefix_variant": MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
-        "force_speak": True,
-    }
-    second = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
+    first = _native_audio_payload(samples=8000)
+    first.update(
+        new_user_turn=True,
+        new_user_turn_prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+        force_speak=True,
+    )
+    second = _native_audio_payload(samples=8000)
 
     assert buffer.append(first, chunk_period_ms=1000) is None
     emitted = buffer.append(second, chunk_period_ms=1000)
@@ -888,20 +915,8 @@ def test_minicpmo_pcm_append_buffer_preserves_new_user_turn_but_drops_force_spea
 
 
 def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
-    first = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
-    second = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.0),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": False,
-    }
+    first = _native_audio_payload(samples=8000)
+    second = _native_audio_payload(samples=8000, value=0.0, is_speech=False)
 
     merged = OmniDuplexSessionHandler._merge_native_audio_payloads(first, second)
 
@@ -909,23 +924,13 @@ def test_minicpmo_merge_native_audio_payloads_preserves_speech_marker():
 
 
 def test_minicpmo_merge_preserves_new_user_turn_but_drops_force_speak():
-    first = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-        "new_user_turn": True,
-        "new_user_turn_prefix_variant": MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
-        "force_speak": True,
-    }
-    second = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": False,
-    }
+    first = _native_audio_payload(samples=8000)
+    first.update(
+        new_user_turn=True,
+        new_user_turn_prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+        force_speak=True,
+    )
+    second = _native_audio_payload(samples=8000, is_speech=False)
 
     merged = OmniDuplexSessionHandler._merge_native_audio_payloads(first, second)
 
@@ -936,35 +941,10 @@ def test_minicpmo_merge_preserves_new_user_turn_but_drops_force_speak():
 
 
 def test_auto_response_playback_overlap_forces_listen_until_ack_or_barge_in():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-silent-overlap",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
-    session.begin_response()
+    handler, session, actor = _auto_response_context("sid-auto-silent-overlap", playback_active=True)
     session.mark_audio_sent(duration_ms=1000)
-
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
-    session.mark_audio_sent(duration_ms=1000)
-    silent_payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.0),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "force_listen": False,
-    }
-    speech_payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "force_listen": False,
-    }
+    silent_payload = _native_audio_payload(value=0.0, is_speech=None, force_listen=False)
+    speech_payload = _native_audio_payload(is_speech=None, force_listen=False)
 
     assert handler._should_force_listen_for_auto_response_overlap(session, actor, {}, silent_payload) is True
     assert handler._should_force_listen_for_auto_response_overlap(session, actor, {}, speech_payload) is True
@@ -983,27 +963,8 @@ def test_auto_response_playback_overlap_forces_listen_until_ack_or_barge_in():
 
 
 def test_auto_response_playback_overlap_defers_append_and_tracks_speech():
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(FakeEngineClient()),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
-    session = DuplexSession(
-        session_id="sid-auto-deferred-overlap",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
-    session.begin_response()
-    session.mark_audio_sent(duration_ms=1000)
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(8640, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
+    handler, session, actor = _auto_response_context("sid-auto-deferred-overlap", playback_active=True)
+    payload = _native_audio_payload(samples=8640)
 
     assert handler._should_start_deferred_native_auto_response_overlap(session, actor, {}) is False
     assert (
@@ -1028,23 +989,9 @@ def test_auto_response_playback_overlap_defers_append_and_tracks_speech():
 
 
 def test_auto_response_waiting_speech_marks_payload_without_advancing_serving_turn():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-new-turn",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
+    handler, session, actor = _auto_response_context("sid-auto-new-turn")
     session.turn_id = 3
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
+    payload = _native_audio_payload()
     handler._minicpmo_session_state(session).auto_response_waiting_for_speech = True
 
     marked = handler._mark_auto_response_new_user_turn_payload(session, actor, {}, payload)
@@ -1057,23 +1004,8 @@ def test_auto_response_waiting_speech_marks_payload_without_advancing_serving_tu
 
 
 def test_auto_response_waiting_speech_ignores_stale_payload_force_listen():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-new-turn-stale-force-listen",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-        "force_listen": True,
-    }
+    handler, session, actor = _auto_response_context("sid-auto-new-turn-stale-force-listen")
+    payload = _native_audio_payload(force_listen=True)
     handler._mark_auto_response_waiting_for_speech(
         session,
         prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
@@ -1090,34 +1022,9 @@ def test_auto_response_waiting_speech_ignores_stale_payload_force_listen():
 
 
 def test_auto_response_waiting_speech_skips_silent_waiting_append():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-waiting-silence",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
-    session.begin_response()
-    session.mark_audio_sent(duration_ms=1000)
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    silent_payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.0),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": False,
-        "force_listen": False,
-    }
-    speech_payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-        "force_listen": False,
-    }
+    handler, session, actor = _auto_response_context("sid-auto-waiting-silence", playback_active=True)
+    silent_payload = _native_audio_payload(value=0.0, is_speech=False, force_listen=False)
+    speech_payload = _native_audio_payload(force_listen=False)
     handler._minicpmo_session_state(session).auto_response_waiting_for_speech = True
 
     assert actor.assistant_playback_active() is True
@@ -1127,22 +1034,8 @@ def test_auto_response_waiting_speech_skips_silent_waiting_append():
 
 
 def test_auto_response_waiting_speech_marks_clean_done_prefix_variant():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-new-turn-clean",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
+    handler, session, actor = _auto_response_context("sid-auto-new-turn-clean")
+    payload = _native_audio_payload()
     handler._mark_auto_response_waiting_for_speech(
         session,
         prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
@@ -1158,25 +1051,8 @@ def test_auto_response_waiting_speech_marks_clean_done_prefix_variant():
 
 
 def test_auto_response_barge_in_marks_new_user_turn_payload_without_waiting_latch():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-barge-new-turn",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
-    session.begin_response()
-    session.mark_audio_sent(duration_ms=1000)
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
+    handler, session, actor = _auto_response_context("sid-auto-barge-new-turn", playback_active=True)
+    payload = _native_audio_payload()
 
     marked = handler._mark_auto_response_new_user_turn_payload(
         session,
@@ -1211,22 +1087,8 @@ def test_native_realtime_barge_in_marks_payload_as_new_user_turn_without_turn_id
 
 
 def test_auto_response_force_barge_in_does_not_clear_waiting_turn_variant_before_marking():
-    engine = FakeEngineClient()
-    chat_service = FakeChatService(engine)
-    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    session = DuplexSession(
-        session_id="sid-auto-barge-keeps-variant",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    actor = DuplexSessionActor(websocket=TimedWebSocket())  # type: ignore[arg-type]
-    actor.session = session
-    payload = {
-        "type": "audio",
-        "audio": _pcm_f32_b64(16000, value=0.05),
-        "format": "pcm_f32le",
-        "sample_rate_hz": 16000,
-        "is_speech": True,
-    }
+    handler, session, actor = _auto_response_context("sid-auto-barge-keeps-variant")
+    payload = _native_audio_payload()
     handler._mark_auto_response_waiting_for_speech(
         session,
         prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
@@ -1450,9 +1312,20 @@ def test_duplex_data_plane_output_prefers_audio_segment_text_metadata():
     assert next_results[0]["text"] == ""
 
 
-def test_duplex_audio_cursor_keeps_request_cumulative_offset_across_model_turns():
+@pytest.mark.parametrize(
+    ("request_id", "second_samples", "expected_second_audio"),
+    [
+        ("duplex-sid-model-turn-audio-e0-stage0", 36000, "wav-12000"),
+        ("duplex-sid-model-turn-audio-restart-e0-stage0", 12000, "wav-12000"),
+    ],
+    ids=["cumulative-across-model-turns", "upstream-cumulative-audio-restarts"],
+)
+def test_duplex_audio_cursor_across_model_turns(
+    request_id: str,
+    second_samples: int,
+    expected_second_audio: str,
+):
     data_plane = _test_data_plane()
-    request_id = "duplex-sid-model-turn-audio-e0-stage0"
 
     def output(turn_id: int, samples: int):
         return SimpleNamespace(
@@ -1467,33 +1340,10 @@ def test_duplex_audio_cursor_keeps_request_cumulative_offset_across_model_turns(
         )
 
     first = list(data_plane.project_output(output(0, 24000)))
-    second = list(data_plane.project_output(output(1, 36000)))
+    second = list(data_plane.project_output(output(1, second_samples)))
 
     assert first[0]["audio_data"] == "wav-24000"
-    assert second[0]["audio_data"] == "wav-12000"
-
-
-def test_duplex_audio_cursor_recovers_when_upstream_cumulative_audio_restarts():
-    data_plane = _test_data_plane()
-    request_id = "duplex-sid-model-turn-audio-restart-e0-stage0"
-
-    def output(turn_id: int, samples: int):
-        return SimpleNamespace(
-            request_id=request_id,
-            finished=False,
-            outputs=[SimpleNamespace(text="", multimodal_output={})],
-            multimodal_output={
-                "audio": np.zeros(samples, dtype=np.float32),
-                "sr": 24000,
-                "meta.duplex_turn_id": np.array([turn_id], dtype=np.int32),
-            },
-        )
-
-    first = list(data_plane.project_output(output(0, 24000)))
-    restarted = list(data_plane.project_output(output(1, 12000)))
-
-    assert first[0]["audio_data"] == "wav-24000"
-    assert restarted[0]["audio_data"] == "wav-12000"
+    assert second[0]["audio_data"] == expected_second_audio
 
 
 def test_duplex_data_plane_accepts_model_turn_output_across_client_commits():
@@ -1578,55 +1428,60 @@ def _duplex_tts_output(
     )
 
 
-def test_duplex_auto_response_tts_last_audio_batch_does_not_end_response():
+@pytest.mark.parametrize(
+    (
+        "finished",
+        "tts_is_last_chunk",
+        "turn_end",
+        "consume_audio_first",
+        "expected_end_of_turn",
+        "expected_audio",
+    ),
+    [
+        (False, True, False, False, False, "wav-24000"),
+        (True, True, False, True, False, ""),
+        (True, True, True, True, True, ""),
+    ],
+    ids=[
+        "last-audio-batch-does-not-end-response",
+        "scheduler-eos-only-ends-tts-segment",
+        "explicit-turn-end-metadata-ends-response",
+    ],
+)
+def test_duplex_auto_response_tts_boundary(
+    finished: bool,
+    tts_is_last_chunk: bool,
+    turn_end: bool,
+    consume_audio_first: bool,
+    expected_end_of_turn: bool,
+    expected_audio: str,
+):
     data_plane = _test_data_plane()
+    request_id = "duplex-sid-tts-boundary-e0-stage0"
     session = DuplexSession(
-        session_id="sid-tts-segment-audio",
+        session_id="sid-tts-boundary",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.active_response_turn_id = 0
-    output = _duplex_tts_output(
-        request_id="duplex-sid-tts-segment-audio-e0-stage0",
-        samples=24000,
-        finished=False,
-        tts_is_last_chunk=True,
-    )
-
-    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
-
-    assert len(results) == 1
-    segment = results[0]
-    assert segment["stage_role"] == "tts"
-    assert segment["end_of_turn"] is False
-    assert segment["abort_data_plane_request"] is True
-    assert segment["audio_data"] == "wav-24000"
-
-
-def test_duplex_auto_response_tts_scheduler_eos_only_ends_tts_segment():
-    data_plane = _test_data_plane()
-    request_id = "duplex-sid-tts-segment-eos-e0-stage0"
-    session = DuplexSession(
-        session_id="sid-tts-segment-eos",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    session.active_response_turn_id = 0
-    data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
+    if consume_audio_first:
+        data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
     output = _duplex_tts_output(
         request_id=request_id,
         samples=24000,
-        finished=True,
-        tts_is_last_chunk=True,
-        token_ids=[151645],
+        finished=finished,
+        tts_is_last_chunk=tts_is_last_chunk,
+        turn_end=turn_end,
+        token_ids=[151645] if finished else None,
     )
 
     results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
-    segment = results[0]
-    assert segment["stage_role"] == "tts"
-    assert segment["end_of_turn"] is False
-    assert segment["audio_data"] == ""
-    assert segment["abort_data_plane_request"] is True
+    boundary = results[0]
+    assert boundary["stage_role"] == "tts"
+    assert boundary["end_of_turn"] is expected_end_of_turn
+    assert boundary["abort_data_plane_request"] is True
+    assert boundary["audio_data"] == expected_audio
 
 
 def test_duplex_auto_response_tts_scheduler_eos_fallback_does_not_require_profile_logs(monkeypatch):
@@ -1652,34 +1507,6 @@ def test_duplex_auto_response_tts_scheduler_eos_fallback_does_not_require_profil
     assert len(results) == 1
     assert results[0]["stage_role"] == "tts"
     assert results[0]["abort_data_plane_request"] is True
-
-
-def test_duplex_auto_response_explicit_turn_end_metadata_ends_response():
-    data_plane = _test_data_plane()
-    request_id = "duplex-sid-turn-end-e0-stage0"
-    session = DuplexSession(
-        session_id="sid-turn-end",
-        config=DuplexSessionConfig(extra_body={"auto_response": True}),
-    )
-    session.active_response_turn_id = 0
-    data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
-    output = _duplex_tts_output(
-        request_id=request_id,
-        samples=24000,
-        finished=True,
-        tts_is_last_chunk=True,
-        turn_end=True,
-        token_ids=[151645],
-    )
-
-    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
-
-    assert len(results) == 1
-    terminal = results[0]
-    assert terminal["stage_role"] == "tts"
-    assert terminal["end_of_turn"] is True
-    assert terminal["audio_data"] == ""
-    assert terminal["abort_data_plane_request"] is True
 
 
 def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
@@ -3758,13 +3585,30 @@ async def test_minicpmo_auto_response_segment_complete_continues_until_model_lis
     assert final is False
 
 
-def test_minicpmo_data_plane_text_cursor_is_turn_scoped_for_stable_request_id():
+@pytest.mark.parametrize(
+    ("steps", "expected_deltas"),
+    [
+        (
+            [("你好呀", 1), ("你好呀", 1), ("你好呀", 2)],
+            ["你好呀", "", "你好呀"],
+        ),
+        (
+            [("你好呀", 1), ("你好呀", 2)],
+            ["你好呀", "你好呀"],
+        ),
+    ],
+    ids=["turn-scoped", "exact-repeated-turn-text"],
+)
+def test_minicpmo_data_plane_text_cursor(
+    steps: list[tuple[str, int]],
+    expected_deltas: list[str],
+):
     data_plane = _test_data_plane()
     request_id = "duplex-sid-native-e0-stage0"
 
-    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=1) == "你好呀"
-    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=1) == ""
-    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=2) == "你好呀"
+    deltas = [data_plane.segment_text_delta(request_id, text, turn_id=turn_id) for text, turn_id in steps]
+
+    assert deltas == expected_deltas
 
 
 def test_minicpmo_data_plane_text_cursor_does_not_clip_prior_turn_overlap():
@@ -3776,14 +3620,6 @@ def test_minicpmo_data_plane_text_cursor_does_not_clip_prior_turn_overlap():
         data_plane.segment_text_delta(request_id, "你有什么想聊的吗？你好呀。", turn_id=2)
         == "你有什么想聊的吗？你好呀。"
     )
-
-
-def test_minicpmo_data_plane_text_cursor_keeps_exact_repeated_turn_text():
-    data_plane = _test_data_plane()
-    request_id = "duplex-sid-native-e0-stage0"
-
-    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=1) == "你好呀"
-    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=2) == "你好呀"
 
 
 @pytest.mark.asyncio
