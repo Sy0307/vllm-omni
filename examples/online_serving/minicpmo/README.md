@@ -94,20 +94,11 @@ to a stable per-session/epoch stage request with runner-owned
 Stage0 output is forwarded through the existing stage pipeline instead of
 placing hidden states in a worker-control RPC payload. This gives the current
 prototype long-lived stage request IDs for the active epoch, but it is still not
-a core persistent KV lease. Stage0 may only run when the loaded vLLM model
-runner exposes a scheduler/KV-backed
-`duplex_forward_with_runner_context` hook, but that is still a model-runner
-forward boundary rather than the RFC's long-lived request lifecycle. Internal
+a core persistent KV lease. The normal vLLM model runner owns attention
+metadata, sampling, and the resumable request KV; MiniCPM only builds the Stage0
+input embeddings in model preprocessing. There is no parallel worker provider,
+runner-context hook, eager decoder, or second model copy in this path. Internal
 runtime-control diagnostics are not emitted as public API fields by default.
-
-The worker path wraps the already loaded MiniCPM-o stage model. It must not load
-a second full `AutoModel.from_pretrained(...).to("cuda")` copy for native duplex.
-The Stage0 LLM path requires a scheduler-backed
-`duplex_forward_with_runner_context` hook before it can claim
-`runner_kv_backed=true`; the hook must return that metadata explicitly. There
-is no single-sequence eager decoder fallback in the native Stage0 path; if the
-runner hook is absent, the stage reports an explicit error instead of pretending
-to be KV-backed.
 
 The `/v1/realtime?duplex=1` endpoint uses the same `DuplexSessionActor` runtime
 and translates the main OpenAI-style realtime client events used by MiniCPM-o
@@ -189,6 +180,21 @@ different `--turn-input-wav` for each later turn and use
 transcript tail reuse. It fails on incomplete response/audio lifecycle events,
 stale output, cancellation, transcript delta/done mismatch, or missing audio
 when `--require-audio` is set.
+
+## 4. Open the experimental browser client
+
+The canonical browser UI lives with the experimental runtime. It serves the
+page and proxies the same-origin Realtime WebSocket to the backend:
+
+```bash
+python -m vllm_omni.experimental.fullduplex.web \
+    --port 7862 \
+    --ws-backend ws://127.0.0.1:8099
+```
+
+Open `http://<host>:7862/`. Behind Cloud Studio, open the full
+`https://<aop-host>/aoplab/<workspace>/studio/proxy/7862/` URL. The browser
+derives its `wss://` endpoint relative to that URL, preserving the proxy path.
 
 ## Notes
 
