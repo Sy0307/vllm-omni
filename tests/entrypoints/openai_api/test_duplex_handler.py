@@ -23,6 +23,9 @@ from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.session import (
+    MiniCPMO45ServingSessionState,
+)
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
@@ -1042,7 +1045,7 @@ def test_auto_response_waiting_speech_marks_payload_without_advancing_serving_tu
         "sample_rate_hz": 16000,
         "is_speech": True,
     }
-    handler._auto_response_waiting_for_speech.add(session.session_id)
+    handler._minicpmo_session_state(session).auto_response_waiting_for_speech = True
 
     marked = handler._mark_auto_response_new_user_turn_payload(session, actor, {}, payload)
 
@@ -1050,7 +1053,7 @@ def test_auto_response_waiting_speech_marks_payload_without_advancing_serving_tu
     assert payload["new_user_turn"] is True
     assert session.turn_id == 3
     assert payload.get("force_speak") is not True
-    assert session.session_id not in handler._auto_response_waiting_for_speech
+    assert not handler._minicpmo_session_state(session).auto_response_waiting_for_speech
 
 
 def test_auto_response_waiting_speech_ignores_stale_payload_force_listen():
@@ -1083,7 +1086,7 @@ def test_auto_response_waiting_speech_ignores_stale_payload_force_listen():
     assert payload["force_listen"] is False
     assert session.turn_id == 0
     assert payload["new_user_turn_prefix_variant"] == MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE
-    assert session.session_id not in handler._auto_response_waiting_for_speech
+    assert not handler._minicpmo_session_state(session).auto_response_waiting_for_speech
 
 
 def test_auto_response_waiting_speech_skips_silent_waiting_append():
@@ -1115,7 +1118,7 @@ def test_auto_response_waiting_speech_skips_silent_waiting_append():
         "is_speech": True,
         "force_listen": False,
     }
-    handler._auto_response_waiting_for_speech.add(session.session_id)
+    handler._minicpmo_session_state(session).auto_response_waiting_for_speech = True
 
     assert actor.assistant_playback_active() is True
     assert handler._should_skip_auto_response_waiting_silence(session, actor, {}, silent_payload) is True
@@ -1151,7 +1154,7 @@ def test_auto_response_waiting_speech_marks_clean_done_prefix_variant():
     assert payload["new_user_turn"] is True
     assert session.turn_id == 0
     assert payload["new_user_turn_prefix_variant"] == MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE
-    assert session.session_id not in handler._auto_response_waiting_for_speech
+    assert not handler._minicpmo_session_state(session).auto_response_waiting_for_speech
 
 
 def test_auto_response_barge_in_marks_new_user_turn_payload_without_waiting_latch():
@@ -1238,9 +1241,9 @@ def test_auto_response_force_barge_in_does_not_clear_waiting_turn_variant_before
         )
         is False
     )
-    assert session.session_id in handler._auto_response_waiting_for_speech
+    assert handler._minicpmo_session_state(session).auto_response_waiting_for_speech
     assert (
-        handler._auto_response_new_turn_prefix_variants[session.session_id]
+        handler._minicpmo_session_state(session).auto_response_new_turn_prefix_variant
         == MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE
     )
 
@@ -2304,7 +2307,8 @@ async def test_minicpmo_native_duplex_session_close_cleans_auto_response_data_pl
     handler._minicpmo_data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
     handler._minicpmo_data_plane.segment_text_delta(request_id, "hello")
     handler._minicpmo_data_plane.mark_terminal(request_id)
-    handler._auto_response_waiting_for_speech.add(session_id)
+    native = MiniCPMO45ServingSessionState(auto_response_waiting_for_speech=True)
+    handler._minicpmo_sessions[session_id] = native
 
     event = _native_session_create(session_id)
     event["session"]["extra_body"]["auto_response"] = True
@@ -2315,7 +2319,7 @@ async def test_minicpmo_native_duplex_session_close_cleans_auto_response_data_pl
     await handler.handle_session(ws)
 
     assert not handler._minicpmo_data_plane.has_request(request_id)
-    assert session_id not in handler._auto_response_waiting_for_speech
+    assert session_id not in handler._minicpmo_sessions
 
 
 @pytest.mark.asyncio
@@ -3744,7 +3748,7 @@ async def test_minicpmo_auto_response_segment_complete_continues_until_model_lis
     assert session.active_response_id == response_id
     assert session.active_request_id == request_id
     assert not handler._minicpmo_data_plane.is_terminal(request_id)
-    assert session.session_id not in handler._auto_response_waiting_for_speech
+    assert not handler._minicpmo_session_state(session).auto_response_waiting_for_speech
     assert sent == []
     assert len(engine.appended) == 1
     _, mode, payload, final = engine.appended[0]
