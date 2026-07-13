@@ -16,6 +16,10 @@ from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
+    MiniCPMO45DataPlaneContext,
+    MiniCPMO45DataPlaneSession,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
@@ -194,6 +198,47 @@ class FakeChatService:
 
     def create_audio(self, audio_obj):
         return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
+
+
+def _test_data_plane() -> MiniCPMO45DataPlaneSession:
+    def encode_audio(
+        audio: object,
+        sample_rate_hz: int,
+        response_format: str,
+        speed: float | None,
+    ) -> str | None:
+        del sample_rate_hz, response_format, speed
+        if audio is None:
+            return None
+        if hasattr(audio, "numel"):
+            return f"wav-{int(audio.numel())}"
+        return f"wav-{int(np.asarray(audio).size)}"
+
+    return MiniCPMO45DataPlaneSession(encode_audio)
+
+
+def _data_plane_context(session: DuplexSession | None = None) -> MiniCPMO45DataPlaneContext:
+    if session is None:
+        return MiniCPMO45DataPlaneContext()
+    return MiniCPMO45DataPlaneContext(
+        epoch=session.epoch,
+        turn_id=session.turn_id,
+        active_response_turn_id=session.active_response_turn_id,
+        active_response_id=session.active_response_id,
+        auto_responds=bool(session.config.extra_body.get("auto_response", False)),
+        response_format=session.config.response_format,
+        speed=session.config.speed,
+        modalities=tuple(session.config.modalities),
+    )
+
+
+def _project_data_plane(
+    data_plane: MiniCPMO45DataPlaneSession,
+    result: object,
+    *,
+    session: DuplexSession | None = None,
+) -> list[dict[str, object]]:
+    return list(data_plane.project(result, context=_data_plane_context(session)))
 
 
 class TimedWebSocket:
@@ -1235,13 +1280,7 @@ stage_args:
 def test_duplex_handler_splits_data_plane_audio_list_into_deltas():
     import torch
 
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     output = SimpleNamespace(
         finished=True,
         outputs=[
@@ -1258,7 +1297,7 @@ def test_duplex_handler_splits_data_plane_audio_list_into_deltas():
         ],
     )
 
-    native_results = list(handler._native_results_from_data_plane_output(output))
+    native_results = list(data_plane.project_output(output))
 
     assert [result["audio_data"] for result in native_results] == ["wav-10", "wav-20"]
     assert [result["text"] for result in native_results] == ["hello", ""]
@@ -1268,13 +1307,7 @@ def test_duplex_handler_splits_data_plane_audio_list_into_deltas():
 def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
     import torch
 
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     request_id = "duplex-duplex-sess-stage0"
 
     # A model-listen decision wraps the segment with a latent tensor that is
@@ -1290,7 +1323,7 @@ def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
             "meta": {"sr": 24000},
         },
     )
-    listen_results = list(handler._native_results_from_data_plane_output(listen_output))
+    listen_results = list(data_plane.project_output(listen_output))
     assert [result.get("is_listen") for result in listen_results] == [True]
 
     # The first speak unit carries cumulative stage-1 audio far smaller than
@@ -1309,7 +1342,7 @@ def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
             "sr": 24000,
         },
     )
-    speak_results = list(handler._native_results_from_data_plane_output(speak_output))
+    speak_results = list(data_plane.project_output(speak_output))
     assert [result.get("audio_data") for result in speak_results] == ["wav-32768"]
     assert speak_results[0]["text"] == " It was a very"
 
@@ -1323,7 +1356,7 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
         def create_audio(self, audio_obj):
             return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
 
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     request_id = "duplex-duplex-sess-stage0"
     session = DuplexSession(
         session_id="sid-auto-respond",
@@ -1340,7 +1373,7 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
                 "sr": 24000,
             },
         )
-        return list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+        return _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     def _audio(results):
         return [r for r in results if r.get("is_listen") is False]
@@ -1377,13 +1410,7 @@ def test_duplex_segment_text_is_attached_once_across_streaming_batches():
 
 
 def test_duplex_data_plane_output_prefers_audio_segment_text_metadata():
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-native-segment-text-e0-stage0"
     segment_text = "你好，有什么想聊的吗？"
     cumulative_text = segment_text * 2
@@ -1398,7 +1425,7 @@ def test_duplex_data_plane_output_prefers_audio_segment_text_metadata():
         },
     )
 
-    results = list(handler._native_results_from_data_plane_output(output))
+    results = list(data_plane.project_output(output))
 
     assert len(results) == 1
     assert results[0]["audio_data"] == "wav-24000"
@@ -1413,7 +1440,7 @@ def test_duplex_data_plane_output_prefers_audio_segment_text_metadata():
             "sr": 24000,
         },
     )
-    next_results = list(handler._native_results_from_data_plane_output(next_output_without_segment_metadata))
+    next_results = list(data_plane.project_output(next_output_without_segment_metadata))
 
     assert len(next_results) == 1
     assert next_results[0]["audio_data"] == "wav-6720"
@@ -1421,13 +1448,7 @@ def test_duplex_data_plane_output_prefers_audio_segment_text_metadata():
 
 
 def test_duplex_audio_cursor_keeps_request_cumulative_offset_across_model_turns():
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-model-turn-audio-e0-stage0"
 
     def output(turn_id: int, samples: int):
@@ -1442,21 +1463,15 @@ def test_duplex_audio_cursor_keeps_request_cumulative_offset_across_model_turns(
             },
         )
 
-    first = list(handler._native_results_from_data_plane_output(output(0, 24000)))
-    second = list(handler._native_results_from_data_plane_output(output(1, 36000)))
+    first = list(data_plane.project_output(output(0, 24000)))
+    second = list(data_plane.project_output(output(1, 36000)))
 
     assert first[0]["audio_data"] == "wav-24000"
     assert second[0]["audio_data"] == "wav-12000"
 
 
 def test_duplex_audio_cursor_recovers_when_upstream_cumulative_audio_restarts():
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-model-turn-audio-restart-e0-stage0"
 
     def output(turn_id: int, samples: int):
@@ -1471,21 +1486,15 @@ def test_duplex_audio_cursor_recovers_when_upstream_cumulative_audio_restarts():
             },
         )
 
-    first = list(handler._native_results_from_data_plane_output(output(0, 24000)))
-    restarted = list(handler._native_results_from_data_plane_output(output(1, 12000)))
+    first = list(data_plane.project_output(output(0, 24000)))
+    restarted = list(data_plane.project_output(output(1, 12000)))
 
     assert first[0]["audio_data"] == "wav-24000"
     assert restarted[0]["audio_data"] == "wav-12000"
 
 
 def test_duplex_data_plane_accepts_model_turn_output_across_client_commits():
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     session = DuplexSession(
         session_id="sid-auto-stale-turn",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
@@ -1506,7 +1515,7 @@ def test_duplex_data_plane_accepts_model_turn_output_across_client_commits():
         },
     )
 
-    results = list(handler._native_results_from_data_plane_output(output, session=session))
+    results = list(data_plane.project_output(output, context=_data_plane_context(session)))
 
     assert len(results) == 1
     assert results[0]["audio_data"] == "wav-24000"
@@ -1514,13 +1523,7 @@ def test_duplex_data_plane_accepts_model_turn_output_across_client_commits():
 
 
 def test_duplex_data_plane_accepts_active_response_turn_identity():
-    class _ChatService:
-        model_config = _ModelConfig()
-
-        def create_audio(self, audio_obj):
-            return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
-
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     session = DuplexSession(
         session_id="sid-active-response-turn",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
@@ -1540,7 +1543,7 @@ def test_duplex_data_plane_accepts_active_response_turn_identity():
         },
     )
 
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
     assert results[0]["audio_data"] == "wav-10"
@@ -1573,7 +1576,7 @@ def _duplex_tts_output(
 
 
 def test_duplex_auto_response_tts_last_audio_batch_does_not_end_response():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     session = DuplexSession(
         session_id="sid-tts-segment-audio",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
@@ -1586,7 +1589,7 @@ def test_duplex_auto_response_tts_last_audio_batch_does_not_end_response():
         tts_is_last_chunk=True,
     )
 
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
     segment = results[0]
@@ -1597,14 +1600,14 @@ def test_duplex_auto_response_tts_last_audio_batch_does_not_end_response():
 
 
 def test_duplex_auto_response_tts_scheduler_eos_only_ends_tts_segment():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-tts-segment-eos-e0-stage0"
     session = DuplexSession(
         session_id="sid-tts-segment-eos",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.active_response_turn_id = 0
-    handler._data_plane_audio_offsets[request_id] = 24000
+    data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
     output = _duplex_tts_output(
         request_id=request_id,
         samples=24000,
@@ -1613,7 +1616,7 @@ def test_duplex_auto_response_tts_scheduler_eos_only_ends_tts_segment():
         token_ids=[151645],
     )
 
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
     segment = results[0]
@@ -1625,14 +1628,14 @@ def test_duplex_auto_response_tts_scheduler_eos_only_ends_tts_segment():
 
 def test_duplex_auto_response_tts_scheduler_eos_fallback_does_not_require_profile_logs(monkeypatch):
     monkeypatch.delenv("MINICPMO45_PROFILE_LOGS", raising=False)
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-tts-eos-no-profile-e0-stage0"
     session = DuplexSession(
         session_id="sid-tts-eos-no-profile",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.active_response_turn_id = 0
-    handler._data_plane_audio_offsets[request_id] = 24000
+    data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
     output = _duplex_tts_output(
         request_id=request_id,
         samples=24000,
@@ -1641,7 +1644,7 @@ def test_duplex_auto_response_tts_scheduler_eos_fallback_does_not_require_profil
         token_ids=[151645],
     )
 
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
     assert results[0]["stage_role"] == "tts"
@@ -1649,14 +1652,14 @@ def test_duplex_auto_response_tts_scheduler_eos_fallback_does_not_require_profil
 
 
 def test_duplex_auto_response_explicit_turn_end_metadata_ends_response():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-turn-end-e0-stage0"
     session = DuplexSession(
         session_id="sid-turn-end",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.active_response_turn_id = 0
-    handler._data_plane_audio_offsets[request_id] = 24000
+    data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
     output = _duplex_tts_output(
         request_id=request_id,
         samples=24000,
@@ -1666,7 +1669,7 @@ def test_duplex_auto_response_explicit_turn_end_metadata_ends_response():
         token_ids=[151645],
     )
 
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
     terminal = results[0]
@@ -1677,7 +1680,7 @@ def test_duplex_auto_response_explicit_turn_end_metadata_ends_response():
 
 
 def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-turn-end-after-segment-e0-stage0"
     session = DuplexSession(
         session_id="sid-turn-end-after-segment",
@@ -1685,8 +1688,20 @@ def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
     )
     session.begin_response(turn_id=0)
     session.active_request_id = request_id
-    handler._data_plane_audio_offsets[request_id] = 24000
-    handler._data_plane_tts_eos_done.add(f"{request_id}:turn:0")
+    _project_data_plane(
+        data_plane,
+        {
+            "data_plane_outputs": [
+                _duplex_tts_output(
+                    request_id=request_id,
+                    samples=24000,
+                    finished=False,
+                    tts_is_last_chunk=True,
+                )
+            ]
+        },
+        session=session,
+    )
     output = _duplex_tts_output(
         request_id=request_id,
         samples=24000,
@@ -1697,19 +1712,19 @@ def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
         token_ids=[151645],
     )
 
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(results) == 1
     assert results[0]["stage_role"] == "tts"
     assert results[0]["end_of_turn"] is True
 
-    duplicate = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    duplicate = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert not any(result.get("end_of_turn") is True for result in duplicate)
 
 
 def test_duplex_auto_response_discards_terminal_only_audio_before_response_creation():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-terminal-only-audio-e0-stage0"
     session = DuplexSession(
         session_id="sid-terminal-only-audio",
@@ -1723,7 +1738,7 @@ def test_duplex_auto_response_discards_terminal_only_audio_before_response_creat
         text="",
     )
 
-    assert list(handler._data_plane_native_results({"data_plane_outputs": [first_audio]}, session=session)) == []
+    assert _project_data_plane(data_plane, {"data_plane_outputs": [first_audio]}, session=session) == []
 
     terminal = _duplex_tts_output(
         request_id=request_id,
@@ -1734,17 +1749,17 @@ def test_duplex_auto_response_discards_terminal_only_audio_before_response_creat
         turn_end=True,
         token_ids=[151645],
     )
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [terminal]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [terminal]}, session=session)
 
     assert len(results) == 1
     assert results[0]["audio_data"] == ""
     assert results[0]["end_of_turn"] is True
     assert session.active_request_id == request_id
-    assert request_id not in handler._data_plane_terminal_request_ids
+    assert not data_plane.is_terminal(request_id)
 
 
 def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-delayed-transcript-e0-stage0"
     session = DuplexSession(
         session_id="sid-delayed-transcript",
@@ -1757,7 +1772,7 @@ def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
         text="",
     )
 
-    assert list(handler._data_plane_native_results({"data_plane_outputs": [audio_before_text]}, session=session)) == []
+    assert _project_data_plane(data_plane, {"data_plane_outputs": [audio_before_text]}, session=session) == []
 
     audio_with_text = _duplex_tts_output(
         request_id=request_id,
@@ -1765,14 +1780,14 @@ def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
         finished=False,
         text="hello",
     )
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [audio_with_text]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [audio_with_text]}, session=session)
 
     assert [result["audio_data"] for result in results] == ["wav-100", "wav-100"]
     assert [result["text"] for result in results] == ["", "hello"]
 
 
 def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-delayed-terminal-text-e0-stage0"
     session = DuplexSession(
         session_id="sid-delayed-terminal-text",
@@ -1786,7 +1801,7 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
         turn_id=1,
     )
 
-    assert list(handler._data_plane_native_results({"data_plane_outputs": [audio_before_text]}, session=session)) == []
+    assert _project_data_plane(data_plane, {"data_plane_outputs": [audio_before_text]}, session=session) == []
 
     textless_turn_terminal = _duplex_tts_output(
         request_id=request_id,
@@ -1799,7 +1814,10 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
         token_ids=[151645],
     )
     terminal_results = list(
-        handler._data_plane_native_results({"data_plane_outputs": [textless_turn_terminal]}, session=session)
+        data_plane.project(
+            {"data_plane_outputs": [textless_turn_terminal]},
+            context=_data_plane_context(session),
+        )
     )
 
     assert len(terminal_results) == 1
@@ -1818,14 +1836,14 @@ def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
             "meta.duplex_epoch": np.array([0], dtype=np.int32),
         },
     )
-    results = list(handler._data_plane_native_results({"data_plane_outputs": [text_only_terminal]}, session=session))
+    results = _project_data_plane(data_plane, {"data_plane_outputs": [text_only_terminal]}, session=session)
 
     assert len(results) == 1
     assert results[0]["audio_data"] == "wav-100"
     assert results[0]["text"] == "hello"
     assert results[0]["end_of_turn"] is True
     assert results[0]["abort_data_plane_request"] is True
-    assert handler._data_plane_pending_audio_without_text == {}
+    assert not data_plane.has_pending_audio(request_id)
 
 
 @pytest.mark.asyncio
@@ -2006,7 +2024,7 @@ async def test_minicpmo_auto_response_listen_before_response_keeps_resumable_req
     assert close_reason is None
     assert emitted is True
     assert session.active_request_id == request_id
-    assert request_id not in handler._data_plane_terminal_request_ids
+    assert not handler._minicpmo_data_plane.is_terminal(request_id)
     assert ws.sent_types().count("response.listen") == 1
 
 
@@ -2097,7 +2115,7 @@ def test_duplex_data_plane_drops_stale_epoch_audio_after_barge_in():
         def create_audio(self, audio_obj):
             return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
 
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     session = DuplexSession(
         session_id="sid-auto-stale-epoch",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
@@ -2117,23 +2135,23 @@ def test_duplex_data_plane_drops_stale_epoch_audio_after_barge_in():
         },
     )
 
-    assert list(handler._native_results_from_data_plane_output(output, session=session)) == []
+    assert list(data_plane.project_output(output, context=_data_plane_context(session))) == []
 
 
 def test_duplex_data_plane_text_delta_preserves_repeated_suffix_growth():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-native-repeated-word-e0-stage0"
 
-    assert handler._data_plane_segment_text_delta(request_id, "好的") == "好的"
-    assert handler._data_plane_segment_text_delta(request_id, "好的好的") == "好的"
+    assert data_plane.segment_text_delta(request_id, "好的") == "好的"
+    assert data_plane.segment_text_delta(request_id, "好的好的") == "好的"
 
 
 def test_duplex_data_plane_text_delta_keeps_non_prefix_text():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-native-rewrite-e0-stage0"
 
-    assert handler._data_plane_segment_text_delta(request_id, "hello world") == "hello world"
-    assert handler._data_plane_segment_text_delta(request_id, "hullo world") == "hullo world"
+    assert data_plane.segment_text_delta(request_id, "hello world") == "hello world"
+    assert data_plane.segment_text_delta(request_id, "hullo world") == "hullo world"
 
 
 def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():
@@ -2145,7 +2163,7 @@ def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():
         def create_audio(self, audio_obj):
             return SimpleNamespace(audio_data=f"wav-{int(audio_obj.audio_tensor.shape[0])}")
 
-    handler = OmniDuplexSessionHandler(chat_service=_ChatService())
+    data_plane = _test_data_plane()
     request_id = "duplex-duplex-sess-stage0"
     session = DuplexSession(
         session_id="sid-auto-respond",
@@ -2153,7 +2171,7 @@ def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():
     )
     session.active_response_id = "resp-sid-auto-respond-0"
     session.playback.sent_ms = 1280
-    handler._data_plane_audio_offsets[request_id] = 30720
+    data_plane.slice_cumulative_audio(request_id, np.zeros(30720, dtype=np.float32))
 
     output = SimpleNamespace(
         request_id=request_id,
@@ -2165,7 +2183,7 @@ def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():
         },
     )
 
-    native_results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    native_results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert len(native_results) == 1
     assert native_results[0]["is_listen"] is True
@@ -2175,7 +2193,7 @@ def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():
 
 
 def test_duplex_auto_response_prior_playback_does_not_abort_before_current_response():
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-duplex-sess-stage0"
     session = DuplexSession(
         session_id="sid-auto-respond-next-turn",
@@ -2191,7 +2209,7 @@ def test_duplex_auto_response_prior_playback_does_not_abort_before_current_respo
         multimodal_output={},
     )
 
-    native_results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    native_results = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
 
     assert native_results == []
 
@@ -2199,7 +2217,7 @@ def test_duplex_auto_response_prior_playback_does_not_abort_before_current_respo
 def test_duplex_auto_response_text_only_flush_does_not_consume_audio_transcript():
     import numpy as np
 
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    data_plane = _test_data_plane()
     request_id = "duplex-duplex-sess-stage0"
     session = DuplexSession(
         session_id="sid-auto-respond-delayed-audio",
@@ -2214,7 +2232,7 @@ def test_duplex_auto_response_text_only_flush_does_not_consume_audio_transcript(
         multimodal_output={"sr": 24000},
     )
 
-    assert list(handler._data_plane_native_results({"data_plane_outputs": [text_only_output]}, session=session)) == []
+    assert _project_data_plane(data_plane, {"data_plane_outputs": [text_only_output]}, session=session) == []
 
     audio_output = SimpleNamespace(
         request_id=request_id,
@@ -2226,7 +2244,7 @@ def test_duplex_auto_response_text_only_flush_does_not_consume_audio_transcript(
         },
     )
 
-    native_results = list(handler._data_plane_native_results({"data_plane_outputs": [audio_output]}, session=session))
+    native_results = _project_data_plane(data_plane, {"data_plane_outputs": [audio_output]}, session=session)
 
     assert len(native_results) == 1
     assert native_results[0]["audio_data"].startswith("wav-")
@@ -2257,7 +2275,12 @@ async def test_duplex_auto_response_empty_terminal_does_not_create_empty_respons
         },
     )
 
-    native_results = list(handler._data_plane_native_results({"data_plane_outputs": [output]}, session=session))
+    native_results = list(
+        handler._minicpmo_data_plane.project(
+            {"data_plane_outputs": [output]},
+            context=_data_plane_context(session),
+        )
+    )
     assert len(native_results) == 1
     assert native_results[0]["end_of_turn"] is True
     assert native_results[0]["model_turn_id"] == 0
@@ -2268,7 +2291,7 @@ async def test_duplex_auto_response_empty_terminal_does_not_create_empty_respons
     assert "response.created" not in [m.get("type") for m in sent]
     assert "response.done" not in [m.get("type") for m in sent]
     assert session.turn_id == 1
-    assert request_id not in handler._data_plane_terminal_request_ids
+    assert not handler._minicpmo_data_plane.is_terminal(request_id)
 
 
 @pytest.mark.asyncio
@@ -2278,10 +2301,9 @@ async def test_minicpmo_native_duplex_session_close_cleans_auto_response_data_pl
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
-    handler._data_plane_audio_offsets[request_id] = 24000
-    handler._data_plane_sent_segment_texts[request_id] = "hello"
-    handler._data_plane_tts_eos_done.add(request_id)
-    handler._data_plane_terminal_request_ids.add(request_id)
+    handler._minicpmo_data_plane.slice_cumulative_audio(request_id, np.zeros(24000, dtype=np.float32))
+    handler._minicpmo_data_plane.segment_text_delta(request_id, "hello")
+    handler._minicpmo_data_plane.mark_terminal(request_id)
     handler._auto_response_waiting_for_speech.add(session_id)
 
     event = _native_session_create(session_id)
@@ -2292,10 +2314,7 @@ async def test_minicpmo_native_duplex_session_close_cleans_auto_response_data_pl
 
     await handler.handle_session(ws)
 
-    assert request_id not in handler._data_plane_audio_offsets
-    assert request_id not in handler._data_plane_sent_segment_texts
-    assert request_id not in handler._data_plane_tts_eos_done
-    assert request_id not in handler._data_plane_terminal_request_ids
+    assert not handler._minicpmo_data_plane.has_request(request_id)
     assert session_id not in handler._auto_response_waiting_for_speech
 
 
@@ -3615,7 +3634,10 @@ async def test_minicpmo_native_duplex_uses_segment_text_metadata_for_transcript_
 
     async def emit(output: object) -> None:
         result = {"data_plane_outputs": [output]}
-        for native_result in handler._data_plane_native_results(result, session=session):
+        for native_result in handler._minicpmo_data_plane.project(
+            result,
+            context=_data_plane_context(session),
+        ):
             await handler._send_one_native_duplex_event(send_json, native_result, session=session)
 
     await emit(_stage_output("same reply", 24000, segment_text="same reply"))
@@ -3721,7 +3743,7 @@ async def test_minicpmo_auto_response_segment_complete_continues_until_model_lis
     assert emitted is False
     assert session.active_response_id == response_id
     assert session.active_request_id == request_id
-    assert request_id not in handler._data_plane_terminal_request_ids
+    assert not handler._minicpmo_data_plane.is_terminal(request_id)
     assert session.session_id not in handler._auto_response_waiting_for_speech
     assert sent == []
     assert len(engine.appended) == 1
@@ -3733,43 +3755,31 @@ async def test_minicpmo_auto_response_segment_complete_continues_until_model_lis
 
 
 def test_minicpmo_data_plane_text_cursor_is_turn_scoped_for_stable_request_id():
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(FakeEngineClient()),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-native-e0-stage0"
 
-    assert handler._data_plane_segment_text_delta(request_id, "你好呀", turn_id=1) == "你好呀"
-    assert handler._data_plane_segment_text_delta(request_id, "你好呀", turn_id=1) == ""
-    assert handler._data_plane_segment_text_delta(request_id, "你好呀", turn_id=2) == "你好呀"
+    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=1) == "你好呀"
+    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=1) == ""
+    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=2) == "你好呀"
 
 
 def test_minicpmo_data_plane_text_cursor_does_not_clip_prior_turn_overlap():
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(FakeEngineClient()),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-native-e0-stage0"
 
-    assert handler._data_plane_segment_text_delta(request_id, "你好呀。你有什么想聊的吗？", turn_id=1)
+    assert data_plane.segment_text_delta(request_id, "你好呀。你有什么想聊的吗？", turn_id=1)
     assert (
-        handler._data_plane_segment_text_delta(request_id, "你有什么想聊的吗？你好呀。", turn_id=2)
+        data_plane.segment_text_delta(request_id, "你有什么想聊的吗？你好呀。", turn_id=2)
         == "你有什么想聊的吗？你好呀。"
     )
 
 
 def test_minicpmo_data_plane_text_cursor_keeps_exact_repeated_turn_text():
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(FakeEngineClient()),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
+    data_plane = _test_data_plane()
     request_id = "duplex-sid-native-e0-stage0"
 
-    assert handler._data_plane_segment_text_delta(request_id, "你好呀", turn_id=1) == "你好呀"
-    assert handler._data_plane_segment_text_delta(request_id, "你好呀", turn_id=2) == "你好呀"
+    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=1) == "你好呀"
+    assert data_plane.segment_text_delta(request_id, "你好呀", turn_id=2) == "你好呀"
 
 
 @pytest.mark.asyncio
