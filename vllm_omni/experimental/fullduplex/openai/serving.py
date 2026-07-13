@@ -23,6 +23,12 @@ from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
+    MiniCPMO45DataPlaneContext,
+    MiniCPMO45DataPlaneSession,
+    coerce_int,
+    payload_turn_id,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
@@ -120,21 +126,9 @@ class OmniDuplexSessionHandler:
             )
         )
         self._turn_controller = DuplexTurnController()
-        self._data_plane_audio_offsets: dict[str, int] = {}
-        # request_id -> cumulative text cursor already exposed with audio.
-        # Auto-response streams keep it across segment boundaries.
-        self._data_plane_sent_segment_texts: dict[str, str] = {}
-        self._data_plane_segment_text_metadata_request_ids: set[str] = set()
-        self._data_plane_pending_audio_without_text: dict[str, list[dict[str, object]]] = {}
-        self._data_plane_turns_with_text: set[str] = set()
+        self._minicpmo_data_plane = MiniCPMO45DataPlaneSession(self._encode_minicpmo_data_plane_audio)
         self._auto_response_waiting_for_speech: set[str] = set()
         self._auto_response_new_turn_prefix_variants: dict[str, str] = {}
-        # TTS segment completion and model-turn completion are independent.
-        # A turn can finish in a later metadata-only output after its final
-        # audio segment has already closed.
-        self._data_plane_tts_eos_done: set[str] = set()
-        self._data_plane_turn_eos_done: set[str] = set()
-        self._data_plane_terminal_request_ids: set[str] = set()
         self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
         # session_id -> (response_id, silence continuation units already sent)
         self._native_response_continuations: dict[str, tuple[str, int]] = {}
@@ -361,7 +355,7 @@ class OmniDuplexSessionHandler:
             if session is None:
                 return
             append_epoch = session.epoch
-            append_turn_id = self._payload_turn_id(payload)
+            append_turn_id = payload_turn_id(payload)
             if append_turn_id is None:
                 append_turn_id = session.turn_id
             request_id = self._native_stage0_request_id(session, append_epoch)
@@ -2206,13 +2200,13 @@ class OmniDuplexSessionHandler:
             if expected_epoch is not None and self._callable_accepts_keyword(append_input, "expected_epoch"):
                 append_kwargs["expected_epoch"] = expected_epoch
             if self._callable_accepts_keyword(append_input, "fence"):
-                payload_turn_id = self._payload_turn_id(payload)
+                payload_turn = payload_turn_id(payload)
                 append_kwargs["fence"] = DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
                     turn_id=(
-                        payload_turn_id
-                        if payload_turn_id is not None
+                        payload_turn
+                        if payload_turn is not None
                         else (
                             session.active_response_turn_id
                             if session.active_response_turn_id is not None
@@ -2243,9 +2237,7 @@ class OmniDuplexSessionHandler:
             self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
         )
         if request_id is not None:
-            self._data_plane_terminal_request_ids.discard(request_id)
-            self._data_plane_tts_eos_done.discard(request_id)
-            self._data_plane_turn_eos_done.discard(request_id)
+            self._minicpmo_data_plane.begin_request(request_id)
         if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1" and isinstance(result, dict):
             dp_outputs = result.get("data_plane_outputs")
             logger.info(
@@ -2385,8 +2377,7 @@ class OmniDuplexSessionHandler:
                     # whose audio accumulates across speak units; the offset
                     # must survive drain-task turnover or every unit re-sends
                     # the reply audio from the start.
-                    self._data_plane_audio_offsets.pop(request_id, None)
-                    self._data_plane_sent_segment_texts.pop(request_id, None)
+                    self._minicpmo_data_plane.close_stream(request_id)
             if close_reason is None:
                 self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
@@ -2676,13 +2667,14 @@ class OmniDuplexSessionHandler:
         close_reason: str | None = None
         emitted_response = False
         request_id, _ = self._data_plane_request_info(result)
-        if request_id is not None and request_id in self._data_plane_terminal_request_ids:
+        if self._minicpmo_data_plane.is_terminal(request_id):
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
                 logger.info("native data-plane output ignored after terminal request_id=%s", request_id)
             return None, False
         if request_id is not None and session.active_request_id is None:
             session.active_request_id = request_id
-        for native_result in self._data_plane_native_results(result, session=session):
+        context = self._minicpmo_data_plane_context(session)
+        for native_result in self._minicpmo_data_plane.project(result, context=context):
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
                 native_result,
@@ -2720,7 +2712,7 @@ class OmniDuplexSessionHandler:
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
-            if request_id in self._data_plane_terminal_request_ids:
+            if self._minicpmo_data_plane.is_terminal(request_id):
                 if profile_logs:
                     logger.info("[drain] exit terminal data-plane request: request_id=%s", request_id)
                 return None
@@ -2809,6 +2801,18 @@ class OmniDuplexSessionHandler:
             return None, None
         return duplex_data_plane_request_info(result)
 
+    def _minicpmo_data_plane_context(self, session: DuplexSession) -> MiniCPMO45DataPlaneContext:
+        return MiniCPMO45DataPlaneContext(
+            epoch=session.epoch,
+            turn_id=session.turn_id,
+            active_response_turn_id=session.active_response_turn_id,
+            active_response_id=session.active_response_id,
+            auto_responds=self._session_auto_responds(session),
+            response_format=session.config.response_format,
+            speed=session.config.speed,
+            modalities=tuple(session.config.modalities),
+        )
+
     async def _send_one_native_duplex_event(
         self,
         send_json,
@@ -2822,7 +2826,7 @@ class OmniDuplexSessionHandler:
         if expected_epoch is not None and session.epoch != expected_epoch:
             return close_reason, emitted_response
         data_plane_request_id = native_result.get("data_plane_request_id")
-        if isinstance(data_plane_request_id, str) and data_plane_request_id in self._data_plane_terminal_request_ids:
+        if isinstance(data_plane_request_id, str) and self._minicpmo_data_plane.is_terminal(data_plane_request_id):
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
                 logger.info("native event ignored after terminal data-plane request_id=%s", data_plane_request_id)
             return close_reason, emitted_response
@@ -2911,7 +2915,7 @@ class OmniDuplexSessionHandler:
                 model_listen = native_result.get("reason") in {None, "", "model_listen"}
             response_id = session.active_response_id
             if isinstance(data_plane_request_id, str) and not auto_response:
-                self._data_plane_terminal_request_ids.add(data_plane_request_id)
+                self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
             emitted_response = True
             payload = {
                 "type": "response.listen",
@@ -2983,8 +2987,8 @@ class OmniDuplexSessionHandler:
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
                     session.active_request_id = None
                 if not self._session_auto_responds(session):
-                    self._data_plane_terminal_request_ids.add(data_plane_request_id)
-            model_turn_id = self._coerce_data_plane_int(native_result.get("model_turn_id"))
+                    self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
+            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
             return close_reason, emitted_response
@@ -2992,7 +2996,7 @@ class OmniDuplexSessionHandler:
         response_created = False
         response_id = session.active_response_id
         if response_id is None:
-            model_turn_id = self._coerce_data_plane_int(native_result.get("model_turn_id"))
+            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             response_id = session.begin_response(turn_id=model_turn_id)
             self._remember_response_conversation_mode(session, response_id)
             response_created = True
@@ -3094,19 +3098,18 @@ class OmniDuplexSessionHandler:
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
             if isinstance(data_plane_request_id, str) and not self._session_auto_responds(session):
-                self._data_plane_audio_offsets.pop(data_plane_request_id, None)
-                self._data_plane_sent_segment_texts.pop(data_plane_request_id, None)
+                self._minicpmo_data_plane.close_stream(data_plane_request_id)
             if isinstance(data_plane_request_id, str):
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
                     session.active_request_id = None
                 if not self._session_auto_responds(session):
-                    self._data_plane_terminal_request_ids.add(data_plane_request_id)
+                    self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
             should_commit = self._should_commit_response_to_history(response_id)
             committed_message = session.end_response(
                 commit_text=should_commit,
                 preserve_request=self._session_auto_responds(session),
             )
-            model_turn_id = self._coerce_data_plane_int(native_result.get("model_turn_id"))
+            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
             if self._session_auto_responds(session):
@@ -3155,1037 +3158,26 @@ class OmniDuplexSessionHandler:
             )
         return normalized or None
 
-    def _data_plane_native_results(self, result: object, *, session: DuplexSession | None = None):
-        if not isinstance(result, dict):
-            return
-        outputs = result.get("data_plane_outputs")
-        if not isinstance(outputs, list):
-            return
-        for output in outputs:
-            yield from self._native_results_from_data_plane_output(output, session=session)
-
-    def _native_results_from_data_plane_output(self, output: object, *, session: DuplexSession | None = None):
-        data_plane_request_id = getattr(output, "request_id", None)
-        if not isinstance(data_plane_request_id, str) or not data_plane_request_id:
-            data_plane_request_id = None
-        outputs = getattr(output, "outputs", None)
-        completion = outputs[0] if isinstance(outputs, list) and outputs else None
-        text = getattr(completion, "text", "") if completion is not None else ""
-        mm_output = getattr(output, "multimodal_output", None)
-        if not isinstance(mm_output, Mapping):
-            mm_output = getattr(completion, "multimodal_output", {}) if completion is not None else {}
-        if not mm_output:
-            inner_output = getattr(output, "request_output", None)
-            if inner_output is not None and inner_output is not output:
-                inner_mm_output = getattr(inner_output, "multimodal_output", None)
-                if isinstance(inner_mm_output, Mapping) and inner_mm_output:
-                    mm_output = inner_mm_output
-                else:
-                    inner_outputs = getattr(inner_output, "outputs", None)
-                    inner_completion = inner_outputs[0] if isinstance(inner_outputs, list) and inner_outputs else None
-                    inner_completion_mm_output = (
-                        getattr(inner_completion, "multimodal_output", None) if inner_completion is not None else None
-                    )
-                    if completion is None and inner_completion is not None:
-                        completion = inner_completion
-                        text = getattr(inner_completion, "text", "") or text
-                    if isinstance(inner_completion_mm_output, Mapping):
-                        mm_output = inner_completion_mm_output
-        if isinstance(mm_output, Mapping):
-            mm_output = dict(mm_output)
-        else:
-            mm_output = {}
-        output_turn_id = self._data_plane_output_turn_id(mm_output)
-        output_epoch = self._data_plane_output_epoch(mm_output)
-        stale_turn = False
-        stale_epoch = False
-        if session is not None:
-            expected_turn_id = session.active_response_turn_id
-            stale_turn = (
-                expected_turn_id is not None and output_turn_id is not None and output_turn_id != expected_turn_id
-            )
-            if expected_turn_id is None and output_turn_id is not None:
-                stale_turn = output_turn_id < session.turn_id
-            stale_epoch = output_epoch is not None and output_epoch != session.epoch
-        if session is not None and self._session_auto_responds(session) and (stale_turn or stale_epoch):
-            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-                logger.info(
-                    "drop stale duplex data-plane output: request_id=%s output_turn_id=%s "
-                    "session_turn_id=%s active_response_turn_id=%s output_epoch=%s session_epoch=%s",
-                    data_plane_request_id,
-                    output_turn_id,
-                    session.turn_id,
-                    session.active_response_turn_id,
-                    output_epoch,
-                    session.epoch,
-                )
-            return
-        mm_text = self._data_plane_llm_output_text(mm_output)
-        if mm_text:
-            # Stage-1 audio outputs can expose cumulative completion.text while
-            # carrying the exact text for this audio segment in metadata.
-            text = mm_text
-            if data_plane_request_id is not None:
-                self._data_plane_segment_text_metadata_request_ids.add(data_plane_request_id)
-        elif (
-            data_plane_request_id is not None
-            and data_plane_request_id in self._data_plane_segment_text_metadata_request_ids
-        ):
-            # Once a data-plane request has explicit segment text metadata,
-            # keep transcript sourcing there. TTS-stage completion.text is
-            # cumulative and will duplicate transcripts if mixed back in.
-            text = ""
-        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-        finished = bool(getattr(output, "finished", False))
-        tts_is_last_chunk = self._data_plane_bool_metadata(
-            mm_output,
-            ("tts_is_last_chunk",),
-            default=False,
-        )
-        token_ids = self._data_plane_completion_token_ids(completion)
-        native_decision = self._data_plane_native_decision(
-            completion,
-            mm_output,
-            token_ids=token_ids,
-            finished=finished,
-        )
-        if native_decision == "listen":
-            # A model-listen wrapper carries the thinker's hidden states under
-            # "latent", which the audio encoder's key fallback would treat as
-            # a waveform: encoding it ratchets the cumulative audio offset
-            # (tokens x hidden_dim samples) past the talker's real audio, and
-            # every later speak unit slices to empty and is dropped. Yield the
-            # listen before any audio work so the offset is never touched.
-            if profile_logs:
-                logger.info(
-                    "duplex data-plane output: request_id=%s finished=%s "
-                    "native_decision=listen mm_keys=%s (audio encode skipped)",
-                    getattr(output, "request_id", None),
-                    finished,
-                    sorted(mm_output.keys()),
-                )
-            yield {
-                "supported": True,
-                "stage_role": "llm",
-                "is_listen": True,
-                "model_listen": True,
-                "listen_source": "model_listen",
-                "data_plane_request_id": data_plane_request_id,
-                "end_of_turn": False,
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
-                "runtime_impl": "scheduler_data_plane",
-                "owned_runtime": False,
-            }
-            return
-        # Stage 1 exposes a cumulative waveform for the lifetime of its
-        # resumable scheduler request, including across model-owned turns.
-        # Keep the audio cursor request-scoped; keying it by turn replays the
-        # complete previous waveform whenever the turn id advances.
-        audio_cursor_key = data_plane_request_id
-        turn_cursor_key = self._data_plane_text_cursor_key(data_plane_request_id, output_turn_id)
-        raw_audio = next((mm_output[k] for k in ("audio", "model_outputs", "latent") if k in mm_output), None)
-        raw_audio_samples = self._audio_num_samples(raw_audio)
-        offset_before = self._data_plane_audio_offsets.get(audio_cursor_key) if audio_cursor_key is not None else None
-        audio_chunks = list(
-            self._encode_data_plane_audio_chunks_with_duration(
-                mm_output,
-                request_id=audio_cursor_key,
-                response_format=(session.config.response_format if session is not None else "wav"),
-                speed=(session.config.speed if session is not None else None),
-            )
-        )
-        stage_turn_end = self._data_plane_bool_metadata(
-            mm_output,
-            ("turn_end", "end_of_turn"),
-            default=False,
-        )
-        # Terminal de-duplication is turn-scoped even though cumulative audio
-        # slicing is request-scoped.
-        tts_eos_key = turn_cursor_key or data_plane_request_id or ""
-        stage_tts_eos = (
-            session is not None
-            and self._session_auto_responds(session)
-            and 151645 in token_ids
-            and not audio_chunks
-            and raw_audio_samples is not None
-            and (raw_audio_samples == 0 or raw_audio_samples == offset_before)
-            and tts_eos_key not in self._data_plane_tts_eos_done
-        )
-        tts_segment_end = bool(tts_is_last_chunk or stage_tts_eos) and (
-            not tts_eos_key or tts_eos_key not in self._data_plane_tts_eos_done
-        )
-        if tts_segment_end and tts_eos_key:
-            self._data_plane_tts_eos_done.add(tts_eos_key)
-        stage_turn_end_new = bool(stage_turn_end) and (
-            not tts_eos_key or tts_eos_key not in self._data_plane_turn_eos_done
-        )
-        if stage_turn_end_new and tts_eos_key:
-            self._data_plane_turn_eos_done.add(tts_eos_key)
-        unit_end_of_turn = stage_turn_end_new or (
-            finished and not (session is not None and self._session_auto_responds(session))
-        )
-        if profile_logs:
-            logger.info(
-                "duplex data-plane output: request_id=%s finished=%s "
-                "text_len=%d audio_chunks=%d native_decision=%s mm_keys=%s "
-                "raw_audio_samples=%s offset_before=%s offset_after=%s "
-                "token_ids=%s tts_is_last_chunk=%s stage_tts_eos=%s "
-                "stage_turn_end=%s stage_turn_end_new=%s tts_segment_end=%s",
-                getattr(output, "request_id", None),
-                finished,
-                len(text) if isinstance(text, str) else 0,
-                len(audio_chunks),
-                native_decision,
-                sorted(mm_output.keys()),
-                raw_audio_samples,
-                offset_before,
-                (self._data_plane_audio_offsets.get(audio_cursor_key) if audio_cursor_key is not None else None),
-                token_ids,
-                tts_is_last_chunk,
-                stage_tts_eos,
-                stage_turn_end,
-                stage_turn_end_new,
-                tts_segment_end,
-            )
-        if audio_chunks:
-            # The talker streams several cumulative-audio batches per handed
-            # text, INCLUDING continuation units that re-run it with the
-            # same text past finished=True boundaries (every engine segment
-            # ends finished); official results carry per-unit deltas, so
-            # attach only text not yet delivered, comparing by content.
-            # Deliberately no reset at segment or response boundaries: any
-            # reset re-attaches the text on the next same-text continuation
-            # batch and duplicates the transcript.
-            delta_text = self._data_plane_segment_text_delta(
-                data_plane_request_id,
-                text,
-                turn_id=(
-                    output_turn_id if output_turn_id is not None else (session.turn_id if session is not None else None)
-                ),
-            )
-            last_idx = len(audio_chunks) - 1
-            sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)
-            audio_text_marks = self._data_plane_audio_text_marks(mm_output)
-            fallback_audio_text_marks: list[list[dict[str, int]] | None] = []
-            if not audio_text_marks and delta_text:
-                total_duration_ms = sum(max(0, int(duration_ms)) for _, duration_ms in audio_chunks)
-                cumulative_duration_ms = 0
-                for _, duration_ms in audio_chunks:
-                    cumulative_duration_ms += max(0, int(duration_ms))
-                    if total_duration_ms <= 0:
-                        fallback_audio_text_marks.append(None)
-                        continue
-                    text_chars = int(
-                        len(delta_text) * max(0.0, min(1.0, cumulative_duration_ms / float(total_duration_ms)))
-                    )
-                    fallback_audio_text_marks.append(
-                        [
-                            {
-                                "text_chars": max(0, text_chars),
-                                "audio_end_ms": max(0, cumulative_duration_ms),
-                            }
-                        ]
-                    )
-            audio_results: list[dict[str, object]] = []
-            for idx, (audio, duration_ms) in enumerate(audio_chunks):
-                native_result = {
-                    "supported": True,
-                    "stage_role": "tts",
-                    "is_listen": False,
-                    "data_plane_request_id": data_plane_request_id,
-                    "text": delta_text if idx == 0 else "",
-                    "audio_data": audio,
-                    "audio_format": session.config.response_format if session is not None else "wav",
-                    "audio_duration_ms": duration_ms,
-                    "audio_text_mark": idx == last_idx,
-                    "sample_rate_hz": sample_rate_hz,
-                    "end_of_turn": unit_end_of_turn and idx == last_idx,
-                    "abort_data_plane_request": tts_segment_end and idx == last_idx,
-                    "uses_model_runner_scheduler": True,
-                    "runner_kv_backed": True,
-                    "runtime_impl": "scheduler_data_plane",
-                    "owned_runtime": False,
-                }
-                if output_turn_id is not None:
-                    native_result["model_turn_id"] = output_turn_id
-                if audio_text_marks and idx == last_idx:
-                    native_result["audio_text_marks"] = audio_text_marks
-                    native_result["audio_text_marks_are_cumulative"] = True
-                elif idx < len(fallback_audio_text_marks) and fallback_audio_text_marks[idx]:
-                    native_result["audio_text_marks"] = fallback_audio_text_marks[idx]
-                    native_result["audio_text_marks_are_cumulative"] = True
-                audio_results.append(native_result)
-
-            pending_audio_key = data_plane_request_id
-            turn_text_key = turn_cursor_key or data_plane_request_id
-            if session is not None and self._session_auto_responds(session):
-                if delta_text and turn_text_key is not None:
-                    self._data_plane_turns_with_text.add(turn_text_key)
-                response_turn_bound = session.active_response_id is not None or (
-                    session.active_response_turn_id is not None
-                    and output_turn_id is not None
-                    and session.active_response_turn_id == output_turn_id
-                )
-                turn_has_text = turn_text_key is not None and turn_text_key in self._data_plane_turns_with_text
-                if not response_turn_bound and not turn_has_text:
-                    if pending_audio_key is not None:
-                        if tts_segment_end:
-                            self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
-                        else:
-                            self._data_plane_pending_audio_without_text.setdefault(pending_audio_key, []).extend(
-                                audio_results
-                            )
-                    if tts_segment_end:
-                        terminal_result = dict(audio_results[-1])
-                        terminal_result.update(
-                            {
-                                "audio_data": "",
-                                "audio_duration_ms": 0,
-                                "audio_text_mark": False,
-                                "end_of_turn": True,
-                            }
-                        )
-                        yield terminal_result
-                    return
-                if pending_audio_key is not None:
-                    yield from self._data_plane_pending_audio_without_text.pop(pending_audio_key, [])
-            yield from audio_results
-            return
-        pending_audio_key = data_plane_request_id
-        turn_text_key = turn_cursor_key or data_plane_request_id
-        if (
-            session is not None
-            and self._session_auto_responds(session)
-            and pending_audio_key is not None
-            and isinstance(text, str)
-            and text
-        ):
-            pending_audio = self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
-            if pending_audio:
-                delta_text = self._data_plane_segment_text_delta(
-                    data_plane_request_id,
-                    text,
-                    turn_id=(
-                        output_turn_id
-                        if output_turn_id is not None
-                        else (session.turn_id if session is not None else None)
-                    ),
-                )
-                if delta_text:
-                    pending_audio[0]["text"] = delta_text
-                    if turn_text_key is not None:
-                        self._data_plane_turns_with_text.add(turn_text_key)
-                    total_duration_ms = sum(
-                        max(0, int(result.get("audio_duration_ms", 0) or 0)) for result in pending_audio
-                    )
-                    if total_duration_ms > 0 and not pending_audio[-1].get("audio_text_marks"):
-                        pending_audio[-1]["audio_text_marks"] = [
-                            {
-                                "text_chars": len(delta_text),
-                                "audio_end_ms": total_duration_ms,
-                            }
-                        ]
-                        pending_audio[-1]["audio_text_marks_are_cumulative"] = True
-                    if unit_end_of_turn:
-                        pending_audio[-1]["end_of_turn"] = True
-                    if tts_segment_end:
-                        pending_audio[-1]["abort_data_plane_request"] = True
-                    yield from pending_audio
-                    return
-                self._data_plane_pending_audio_without_text[pending_audio_key] = pending_audio
-        if tts_segment_end:
-            if unit_end_of_turn and pending_audio_key is not None:
-                pending_audio = self._data_plane_pending_audio_without_text.get(pending_audio_key)
-                if pending_audio:
-                    pending_audio[-1]["end_of_turn"] = True
-                    pending_audio[-1]["abort_data_plane_request"] = True
-            terminal_result = {
-                "supported": True,
-                "stage_role": "tts",
-                "is_listen": False,
-                "data_plane_request_id": data_plane_request_id,
-                "text": "",
-                "audio_data": "",
-                "audio_format": session.config.response_format if session is not None else "wav",
-                "audio_text_mark": False,
-                "end_of_turn": unit_end_of_turn,
-                "abort_data_plane_request": True,
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
-                "runtime_impl": "scheduler_data_plane",
-                "owned_runtime": False,
-            }
-            if output_turn_id is not None:
-                terminal_result["model_turn_id"] = output_turn_id
-            yield terminal_result
-            return
-        if session is not None and session.active_response_id is not None and unit_end_of_turn:
-            terminal_result = {
-                "supported": True,
-                "stage_role": "tts",
-                "is_listen": False,
-                "data_plane_request_id": data_plane_request_id,
-                "text": "",
-                "audio_data": "",
-                "audio_format": session.config.response_format,
-                "audio_text_mark": False,
-                "end_of_turn": True,
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
-                "runtime_impl": "scheduler_data_plane",
-                "owned_runtime": False,
-            }
-            if output_turn_id is not None:
-                terminal_result["model_turn_id"] = output_turn_id
-            yield terminal_result
-            return
-        if data_plane_request_id is not None and session is not None and self._session_auto_responds(session):
-            # Text-only flushes are not client-visible transcript segments.
-            # Keep the audio-bound cursor for the next batch that carries audio.
-            if unit_end_of_turn and session.active_response_id is None:
-                pending_audio_key = turn_cursor_key or data_plane_request_id
-                if pending_audio_key is not None:
-                    self._data_plane_pending_audio_without_text.pop(pending_audio_key, None)
-                terminal_result = {
-                    "supported": True,
-                    "stage_role": "tts",
-                    "is_listen": False,
-                    "data_plane_request_id": data_plane_request_id,
-                    "text": "",
-                    "audio_data": "",
-                    "audio_format": session.config.response_format,
-                    "audio_text_mark": False,
-                    "end_of_turn": True,
-                    "abort_data_plane_request": True,
-                    "uses_model_runner_scheduler": True,
-                    "runner_kv_backed": True,
-                    "runtime_impl": "scheduler_data_plane",
-                    "owned_runtime": False,
-                }
-                if output_turn_id is not None:
-                    terminal_result["model_turn_id"] = output_turn_id
-                yield terminal_result
-                return
-        if (
-            finished
-            and session is not None
-            and self._session_auto_responds(session)
-            and session.active_response_id is not None
-            and data_plane_request_id is not None
-            and not unit_end_of_turn
-        ):
-            yield {
-                "supported": True,
-                "stage_role": "llm",
-                "is_listen": True,
-                "model_listen": False,
-                "listen_source": "auto_response_segment_complete",
-                "reason": "auto_response_segment_complete",
-                "data_plane_request_id": data_plane_request_id,
-                "end_of_turn": False,
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
-                "runtime_impl": "scheduler_data_plane",
-                "owned_runtime": False,
-            }
-            return
-        if not text:
-            if session is not None and self._session_auto_responds(session):
-                return
-            if finished:
-                yield {
-                    "supported": True,
-                    "stage_role": "llm",
-                    "is_listen": True,
-                    "model_listen": False,
-                    "listen_source": "data_plane_finished_without_output",
-                    "reason": "data_plane_finished_without_output",
-                    "data_plane_request_id": data_plane_request_id,
-                    "end_of_turn": False,
-                    "uses_model_runner_scheduler": True,
-                    "runner_kv_backed": True,
-                    "runtime_impl": "scheduler_data_plane",
-                    "owned_runtime": False,
-                }
-            return
-        if session is not None and self._session_auto_responds(session):
-            return
-        if session is not None and "audio" in session.config.modalities:
-            yield {
-                "supported": True,
-                "stage_role": "tts",
-                "error_code": "runtime_data_plane_text_without_audio",
-                "error": "MiniCPM-o native duplex data-plane produced text without audio.",
-                "data_plane_request_id": data_plane_request_id,
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
-                "runtime_impl": "scheduler_data_plane",
-                "owned_runtime": False,
-            }
-            return
-        yield {
-            "supported": True,
-            "stage_role": "llm",
-            "is_listen": False,
-            "data_plane_request_id": data_plane_request_id,
-            "text": text if isinstance(text, str) else "",
-            "audio_data": "",
-            "end_of_turn": unit_end_of_turn,
-            "uses_model_runner_scheduler": True,
-            "runner_kv_backed": True,
-            "runtime_impl": "scheduler_data_plane",
-            "owned_runtime": False,
-        }
-
-    @classmethod
-    def _data_plane_native_decision(
-        cls,
-        completion: object,
-        mm_output: dict[str, object],
-        *,
-        token_ids: list[int],
-        finished: bool,
-    ) -> str | None:
-        if not finished:
-            return None
-        # The orchestrator stamps model-listen segments explicitly; honor the
-        # marker before falling back to token heuristics (the wrapped listen
-        # output does not expose completion token ids).
-        if mm_output.get("duplex_native_decision") == "listen" or mm_output.get("model_listen") is True:
-            return "listen"
-        special = cls._data_plane_special_token_ids(mm_output)
-        listen_id = special.get("listen_token_id")
-        if listen_id is None:
-            return None
-        stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
-        if cls._coerce_data_plane_int(stop_reason) == listen_id:
-            return "listen"
-        return "listen" if token_ids and token_ids[-1] == listen_id else None
-
-    @classmethod
-    def _data_plane_special_token_ids(cls, mm_output: dict[str, object]) -> dict[str, int]:
-        out: dict[str, int] = {}
-        sources: list[object] = []
-        raw_special = mm_output.get("special_token_ids")
-        if isinstance(raw_special, dict):
-            sources.append(raw_special)
-        raw_meta = mm_output.get("meta")
-        if isinstance(raw_meta, dict):
-            sources.append(raw_meta)
-        sources.append(
-            {
-                key.removeprefix("meta."): value
-                for key, value in mm_output.items()
-                if isinstance(key, str) and key.startswith("meta.")
-            }
-        )
-        for source in sources:
-            if not isinstance(source, dict):
-                continue
-            for key, value in source.items():
-                if not isinstance(key, str):
-                    continue
-                token_id = cls._coerce_data_plane_int(value)
-                if token_id is not None and token_id >= 0:
-                    out[key] = token_id
-        return out
-
-    @classmethod
-    def _payload_turn_id(cls, payload: object) -> int | None:
-        if not isinstance(payload, Mapping):
-            return None
-        return cls._coerce_data_plane_int(payload.get("duplex_turn_id"))
-
-    @classmethod
-    def _data_plane_output_turn_id(cls, mm_output: dict[str, object]) -> int | None:
-        candidates: list[object] = [
-            mm_output.get("duplex_turn_id"),
-            mm_output.get("turn_id"),
-            mm_output.get("meta.duplex_turn_id"),
-            mm_output.get("meta.turn_id"),
-        ]
-        meta = mm_output.get("meta")
-        if isinstance(meta, dict):
-            candidates.extend((meta.get("duplex_turn_id"), meta.get("turn_id")))
-        for value in candidates:
-            turn_id = cls._coerce_data_plane_int(value)
-            if turn_id is not None:
-                return turn_id
-        return None
-
-    @classmethod
-    def _data_plane_output_epoch(cls, mm_output: dict[str, object]) -> int | None:
-        candidates: list[object] = [
-            mm_output.get("duplex_epoch"),
-            mm_output.get("epoch"),
-            mm_output.get("meta.duplex_epoch"),
-            mm_output.get("meta.epoch"),
-        ]
-        meta = mm_output.get("meta")
-        if isinstance(meta, dict):
-            candidates.extend((meta.get("duplex_epoch"), meta.get("epoch")))
-        for value in candidates:
-            epoch = cls._coerce_data_plane_int(value)
-            if epoch is not None:
-                return epoch
-        return None
-
-    @classmethod
-    def _data_plane_completion_token_ids(cls, completion: object) -> list[int]:
-        if completion is None:
-            return []
-        candidates = (
-            getattr(completion, "token_ids", None),
-            getattr(completion, "cumulative_token_ids", None),
-        )
-        for candidate in candidates:
-            token_ids = cls._coerce_data_plane_int_list(candidate)
-            if token_ids:
-                return token_ids
-        return []
-
-    @classmethod
-    def _coerce_data_plane_int_list(cls, value: object) -> list[int]:
-        if value is None:
-            return []
-        if hasattr(value, "detach"):
-            try:
-                value = value.detach().cpu().reshape(-1).tolist()
-            except Exception:
-                return []
-        if not isinstance(value, (list, tuple)):
-            return []
-        out: list[int] = []
-        for item in value:
-            token_id = cls._coerce_data_plane_int(item)
-            if token_id is not None:
-                out.append(token_id)
-        return out
-
-    @staticmethod
-    def _data_plane_text_cursor_key(request_id: str | None, turn_id: int | None = None) -> str | None:
-        if request_id is None:
-            return None
-        if turn_id is None:
-            return request_id
-        return f"{request_id}:turn:{turn_id}"
-
-    def _data_plane_segment_text_delta(
-        self,
-        request_id: str | None,
-        text: object,
-        *,
-        turn_id: int | None = None,
-    ) -> str:
-        if not isinstance(text, str) or not text:
-            return ""
-        cursor_key = self._data_plane_text_cursor_key(request_id, turn_id)
-        if cursor_key is None:
-            return text
-        sent_text = self._data_plane_sent_segment_texts.get(cursor_key)
-        if not isinstance(sent_text, str) or not sent_text:
-            delta_text = text
-        elif text == sent_text:
-            delta_text = ""
-        elif text.startswith(sent_text):
-            delta_text = text[len(sent_text) :]
-        else:
-            logger.warning(
-                "Non-prefix duplex data-plane transcript for request_id=%s turn_id=%s; emitting full text",
-                request_id,
-                turn_id,
-            )
-            delta_text = text
-        self._data_plane_sent_segment_texts[cursor_key] = text
-        return delta_text
-
-    @staticmethod
-    def _data_plane_request_belongs_to_session(request_id: str, session_id: str) -> bool:
-        return request_id.startswith(f"duplex-{session_id}-") or request_id.startswith(f"chatcmpl-duplex-{session_id}-")
-
-    def _cleanup_data_plane_request_state(self, request_id: str) -> None:
-        for cursor_key in list(self._data_plane_audio_offsets):
-            if cursor_key == request_id or cursor_key.startswith(f"{request_id}:"):
-                self._data_plane_audio_offsets.pop(cursor_key, None)
-        for cursor_key in list(self._data_plane_sent_segment_texts):
-            if cursor_key == request_id or cursor_key.startswith(f"{request_id}:"):
-                self._data_plane_sent_segment_texts.pop(cursor_key, None)
-        for cursor_key in list(self._data_plane_pending_audio_without_text):
-            if cursor_key == request_id or cursor_key.startswith(f"{request_id}:"):
-                self._data_plane_pending_audio_without_text.pop(cursor_key, None)
-        for cursor_key in list(self._data_plane_turns_with_text):
-            if cursor_key == request_id or cursor_key.startswith(f"{request_id}:"):
-                self._data_plane_turns_with_text.discard(cursor_key)
-        self._data_plane_segment_text_metadata_request_ids.discard(request_id)
-        for terminal_key in list(self._data_plane_tts_eos_done):
-            if terminal_key == request_id or terminal_key.startswith(f"{request_id}:"):
-                self._data_plane_tts_eos_done.discard(terminal_key)
-        for terminal_key in list(self._data_plane_turn_eos_done):
-            if terminal_key == request_id or terminal_key.startswith(f"{request_id}:"):
-                self._data_plane_turn_eos_done.discard(terminal_key)
-        for terminal_key in list(self._data_plane_terminal_request_ids):
-            if terminal_key == request_id or terminal_key.startswith(f"{request_id}:"):
-                self._data_plane_terminal_request_ids.discard(terminal_key)
-
     def _cleanup_duplex_session_state(self, session: DuplexSession) -> None:
         session_id = session.session_id
         self._auto_response_waiting_for_speech.discard(session_id)
         self._auto_response_new_turn_prefix_variants.pop(session_id, None)
         self._native_response_continuations.pop(session_id, None)
-        active_request_id = session.active_request_id
-        if isinstance(active_request_id, str):
-            self._cleanup_data_plane_request_state(active_request_id)
-        for request_id in (
-            set(self._data_plane_audio_offsets)
-            | set(self._data_plane_sent_segment_texts)
-            | set(self._data_plane_pending_audio_without_text)
-            | set(self._data_plane_turns_with_text)
-            | set(self._data_plane_segment_text_metadata_request_ids)
-        ):
-            if self._data_plane_request_belongs_to_session(request_id, session_id):
-                self._cleanup_data_plane_request_state(request_id)
-        for request_id in (
-            set(self._data_plane_tts_eos_done)
-            | set(self._data_plane_turn_eos_done)
-            | set(self._data_plane_terminal_request_ids)
-        ):
-            if self._data_plane_request_belongs_to_session(request_id, session_id):
-                self._cleanup_data_plane_request_state(request_id)
-
-    @staticmethod
-    def _coerce_data_plane_int(value: object) -> int | None:
-        if hasattr(value, "detach"):
-            try:
-                value = value.detach().cpu().reshape(-1)
-                if value.numel() == 0:
-                    return None
-                value = value[0].item()
-            except Exception:
-                return None
-        elif hasattr(value, "reshape") and hasattr(value, "size"):
-            try:
-                value = value.reshape(-1)
-                if int(value.size) == 0:
-                    return None
-                item = value[0]
-                value = item.item() if hasattr(item, "item") else item
-            except Exception:
-                return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _encode_data_plane_audio_chunks(
-        self,
-        mm_output: dict[str, object],
-        *,
-        request_id: str | None = None,
-        response_format: str = "wav",
-        speed: float | None = None,
-    ):
-        audio_data = None
-        for key in ("audio", "model_outputs", "latent"):
-            if key in mm_output:
-                audio_data = mm_output[key]
-                break
-        if isinstance(audio_data, list):
-            for item in audio_data:
-                encoded = self._encode_data_plane_audio_value(
-                    item,
-                    mm_output,
-                    response_format=response_format,
-                    speed=speed,
-                )
-                if encoded:
-                    yield encoded
-            return
-        audio_data = self._slice_cumulative_data_plane_audio(request_id, audio_data)
-        encoded = self._encode_data_plane_audio_value(
-            audio_data,
-            mm_output,
-            response_format=response_format,
-            speed=speed,
+        self._minicpmo_data_plane.close_session(
+            session_id,
+            active_request_id=session.active_request_id,
         )
-        if encoded:
-            yield encoded
 
-    def _encode_data_plane_audio_chunks_with_duration(
-        self,
-        mm_output: dict[str, object],
-        *,
-        request_id: str | None = None,
-        response_format: str = "wav",
-        speed: float | None = None,
-    ):
-        sample_rate_hz = self._data_plane_sample_rate_hz(mm_output)
-        audio_data = None
-        for key in ("audio", "model_outputs", "latent"):
-            if key in mm_output:
-                audio_data = mm_output[key]
-                break
-        if isinstance(audio_data, list):
-            for value in audio_data:
-                encoded = self._encode_data_plane_audio_value(
-                    value,
-                    mm_output,
-                    response_format=response_format,
-                    speed=speed,
-                )
-                if not encoded:
-                    continue
-                num_samples = self._audio_num_samples(value) or 0
-                duration_ms = int(num_samples * 1000 / max(1, sample_rate_hz))
-                yield encoded, duration_ms
-            return
-        sliced = self._slice_cumulative_data_plane_audio(request_id, audio_data)
-        encoded = self._encode_data_plane_audio_value(
-            sliced,
-            mm_output,
-            response_format=response_format,
-            speed=speed,
-        )
-        if encoded:
-            num_samples = self._audio_num_samples(sliced) or 0
-            duration_ms = int(num_samples * 1000 / max(1, sample_rate_hz))
-            yield encoded, duration_ms
-
-    def _slice_cumulative_data_plane_audio(
-        self,
-        request_id: str | None,
-        audio_data: object,
-    ) -> object:
-        if request_id is None:
-            return audio_data
-        num_samples = self._audio_num_samples(audio_data)
-        if num_samples is None or num_samples <= 0:
-            return audio_data
-        prev_samples = self._data_plane_audio_offsets.get(request_id, 0)
-        if prev_samples <= 0:
-            self._data_plane_audio_offsets[request_id] = num_samples
-            return audio_data
-        if num_samples == prev_samples:
-            return None
-        if num_samples < prev_samples:
-            # Some stage implementations restart their cumulative waveform at
-            # a model-turn boundary. Treat an actual length rollback as the
-            # reset signal instead of assuming every turn restarts.
-            self._data_plane_audio_offsets[request_id] = num_samples
-            return audio_data
-        self._data_plane_audio_offsets[request_id] = num_samples
-        try:
-            import numpy as np
-            import torch
-
-            if isinstance(audio_data, torch.Tensor):
-                return audio_data.reshape(-1)[prev_samples:].contiguous()
-            audio_array = np.asarray(audio_data, dtype=np.float32).reshape(-1)
-            return audio_array[prev_samples:]
-        except Exception:
-            logger.exception("Failed to slice cumulative duplex audio output")
-            return audio_data
-
-    @staticmethod
-    def _audio_num_samples(audio_data: object) -> int | None:
-        try:
-            import numpy as np
-            import torch
-
-            if isinstance(audio_data, torch.Tensor):
-                return int(audio_data.numel())
-            return int(np.asarray(audio_data, dtype=np.float32).size)
-        except Exception:
-            return None
-
-    @classmethod
-    def _data_plane_bool_metadata(
-        cls,
-        mm_output: dict[str, object],
-        names: tuple[str, ...],
-        *,
-        default: bool = False,
-    ) -> bool:
-        def coerce(value: object) -> bool | None:
-            if value is None:
-                return None
-            if isinstance(value, bool):
-                return value
-            try:
-                import torch
-
-                if isinstance(value, torch.Tensor):
-                    if value.numel() == 0:
-                        return None
-                    return bool(value.reshape(-1)[-1].item())
-            except Exception:
-                pass
-            if isinstance(value, np.ndarray):
-                if value.size == 0:
-                    return None
-                return bool(value.reshape(-1)[-1].item())
-            if isinstance(value, np.generic):
-                return bool(value.item())
-            if isinstance(value, (list, tuple)):
-                return coerce(value[-1]) if value else None
-            if isinstance(value, (int, float)):
-                return bool(value)
-            return None
-
-        meta = mm_output.get("meta")
-        for name in names:
-            for key in (name, f"meta.{name}"):
-                result = coerce(mm_output.get(key))
-                if result is not None:
-                    return result
-            if isinstance(meta, dict):
-                result = coerce(meta.get(name))
-                if result is not None:
-                    return result
-        return default
-
-    @staticmethod
-    def _data_plane_sample_rate_hz(mm_output: dict[str, object]) -> int:
-        sr_raw = mm_output.get("sr")
-        if sr_raw is None:
-            sr_raw = mm_output.get("sample_rate_hz", mm_output.get("sample_rate"))
-        if sr_raw is None and isinstance(mm_output.get("meta"), dict):
-            meta = mm_output["meta"]
-            sr_raw = meta.get("sr") or meta.get("sample_rate_hz") or meta.get("sample_rate")
-        if sr_raw is None:
-            sr_raw = (
-                mm_output.get("meta.sr") or mm_output.get("meta.sample_rate_hz") or mm_output.get("meta.sample_rate")
-            )
-        if hasattr(sr_raw, "item"):
-            try:
-                return int(sr_raw.item())
-            except Exception:
-                return 24000
-        if isinstance(sr_raw, int | float):
-            return int(sr_raw)
-        return 24000
-
-    @staticmethod
-    def _data_plane_audio_text_marks(mm_output: dict[str, object]) -> list[dict[str, object]]:
-        candidate_sources: list[object] = []
-        for key in (
-            "audio_text_marks",
-            "text_audio_marks",
-            "audio_text_alignment",
-            "alignment_marks",
-        ):
-            candidate_sources.append(mm_output.get(key))
-        meta = mm_output.get("meta")
-        if isinstance(meta, dict):
-            for key in (
-                "audio_text_marks",
-                "text_audio_marks",
-                "audio_text_alignment",
-                "alignment_marks",
-            ):
-                candidate_sources.append(meta.get(key))
-        for key, value in mm_output.items():
-            if (
-                isinstance(key, str)
-                and key.startswith("meta.")
-                and key.rsplit(".", 1)[-1]
-                in {
-                    "audio_text_marks",
-                    "text_audio_marks",
-                    "audio_text_alignment",
-                    "alignment_marks",
-                }
-            ):
-                candidate_sources.append(value)
-
-        for raw in candidate_sources:
-            if not isinstance(raw, list):
-                continue
-            marks: list[dict[str, object]] = []
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                text_chars = item.get("text_chars")
-                audio_end_ms = item.get("audio_end_ms", item.get("audio_ms"))
-                if not isinstance(text_chars, int | float) or not isinstance(audio_end_ms, int | float):
-                    continue
-                marks.append(
-                    {
-                        "text_chars": max(0, int(text_chars)),
-                        "audio_end_ms": max(0, int(audio_end_ms)),
-                    }
-                )
-            if marks:
-                return marks
-        return []
-
-    @staticmethod
-    def _data_plane_llm_output_text(mm_output: dict[str, object]) -> str:
-        candidates: list[object] = [
-            mm_output.get("llm_output_text"),
-            mm_output.get("text"),
-            mm_output.get("llm_output_text_utf8"),
-            mm_output.get("meta.llm_output_text_utf8"),
-        ]
-        meta = mm_output.get("meta")
-        if isinstance(meta, dict):
-            candidates.extend((meta.get("llm_output_text"), meta.get("text"), meta.get("llm_output_text_utf8")))
-        for key in ("meta.llm_output_text", "meta.text"):
-            candidates.append(mm_output.get(key))
-        for value in candidates:
-            if isinstance(value, str) and value:
-                return value
-            decoded = OmniDuplexSessionHandler._decode_data_plane_text_tensor(value)
-            if decoded:
-                return decoded
-            if isinstance(value, list):
-                text_chunks = [item for item in value if isinstance(item, str)]
-                if text_chunks:
-                    return "".join(text_chunks)
-        return ""
-
-    @staticmethod
-    def _decode_data_plane_text_tensor(value: object) -> str:
-        if value is None:
-            return ""
-        try:
-            if isinstance(value, np.ndarray):
-                raw = value.astype(np.uint8, copy=False).reshape(-1).tobytes()
-            elif hasattr(value, "detach"):
-                raw = value.detach().cpu().numpy().astype(np.uint8, copy=False).reshape(-1).tobytes()
-            else:
-                return ""
-            return raw.decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
-
-    def _encode_data_plane_audio(
-        self,
-        mm_output: dict[str, object],
-        *,
-        response_format: str = "wav",
-        speed: float | None = None,
-    ) -> str | None:
-        for encoded in self._encode_data_plane_audio_chunks(
-            mm_output,
-            response_format=response_format,
-            speed=speed,
-        ):
-            return encoded
-        return None
-
-    def _encode_data_plane_audio_value(
+    def _encode_minicpmo_data_plane_audio(
         self,
         audio_data: object,
-        mm_output: dict[str, object],
-        *,
-        response_format: str = "wav",
-        speed: float | None = None,
+        sample_rate_hz: int,
+        response_format: str,
+        speed: float | None,
     ) -> str | None:
         if audio_data is None:
             return None
         try:
-            import numpy as np
             import torch
 
             from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
@@ -4196,11 +3188,10 @@ class OmniDuplexSessionHandler:
                 audio_tensor = np.asarray(audio_data, dtype=np.float32)
             if audio_tensor.ndim > 1:
                 audio_tensor = audio_tensor.reshape(-1)
-            sample_rate = self._data_plane_sample_rate_hz(mm_output)
             audio_response = self._chat_service.create_audio(
                 CreateAudio(
                     audio_tensor=audio_tensor,
-                    sample_rate=sample_rate,
+                    sample_rate=sample_rate_hz,
                     response_format=response_format,
                     speed=float(speed) if isinstance(speed, int | float) and speed > 0 else 1.0,
                     stream_format="audio",
