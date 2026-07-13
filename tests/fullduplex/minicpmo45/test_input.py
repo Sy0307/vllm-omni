@@ -27,9 +27,7 @@ def test_commit_does_not_add_silence_after_incremental_audio_was_drained():
 
     assert emitted is not None
     assert not buffer.has_pending()
-    assert committed.had_input is True
-    assert committed.had_speech is True
-    assert committed.payload is None
+    assert committed is None
 
 
 def test_commit_without_speech_does_not_synthesize_terminal_audio():
@@ -38,9 +36,7 @@ def test_commit_without_speech_does_not_synthesize_terminal_audio():
 
     committed = buffer.commit(chunk_period_ms=1_000)
 
-    assert committed.had_input is True
-    assert committed.had_speech is False
-    assert committed.payload is None
+    assert committed is None
 
 
 def test_commit_resets_cumulative_turn_accounting():
@@ -50,6 +46,4 @@ def test_commit_resets_cumulative_turn_accounting():
 
     empty = buffer.commit(chunk_period_ms=1_000)
 
-    assert empty.had_input is False
-    assert empty.had_speech is False
-    assert empty.payload is None
+    assert empty is None

@@ -557,6 +557,10 @@ def _input_transcription_ok(count: int, *, transcript_hints_enabled: bool) -> bo
     return count > 0 if transcript_hints_enabled else True
 
 
+def _unexpected_error_events(state: DemoState) -> list[dict[str, object]]:
+    return [event for event in state.events if event.get("type") == "error"]
+
+
 def _evaluate_transcript_integrity(
     state: DemoState,
     response_ids: list[str],
@@ -1165,6 +1169,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             completed_response_ids,
         )
     )
+    unexpected_error_events = _unexpected_error_events(state)
     result = {
         "ok": terminal_activity_ok
         and state.count("session.closed") > 0
@@ -1218,6 +1223,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "stale_audio_delta_count": stale_audio_delta_count,
         "all_audio_responses_have_transcript": all_audio_responses_have_transcript,
         "distinct_turn_inputs": distinct_turn_inputs,
+        "error_count": len(unexpected_error_events),
+        "errors": unexpected_error_events,
         **transcript_integrity,
         "turn_inputs": [
             {
@@ -1242,6 +1249,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and all_audio_responses_have_transcript
         and playback_history_committed_ok
         and listen_only_overlap_ok
+        and not unexpected_error_events
         and (distinct_turn_inputs or not getattr(args, "require_distinct_inputs", False))
     )
     return result

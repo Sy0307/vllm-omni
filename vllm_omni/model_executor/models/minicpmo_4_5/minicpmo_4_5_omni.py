@@ -77,7 +77,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
-        from vllm_omni.experimental.fullduplex.minicpmo45.worker import (
+        from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
             patch_minicpmo_remote_config,
         )
 
@@ -277,11 +277,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             state = _MiniCPMO45Stage0SessionState(session_id=session_id)
             helper.sessions[session_id] = state
             session_config = duplex.get("session_config")
-            helper.session_config = dict(session_config) if isinstance(session_config, dict) else {}
+            session_config = dict(session_config) if isinstance(session_config, dict) else {}
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor()
-            helper._prepare_session_context(state, helper.session_config)
+            helper._prepare_session_context(state, session_config)
 
         audio_waveform = helper._decode_audio_payload(payload)
         seq = duplex.get("seq")
@@ -1054,36 +1054,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             remove.scatter_(dim=-1, index=sorted_indices, src=sorted_remove)
             logits = logits.masked_fill(remove, float("-inf"))
         return logits
-
-    def generate_audio(self, code: torch.Tensor, voice_type: str = "default") -> torch.Tensor:
-        """
-        Generate audio from code tokens using the code2wav model.
-
-        Args:
-            code: Code tokens from talker model
-            voice_type: Voice type for speech generation (optional for MiniCPM-o)
-
-        Returns:
-            Audio tensor
-        """
-        if self.code2wav is None:
-            logger.warning("Code2Wav model not initialized, cannot generate audio")
-            return torch.zeros(0)
-
-        code2wav_dev = self._module_device(self.code2wav)
-        if isinstance(code, torch.Tensor):
-            code_tensor = code.to(dtype=torch.long, device=code2wav_dev)
-        else:
-            code_tensor = torch.as_tensor(code, dtype=torch.long, device=code2wav_dev)
-        if code_tensor.ndim == 2 and code_tensor.shape[0] == 1:
-            code_tensor = code_tensor.squeeze(0)
-
-        # Generate audio using code2wav model
-        # TODO: Implement actual audio generation based on MiniCPM-o's code2wav implementation
-        with torch.inference_mode():
-            audio_tensor = self.code2wav(code_tensor)
-
-        return audio_tensor
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""

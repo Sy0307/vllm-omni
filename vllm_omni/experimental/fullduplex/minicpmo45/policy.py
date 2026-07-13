@@ -12,11 +12,6 @@ class MiniCPMO45DuplexPolicy:
     MiniCPM-o 4.5 remote-code contract, not a general vLLM-Omni duplex schema.
     """
 
-    INPUT_AUDIO_MODE = "append_audio_chunk"
-    STAGE_HANDOFF_MODE = "append_stage_handoff"
-    TTS_HANDOFF_MODE = "append_tts_handoff"
-    TTS_HANDOFF_TYPE = "minicpmo45_tts_handoff"
-
     # Audio framing contract shared by serving, orchestrator, and worker.
     # MiniCPM-o consumes 1 s units at 16 kHz and pools audio to one embedding
     # per 100 ms, so a unit contributes exactly 10 audio embeddings plus the

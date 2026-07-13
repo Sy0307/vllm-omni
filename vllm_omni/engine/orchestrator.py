@@ -55,12 +55,10 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import (
-    DuplexAdapterPattern,
     DuplexInputMode,
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
-    DuplexSignalSource,
     SessionMode,
     build_duplex_data_plane_prompt,
     duplex_resource_request_id,
@@ -488,49 +486,17 @@ class Orchestrator:
 
     @staticmethod
     def _coerce_duplex_capabilities(raw: dict[str, object]) -> DuplexRuntimeCapabilities:
-        def enum_set(enum_cls: Any, values: object) -> set[Any]:
-            if not isinstance(values, list):
-                return set()
-            result = set()
+        input_modes: set[DuplexInputMode] = set()
+        values = raw.get("input_modes")
+        if isinstance(values, list):
             for value in values:
                 try:
-                    result.add(enum_cls(value))
+                    input_modes.add(DuplexInputMode(value))
                 except ValueError:
-                    logger.warning("[Orchestrator] Ignoring unknown duplex capability value: %s", value)
-            return result
-
-        adapter_patterns = enum_set(DuplexAdapterPattern, raw.get("adapter_patterns"))
-        input_modes = enum_set(DuplexInputMode, raw.get("input_modes")) or {DuplexInputMode.TURN_COMMIT_ONLY}
-        signal_sources = enum_set(DuplexSignalSource, raw.get("signal_sources")) or {
-            DuplexSignalSource.CLIENT_EVENT,
-            DuplexSignalSource.SERVER_POLICY,
-        }
-        chunk_period = raw.get("chunk_period_ms")
-        target_latency = raw.get("target_barge_in_latency_ms")
+                    logger.warning("[Orchestrator] Ignoring unknown duplex input mode: %s", value)
         return DuplexRuntimeCapabilities(
-            adapter_patterns=adapter_patterns,
-            input_modes=input_modes,
-            signal_sources=signal_sources,
-            supports_kv_lease=bool(raw.get("supports_kv_lease", False)),
-            supports_core_kv_lease=bool(raw.get("supports_core_kv_lease", False)),
-            supports_model_internal_state=bool(raw.get("supports_model_internal_state", False)),
-            supports_stage_resumption=bool(raw.get("supports_stage_resumption", False)),
-            supports_scheduler_native_append=bool(raw.get("supports_scheduler_native_append", False)),
-            supports_core_resumable_request=bool(raw.get("supports_core_resumable_request", False)),
-            supports_stage_connector_handoff=bool(raw.get("supports_stage_connector_handoff", False)),
-            supports_independent_io_streams=bool(raw.get("supports_independent_io_streams", False)),
-            supports_realtime_endpoint=bool(raw.get("supports_realtime_endpoint", False)),
-            supports_multi_session=bool(raw.get("supports_multi_session", False)),
-            supports_multi_session_same_replica=bool(raw.get("supports_multi_session_same_replica", False)),
-            supports_barge_in=bool(raw.get("supports_barge_in", True)),
-            supports_playback_ack=bool(raw.get("supports_playback_ack", True)),
-            supports_audio_truncate=bool(raw.get("supports_audio_truncate", False)),
+            input_modes=input_modes or {DuplexInputMode.TURN_COMMIT_ONLY},
             implementation_level=str(raw.get("implementation_level") or "serving_session_adapter"),
-            stage_handoff_transport=(
-                str(raw.get("stage_handoff_transport")) if raw.get("stage_handoff_transport") is not None else None
-            ),
-            chunk_period_ms=int(chunk_period) if isinstance(chunk_period, int | float) else None,
-            target_barge_in_latency_ms=int(target_latency) if isinstance(target_latency, int | float) else None,
         )
 
     async def _handle_open_duplex_session(self, msg: OpenDuplexSessionMessage) -> None:
@@ -539,7 +505,6 @@ class Orchestrator:
             capabilities = self._coerce_duplex_capabilities(msg.capabilities)
             self.duplex_sessions.open_session(
                 msg.fence,
-                session_mode=session_mode,
                 capabilities=capabilities,
                 session_config=msg.session_config,
             )
@@ -561,7 +526,6 @@ class Orchestrator:
                             "session_mode": session_mode.value,
                             "scheduler_request_context": request_state is not None,
                             "request_id": request_state.request_id if request_state is not None else None,
-                            "stage_request_topology": self._duplex_stage_request_topology(session),
                         },
                     }
                 ],
@@ -585,10 +549,8 @@ class Orchestrator:
                 raise ValueError("expected_epoch must match fence.epoch")
             mode = DuplexInputMode(msg.mode)
             update = session.append_input(
-                msg.payload,
                 mode=mode,
                 fence=msg.fence,
-                final=msg.final,
             )
             stage_results = await self._append_duplex_input_via_data_plane(
                 msg,
@@ -687,7 +649,6 @@ class Orchestrator:
                     "data_plane_append": True,
                     "request_id": request_id,
                     "response_stage_id": req_state.final_stage_id,
-                    "stage_request_topology": self._duplex_stage_request_topology(session),
                     "seq": seq,
                     "turn_id": turn_id,
                     "response_seq": msg.fence.response_seq,
@@ -805,52 +766,6 @@ class Orchestrator:
             }
         )
 
-    def _duplex_stage_request_topology(self, session: DuplexSessionRuntimeState) -> dict[str, Any]:
-        """Return the session's scheduler data-plane request topology.
-
-        One duplex session owns one logical resumable scheduler request for the
-        current epoch. Each physical stage keeps its own runner/scheduler state
-        for that logical request id after it is admitted. Downstream stages are
-        admitted on the first handoff and then updated until the final segment.
-        This is deliberately not a persistent core KV lease.
-        """
-        logical_request_id = self._duplex_stage_request_id(session.fence, stage_id=0)
-        created = logical_request_id in self.request_states
-        stage_requests: list[dict[str, Any]] = []
-        all_stage_actors_submitted = bool(self.stage_pools)
-        for stage_id in range(len(self.stage_pools)):
-            binding = session.stage_bindings.get(stage_id)
-            is_stage0 = stage_id == 0
-            if binding is None:
-                all_stage_actors_submitted = False
-            stage_requests.append(
-                {
-                    "stage_id": stage_id,
-                    "logical_request_id": logical_request_id,
-                    "planned_request_id": logical_request_id,
-                    "bound_request_id": binding.request_id if binding is not None else None,
-                    "created": created,
-                    "submitted": binding is not None,
-                    "replica_id": binding.replica_id if binding is not None else None,
-                    "resumable": True,
-                    "admission": "open" if is_stage0 else "first_handoff",
-                    "update_policy": "append_streaming_input" if is_stage0 else "segment_payload_update",
-                    "stage_actor_state": "submitted" if binding is not None else "planned",
-                    "long_lived_stage_actor": is_stage0 or binding is not None,
-                }
-            )
-        return {
-            "kind": "scheduler_data_plane_resumable_stage_pipeline",
-            "persistent_core_kv_lease": False,
-            "one_long_lived_request_per_stage": all_stage_actors_submitted,
-            "stage0_long_lived_request": True,
-            "stage_actors_become_long_lived_after_first_handoff": True,
-            "downstream_stage_update_policy": "segment_payload_update",
-            "logical_request_id": logical_request_id,
-            "stage_request_id_scope": "epoch_scoped_logical_request_id_per_stage_runner_state",
-            "stage_requests": stage_requests,
-        }
-
     @staticmethod
     def _build_duplex_data_plane_prompt(
         *,
@@ -877,18 +792,14 @@ class Orchestrator:
         stage_results: list[dict[str, object]] = []
         try:
             session = self.duplex_sessions.require(msg.session_id)
-            session.accept_fence(msg.fence)
             if msg.event in {"barge_in", "input.cancel", "response.cancel"}:
-                bound_stage_requests = [item for item in session.stage_bindings.items() if item[1].fence == msg.fence]
-                stage_results.extend(
-                    await self._signal_bound_duplex_stage_replicas(
-                        msg,
-                        bound_stage_requests=bound_stage_requests,
-                    )
-                )
+                # Cancellation identifies the generation being released. It may
+                # arrive after the session has already advanced to a new fence.
                 stale_request_ids = session.release_fence(msg.fence)
                 if stale_request_ids:
                     await self._cleanup_request_ids(stale_request_ids, abort=True)
+            else:
+                session.accept_fence(msg.fence)
             stage_results.append(
                 {
                     "stage_id": -1,
@@ -918,56 +829,6 @@ class Orchestrator:
                 stage_results=[],
                 error=str(exc),
             )
-
-    async def _signal_bound_duplex_stage_replicas(
-        self,
-        msg: SignalDuplexTurnMessage,
-        *,
-        bound_stage_requests: list[tuple[int, Any]],
-    ) -> list[dict[str, object]]:
-        stage_results: list[dict[str, object]] = []
-        payload = dict(msg.payload or {})
-        payload.setdefault("turn_id", msg.fence.turn_id)
-        payload.setdefault("response_seq", msg.fence.response_seq)
-        for stage_id, binding in bound_stage_requests:
-            if stage_id < 0 or stage_id >= len(self.stage_pools):
-                continue
-            replica_id = getattr(binding, "replica_id", None)
-            if replica_id is None:
-                continue
-            try:
-                result = await self.stage_pools[stage_id].collective_rpc(
-                    int(replica_id),
-                    "signal_duplex_turn_async",
-                    timeout=msg.timeout,
-                    kwargs={
-                        "session_id": msg.session_id,
-                        "epoch": msg.fence.epoch,
-                        "fence": msg.fence,
-                        "event": msg.event,
-                        "payload": dict(payload),
-                    },
-                )
-            except Exception as exc:
-                result = {
-                    "supported": False,
-                    "error": str(exc),
-                }
-            if isinstance(result, dict) and result.get("supported") is False and not result.get("error"):
-                result = {
-                    "supported": True,
-                    "ignored_unsupported_stage_signal": True,
-                    "event": msg.event,
-                    "reason": result.get("reason"),
-                }
-            stage_results.append(
-                {
-                    "stage_id": stage_id,
-                    "replica_id": int(replica_id),
-                    "result": result,
-                }
-            )
-        return stage_results
 
     async def _handle_close_duplex_session(self, msg: CloseDuplexSessionMessage) -> None:
         stage_results: list[dict[str, object]] = []
@@ -1025,29 +886,16 @@ class Orchestrator:
                 yield from cls._iter_duplex_result_dicts(item)
 
     @classmethod
-    def _duplex_result_has_passive_stage(cls, result: object) -> bool:
-        if isinstance(result, dict):
-            if result.get("passive_stage") is True:
-                return True
-            return any(cls._duplex_result_has_passive_stage(value) for value in result.values())
-        if isinstance(result, list | tuple):
-            return any(cls._duplex_result_has_passive_stage(item) for item in result)
-        return False
-
-    @classmethod
-    def _duplex_result_counts(cls, stage_results: list[dict[str, object]]) -> tuple[int, int, int]:
+    def _duplex_result_counts(cls, stage_results: list[dict[str, object]]) -> tuple[int, int]:
         unsupported_count = 0
         error_count = 0
-        passive_count = 0
         for item in stage_results:
             for result in cls._iter_duplex_result_dicts(item.get("result")):
                 if result.get("supported") is False:
                     unsupported_count += 1
                 if result.get("error"):
                     error_count += 1
-                if cls._duplex_result_has_passive_stage(result.get("native_result")):
-                    passive_count += 1
-        return unsupported_count, error_count, passive_count
+        return unsupported_count, error_count
 
     async def _put_duplex_control_result(
         self,
@@ -1067,7 +915,7 @@ class Orchestrator:
                     "result": {"supported": False, "error": error},
                 }
             ]
-        unsupported_count, error_count, passive_count = self._duplex_result_counts(stage_results)
+        unsupported_count, error_count = self._duplex_result_counts(stage_results)
         await self.rpc_async_queue.put(
             DuplexControlResultMessage(
                 control_id=control_id,
@@ -1078,7 +926,6 @@ class Orchestrator:
                 stage_results=stage_results,
                 unsupported_count=unsupported_count,
                 error_count=error_count,
-                passive_count=passive_count,
             )
         )
 
@@ -1392,24 +1239,18 @@ class Orchestrator:
                                 replica_id,
                                 e,
                             )
-                            affected_session_ids = pool.duplex_session_ids_for_replica(replica_id)
                             affected_request_ids = pool.mark_replica_unavailable(replica_id)
-                            if affected_session_ids:
-                                for session_id in affected_session_ids:
-                                    session = self.duplex_sessions.get(session_id)
-                                    if session is None:
-                                        continue
-                                    stale_request_ids = session.stage_request_ids()
-                                    self.duplex_sessions.close_session(session.fence)
-                                    affected_request_ids.extend(stale_request_ids)
-                                    logger.warning(
-                                        "[Orchestrator] closed duplex session %s after stage-%s replica-%s died; "
-                                        "stale_request_ids=%s",
-                                        session_id,
-                                        stage_id,
-                                        replica_id,
-                                        stale_request_ids,
-                                    )
+                            closed_sessions = self.duplex_sessions.close_sessions_for_request_ids(affected_request_ids)
+                            for session_id, stale_request_ids in closed_sessions.items():
+                                affected_request_ids.extend(stale_request_ids)
+                                logger.warning(
+                                    "[Orchestrator] closed duplex session %s after stage-%s replica-%s died; "
+                                    "stale_request_ids=%s",
+                                    session_id,
+                                    stage_id,
+                                    replica_id,
+                                    stale_request_ids,
+                                )
                             affected_request_ids = list(dict.fromkeys(affected_request_ids))
                             if pool.available_replica_ids():
                                 for req_id in affected_request_ids:
@@ -1670,7 +1511,6 @@ class Orchestrator:
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
-                    fence=self._duplex_fence_for_req_state(req_state, stage_id=stage_id),
                     stage_id=stage_id,
                     replica_id=replica_id,
                     engine_outputs=output,
@@ -1929,7 +1769,6 @@ class Orchestrator:
         await self.output_async_queue.put(
             OutputMessage(
                 request_id=req_id,
-                fence=self._duplex_fence_for_req_state(req_state, stage_id=stage_id),
                 stage_id=stage_id,
                 engine_outputs=OmniRequestOutput(
                     request_id=req_id,
@@ -2277,7 +2116,6 @@ class Orchestrator:
                     await self.output_async_queue.put(
                         OutputMessage(
                             request_id=req_id,
-                            fence=self._duplex_fence_for_req_state(req_state, stage_id=next_logical),
                             stage_id=next_logical,
                             engine_outputs=error_output,
                             metrics=None,
@@ -2304,7 +2142,6 @@ class Orchestrator:
                         await self.output_async_queue.put(
                             OutputMessage(
                                 request_id=req_id,
-                                fence=self._duplex_fence_for_req_state(req_state, stage_id=next_logical),
                                 stage_id=next_logical,
                                 engine_outputs=error_output,
                                 metrics=None,
@@ -2488,7 +2325,6 @@ class Orchestrator:
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
-                    fence=self._duplex_fence_for_req_state(req_state, stage_id=final_stage_id),
                     stage_id=final_stage_id,
                     replica_id=0,
                     engine_outputs=terminal_output,

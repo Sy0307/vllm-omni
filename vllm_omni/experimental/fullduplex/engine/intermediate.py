@@ -95,14 +95,3 @@ def get_stream_request_key(info: dict[str, Any]) -> str:
             "expected global_request_id, request_id, or _omni_req_id."
         )
     return str(key)
-
-
-def populate_tts_handoff_from_omni_payload(info: dict[str, Any], payload: dict[str, Any]) -> None:
-    if info.get("tts_token_ids") is not None and info.get("tts_hidden_states") is not None:
-        return
-    ids = payload.get("ids")
-    hidden_states = payload.get("hidden_states")
-    if isinstance(ids, dict) and info.get("tts_token_ids") is None:
-        info["tts_token_ids"] = ids.get("output")
-    if isinstance(hidden_states, dict) and info.get("tts_hidden_states") is None:
-        info["tts_hidden_states"] = hidden_states.get("output")

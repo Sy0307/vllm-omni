@@ -26,7 +26,7 @@ This checkpoint does not claim:
 - bounded KV for minute-scale conversations;
 - production multi-session capacity or concurrency guarantees.
 
-The interruption reducer and epoch fence exist as a common contract, but
+Epoch fencing and stale-output rejection exist in the active path, but
 MiniCPM-o 4.5 does not currently provide a validated automatic interruption
 source. A clean multi-turn native duplex checkpoint must not be presented as a
 validated barge-in implementation.
@@ -37,13 +37,13 @@ The review branch is rebased on the current local `origin/main` used for this
 checkpoint:
 
 ```text
-origin/main: ff6f0da271bd1c3658c3e46e4e2cdc4db17219a5
-runtime checkpoint before deploy migration:
-             4159a910ceac24ab63f8b9ea799e0406ae56c279
+origin/main: d3c47efc4f818931f29e5f1567c94c454561631c
+runtime checkpoint before this cleanup:
+             b14a01d6d3bc7299a822e3eefc5b97d1da37f77a
 ```
 
 `origin/main` is an ancestor of the branch. The implementation was validated in
-the remote CUDA environment with vLLM 0.24-compatible APIs. The full-duplex
+the remote CUDA environment with vLLM 0.25.0. The full-duplex
 package remains under `vllm_omni.experimental` because the scheduler append and
 production lifetime contracts are not upstream-stable APIs yet.
 
@@ -82,11 +82,11 @@ DuplexFence(
 )
 ```
 
-The fence is attached to typed engine messages, orchestrator request state,
-stage bindings, multimodal metadata, output events, cursors, and teardown
-operations. Missing fence metadata is an error on typed duplex paths. A valid
-old fence is stale output and is dropped; an impossible newer or mismatched
-fence fails loudly.
+The fence is attached to engine messages, orchestrator request state, stage
+bindings, multimodal metadata, output events, cursors, and teardown operations.
+Missing fence metadata is an error on fenced duplex paths. A valid old fence is
+stale output and is dropped; an impossible newer or mismatched fence fails
+loudly.
 
 Clean turns advance `turn_id` and `response_seq` while preserving `epoch`.
 Interruption advances `epoch` atomically and invalidates all prior output.
@@ -96,8 +96,9 @@ Interruption advances `epoch` atomically and invalidates all prior output.
 MiniCPM-o samples native `listen` and `speak` tokens. On the validated
 `auto_response` path, serving does not make the model speak by rewriting
 probabilities, forcing a token, or converting a `listen` decision into a
-response. The generic runtime performs transport and lifecycle operations; the
-MiniCPM adapter maps model outputs to typed events.
+response. The Realtime session controller performs transport and lifecycle
+operations; MiniCPM Stage0/Stage1 adapters expose model outputs to that active
+path.
 
 The non-auto-response short-commit and overlap compatibility paths may set
 `force_listen`. This does not rewrite the sampled token; it prevents the
@@ -116,70 +117,64 @@ The implementation therefore removed the successful-run dependency on:
 
 Current vLLM does not expose the scheduler-native append/session-KV primitive
 needed by the target architecture. The existing resumable request and scheduler
-data-plane behavior is isolated behind
-`experimental.fullduplex.engine.OmniDuplexEnginePort` and typed engine methods.
+data-plane behavior is isolated in `experimental.fullduplex.engine.omni` and the
+fenced AsyncOmni/orchestrator methods. Placeholder-token accounting remains at
+that engine boundary rather than in OpenAI protocol or MiniCPM turn policy.
 
-The core lifecycle, OpenAI projection, and MiniCPM adapter do not depend on
-placeholder-token accounting. A future native append implementation can replace
-the engine port without changing the domain events or response lifecycle.
+A future native append implementation can replace these compatibility helpers
+without changing the Realtime response lifecycle or model adapters. The PR does
+not carry an unconnected second engine-port/reducer implementation.
 
 ## 4. Package Boundaries
 
 ```text
 vllm_omni/experimental/fullduplex/
   core/
-    identity.py       immutable `DuplexFence`
-    events.py         typed domain events and effects
-    state.py          pure session/turn/response reducer
-    runtime.py        effect execution and task ownership
-    ports.py          engine and event-sink protocols
-    playback.py       generated/sent/played/committed cursor
+    identity.py       immutable cross-layer `DuplexFence`
+    adapter.py        original JoyVL adapter contract
+    runtime.py        original JoyVL session runtime
+    session.py        original JoyVL session state
   engine/
     omni.py           current orchestrator/scheduler data-plane adapter
     intermediate.py   typed Stage0 -> Stage1 payload helpers
-    worker.py         loaded-model runner/provider integration
   openai/
     protocol.py       duplex protocol schema and session registry
     realtime_session.py Realtime input/output schema projection
     websocket.py      reader/writer queues and task ownership
     serving.py        session controller and engine/protocol orchestration
-    realtime.py       typed reducer event projection
-    history.py        response lifecycle ledger
-    data_plane.py     per-fence output cursors
     audio.py          audio format conversion
   minicpmo45/
     policy.py         token names, framing, and scheduler accounting rules
     input.py          PCM chunk buffering and commit accounting
-    adapter.py        model events and serving-side session preparation
-    stage0.py         native thinker/listen/speak runtime
-    stage1.py         talker/Token2Wav runtime
-    worker.py         stage provider hooks
-    runtime.py        MiniCPM adapter exports
+    compat.py         checkpoint config compatibility fixes
+    adapter.py        serving-side session preparation
+    stage0.py         scheduler-owned Stage0 input builder
   joyvl/
-    ...               second model package using the same core contracts
+    ...               existing integration using the original core runtime
 ```
 
-The generic package owns lifecycle and identity. Model token IDs, MiniCPM audio
-unit sizing, reference-audio setup, Stage0 state, and Stage1 handoff rules stay
-inside `minicpmo45`.
+The active MiniCPM path owns Realtime lifecycle in `openai/protocol.py` and
+`openai/serving.py`, while `DuplexFence` is the cross-layer identity. Model token
+IDs, MiniCPM audio-unit sizing, reference-audio setup, Stage0 state, and Stage1
+handoff rules stay inside `minicpmo45`. The original JoyVL runtime remains
+separate and unchanged.
 
 `openai/serving.py` remains the largest integration module because it projects
 the existing `/v1/duplex` and `/v1/realtime?duplex=1` protocols onto the engine
 adapter. It no longer contains the model Stage0/Stage1 implementation, audio
 codecs, WebSocket actor, or Realtime schema state. Further reduction of this
-controller is possible, but is not required to replace the current engine port.
+controller is possible, but is independent of scheduler-native append work.
 
-The loaded-model worker boundary is an explicit provider contract. A native
-provider must implement `open_duplex_session`, `append_duplex_input`,
-`signal_duplex_turn`, and `close_duplex_session`; session open fails when any
-method is absent. The worker no longer reflects over model-local
-`prepare/prefill/generate`, guesses stop/reset/cleanup methods, or falls back to
-signalling an unrelated loaded-model object. This keeps the scheduler data-plane
-adapter as the only native MiniCPM execution path.
+MiniCPM does not install a second loaded-model provider lifecycle. Stage0 builds
+audio embeddings during the normal model `preprocess()` call, and the existing
+runner owns attention metadata, sampling, and request KV. Stage0 output then
+continues through the normal orchestrator pipeline into the model's Stage1/TTS
+implementation. Open, signal, and close remain session/control-plane operations;
+they do not invoke parallel worker RPC wrappers.
 
 ## 5. State Machine and Normal Turn Flow
 
-The pure reducer uses these turn phases:
+The active Realtime session controller follows these logical turn phases:
 
 ```text
 IDLE
@@ -195,7 +190,8 @@ The normal native audio flow is:
 1. `input_audio_buffer.append` is decoded and normalized to 16 kHz
    `pcm_f32le`.
 2. `MiniCPMO45PcmAppendBuffer` emits only complete model audio units. It tracks
-   per-turn `had_input` and `had_speech` independently from residual bytes.
+   per-turn speech independently from residual bytes; the serving loop tracks
+   input and speech observed since the last commit.
 3. Incremental units are appended with `final=False` to the stable fenced
    engine session.
 4. `input_audio_buffer.commit` advances the logical turn and reserves one
@@ -301,35 +297,38 @@ not also exposed to the client. Removed legacy/output event query and session
 switches are ignored. PCM, WAV, and G.711 conversion is implemented only in
 `openai/audio.py`.
 
-`ResponseLifecycleLedger` and per-response terminal sets make terminal events
-idempotent. `response.created` is keyed by the fenced response rather than by a
-raw string grep count, which avoids both actual duplicate creation and false
-diagnosis from nested event payload text.
+Per-response state and terminal sets in the active protocol/session controller
+make terminal events idempotent. `response.created` is keyed by the fenced
+response rather than by a raw string grep count, which avoids both actual
+duplicate creation and false diagnosis from nested event payload text.
 
 Text and audio use per-fence cursors. A new turn cannot reuse the previous
 turn's cumulative text cursor, audio offset, or text/audio marks. Late output
 after `response.done` is rejected or stale-dropped depending on its fence.
 
 Playback acknowledgement tracks four monotonic positions: generated, sent,
-played, and committed. Only playback-committed assistant history is eligible
-for reconstruction after interruption. This contract is present even though
-automatic barge-in is out of scope for this checkpoint.
+played, and committed. Only playback-committed assistant history is retained
+by serving for conversation continuation after interruption. This contract is
+present even though automatic barge-in is out of scope for this checkpoint.
 
 ## 8. Interruption Contract and Current Barge-In Scope
 
-The reducer defines one interruption transition:
+The fenced serving/engine contract defines one interruption transition:
 
 1. capture the old fence;
-2. increment `epoch`;
-3. cancel old-fence work;
-4. stale-drop late old-fence output;
-5. reset Stage1 with the old fence;
-6. rebuild Stage0 from playback-committed history;
-7. accept new output only under the new fence.
+2. commit only playback-visible assistant history in serving;
+3. increment `epoch` for subsequent input;
+4. signal and release runtime work with the captured old fence;
+5. stale-drop late old-fence output and reset old Stage1 state;
+6. accept subsequent input and output only under the new fence.
 
-There is no second barge-in-specific response state machine in the core design.
-A future VAD, model signal, or explicit client control can emit
-`InterruptRequested` through the same transition.
+The current scheduler data plane does not implement Stage0 KV rollback or
+history reconstruction. Conversation truncation remains serving-owned; runtime
+signals intentionally carry only event, fence, and timeout.
+
+There is no independently advertised barge-in capability in this checkpoint. A
+future VAD, model signal, or explicit client control must enter through this
+same fenced transition rather than create a second response lifecycle.
 
 MiniCPM-o 4.5 currently exposes model-owned `listen`/`speak`, but the validated
 official loop does not provide a reliable, explicit automatic barge-in event.
@@ -443,14 +442,13 @@ trust boundary.
 
 ## 11. Review Map by Subsystem
 
-### Core lifecycle and identity
+### Shared identity and existing JoyVL runtime
 
 - `vllm_omni/experimental/fullduplex/core/identity.py`
-- `vllm_omni/experimental/fullduplex/core/events.py`
-- `vllm_omni/experimental/fullduplex/core/state.py`
 - `vllm_omni/experimental/fullduplex/core/runtime.py`
-- `vllm_omni/experimental/fullduplex/core/playback.py`
-- `vllm_omni/experimental/fullduplex/core/ports.py`
+- `vllm_omni/experimental/fullduplex/core/adapter.py`
+- `vllm_omni/experimental/fullduplex/core/session.py`
+- `vllm_omni/experimental/fullduplex/joyvl/adapter.py`
 
 ### OpenAI Realtime and WebSocket projection
 
@@ -458,8 +456,6 @@ trust boundary.
 - `vllm_omni/experimental/fullduplex/openai/realtime_session.py`
 - `vllm_omni/experimental/fullduplex/openai/websocket.py`
 - `vllm_omni/experimental/fullduplex/openai/protocol.py`
-- `vllm_omni/experimental/fullduplex/openai/history.py`
-- `vllm_omni/experimental/fullduplex/openai/data_plane.py`
 - `vllm_omni/experimental/fullduplex/openai/audio.py`
 - `vllm_omni/entrypoints/openai/api_server.py`
 - `vllm_omni/entrypoints/openai/serving_chat.py`
@@ -494,7 +490,7 @@ trust boundary.
 ### Demo and verification
 
 - `examples/online_serving/minicpmo/realtime_duplex_demo.py`
-- `examples/online_serving/minicpmo/realtime_web/`
+- `vllm_omni/experimental/fullduplex/web/`
 - `tests/fullduplex/`
 - `tests/entrypoints/openai/test_duplex_protocol.py`
 - `tests/entrypoints/openai_api/test_duplex_handler.py`
@@ -669,8 +665,9 @@ turn that the gate had skipped. Whisper large-v3 decoded its 1.28-second audio
 as unrelated speech (`料汤`) while the protocol transcript was empty. The root
 cause was Stage1 starting TTS from a terminal-only `[speak, turn_eos]` handoff.
 The runtime now treats `turn_eos` as a flush only when a spoken Stage1 turn is
-already open; an empty terminal still reaches the reducer so model-turn identity
-advances, but it does not create an OpenAI response or synthesize audio.
+already open; an empty terminal still reaches the active session controller so
+model-turn identity advances, but it does not create an OpenAI response or
+synthesize audio.
 
 The earlier response-required contract was intentionally single-turn. The
 latest checkpoint adds a pinned three-turn semantic chain with transcript hints
@@ -693,6 +690,16 @@ transcripts:
   2. 你好，有什么可以帮您的吗？
   3. 没问题，刚才的暗号是鲸鱼。
 ```
+
+Whisper large-v3 also decoded all three fresh WAVs as continuous Chinese
+speech. It matched the middle response exactly and retained the code-word
+semantics in the first and third responses despite homophone substitutions:
+
+```text
+/tmp/remote_gpu_logs/1610897a.log
+```
+
+This is an intelligibility sanity check, not a corpus-level MOS claim.
 
 The third answer depends on the first input, while the unrelated short second
 turn has its own response. This is evidence for sequential multi-turn audio
@@ -823,10 +830,52 @@ adapter, Stage0/Stage1 hooks, Realtime handler, and demo gates, passed on H20:
 ```
 
 The matrix uses vLLM 0.25.0 and includes the latest-main stage-init and output
-processor tests that cover both rebase conflict resolutions. The cleanup still
-removes the ten tests that existed only to verify the deleted reflection adapter
-and worker-method fallbacks; active Stage0, Stage1, provider lifecycle,
-protocol, and E2E coverage remain in the 550-test matrix.
+processor tests that cover both rebase conflict resolutions. The final cleanup
+removes tests that existed only to verify deleted reducer, provider, runner-hook,
+and worker-RPC implementations. The post-cleanup H20 matrix below is the
+authoritative regression evidence for the remaining Stage0, Stage1/TTS,
+protocol, and E2E path.
+
+The post-cleanup tree passed three disjoint H20 regression groups:
+
+```text
+duplex runtime, Realtime serving, fence, web, and MiniCPM integration:
+  337 passed
+  /tmp/remote_gpu_logs/80721cab.log
+
+stage initialization, output processor, intermediate data, and deploy config:
+  86 passed
+  /tmp/remote_gpu_logs/04af649a.log
+
+scheduler streaming, MiniCPM model/TTS, and GPU AR runner:
+  66 passed
+  /tmp/remote_gpu_logs/73955fb9.log
+```
+
+The final cleanup also removed a stale signal payload contract. Runtime signals
+now carry only event, fence, and timeout; conversation and playback mutation
+remain serving-owned. The fake engine uses the same strict signature as the
+real engine, and the demo treats every server `error` event as a hard failure.
+Cancellation now signals the captured pre-increment fence, so the orchestrator
+can release old Stage0/Stage1 bindings even if the session has already advanced
+to the next epoch. A focused H20 test covers both immediate and late delivery.
+The fresh pinned three-turn H20 run completed without any error event:
+
+```text
+PASS
+/tmp/remote_gpu_logs/b615de0e.log
+server: /tmp/remote_gpu_logs/42710bc9.log
+artifacts: /tmp/pr3907_cleanup_response_required_cancel_fence
+turn outcomes: speak, speak, speak
+response.created/audio.done/done: 3/3/3
+response.audio.delta: 13
+playback history committed: 3/3
+cancel/truncate/stale/error: 0/0/0/0
+transcripts:
+  1. 好的，我记住了，暗号是鲸鱼。
+  2. 你好，有什么可以帮您的吗？
+  3. 没问题，刚才的暗号是鲸鱼。
+```
 
 ## 14. Reviewer Reproduction
 
@@ -870,7 +919,8 @@ produce `response.listen` instead of `response.created`. Verify:
 - every input is committed and every turn reports `listen` or `speak`;
 - any created response has a symmetric terminal lifecycle;
 - no missing-fence, stale output, cancellation, truncation, timeout, or forced
-  speak fallback occurs.
+  speak fallback occurs;
+- the result reports `error_count: 0`; any server `error` event fails the run.
 
 ### 14.3 Run the pinned response-required fixture
 
@@ -921,7 +971,9 @@ Review the per-response WAV files and verify:
 - no previous-turn suffix in the next response;
 - audio exists before done and no audio arrives after done;
 - no missing-fence, stale-guard-inert, timeout, forced-speak, or forced-listen
-  fallback in the server log.
+  fallback in the server log;
+- `error_count` is zero. The demo must exit nonzero for any server `error`
+  event, even when all response lifecycle counts otherwise look valid.
 
 `--turn-transcript` labels the local fixture and expected result only when
 `--omit-transcript-hints` is set; it is not sent to the server. Validate
@@ -993,7 +1045,7 @@ Reviewers should focus on these invariants rather than only the demo output:
 The next architectural tiers are intentionally separate from this checkpoint:
 
 - add an upstream scheduler-native append/session-KV primitive and replace the
-  compatibility engine port;
+  compatibility helpers in the AsyncOmni/orchestrator engine boundary;
 - select and validate an automatic interruption source for MiniCPM-o;
 - run the existing epoch interruption contract through full E2E audio fencing;
 - implement bounded/windowed conversational KV for minute-scale sessions;

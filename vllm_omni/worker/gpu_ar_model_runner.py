@@ -296,8 +296,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     outputs per request while keeping Async output semantics.
     """
 
-    supports_native_duplex_runner_context = True
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -703,49 +701,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if isinstance(value, str):
             return value.lower() in ("1", "true", "yes", "on")
         return bool(value)
-
-    def duplex_forward_with_runner_context(
-        self,
-        *,
-        session_id: str,
-        inputs_embeds: torch.Tensor,
-        context_len: int,
-        previous_context_len: int = 0,
-        reset_kv: bool = False,
-    ) -> dict[str, Any]:
-        """Run one native-duplex Stage0 step through a runner-owned boundary.
-
-        This method is intentionally a runner contract, not a model method:
-        token selection and KV/attention ownership must stay in the model
-        runner instead of being reimplemented by MiniCPM-o's duplex runtime.
-
-        The actual scheduled implementation is installed by the runner/backend
-        that owns the active session context. Without that context we fail
-        closed rather than falling back to an eager model.forward path.
-        """
-        impl = getattr(self, "_duplex_forward_with_runner_context_impl", None)
-        if not callable(impl):
-            raise RuntimeError(
-                "GPUARModelRunner native duplex requires a scheduler-owned "
-                "duplex runner context; core KV lease/resumable request is not "
-                "enabled for this runner."
-            )
-        output = impl(
-            session_id=session_id,
-            inputs_embeds=inputs_embeds,
-            context_len=context_len,
-            previous_context_len=previous_context_len,
-            reset_kv=reset_kv,
-        )
-        if not isinstance(output, dict):
-            raise TypeError("duplex runner context forward must return a dict")
-        missing = {"logits", "hidden_states", "sampled_token_id", "kv_cache_length"} - set(output)
-        if missing:
-            raise ValueError(f"duplex runner context forward missing fields: {sorted(missing)}")
-        output = dict(output)
-        output["uses_model_runner_scheduler"] = True
-        output["runner_kv_backed"] = True
-        return output
 
     def capture_model(self) -> int:
         result = super().capture_model()
@@ -2414,8 +2369,3 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 return global_id.decode("utf-8")
             return str(global_id)
         return req_id
-
-
-GPUARModelRunner.duplex_forward_with_runner_context.uses_scheduler_metadata = True  # type: ignore[attr-defined]
-GPUARModelRunner.duplex_forward_with_runner_context.uses_runner_kv_cache = True  # type: ignore[attr-defined]
-GPUARModelRunner.duplex_forward_with_runner_context.vllm_omni_runner_context_contract = True  # type: ignore[attr-defined]
