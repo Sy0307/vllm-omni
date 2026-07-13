@@ -225,6 +225,43 @@ class TimedWebSocket:
         return [m.get("type", "") for m in self.sent]
 
 
+def test_native_realtime_protocol_emits_speak_once_per_response():
+    protocol = NativeRealtimeSessionProtocol({})
+    response_id = "resp-speak-once"
+
+    projected = protocol.encode_outbound_event(
+        {
+            "type": "response.created",
+            "response_id": response_id,
+            "modalities": ["audio", "text"],
+        }
+    )
+    projected.extend(
+        protocol.encode_outbound_event(
+            {
+                "type": "response.speak",
+                "response_id": response_id,
+                "text": "hello",
+                "model_speak": True,
+            }
+        )
+    )
+    projected.extend(
+        protocol.encode_outbound_event(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": response_id,
+                "audio": base64.b64encode(b"\x00\x00").decode("ascii"),
+                "format": "pcm16",
+                "sample_rate_hz": 24000,
+                "model_speak": True,
+            }
+        )
+    )
+
+    assert [event["type"] for event in projected].count("response.speak") == 1
+
+
 @pytest.mark.asyncio
 async def test_native_realtime_protocol_drains_internal_conversation_item_control_event():
     ws = TimedWebSocket()
