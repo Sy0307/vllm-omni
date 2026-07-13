@@ -287,9 +287,9 @@ python -m vllm_omni.experimental.fullduplex.web \
     --ws-backend ws://127.0.0.1:8099
 ```
 
-Open `http://<host>:7862/`. Behind Cloud Studio, open the full
-`https://<aop-host>/aoplab/<workspace>/studio/proxy/7862/` URL. The browser
-derives its `wss://` endpoint relative to that URL, preserving the proxy path.
+Open `http://<host>:7862/`. When using a reverse proxy, open the proxy URL that
+maps to port `7862`. The browser derives its WebSocket endpoint relative to
+that URL, preserving any proxy path prefix.
 
 ## Notes
 

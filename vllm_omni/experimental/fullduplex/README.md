@@ -38,9 +38,9 @@ python -m vllm_omni.experimental.fullduplex.web \
   --ws-backend ws://127.0.0.1:8099
 ```
 
-Open `http://<host>:7862/`. In Cloud Studio use the complete proxy URL:
-`https://<aop-host>/aoplab/<workspace>/studio/proxy/7862/`. The page uses a
-same-origin WebSocket path, so the proxy prefix is retained automatically.
+Open `http://<host>:7862/`. When using a reverse proxy, open the proxy URL that
+maps to port `7862`. The page uses a same-origin WebSocket path, so any proxy
+path prefix is retained automatically.
 
 The page exposes the currently supported model-policy session only. It does
 not present automatic/VAD barge-in or multi-session controls.
