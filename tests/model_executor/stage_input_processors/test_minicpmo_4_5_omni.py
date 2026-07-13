@@ -515,7 +515,6 @@ def test_native_duplex_talker_uses_generate_chunk_continuation(monkeypatch):
     model._talker_consumed_tokens = {}
 
     monkeypatch.setattr(model, "_lazy_init_tts", lambda: None)
-    monkeypatch.setattr(model, "_maybe_compile_tts_model", lambda: None)
     monkeypatch.setattr(
         model, "_build_tts_sampling_params", lambda: SimpleNamespace(temperature=0.8, repetition_penalty=1.05)
     )
@@ -598,7 +597,6 @@ def test_minicpmo_native_duplex_talker_turn_end_metadata_flushes_tail(monkeypatc
     model._talker_consumed_tokens = {}
 
     monkeypatch.setattr(model, "_lazy_init_tts", lambda: None)
-    monkeypatch.setattr(model, "_maybe_compile_tts_model", lambda: None)
     monkeypatch.setattr(
         model, "_build_tts_sampling_params", lambda: SimpleNamespace(temperature=0.8, repetition_penalty=1.05)
     )
@@ -671,7 +669,6 @@ def test_minicpmo_native_duplex_terminal_only_new_turn_does_not_start_tts(monkey
     model._talker_consumed_tokens = {}
 
     monkeypatch.setattr(model, "_lazy_init_tts", lambda: None)
-    monkeypatch.setattr(model, "_maybe_compile_tts_model", lambda: None)
     monkeypatch.setattr(
         model, "_build_tts_sampling_params", lambda: SimpleNamespace(temperature=0.8, repetition_penalty=1.05)
     )
@@ -736,72 +733,6 @@ def test_minicpmo_native_duplex_talker_finished_request_closes_session_keyed_tur
     assert model.audio_tokenizer.hift_cache_dict == {}
 
 
-def test_minicpmo_native_duplex_talker_signal_ignores_stale_epoch():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        _TalkerTurnState,
-    )
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model.audio_tokenizer = SimpleNamespace(stream_cache={"new": True}, hift_cache_dict={"new": True})
-    model._talker_turn_states = {
-        "sid-stage1": _TalkerTurnState(prompt_wav_path=None, temp_prompt_wav_path=None, epoch=2),
-    }
-    model._talker_consumed_tokens = {"sid-stage1": 4}
-    model._talker_request_keys = {}
-
-    stale = model.signal_duplex_turn(session_id="sid-stage1", event="barge_in", epoch=1)
-
-    assert stale["stale_signal_ignored"] is True
-    assert "sid-stage1" in model._talker_turn_states
-    assert model._talker_consumed_tokens["sid-stage1"] == 4
-    assert model.audio_tokenizer.stream_cache == {"new": True}
-
-    current = model.signal_duplex_turn(session_id="sid-stage1", event="barge_in", epoch=2)
-
-    assert current.get("stale_signal_ignored") is not True
-    assert "sid-stage1" not in model._talker_turn_states
-    assert "sid-stage1" not in model._talker_consumed_tokens
-    assert model.audio_tokenizer.stream_cache is None
-
-
-def test_minicpmo_native_duplex_talker_signal_ignores_stale_turn_id():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        _TalkerTurnState,
-    )
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model.audio_tokenizer = SimpleNamespace(stream_cache={"new": True}, hift_cache_dict={"new": True})
-    model._talker_turn_states = {
-        "sid-stage1": _TalkerTurnState(prompt_wav_path=None, temp_prompt_wav_path=None, epoch=3, turn_id=2),
-    }
-    model._talker_consumed_tokens = {"sid-stage1": 4}
-    model._talker_request_keys = {}
-
-    stale = model.signal_duplex_turn(
-        session_id="sid-stage1",
-        event="barge_in",
-        epoch=3,
-        payload={"turn_id": 1},
-    )
-
-    assert stale["stale_signal_ignored"] is True
-    assert "sid-stage1" in model._talker_turn_states
-    assert model.audio_tokenizer.stream_cache == {"new": True}
-
-    current = model.signal_duplex_turn(
-        session_id="sid-stage1",
-        event="barge_in",
-        epoch=3,
-        payload={"turn_id": 2},
-    )
-
-    assert current.get("stale_signal_ignored") is not True
-    assert "sid-stage1" not in model._talker_turn_states
-    assert "sid-stage1" not in model._talker_consumed_tokens
-
-
 def test_minicpmo_native_duplex_talker_new_turn_reopens_session_keyed_state(monkeypatch):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
@@ -838,7 +769,6 @@ def test_minicpmo_native_duplex_talker_new_turn_reopens_session_keyed_state(monk
     model._talker_request_keys = {}
 
     monkeypatch.setattr(model, "_lazy_init_tts", lambda: None)
-    monkeypatch.setattr(model, "_maybe_compile_tts_model", lambda: None)
     monkeypatch.setattr(
         model, "_build_tts_sampling_params", lambda: SimpleNamespace(temperature=0.8, repetition_penalty=1.05)
     )
@@ -903,7 +833,6 @@ def test_minicpmo_native_duplex_talker_segment_end_preserves_token2wav_stream_un
     model._talker_consumed_tokens = {}
 
     monkeypatch.setattr(model, "_lazy_init_tts", lambda: None)
-    monkeypatch.setattr(model, "_maybe_compile_tts_model", lambda: None)
     monkeypatch.setattr(
         model, "_build_tts_sampling_params", lambda: SimpleNamespace(temperature=0.8, repetition_penalty=1.05)
     )

@@ -16,7 +16,6 @@ import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any
@@ -31,7 +30,6 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key, get_tts_handoff
-from vllm_omni.platforms import current_omni_platform
 
 try:
     from stepaudio2 import Token2wav as _Token2wav
@@ -67,20 +65,6 @@ class MiniCPMO45TTSRuntimeConfig:
     streaming_generator_chunk: int = 25
     streaming_vocoder_threshold: int = 2500
     streaming_vocoder_chunk: int = 50
-    enable_streaming_probe: bool = False
-    enable_fast_generate: bool = False
-    enable_static_kv: bool = False
-    enable_prealloc_kv: bool = False
-    enable_torch_compile: bool = False
-    torch_compile_mode: str = "default"
-    torch_compile_fullgraph: bool = False
-    torch_compile_dynamic: bool = True
-    torch_compile_target: str = "module"
-    torch_compile_strict: bool = False
-    enable_compile_warmup: bool = False
-    compile_warmup_seq_lens: tuple[int, ...] = (16,)
-    compile_warmup_decode_steps: int = 2
-    compile_warmup_generate: bool = False
 
 
 def _install_torchaudio_soundfile_shim() -> None:
@@ -113,70 +97,6 @@ def _install_torchaudio_soundfile_shim() -> None:
 
 
 _install_torchaudio_soundfile_shim()
-
-
-class _PreallocatedKVCache:
-    """Dynamic-length KV cache backed by fixed per-layer buffers.
-
-    HuggingFace's default DynamicLayer appends one token with torch.cat on
-    every decode step. For MiniCPM-o 4.5 TTS bs=1 decode that shows up as
-    thousands of small cat kernels. This cache preserves the same growing
-    attention length while avoiding per-step cache reallocation/copy.
-    """
-
-    is_compilable = False
-
-    def __init__(self, *, num_layers: int, max_cache_len: int):
-        self.max_cache_len = max_cache_len
-        self.is_sliding = [False] * num_layers
-        self._layers: list[dict[str, torch.Tensor | int | None]] = [
-            {"keys": None, "values": None, "length": 0} for _ in range(num_layers)
-        ]
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        *args,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        layer = self._layers[layer_idx]
-        keys = layer["keys"]
-        values = layer["values"]
-        if keys is None or values is None:
-            key_shape = list(key_states.shape)
-            value_shape = list(value_states.shape)
-            key_shape[-2] = self.max_cache_len
-            value_shape[-2] = self.max_cache_len
-            keys = torch.empty(key_shape, dtype=key_states.dtype, device=key_states.device)
-            values = torch.empty(value_shape, dtype=value_states.dtype, device=value_states.device)
-            layer["keys"] = keys
-            layer["values"] = values
-
-        start = int(layer["length"] or 0)
-        step = key_states.shape[-2]
-        end = start + step
-        if end > self.max_cache_len:
-            raise RuntimeError(
-                f"MiniCPM-o 4.5 preallocated TTS KV cache overflow: end={end}, max_cache_len={self.max_cache_len}"
-            )
-
-        keys[:, :, start:end, :].copy_(key_states)
-        values[:, :, start:end, :].copy_(value_states)
-        layer["length"] = end
-        return keys[:, :, :end, :], values[:, :, :end, :]
-
-    def get_seq_length(self) -> int:
-        if not self._layers:
-            return 0
-        return int(self._layers[0]["length"] or 0)
-
-    def get_mask_sizes(self, query_length: int, layer_idx: int | None = None) -> tuple[int, int]:
-        return self.get_seq_length() + query_length, 0
-
-    def get_max_cache_shape(self) -> int:
-        return self.max_cache_len
 
 
 class _TalkerTurnState:
@@ -1031,7 +951,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             yield self._empty_audio_chunk(), True
             return
 
-        self._maybe_compile_tts_model()
         tts = self.tts_obj
         if not hasattr(tts.model.config, "rope_theta"):
             tts.model.config.rope_theta = 10000.0
@@ -1251,7 +1170,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 yield torch.as_tensor(waveform, dtype=torch.float32).reshape(-1).cpu().contiguous(), True
             return
 
-        self._maybe_compile_tts_model()
         tts = self.tts_obj
         if not hasattr(tts.model.config, "rope_theta"):
             tts.model.config.rope_theta = 10000.0
@@ -1427,415 +1345,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         logger.info("Moved MiniCPM-o 4.5 TTS AR modules to cuda dtype=%s", target_dtype)
         return target_dtype
 
-    def _maybe_compile_tts_model(self, *, allow_module_target: bool = True) -> None:
-        cfg = self._tts_runtime_config()
-        if not cfg.enable_torch_compile:
-            return
-        if getattr(self, "_tts_torch_compile_applied", False):
-            return
-
-        # `reduce-overhead` enables Inductor CUDA Graph capture and currently
-        # fails on this dynamic decode loop with overwritten CUDAGraph outputs.
-        # `default` still compiles/fuses the decoder and has shown steady-state
-        # wins after the first compile warmup.
-        mode = cfg.torch_compile_mode
-        fullgraph = cfg.torch_compile_fullgraph
-        dynamic = cfg.torch_compile_dynamic
-        target = cfg.torch_compile_target
-        if target not in ("module", "forward"):
-            raise ValueError("MiniCPM-o 4.5 TTS torch compile target must be 'module' or 'forward'")
-        if target == "module" and not allow_module_target:
-            logger.warning(
-                "Skipping MiniCPM-o 4.5 module-level torch.compile during load_weights; "
-                "load-time compile requires a forward-level target."
-            )
-            return
-        try:
-            if target == "forward":
-                self.tts_obj.model.forward = torch.compile(
-                    self.tts_obj.model.forward,
-                    mode=mode,
-                    fullgraph=fullgraph,
-                    dynamic=dynamic,
-                )
-            else:
-                self.tts_obj.model = torch.compile(
-                    self.tts_obj.model,
-                    mode=mode,
-                    fullgraph=fullgraph,
-                    dynamic=dynamic,
-                )
-            self._tts_torch_compile_applied = True
-            logger.info(
-                "Enabled experimental torch.compile for MiniCPM-o 4.5 TTS model "
-                "(target=%s, mode=%s, fullgraph=%s, dynamic=%s)",
-                target,
-                mode,
-                fullgraph,
-                dynamic,
-            )
-        except Exception as exc:
-            logger.warning("Failed to enable MiniCPM-o 4.5 TTS torch.compile: %s", exc, exc_info=True)
-            if cfg.torch_compile_strict:
-                raise
-
-    def _maybe_warmup_tts_compile(self) -> None:
-        cfg = self._tts_runtime_config()
-        if not cfg.enable_compile_warmup:
-            return
-        if getattr(self, "_tts_compile_warmup_done", False):
-            return
-        if not getattr(self, "_tts_torch_compile_applied", False):
-            return
-
-        tts = self.tts_obj
-        hidden_size = int(getattr(tts.config, "hidden_size", tts.emb_text.weight.shape[-1]))
-        seq_lens = list(cfg.compile_warmup_seq_lens)
-        decode_steps = cfg.compile_warmup_decode_steps
-        use_generate = cfg.compile_warmup_generate
-        if not seq_lens or any(seq_len <= 0 for seq_len in seq_lens) or decode_steps < 0:
-            raise ValueError(
-                "MiniCPM-o 4.5 TTS compile warmup seq_lens must be positive and decode_steps must be non-negative"
-            )
-
-        device = tts.emb_text.weight.device
-        dtype = tts.emb_text.weight.dtype
-        warmup_t0 = time.perf_counter()
-        try:
-            with torch.inference_mode():
-                for seq_len in seq_lens:
-                    inputs_embeds = torch.zeros(1, seq_len, hidden_size, device=device, dtype=dtype)
-                    if use_generate:
-                        eos_token = torch.tensor([tts.config.num_audio_tokens - 1], dtype=torch.long, device=device)
-                        generate_kwargs = {
-                            "inputs_embeds": inputs_embeds,
-                            "eos_token": eos_token,
-                            "force_no_stop": True,
-                            "max_new_token": max(1, decode_steps),
-                            "min_new_token": max(1, decode_steps),
-                            "show_tqdm": False,
-                        }
-                        sampling_params = self._build_tts_sampling_params()
-                        if sampling_params is not None:
-                            generate_kwargs["sampling_params"] = sampling_params
-                        _ = tts.generate(**generate_kwargs)
-                        continue
-
-                    position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
-                    outputs = tts.model(
-                        position_ids=position_ids,
-                        cache_position=position_ids,
-                        past_key_values=None,
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=None,
-                        use_cache=True,
-                        output_attentions=False,
-                    )
-                    past_key_values = outputs.past_key_values
-                    for step in range(decode_steps):
-                        step_pos = torch.tensor([[seq_len + step]], dtype=torch.long, device=device)
-                        step_embeds = torch.zeros(1, 1, hidden_size, device=device, dtype=dtype)
-                        outputs = tts.model(
-                            position_ids=step_pos,
-                            cache_position=step_pos,
-                            past_key_values=past_key_values,
-                            inputs_embeds=step_embeds,
-                            attention_mask=None,
-                            use_cache=True,
-                            output_attentions=False,
-                        )
-                        past_key_values = outputs.past_key_values
-                if device.type == "cuda":
-                    torch.accelerator.synchronize(device)
-            self._tts_compile_warmup_done = True
-            logger.info(
-                "MiniCPM-o 4.5 TTS compile warmup finished: seq_lens=%s decode_steps=%d generate=%s total_ms=%.3f",
-                seq_lens,
-                decode_steps,
-                use_generate,
-                (time.perf_counter() - warmup_t0) * 1000,
-            )
-        except Exception as exc:
-            logger.warning("MiniCPM-o 4.5 TTS compile warmup failed: %s", exc, exc_info=True)
-            if cfg.torch_compile_strict:
-                raise
-
-    def _generate_speech_streaming_probe(
-        self,
-        *,
-        tts_embeds: torch.Tensor,
-        eos_token: torch.Tensor,
-        max_new_token: int,
-        sampling_params,
-        prompt_wav_path: str | None,
-    ) -> tuple[np.ndarray, int, int, int, float, float, float | None] | None:
-        """Probe MiniCPM-o's remote-code streaming generator.
-
-        This is intentionally opt-in and still returns a single concatenated
-        waveform to the current engine. It measures whether the model can
-        produce early audio chunks before we restructure vLLM-Omni to stream
-        those chunks through the API.
-        """
-        generator_cls = getattr(self, "_tts_streaming_generator_cls", None)
-        if generator_cls is None or self._tts_gen_logits is None:
-            logger.warning("MiniCPM-o 4.5 streaming probe unavailable in remote code")
-            return None
-
-        tts = self.tts_obj
-        chunk_size = self._tts_runtime_config().streaming_generator_chunk
-        if chunk_size <= 0:
-            raise ValueError("MiniCPM-o 4.5 TTS streaming generator chunk must be positive")
-
-        logits_warpers, logits_processors = self._tts_gen_logits(
-            num_code=tts.config.num_audio_tokens,
-            repetition_penalty=sampling_params.repetition_penalty,
-            top_p=sampling_params.top_p,
-            top_k=sampling_params.top_k,
-        )
-        if not hasattr(tts.model.config, "rope_theta"):
-            tts.model.config.rope_theta = 10000.0
-        tts_streaming_generator = generator_cls(
-            model=tts,
-            temperature=sampling_params.temperature,
-            eos_token=eos_token,
-            chunk_size=chunk_size,
-            logits_processors=logits_processors,
-            logits_warpers=logits_warpers,
-        )
-
-        stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
-        self.audio_tokenizer.stream_cache = stream_cache
-        self.audio_tokenizer.hift_cache_dict = hift_cache_dict
-
-        pieces: list[np.ndarray] = []
-        total_tokens = 0
-        num_chunks = 0
-        first_audio_ms: float | None = None
-        generate_ms = 0.0
-        vocoder_ms = 0.0
-        total_t0 = time.perf_counter()
-        try:
-            token_iter = tts_streaming_generator.generate_with_buffer(
-                condition=tts_embeds.unsqueeze(0),
-                text_finished=True,
-                max_new_token=max_new_token,
-            )
-            while True:
-                iter_t0 = time.perf_counter()
-                try:
-                    audio_token_chunk, is_last = next(token_iter)
-                except StopIteration:
-                    break
-                generate_ms += (time.perf_counter() - iter_t0) * 1000
-                if audio_token_chunk is None:
-                    break
-
-                token_list = audio_token_chunk.reshape(-1).detach().cpu().tolist()
-                if not token_list:
-                    if is_last:
-                        break
-                    continue
-
-                num_chunks += 1
-                total_tokens += len(token_list)
-                vocoder_t0 = time.perf_counter()
-                autocast_context, _ = self._token2wav_autocast_context()
-                with autocast_context:
-                    wav_np = self.audio_tokenizer.stream(
-                        token_list,
-                        prompt_wav_path,
-                        last_chunk=bool(is_last),
-                        return_waveform=True,
-                    )
-                vocoder_ms += (time.perf_counter() - vocoder_t0) * 1000
-                pieces.append(np.asarray(wav_np).reshape(-1))
-                if first_audio_ms is None:
-                    first_audio_ms = (time.perf_counter() - total_t0) * 1000
-                if is_last:
-                    break
-        finally:
-            self.audio_tokenizer.stream_cache = None
-            self.audio_tokenizer.hift_cache_dict = {}
-
-        if not pieces:
-            waveform = np.zeros((0,), dtype=np.float32)
-        else:
-            waveform = np.concatenate(pieces, axis=0).astype(np.float32)
-        return waveform, 24000, total_tokens, num_chunks, generate_ms, vocoder_ms, first_audio_ms
-
-    @torch.inference_mode()
-    def _generate_tts_tokens_fast(
-        self,
-        inputs_embeds: torch.Tensor,
-        eos_token: torch.Tensor,
-        max_new_token: int,
-        sampling_params,
-    ):
-        """Single-codebook fast path for MiniCPM-o 4.5 TTS token generation.
-
-        The upstream remote-code loop is generic over num_vq, so for the 4.5
-        checkpoint's num_vq=1 it still allocates 4D logits, projects every
-        condition token on the first step, and permutes/reshapes tensors every
-        decode step. This path keeps the same model, cache, logits processors,
-        and sampling semantics, but operates directly on the last hidden state.
-        """
-        tts = self.tts_obj
-        decode_profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-        num_vq = getattr(tts, "num_vq", None)
-        if num_vq != 1 or self._tts_gen_logits is None:
-            if decode_profile_enabled:
-                logger.info(
-                    "generate_speech fast_decode_profile: skipped fast path (num_vq=%s, has_gen_logits=%s)",
-                    num_vq,
-                    self._tts_gen_logits is not None,
-                )
-            return None
-
-        device = inputs_embeds.device
-        temperature_value = float(getattr(sampling_params, "temperature", 0.8))
-        logits_warpers, logits_processors = self._tts_gen_logits(
-            num_code=tts.config.num_audio_tokens,
-            repetition_penalty=sampling_params.repetition_penalty,
-            top_p=sampling_params.top_p,
-            top_k=sampling_params.top_k,
-        )
-
-        finish = torch.zeros(inputs_embeds.shape[0], device=device, dtype=torch.bool)
-        condition_length = inputs_embeds.shape[1]
-        new_tokens = torch.empty(
-            inputs_embeds.shape[0],
-            max_new_token,
-            1,
-            device=device,
-            dtype=torch.long,
-        )
-        static_kv = self._tts_runtime_config().enable_static_kv
-        prealloc_kv = self._tts_runtime_config().enable_prealloc_kv
-        if static_kv:
-            from transformers.cache_utils import StaticCache
-
-            past_key_values = StaticCache(
-                config=tts.model.config,
-                max_cache_len=condition_length + max_new_token,
-            )
-            cache_mode = "static"
-        elif prealloc_kv:
-            num_layers = int(getattr(tts.model.config, "num_hidden_layers", 0))
-            past_key_values = _PreallocatedKVCache(
-                num_layers=num_layers,
-                max_cache_len=condition_length + max_new_token,
-            )
-            cache_mode = "prealloc"
-        else:
-            past_key_values = None
-            cache_mode = "dynamic"
-        prefill_position_ids = torch.arange(condition_length, dtype=torch.long, device=device).unsqueeze(0)
-        decode_position_ids = torch.arange(
-            condition_length,
-            condition_length + max_new_token,
-            dtype=torch.long,
-            device=device,
-        ).unsqueeze(0)
-        min_new_token = self._tts_runtime_config().min_new_tokens
-        last_t = 0
-        eos_token_id = int(eos_token.item())
-        model_ms = 0.0
-        head_ms = 0.0
-        processors_ms = 0.0
-        sample_ms = 0.0
-
-        def profile_mark():
-            if decode_profile_enabled:
-                torch.accelerator.synchronize(device)
-            return time.perf_counter()
-
-        def head_context():
-            return self._tts_parametrize.cached() if self._tts_parametrize is not None else nullcontext()
-
-        for t in range(max_new_token):
-            audio_bos = t == 0
-            if audio_bos:
-                step_embeds = inputs_embeds
-                position_ids = prefill_position_ids
-            else:
-                step_embeds = tts.emb_code[0](new_tokens[:, t - 1 : t, 0])
-                position_ids = decode_position_ids[:, t - 1 : t]
-
-            t0 = profile_mark()
-            outputs = tts.model(
-                position_ids=position_ids,
-                cache_position=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=step_embeds,
-                attention_mask=None,
-                use_cache=True,
-                output_attentions=False,
-            )
-            if decode_profile_enabled:
-                model_ms += (profile_mark() - t0) * 1000
-            past_key_values = outputs.past_key_values
-            hidden_state = outputs.last_hidden_state[:, -1]
-
-            t0 = profile_mark()
-            with head_context():
-                logits = tts.head_code[0](hidden_state).float()
-            logits.div_(temperature_value)
-            if decode_profile_enabled:
-                head_ms += (profile_mark() - t0) * 1000
-
-            t0 = profile_mark()
-            if not audio_bos:
-                logits_token = new_tokens[:, :t, 0]
-                for logits_processor in logits_processors:
-                    logits = logits_processor(logits_token, logits)
-                for logits_warper in logits_warpers:
-                    logits = logits_warper(logits_token, logits)
-
-            if t < min_new_token:
-                logits[:, eos_token_id] = -torch.inf
-            if decode_profile_enabled:
-                processors_ms += (profile_mark() - t0) * 1000
-
-            t0 = profile_mark()
-            scores = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(scores, num_samples=1).to(finish.device)
-            if decode_profile_enabled:
-                sample_ms += (profile_mark() - t0) * 1000
-            idx_next = idx_next.view(-1, 1)
-            finish.logical_or_(idx_next.eq(eos_token_id).any(1))
-            new_tokens[:, t] = idx_next
-            last_t = t
-
-            if t == 0 and finish.any():
-                break
-            if finish.all():
-                break
-
-        generated_input_ids = new_tokens[:, :last_t, :]
-        if decode_profile_enabled:
-            steps = max(last_t + 1, 1)
-            logger.info(
-                "generate_speech fast_decode_profile: steps=%d model_ms=%.3f head_ms=%.3f "
-                "processors_ms=%.3f sample_ms=%.3f per_step_ms=%.3f cache=%s",
-                steps,
-                model_ms,
-                head_ms,
-                processors_ms,
-                sample_ms,
-                (model_ms + head_ms + processors_ms + sample_ms) / steps,
-                cache_mode,
-            )
-        output_cls = tts.generate.__globals__.get("MiniCPMTTSGenerationOutput")
-        if output_cls is None:
-            return None
-        return output_cls(
-            new_ids=generated_input_ids,
-            audio_input_ids=None,
-            past_key_values=None,
-            past_input_ids=None,
-            finished=finish.all(),
-        )
-
     def generate_speech(
         self,
         tts_token_ids: torch.Tensor,
@@ -1849,7 +1358,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             logger.warning("generate_speech: tts_obj not initialized")
             return None
 
-        self._maybe_compile_tts_model()
         tts = self.tts_obj
         device = tts.emb_text.weight.device
         dtype = tts.emb_text.weight.dtype
@@ -1901,87 +1409,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         prompt_wav_path = temp_prompt_wav_path or (default_ref if os.path.exists(default_ref) else None)
 
         try:
-            streaming_probe = self._tts_runtime_config().enable_streaming_probe
-            if streaming_probe and sampling_params is not None:
-                import torchaudio
-
-                _orig_save = torchaudio.save
-
-                def _patched_save(uri, src, sample_rate, **kw):
-                    kw.pop("backend", None)
-                    if hasattr(uri, "write"):
-                        sf.write(uri, src.cpu().numpy().T, sample_rate, format="WAV")
-                        return
-                    return _orig_save(uri, src, sample_rate, backend="soundfile", **kw)
-
-                torchaudio.save = _patched_save
-                prev_dtype = torch.get_default_dtype()
-                torch.set_default_dtype(torch.float32)
-                try:
-                    _, token2wav_autocast = self._token2wav_autocast_context()
-                    probe_result = self._generate_speech_streaming_probe(
-                        tts_embeds=tts_embeds,
-                        eos_token=eos_token,
-                        max_new_token=max_new_token,
-                        sampling_params=sampling_params,
-                        prompt_wav_path=prompt_wav_path,
-                    )
-                finally:
-                    torch.set_default_dtype(prev_dtype)
-                    torchaudio.save = _orig_save
-
-                if probe_result is not None:
-                    waveform, sr, num_tokens, num_chunks, generate_ms, vocoder_ms, first_audio_ms = probe_result
-                    if profile_enabled:
-                        logger.info("generate_speech: waveform %d samples, sr=%d", waveform.shape[0], sr)
-                        logger.info(
-                            "generate_speech streaming_probe_profile: text_tokens=%d audio_tokens=%d "
-                            "chunks=%d prep_ms=%.3f tts_generate_ms=%.3f vocoder_ms=%.3f "
-                            "first_audio_ms=%.3f total_ms=%.3f min_new_token=%d max_new_token=%d "
-                            "token2wav_n_timesteps=%d token2wav_autocast=%s",
-                            num_text,
-                            num_tokens,
-                            num_chunks,
-                            prep_ms,
-                            generate_ms,
-                            vocoder_ms,
-                            -1.0 if first_audio_ms is None else first_audio_ms,
-                            (time.perf_counter() - total_t0) * 1000,
-                            min_new_token,
-                            max_new_token,
-                            getattr(self, "_token2wav_n_timesteps", 10),
-                            token2wav_autocast,
-                        )
-                    return waveform
-
-            # Keep this experimental path opt-in: remote A/B showed it does not
-            # reduce tts_generate_ms reliably yet, despite lower Python-side shape
-            # churn.
-            fast_generate = self._tts_runtime_config().enable_fast_generate
-            if fast_generate and profile_enabled:
-                logger.info(
-                    "generate_speech fast_decode_profile: requested fast path "
-                    "(has_sampling_params=%s, has_gen_logits=%s, num_vq=%s)",
-                    sampling_params is not None,
-                    self._tts_gen_logits is not None,
-                    getattr(tts, "num_vq", None),
-                )
-            outputs = None
-            if fast_generate and sampling_params is not None:
-                outputs = self._generate_tts_tokens_fast(
-                    inputs_embeds=inputs_embeds,
-                    eos_token=eos_token,
-                    max_new_token=max_new_token,
-                    sampling_params=sampling_params,
-                )
-                if outputs is not None and not bool(outputs.finished):
-                    logger.warning(
-                        "generate_speech: fast TTS generate hit max_new_token without EOS; "
-                        "falling back to remote-code generate"
-                    )
-                    outputs = None
-            if outputs is None:
-                outputs = tts.generate(**generate_kwargs)
+            outputs = tts.generate(**generate_kwargs)
             generate_ms = (time.perf_counter() - generate_t0) * 1000
             generated_tokens = outputs.new_ids.squeeze(-1)
             if profile_enabled:
@@ -2166,30 +1594,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         return new_tokens[:, : t + 1 if finished else t, :]
 
-    def _dummy_hidden_states(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Shape-correct zero tensor for vllm KV cache profiling.
-
-        vllm's gpu_model_runner._dummy_run takes forward()'s return value as
-        ``hidden_states`` and does ``hidden_states[logit_indices_device]``;
-        returning None on the dummy path crashes with
-        ``TypeError: 'NoneType' object is not subscriptable``.
-        """
-        for ref in (input_ids, positions, inputs_embeds):
-            if isinstance(ref, torch.Tensor):
-                num_tokens = int(ref.shape[0]) if ref.ndim >= 1 else 1
-                device = ref.device
-                break
-        else:
-            num_tokens = 1
-            device = current_omni_platform.get_torch_device()
-        hidden_size = int(getattr(self, "_hidden_size", 768) or 768)
-        return torch.zeros((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
-
     def forward(
         self,
         input_ids=None,
@@ -2337,29 +1741,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 if key in keys:
                     self._talker_consumed_tokens.pop(key, None)
 
-    def signal_duplex_turn(self, **kwargs: Any) -> dict[str, Any]:
-        session_id = self._coerce_request_key(kwargs.get("session_id"))
-        event = kwargs.get("event")
-        expected_epoch = self._coerce_epoch(kwargs.get("epoch"))
-        payload = kwargs.get("payload")
-        expected_turn_id = self._coerce_turn_id(payload.get("turn_id")) if isinstance(payload, dict) else None
-        if event in {"barge_in", "input.cancel", "response.cancel"} and session_id:
-            closed = self._close_turn_state(
-                session_id,
-                expected_epoch=expected_epoch,
-                expected_turn_id=expected_turn_id,
-            )
-        else:
-            closed = True
-        result = {
-            "supported": True,
-            "stage_role": "tts",
-            "event": event,
-        }
-        if closed is False:
-            result["stale_signal_ignored"] = True
-        return result
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded = set()
         tts_weights = {}
@@ -2382,9 +1763,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     self.audio_tokenizer.to("cuda")
                 self.emb_text = self.tts_obj.emb_text
                 self.projector_semantic = self.tts_obj.projector_semantic
-                if self._tts_runtime_config().enable_torch_compile:
-                    self._maybe_compile_tts_model(allow_module_target=False)
-                    self._maybe_warmup_tts_compile()
                 logger.info("Loaded %d TTS weights, moved AR modules to cuda dtype=%s", len(tts_weights), tts_dtype)
 
         return loaded

@@ -87,7 +87,6 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
             "sid",
             {
                 "event": "barge_in",
-                "payload": None,
                 "timeout": 13.5,
             },
         ),

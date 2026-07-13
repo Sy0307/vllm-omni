@@ -479,7 +479,7 @@ class OmniDuplexSessionHandler:
                 response_bound=final,
             )
 
-        def signal_runtime_background(event_name: str, payload: dict[str, object]) -> None:
+        def signal_runtime_background(event_name: str) -> None:
             if session is None:
                 return
             captured_fence = DuplexFence(
@@ -491,7 +491,6 @@ class OmniDuplexSessionHandler:
                 self._signal_runtime_session(
                     session,
                     event_name,
-                    payload,
                     send_json,
                     fence=captured_fence,
                 )
@@ -638,6 +637,11 @@ class OmniDuplexSessionHandler:
                     cancel_reason = (
                         "output_audio_buffer_clear" if event_type == "output_audio_buffer.clear" else "barge_in"
                     )
+                    cancelled_fence = DuplexFence(
+                        session.session_id,
+                        epoch=session.epoch,
+                        turn_id=session.turn_id,
+                    )
                     if event_type == "response.cancel":
                         requested_response_id = event.get("response_id")
                         has_active_response_work = (
@@ -698,7 +702,6 @@ class OmniDuplexSessionHandler:
                         actor.active_response_task,
                         send_json,
                         reason=cancel_reason,
-                        rebuild_runtime_history_after_truncate=True,
                     )
                     had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
                     if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
@@ -706,14 +709,6 @@ class OmniDuplexSessionHandler:
                         old_response_id = session.active_response_id
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, old_response_id, committed_ms)
-                        if not await self._signal_runtime_history_rebuild_after_truncate(
-                            session,
-                            old_response_id,
-                            committed_ms,
-                            reason=cancel_reason,
-                            send_json=send_json,
-                        ):
-                            continue
                         new_epoch, old_playback = self._advance_barge_in_epoch(session)
                         await send_json(
                             {
@@ -732,14 +727,6 @@ class OmniDuplexSessionHandler:
                         old_epoch = session.epoch
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, actor.last_response_id, committed_ms)
-                        if not await self._signal_runtime_history_rebuild_after_truncate(
-                            session,
-                            actor.last_response_id,
-                            committed_ms,
-                            reason=cancel_reason,
-                            send_json=send_json,
-                        ):
-                            continue
                         new_epoch, old_playback = self._advance_barge_in_epoch(session)
                         await send_json(
                             {
@@ -759,14 +746,6 @@ class OmniDuplexSessionHandler:
                         old_response_id = session.active_response_id
                         committed_ms = session.playback.committed_ms
                         self._commit_played_response_history(session, old_response_id, committed_ms)
-                        if not await self._signal_runtime_history_rebuild_after_truncate(
-                            session,
-                            old_response_id,
-                            committed_ms,
-                            reason=cancel_reason,
-                            send_json=send_json,
-                        ):
-                            continue
                         new_epoch, old_playback = self._advance_barge_in_epoch(session)
                         await send_json(
                             {
@@ -800,7 +779,12 @@ class OmniDuplexSessionHandler:
                         cancelled = True
                     if not cancelled:
                         await self._cancel_pending_input(session, send_json, reason="barge_in")
-                    if not await self._signal_runtime_session(session, "barge_in", event, send_json):
+                    if not await self._signal_runtime_session(
+                        session,
+                        "barge_in",
+                        send_json,
+                        fence=cancelled_fence,
+                    ):
                         continue
                     actor.active_response_task = None
                     actor.transition("open")
@@ -828,7 +812,7 @@ class OmniDuplexSessionHandler:
                             if update_error is not None:
                                 await send_json(update_error)
                                 continue
-                            if not await self._signal_runtime_session(session, turn_event, event, send_json):
+                            if not await self._signal_runtime_session(session, turn_event, send_json):
                                 continue
                             await send_json(
                                 {
@@ -845,7 +829,7 @@ class OmniDuplexSessionHandler:
                             if message is not None:
                                 session.history.append(message)
                                 session.register_history_item(item_id if isinstance(item_id, str) else None, message)
-                            if not await self._signal_runtime_session(session, turn_event, event, send_json):
+                            if not await self._signal_runtime_session(session, turn_event, send_json):
                                 continue
                             await send_json(
                                 {
@@ -860,7 +844,7 @@ class OmniDuplexSessionHandler:
                             payload = event.get("payload")
                             item_id = payload.get("item_id") if isinstance(payload, dict) else None
                             deleted = session.delete_history_item(item_id) if isinstance(item_id, str) else False
-                            if not await self._signal_runtime_session(session, turn_event, event, send_json):
+                            if not await self._signal_runtime_session(session, turn_event, send_json):
                                 continue
                             await send_json(
                                 {
@@ -883,18 +867,7 @@ class OmniDuplexSessionHandler:
                                 if isinstance(item_id, str)
                                 else False
                             )
-                            signal_event = dict(event)
-                            if isinstance(payload, dict):
-                                signal_payload = dict(payload)
-                                signal_payload["history"] = list(session.history)
-                                signal_payload["playback"] = session.playback.as_dict()
-                                signal_event["payload"] = signal_payload
-                            else:
-                                signal_event["payload"] = {
-                                    "history": list(session.history),
-                                    "playback": session.playback.as_dict(),
-                                }
-                            if not await self._signal_runtime_session(session, turn_event, signal_event, send_json):
+                            if not await self._signal_runtime_session(session, turn_event, send_json):
                                 continue
                             await send_json(
                                 {
@@ -909,7 +882,7 @@ class OmniDuplexSessionHandler:
                                 }
                             )
                             continue
-                        if not await self._signal_runtime_session(session, turn_event, event, send_json):
+                        if not await self._signal_runtime_session(session, turn_event, send_json):
                             continue
                         await send_json(self._turn_controller.signal(session, turn_event, event))
                     else:
@@ -1045,6 +1018,11 @@ class OmniDuplexSessionHandler:
                             else:
                                 event["force_barge_in"] = True
                                 self._mark_barge_in_new_user_turn_payload(payload)
+                                cancelled_fence = DuplexFence(
+                                    session.session_id,
+                                    epoch=session.epoch,
+                                    turn_id=session.turn_id,
+                                )
                                 playback_was_active = actor.assistant_playback_active()
                                 buffer_overlap_audio = True
                                 defer_native_append = False
@@ -1060,7 +1038,6 @@ class OmniDuplexSessionHandler:
                                     actor.active_response_task,
                                     send_json,
                                     reason="barge_in",
-                                    rebuild_runtime_history_after_truncate=True,
                                 )
                                 had_native_stream = (
                                     await self._cancel_native_data_plane_stream(session) or had_native_stream
@@ -1070,14 +1047,6 @@ class OmniDuplexSessionHandler:
                                     old_response_id = session.active_response_id
                                     committed_ms = session.playback.committed_ms
                                     self._commit_played_response_history(session, old_response_id, committed_ms)
-                                    if not await self._signal_runtime_history_rebuild_after_truncate(
-                                        session,
-                                        old_response_id,
-                                        committed_ms,
-                                        reason="barge_in",
-                                        send_json=send_json,
-                                    ):
-                                        continue
                                     new_epoch, old_playback = self._advance_barge_in_epoch(session)
                                     await send_json(
                                         {
@@ -1096,14 +1065,6 @@ class OmniDuplexSessionHandler:
                                     old_epoch = session.epoch
                                     committed_ms = session.playback.committed_ms
                                     self._commit_played_response_history(session, actor.last_response_id, committed_ms)
-                                    if not await self._signal_runtime_history_rebuild_after_truncate(
-                                        session,
-                                        actor.last_response_id,
-                                        committed_ms,
-                                        reason="barge_in",
-                                        send_json=send_json,
-                                    ):
-                                        continue
                                     new_epoch, old_playback = self._advance_barge_in_epoch(session)
                                     await send_json(
                                         {
@@ -1118,7 +1079,12 @@ class OmniDuplexSessionHandler:
                                         }
                                     )
                                     cancelled = True
-                                if not await self._signal_runtime_session(session, "barge_in", event, send_json):
+                                if not await self._signal_runtime_session(
+                                    session,
+                                    "barge_in",
+                                    send_json,
+                                    fence=cancelled_fence,
+                                ):
                                     continue
                                 actor.active_response_task = None
                         elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
@@ -1294,7 +1260,7 @@ class OmniDuplexSessionHandler:
                                 native_deferred_response_create = should_create_response
                                 native_input_since_commit = False
                                 native_speech_since_commit = False
-                                signal_runtime_background("input.commit", event)
+                                signal_runtime_background("input.commit")
                                 committed = self._commit_native_audio_input(
                                     session,
                                     realtime_item_id=event.get("realtime_item_id"),
@@ -1318,7 +1284,7 @@ class OmniDuplexSessionHandler:
                             committed_input = native_audio_buffer.commit(
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                             )
-                            final_payload = committed_input.payload
+                            final_payload = committed_input
                             if native_committed_audio_payload is not None:
                                 if final_payload is not None:
                                     final_payload = self._merge_native_audio_payloads(
@@ -1331,7 +1297,7 @@ class OmniDuplexSessionHandler:
                                 native_deferred_response_create = False
                             native_input_since_commit = False
                             native_speech_since_commit = False
-                            signal_runtime_background("input.commit", event)
+                            signal_runtime_background("input.commit")
                             data_plane_turn_id = session.turn_id
                             committed = self._commit_native_audio_input(
                                 session,
@@ -1418,7 +1384,7 @@ class OmniDuplexSessionHandler:
                                 flushed["force_listen"] = True
                             native_input_since_commit = False
                             if event_type != "response.create":
-                                signal_runtime_background("input.commit", event)
+                                signal_runtime_background("input.commit")
                             committed = self._commit_native_audio_input(
                                 session,
                                 realtime_item_id=event.get("realtime_item_id"),
@@ -1456,9 +1422,9 @@ class OmniDuplexSessionHandler:
                         "input_audio_buffer.commit",
                         "input.commit",
                     }:
-                        signal_runtime_background("input.commit", event)
+                        signal_runtime_background("input.commit")
                     else:
-                        signal_runtime_background("input.commit", event)
+                        signal_runtime_background("input.commit")
                     native_had_uncommitted_audio = self._uses_native_input_append(session) and (
                         native_input_since_commit
                         or native_audio_buffer.has_pending()
@@ -1558,7 +1524,7 @@ class OmniDuplexSessionHandler:
                     await self._close_runtime_session(session, reason="disconnect")
                 self._cleanup_duplex_session_state(session)
                 self._registry.close(session.session_id)
-            await actor.output_queue.put(None)
+            await actor.close_writer()
             with suppress(Exception):
                 await asyncio.wait_for(actor.output_queue.join(), timeout=2.0)
             if not writer_task.done():
@@ -1600,63 +1566,6 @@ class OmniDuplexSessionHandler:
             audio_end_ms=committed_ms,
             playback=session.playback_for_response(response_id),
         )
-
-    async def _signal_runtime_history_rebuild_after_truncate(
-        self,
-        session: DuplexSession,
-        response_id: str | None,
-        committed_ms: int,
-        *,
-        reason: str,
-        send_json=None,
-    ) -> bool:
-        profile_logs = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-        if not response_id or committed_ms < 0:
-            if profile_logs:
-                logger.info(
-                    "skip duplex runtime history rebuild after truncate: session=%s "
-                    "response_id=%s committed_ms=%s reason=%s",
-                    session.session_id,
-                    response_id,
-                    committed_ms,
-                    reason,
-                )
-            return True
-        signal_event = {
-            "type": "turn.signal",
-            "event": "conversation.item.truncate",
-            "payload": {
-                "item_id": f"item_{response_id}",
-                "audio_end_ms": int(committed_ms),
-                "history": list(session.history),
-                "playback": session.playback.as_dict(),
-                "reason": reason,
-            },
-        }
-        if profile_logs:
-            logger.info(
-                "signal duplex runtime history rebuild after truncate: session=%s "
-                "response_id=%s committed_ms=%s reason=%s history_len=%d",
-                session.session_id,
-                response_id,
-                committed_ms,
-                reason,
-                len(session.history),
-            )
-        result = await self._signal_runtime_session(
-            session,
-            "conversation.item.truncate",
-            signal_event,
-            send_json,
-        )
-        if profile_logs:
-            logger.info(
-                "duplex runtime history rebuild after truncate result: session=%s response_id=%s ok=%s",
-                session.session_id,
-                response_id,
-                result,
-            )
-        return result
 
     def _remember_response_conversation_mode(self, session: DuplexSession, response_id: str) -> None:
         mode = session.config.extra_body.pop("realtime_response_conversation", None)
@@ -2588,7 +2497,6 @@ class OmniDuplexSessionHandler:
         self,
         session: DuplexSession,
         event: str,
-        payload: dict[str, object] | None = None,
         send_json=None,
         *,
         fence: DuplexFence | None = None,
@@ -2599,7 +2507,6 @@ class OmniDuplexSessionHandler:
         try:
             signal_kwargs = {
                 "event": event,
-                "payload": payload,
                 "timeout": self._runtime_control_timeout_s(session),
             }
             if self._callable_accepts_keyword(signal_turn, "fence"):
@@ -2687,7 +2594,7 @@ class OmniDuplexSessionHandler:
             return
         if not isinstance(result, dict):
             return
-        if not result.get("unsupported_count") and not result.get("error_count") and not result.get("passive_count"):
+        if not result.get("unsupported_count") and not result.get("error_count"):
             return
         await send_json(
             {
@@ -2741,8 +2648,6 @@ class OmniDuplexSessionHandler:
                     "tts_hidden_states",
                     "tts_token_ids",
                     "traceback",
-                    "experimental_worker_control_rpc",
-                    "experimental_eager_decoder",
                 }
             }
             native_result = redacted.get("native_result")
@@ -2778,17 +2683,6 @@ class OmniDuplexSessionHandler:
         if request_id is not None and session.active_request_id is None:
             session.active_request_id = request_id
         for native_result in self._data_plane_native_results(result, session=session):
-            close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
-                send_json,
-                native_result,
-                session=session,
-                expected_epoch=expected_epoch,
-            )
-            emitted_response = emitted_response or did_emit
-            close_reason = close_reason or close_reason_for_result
-            if expected_epoch is not None and session.epoch != expected_epoch:
-                return None, emitted_response
-        for native_result in self._iter_native_duplex_results(result):
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
                 native_result,
@@ -2927,8 +2821,6 @@ class OmniDuplexSessionHandler:
         emitted_response = False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return close_reason, emitted_response
-        if native_result.get("passive_stage") is True:
-            return close_reason, emitted_response
         data_plane_request_id = native_result.get("data_plane_request_id")
         if isinstance(data_plane_request_id, str) and data_plane_request_id in self._data_plane_terminal_request_ids:
             if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
@@ -2945,7 +2837,6 @@ class OmniDuplexSessionHandler:
                     session.active_request_id,
                 )
             return close_reason, emitted_response
-        kv_cache_length = native_result.get("kv_cache_length")
         if isinstance(native_result.get("error_code"), str):
             response_id = session.active_response_id
             await send_json(
@@ -2975,31 +2866,6 @@ class OmniDuplexSessionHandler:
                     }
                 )
             return close_reason, True
-        if self._native_result_missing_stage_role(session, native_result):
-            await send_json(
-                {
-                    "type": "error",
-                    "code": "runtime_native_stage_role_required",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "error": "MiniCPM-o native duplex results must include explicit stage_role.",
-                }
-            )
-            return close_reason, True
-        if self._native_result_requires_runner_kv(session, native_result):
-            await send_json(
-                {
-                    "type": "error",
-                    "code": "runtime_native_runner_kv_required",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "error": ("MiniCPM-o native duplex Stage0 output must be scheduler/KV-backed by the model runner."),
-                    "vllm_omni": {
-                        "runtime_impl": native_result.get("runtime_impl", ""),
-                    },
-                }
-            )
-            return close_reason, True
         if native_result.get("requires_stage_handoff") is True or native_result.get("requires_tts_stage") is True:
             # Stage0 announces a talker handoff before Stage1 has produced
             # client-visible audio. A single client input stream may contain
@@ -3015,7 +2881,6 @@ class OmniDuplexSessionHandler:
                 "type": "response.listen",
                 "session_id": session.session_id,
                 "epoch": session.epoch,
-                "kv_cache_length": kv_cache_length,
                 "reason": native_result.get("reason") or "buffering",
                 "model_listen": False,
                 "buffering": True,
@@ -3052,7 +2917,6 @@ class OmniDuplexSessionHandler:
                 "type": "response.listen",
                 "session_id": session.session_id,
                 "epoch": session.epoch,
-                "kv_cache_length": kv_cache_length,
                 "reason": native_result.get("reason") or "model_listen",
                 "model_listen": model_listen,
             }
@@ -3096,8 +2960,6 @@ class OmniDuplexSessionHandler:
                         "playback": session.playback.as_dict(),
                     }
                 )
-            if self._is_native_context_full(session, kv_cache_length):
-                close_reason = "context_full"
             return close_reason, emitted_response
 
         text = native_result.get("text")
@@ -3149,7 +3011,6 @@ class OmniDuplexSessionHandler:
                 "text": text if isinstance(text, str) else "",
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
-                "kv_cache_length": kv_cache_length,
             }
             self._attach_native_runtime_metadata(speak_payload, native_result)
             await send_json(speak_payload)
@@ -3199,7 +3060,6 @@ class OmniDuplexSessionHandler:
             ),
             "end_of_turn": end_of_turn,
             "model_speak": True,
-            "kv_cache_length": kv_cache_length,
         }
         if mark_duration_ms is not None:
             payload["audio_duration_ms"] = mark_duration_ms
@@ -3268,8 +3128,6 @@ class OmniDuplexSessionHandler:
             )
         elif response_created:
             session.turn_state = DuplexTurnState.ASSISTANT_PLAYING
-        if self._is_native_context_full(session, kv_cache_length):
-            close_reason = "context_full"
         return close_reason, emitted_response
 
     @staticmethod
@@ -3418,8 +3276,6 @@ class OmniDuplexSessionHandler:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "owned_runtime": False,
-                "experimental_worker_control_rpc": False,
-                "runner_local_payload_ref": False,
             }
             return
         # Stage 1 exposes a cumulative waveform for the lifetime of its
@@ -3550,8 +3406,6 @@ class OmniDuplexSessionHandler:
                     "runner_kv_backed": True,
                     "runtime_impl": "scheduler_data_plane",
                     "owned_runtime": False,
-                    "experimental_worker_control_rpc": False,
-                    "runner_local_payload_ref": False,
                 }
                 if output_turn_id is not None:
                     native_result["model_turn_id"] = output_turn_id
@@ -3661,8 +3515,6 @@ class OmniDuplexSessionHandler:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "owned_runtime": False,
-                "experimental_worker_control_rpc": False,
-                "runner_local_payload_ref": False,
             }
             if output_turn_id is not None:
                 terminal_result["model_turn_id"] = output_turn_id
@@ -3683,8 +3535,6 @@ class OmniDuplexSessionHandler:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "owned_runtime": False,
-                "experimental_worker_control_rpc": False,
-                "runner_local_payload_ref": False,
             }
             if output_turn_id is not None:
                 terminal_result["model_turn_id"] = output_turn_id
@@ -3712,8 +3562,6 @@ class OmniDuplexSessionHandler:
                     "runner_kv_backed": True,
                     "runtime_impl": "scheduler_data_plane",
                     "owned_runtime": False,
-                    "experimental_worker_control_rpc": False,
-                    "runner_local_payload_ref": False,
                 }
                 if output_turn_id is not None:
                     terminal_result["model_turn_id"] = output_turn_id
@@ -3740,8 +3588,6 @@ class OmniDuplexSessionHandler:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "owned_runtime": False,
-                "experimental_worker_control_rpc": False,
-                "runner_local_payload_ref": False,
             }
             return
         if not text:
@@ -3761,8 +3607,6 @@ class OmniDuplexSessionHandler:
                     "runner_kv_backed": True,
                     "runtime_impl": "scheduler_data_plane",
                     "owned_runtime": False,
-                    "experimental_worker_control_rpc": False,
-                    "runner_local_payload_ref": False,
                 }
             return
         if session is not None and self._session_auto_responds(session):
@@ -3778,8 +3622,6 @@ class OmniDuplexSessionHandler:
                 "runner_kv_backed": True,
                 "runtime_impl": "scheduler_data_plane",
                 "owned_runtime": False,
-                "experimental_worker_control_rpc": False,
-                "runner_local_payload_ref": False,
             }
             return
         yield {
@@ -3794,8 +3636,6 @@ class OmniDuplexSessionHandler:
             "runner_kv_backed": True,
             "runtime_impl": "scheduler_data_plane",
             "owned_runtime": False,
-            "experimental_worker_control_rpc": False,
-            "runner_local_payload_ref": False,
         }
 
     @classmethod
@@ -4373,43 +4213,6 @@ class OmniDuplexSessionHandler:
             return None
 
     @staticmethod
-    def _native_result_emits_model_event(native_result: dict[str, object]) -> bool:
-        text = native_result.get("text")
-        audio = native_result.get("audio_data", native_result.get("audio"))
-        return any(
-            (
-                native_result.get("is_listen") is True,
-                native_result.get("requires_stage_handoff") is True,
-                native_result.get("requires_tts_stage") is True,
-                isinstance(text, str) and bool(text),
-                isinstance(audio, str) and bool(audio),
-                native_result.get("end_of_turn") is True,
-            )
-        )
-
-    @classmethod
-    def _native_result_missing_stage_role(cls, session: DuplexSession, native_result: dict[str, object]) -> bool:
-        if not session.capabilities.requires_native_stage_role:
-            return False
-        if not cls._native_result_emits_model_event(native_result):
-            return False
-        return native_result.get("stage_role") not in {"llm", "thinker", "tts", "talker"}
-
-    @staticmethod
-    def _native_result_requires_runner_kv(session: DuplexSession, native_result: dict[str, object]) -> bool:
-        if not session.capabilities.requires_model_runner_kv:
-            return False
-        stage_role = native_result.get("stage_role")
-        if stage_role not in {"llm", "thinker"}:
-            return False
-        if not OmniDuplexSessionHandler._native_result_emits_model_event(native_result):
-            return False
-        return (
-            native_result.get("uses_model_runner_scheduler") is not True
-            or native_result.get("runner_kv_backed") is not True
-        )
-
-    @staticmethod
     def _attach_native_runtime_metadata(payload: dict[str, object], native_result: dict[str, object]) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = native_result.get("runtime_impl")
@@ -4421,42 +4224,12 @@ class OmniDuplexSessionHandler:
         for name in (
             "uses_model_runner_scheduler",
             "runner_kv_backed",
-            "per_step_tensor_handoff",
-            "runner_local_payload_ref",
         ):
             value = native_result.get(name)
             if isinstance(value, bool):
                 metadata[name] = value
         if metadata:
             payload["vllm_omni"] = metadata
-
-    @staticmethod
-    def _is_native_context_full(session: DuplexSession, kv_cache_length: object) -> bool:
-        if not isinstance(kv_cache_length, int | float):
-            return False
-        raw_limit = (
-            session.config.extra_body.get("duplex_context_limit")
-            or session.config.extra_body.get("context_limit")
-            or session.config.extra_body.get("max_context_tokens")
-            or 8192
-        )
-        limit = int(raw_limit) if isinstance(raw_limit, int | float) else 8192
-        return int(kv_cache_length) >= limit
-
-    @classmethod
-    def _iter_native_duplex_results(cls, result: object):
-        if isinstance(result, dict):
-            native_result = result.get("native_result")
-            if isinstance(native_result, dict):
-                yield native_result
-            for key in ("stage_results", "result", "results"):
-                value = result.get(key)
-                if value is not None:
-                    yield from cls._iter_native_duplex_results(value)
-            return
-        if isinstance(result, list | tuple):
-            for item in result:
-                yield from cls._iter_native_duplex_results(item)
 
     async def _send_runtime_error(
         self,
@@ -5042,7 +4815,6 @@ class OmniDuplexSessionHandler:
         *,
         reason: str,
         notify: bool = True,
-        rebuild_runtime_history_after_truncate: bool = False,
     ) -> bool:
         has_running_task = active_task is not None and not active_task.done()
         if not has_running_task and session.active_request_id is None and session.active_response_id is None:
@@ -5062,14 +4834,6 @@ class OmniDuplexSessionHandler:
                 session.register_history_item(item_id, committed_message)
             elif committed_ms > 0:
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
-            if rebuild_runtime_history_after_truncate:
-                await self._signal_runtime_history_rebuild_after_truncate(
-                    session,
-                    old_response_id,
-                    committed_ms,
-                    reason=reason,
-                    send_json=send_json,
-                )
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
         if old_request_id is not None:
             await self._abort_request_background(

@@ -46,7 +46,6 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     OpenDuplexSessionMessage,
-    OutputMessage,
     ShutdownRequestMessage,
     SignalDuplexTurnMessage,
     StageSubmissionMessage,
@@ -69,7 +68,6 @@ from vllm_omni.entrypoints.utils import (
     parse_stage_overrides,
 )
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.omni import duplex_resource_request_id
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -323,11 +321,6 @@ class AsyncOmniEngine:
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
-        self._output_router_lock = threading.Lock()
-        self._routed_output_queue: queue.Queue[EngineQueueMessage] = queue.Queue()
-        self._duplex_output_queues: dict[str, queue.Queue[OutputMessage]] = {}
-        self._typed_duplex_sessions: set[str] = set()
-        self._duplex_request_sessions: dict[str, str] = {}
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
@@ -1441,132 +1434,6 @@ class AsyncOmniEngine:
             resumable=resumable,
         )
 
-    async def open_duplex_session_fenced_async(
-        self,
-        fence: DuplexFence,
-        *,
-        session_mode: str = "duplex",
-        capabilities: dict[str, object] | None = None,
-        session_config: dict[str, object] | None = None,
-        timeout: float | None = 10.0,
-    ) -> dict[str, object]:
-        """Open a typed duplex session with caller-owned identity."""
-        self._ensure_output_router()
-        was_typed = fence.session_id in self._typed_duplex_sessions
-        self._typed_duplex_sessions.add(fence.session_id)
-        try:
-            return await self._duplex_control_async(
-                OpenDuplexSessionMessage(
-                    control_id=uuid.uuid4().hex,
-                    fence=fence,
-                    session_id=fence.session_id,
-                    session_mode=session_mode,
-                    capabilities=dict(capabilities or {}),
-                    session_config=dict(session_config or {}),
-                    timeout=timeout,
-                ),
-                timeout=timeout,
-            )
-        except BaseException:
-            if not was_typed:
-                self._typed_duplex_sessions.discard(fence.session_id)
-            raise
-
-    async def append_duplex_input_fenced_async(
-        self,
-        fence: DuplexFence,
-        *,
-        mode: str,
-        payload: object,
-        final: bool = False,
-        expected_epoch: int | None = None,
-        timeout: float | None = 10.0,
-    ) -> dict[str, object]:
-        """Append typed duplex input without synthesizing identity."""
-        if expected_epoch is not None and expected_epoch != fence.epoch:
-            raise ValueError("expected_epoch must match fence.epoch")
-        self._ensure_output_router()
-        self._typed_duplex_sessions.add(fence.session_id)
-        planned_request_id = duplex_resource_request_id(fence, "stage0")
-        previous_session_id = self._duplex_request_sessions.get(planned_request_id)
-        self._duplex_request_sessions[planned_request_id] = fence.session_id
-        try:
-            result = await self._duplex_control_async(
-                AppendDuplexInputMessage(
-                    control_id=uuid.uuid4().hex,
-                    fence=fence,
-                    session_id=fence.session_id,
-                    expected_epoch=expected_epoch,
-                    mode=mode,
-                    payload=payload,
-                    final=final,
-                    timeout=timeout,
-                ),
-                timeout=timeout,
-            )
-        except BaseException:
-            if previous_session_id is None:
-                self._duplex_request_sessions.pop(planned_request_id, None)
-            else:
-                self._duplex_request_sessions[planned_request_id] = previous_session_id
-            raise
-        registered_request_ids = self._register_duplex_request_ids(fence.session_id, result)
-        if planned_request_id not in registered_request_ids:
-            if previous_session_id is None:
-                self._duplex_request_sessions.pop(planned_request_id, None)
-            else:
-                self._duplex_request_sessions[planned_request_id] = previous_session_id
-        return result
-
-    async def signal_duplex_turn_fenced_async(
-        self,
-        fence: DuplexFence,
-        *,
-        event: str,
-        payload: dict[str, object] | None = None,
-        timeout: float | None = 10.0,
-    ) -> dict[str, object]:
-        """Signal typed duplex resources with caller-owned identity."""
-        return await self._duplex_control_async(
-            SignalDuplexTurnMessage(
-                control_id=uuid.uuid4().hex,
-                fence=fence,
-                session_id=fence.session_id,
-                event=event,
-                payload=dict(payload or {}),
-                timeout=timeout,
-            ),
-            timeout=timeout,
-        )
-
-    async def close_duplex_session_fenced_async(
-        self,
-        fence: DuplexFence,
-        *,
-        reason: str = "client_close",
-        timeout: float | None = 10.0,
-    ) -> dict[str, object]:
-        """Close typed duplex resources with caller-owned identity."""
-        return await self._duplex_control_async(
-            CloseDuplexSessionMessage(
-                control_id=uuid.uuid4().hex,
-                fence=fence,
-                session_id=fence.session_id,
-                reason=reason,
-                timeout=timeout,
-            ),
-            timeout=timeout,
-        )
-
-    async def _duplex_control_async(
-        self,
-        msg: OpenDuplexSessionMessage | AppendDuplexInputMessage | SignalDuplexTurnMessage | CloseDuplexSessionMessage,
-        *,
-        timeout: float | None,
-    ) -> dict[str, object]:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self._duplex_control(msg, timeout=timeout))
-
     def open_duplex_session(
         self,
         session_id: str,
@@ -1577,7 +1444,7 @@ class AsyncOmniEngine:
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper that may synthesize a base fence."""
+        """Open an engine-level duplex session."""
         return self._duplex_control(
             OpenDuplexSessionMessage(
                 control_id=uuid.uuid4().hex,
@@ -1586,7 +1453,6 @@ class AsyncOmniEngine:
                 session_mode=session_mode,
                 capabilities=dict(capabilities or {}),
                 session_config=dict(session_config or {}),
-                timeout=timeout,
             ),
             timeout=timeout,
         )
@@ -1601,7 +1467,7 @@ class AsyncOmniEngine:
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper for pre-Task-6 OpenAI serving."""
+        """Async wrapper for opening an engine-level duplex session."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
@@ -1626,7 +1492,7 @@ class AsyncOmniEngine:
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper that may synthesize identity."""
+        """Append input to an engine-level duplex session."""
         message_fence = fence or DuplexFence(session_id, epoch=expected_epoch or 0)
         if expected_epoch is not None and expected_epoch != message_fence.epoch:
             raise ValueError("expected_epoch must match fence.epoch")
@@ -1639,7 +1505,6 @@ class AsyncOmniEngine:
                 mode=mode,
                 payload=payload,
                 final=final,
-                timeout=timeout,
             ),
             timeout=timeout,
         )
@@ -1655,7 +1520,7 @@ class AsyncOmniEngine:
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper for pre-Task-6 OpenAI serving."""
+        """Async wrapper for appending duplex input."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
@@ -1675,19 +1540,16 @@ class AsyncOmniEngine:
         session_id: str,
         *,
         event: str,
-        payload: dict[str, object] | None = None,
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper that may synthesize identity."""
+        """Signal an engine-level duplex turn."""
         return self._duplex_control(
             SignalDuplexTurnMessage(
                 control_id=uuid.uuid4().hex,
                 fence=fence or DuplexFence(session_id),
                 session_id=session_id,
                 event=event,
-                payload=dict(payload or {}),
-                timeout=timeout,
             ),
             timeout=timeout,
         )
@@ -1697,18 +1559,16 @@ class AsyncOmniEngine:
         session_id: str,
         *,
         event: str,
-        payload: dict[str, object] | None = None,
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper for pre-Task-6 OpenAI serving."""
+        """Async wrapper for signaling a duplex turn."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self.signal_duplex_turn(
                 session_id,
                 event=event,
-                payload=payload,
                 fence=fence,
                 timeout=timeout,
             ),
@@ -1722,14 +1582,13 @@ class AsyncOmniEngine:
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper that may synthesize identity."""
+        """Close an engine-level duplex session."""
         return self._duplex_control(
             CloseDuplexSessionMessage(
                 control_id=uuid.uuid4().hex,
                 fence=fence or DuplexFence(session_id),
                 session_id=session_id,
                 reason=reason,
-                timeout=timeout,
             ),
             timeout=timeout,
         )
@@ -1742,7 +1601,7 @@ class AsyncOmniEngine:
         fence: DuplexFence | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
-        """Deprecated compatibility wrapper for pre-Task-6 OpenAI serving."""
+        """Async wrapper for closing an engine-level duplex session."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
@@ -1799,108 +1658,28 @@ class AsyncOmniEngine:
                     "stage_results": list(result_msg.stage_results),
                     "unsupported_count": result_msg.unsupported_count,
                     "error_count": result_msg.error_count,
-                    "passive_count": result_msg.passive_count,
                 }
                 if result_msg.error_count:
                     raise RuntimeError(f"duplex {result_msg.operation} failed: {result}")
                 return result
 
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
-        """Read one generic output through the shared output router."""
-        self._ensure_output_router()
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                return self._routed_output_queue.get_nowait()
-            except queue.Empty:
-                remaining = max(0.0, deadline - time.monotonic())
-                try:
-                    self._route_one_output(remaining)
-                except queue.Empty:
-                    if not self.is_alive():
-                        raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-                    return None
-
-    async def try_get_output_async(self) -> EngineQueueMessage | None:
-        """Read one generic output through the shared output router."""
-        self._ensure_output_router()
-        self._route_available_outputs()
+        """Read one output message from the Orchestrator output queue."""
         try:
-            return self._routed_output_queue.get_nowait()
+            return self.output_queue.sync_q.get(timeout=timeout)
         except queue.Empty:
             if not self.is_alive():
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
-    async def get_duplex_output_async(self, session_id: str) -> OutputMessage:
-        """Read a fenced duplex output without consuming the shared stream."""
-        self._ensure_output_router()
-        output_queue = self._duplex_output_queues.setdefault(session_id, queue.Queue())
-        while True:
-            self._route_available_outputs()
-            try:
-                return output_queue.get_nowait()
-            except queue.Empty:
-                if not self.is_alive():
-                    raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-                await asyncio.sleep(0.001)
-
-    def _ensure_output_router(self) -> None:
-        if getattr(self, "_routed_output_queue", None) is not None:
-            return
-        self._routed_output_queue = queue.Queue()
-        self._duplex_output_queues = {}
-        self._output_router_lock = threading.Lock()
-        self._typed_duplex_sessions = set()
-        self._duplex_request_sessions = {}
-
-    def _route_available_outputs(self) -> None:
-        if not self._output_router_lock.acquire(blocking=False):
-            return
+    async def try_get_output_async(self) -> EngineQueueMessage | None:
+        """Async read from the Orchestrator output queue."""
         try:
-            while True:
-                try:
-                    message = self.output_queue.sync_q.get_nowait()
-                except queue.Empty:
-                    return
-                self._route_output_message(message)
-        finally:
-            self._output_router_lock.release()
-
-    def _route_one_output(self, timeout: float) -> None:
-        with self._output_router_lock:
-            message = self.output_queue.sync_q.get(timeout=timeout)
-            self._route_output_message(message)
-
-    def _route_output_message(self, message: EngineQueueMessage) -> None:
-        session_id: str | None = None
-        if isinstance(message, OutputMessage):
-            if isinstance(message.fence, DuplexFence) and message.fence.session_id in self._typed_duplex_sessions:
-                session_id = message.fence.session_id
-            elif message.request_id in self._duplex_request_sessions:
-                session_id = self._duplex_request_sessions[message.request_id]
-        if session_id is None:
-            self._routed_output_queue.put_nowait(message)
-            return
-        duplex_queue = self._duplex_output_queues.setdefault(session_id, queue.Queue())
-        duplex_queue.put_nowait(message)
-
-    def _register_duplex_request_ids(self, session_id: str, result: dict[str, object]) -> set[str]:
-        registered: set[str] = set()
-        stage_results = result.get("stage_results")
-        if not isinstance(stage_results, list):
-            return registered
-        for stage_result in stage_results:
-            if not isinstance(stage_result, dict):
-                continue
-            inner = stage_result.get("result")
-            if not isinstance(inner, dict) or inner.get("data_plane_append") is not True:
-                continue
-            request_id = inner.get("request_id")
-            if isinstance(request_id, str) and request_id:
-                self._duplex_request_sessions[request_id] = session_id
-                registered.add(request_id)
-        return registered
+            return self.output_queue.sync_q.get_nowait()
+        except queue.Empty:
+            if not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+            return None
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""

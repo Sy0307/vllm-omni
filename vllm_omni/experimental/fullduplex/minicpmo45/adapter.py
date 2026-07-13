@@ -7,54 +7,8 @@ from typing import Any
 import numpy as np
 from vllm.multimodal.media import MediaConnector
 
-from vllm_omni.experimental.fullduplex.core.events import (
-    ModelListening,
-    ModelSegmentEnded,
-    ModelSpeaking,
-    ModelTextDelta,
-    ModelTurnEnded,
-)
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
-
-
-class MiniCPMO45ModelEventAdapter:
-    """Translate model-owned listen/speak boundaries into domain events."""
-
-    def __init__(self) -> None:
-        self._speaking_fences: set[DuplexFence] = set()
-
-    def map_output(self, output: object, fence: DuplexFence) -> tuple[object, ...]:
-        if not isinstance(output, dict):
-            raise TypeError("MiniCPM-o duplex output must be a dictionary")
-        meta = output.get("meta")
-        metadata = meta if isinstance(meta, dict) else {}
-
-        if output.get("is_listen") is True:
-            return (ModelListening(fence=fence),)
-
-        events: list[object] = []
-        if output.get("is_listen") is False and fence not in self._speaking_fences:
-            self._speaking_fences.add(fence)
-            events.append(ModelSpeaking(fence=fence))
-        text = output.get("text")
-        if isinstance(text, str) and text:
-            events.append(ModelTextDelta(text=text, fence=fence))
-
-        segment_end = bool(
-            output.get("segment_end")
-            or output.get("tts_is_last_chunk")
-            or metadata.get("segment_end")
-            or metadata.get("tts_is_last_chunk")
-        )
-        turn_end = bool(output.get("turn_end") or metadata.get("turn_end"))
-        if segment_end:
-            events.append(ModelSegmentEnded(fence=fence))
-        if turn_end:
-            self._speaking_fences.discard(fence)
-            events.append(ModelTurnEnded(reason="model_turn_eos", fence=fence))
-        return tuple(events)
 
 
 class MiniCPMO45NativeDuplexServingAdapter:

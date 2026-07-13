@@ -849,10 +849,6 @@ class DuplexSession:
         self.active_response_turn_id = None
         self.touch()
 
-    def is_idle_expired(self, now: float | None = None) -> bool:
-        now = time.monotonic() if now is None else now
-        return now - self.updated_at > self.config.idle_timeout_s
-
     def as_public_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "id": self.session_id,
@@ -977,11 +973,3 @@ class DuplexSessionRegistry:
         if session is not None:
             session.close()
         return session
-
-    def reap_expired(self) -> list[DuplexSession]:
-        expired: list[DuplexSession] = []
-        for session_id, session in list(self._sessions.items()):
-            if session.is_idle_expired():
-                expired.append(session)
-                self.close(session_id)
-        return expired
