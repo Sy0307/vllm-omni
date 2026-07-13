@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import json
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
@@ -75,6 +76,34 @@ REALTIME_ERROR_TYPES_BY_CODE = {
 }
 
 
+@dataclass(slots=True)
+class _RealtimeResponseState:
+    item_id: str
+    transcript_parts: list[str] = field(default_factory=list)
+    text_parts: list[str] = field(default_factory=list)
+    audio_duration_ms: int | None = None
+    audio_text_marks: list[dict[str, int]] = field(default_factory=list)
+    audio_delta_emitted: bool = False
+    audio_done_emitted: bool = False
+    audio_part_added: bool = False
+    audio_part_done: bool = False
+    text_part_added: bool = False
+    text_part_done: bool = False
+    output_text_done: bool = False
+    output_item_done: bool = False
+    conversation_item_done: bool = False
+    speak_emitted: bool = False
+    done_emitted: bool = False
+
+    @property
+    def transcript(self) -> str:
+        return "".join(self.transcript_parts)
+
+    @property
+    def text(self) -> str:
+        return "".join(self.text_parts)
+
+
 class NativeRealtimeSessionProtocol:
     """Realtime schema state for the native session actor path.
 
@@ -102,24 +131,8 @@ class NativeRealtimeSessionProtocol:
         self._send_realtime_json = None
         self._initial_session_update = False
         self._input_speech_started = False
-        self._done_response_ids: set[str] = set()
-        self._audio_done_response_ids: set[str] = set()
-        self._audio_delta_response_ids: set[str] = set()
-        self._content_done_response_ids: set[str] = set()
-        self._output_item_done_response_ids: set[str] = set()
-        self._conversation_item_done_response_ids: set[str] = set()
-        self._response_items: dict[str, str] = {}
-        self._response_transcripts: dict[str, list[str]] = {}
-        self._response_audio_formats: dict[str, str] = {}
-        self._response_audio_durations_ms: dict[str, int] = {}
-        self._response_audio_text_marks: dict[str, list[dict[str, int]]] = {}
-        self._response_text_parts: dict[str, list[str]] = {}
+        self._response_states: dict[str | int, _RealtimeResponseState] = {}
         self._item_truncation_cursors: dict[str, tuple[int, int]] = {}
-        self._speak_response_ids: set[str] = set()
-        self._audio_content_part_added_response_ids: set[str] = set()
-        self._text_content_part_added_response_ids: set[str] = set()
-        self._text_content_part_done_response_ids: set[str] = set()
-        self._output_text_done_response_ids: set[str] = set()
         self._active_response_id: str | None = None
         self._last_response_id: str | None = None
         self._conversation_items: dict[str, dict[str, object]] = {}
@@ -523,7 +536,7 @@ class NativeRealtimeSessionProtocol:
             response_id = event.get("response_id")
             if not isinstance(response_id, str) or not response_id:
                 response_id = self._active_response_id or self._last_response_id
-            if isinstance(response_id, str) and response_id in self._done_response_ids:
+            if self._response_is_done(response_id):
                 await self._send_realtime_payload(
                     {
                         "type": "output_audio_buffer.cleared",
@@ -539,7 +552,7 @@ class NativeRealtimeSessionProtocol:
             response_id = event.get("response_id")
             if not isinstance(response_id, str) or not response_id:
                 response_id = self._active_response_id or self._last_response_id
-            if isinstance(response_id, str) and response_id in self._done_response_ids:
+            if self._response_is_done(response_id):
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
                         "response_not_active",
@@ -1339,6 +1352,11 @@ class NativeRealtimeSessionProtocol:
             ]
         if event_type == "response.speak":
             response_id = event.get("response_id")
+            state = self._response_state(response_id)
+            if state is not None:
+                if state.speak_emitted:
+                    return []
+                state.speak_emitted = True
             return [
                 {
                     "type": "response.speak",
@@ -1410,8 +1428,9 @@ class NativeRealtimeSessionProtocol:
         if event_type == "response.text.delta":
             response_id = event.get("response_id")
             text = event.get("delta", "")
-            if isinstance(response_id, str) and isinstance(text, str) and text:
-                self._response_text_parts.setdefault(response_id, []).append(text)
+            state = self._response_state(response_id)
+            if state is not None and isinstance(text, str) and text:
+                state.text_parts.append(text)
                 self._refresh_in_progress_response_item(response_id)
             payloads = self._ensure_response_text_part_added(response_id)
             payloads.append(
@@ -1420,9 +1439,7 @@ class NativeRealtimeSessionProtocol:
                     "response_id": response_id,
                     "item_id": self._response_item_id(response_id),
                     "output_index": 0,
-                    "content_index": 1
-                    if (isinstance(response_id, str) and response_id in self._audio_content_part_added_response_ids)
-                    else 0,
+                    "content_index": 1 if state is not None and state.audio_part_added else 0,
                     "delta": text,
                 }
             )
@@ -1498,7 +1515,7 @@ class NativeRealtimeSessionProtocol:
                 response_id = self._active_response_id
             if not isinstance(response_id, str) or not response_id:
                 return payloads
-            if response_id in self._done_response_ids:
+            if self._response_is_done(response_id):
                 return payloads
             committed_ms = event.get("committed_ms")
             if isinstance(committed_ms, int | float):
@@ -1768,9 +1785,35 @@ class NativeRealtimeSessionProtocol:
             payload["rate"] = int(sample_rate_hz)
         return payload
 
-    def _response_item_id(self, response_id: object) -> str:
+    def _response_state(
+        self,
+        response_id: object,
+        *,
+        event: dict[str, Any] | None = None,
+        create: bool = True,
+    ) -> _RealtimeResponseState | None:
         if isinstance(response_id, str) and response_id:
-            return self._response_items.setdefault(response_id, f"item_{response_id}")
+            key: str | int = response_id
+            item_id = f"item_{response_id}"
+        elif event is not None:
+            key = id(event)
+            item_id = f"item_{uuid4().hex}"
+        else:
+            return None
+        state = self._response_states.get(key)
+        if state is None and create:
+            state = _RealtimeResponseState(item_id=item_id)
+            self._response_states[key] = state
+        return state
+
+    def _response_is_done(self, response_id: object) -> bool:
+        state = self._response_state(response_id, create=False)
+        return state is not None and state.done_emitted
+
+    def _response_item_id(self, response_id: object) -> str:
+        state = self._response_state(response_id)
+        if state is not None:
+            return state.item_id
         return f"item_{uuid4().hex}"
 
     def _response_done_output_item(
@@ -1780,20 +1823,13 @@ class NativeRealtimeSessionProtocol:
         status: str,
     ) -> dict[str, object]:
         item_id = self._response_item_id(response_id)
-        transcript = ""
-        audio_duration_ms: int | None = None
-        audio_text_marks: list[dict[str, int]] | None = None
-        if isinstance(response_id, str):
-            transcript = "".join(self._response_transcripts.get(response_id, []))
-            audio_duration_ms = self._response_audio_durations_ms.get(response_id)
-            audio_text_marks = self._response_audio_text_marks.get(response_id)
-        text = "".join(self._response_text_parts.get(response_id, [])) if isinstance(response_id, str) else ""
+        state = self._response_state(response_id)
+        transcript = state.transcript if state is not None else ""
+        text = state.text if state is not None else ""
+        audio_duration_ms = state.audio_duration_ms if state is not None else None
+        audio_text_marks = state.audio_text_marks if state is not None else None
         content: list[dict[str, object]] = []
-        if (
-            (isinstance(response_id, str) and response_id in self._audio_content_part_added_response_ids)
-            or transcript
-            or audio_duration_ms is not None
-        ):
+        if (state is not None and state.audio_part_added) or transcript or audio_duration_ms is not None:
             content.append(
                 self._response_item_content_part(
                     transcript=transcript,
@@ -1840,14 +1876,13 @@ class NativeRealtimeSessionProtocol:
             content = []
             item["content"] = content
 
-        transcript = "".join(self._response_transcripts.get(response_id, []))
-        audio_duration_ms = self._response_audio_durations_ms.get(response_id)
-        audio_text_marks = self._response_audio_text_marks.get(response_id)
-        has_audio = (
-            response_id in self._audio_content_part_added_response_ids
-            or bool(transcript)
-            or audio_duration_ms is not None
-        )
+        state = self._response_state(response_id)
+        if state is None:
+            return
+        transcript = state.transcript
+        audio_duration_ms = state.audio_duration_ms
+        audio_text_marks = state.audio_text_marks
+        has_audio = state.audio_part_added or bool(transcript) or audio_duration_ms is not None
         if has_audio:
             audio_part = self._response_item_content_part(
                 transcript=transcript,
@@ -1859,7 +1894,7 @@ class NativeRealtimeSessionProtocol:
             else:
                 content.insert(0, audio_part)
 
-        text = "".join(self._response_text_parts.get(response_id, []))
+        text = state.text
         if text:
             text_index = (
                 1
@@ -1885,17 +1920,19 @@ class NativeRealtimeSessionProtocol:
         self._apply_pending_item_truncation(item)
 
     def _append_response_transcript(self, response_id: object, text: str) -> None:
-        if not isinstance(response_id, str) or not text:
+        state = self._response_state(response_id)
+        if state is None or not text:
             return
-        self._response_transcripts.setdefault(response_id, []).append(text)
+        state.transcript_parts.append(text)
 
     def _ensure_response_text_part_added(self, response_id: object) -> list[dict[str, object]]:
-        if not isinstance(response_id, str) or not response_id:
+        state = self._response_state(response_id)
+        if state is None:
             return []
-        if response_id in self._text_content_part_added_response_ids:
+        if state.text_part_added:
             return []
-        self._text_content_part_added_response_ids.add(response_id)
-        content_index = 1 if response_id in self._audio_content_part_added_response_ids else 0
+        state.text_part_added = True
+        content_index = 1 if state.audio_part_added else 0
         return [
             {
                 "type": "response.content_part.added",
@@ -1908,11 +1945,12 @@ class NativeRealtimeSessionProtocol:
         ]
 
     def _ensure_response_audio_part_added(self, response_id: object) -> list[dict[str, object]]:
-        if not isinstance(response_id, str) or not response_id:
+        state = self._response_state(response_id)
+        if state is None:
             return []
-        if response_id in self._audio_content_part_added_response_ids:
+        if state.audio_part_added:
             return []
-        self._audio_content_part_added_response_ids.add(response_id)
+        state.audio_part_added = True
         return [
             {
                 "type": "response.content_part.added",
@@ -1925,17 +1963,15 @@ class NativeRealtimeSessionProtocol:
         ]
 
     def _remember_response_audio_metadata(self, response_id: object, event: dict[str, Any]) -> None:
-        if not isinstance(response_id, str) or not response_id:
+        state = self._response_state(response_id)
+        if state is None:
             return
         duration = event.get("audio_duration_ms")
         playback = event.get("playback")
         if not isinstance(duration, int | float) and isinstance(playback, dict):
             duration = playback.get("sent_ms") or playback.get("generated_ms")
         if isinstance(duration, int | float):
-            self._response_audio_durations_ms[response_id] = max(
-                self._response_audio_durations_ms.get(response_id, 0),
-                int(duration),
-            )
+            state.audio_duration_ms = max(state.audio_duration_ms or 0, int(duration))
         marks = event.get("audio_text_marks")
         if not isinstance(marks, list):
             return
@@ -1954,12 +1990,12 @@ class NativeRealtimeSessionProtocol:
                 }
             )
         if clean_marks:
-            merged = list(self._response_audio_text_marks.get(response_id, []))
+            merged = list(state.audio_text_marks)
             merged.extend(clean_marks)
             deduped: dict[tuple[int, int], dict[str, int]] = {}
             for mark in merged:
                 deduped[(int(mark["audio_end_ms"]), int(mark["text_chars"]))] = mark
-            self._response_audio_text_marks[response_id] = sorted(
+            state.audio_text_marks = sorted(
                 deduped.values(),
                 key=lambda mark: (mark["audio_end_ms"], mark["text_chars"]),
             )
@@ -2021,17 +2057,13 @@ class NativeRealtimeSessionProtocol:
         marks = event.get("audio_text_marks")
         if isinstance(marks, list):
             metadata["audio_text_marks"] = marks
-        if isinstance(response_id, str):
-            self._response_audio_formats[response_id] = fmt
-            self._audio_delta_response_ids.add(response_id)
+        state = self._response_state(response_id)
+        if state is not None:
+            state.audio_delta_emitted = True
             self._remember_response_audio_metadata(response_id, event)
         payloads: list[dict[str, object]] = []
-        if (
-            isinstance(response_id, str)
-            and response_id not in self._speak_response_ids
-            and metadata.get("model_speak") is True
-        ):
-            self._speak_response_ids.add(response_id)
+        if state is not None and not state.speak_emitted and metadata.get("model_speak") is True:
+            state.speak_emitted = True
             payloads.insert(
                 0,
                 {
@@ -2065,15 +2097,14 @@ class NativeRealtimeSessionProtocol:
         response_id: object,
     ) -> list[dict[str, object]]:
         item_id = self._response_item_id(response_id)
-        transcript = ""
-        if isinstance(response_id, str):
-            transcript = "".join(self._response_transcripts.get(response_id, []))
+        state = self._response_state(response_id, event=event)
+        transcript = state.transcript if state is not None else ""
         payloads: list[dict[str, object]] = []
-        done_key = response_id if isinstance(response_id, str) else str(id(event))
-        if isinstance(response_id, str) and response_id not in self._audio_delta_response_ids and not transcript:
+        if isinstance(response_id, str) and state is not None and not state.audio_delta_emitted and not transcript:
             return payloads
-        if done_key not in self._audio_done_response_ids:
-            self._audio_done_response_ids.add(done_key)
+        if state is None or not state.audio_done_emitted:
+            if state is not None:
+                state.audio_done_emitted = True
             payloads.append(
                 {
                     "type": "response.audio.done",
@@ -2105,17 +2136,11 @@ class NativeRealtimeSessionProtocol:
         status_details: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         item_id = self._response_item_id(response_id)
-        transcript = ""
-        if isinstance(response_id, str):
-            transcript = "".join(self._response_transcripts.get(response_id, []))
-        done_key = response_id if isinstance(response_id, str) else str(id(event))
+        state = self._response_state(response_id, event=event)
+        transcript = state.transcript if state is not None else ""
         payloads: list[dict[str, object]] = []
-        if (
-            isinstance(response_id, str)
-            and response_id in self._audio_content_part_added_response_ids
-            and done_key not in self._content_done_response_ids
-        ):
-            self._content_done_response_ids.add(done_key)
+        if state is not None and state.audio_part_added and not state.audio_part_done:
+            state.audio_part_done = True
             payloads.append(
                 {
                     "type": "response.content_part.done",
@@ -2126,13 +2151,9 @@ class NativeRealtimeSessionProtocol:
                     "part": self._response_content_part(transcript=transcript),
                 }
             )
-        if (
-            isinstance(response_id, str)
-            and self._response_text_parts.get(response_id)
-            and done_key not in self._output_text_done_response_ids
-        ):
-            self._output_text_done_response_ids.add(done_key)
-            content_index = 1 if response_id in self._audio_content_part_added_response_ids else 0
+        if state is not None and state.text_parts and not state.output_text_done:
+            state.output_text_done = True
+            content_index = 1 if state.audio_part_added else 0
             payloads.append(
                 {
                     "type": "response.output_text.done",
@@ -2140,16 +2161,12 @@ class NativeRealtimeSessionProtocol:
                     "item_id": item_id,
                     "output_index": 0,
                     "content_index": content_index,
-                    "text": "".join(self._response_text_parts.get(response_id, [])),
+                    "text": state.text,
                 }
             )
-        if (
-            isinstance(response_id, str)
-            and self._response_text_parts.get(response_id)
-            and done_key not in self._text_content_part_done_response_ids
-        ):
-            self._text_content_part_done_response_ids.add(done_key)
-            content_index = 1 if response_id in self._audio_content_part_added_response_ids else 0
+        if state is not None and state.text_parts and not state.text_part_done:
+            state.text_part_done = True
+            content_index = 1 if state.audio_part_added else 0
             payloads.append(
                 {
                     "type": "response.content_part.done",
@@ -2157,13 +2174,12 @@ class NativeRealtimeSessionProtocol:
                     "item_id": item_id,
                     "output_index": 0,
                     "content_index": content_index,
-                    "part": self._response_text_content_part(
-                        text="".join(self._response_text_parts.get(response_id, []))
-                    ),
+                    "part": self._response_text_content_part(text=state.text),
                 }
             )
-        if done_key not in self._output_item_done_response_ids:
-            self._output_item_done_response_ids.add(done_key)
+        if state is None or not state.output_item_done:
+            if state is not None:
+                state.output_item_done = True
             item = self._response_done_output_item(response_id, status=status)
             payloads.append(
                 {
@@ -2173,11 +2189,13 @@ class NativeRealtimeSessionProtocol:
                     "item": item,
                 }
             )
-            if done_key not in self._conversation_item_done_response_ids:
-                self._conversation_item_done_response_ids.add(done_key)
+            if state is None or not state.conversation_item_done:
+                if state is not None:
+                    state.conversation_item_done = True
                 payloads.append(self._conversation_item_done_event(item))
         done_event = self._realtime_response_done_event(
             {**event, "response_id": response_id},
+            state=state,
             status=status,
             status_details=status_details,
         )
@@ -2192,14 +2210,17 @@ class NativeRealtimeSessionProtocol:
         self,
         event: dict[str, Any],
         *,
+        state: _RealtimeResponseState | None = None,
         status: str = "completed",
         status_details: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
         response_id = event.get("response_id")
-        if isinstance(response_id, str):
-            if response_id in self._done_response_ids:
+        if state is None:
+            state = self._response_state(response_id, event=event)
+        if state is not None:
+            if state.done_emitted:
                 return None
-            self._done_response_ids.add(response_id)
+            state.done_emitted = True
         return {
             "type": "response.done",
             "response_id": response_id,
