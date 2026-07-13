@@ -21,7 +21,6 @@ from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
-    MiniCPMO45PcmAppendBuffer,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
     MiniCPMO45DataPlaneContext,
@@ -31,6 +30,9 @@ from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
+)
+from vllm_omni.experimental.fullduplex.minicpmo45.session import (
+    MiniCPMO45ServingSessionState,
 )
 from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
 from vllm_omni.experimental.fullduplex.openai.protocol import (
@@ -127,11 +129,7 @@ class OmniDuplexSessionHandler:
         )
         self._turn_controller = DuplexTurnController()
         self._minicpmo_data_plane = MiniCPMO45DataPlaneSession(self._encode_minicpmo_data_plane_audio)
-        self._auto_response_waiting_for_speech: set[str] = set()
-        self._auto_response_new_turn_prefix_variants: dict[str, str] = {}
-        self._native_data_plane_tasks: dict[str, asyncio.Task[None]] = {}
-        # session_id -> (response_id, silence continuation units already sent)
-        self._native_response_continuations: dict[str, tuple[str, int]] = {}
+        self._minicpmo_sessions: dict[str, MiniCPMO45ServingSessionState] = {}
         self._response_conversation_modes: dict[str, str] = {}
 
     async def handle_session(
@@ -151,19 +149,9 @@ class OmniDuplexSessionHandler:
 
             realtime_protocol.bind_sender(send_realtime_raw)
         session: DuplexSession | None = None
-        native_audio_buffer = MiniCPMO45PcmAppendBuffer()
-        native_response_emitted = False
-        native_input_since_commit = False
-        native_speech_since_commit = False
-        native_deferred_overlap_turn = False
-        native_committed_audio_payload: dict[str, object] | None = None
-        native_deferred_response_create = False
+        native = MiniCPMO45ServingSessionState()
 
         async def send_json(payload: dict[str, object]) -> None:
-            nonlocal native_input_since_commit, native_response_emitted, native_speech_since_commit
-            nonlocal native_deferred_overlap_turn
-            nonlocal native_committed_audio_payload
-            nonlocal native_deferred_response_create
             payload_type = payload.get("type")
             deferred_overlap_payload: dict[str, object] | None = None
             if not actor._is_stale_model_output(payload):
@@ -195,7 +183,7 @@ class OmniDuplexSessionHandler:
                     } and terminal_status not in {"cancelled", "failed"}
                     if can_promote_overlap and actor.overlap_speech_ms > 0:
                         has_deferred_overlap = (
-                            native_audio_buffer.has_pending() or native_committed_audio_payload is not None
+                            native.audio_buffer.has_pending() or native.committed_audio_payload is not None
                         )
                         should_promote_overlap = (
                             payload_type in {"response.done", "response.listen"}
@@ -206,60 +194,59 @@ class OmniDuplexSessionHandler:
                             and actor.overlap_speech_ms > session.config.overlap_short_ack_ms
                         )
                         if should_promote_overlap and session is not None:
-                            deferred_overlap_payload = native_audio_buffer.flush(
+                            deferred_overlap_payload = native.audio_buffer.flush(
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                             )
-                            if native_committed_audio_payload is not None:
+                            if native.committed_audio_payload is not None:
                                 if deferred_overlap_payload is not None:
                                     deferred_overlap_payload = self._merge_native_audio_payloads(
-                                        native_committed_audio_payload,
+                                        native.committed_audio_payload,
                                         deferred_overlap_payload,
                                     )
                                 else:
-                                    deferred_overlap_payload = native_committed_audio_payload
-                                native_committed_audio_payload = None
+                                    deferred_overlap_payload = native.committed_audio_payload
+                                native.committed_audio_payload = None
                             if self._session_auto_responds(session) and deferred_overlap_payload is not None:
                                 deferred_overlap_payload = dict(deferred_overlap_payload)
                                 deferred_overlap_payload["force_listen"] = False
                                 deferred_overlap_payload["new_user_turn"] = True
                                 deferred_overlap_payload.setdefault(
                                     "new_user_turn_prefix_variant",
-                                    self._auto_response_new_turn_prefix_variants.pop(
-                                        session.session_id,
-                                        MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
-                                    ),
+                                    native.auto_response_new_turn_prefix_variant
+                                    or MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
                                 )
-                                self._auto_response_waiting_for_speech.discard(session.session_id)
-                            native_input_since_commit = deferred_overlap_payload is not None
-                            native_response_emitted = False
+                                native.auto_response_new_turn_prefix_variant = None
+                                native.auto_response_waiting_for_speech = False
+                            native.input_since_commit = deferred_overlap_payload is not None
+                            native.response_emitted = False
                             if realtime_protocol is not None:
-                                native_committed_audio_payload = deferred_overlap_payload
-                                native_deferred_response_create = True
+                                native.committed_audio_payload = deferred_overlap_payload
+                                native.deferred_response_create = True
                                 deferred_overlap_payload = None
                         else:
-                            had_pending_overlap_audio = native_audio_buffer.has_pending()
-                            native_audio_buffer.clear()
-                            native_input_since_commit = False
-                            native_speech_since_commit = False
+                            had_pending_overlap_audio = native.audio_buffer.has_pending()
+                            native.audio_buffer.clear()
+                            native.input_since_commit = False
+                            native.speech_since_commit = False
                             if had_pending_overlap_audio and realtime_protocol is not None:
                                 await realtime_protocol.discard_pending_input_audio(
                                     audio_end_ms=actor.overlap_speech_ms
                                 )
                             if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
-                                native_committed_audio_payload = None
-                                native_deferred_response_create = False
+                                native.committed_audio_payload = None
+                                native.deferred_response_create = False
                     actor.overlap_speech_ms = 0
                     if (
                         can_promote_overlap
-                        and native_deferred_response_create
-                        and native_committed_audio_payload is not None
+                        and native.deferred_response_create
+                        and native.committed_audio_payload is not None
                     ):
-                        deferred_overlap_payload = native_committed_audio_payload
-                        native_committed_audio_payload = None
-                        native_deferred_response_create = False
-                        native_input_since_commit = False
-                        native_speech_since_commit = False
-                        native_deferred_overlap_turn = False
+                        deferred_overlap_payload = native.committed_audio_payload
+                        native.committed_audio_payload = None
+                        native.deferred_response_create = False
+                        native.input_since_commit = False
+                        native.speech_since_commit = False
+                        native.deferred_overlap_turn = False
             await actor.send_json(payload)
             if deferred_overlap_payload is not None and session is not None and not actor.closing:
                 await start_native_append(deferred_overlap_payload, final=True, precreate_response=True)
@@ -317,14 +304,14 @@ class OmniDuplexSessionHandler:
             # commit may need several appends to reach the model.
             result: tuple[bool, bool] | None = None
             while True:
-                flushed = native_audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
+                flushed = native.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
                 if flushed is None:
                     break
                 append_epoch = session.epoch
                 result = await self._append_runtime_input(
                     session,
                     flushed,
-                    final=not native_audio_buffer.has_pending(),
+                    final=not native.audio_buffer.has_pending(),
                     send_json=send_json,
                     mode="append_audio_chunk",
                     expected_epoch=append_epoch,
@@ -334,20 +321,19 @@ class OmniDuplexSessionHandler:
             return result if result is not None else (True, False)
 
         def native_response_in_progress() -> bool:
-            nonlocal native_response_emitted
             if session is None:
                 return False
-            if native_response_emitted and session.active_response_id is not None:
+            if native.response_emitted and session.active_response_id is not None:
                 return True
-            if native_response_emitted and session.active_response_id is None:
-                native_response_emitted = False
+            if native.response_emitted and session.active_response_id is None:
+                native.response_emitted = False
             if session.active_request_id is not None:
                 return True
             if actor.active_response_task is not None and not actor.active_response_task.done():
                 return True
             if actor.has_response_bound_append_tasks():
                 return True
-            if session.session_id in self._native_data_plane_tasks:
+            if native.data_plane_task is not None:
                 return True
             return actor.lifecycle_state == "generating"
 
@@ -377,7 +363,6 @@ class OmniDuplexSessionHandler:
                 )
 
             async def _run() -> None:
-                nonlocal native_response_emitted
                 try:
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
@@ -391,8 +376,8 @@ class OmniDuplexSessionHandler:
                         actor.runtime_closed = True
                         return
                     if emitted_response and self._uses_native_input_append(session):
-                        native_response_emitted = True
-                        native_audio_buffer.clear()
+                        native.response_emitted = True
+                        native.audio_buffer.clear()
                     elif not emitted_response and session.epoch == append_epoch:
                         if session.active_request_id == self._native_stage0_request_id(session, append_epoch):
                             session.active_request_id = None
@@ -498,6 +483,7 @@ class OmniDuplexSessionHandler:
             )
             if session is None:
                 return
+            self._minicpmo_sessions[session.session_id] = native
             if realtime_protocol is not None:
                 session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
             actor.session = session
@@ -523,12 +509,12 @@ class OmniDuplexSessionHandler:
                 if event_type == "__timeout__":
                     actor.closing = True
                     actor.transition("closing", reason="timeout")
-                    native_audio_buffer.clear()
-                    native_response_emitted = False
-                    native_input_since_commit = False
-                    native_speech_since_commit = False
-                    native_committed_audio_payload = None
-                    native_deferred_response_create = False
+                    native.audio_buffer.clear()
+                    native.response_emitted = False
+                    native.input_since_commit = False
+                    native.speech_since_commit = False
+                    native.committed_audio_payload = None
+                    native.deferred_response_create = False
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -564,8 +550,8 @@ class OmniDuplexSessionHandler:
                     continue
 
                 if event_type in {"session.close", "close_session"}:
-                    if self._uses_native_input_append(session) and native_audio_buffer.has_pending():
-                        flushed = native_audio_buffer.flush(
+                    if self._uses_native_input_append(session) and native.audio_buffer.has_pending():
+                        flushed = native.audio_buffer.flush(
                             chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                         )
                         if flushed is not None:
@@ -577,12 +563,12 @@ class OmniDuplexSessionHandler:
                     if session.state == DuplexSessionState.CLOSED:
                         actor.runtime_closed = True
                         return
-                    native_audio_buffer.clear()
-                    native_response_emitted = False
-                    native_input_since_commit = False
-                    native_speech_since_commit = False
-                    native_committed_audio_payload = None
-                    native_deferred_response_create = False
+                    native.audio_buffer.clear()
+                    native.response_emitted = False
+                    native.input_since_commit = False
+                    native.speech_since_commit = False
+                    native.committed_audio_payload = None
+                    native.deferred_response_create = False
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -605,11 +591,11 @@ class OmniDuplexSessionHandler:
                     return
 
                 if event_type == "input_audio_buffer.clear":
-                    native_audio_buffer.clear()
-                    native_input_since_commit = False
-                    native_speech_since_commit = False
-                    native_committed_audio_payload = None
-                    native_deferred_response_create = False
+                    native.audio_buffer.clear()
+                    native.input_since_commit = False
+                    native.speech_since_commit = False
+                    native.committed_audio_payload = None
+                    native.deferred_response_create = False
                     drained = actor.drain_input_queue()
                     cancelled = session.cancel_pending_input()
                     await send_json(
@@ -643,7 +629,7 @@ class OmniDuplexSessionHandler:
                             or session.active_request_id is not None
                             or (actor.active_response_task is not None and not actor.active_response_task.done())
                             or actor.has_response_bound_append_tasks()
-                            or session.session_id in self._native_data_plane_tasks
+                            or native.data_plane_task is not None
                             or actor.assistant_playback_active()
                         )
                         if (
@@ -676,21 +662,21 @@ class OmniDuplexSessionHandler:
                     actor.transition("cancelling", reason="barge_in")
                     had_native_unbuffered_append = (
                         self._uses_native_input_append(session)
-                        and native_input_since_commit
-                        and not native_audio_buffer.has_pending()
+                        and native.input_since_commit
+                        and not native.audio_buffer.has_pending()
                     )
                     playback_was_active = actor.assistant_playback_active()
                     if event_type in {"input.cancel", "barge_in"}:
-                        native_audio_buffer.clear()
-                        native_input_since_commit = False
-                        native_committed_audio_payload = None
-                        native_deferred_response_create = False
+                        native.audio_buffer.clear()
+                        native.input_since_commit = False
+                        native.committed_audio_payload = None
+                        native.deferred_response_create = False
                         actor.drain_input_queue()
-                    native_response_emitted = False
+                    native.response_emitted = False
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
-                    had_native_stream = session.session_id in self._native_data_plane_tasks
+                    had_native_stream = native.data_plane_task is not None
                     cancelled = await self._cancel_active_response(
                         session,
                         actor.active_response_task,
@@ -973,13 +959,13 @@ class OmniDuplexSessionHandler:
                     defer_native_append = False
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
-                        if not native_input_since_commit:
-                            native_deferred_overlap_turn = self._should_start_deferred_native_auto_response_overlap(
+                        if not native.input_since_commit:
+                            native.deferred_overlap_turn = self._should_start_deferred_native_auto_response_overlap(
                                 session,
                                 actor,
                                 event,
                             )
-                        overlap_active = native_deferred_overlap_turn or (
+                        overlap_active = native.deferred_overlap_turn or (
                             not self._session_auto_responds(session)
                             and (
                                 native_response_in_progress()
@@ -1020,13 +1006,13 @@ class OmniDuplexSessionHandler:
                                 playback_was_active = actor.assistant_playback_active()
                                 buffer_overlap_audio = True
                                 defer_native_append = False
-                                native_audio_buffer.clear_force_listen()
+                                native.audio_buffer.clear_force_listen()
                                 actor.overlap_speech_ms = 0
-                                native_response_emitted = False
-                                native_input_since_commit = False
-                                native_speech_since_commit = False
+                                native.response_emitted = False
+                                native.input_since_commit = False
+                                native.speech_since_commit = False
                                 await actor.cancel_append_tasks()
-                                had_native_stream = session.session_id in self._native_data_plane_tasks
+                                had_native_stream = native.data_plane_task is not None
                                 cancelled = await self._cancel_active_response(
                                     session,
                                     actor.active_response_task,
@@ -1105,7 +1091,7 @@ class OmniDuplexSessionHandler:
                             payload,
                         )
                         if new_user_turn_payload:
-                            native_audio_buffer.clear_force_listen()
+                            native.audio_buffer.clear_force_listen()
                         if self._should_skip_auto_response_waiting_silence(session, actor, event, payload):
                             continue
                         if not new_user_turn_payload and self._should_force_listen_for_auto_response_overlap(
@@ -1120,12 +1106,12 @@ class OmniDuplexSessionHandler:
                         if not buffer_overlap_audio:
                             continue
                         session.mark_user_input_activity()
-                        native_input_since_commit = True
-                        native_speech_since_commit = native_speech_since_commit or self._input_looks_like_speech(
+                        native.input_since_commit = True
+                        native.speech_since_commit = native.speech_since_commit or self._input_looks_like_speech(
                             event, payload, session=session
                         )
                         try:
-                            buffered_payload = native_audio_buffer.append(
+                            buffered_payload = native.audio_buffer.append(
                                 payload,
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                                 allow_emit=(
@@ -1157,13 +1143,13 @@ class OmniDuplexSessionHandler:
 
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
                     if event_type in {"input.commit", "input_audio_buffer.commit"}:
-                        native_deferred_overlap_turn = False
+                        native.deferred_overlap_turn = False
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
-                        native_input_since_commit = False
-                        native_speech_since_commit = False
-                        native_audio_buffer.clear()
-                        native_committed_audio_payload = None
-                        native_deferred_response_create = False
+                        native.input_since_commit = False
+                        native.speech_since_commit = False
+                        native.audio_buffer.clear()
+                        native.committed_audio_payload = None
+                        native.deferred_response_create = False
                         await send_json(
                             {
                                 "type": "input.committed",
@@ -1195,14 +1181,14 @@ class OmniDuplexSessionHandler:
                             self._apply_response_create_options(session, response_payload)
                     if self._uses_native_input_append(session) and event_type == "input_audio_buffer.commit":
                         has_pending_native_audio = (
-                            native_input_since_commit
-                            or native_audio_buffer.has_pending()
-                            or native_committed_audio_payload is not None
+                            native.input_since_commit
+                            or native.audio_buffer.has_pending()
+                            or native.committed_audio_payload is not None
                         )
                         if (
                             not has_pending_native_audio
                             and not actor.native_append_tasks
-                            and session.session_id not in self._native_data_plane_tasks
+                            and native.data_plane_task is None
                         ):
                             await send_json(
                                 {
@@ -1216,11 +1202,11 @@ class OmniDuplexSessionHandler:
                             continue
                         if native_response_in_progress() and actor.overlap_speech_ms > 0:
                             if actor.overlap_speech_ms <= session.config.overlap_short_ack_ms:
-                                native_audio_buffer.clear()
-                                native_input_since_commit = False
-                                native_speech_since_commit = False
-                                native_committed_audio_payload = None
-                                native_deferred_response_create = False
+                                native.audio_buffer.clear()
+                                native.input_since_commit = False
+                                native.speech_since_commit = False
+                                native.committed_audio_payload = None
+                                native.deferred_response_create = False
                                 if realtime_protocol is not None:
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=actor.overlap_speech_ms
@@ -1241,19 +1227,19 @@ class OmniDuplexSessionHandler:
                                 session.config.extra_body.pop("realtime_response_conversation", None)
                                 continue
 
-                            deferred_payload = native_audio_buffer.flush(
+                            deferred_payload = native.audio_buffer.flush(
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                             )
                             if deferred_payload is not None:
-                                if native_committed_audio_payload is not None:
+                                if native.committed_audio_payload is not None:
                                     deferred_payload = self._merge_native_audio_payloads(
-                                        native_committed_audio_payload,
+                                        native.committed_audio_payload,
                                         deferred_payload,
                                     )
-                                native_committed_audio_payload = deferred_payload
-                                native_deferred_response_create = should_create_response
-                                native_input_since_commit = False
-                                native_speech_since_commit = False
+                                native.committed_audio_payload = deferred_payload
+                                native.deferred_response_create = should_create_response
+                                native.input_since_commit = False
+                                native.speech_since_commit = False
                                 signal_runtime_background("input.commit")
                                 committed = self._commit_native_audio_input(
                                     session,
@@ -1272,25 +1258,25 @@ class OmniDuplexSessionHandler:
                                 continue
                         if (
                             self._session_auto_responds(session)
-                            and native_speech_since_commit
+                            and native.speech_since_commit
                             and session.active_response_id is None
                         ):
-                            committed_input = native_audio_buffer.commit(
+                            committed_input = native.audio_buffer.commit(
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                             )
                             final_payload = committed_input
-                            if native_committed_audio_payload is not None:
+                            if native.committed_audio_payload is not None:
                                 if final_payload is not None:
                                     final_payload = self._merge_native_audio_payloads(
-                                        native_committed_audio_payload,
+                                        native.committed_audio_payload,
                                         final_payload,
                                     )
                                 else:
-                                    final_payload = native_committed_audio_payload
-                                native_committed_audio_payload = None
-                                native_deferred_response_create = False
-                            native_input_since_commit = False
-                            native_speech_since_commit = False
+                                    final_payload = native.committed_audio_payload
+                                native.committed_audio_payload = None
+                                native.deferred_response_create = False
+                            native.input_since_commit = False
+                            native.speech_since_commit = False
                             signal_runtime_background("input.commit")
                             data_plane_turn_id = session.turn_id
                             committed = self._commit_native_audio_input(
@@ -1320,12 +1306,12 @@ class OmniDuplexSessionHandler:
                         if (
                             native_response_in_progress()
                             or actor.native_append_tasks
-                            or session.session_id in self._native_data_plane_tasks
+                            or native.data_plane_task is not None
                         ):
                             if session.active_response_id is None and (
                                 session.active_request_id is not None
                                 or actor.native_append_tasks
-                                or session.session_id in self._native_data_plane_tasks
+                                or native.data_plane_task is not None
                             ):
                                 continue
                             await send_json(
@@ -1339,12 +1325,12 @@ class OmniDuplexSessionHandler:
                             )
                             session.config.extra_body.pop("realtime_response_conversation", None)
                             continue
-                        if native_committed_audio_payload is not None:
-                            committed_payload = native_committed_audio_payload
-                            native_committed_audio_payload = None
-                            native_input_since_commit = False
-                            native_speech_since_commit = False
-                            native_deferred_response_create = False
+                        if native.committed_audio_payload is not None:
+                            committed_payload = native.committed_audio_payload
+                            native.committed_audio_payload = None
+                            native.input_since_commit = False
+                            native.speech_since_commit = False
+                            native.deferred_response_create = False
                             await start_native_append(committed_payload, final=True, precreate_response=True)
                             continue
                         await send_json(
@@ -1359,24 +1345,24 @@ class OmniDuplexSessionHandler:
                         session.config.extra_body.pop("realtime_response_conversation", None)
                         continue
                     if self._uses_native_input_append(session) and not native_response_in_progress():
-                        flushed = native_audio_buffer.flush(
+                        flushed = native.audio_buffer.flush(
                             chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                         )
-                        if native_committed_audio_payload is not None:
+                        if native.committed_audio_payload is not None:
                             if flushed is not None:
                                 flushed = self._merge_native_audio_payloads(
-                                    native_committed_audio_payload,
+                                    native.committed_audio_payload,
                                     flushed,
                                 )
                             else:
-                                flushed = native_committed_audio_payload
-                            native_committed_audio_payload = None
-                            native_deferred_response_create = False
+                                flushed = native.committed_audio_payload
+                            native.committed_audio_payload = None
+                            native.deferred_response_create = False
                         if flushed is not None:
                             if self._should_force_listen_for_short_commit(session, event, flushed):
                                 flushed = dict(flushed)
                                 flushed["force_listen"] = True
-                            native_input_since_commit = False
+                            native.input_since_commit = False
                             if event_type != "response.create":
                                 signal_runtime_background("input.commit")
                             committed = self._commit_native_audio_input(
@@ -1395,22 +1381,19 @@ class OmniDuplexSessionHandler:
                             if should_create_response:
                                 await start_native_append(flushed, final=True, precreate_response=True)
                             else:
-                                native_committed_audio_payload = flushed
-                                native_deferred_response_create = False
+                                native.committed_audio_payload = flushed
+                                native.deferred_response_create = False
                             continue
                         append_ok, emitted_response = True, False
-                        actor.active_response_task = self._native_data_plane_tasks.get(
-                            session.session_id,
-                            actor.active_response_task,
-                        )
+                        actor.active_response_task = native.data_plane_task or actor.active_response_task
                         if not append_ok:
                             if session.state == DuplexSessionState.CLOSED:
                                 actor.runtime_closed = True
                                 return
                             continue
                         if emitted_response:
-                            native_response_emitted = True
-                            native_audio_buffer.clear()
+                            native.response_emitted = True
+                            native.audio_buffer.clear()
                             continue
                     if self._uses_native_input_append(session) and event_type in {
                         "input_audio_buffer.commit",
@@ -1420,17 +1403,17 @@ class OmniDuplexSessionHandler:
                     else:
                         signal_runtime_background("input.commit")
                     native_had_uncommitted_audio = self._uses_native_input_append(session) and (
-                        native_input_since_commit
-                        or native_audio_buffer.has_pending()
-                        or native_committed_audio_payload is not None
+                        native.input_since_commit
+                        or native.audio_buffer.has_pending()
+                        or native.committed_audio_payload is not None
                     )
                     committed = session.commit_user_input()
                     if self._uses_native_input_append(session) and event_type in {
                         "input_audio_buffer.commit",
                         "input.commit",
                     }:
-                        native_input_since_commit = False
-                        native_speech_since_commit = False
+                        native.input_since_commit = False
+                        native.speech_since_commit = False
                     if committed is None and event_type != "response.create":
                         if self._uses_native_input_append(session):
                             committed = (
@@ -1910,6 +1893,13 @@ class OmniDuplexSessionHandler:
         duration_ms = cls._input_audio_duration_ms(event, payload)
         return 0 < duration_ms <= session.config.overlap_short_ack_ms
 
+    def _minicpmo_session_state(self, session: DuplexSession) -> MiniCPMO45ServingSessionState:
+        state = self._minicpmo_sessions.get(session.session_id)
+        if state is None:
+            state = MiniCPMO45ServingSessionState()
+            self._minicpmo_sessions[session.session_id] = state
+        return state
+
     def _should_force_listen_for_auto_response_overlap(
         self,
         session: DuplexSession,
@@ -1924,13 +1914,14 @@ class OmniDuplexSessionHandler:
         if event.get("force_listen") is True or payload.get("force_listen") is True:
             return True
         looks_like_speech = self._input_looks_like_speech(event, payload, session=session)
-        if session.session_id in self._auto_response_waiting_for_speech:
+        native = self._minicpmo_session_state(session)
+        if native.auto_response_waiting_for_speech:
             return False
         if actor.assistant_playback_active():
             return True
         if looks_like_speech:
-            self._auto_response_waiting_for_speech.discard(session.session_id)
-            self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
+            native.auto_response_waiting_for_speech = False
+            native.auto_response_new_turn_prefix_variant = None
             return False
         return False
 
@@ -1956,7 +1947,7 @@ class OmniDuplexSessionHandler:
     ) -> bool:
         if not self._session_auto_responds(session):
             return False
-        if session.session_id not in self._auto_response_waiting_for_speech:
+        if not self._minicpmo_session_state(session).auto_response_waiting_for_speech:
             return False
         if event.get("force_barge_in") is True:
             return False
@@ -1972,8 +1963,9 @@ class OmniDuplexSessionHandler:
     ) -> None:
         if not self._session_auto_responds(session):
             return
-        self._auto_response_waiting_for_speech.add(session.session_id)
-        self._auto_response_new_turn_prefix_variants[session.session_id] = prefix_variant
+        native = self._minicpmo_session_state(session)
+        native.auto_response_waiting_for_speech = True
+        native.auto_response_new_turn_prefix_variant = prefix_variant
 
     @staticmethod
     def _mark_barge_in_new_user_turn_payload(payload: dict[str, object]) -> None:
@@ -2001,13 +1993,15 @@ class OmniDuplexSessionHandler:
                 )
             return False
         force_barge_in = event.get("force_barge_in") is True
+        native = self._minicpmo_session_state(session)
         if force_barge_in:
-            prefix_variant = self._auto_response_new_turn_prefix_variants.pop(
-                session.session_id,
-                MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
+            prefix_variant = (
+                native.auto_response_new_turn_prefix_variant
+                or MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS
             )
+            native.auto_response_new_turn_prefix_variant = None
         else:
-            if session.session_id not in self._auto_response_waiting_for_speech:
+            if not native.auto_response_waiting_for_speech:
                 if profile_logs:
                     logger.info(
                         "MiniCPM-o auto-response skip new user turn: session=%s reason=waiting_latch_unset "
@@ -2037,8 +2031,9 @@ class OmniDuplexSessionHandler:
                         payload.get("force_listen"),
                     )
                 return False
-            prefix_variant = self._auto_response_new_turn_prefix_variants.pop(session.session_id, None)
-        self._auto_response_waiting_for_speech.discard(session.session_id)
+            prefix_variant = native.auto_response_new_turn_prefix_variant
+            native.auto_response_new_turn_prefix_variant = None
+        native.auto_response_waiting_for_speech = False
         payload["force_listen"] = False
         if prefix_variant:
             payload.setdefault("new_user_turn_prefix_variant", prefix_variant)
@@ -2307,7 +2302,8 @@ class OmniDuplexSessionHandler:
             return False
         session.active_request_id = request_id
 
-        old_task = self._native_data_plane_tasks.get(session.session_id)
+        native = self._minicpmo_session_state(session)
+        old_task = native.data_plane_task
         if old_task is not None and not old_task.done():
             if self._session_auto_responds(session):
                 # One persistent drain per session, like the official worker's
@@ -2369,9 +2365,8 @@ class OmniDuplexSessionHandler:
                             }
                         )
             finally:
-                current = self._native_data_plane_tasks.get(session.session_id)
-                if current is task:
-                    self._native_data_plane_tasks.pop(session.session_id, None)
+                if native.data_plane_task is task:
+                    native.data_plane_task = None
                 if close_reason is None and not self._session_auto_responds(session):
                     # Auto-respond sessions keep one resumable stage-1 stream
                     # whose audio accumulates across speak units; the offset
@@ -2388,7 +2383,7 @@ class OmniDuplexSessionHandler:
                 request_id,
             )
         task = asyncio.create_task(_run())
-        self._native_data_plane_tasks[session.session_id] = task
+        native.data_plane_task = task
         return True
 
     # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
@@ -2408,9 +2403,8 @@ class OmniDuplexSessionHandler:
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
         if self._session_auto_responds(session):
             return True
-        prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
-        if prev_response_id != response_id:
-            count = 0
+        native = self._minicpmo_session_state(session)
+        count = native.continuation_units if native.continuation_response_id == response_id else 0
         return count < self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
 
     def _maybe_continue_native_response(
@@ -2428,22 +2422,22 @@ class OmniDuplexSessionHandler:
         streaming beat) until the model ends the turn or the cap is reached.
         """
         response_id = session.active_response_id
+        native = self._minicpmo_session_state(session)
         if response_id is None or session.state == DuplexSessionState.CLOSED:
-            self._native_response_continuations.pop(session.session_id, None)
+            native.clear_continuation()
             return
         request_id = session.active_request_id
         if request_id is None:
-            self._native_response_continuations.pop(session.session_id, None)
+            native.clear_continuation()
             return
         if expected_epoch is not None and session.epoch != expected_epoch:
             return
-        prev_response_id, count = self._native_response_continuations.get(session.session_id, (response_id, 0))
-        if prev_response_id != response_id:
-            count = 0
+        count = native.continuation_units if native.continuation_response_id == response_id else 0
         auto_response = self._session_auto_responds(session)
         if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
-        self._native_response_continuations[session.session_id] = (response_id, count + 1)
+        native.continuation_response_id = response_id
+        native.continuation_units = count + 1
         payload = self._native_silence_unit_payload()
         payload["duplex_turn_id"] = (
             session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
@@ -2472,7 +2466,9 @@ class OmniDuplexSessionHandler:
         asyncio.create_task(_continue())
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
-        task = self._native_data_plane_tasks.pop(session.session_id, None)
+        native = self._minicpmo_session_state(session)
+        task = native.data_plane_task
+        native.data_plane_task = None
         if task is None or task.done():
             return False
         task.cancel()
@@ -3160,9 +3156,7 @@ class OmniDuplexSessionHandler:
 
     def _cleanup_duplex_session_state(self, session: DuplexSession) -> None:
         session_id = session.session_id
-        self._auto_response_waiting_for_speech.discard(session_id)
-        self._auto_response_new_turn_prefix_variants.pop(session_id, None)
-        self._native_response_continuations.pop(session_id, None)
+        self._minicpmo_sessions.pop(session_id, None)
         self._minicpmo_data_plane.close_session(
             session_id,
             active_request_id=session.active_request_id,
