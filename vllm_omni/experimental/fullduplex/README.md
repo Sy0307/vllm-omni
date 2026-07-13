@@ -1,36 +1,35 @@
 # Experimental Full-Duplex Runtime
 
-This package contains the experimental session-oriented runtime used by the
-MiniCPM-o 4.5 native duplex path and the JoyVL example integration.
+This package contains two experimental integrations:
 
-The current architecture, lifecycle invariants, MiniCPM Stage0/Stage1 data
-flow, deploy configuration, validation evidence, and reviewer reproduction
-steps are documented in:
+- the existing JoyVL framework and example integration;
+- the MiniCPM-o 4.5 native audio path used by `/v1/duplex` and
+  `/v1/realtime?duplex=1`.
 
-[`docs/design/minicpmo45_full_duplex_runtime_review.md`](../../../docs/design/minicpmo45_full_duplex_runtime_review.md)
-
-The existing JoyVL integration recipe remains available at
+To run JoyVL, see
 [`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
+For the MiniCPM production path, lifecycle invariants, capability boundary, and
+review commands, see
+[`docs/design/minicpmo45_full_duplex_runtime_review.md`](../../../docs/design/minicpmo45_full_duplex_runtime_review.md).
 
 ## Package boundaries
 
 ```text
-core/       JoyVL session runtime plus the shared immutable DuplexFence
-engine/     current vLLM-Omni scheduler/orchestrator adapter
-openai/     Realtime protocol projection and WebSocket transport
-minicpmo45/ MiniCPM-o model policy and Stage0/Stage1 runtime adapters
-joyvl/      JoyVL model-specific implementation
+core/       shared DuplexFence plus the existing JoyVL framework
+engine/     AsyncOmni/orchestrator scheduler data-plane adapter
+openai/     WebSocket transport, Realtime projection, and audio codecs
+minicpmo45/ MiniCPM input framing, policy, compatibility, and Stage0 state
+joyvl/      JoyVL model-specific integration
+web/        MiniCPM browser demo and WebSocket proxy
 ```
 
-The original `core` runtime remains the model-agnostic base used by JoyVL;
-MiniCPM-o does not run through a second generic reducer. Model token IDs, input
-framing, and stage state belong in the model package. Scheduler request details
-belong in `engine`. OpenAI event names and audio codecs belong in `openai`.
+MiniCPM does not run through `core.DuplexRuntime`. Its active path uses the
+`openai` session controller, the `engine` compatibility adapter, the standard
+orchestrator/model runners, and the model-specific `minicpmo45` helpers.
 
 ## Browser demo
 
-With the MiniCPM-o backend listening on port `8099`, start the canonical
-experimental browser client with:
+With the MiniCPM backend listening on port `8099`, run:
 
 ```bash
 python -m vllm_omni.experimental.fullduplex.web \
@@ -38,18 +37,15 @@ python -m vllm_omni.experimental.fullduplex.web \
   --ws-backend ws://127.0.0.1:8099
 ```
 
-Open `http://<host>:7862/`. When using a reverse proxy, open the proxy URL that
-maps to port `7862`. The page uses a same-origin WebSocket path, so any proxy
-path prefix is retained automatically.
+Open `http://<host>:7862/`. The browser uses a same-origin WebSocket path, so a
+reverse-proxy path prefix is retained automatically.
 
-The page exposes the currently supported model-policy session only. It does
-not present automatic/VAD barge-in or multi-session controls.
+## Capability boundary
 
-## Scope
+The MiniCPM checkpoint supports sequential clean turns in one session,
+model-owned `listen`/`speak` decisions on the normal auto-response path, and
+streamed audio responses over the implemented Realtime event subset.
 
-The verified MiniCPM-o checkpoint supports model-owned listen/speak on the
-normal auto-response path and clean multi-turn native audio streaming. Its
-capability contract intentionally disables explicit and automatic/VAD
-barge-in and does not advertise multi-session support. Scheduler-native append,
-bounded long-session KV, and production multi-session concurrency remain
-follow-up work.
+It does not advertise scheduler-native append, a persistent KV lease,
+automatic/VAD barge-in, production multi-session concurrency, or bounded
+minute-scale KV. These remain separate design and validation work.
