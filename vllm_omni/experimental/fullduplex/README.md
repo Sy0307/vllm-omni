@@ -15,16 +15,35 @@ The existing JoyVL integration recipe remains available at
 ## Package boundaries
 
 ```text
-core/       typed identity, events, reducer, runtime, ports, playback cursor
+core/       JoyVL session runtime plus the shared immutable DuplexFence
 engine/     current vLLM-Omni scheduler/orchestrator adapter
 openai/     Realtime protocol projection and WebSocket transport
 minicpmo45/ MiniCPM-o model policy and Stage0/Stage1 runtime adapters
 joyvl/      JoyVL model-specific implementation
 ```
 
-`core` is model-agnostic. Model token IDs, input framing, and stage state belong
-in the model package. Scheduler request details belong in `engine`. OpenAI event
-names and audio codecs belong in `openai`.
+The original `core` runtime remains the model-agnostic base used by JoyVL;
+MiniCPM-o does not run through a second generic reducer. Model token IDs, input
+framing, and stage state belong in the model package. Scheduler request details
+belong in `engine`. OpenAI event names and audio codecs belong in `openai`.
+
+## Browser demo
+
+With the MiniCPM-o backend listening on port `8099`, start the canonical
+experimental browser client with:
+
+```bash
+python -m vllm_omni.experimental.fullduplex.web \
+  --port 7862 \
+  --ws-backend ws://127.0.0.1:8099
+```
+
+Open `http://<host>:7862/`. In Cloud Studio use the complete proxy URL:
+`https://<aop-host>/aoplab/<workspace>/studio/proxy/7862/`. The page uses a
+same-origin WebSocket path, so the proxy prefix is retained automatically.
+
+The page exposes the currently supported model-policy session only. It does
+not present automatic/VAD barge-in or multi-session controls.
 
 ## Scope
 
