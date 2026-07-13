@@ -59,14 +59,12 @@ Token2wav. This keeps repeated requests with the same voice prompt from
 thrashing Token2wav's prompt cache while still resetting the cache when the
 reference audio changes.
 
-### Experimental `/v1/duplex` WebSocket
+### Experimental native duplex
 
-`/v1/duplex` is the experimental duplex session runtime entry point. It keeps a
-WebSocket session actor with separate control/input/output queues, tracks the
-active request, epoch, stale-output filtering, playback commit cursor, barge-in
-cancellation, and runtime-control acknowledgements. Generic non-native sessions
-can still fall back to normal chat streaming requests; MiniCPM-o 4.5 native
-sessions use the scheduler data-plane path described below.
+MiniCPM-o 4.5 supports the experimental `/v1/duplex` and
+`/v1/realtime?duplex=1` WebSocket entry points. The native path streams audio
+through a resumable scheduler data-plane request and forwards Stage0 output
+through the existing Stage1/TTS pipeline.
 
 Start the server with the duplex-specific deploy config. The regular
 `minicpmo_4_5.yaml` deploy does not opt into duplex sessions and keeps the
@@ -80,71 +78,19 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
     --host 0.0.0.0 --port 8099
 ```
 
-MiniCPM-o 4.5 also has an explicit experimental native mode:
+Clients enable the model-native path explicitly:
 
 ```json
 {"extra_body": {"minicpmo45_native_duplex": true}}
 ```
 
-That mode is not enabled just because the model name is MiniCPM-o 4.5. The
-current MiniCPM-o 4.5 native audio-append path is scheduler data-plane based:
-open/close/signal remain control-plane events, while audio appends are submitted
-to a stable per-session/epoch stage request with runner-owned
-`model_intermediate_buffer` payload and `resumable=True` streaming updates.
-Stage0 output is forwarded through the existing stage pipeline instead of
-placing hidden states in a worker-control RPC payload. This gives the current
-prototype long-lived stage request IDs for the active epoch, but it is still not
-a core persistent KV lease. The normal vLLM model runner owns attention
-metadata, sampling, and the resumable request KV; MiniCPM only builds the Stage0
-input embeddings in model preprocessing. There is no parallel worker provider,
-runner-context hook, eager decoder, or second model copy in this path. Internal
-runtime-control diagnostics are not emitted as public API fields by default.
-
-The `/v1/realtime?duplex=1` endpoint uses the same `DuplexSessionActor` runtime
-and translates the main OpenAI-style realtime client events used by MiniCPM-o
-4.5 live streaming:
-`session.update`, `conversation.item.create`, `input_audio_buffer.append`,
-`input_audio_buffer.commit`, `input_audio_buffer.clear`, `response.create`,
-`response.cancel`, `output_audio_buffer.clear`, and `session.close`. `pcm16`
-input is converted at the serving boundary to the model-native `pcm_f32le`
-append payload. Silent or low-RMS PCM chunks do not start speech and are routed
-to listen/no-response behavior instead of scheduling a model response. Server
-events include the current Realtime-style `conversation.item.added`,
-`conversation.item.created`, `conversation.item.done`,
-`conversation.item.deleted`, `conversation.item.truncated`,
-`input_audio_buffer.speech_started/stopped`,
-`input_audio_buffer.committed`, `response.created`,
-`response.output_item.added/done`, `response.content_part.added/done`,
-`response.audio.delta/done`, `response.audio_transcript.delta/done`,
-`response.done`, and `rate_limits.updated`. The internal duplex stream uses
-`response.output_audio.*` before the Realtime projection boundary, but those
-events are not exposed as a second client event family. Removed legacy query
-and session switches are ignored.
-Connections that pass `model=` in the Realtime URL open a default session
-immediately; `session.update` can then patch that session without acting as the
-first open event. Output format negotiation accepts both flat string formats
-and nested `audio.input/output.format` objects for PCM/WAV.
-`session.update` preserves common Realtime fields including `tools`,
-`tool_choice`, `metadata`, `turn_detection`, `input_audio_transcription`,
-`audio`, and `tracing`, and unknown JSON-safe session fields are reflected back
-in `session.updated`. It is still not a byte-perfect OpenAI Realtime
-compatibility layer for every event field.
-
-If a response contains `runtime_control.unsupported_count > 0` or a
-`runtime.control` event with `unsupported_count > 0`, one or more stage-native
-duplex hooks returned their no-op fallback. Treat it as capability information,
-not as a failed chat/TTS response. Playback cursor now gates assistant text
-history commit using model/audio delta text-duration marks when available, and
-Realtime `conversation.item.truncate` uses those same marks before falling back
-to proportional truncation for models that do not expose alignment metadata.
-Native persistent KV lease remains future work by design.
-
-In multi-replica deployments, duplex session admission is bound to one replica
-per stage for the session/epoch. A failed replica is evicted from new admission,
-its bound request/session state is cleaned up, and healthy replicas in the same
-stage remain available. If the final healthy replica in a stage dies, the
-orchestrator still fails the stage because there is no remaining admission
-target.
+The normal vLLM model runner still owns attention metadata, sampling, and
+request KV. The current append path is not a scheduler-native append primitive
+or persistent KV lease. MiniCPM advertises neither automatic/VAD barge-in nor
+production multi-session concurrency. See
+[`docs/design/minicpmo45_full_duplex_runtime_review.md`](../../../docs/design/minicpmo45_full_duplex_runtime_review.md)
+for the production path, lifecycle invariants, capability boundary, and focused
+review commands.
 
 ## 2. Launch the Gradio demo
 
