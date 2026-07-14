@@ -3554,11 +3554,6 @@ class OmniDuplexSessionHandler:
             session.config.extra_body["realtime_prompt"] = dict(payload["prompt"])
         elif "prompt" in payload and payload.get("prompt") is None:
             session.config.extra_body.pop("realtime_prompt", None)
-        turn_detection = NativeRealtimeSessionProtocol._turn_detection_config(payload)
-        if isinstance(turn_detection, dict):
-            session.config.extra_body["realtime_turn_detection"] = dict(turn_detection)
-        elif "turn_detection" in payload and payload.get("turn_detection") is None:
-            session.config.extra_body.pop("realtime_turn_detection", None)
         input_audio_transcription = NativeRealtimeSessionProtocol._input_audio_transcription_config(payload)
         if isinstance(input_audio_transcription, dict):
             session.config.extra_body["realtime_input_audio_transcription"] = dict(input_audio_transcription)

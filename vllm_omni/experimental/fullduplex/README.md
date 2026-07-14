@@ -49,3 +49,28 @@ streamed audio responses over the implemented Realtime event subset.
 It does not advertise scheduler-native append, a persistent KV lease,
 automatic/VAD barge-in, production multi-session concurrency, or bounded
 minute-scale KV. These remain separate design and validation work.
+
+The Realtime adapter does not implement `server_vad` or `semantic_vad`.
+Clients must set `turn_detection` to `null` and either commit input explicitly
+or use the model-owned native duplex policy. Unsupported turn-detection objects
+are rejected instead of being accepted and echoed without their advertised VAD
+semantics.
+
+## Realtime response contract
+
+The experimental Realtime projection uses one text channel and one audio
+channel per response:
+
+| Event | Cardinality and ordering |
+| --- | --- |
+| `response.created` | Exactly once, before response content events. |
+| `response.speak` | At most once; decision-only, with no transcript text. |
+| `response.audio.delta` | Zero or more, before `response.audio.done`. |
+| `response.audio_transcript.delta` | Zero or more; concatenation is the response transcript. |
+| `response.audio.done` | Exactly once for a response that emitted audio. |
+| `response.audio_transcript.done` | At most once; equals the concatenated transcript deltas. |
+| `response.done` | Exactly once and terminal; no later audio is valid. |
+
+`response.output_audio.delta` is the internal duplex dialect. Realtime clients
+receive `response.audio.delta`; clients must not consume both dialects as
+independent audio streams.

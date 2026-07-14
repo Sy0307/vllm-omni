@@ -886,8 +886,6 @@ class DuplexSession:
             payload["include"] = list(self.config.extra_body["realtime_include"])
         if isinstance(self.config.extra_body.get("realtime_prompt"), dict):
             payload["prompt"] = dict(self.config.extra_body["realtime_prompt"])
-        if isinstance(self.config.extra_body.get("realtime_turn_detection"), dict):
-            payload["turn_detection"] = dict(self.config.extra_body["realtime_turn_detection"])
         if isinstance(self.config.extra_body.get("realtime_input_audio_transcription"), dict):
             payload["input_audio_transcription"] = dict(self.config.extra_body["realtime_input_audio_transcription"])
         if isinstance(self.config.extra_body.get("realtime_input_audio_noise_reduction"), dict):

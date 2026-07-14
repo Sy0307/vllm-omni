@@ -308,6 +308,43 @@ def test_native_realtime_protocol_emits_speak_once_per_response():
     )
 
     assert [event["type"] for event in projected].count("response.speak") == 1
+    speak = next(event for event in projected if event["type"] == "response.speak")
+    assert "text" not in speak
+    assert speak["metadata"] == {"model_speak": True}
+
+
+def test_native_realtime_protocol_speak_does_not_expose_internal_event():
+    protocol = NativeRealtimeSessionProtocol({})
+
+    projected = protocol.encode_outbound_event(
+        {
+            "type": "response.speak",
+            "response_id": "resp-curated-speak",
+            "session_id": "sid-curated-speak",
+            "epoch": 3,
+            "text": "transcript belongs on the delta channel",
+            "model_speak": True,
+            "data_plane_request_id": "internal-request-id",
+            "uses_model_runner_scheduler": True,
+        }
+    )
+
+    assert len(projected) == 1
+    projected[0].pop("event_id")
+    assert projected == [
+        {
+            "type": "response.speak",
+            "response_id": "resp-curated-speak",
+            "item_id": "item_resp-curated-speak",
+            "output_index": 0,
+            "content_index": 0,
+            "metadata": {
+                "session_id": "sid-curated-speak",
+                "epoch": 3,
+                "model_speak": True,
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -476,12 +513,12 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_turn_detection_maps_to_overlap_policy():
+async def test_native_realtime_protocol_rejects_unimplemented_server_vad():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
 
-    ws.put(
+    translated = await protocol._to_duplex_event(
         {
             "type": "session.update",
             "model": "test-model",
@@ -494,17 +531,61 @@ async def test_native_realtime_protocol_turn_detection_maps_to_overlap_policy():
             },
         }
     )
-    translated = json.loads(await protocol.receive_internal_event_text(ws))
 
-    assert translated["type"] == "session.create"
-    session = translated["session"]
-    assert session["overlap_policy"] == "listen_only"
-    assert session["overlap_short_ack_ms"] == 900
-    assert session["overlap_silence_rms"] == pytest.approx(0.004)
+    assert translated is None
+    error = ws.sent[-1]
+    assert error["type"] == "error"
+    assert error["error"]["code"] == "unsupported_turn_detection"
+    assert "server_vad" in error["error"]["message"]
 
 
 @pytest.mark.asyncio
-async def test_realtime_session_update_preserves_tools_metadata_and_turn_detection():
+async def test_native_realtime_protocol_accepts_disabled_turn_detection():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    ws.put(
+        {
+            "type": "session.update",
+            "model": "test-model",
+            "session_id": "rt-no-turn-detection",
+            "turn_detection": None,
+        }
+    )
+    translated = json.loads(await protocol.receive_internal_event_text(ws))
+
+    assert translated["type"] == "session.create"
+    assert translated["session"]["extra_body"]["realtime_session_payload"]["turn_detection"] is None
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_protocol_rejects_nested_vad_even_when_top_level_is_disabled():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    translated = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "model": "test-model",
+            "turn_detection": None,
+            "audio": {
+                "input": {
+                    "turn_detection": {
+                        "type": "server_vad",
+                    }
+                }
+            },
+        }
+    )
+
+    assert translated is None
+    assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
+
+
+@pytest.mark.asyncio
+async def test_realtime_session_update_preserves_tools_and_metadata():
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
@@ -518,7 +599,6 @@ async def test_realtime_session_update_preserves_tools_metadata_and_turn_detecti
                 "tools": [{"type": "function", "name": "lookup"}],
                 "tool_choice": "auto",
                 "metadata": {"demo": "yes"},
-                "turn_detection": {"type": "server_vad", "interrupt_response": False},
             },
         }
     )
@@ -531,7 +611,7 @@ async def test_realtime_session_update_preserves_tools_metadata_and_turn_detecti
     assert session["tools"] == [{"type": "function", "name": "lookup"}]
     assert session["tool_choice"] == "auto"
     assert session["metadata"] == {"demo": "yes"}
-    assert session["turn_detection"] == {"type": "server_vad", "interrupt_response": False}
+    assert "turn_detection" not in session
 
 
 @pytest.mark.asyncio
@@ -634,6 +714,33 @@ def test_native_realtime_protocol_emits_terminal_audio_transcript_events():
     assert by_type["response.content_part.done"]["part"]["transcript"] == "hello"
     assert by_type["response.output_item.done"]["item"]["object"] == "realtime.item"
     assert by_type["response.done"]["response"]["output"][0]["object"] == "realtime.item"
+
+
+def test_native_realtime_protocol_terminal_transcript_equals_joined_deltas():
+    protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
+    response_id = "resp-transcript-contract"
+    events: list[dict[str, object]] = []
+
+    for text, end_of_turn in (("It's Canberra.", False), (" Next question.", True)):
+        events.extend(
+            protocol._from_duplex_event(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": response_id,
+                    "audio": "AAAA",
+                    "text": text,
+                    "format": "pcm",
+                    "sample_rate_hz": 24000,
+                    "end_of_turn": end_of_turn,
+                }
+            )
+        )
+
+    transcript = "".join(str(event["delta"]) for event in events if event["type"] == "response.audio_transcript.delta")
+    done = [str(event["transcript"]) for event in events if event["type"] == "response.audio_transcript.done"]
+
+    assert transcript == "It's Canberra. Next question."
+    assert done == [transcript]
 
 
 def test_native_realtime_protocol_updates_in_progress_item_for_audio_truncate():
@@ -1976,12 +2083,17 @@ def test_duplex_data_plane_text_delta_preserves_repeated_suffix_growth():
     assert data_plane.segment_text_delta(request_id, "好的好的") == "好的"
 
 
-def test_duplex_data_plane_text_delta_keeps_non_prefix_text():
+def test_duplex_data_plane_text_delta_appends_distinct_non_prefix_segments():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-native-rewrite-e0-stage0"
 
-    assert data_plane.segment_text_delta(request_id, "hello world") == "hello world"
-    assert data_plane.segment_text_delta(request_id, "hullo world") == "hullo world"
+    deltas = [
+        data_plane.segment_text_delta(request_id, "It's Canberra."),
+        data_plane.segment_text_delta(request_id, " Next question."),
+    ]
+
+    assert deltas == ["It's Canberra.", " Next question."]
+    assert "".join(deltas) == "It's Canberra. Next question."
 
 
 def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():

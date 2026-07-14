@@ -561,6 +561,33 @@ def _unexpected_error_events(state: DemoState) -> list[dict[str, object]]:
     return [event for event in state.events if event.get("type") == "error"]
 
 
+def _evaluate_response_speak_contract(state: DemoState) -> dict[str, object]:
+    speak_counts: dict[str, int] = {}
+    invalid_response_speak_count = 0
+    text_bearing_response_speak_count = 0
+
+    for event in state.events:
+        if event.get("type") != "response.speak":
+            continue
+        response_id = state._event_response_id(event)
+        if not response_id or response_id not in state.response_ids:
+            invalid_response_speak_count += 1
+        else:
+            speak_counts[response_id] = speak_counts.get(response_id, 0) + 1
+        if "text" in event:
+            text_bearing_response_speak_count += 1
+
+    duplicate_response_speak_ids = sorted(response_id for response_id, count in speak_counts.items() if count > 1)
+    return {
+        "response_speak_contract_ok": not duplicate_response_speak_ids
+        and invalid_response_speak_count == 0
+        and text_bearing_response_speak_count == 0,
+        "duplicate_response_speak_ids": duplicate_response_speak_ids,
+        "invalid_response_speak_count": invalid_response_speak_count,
+        "text_bearing_response_speak_count": text_bearing_response_speak_count,
+    }
+
+
 def _evaluate_transcript_integrity(
     state: DemoState,
     response_ids: list[str],
@@ -1014,12 +1041,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                             "modalities": ["audio", "text"],
                             "input_audio_format": "pcm16",
                             "output_audio_format": args.output_audio_format,
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "interrupt_response": False,
-                                "silence_duration_ms": args.short_ack_ms,
-                                "threshold": 0.35,
-                            },
+                            "turn_detection": None,
                             "overlap_policy": "listen_only",
                             "overlap_short_ack_ms": args.short_ack_ms,
                             "playback_commit_policy": "ack_only",
@@ -1125,6 +1147,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         require_cross_turn_independence=getattr(args, "require_distinct_inputs", False),
         require_terminal_punctuation=getattr(args, "require_distinct_inputs", False),
     )
+    response_speak_contract = _evaluate_response_speak_contract(state)
     expected_audio_turns = expected_turns - len(expected_empty_turns)
     lifecycle_counts_ok = (
         state.count("response.created") == state.count("response.done")
@@ -1225,6 +1248,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "distinct_turn_inputs": distinct_turn_inputs,
         "error_count": len(unexpected_error_events),
         "errors": unexpected_error_events,
+        **response_speak_contract,
         **transcript_integrity,
         "turn_inputs": [
             {
@@ -1250,6 +1274,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and playback_history_committed_ok
         and listen_only_overlap_ok
         and not unexpected_error_events
+        and response_speak_contract["response_speak_contract_ok"]
         and (distinct_turn_inputs or not getattr(args, "require_distinct_inputs", False))
     )
     return result
