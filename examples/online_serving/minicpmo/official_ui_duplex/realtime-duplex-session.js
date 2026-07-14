@@ -339,8 +339,7 @@ export class DuplexSession {
                 break;
             }
 
-            // Text: use ONLY transcript deltas (response.speak text repeats
-            // them — consuming both caused the duplicated-transcript bug).
+            // Transcript deltas are the only response-text channel.
             case 'response.audio_transcript.delta':
             case 'response.output_audio_transcript.delta': {
                 const delta = evt.delta;
