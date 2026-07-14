@@ -969,7 +969,6 @@ async def omni_init_app_state(
     # Warm up chat template processing to avoid first-request latency
     if state.openai_serving_chat is not None:
         state.openai_serving_chat.warmup()
-        await state.openai_serving_chat.warmup_minicpmo45_chat_audio()
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(
