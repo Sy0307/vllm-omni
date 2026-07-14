@@ -166,6 +166,52 @@ def test_realtime_duplex_demo_gate_checks_delta_done_and_turn_independence():
     assert result["cross_turn_independent_ok"] is True
 
 
+def test_realtime_duplex_demo_speak_gate_accepts_one_decision_event_per_response():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response": {"id": "resp-1"}})
+    state.add(
+        {
+            "type": "response.speak",
+            "response_id": "resp-1",
+            "metadata": {"model_speak": True},
+        }
+    )
+
+    assert demo._evaluate_response_speak_contract(state)["response_speak_contract_ok"] is True
+
+
+def test_realtime_duplex_demo_speak_gate_rejects_duplicate_event():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response": {"id": "resp-1"}})
+    state.add({"type": "response.speak", "response_id": "resp-1"})
+    state.add({"type": "response.speak", "response_id": "resp-1"})
+
+    result = demo._evaluate_response_speak_contract(state)
+
+    assert result["response_speak_contract_ok"] is False
+    assert result["duplicate_response_speak_ids"] == ["resp-1"]
+
+
+def test_realtime_duplex_demo_speak_gate_rejects_text_channel():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response": {"id": "resp-1"}})
+    state.add(
+        {
+            "type": "response.speak",
+            "response_id": "resp-1",
+            "text": "must be emitted through response.audio_transcript.delta",
+        }
+    )
+
+    result = demo._evaluate_response_speak_contract(state)
+
+    assert result["response_speak_contract_ok"] is False
+    assert result["text_bearing_response_speak_count"] == 1
+
+
 def test_realtime_duplex_demo_gate_rejects_cross_turn_tail_reuse():
     demo = _load_demo_module()
     state = demo.DemoState()

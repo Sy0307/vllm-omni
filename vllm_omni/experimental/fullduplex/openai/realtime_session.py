@@ -127,7 +127,6 @@ class NativeRealtimeSessionProtocol:
         self._input_sample_rate_hz = 16000
         self._output_audio_format = "pcm16"
         self._overlap_silence_rms = 0.003
-        self._turn_detection_create_response = False
         self._send_realtime_json = None
         self._initial_session_update = False
         self._input_speech_started = False
@@ -291,6 +290,17 @@ class NativeRealtimeSessionProtocol:
                         "unsupported_audio_format",
                         format_error,
                         event_id=event.get("event_id"),
+                    )
+                )
+                return None
+            turn_detection_error = self._validate_realtime_turn_detection(session_payload)
+            if turn_detection_error is not None:
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "unsupported_turn_detection",
+                        turn_detection_error,
+                        event_id=event.get("event_id"),
+                        param="turn_detection",
                     )
                 )
                 return None
@@ -519,7 +529,7 @@ class NativeRealtimeSessionProtocol:
                 "type": "input_audio_buffer.commit",
                 "final": event.get("final", True),
                 "realtime_item_id": item_id,
-                "response_create": bool(event.get("response_create", self._turn_detection_create_response)),
+                "response_create": bool(event.get("response_create", False)),
             }
             if transcript:
                 payload["transcript"] = transcript
@@ -843,9 +853,6 @@ class NativeRealtimeSessionProtocol:
             extra_body["realtime_include"] = list(session_payload["include"])
         if isinstance(session_payload.get("prompt"), dict):
             extra_body["realtime_prompt"] = dict(session_payload["prompt"])
-        turn_detection = self._turn_detection_config(session_payload)
-        if isinstance(turn_detection, dict):
-            extra_body["realtime_turn_detection"] = dict(turn_detection)
         input_audio_transcription = self._input_audio_transcription_config(session_payload)
         if isinstance(input_audio_transcription, dict):
             extra_body["realtime_input_audio_transcription"] = dict(input_audio_transcription)
@@ -924,13 +931,6 @@ class NativeRealtimeSessionProtocol:
             self._input_sample_rate_hz = int(sample_rate)
         if isinstance(output_rate, int | float) and output_rate > 0:
             self._output_sample_rate_hz = int(output_rate)
-        turn_detection = self._turn_detection_config(session_payload)
-        if isinstance(turn_detection, dict):
-            create_response = turn_detection.get("create_response")
-            if isinstance(create_response, bool):
-                self._turn_detection_create_response = create_response
-        elif "turn_detection" in session_payload and session_payload.get("turn_detection") is None:
-            self._turn_detection_create_response = False
         overlap_fields = self._realtime_overlap_fields(session_payload)
         overlap_silence_rms = overlap_fields.get("overlap_silence_rms")
         if isinstance(overlap_silence_rms, int | float):
@@ -1154,35 +1154,29 @@ class NativeRealtimeSessionProtocol:
             if isinstance(value, int | float):
                 fields[key] = value
 
-        turn_detection = cls._turn_detection_config(session_payload)
-        if isinstance(turn_detection, dict):
-            interrupt_response = turn_detection.get("interrupt_response")
-            if "overlap_policy" not in fields and isinstance(interrupt_response, bool):
-                fields["overlap_policy"] = "auto" if interrupt_response else "listen_only"
-            silence_duration_ms = turn_detection.get("silence_duration_ms")
-            if isinstance(silence_duration_ms, int | float) and "overlap_short_ack_ms" not in fields:
-                fields["overlap_short_ack_ms"] = max(0, int(silence_duration_ms))
-            threshold = turn_detection.get("threshold")
-            if isinstance(threshold, int | float) and "overlap_silence_rms" not in fields:
-                fields["overlap_silence_rms"] = max(0.0, min(1.0, float(threshold))) * 0.01
-
         if isinstance(session_payload.get("playback_commit_policy"), str):
             fields["playback_commit_policy"] = session_payload["playback_commit_policy"]
         return fields
 
     @staticmethod
-    def _turn_detection_config(session_payload: dict[str, object]) -> dict[str, object] | None:
-        turn_detection = session_payload.get("turn_detection")
-        if isinstance(turn_detection, dict):
-            return turn_detection
+    def _validate_realtime_turn_detection(session_payload: dict[str, object]) -> str | None:
+        configured_values: list[tuple[str, object]] = []
+        if "turn_detection" in session_payload:
+            configured_values.append(("turn_detection", session_payload["turn_detection"]))
         audio_config = session_payload.get("audio")
-        if not isinstance(audio_config, dict):
-            return None
-        audio_input = audio_config.get("input")
-        if not isinstance(audio_input, dict):
-            return None
-        turn_detection = audio_input.get("turn_detection")
-        return turn_detection if isinstance(turn_detection, dict) else None
+        if isinstance(audio_config, dict):
+            audio_input = audio_config.get("input")
+            if isinstance(audio_input, dict) and "turn_detection" in audio_input:
+                configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
+        for field_path, turn_detection in configured_values:
+            if turn_detection is None:
+                continue
+            turn_detection_type = turn_detection.get("type") if isinstance(turn_detection, dict) else turn_detection
+            return (
+                f"{field_path}={turn_detection_type!r} is not implemented by the duplex Realtime adapter; "
+                "set turn_detection to null and commit input explicitly, or use the model-owned duplex policy"
+            )
+        return None
 
     @staticmethod
     def _input_audio_transcription_config(session_payload: dict[str, object]) -> dict[str, object] | None:
@@ -1364,8 +1358,7 @@ class NativeRealtimeSessionProtocol:
                     "item_id": self._response_item_id(response_id),
                     "output_index": 0,
                     "content_index": 0,
-                    "text": event.get("text", ""),
-                    "metadata": event,
+                    "metadata": self._response_speak_metadata(event),
                 }
             ]
         if event_type == "overlap.decision":
@@ -2072,8 +2065,7 @@ class NativeRealtimeSessionProtocol:
                     "item_id": item_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "text": event.get("text", ""),
-                    "metadata": event,
+                    "metadata": self._response_speak_metadata(event),
                 },
             )
         payloads.append(
@@ -2090,6 +2082,10 @@ class NativeRealtimeSessionProtocol:
             }
         )
         return payloads
+
+    @staticmethod
+    def _response_speak_metadata(event: dict[str, Any]) -> dict[str, object]:
+        return {key: event[key] for key in ("session_id", "epoch", "model_speak") if key in event}
 
     def _realtime_audio_done_events(
         self,

@@ -479,11 +479,9 @@ class MiniCPMO45DataPlaneSession:
         elif text.startswith(sent_text):
             delta_text = text[len(sent_text) :]
         else:
-            logger.warning(
-                "Non-prefix duplex data-plane transcript for request_id=%s turn_id=%s; emitting full text",
-                request_id,
-                turn_id,
-            )
+            # The producer sends text for the current thinker segment, not a
+            # cumulative turn snapshot. Distinct adjacent segments need not
+            # have a prefix relationship and must both remain visible.
             delta_text = text
         turn_state.sent_segment_text = text
         return delta_text

@@ -17,8 +17,8 @@ hook surface that speaks the realtime duplex protocol from the browser:
 
 - mic chunks (f32le 16 kHz base64) -> `input_audio_buffer.append` (pcm16)
 - `response.audio.delta` (pcm16 24 kHz) -> official `AudioPlayer` (f32le)
-- `response.audio_transcript.delta` -> AI chat bubbles (transcript deltas
-  only — `response.speak` text repeats them and would duplicate the text)
+- `response.audio_transcript.delta` -> AI chat bubbles (the only response-text
+  channel; `response.speak` is a decision event)
 - `conversation.item.input_audio_transcription.completed` -> "You:" bubbles
 - ref audio / presets / system prompt: official assets, unchanged
 
