@@ -93,9 +93,9 @@ The normal vLLM model runner still owns attention metadata, sampling, and
 request KV. The current append path is not a scheduler-native append primitive
 or persistent KV lease. MiniCPM advertises neither automatic/VAD barge-in nor
 production multi-session concurrency. See
-[`docs/design/minicpmo45_full_duplex_runtime_review.md`](../../../docs/design/minicpmo45_full_duplex_runtime_review.md)
-for the production path, lifecycle invariants, capability boundary, and focused
-review commands.
+[`docs/design/minicpmo45_duplex_runtime_architecture.md`](../../../docs/design/minicpmo45_duplex_runtime_architecture.md)
+for the active runtime path, lifecycle invariants, capability boundary, and
+validation scope.
 
 ### Stage-based CLI (optional)
 
@@ -255,5 +255,3 @@ that URL, preserving any proxy path prefix.
   Token2Wav; sample rate is 24 kHz.
 - Video input is forwarded as a base64 `video_url` entry; the server needs
   decord/torchvision to decode it.
-- `MINICPMO45_PROFILE_LOGS=1` logs `llm2tts`, Talker decode, and Token2wav
-  timings for profiling.

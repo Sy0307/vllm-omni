@@ -69,9 +69,9 @@ python examples/online_serving/minicpmo/official_ui_duplex/serve.py \
 Open `http://localhost:8006` — on a remote box, tunnel first
 (`ssh -N -L 8006:127.0.0.1:8006 <host>`; the mic requires a secure origin,
 which `localhost` satisfies). Pick a preset (中文通话 / English call) or edit
-the system prompt, press Start, and talk. Barge-in, waveform, voice presets,
-reference-audio cloning, and session recording all work as in the official
-deployment.
+the system prompt, press Start, and talk. Waveform rendering, voice presets,
+reference-audio cloning, and session recording work as in the official
+deployment. Automatic or VAD-driven barge-in is not supported by this runtime.
 
 ## Notes and limitations
 
@@ -84,4 +84,5 @@ deployment.
 - The session sends `session.update` with
   `extra_body: {auto_response: true, minicpmo45_native_duplex: true}` and,
   when a reference voice is selected, `extra_body.ref_audio` as a WAV data
-  URI. Turn-taking is server-VAD driven.
+  URI. Turn detection is not configured; turn-taking uses the model-owned
+  native listen/speak policy.

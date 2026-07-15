@@ -31,6 +31,17 @@ def test_duplex_session_commits_text_and_audio_as_one_turn():
     assert session.turn_state == DuplexTurnState.USER_COMMITTED
 
 
+def test_duplex_session_registry_advances_incarnation_when_id_is_reused():
+    registry = DuplexSessionRegistry()
+
+    first = registry.create(session_id="reused-session")
+    registry.close(first.session_id)
+    second = registry.create(session_id="reused-session")
+
+    assert first.incarnation == 0
+    assert second.incarnation == 1
+
+
 def test_native_input_commit_does_not_advance_model_turn_identity():
     session = DuplexSession(
         session_id="sid-model-owned-turn",
@@ -44,6 +55,21 @@ def test_native_input_commit_does_not_advance_model_turn_identity():
     assert first.input_commit_seq == 1
     assert second.input_commit_seq == 2
     assert first.turn_id == second.turn_id == session.turn_id == 0
+
+
+def test_duplex_session_owns_response_and_overlap_identity():
+    session = DuplexSession(session_id="sid-state-owner", config=DuplexSessionConfig())
+
+    response_id = session.begin_response()
+    session.accumulate_overlap_speech(320)
+    session.accumulate_overlap_speech(180)
+    session.end_response()
+
+    assert session.active_response_id is None
+    assert session.last_response_id == response_id
+    assert session.overlap_speech_ms == 500
+    assert session.reset_overlap_speech() == 500
+    assert session.overlap_speech_ms == 0
 
 
 def test_duplex_barge_in_advances_epoch_and_drops_uncommitted_assistant_text():

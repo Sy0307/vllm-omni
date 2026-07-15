@@ -7,10 +7,9 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
-import os
 import threading
 from collections.abc import Callable, Sequence
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
 from typing import Any, NamedTuple
@@ -43,6 +42,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.model_executor.duplex import DuplexSamplingRow
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -329,10 +329,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
-        self._duplex_force_listen_applied_segments: set[tuple[str, int]] = set()
-        # Sessions whose turn ended (last terminator <|turn_eos|>) and have not
-        # received new speech; force listen on their silence chunks.
-        self._duplex_turn_ended_sessions: set[str] = set()
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -400,16 +396,47 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
 
-    def _model_sampler_duplex_rows(self) -> list[int]:
-        req_ids = list(getattr(self.input_batch, "req_ids", []))
-        return [idx for idx, req_id in enumerate(req_ids) if self._request_has_duplex_data_plane_metadata(str(req_id))]
-
-    def _request_has_duplex_data_plane_metadata(self, req_id: str) -> bool:
-        info = self._request_duplex_intermediate_info(req_id)
-        if not isinstance(info, dict):
-            return False
-        duplex = info.get("duplex")
-        return isinstance(duplex, dict) and duplex.get("data_plane") is True
+    def _duplex_sampling_rows(self) -> tuple[DuplexSamplingRow, ...]:
+        rows: list[DuplexSamplingRow] = []
+        req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
+        requests = getattr(self, "requests", {})
+        for row_idx, req_id in enumerate(req_ids):
+            info = self._request_duplex_intermediate_info(req_id)
+            duplex = info.get("duplex") if isinstance(info, dict) else None
+            if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+                continue
+            session_id = duplex.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                session_id = None
+            try:
+                incarnation = int(duplex.get("incarnation", 0))
+            except (TypeError, ValueError):
+                incarnation = 0
+            try:
+                seq = int(duplex.get("seq"))
+            except (TypeError, ValueError):
+                seq = None
+            payload = duplex.get("payload")
+            if not isinstance(payload, dict):
+                payload = None
+            request = requests.get(req_id) if isinstance(requests, dict) else None
+            sampling_params = getattr(request, "sampling_params", None)
+            try:
+                max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                max_tokens = 0
+            rows.append(
+                DuplexSamplingRow(
+                    row_idx=row_idx,
+                    request_id=req_id,
+                    session_id=session_id,
+                    incarnation=incarnation,
+                    seq=seq,
+                    payload=payload,
+                    max_tokens=max_tokens if max_tokens > 0 else None,
+                )
+            )
+        return tuple(rows)
 
     def _request_duplex_intermediate_info(self, req_id: str) -> dict[str, Any] | None:
         model_intermediate_buffer = getattr(self, "model_intermediate_buffer", {})
@@ -420,211 +447,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         req_state = requests.get(req_id) if isinstance(requests, dict) else None
         info = getattr(req_state, "additional_information_cpu", None)
         return info if isinstance(info, dict) else None
-
-    def _request_duplex_payload(self, req_id: str) -> dict[str, Any] | None:
-        info = self._request_duplex_intermediate_info(req_id)
-        if not isinstance(info, dict):
-            return None
-        duplex = info.get("duplex")
-        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
-            return None
-        payload = duplex.get("payload")
-        return payload if isinstance(payload, dict) else None
-
-    def _request_duplex_seq(self, req_id: str) -> int | None:
-        info = self._request_duplex_intermediate_info(req_id)
-        if not isinstance(info, dict):
-            return None
-        duplex = info.get("duplex")
-        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
-            return None
-        try:
-            return int(duplex.get("seq"))
-        except (TypeError, ValueError):
-            return None
-
-    def _request_duplex_session_id(self, req_id: str) -> str | None:
-        info = self._request_duplex_intermediate_info(req_id)
-        if not isinstance(info, dict):
-            return None
-        duplex = info.get("duplex")
-        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
-            return None
-        session_id = duplex.get("session_id")
-        return session_id if isinstance(session_id, str) and session_id else None
-
-    def _publish_duplex_row_sessions(self, duplex_rows: list[int]) -> None:
-        """Expose row -> duplex session id so the model sampler can record
-        per-session state (e.g. the segment's sampled terminator token, which
-        the scheduler session update discards before the next append)."""
-        if not duplex_rows:
-            if getattr(self.model, "_minicpmo45_duplex_row_sessions", None):
-                self.model._minicpmo45_duplex_row_sessions = {}
-            if getattr(self.model, "_minicpmo45_duplex_row_payloads", None):
-                self.model._minicpmo45_duplex_row_payloads = {}
-            if getattr(self.model, "_minicpmo45_duplex_row_max_tokens", None):
-                self.model._minicpmo45_duplex_row_max_tokens = {}
-            return
-        req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
-        row_sessions: dict[int, str] = {}
-        row_payloads: dict[int, dict[str, Any]] = {}
-        row_max_tokens: dict[int, int] = {}
-        requests = getattr(self, "requests", {})
-        for row_idx in duplex_rows:
-            if row_idx >= len(req_ids):
-                continue
-            req_id = req_ids[row_idx]
-            info = self._request_duplex_intermediate_info(req_id)
-            duplex = info.get("duplex") if isinstance(info, dict) else None
-            session_id = duplex.get("session_id") if isinstance(duplex, dict) else None
-            if isinstance(session_id, str) and session_id:
-                row_sessions[row_idx] = session_id
-            payload = duplex.get("payload") if isinstance(duplex, dict) else None
-            if isinstance(payload, dict):
-                row_payloads[row_idx] = payload
-            request = requests.get(req_id) if isinstance(requests, dict) else None
-            sampling_params = getattr(request, "sampling_params", None)
-            try:
-                max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
-            except (TypeError, ValueError):
-                max_tokens = 0
-            if max_tokens > 0:
-                row_max_tokens[row_idx] = max_tokens
-        self.model._minicpmo45_duplex_row_sessions = row_sessions
-        self.model._minicpmo45_duplex_row_payloads = row_payloads
-        self.model._minicpmo45_duplex_row_max_tokens = row_max_tokens
-
-    def _apply_duplex_force_listen_logits(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: Any,
-        duplex_rows: list[int],
-    ) -> None:
-        if not duplex_rows:
-            return
-        token_id_fn = getattr(self.model, "_minicpmo45_native_duplex_token_ids", None)
-        if not callable(token_id_fn):
-            return
-        try:
-            token_ids_map = token_id_fn()
-            listen_id = int(token_ids_map.get("listen_token_id", -1))
-            tts_bos_id = int(token_ids_map.get("tts_bos_token_id", -1))
-            turn_eos_id = int(token_ids_map.get("turn_eos_token_id", -1))
-        except Exception:
-            return
-        if listen_id < 0 or listen_id >= logits.shape[-1]:
-            return
-        helper = getattr(self.model, "_minicpmo45_duplex_data_plane_helper", None)
-        helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
-        req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
-        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
-        for row_idx in duplex_rows:
-            if row_idx >= len(req_ids):
-                continue
-            req_id = req_ids[row_idx]
-            payload = self._request_duplex_payload(req_id)
-            if not isinstance(payload, dict):
-                continue
-            force_listen = payload.get("force_listen") is True
-            is_speech = payload.get("is_speech")
-            new_user_turn = payload.get("new_user_turn") is True
-            redirect_listen = False
-            # Turn-ended latch: after <|turn_eos|>, force listen on silence until
-            # new speech, so the model does not re-open a turn and repeat itself.
-            if turn_eos_id >= 0:
-                session_id = self._request_duplex_session_id(req_id)
-                if session_id:
-                    helper_current_turn_ended = None
-                    helper_last_terminator = None
-                    if isinstance(helper_sessions, dict):
-                        state = helper_sessions.get(session_id)
-                        if state is not None:
-                            helper_current_turn_ended = getattr(state, "current_turn_ended", None)
-                            helper_last_terminator = getattr(state, "last_terminator_token", None)
-                    if is_speech is True:
-                        self._duplex_turn_ended_sessions.discard(session_id)
-                        if isinstance(helper_sessions, dict):
-                            state = helper_sessions.get(session_id)
-                            if state is not None:
-                                if new_user_turn:
-                                    with suppress(Exception):
-                                        state.current_turn_ended = True
-                                if not getattr(state, "current_turn_ended", True):
-                                    redirect_listen = True
-                                with suppress(Exception):
-                                    state.last_terminator_token = None
-                    else:
-                        prev_term = None
-                        if isinstance(helper_sessions, dict):
-                            state = helper_sessions.get(session_id)
-                            prev_term = getattr(state, "last_terminator_token", None)
-                            if prev_term is None:
-                                prev_term = getattr(state, "pending_terminator_token", None)
-                        if prev_term == turn_eos_id:
-                            self._duplex_turn_ended_sessions.add(session_id)
-                    if session_id in self._duplex_turn_ended_sessions and is_speech is not True:
-                        force_listen = True
-            if not force_listen and not redirect_listen:
-                continue
-            seq = self._request_duplex_seq(req_id)
-            segment_key = (req_id, seq if seq is not None else -1)
-            if force_listen and segment_key in self._duplex_force_listen_applied_segments:
-                continue
-            row_outputs = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
-            try:
-                prior_output_len = sum(1 for token_id in row_outputs if int(token_id) >= 0)
-            except (TypeError, ValueError):
-                prior_output_len = len(row_outputs) if hasattr(row_outputs, "__len__") else None
-            if force_listen:
-                logits[row_idx, :] = float("-inf")
-                logits[row_idx, listen_id] = 0.0
-                self._duplex_force_listen_applied_segments.add(segment_key)
-                action = "force listen"
-            elif redirect_listen and 0 <= tts_bos_id < logits.shape[-1]:
-                # Mirror the official mid-turn decode rule: if the model
-                # would listen before the current turn ended, feed tts_bos
-                # instead. Moving listen's score to tts_bos preserves that
-                # decision better than picking an arbitrary next-best token.
-                if logits[row_idx, listen_id] > logits[row_idx, tts_bos_id]:
-                    logits[row_idx, tts_bos_id] = logits[row_idx, listen_id]
-                logits[row_idx, listen_id] = float("-inf")
-                action = "redirect listen"
-            else:
-                continue
-            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-                logger.info(
-                    "MiniCPM-o duplex %s logits: req_id=%s seq=%s row=%s "
-                    "prior_output_len=%s listen_id=%s flags={is_speech:%s,new_user_turn:%s,"
-                    "force_listen:%s} turn_state={ended:%s,last_term:%s,latch:%s}",
-                    action,
-                    req_id,
-                    seq,
-                    row_idx,
-                    prior_output_len,
-                    listen_id,
-                    is_speech,
-                    new_user_turn,
-                    payload.get("force_listen"),
-                    helper_current_turn_ended,
-                    helper_last_terminator,
-                    session_id in self._duplex_turn_ended_sessions if session_id else None,
-                )
-
-    @staticmethod
-    def _call_model_sampler(
-        model_sample: Any,
-        logits: torch.Tensor,
-        sampling_metadata: Any,
-        *,
-        duplex_rows: list[int],
-    ):
-        if duplex_rows:
-            try:
-                return model_sample(logits, sampling_metadata, duplex_rows=duplex_rows)
-            except TypeError as exc:
-                if "duplex_rows" not in str(exc):
-                    raise
-        return model_sample(logits, sampling_metadata)
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -1650,24 +1472,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
-            duplex_rows = self._model_sampler_duplex_rows()
-            if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-                req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
-                if duplex_rows:
-                    prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None)
-                    output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
-                    logger.info(
-                        "MiniCPM-o duplex sampler gate: req_ids=%s prefer_model_sampler=%s "
-                        "model=%s prompt_shape=%s output_lens=%s temperature=%s top_k=%s top_p=%s",
-                        req_ids,
-                        getattr(self.model, "prefer_model_sampler", False),
-                        type(self.model).__name__,
-                        None if prompt_token_ids is None else tuple(prompt_token_ids.shape),
-                        None if output_token_ids is None else [len(ids) for ids in output_token_ids],
-                        getattr(sampling_metadata, "temperature", None),
-                        getattr(sampling_metadata, "top_k", None),
-                        getattr(sampling_metadata, "top_p", None),
-                    )
+            duplex_rows = self._duplex_sampling_rows()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
@@ -1679,14 +1484,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                self._apply_duplex_force_listen_logits(logits, sampling_metadata, duplex_rows)
-                self._publish_duplex_row_sessions(duplex_rows)
-                sampler_output = self._call_model_sampler(
-                    model_sample,
-                    logits,
-                    self._sampling_metadata_for_model_sampler(sampling_metadata),
-                    duplex_rows=duplex_rows,
-                )
+                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                prepare_duplex_sampling = getattr(self.model, "prepare_duplex_sampling", None)
+                if callable(prepare_duplex_sampling):
+                    prepare_duplex_sampling(logits, prepared_sampling_metadata, duplex_rows)
+                sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(

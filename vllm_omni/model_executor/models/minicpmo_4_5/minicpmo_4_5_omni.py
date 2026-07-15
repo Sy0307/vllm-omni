@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Iterable
+from contextlib import suppress
 from functools import cached_property
 from typing import Any
 
@@ -29,6 +30,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.duplex import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -149,6 +151,103 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         return Sampler()
 
+    def prepare_duplex_sampling(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        rows: tuple[DuplexSamplingRow, ...],
+    ) -> None:
+        """Apply MiniCPM duplex policy before the standard model sampler."""
+        del sampling_metadata
+        self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
+        self._minicpmo45_duplex_row_sessions = {
+            row.row_idx: (row.session_id, row.incarnation) for row in rows if row.session_id is not None
+        }
+        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
+        if not isinstance(request_sessions, dict):
+            request_sessions = {}
+            self._minicpmo45_duplex_request_sessions = request_sessions
+        request_sessions.update(
+            {row.request_id: (row.session_id, row.incarnation) for row in rows if row.session_id is not None}
+        )
+        self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
+        self._minicpmo45_duplex_row_max_tokens = {
+            row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
+        }
+        if self.model_stage != "llm" or not rows or logits.ndim != 2:
+            return
+
+        token_ids = self._minicpmo45_native_duplex_token_ids()
+        listen_id = int(token_ids.get("listen_token_id", -1))
+        tts_bos_id = int(token_ids.get("tts_bos_token_id", -1))
+        turn_eos_id = int(token_ids.get("turn_eos_token_id", -1))
+        if listen_id < 0 or listen_id >= logits.shape[-1]:
+            return
+
+        force_listen_segments = getattr(
+            self,
+            "_minicpmo45_force_listen_applied_segments",
+            None,
+        )
+        if not isinstance(force_listen_segments, set):
+            force_listen_segments = set()
+            self._minicpmo45_force_listen_applied_segments = force_listen_segments
+        turn_ended_sessions = getattr(self, "_minicpmo45_turn_ended_sessions", None)
+        if not isinstance(turn_ended_sessions, set):
+            turn_ended_sessions = set()
+            self._minicpmo45_turn_ended_sessions = turn_ended_sessions
+
+        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+        helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
+        for row in rows:
+            row_idx = row.row_idx
+            if row_idx < 0 or row_idx >= logits.shape[0]:
+                continue
+            payload = row.payload
+            if not isinstance(payload, dict):
+                continue
+            force_listen = payload.get("force_listen") is True
+            is_speech = payload.get("is_speech")
+            new_user_turn = payload.get("new_user_turn") is True
+            redirect_listen = False
+            session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
+            if turn_eos_id >= 0 and session_key is not None:
+                state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
+                if is_speech is True:
+                    turn_ended_sessions.discard(session_key)
+                    if state is not None:
+                        if new_user_turn:
+                            with suppress(Exception):
+                                state.current_turn_ended = True
+                        if not getattr(state, "current_turn_ended", True):
+                            redirect_listen = True
+                        with suppress(Exception):
+                            state.last_terminator_token = None
+                else:
+                    prev_term = None
+                    if state is not None:
+                        prev_term = getattr(state, "last_terminator_token", None)
+                        if prev_term is None:
+                            prev_term = getattr(state, "pending_terminator_token", None)
+                    if prev_term == turn_eos_id:
+                        turn_ended_sessions.add(session_key)
+                if session_key in turn_ended_sessions and is_speech is not True:
+                    force_listen = True
+
+            if not force_listen and not redirect_listen:
+                continue
+            segment_key = (row.request_id, row.seq if row.seq is not None else -1)
+            if force_listen and segment_key in force_listen_segments:
+                continue
+            if force_listen:
+                logits[row_idx, :] = float("-inf")
+                logits[row_idx, listen_id] = 0.0
+                force_listen_segments.add(segment_key)
+            elif 0 <= tts_bos_id < logits.shape[-1]:
+                if logits[row_idx, listen_id] > logits[row_idx, tts_bos_id]:
+                    logits[row_idx, tts_bos_id] = logits[row_idx, listen_id]
+                logits[row_idx, listen_id] = float("-inf")
+
     # -------------------- Device utilities --------------------
     @staticmethod
     def _module_device(module: nn.Module) -> torch.device:
@@ -263,19 +362,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         helper = self._duplex_data_plane_helper()
         session_id = str(duplex.get("session_id") or "")
+        try:
+            incarnation = int(duplex.get("incarnation", 0))
+        except (TypeError, ValueError):
+            incarnation = 0
         payload = duplex.get("payload")
         if not session_id or not isinstance(payload, dict):
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
 
-        state = helper.sessions.get(session_id)
+        session_key = (session_id, incarnation)
+        state = helper.sessions.get(session_key)
         if state is None:
             from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
                 _MiniCPMO45Stage0SessionState,
             )
 
             state = _MiniCPMO45Stage0SessionState(session_id=session_id)
-            helper.sessions[session_id] = state
+            helper.sessions[session_key] = state
             session_config = duplex.get("session_config")
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
             if hasattr(helper.thinker, "audio_past_key_values"):
@@ -530,7 +634,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
             meta_info = talker_info.get("meta") if isinstance(talker_info.get("meta"), dict) else {}
-            if talker_info.get("minicpmo45_native_duplex") is True:
+            if talker_info.get("native_duplex") is True:
                 # ids/hidden_states may be accumulated for the talker KV stream,
                 # but displayed transcript belongs to the current thinker segment.
                 tts_text = meta_info.get("native_duplex_segment_text", "")
@@ -539,7 +643,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if isinstance(tts_text, list):
                 tts_text = (
                     tts_text[-1]
-                    if talker_info.get("minicpmo45_native_duplex") is True and tts_text
+                    if talker_info.get("native_duplex") is True and tts_text
                     else (tts_text[0] if tts_text else "")
                 )
             if not isinstance(tts_text, str):
@@ -552,7 +656,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     inputs_embeds=inputs_embeds,
                     additional_information=talker_info,
                 )
-            if talker_info.get("minicpmo45_native_duplex") is True:
+            if talker_info.get("native_duplex") is True:
                 emitted_text = getattr(self.talker, "_ar_last_emitted_text", "")
                 tts_text = emitted_text if isinstance(emitted_text, str) else ""
 
@@ -563,7 +667,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 mel_spec, waveform = talker_result
                 mm_out = {}
                 duplex_info = talker_info.get("duplex") if isinstance(talker_info.get("duplex"), dict) else {}
-                if talker_info.get("minicpmo45_native_duplex") is True and isinstance(duplex_info, dict):
+                if talker_info.get("native_duplex") is True and isinstance(duplex_info, dict):
                     turn_id = duplex_info.get("turn_id")
                     if isinstance(turn_id, int):
                         mm_out["meta.duplex_turn_id"] = torch.tensor([turn_id], dtype=torch.int32, device=device)
@@ -579,13 +683,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 )
                 turn_end_flags = getattr(self.talker, "_ar_turn_end_flags", [False])
                 turn_ended = bool(turn_end_flags[-1]) if turn_end_flags else False
-                if talker_info.get("minicpmo45_native_duplex") is True:
+                if talker_info.get("native_duplex") is True:
                     mm_out["meta.turn_end"] = torch.tensor(
                         [int(turn_ended)],
                         dtype=torch.int32,
                         device=device,
                     )
-                if isinstance(tts_text, str) and (tts_text or talker_info.get("minicpmo45_native_duplex") is True):
+                if isinstance(tts_text, str) and (tts_text or talker_info.get("native_duplex") is True):
                     mm_out["meta.llm_output_text_utf8"] = torch.tensor(
                         list(tts_text.encode("utf-8")),
                         dtype=torch.uint8,
@@ -665,6 +769,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self.model.compute_logits(hidden_states)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
+        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
+        sessions = getattr(helper, "sessions", None) if helper is not None else None
+        if isinstance(request_sessions, dict):
+            for request_id in finished_req_ids:
+                session_key = request_sessions.pop(request_id, None)
+                if session_key is not None and isinstance(sessions, dict):
+                    sessions.pop(session_key, None)
+        forced_segments = getattr(self, "_minicpmo45_force_listen_applied_segments", None)
+        if isinstance(forced_segments, set):
+            finished = set(finished_req_ids)
+            completed_segments = {segment for segment in forced_segments if segment[0] in finished}
+            forced_segments.difference_update(completed_segments)
         if hasattr(self.model, "on_requests_finished"):
             self.model.on_requests_finished(finished_req_ids)
 
@@ -672,13 +789,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-        *,
-        duplex_rows: list[int] | None = None,
     ) -> SamplerOutput | None:
         native_duplex = self._sample_minicpmo45_native_duplex_stage0(
             logits,
             sampling_metadata,
-            duplex_rows=duplex_rows,
+            duplex_rows=getattr(self, "_minicpmo45_active_duplex_rows", None),
         )
         if native_duplex is not None:
             return native_duplex
@@ -699,7 +814,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         unit_id = token_ids.get("unit_token_id", -1)
         if unit_id < 0:
             return None
-        native_rows = self._native_duplex_prompt_rows(
+        native_rows = self._minicpmo45_native_duplex_prompt_rows(
             sampling_metadata,
             unit_id,
             logits.shape[0],
@@ -737,19 +852,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         raw_recent_tokens = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
         recent_tokens = [int(token_id) for token_id in raw_recent_tokens if isinstance(token_id, int) and token_id >= 0]
-        if MiniCPMO45DuplexPolicy.profile_logs_enabled() and not recent_tokens:
-            top_values, top_indices = torch.topk(logits[0], k=min(12, logits.shape[-1]))
-            special_scores = {
-                name: float(logits[0, token_id].detach().cpu())
-                for name, token_id in token_ids.items()
-                if 0 <= token_id < logits.shape[-1]
-            }
-            logger.info(
-                "MiniCPM-o native duplex first-step logits: top_ids=%s top_values=%s special_scores=%s",
-                top_indices.detach().cpu().tolist(),
-                [round(float(v), 4) for v in top_values.detach().cpu().tolist()],
-                {key: round(value, 4) for key, value in special_scores.items()},
-            )
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
             max_speak_tokens = int(
                 getattr(
@@ -764,20 +866,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if request_max_tokens is not None:
                 effective_max_speak_tokens = min(effective_max_speak_tokens, request_max_tokens)
             if len(recent_tokens) >= max(1, effective_max_speak_tokens - 1):
-                if MiniCPMO45DuplexPolicy.profile_logs_enabled():
-                    logger.info(
-                        "MiniCPM-o native duplex force chunk_eos: row=%s "
-                        "recent_len=%d max_speak_tokens=%d request_max_tokens=%s "
-                        "effective_max_speak_tokens=%d chunk_eos_id=%s "
-                        "recent_tail=%s",
-                        row_idx,
-                        len(recent_tokens),
-                        max_speak_tokens,
-                        request_max_tokens,
-                        effective_max_speak_tokens,
-                        chunk_eos_id,
-                        recent_tokens[-8:],
-                    )
                 return int(chunk_eos_id)
 
             # Match the released StreamDecoder: first sample the original
@@ -810,24 +898,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 else:
                     logits[0, token_id] *= repetition_penalty
 
-        # Official MiniCPM-o StreamDecoder.decode listen handling (utils.py): bias
-        # the listen token and optionally force-keep it only when it ranks in the
-        # top-k. Defaults (scale=1.0, top_k=None) are a no-op; a scale < 1 makes
-        # the model speak more readily (the official knob for listen/speak balance).
-        listen_id = token_ids.get("listen_token_id", -1)
-        listen_prob_scale, listen_top_k = self._minicpmo45_listen_decode_params()
-        if 0 <= listen_id < logits.shape[-1]:
-            if listen_prob_scale != 1.0:
-                logits[0, listen_id] = logits[0, listen_id] * listen_prob_scale
-            if listen_top_k is not None:
-                listen_rank = int((logits[0] > logits[0, listen_id]).sum().item())
-                if listen_rank < int(listen_top_k):
-                    return self._finalize_minicpmo45_native_duplex_sample(
-                        row_idx,
-                        int(listen_id),
-                        token_ids,
-                    )
-
         temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
@@ -849,12 +919,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     def _minicpmo45_duplex_state_for_row(self, row_idx: int):
         row_sessions = getattr(self, "_minicpmo45_duplex_row_sessions", None)
-        session_id = row_sessions.get(row_idx) if isinstance(row_sessions, dict) else None
-        if not session_id:
+        session_key = row_sessions.get(row_idx) if isinstance(row_sessions, dict) else None
+        if not session_key:
             return None
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None
-        return sessions.get(session_id) if isinstance(sessions, dict) else None
+        return sessions.get(session_key) if isinstance(sessions, dict) else None
 
     def _minicpmo45_duplex_payload_for_row(self, row_idx: int) -> dict[str, Any] | None:
         row_payloads = getattr(self, "_minicpmo45_duplex_row_payloads", None)
@@ -919,34 +989,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state.last_terminator_token = None
         state.current_turn_ended = False
 
-    def _minicpmo45_listen_decode_params(self) -> tuple[float, int | None]:
-        """Listen-token decode controls, matching official StreamDecoder.decode.
-
-        Read from config/env so the listen/speak balance is tunable without code
-        changes. ``listen_prob_scale`` multiplies the listen-token logit (<1 ->
-        speak more); ``listen_top_k`` forces listen only when it ranks in top-k.
-        Defaults (1.0, None) preserve current behavior.
-        """
-        cached = getattr(self, "_minicpmo45_listen_decode_params_cache", None)
-        if cached is not None:
-            return cached
-        import os
-
-        try:
-            scale = float(os.environ.get("MINICPMO45_LISTEN_PROB_SCALE", "1.0"))
-        except (TypeError, ValueError):
-            scale = 1.0
-        top_k: int | None = None
-        raw_k = os.environ.get("MINICPMO45_LISTEN_TOP_K")
-        if raw_k not in (None, ""):
-            try:
-                top_k = int(raw_k)
-            except (TypeError, ValueError):
-                top_k = None
-        params = (scale, top_k)
-        self._minicpmo45_listen_decode_params_cache = params
-        return params
-
     def _minicpmo45_tokenizer(self):
         if hasattr(self, "_minicpmo45_tokenizer_cache"):
             return self._minicpmo45_tokenizer_cache
@@ -959,9 +1001,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 from vllm.tokenizers import cached_tokenizer_from_config
 
                 tokenizer = cached_tokenizer_from_config(self.vllm_config.model_config)
-            except Exception as exc:
-                if MiniCPMO45DuplexPolicy.profile_logs_enabled():
-                    logger.info("MiniCPM-o native duplex sampler could not load tokenizer: %s", exc)
+            except Exception:
+                pass
         self._minicpmo45_tokenizer_cache = tokenizer
         return tokenizer
 
@@ -974,7 +1015,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_native_duplex_token_ids_cache = cached
         return cached
 
-    def _native_duplex_prompt_rows(
+    def _minicpmo45_native_duplex_prompt_rows(
         self,
         sampling_metadata: SamplingMetadata,
         unit_id: int,

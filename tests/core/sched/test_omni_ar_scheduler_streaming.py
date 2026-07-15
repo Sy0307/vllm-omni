@@ -92,9 +92,10 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
-def test_duplex_segment_boundary_uses_current_stage_stop_overrides() -> None:
+def test_duplex_segment_boundary_uses_typed_sampling_params_only() -> None:
     sched = _make_scheduler(stage_id=1)
     request = _make_request()
+    request.sampling_params = SamplingParams(max_tokens=8, stop_token_ids=[151645])
     request.resumable = True
     request.model_intermediate_buffer = {
         "duplex": {
@@ -102,7 +103,7 @@ def test_duplex_segment_boundary_uses_current_stage_stop_overrides() -> None:
             "session_config": {
                 "duplex_stage_sampling_params": {
                     "0": {"stop_token_ids": [111]},
-                    "1": {"stop_token_ids": [151645]},
+                    "1": {"stop_token_ids": [999]},
                 }
             },
         }

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
@@ -167,17 +166,6 @@ class MiniCPMO45DataPlaneSession:
             stale_turn = output_turn_id < context.turn_id
         stale_epoch = output_epoch is not None and output_epoch != context.epoch
         if context.auto_responds and (stale_turn or stale_epoch):
-            if _profile_logs_enabled():
-                logger.info(
-                    "drop stale duplex data-plane output: request_id=%s output_turn_id=%s "
-                    "session_turn_id=%s active_response_turn_id=%s output_epoch=%s session_epoch=%s",
-                    request_id,
-                    output_turn_id,
-                    context.turn_id,
-                    context.active_response_turn_id,
-                    output_epoch,
-                    context.epoch,
-                )
             return
 
         mm_text = _llm_output_text(mm_output)
@@ -193,14 +181,6 @@ class MiniCPMO45DataPlaneSession:
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
-            if _profile_logs_enabled():
-                logger.info(
-                    "duplex data-plane output: request_id=%s finished=%s "
-                    "native_decision=listen mm_keys=%s (audio encode skipped)",
-                    request_id,
-                    finished,
-                    sorted(mm_output),
-                )
             yield _runtime_result(
                 stage_role="llm",
                 is_listen=True,
@@ -243,29 +223,6 @@ class MiniCPMO45DataPlaneSession:
         if stage_turn_end_new and terminal_turn_state is not None:
             terminal_turn_state.turn_eos_done = True
         unit_end_of_turn = stage_turn_end_new or (finished and not context.auto_responds)
-
-        if _profile_logs_enabled():
-            logger.info(
-                "duplex data-plane output: request_id=%s finished=%s text_len=%d "
-                "audio_chunks=%d native_decision=%s mm_keys=%s raw_audio_samples=%s "
-                "offset_before=%s offset_after=%s token_ids=%s tts_is_last_chunk=%s "
-                "stage_tts_eos=%s stage_turn_end=%s stage_turn_end_new=%s tts_segment_end=%s",
-                request_id,
-                finished,
-                len(text) if isinstance(text, str) else 0,
-                len(audio_chunks),
-                native_decision,
-                sorted(mm_output),
-                raw_audio_samples,
-                offset_before,
-                self.audio_offset(request_id),
-                token_ids,
-                tts_is_last_chunk,
-                stage_tts_eos,
-                stage_turn_end,
-                stage_turn_end_new,
-                tts_segment_end,
-            )
 
         text_turn_id = output_turn_id if output_turn_id is not None else context.turn_id
         text_turn_state = request_state.turn(text_turn_id) if request_state is not None else None
@@ -602,10 +559,6 @@ def _runtime_result(**values: object) -> dict[str, object]:
         "runtime_impl": "scheduler_data_plane",
         "owned_runtime": False,
     }
-
-
-def _profile_logs_enabled() -> bool:
-    return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
 
 
 def _native_decision(

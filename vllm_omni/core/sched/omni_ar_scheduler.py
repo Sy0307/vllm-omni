@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -35,10 +34,6 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
-
-
-def _minicpmo45_profile_logs_enabled() -> bool:
-    return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
 
 
 @dataclass
@@ -167,34 +162,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         continue
                     if token_id >= 0:
                         stop_token_ids.add(token_id)
-
-        duplex = OmniARScheduler._duplex_data_plane_info(request)
-        if duplex is None:
-            return stop_token_ids
-        session_config = duplex.get("session_config")
-        if not isinstance(session_config, dict):
-            return stop_token_ids
-        extra_body = session_config.get("extra_body")
-        raw = session_config.get("duplex_stage_sampling_params")
-        if raw is None and isinstance(extra_body, dict):
-            raw = extra_body.get("duplex_stage_sampling_params")
-        stage_id = int(getattr(self.vllm_config.model_config, "stage_id", 0) or 0)
-        stage_params = None
-        if isinstance(raw, dict):
-            candidate = raw.get(stage_id)
-            if candidate is None:
-                candidate = raw.get(str(stage_id))
-            if isinstance(candidate, dict):
-                stage_params = candidate
-        raw_stop = stage_params.get("stop_token_ids") if isinstance(stage_params, dict) else None
-        if isinstance(raw_stop, (list, tuple, set)):
-            for token_id in raw_stop:
-                try:
-                    token_id = int(token_id)
-                except (TypeError, ValueError):
-                    continue
-                if token_id >= 0:
-                    stop_token_ids.add(token_id)
         return stop_token_ids
 
     def _is_duplex_segment_boundary(
@@ -512,24 +479,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
-
-            if (
-                new_token_ids
-                and self._duplex_data_plane_info(request) is not None
-                and _minicpmo45_profile_logs_enabled()
-            ):
-                logger.info(
-                    "[OmniARScheduler] duplex post-update: req=%s tokens=%s "
-                    "stopped=%s status=%s resumable=%s output_len=%s "
-                    "stop_token_ids=%s",
-                    request.request_id,
-                    new_token_ids,
-                    stopped,
-                    request.status,
-                    getattr(request, "resumable", None),
-                    len(getattr(request, "output_token_ids", []) or []),
-                    sorted(self._duplex_stage_stop_token_ids(request)),
-                )
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background

@@ -24,6 +24,7 @@ async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
 
     result = await app.open_duplex_session_async(
         "sid",
+        fence=DuplexFence("sid"),
         capabilities={"implementation_level": "model_native_duplex"},
         session_config={"instructions": "Be brief.", "idle_timeout_s": 30},
         timeout=7.5,
@@ -37,6 +38,7 @@ async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
                 "session_mode": "duplex",
                 "capabilities": {"implementation_level": "model_native_duplex"},
                 "session_config": {"instructions": "Be brief.", "idle_timeout_s": 30},
+                "fence": DuplexFence("sid"),
                 "timeout": 7.5,
             },
         )
@@ -46,6 +48,8 @@ async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
 @pytest.mark.asyncio
 async def test_async_omni_duplex_runtime_controls_forward_timeout():
     calls = []
+    cancelled_fence = DuplexFence("sid", epoch=2, turn_id=3)
+    next_fence = DuplexFence("sid", epoch=3, turn_id=3)
 
     async def append_duplex_input_async(session_id, **kwargs):
         calls.append(("append", session_id, kwargs))
@@ -66,9 +70,21 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         close_duplex_session_async=close_duplex_session_async,
     )
 
-    await app.append_duplex_input_async("sid", mode="append_audio_chunk", payload={}, timeout=12.5)
-    await app.signal_duplex_turn_async("sid", event="barge_in", timeout=13.5)
-    await app.close_duplex_session_async("sid", reason="done", timeout=14.5)
+    await app.append_duplex_input_async(
+        "sid",
+        mode="append_audio_chunk",
+        payload={},
+        fence=cancelled_fence,
+        timeout=12.5,
+    )
+    await app.signal_duplex_turn_async(
+        "sid",
+        event="barge_in",
+        fence=cancelled_fence,
+        next_fence=next_fence,
+        timeout=13.5,
+    )
+    await app.close_duplex_session_async("sid", reason="done", fence=next_fence, timeout=14.5)
 
     assert calls == [
         (
@@ -79,6 +95,7 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
                 "payload": {},
                 "final": False,
                 "expected_epoch": None,
+                "fence": cancelled_fence,
                 "timeout": 12.5,
             },
         ),
@@ -87,6 +104,8 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
             "sid",
             {
                 "event": "barge_in",
+                "fence": cancelled_fence,
+                "next_fence": next_fence,
                 "timeout": 13.5,
             },
         ),
@@ -95,6 +114,7 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
             "sid",
             {
                 "reason": "done",
+                "fence": next_fence,
                 "timeout": 14.5,
             },
         ),
@@ -126,6 +146,7 @@ async def test_async_omni_duplex_append_can_defer_data_plane_output_collection()
         "sid",
         mode="append_audio_chunk",
         payload={},
+        fence=DuplexFence("sid"),
         collect_outputs=False,
     )
 
