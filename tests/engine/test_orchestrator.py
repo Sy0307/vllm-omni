@@ -14,6 +14,7 @@ import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -21,6 +22,7 @@ from vllm_omni.engine.messages import (
     AppendDuplexInputMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    ErrorMessage,
     OutputMessage,
     ShutdownRequestMessage,
     SignalDuplexTurnMessage,
@@ -39,6 +41,36 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.MonkeyPatch) -> None:
+    rpc_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_queue,
+        stage_pools=[],
+    )
+    orchestrator._fatal_error = "stage engine died"
+    orchestrator._fatal_error_stage_id = 2
+
+    async def wait_for_requests() -> None:
+        await asyncio.Event().wait()
+
+    async def fail_outputs() -> None:
+        raise EngineDeadError("stage engine died")
+
+    monkeypatch.setattr(orchestrator, "_request_handler", wait_for_requests)
+    monkeypatch.setattr(orchestrator, "_orchestration_output_handler", fail_outputs)
+
+    await orchestrator.run()
+
+    fatal = rpc_queue.get_nowait()
+    assert isinstance(fatal, ErrorMessage)
+    assert fatal.fatal is True
+    assert fatal.error == "stage engine died"
+    assert fatal.stage_id == 2
 
 
 @dataclass
@@ -753,8 +785,8 @@ async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fenc
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
         ),
     )
-    session.bind_stage_request(0, "req-stage0", replica_id=0, fence=session.fence)
-    session.bind_stage_request(1, "req-stage1", replica_id=0, fence=session.fence)
+    session.bind_stage_request(0, "req-stage0", fence=session.fence)
+    session.bind_stage_request(1, "req-stage1", fence=session.fence)
     assert stage_pools[0].select_replica_id("req-stage0") == 0
     assert stage_pools[1].select_replica_id("req-stage1") == 0
     session.append_input(
@@ -765,6 +797,7 @@ async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fenc
         SignalDuplexTurnMessage(
             control_id="ctrl-signal",
             fence=session.fence,
+            next_fence=DuplexFence("sid-stage-signal", epoch=1),
             session_id="sid-stage-signal",
             event="barge_in",
         )
@@ -775,6 +808,7 @@ async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fenc
     assert stage0.collective_rpc_calls == []
     assert stage1.collective_rpc_calls == []
     assert session.stage_bindings == {}
+    assert session.fence == DuplexFence("sid-stage-signal", epoch=1)
     result = rpc_q.get_nowait()
     assert result.ok is True
 
@@ -805,8 +839,8 @@ async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> 
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
         ),
     )
-    session.bind_stage_request(0, "req-stage0", replica_id=0, fence=cancelled_fence)
-    session.bind_stage_request(1, "req-stage1", replica_id=0, fence=cancelled_fence)
+    session.bind_stage_request(0, "req-stage0", fence=cancelled_fence)
+    session.bind_stage_request(1, "req-stage1", fence=cancelled_fence)
     assert stage_pools[0].select_replica_id("req-stage0") == 0
     assert stage_pools[1].select_replica_id("req-stage1") == 0
     current_fence = DuplexFence("sid-late-stage-signal", epoch=1)
@@ -816,6 +850,7 @@ async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> 
         SignalDuplexTurnMessage(
             control_id="ctrl-late-signal",
             fence=cancelled_fence,
+            next_fence=current_fence,
             session_id="sid-late-stage-signal",
             event="barge_in",
         )
@@ -827,6 +862,142 @@ async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> 
     assert session.fence == current_fence
     result = rpc_q.get_nowait()
     assert result.ok is True
+
+
+@pytest.mark.asyncio
+async def test_duplex_cancel_without_next_fence_is_rejected_without_releasing_bindings() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    rpc_q: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_q,
+        stage_pools=stage_pools,
+    )
+    fence = DuplexFence("sid-cancel-contract")
+    session = orchestrator.duplex_sessions.open_session(fence)
+    session.bind_stage_request(0, "req-live", fence=fence)
+
+    await orchestrator._handle_signal_duplex_turn(
+        SignalDuplexTurnMessage(
+            control_id="cancel-without-next",
+            fence=fence,
+            session_id=fence.session_id,
+            event="input.cancel",
+        )
+    )
+
+    result = rpc_q.get_nowait()
+    assert result.ok is False
+    assert result.error_count == 1
+    assert "next_fence" in result.stage_results[0]["result"]["error"]
+    assert session.fence == fence
+    assert session.stage_request_ids() == ["req-live"]
+    assert stage0.abort_calls == []
+
+
+@pytest.mark.asyncio
+async def test_duplex_session_update_replaces_runtime_config() -> None:
+    rpc_q: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_q,
+        stage_pools=[],
+    )
+    fence = DuplexFence("sid-update-config")
+    session = orchestrator.duplex_sessions.open_session(
+        fence,
+        session_config={"temperature": 0.7},
+    )
+
+    await orchestrator._handle_signal_duplex_turn(
+        SignalDuplexTurnMessage(
+            control_id="update-config",
+            fence=fence,
+            session_id=fence.session_id,
+            event="session.update",
+            session_config={"temperature": 0.0, "instructions": "updated"},
+        )
+    )
+
+    result = rpc_q.get_nowait()
+    assert result.ok is True
+    assert session.session_config == {"temperature": 0.0, "instructions": "updated"}
+
+
+@pytest.mark.asyncio
+async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pools = _build_stage_pools(
+        [[stage0]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))],
+    )
+    rpc_q: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=rpc_q,
+        stage_pools=stage_pools,
+    )
+    cancelled_fence = DuplexFence("sid-cancel-late-append")
+    next_fence = DuplexFence("sid-cancel-late-append", epoch=1)
+    session = orchestrator.duplex_sessions.open_session(
+        cancelled_fence,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+
+    await orchestrator._handle_signal_duplex_turn(
+        SignalDuplexTurnMessage(
+            control_id="cancel-old-fence",
+            fence=cancelled_fence,
+            next_fence=next_fence,
+            session_id=session.session_id,
+            event="input.cancel",
+        )
+    )
+
+    cancel_result = rpc_q.get_nowait()
+    assert cancel_result.ok is True
+    assert session.fence == next_fence
+
+    await orchestrator._handle_append_duplex_input(
+        AppendDuplexInputMessage(
+            control_id="late-old-append",
+            fence=cancelled_fence,
+            session_id=session.session_id,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+            payload={"is_speech": True},
+        )
+    )
+
+    stale_result = rpc_q.get_nowait()
+    assert stale_result.ok is False
+    assert stage0.add_request_calls == []
+    assert session.stage_bindings == {}
+
+    await orchestrator._handle_append_duplex_input(
+        AppendDuplexInputMessage(
+            control_id="next-epoch-append",
+            fence=next_fence,
+            session_id=session.session_id,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+            payload={"is_speech": True},
+        )
+    )
+
+    next_result = rpc_q.get_nowait()
+    assert next_result.ok is True
+    assert len(stage0.add_request_calls) == 1
+    assert session.stage_bindings[0].fence == next_fence
 
 
 @pytest.mark.asyncio
@@ -848,7 +1019,12 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         capabilities=DuplexRuntimeCapabilities(
             input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
         ),
-        session_config={"voice": "test"},
+        session_config={
+            "voice": "test",
+            "duplex_stage_sampling_params": {
+                "0": {"stop_token_ids": [151645]},
+            },
+        },
     )
 
     await orchestrator._handle_append_duplex_input(
@@ -866,7 +1042,8 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     assert duplex_state1["session_id"] == "sid-bridge-turn"
     assert duplex_state1["epoch"] == 0
     assert duplex_state1["turn_id"] == 0
-    assert duplex_state1["session_config"] == {"voice": "test"}
+    assert duplex_state1["session_config"] == session.session_config
+    assert req_state1.sampling_params_list[0].stop_token_ids == [151645]
 
     await orchestrator._handle_append_duplex_input(
         AppendDuplexInputMessage(

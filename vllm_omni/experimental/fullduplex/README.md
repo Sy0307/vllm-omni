@@ -8,14 +8,14 @@ This package contains two experimental integrations:
 
 To run JoyVL, see
 [`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
-For the MiniCPM production path, lifecycle invariants, capability boundary, and
-review commands, see
-[`docs/design/minicpmo45_full_duplex_runtime_review.md`](../../../docs/design/minicpmo45_full_duplex_runtime_review.md).
+For the MiniCPM active runtime path, lifecycle invariants, capability boundary,
+and validation scope, see
+[`docs/design/minicpmo45_duplex_runtime_architecture.md`](../../../docs/design/minicpmo45_duplex_runtime_architecture.md).
 
 ## Package boundaries
 
 ```text
-core/       shared DuplexFence plus the existing JoyVL framework
+core/       existing JoyVL framework and experimental compatibility exports
 engine/     AsyncOmni/orchestrator scheduler data-plane adapter
 openai/     WebSocket transport, Realtime projection, and audio codecs
 minicpmo45/ MiniCPM input framing, policy, compatibility, and Stage0 state

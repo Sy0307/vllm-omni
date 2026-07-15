@@ -8,7 +8,6 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
@@ -28,6 +27,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
@@ -35,7 +35,6 @@ from vllm_omni.entrypoints.omni_base import (
     OmniEngineDeadError,
 )
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -264,7 +263,7 @@ class AsyncOmni(EngineClient, OmniBase):
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Open an engine-level duplex session when the backend supports it."""
@@ -274,8 +273,7 @@ class AsyncOmni(EngineClient, OmniBase):
             "session_config": session_config,
             "timeout": timeout,
         }
-        if fence is not None:
-            kwargs["fence"] = fence
+        kwargs["fence"] = fence
         return await self.engine.open_duplex_session_async(session_id, **kwargs)
 
     async def append_duplex_input_async(
@@ -286,7 +284,7 @@ class AsyncOmni(EngineClient, OmniBase):
         payload: object,
         final: bool = False,
         expected_epoch: int | None = None,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
         collect_outputs: bool = True,
     ) -> dict[str, object]:
@@ -298,8 +296,7 @@ class AsyncOmni(EngineClient, OmniBase):
             "expected_epoch": expected_epoch,
             "timeout": timeout,
         }
-        if fence is not None:
-            kwargs["fence"] = fence
+        kwargs["fence"] = fence
         result = await self.engine.append_duplex_input_async(session_id, **kwargs)
         request_id, response_stage_id = self._duplex_data_plane_request_info(result)
         if request_id is None:
@@ -329,18 +326,6 @@ class AsyncOmni(EngineClient, OmniBase):
         """Collect the next duplex data-plane output batch for a live request."""
         self._final_output_handler()
         req_state = self.request_states.get(request_id)
-        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-            duplex_states = {
-                rid: state.queue.qsize()
-                for rid, state in self.request_states.items()
-                if isinstance(rid, str) and rid.startswith("duplex-")
-            }
-            logger.info(
-                "[collect] request_id=%s known=%s duplex_queues=%s",
-                request_id,
-                req_state is not None,
-                duplex_states,
-            )
         if req_state is None:
             return []
         return await self._collect_duplex_data_plane_outputs(
@@ -355,7 +340,9 @@ class AsyncOmni(EngineClient, OmniBase):
         session_id: str,
         *,
         event: str,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Send a turn/control signal to an engine-level duplex session."""
@@ -363,8 +350,11 @@ class AsyncOmni(EngineClient, OmniBase):
             "event": event,
             "timeout": timeout,
         }
-        if fence is not None:
-            kwargs["fence"] = fence
+        kwargs["fence"] = fence
+        if next_fence is not None:
+            kwargs["next_fence"] = next_fence
+        if session_config is not None:
+            kwargs["session_config"] = session_config
         return await self.engine.signal_duplex_turn_async(session_id, **kwargs)
 
     async def close_duplex_session_async(
@@ -372,13 +362,12 @@ class AsyncOmni(EngineClient, OmniBase):
         session_id: str,
         *,
         reason: str = "client_close",
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Close an engine-level duplex session."""
         kwargs = {"reason": reason, "timeout": timeout}
-        if fence is not None:
-            kwargs["fence"] = fence
+        kwargs["fence"] = fence
         return await self.engine.close_duplex_session_async(session_id, **kwargs)
 
     @staticmethod
@@ -952,18 +941,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
                     # Route to the per-request queue
                     await req_state.queue.put(msg)
-                    if (
-                        os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-                        and isinstance(req_state.request_id, str)
-                        and req_state.request_id.startswith("duplex-")
-                    ):
-                        logger.info(
-                            "[pump] routed request_id=%s stage_id=%s finished=%s qsize=%d",
-                            req_state.request_id,
-                            stage_id,
-                            getattr(msg, "finished", None),
-                            req_state.queue.qsize(),
-                        )
 
             except asyncio.CancelledError:
                 raise

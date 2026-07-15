@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from uuid import uuid4
@@ -323,19 +322,20 @@ class DuplexSession:
     session_id: str
     config: DuplexSessionConfig
     capabilities: DuplexCapabilities = field(default_factory=DuplexCapabilities)
+    incarnation: int = 0
     state: DuplexSessionState = DuplexSessionState.OPEN
     turn_state: DuplexTurnState = DuplexTurnState.IDLE
     epoch: int = 0
     turn_id: int = 0
     input_commit_seq: int = 0
-    created_at: float = field(default_factory=time.monotonic)
-    updated_at: float = field(default_factory=time.monotonic)
     history: list[dict[str, object]] = field(default_factory=list)
     pending_text: list[str] = field(default_factory=list)
     pending_audio: list[DuplexAudioChunk] = field(default_factory=list)
     active_request_id: str | None = None
     active_response_id: str | None = None
     active_response_turn_id: int | None = None
+    last_response_id: str | None = None
+    overlap_speech_ms: int = 0
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     playback: DuplexPlaybackCursor = field(default_factory=DuplexPlaybackCursor)
@@ -348,26 +348,23 @@ class DuplexSession:
     last_assistant_full_message: dict[str, object] | None = None
     last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
 
-    def touch(self) -> None:
-        self.updated_at = time.monotonic()
-
     def append_text(self, text: str) -> None:
         if not text:
             return
         self.pending_text.append(text)
         self.turn_state = DuplexTurnState.USER_SPEAKING
-        self.touch()
 
     def append_audio(self, data: str, *, fmt: str = "wav", sample_rate_hz: int | None = None) -> None:
         if not data:
             return
         self.pending_audio.append(DuplexAudioChunk(data=data, format=fmt, sample_rate_hz=sample_rate_hz))
         self.turn_state = DuplexTurnState.USER_SPEAKING
-        self.touch()
 
     def mark_user_input_activity(self) -> None:
         self.turn_state = DuplexTurnState.USER_SPEAKING
-        self.touch()
+
+    def mark_assistant_generating(self) -> None:
+        self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
 
     def cancel_pending_input(self) -> dict[str, int]:
         cancelled = {
@@ -377,7 +374,6 @@ class DuplexSession:
         self.pending_text.clear()
         self.pending_audio.clear()
         self.turn_state = DuplexTurnState.IDLE
-        self.touch()
         return cancelled
 
     def commit_user_input(self) -> DuplexCommittedInput | None:
@@ -410,7 +406,6 @@ class DuplexSession:
         self.pending_text.clear()
         self.pending_audio.clear()
         self.turn_state = DuplexTurnState.USER_COMMITTED
-        self.touch()
         return DuplexCommittedInput(
             message=message,
             turn_id=self.turn_id,
@@ -433,7 +428,6 @@ class DuplexSession:
         self.pending_text.clear()
         self.pending_audio.clear()
         self.turn_state = DuplexTurnState.USER_COMMITTED
-        self.touch()
         return DuplexCommittedInput(
             message=message,
             turn_id=self.turn_id,
@@ -446,11 +440,11 @@ class DuplexSession:
         completed_turn_id = int(turn_id)
         if completed_turn_id >= self.turn_id:
             self.turn_id = completed_turn_id + 1
-        self.touch()
 
     def begin_response(self, *, turn_id: int | None = None) -> str:
         self.active_response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self.last_response_id = self.active_response_id
         self.assistant_text_buffer.clear()
         self.assistant_audio_text_marks.clear()
         self.last_assistant_full_message = None
@@ -458,13 +452,20 @@ class DuplexSession:
         self.playback = DuplexPlaybackCursor()
         self.response_playbacks[self.active_response_id] = self.playback
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
-        self.touch()
         return self.active_response_id
+
+    def accumulate_overlap_speech(self, duration_ms: int) -> int:
+        self.overlap_speech_ms += max(0, int(duration_ms))
+        return self.overlap_speech_ms
+
+    def reset_overlap_speech(self) -> int:
+        previous = self.overlap_speech_ms
+        self.overlap_speech_ms = 0
+        return previous
 
     def append_assistant_text(self, text: str) -> None:
         if text:
             self.assistant_text_buffer.append(text)
-            self.touch()
 
     def mark_audio_sent(
         self,
@@ -498,7 +499,6 @@ class DuplexSession:
                     )
                 )
         self.turn_state = DuplexTurnState.ASSISTANT_PLAYING
-        self.touch()
 
     def playback_for_response(self, response_id: str | None = None) -> DuplexPlaybackCursor:
         if response_id is None:
@@ -520,7 +520,6 @@ class DuplexSession:
     ) -> DuplexPlaybackCursor:
         playback = self.playback_for_response(response_id)
         playback.acknowledge(played_ms, committed_ms)
-        self.touch()
         return playback
 
     def truncate_playback_commit(
@@ -531,7 +530,6 @@ class DuplexSession:
     ) -> DuplexPlaybackCursor:
         playback = self.playback_for_response(response_id)
         playback.truncate_committed(committed_ms)
-        self.touch()
         return playback
 
     def release_response_playback(self, response_id: str | None) -> None:
@@ -543,7 +541,6 @@ class DuplexSession:
         self.playback = DuplexPlaybackCursor()
         if self.active_response_id is not None:
             self.response_playbacks[self.active_response_id] = self.playback
-        self.touch()
 
     def end_response(
         self,
@@ -573,7 +570,6 @@ class DuplexSession:
         self.active_response_id = None
         self.active_response_turn_id = None
         self.turn_state = DuplexTurnState.IDLE
-        self.touch()
         return message
 
     def register_history_item(self, item_id: str | None, message: dict[str, object] | None) -> None:
@@ -592,7 +588,6 @@ class DuplexSession:
                     audio_end_ms=pending_audio_ms,
                     playback=self._playback_for_item_id(item_id),
                 )
-            self.touch()
             return
         pending_audio_ms = self.pending_history_truncations_ms.pop(item_id, None)
         if pending_audio_ms is not None:
@@ -615,7 +610,6 @@ class DuplexSession:
             marks = self.assistant_audio_text_marks or self.last_assistant_audio_text_marks
             if marks:
                 self.history_item_audio_text_marks[item_id] = list(marks)
-        self.touch()
 
     def delete_history_item(self, item_id: str) -> bool:
         message = self.history_item_ids.pop(item_id, None)
@@ -624,14 +618,11 @@ class DuplexSession:
         self.pending_history_item_audio_text_marks.pop(item_id, None)
         self.pending_history_truncations_ms.pop(item_id, None)
         if message is None:
-            if pending is not None:
-                self.touch()
             return pending is not None
         try:
             self.history.remove(message)
         except ValueError:
             pass
-        self.touch()
         return True
 
     def truncate_history_item(
@@ -647,7 +638,6 @@ class DuplexSession:
             pending = self.pending_history_item_ids.get(item_id)
             if pending is None:
                 self.pending_history_truncations_ms[item_id] = max(0, int(audio_end_ms))
-                self.touch()
                 return False
             message = dict(pending)
             changed = self._truncate_message_to_audio_ms(
@@ -661,7 +651,6 @@ class DuplexSession:
                     self.pending_history_item_ids.pop(item_id, None)
                     self.pending_history_item_audio_text_marks.pop(item_id, None)
                     self.pending_history_truncations_ms.pop(item_id, None)
-                    self.touch()
                 return changed
             self.history.append(message)
             self.history_item_ids[item_id] = message
@@ -670,7 +659,6 @@ class DuplexSession:
             self.pending_history_item_ids.pop(item_id, None)
             self.pending_history_item_audio_text_marks.pop(item_id, None)
             self.pending_history_truncations_ms.pop(item_id, None)
-            self.touch()
             return True
         changed = self._truncate_message_to_audio_ms(
             message,
@@ -685,7 +673,6 @@ class DuplexSession:
                 self.history.remove(message)
             except ValueError:
                 pass
-            self.touch()
         return changed
 
     def _truncate_message_to_audio_ms(
@@ -705,7 +692,6 @@ class DuplexSession:
                 playback=playback,
             )
             message["content"] = content[:keep_chars].rstrip()
-            self.touch()
             return True
         if not isinstance(content, list):
             return False
@@ -738,7 +724,6 @@ class DuplexSession:
                     changed = True
         if not changed:
             return False
-        self.touch()
         return True
 
     @staticmethod
@@ -835,19 +820,16 @@ class DuplexSession:
         self.active_response_id = None
         self.active_response_turn_id = None
         self.turn_state = DuplexTurnState.BARGE_IN
-        self.touch()
         return self.epoch
 
     def mark_closing(self) -> None:
         if self.state != DuplexSessionState.CLOSED:
             self.state = DuplexSessionState.CLOSING
-        self.touch()
 
     def close(self) -> None:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self.active_response_turn_id = None
-        self.touch()
 
     def as_public_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -933,7 +915,6 @@ class DuplexTurnController:
             session.turn_state = DuplexTurnState.BARGE_IN
         elif event_type in {DuplexTurnEventType.CLOSE.value, DuplexTurnEventType.TIMEOUT.value}:
             session.state = DuplexSessionState.CLOSING
-        session.touch()
         return {
             "type": "turn.event",
             "session_id": session.session_id,
@@ -947,15 +928,19 @@ class DuplexSessionRegistry:
     def __init__(self, capabilities: DuplexCapabilities | None = None) -> None:
         self._capabilities = capabilities or DuplexCapabilities()
         self._sessions: dict[str, DuplexSession] = {}
+        self._next_incarnation_by_session_id: dict[str, int] = {}
 
     def create(self, config: DuplexSessionConfig | None = None, session_id: str | None = None) -> DuplexSession:
         sid = session_id or f"duplex-{uuid4().hex}"
         if sid in self._sessions:
             raise ValueError(f"Duplex session already exists: {sid}")
+        incarnation = self._next_incarnation_by_session_id.get(sid, 0)
+        self._next_incarnation_by_session_id[sid] = incarnation + 1
         session = DuplexSession(
             session_id=sid,
             config=config or DuplexSessionConfig(),
             capabilities=self._capabilities,
+            incarnation=incarnation,
         )
         self._sessions[sid] = session
         return session

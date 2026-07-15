@@ -18,7 +18,7 @@ class DuplexIntermediateBuffer(TypedDict, total=False):
     llm_output_token_ids: list[int]
     llm_output_text: list[str]
     stream_output: bool
-    minicpmo45_native_duplex: bool
+    native_duplex: bool
     ids: dict[str, Any]
     hidden_states: dict[str, Any]
     codes: dict[str, Any]
@@ -36,7 +36,7 @@ def build_duplex_intermediate_buffer(
     output_token_ids: list[int] | None = None,
     output_text: str | None = None,
     stream_output: bool = False,
-    minicpmo45_native_duplex: bool = False,
+    native_duplex: bool = False,
 ) -> DuplexIntermediateBuffer:
     buffer: DuplexIntermediateBuffer = {
         "global_request_id": [str(request_id)],
@@ -54,8 +54,8 @@ def build_duplex_intermediate_buffer(
         buffer["llm_output_text"] = [output_text]
     if stream_output:
         buffer["stream_output"] = True
-    if minicpmo45_native_duplex:
-        buffer["minicpmo45_native_duplex"] = True
+    if native_duplex:
+        buffer["native_duplex"] = True
     return buffer
 
 

@@ -12,8 +12,8 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
-import os
 import time as _time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,6 +30,7 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -53,7 +54,6 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import (
     DuplexInputMode,
     DuplexRuntimeCapabilities,
@@ -132,10 +132,6 @@ def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) 
     return default
 
 
-def _minicpmo45_profile_logs_enabled() -> bool:
-    return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-
-
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -188,17 +184,6 @@ def build_engine_core_request_from_tokens(
     )
 
 
-def _duplex_force_listen_count(extra_body: object) -> int:
-    """HF-compatible MiniCPM-o force-listen default."""
-    raw_force_listen_count = None
-    if isinstance(extra_body, dict):
-        raw_force_listen_count = extra_body.get("force_listen_count")
-    try:
-        return 0 if raw_force_listen_count is None else max(0, int(raw_force_listen_count))
-    except (TypeError, ValueError):
-        return 0
-
-
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -241,6 +226,9 @@ class StreamingInputState:
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
     bridge_states: dict[str, Any] = field(default_factory=dict)
+    # Synchronous stage-transition capability installed by the orchestrator
+    # while the downstream input processor consumes upstream token output.
+    source_token_decoder: Callable[..., str] | None = None
 
 
 class Orchestrator:
@@ -405,6 +393,15 @@ class Orchestrator:
             # During teardown this is expected; the finally block handles
             # proper cleanup.  Do not re-raise.
             logger.info("[Orchestrator] Engine dead during shutdown: %s", e)
+            if self._fatal_error is None:
+                self._fatal_error = str(e) or "Stage engine died"
+            await self.rpc_async_queue.put(
+                ErrorMessage(
+                    error=self._fatal_error or str(e),
+                    fatal=True,
+                    stage_id=self._fatal_error_stage_id,
+                )
+            )
         except Exception:
             logger.exception("[Orchestrator] Fatal error in orchestrator tasks")
             raise
@@ -636,7 +633,6 @@ class Orchestrator:
             request_id,
             replica_id,
             req_state,
-            already_submitted=already_submitted,
         )
         req_state.stage_submit_ts[stage_id] = _time.time()
         return [
@@ -792,14 +788,19 @@ class Orchestrator:
         stage_results: list[dict[str, object]] = []
         try:
             session = self.duplex_sessions.require(msg.session_id)
+            effective_next_fence = msg.next_fence
             if msg.event in {"barge_in", "input.cancel", "response.cancel"}:
                 # Cancellation identifies the generation being released. It may
                 # arrive after the session has already advanced to a new fence.
-                stale_request_ids = session.release_fence(msg.fence)
+                if effective_next_fence is None:
+                    raise ValueError(f"{msg.event} requires next_fence")
+                stale_request_ids = session.cancel_fence(msg.fence, effective_next_fence)
                 if stale_request_ids:
                     await self._cleanup_request_ids(stale_request_ids, abort=True)
             else:
                 session.accept_fence(msg.fence)
+            if msg.session_config is not None:
+                session.session_config = dict(msg.session_config)
             stage_results.append(
                 {
                     "stage_id": -1,
@@ -809,6 +810,7 @@ class Orchestrator:
                         "data_plane_signal": True,
                         "event": msg.event,
                         "fence": msg.fence,
+                        "next_fence": effective_next_fence,
                     },
                 }
             )
@@ -1194,17 +1196,6 @@ class Orchestrator:
                                     if req_state.streaming.segment_finished
                                     else {}
                                 )
-                                if self._is_duplex_session_request(req_state) and _minicpmo45_profile_logs_enabled():
-                                    logger.info(
-                                        "[Orchestrator] duplex raw output: stage=%s "
-                                        "req=%s finished=%s segment_finished=%s "
-                                        "new_tokens=%s",
-                                        stage_id,
-                                        getattr(eco, "request_id", None),
-                                        getattr(eco, "finished", None),
-                                        getattr(eco, "is_segment_finished", None),
-                                        getattr(eco, "new_token_ids", None),
-                                    )
                                 req_state.streaming.new_prompt_len_snapshot = getattr(
                                     eco,
                                     "new_prompt_len_snapshot",
@@ -1449,8 +1440,6 @@ class Orchestrator:
         request_id: str,
         replica_id: int,
         req_state: OrchestratorRequestState,
-        *,
-        already_submitted: bool,
     ) -> None:
         session = self._duplex_session_for_req_state(req_state)
         if session is None:
@@ -1459,17 +1448,7 @@ class Orchestrator:
         if fence is None:
             raise RuntimeError("duplex stage submission is missing a DuplexFence")
         req_state.duplex_stage_fences[stage_id] = fence
-        session.bind_stage_request(stage_id, request_id, replica_id=replica_id, fence=fence)
-        if _minicpmo45_profile_logs_enabled():
-            logger.info(
-                "[Orchestrator] duplex stage submit: session=%s epoch=%s stage=%s replica=%s req=%s update=%s",
-                session.session_id,
-                session.epoch,
-                stage_id,
-                replica_id,
-                request_id,
-                already_submitted,
-            )
+        session.bind_stage_request(stage_id, request_id, fence=fence)
 
     async def _route_output(
         self,
@@ -1538,22 +1517,6 @@ class Orchestrator:
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
-
-        if self._is_duplex_session_request(req_state) and _minicpmo45_profile_logs_enabled():
-            logger.info(
-                "[Orchestrator] duplex route check: stage=%s replica=%s "
-                "req=%s finished=%s streaming=%s segment_finished=%s "
-                "final_stage=%s async_chunk=%s next_submitted=%s",
-                stage_id,
-                replica_id,
-                req_id,
-                finished,
-                req_state.streaming.enabled,
-                req_state.streaming.segment_finished,
-                req_state.final_stage_id,
-                self.async_chunk,
-                self._next_stage_already_submitted(stage_id, req_state),
-            )
 
         if self._is_duplex_model_listen_segment(stage_id, output, req_state):
             await self._emit_duplex_model_listen_output(
@@ -1759,13 +1722,6 @@ class Orchestrator:
         direct_mm_output.setdefault("duplex_native_decision", "listen")
         direct_mm_output.setdefault("model_listen", True)
         direct_mm_output.setdefault("listen_source", "model_listen")
-        if _minicpmo45_profile_logs_enabled():
-            logger.info(
-                "[Orchestrator] duplex model listen: stage=%s req=%s segment_finished=%s; bypassing downstream stages",
-                stage_id,
-                req_id,
-                req_state.streaming.segment_finished,
-            )
         await self.output_async_queue.put(
             OutputMessage(
                 request_id=req_id,
@@ -2177,7 +2133,6 @@ class Orchestrator:
                 req_id,
                 replica_id,
                 req_state,
-                already_submitted=already_submitted,
             )
             req_state.stage_submit_ts[next_logical] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
@@ -2231,7 +2186,6 @@ class Orchestrator:
                     req_id,
                     replica_id,
                     req_state,
-                    already_submitted=already_submitted,
                 )
 
             req_state.stage_submit_ts[next_logical] = _time.time()
@@ -2252,26 +2206,12 @@ class Orchestrator:
                 {},
             )[req_id] = req_state.pd_prefill_multimodal_output
 
-        decoder_key = "minicpmo45_text_decoder"
-        decoder_sentinel = object()
-        previous_decoder = decoder_sentinel
-        installed_decoder = False
-        if self._is_duplex_session_request(req_state):
-            source_processor = self.stage_pools[src_stage_id].output_processor
-            tokenizer = getattr(source_processor, "tokenizer", None)
-            decode = getattr(tokenizer, "decode", None)
-            if callable(decode):
-                previous_decoder = req_state.streaming.bridge_states.get(decoder_key, decoder_sentinel)
-
-                def _decode_minicpmo45_token_delta(token_ids, _decode=decode):
-                    ids = [int(token_id) for token_id in token_ids]
-                    try:
-                        return _decode(ids, skip_special_tokens=True)
-                    except TypeError:
-                        return _decode(ids)
-
-                req_state.streaming.bridge_states[decoder_key] = _decode_minicpmo45_token_delta
-                installed_decoder = True
+        previous_decoder = req_state.streaming.source_token_decoder
+        source_processor = self.stage_pools[src_stage_id].output_processor
+        tokenizer = getattr(source_processor, "tokenizer", None)
+        decode = getattr(tokenizer, "decode", None)
+        if callable(decode):
+            req_state.streaming.source_token_decoder = decode
 
         try:
             next_inputs = next_client.process_engine_inputs(
@@ -2287,11 +2227,7 @@ class Orchestrator:
             )
             raise
         finally:
-            if installed_decoder:
-                if previous_decoder is decoder_sentinel:
-                    req_state.streaming.bridge_states.pop(decoder_key, None)
-                else:
-                    req_state.streaming.bridge_states[decoder_key] = previous_decoder
+            req_state.streaming.source_token_decoder = previous_decoder
 
         if not next_inputs:
             if not getattr(output, "finished", False):
@@ -2360,7 +2296,6 @@ class Orchestrator:
                 req_id,
                 replica_id,
                 req_state,
-                already_submitted=already_submitted,
             )
 
         req_state.stage_submit_ts[next_logical] = _time.time()

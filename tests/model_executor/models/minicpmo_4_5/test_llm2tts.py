@@ -54,7 +54,7 @@ def test_native_duplex_talker_emits_empty_text_metadata_to_clear_previous_segmen
         positions=torch.tensor([0]),
         runtime_additional_information=[
             {
-                "minicpmo45_native_duplex": True,
+                "native_duplex": True,
                 "duplex": {"turn_id": 1, "epoch": 0},
                 "meta": {"native_duplex_segment_text": ""},
             }

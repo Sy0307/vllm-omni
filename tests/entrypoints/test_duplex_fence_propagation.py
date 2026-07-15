@@ -14,6 +14,7 @@ class FenceRecordingEngine:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, DuplexFence | None]] = []
+        self.signal_next_fences: list[DuplexFence | None] = []
 
     async def open_duplex_session_async(self, session_id, *, fence=None, **kwargs):
         del session_id, kwargs
@@ -25,9 +26,18 @@ class FenceRecordingEngine:
         self.calls.append(("append", fence))
         return {"ok": True}
 
-    async def signal_duplex_turn_async(self, session_id, *, event, fence=None, timeout=None):
+    async def signal_duplex_turn_async(
+        self,
+        session_id,
+        *,
+        event,
+        fence=None,
+        next_fence=None,
+        timeout=None,
+    ):
         del session_id, event, timeout
         self.calls.append(("signal", fence))
+        self.signal_next_fences.append(next_fence)
         return {"ok": True}
 
     async def close_duplex_session_async(self, session_id, *, fence=None, **kwargs):
@@ -88,3 +98,24 @@ async def test_runtime_signal_uses_fence_captured_before_session_turn_advances()
     )
 
     assert engine.calls == [("signal", captured_fence)]
+
+
+@pytest.mark.asyncio
+async def test_openai_handler_forwards_cancel_fence_through_async_omni_facade():
+    engine = FenceRecordingEngine()
+    app = object.__new__(AsyncOmni)
+    app.engine = engine
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(app))
+    session = DuplexSession(session_id="sid-cancel", config=DuplexSessionConfig())
+    cancelled_fence = DuplexFence("sid-cancel", epoch=2, turn_id=3)
+    next_fence = DuplexFence("sid-cancel", epoch=3, turn_id=3)
+
+    assert await handler._signal_runtime_session(
+        session,
+        "input.cancel",
+        fence=cancelled_fence,
+        next_fence=next_fence,
+    )
+
+    assert engine.calls == [("signal", cancelled_fence)]
+    assert engine.signal_next_fences == [next_fence]

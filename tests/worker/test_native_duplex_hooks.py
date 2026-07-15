@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,6 +8,223 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _minicpmo_duplex_policy_case(
+    state: SimpleNamespace,
+    payload: dict[str, object],
+):
+    from vllm_omni.model_executor.duplex import DuplexSamplingRow
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = ("sid-policy", 1)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model._minicpmo45_native_duplex_token_ids_cache = {
+        "listen_token_id": 7,
+        "tts_bos_token_id": 8,
+        "turn_eos_token_id": 9,
+    }
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    row = DuplexSamplingRow(
+        row_idx=0,
+        request_id="req-policy",
+        session_id=session_key[0],
+        incarnation=session_key[1],
+        seq=3,
+        payload=payload,
+        max_tokens=20,
+    )
+    return model, row
+
+
+def test_minicpmo_model_hook_owns_duplex_sampling_rows_and_force_listen():
+    from vllm_omni.model_executor.duplex import DuplexSamplingRow
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    listen_id = 7
+    state = SimpleNamespace(
+        current_turn_ended=True,
+        last_terminator_token=None,
+        pending_terminator_token=None,
+    )
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model._minicpmo45_native_duplex_token_ids_cache = {
+        "listen_token_id": listen_id,
+        "tts_bos_token_id": 8,
+        "turn_eos_token_id": 9,
+    }
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={("sid-hook", 2): state})
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    row = DuplexSamplingRow(
+        row_idx=0,
+        request_id="req-hook",
+        session_id="sid-hook",
+        incarnation=2,
+        seq=3,
+        payload={"force_listen": True, "is_speech": True},
+        max_tokens=20,
+    )
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    assert model._minicpmo45_active_duplex_rows == [0]
+    assert model._minicpmo45_duplex_row_sessions == {0: ("sid-hook", 2)}
+    assert model._minicpmo45_duplex_row_payloads == {0: row.payload}
+    assert model._minicpmo45_duplex_row_max_tokens == {0: 20}
+    assert logits[0, listen_id].item() == 0.0
+    assert torch.isneginf(logits[0, :listen_id]).all()
+    assert torch.isneginf(logits[0, listen_id + 1 :]).all()
+
+
+def test_minicpmo_model_hook_turn_end_latch_forces_silence_to_listen():
+    state = SimpleNamespace(
+        current_turn_ended=True,
+        last_terminator_token=9,
+        pending_terminator_token=None,
+    )
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 10] = 20.0
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    assert logits[0, 7].item() == 0.0
+    assert torch.isneginf(logits[0, :7]).all()
+    assert torch.isneginf(logits[0, 8:]).all()
+
+
+def test_minicpmo_model_hook_new_speech_clears_turn_end_latch():
+    state = SimpleNamespace(
+        current_turn_ended=True,
+        last_terminator_token=9,
+        pending_terminator_token=None,
+    )
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": True})
+    model._minicpmo45_turn_ended_sessions = {("sid-policy", 1)}
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    original_logits = logits.clone()
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    assert model._minicpmo45_turn_ended_sessions == set()
+    assert state.last_terminator_token is None
+    assert torch.equal(logits, original_logits)
+
+
+def test_minicpmo_model_hook_mid_turn_speech_redirects_listen_to_tts_bos():
+    state = SimpleNamespace(
+        current_turn_ended=False,
+        last_terminator_token=None,
+        pending_terminator_token=None,
+    )
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": True})
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 7] = 30.0
+    logits[0, 8] = -2.0
+    logits[0, 10] = 20.0
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    assert torch.isneginf(logits[0, 7])
+    assert logits[0, 8].item() == 30.0
+    assert logits[0, 10].item() == 20.0
+
+
+def test_minicpmo_model_hook_new_user_turn_opens_turn_without_forcing_speak():
+    state = SimpleNamespace(
+        current_turn_ended=False,
+        last_terminator_token=8,
+        pending_terminator_token=8,
+    )
+    model, row = _minicpmo_duplex_policy_case(
+        state,
+        {"is_speech": True, "new_user_turn": True, "force_speak": True},
+    )
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 7] = 5.0
+    logits[0, 10] = 20.0
+    original_logits = logits.clone()
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    assert state.current_turn_ended is True
+    assert state.last_terminator_token is None
+    assert torch.equal(logits, original_logits)
+
+
+def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["req-duplex", "req-plain"])
+    runner.model_intermediate_buffer = {
+        "req-duplex": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": "sid-runner-hook",
+                "incarnation": 4,
+                "seq": 4,
+                "payload": {"is_speech": True},
+            }
+        }
+    }
+    runner.requests = {
+        "req-duplex": SimpleNamespace(
+            sampling_params=SimpleNamespace(max_tokens=32),
+        )
+    }
+
+    rows = runner._duplex_sampling_rows()
+
+    assert len(rows) == 1
+    assert rows[0].row_idx == 0
+    assert rows[0].request_id == "req-duplex"
+    assert rows[0].session_id == "sid-runner-hook"
+    assert rows[0].incarnation == 4
+    assert rows[0].seq == 4
+    assert rows[0].payload == {"is_speech": True}
+    assert rows[0].max_tokens == 32
+
+
+def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    source = inspect.getsource(GPUARModelRunner)
+
+    assert "_minicpmo45_duplex_row" not in source
+    assert "_minicpmo45_native_duplex_token_ids" not in source
+    assert 'if "duplex_rows" not in str(exc)' not in source
+
+
+def test_minicpmo_model_cleans_incarnation_state_when_request_finishes():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    request_id = "duplex-sid-cleanup-i3-e0-stage0"
+    session_key = ("sid-cleanup", 3)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model = SimpleNamespace()
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: object()})
+    model._minicpmo45_duplex_request_sessions = {request_id: session_key}
+    model._minicpmo45_force_listen_applied_segments = {
+        (request_id, 1),
+        ("duplex-sid-other-e0-stage0", 2),
+    }
+
+    model.on_requests_finished({request_id})
+
+    assert model._minicpmo45_duplex_data_plane_helper.sessions == {}
+    assert model._minicpmo45_duplex_request_sessions == {}
+    assert model._minicpmo45_force_listen_applied_segments == {
+        ("duplex-sid-other-e0-stage0", 2),
+    }
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
@@ -48,7 +266,7 @@ def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_conditi
         positions=torch.zeros(1, dtype=torch.long),
         runtime_additional_information=[
             {
-                "minicpmo45_native_duplex": True,
+                "native_duplex": True,
                 "llm_output_text": ["你好，你有什莫想聊的吗？你好，你有什莫想聊的吗？"],
                 "meta": {
                     "native_duplex_segment_text": "你好，你有什莫想聊的吗？",
@@ -85,7 +303,7 @@ def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
         positions=torch.zeros(1, dtype=torch.long),
         runtime_additional_information=[
             {
-                "minicpmo45_native_duplex": True,
+                "native_duplex": True,
                 "meta": {"native_duplex_segment_text": ""},
             }
         ],
@@ -1229,8 +1447,8 @@ def test_minicpmo_stage0_native_sampler_converts_mid_turn_listen_to_tts_bos():
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
-    model._minicpmo45_duplex_row_sessions = {0: "sid-native"}
-    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"sid-native": state})
+    model._minicpmo45_duplex_row_sessions = {0: ("sid-native", 0)}
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={("sid-native", 0): state})
     vocab_size = 151723
     logits = torch.full((1, vocab_size), -100.0)
     logits[0, 151705] = 30.0
@@ -1281,9 +1499,9 @@ def test_minicpmo_stage0_native_sampler_forced_listen_yields_floor():
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
-    model._minicpmo45_duplex_row_sessions = {0: "sid-native"}
+    model._minicpmo45_duplex_row_sessions = {0: ("sid-native", 0)}
     model._minicpmo45_duplex_row_payloads = {0: {"force_listen": True}}
-    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"sid-native": state})
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={("sid-native", 0): state})
     vocab_size = 151723
     logits = torch.full((1, vocab_size), -100.0)
     logits[0, 151705] = 30.0
@@ -1315,7 +1533,7 @@ def test_minicpmo_stage0_native_sampler_uses_runner_duplex_rows():
         prompt_token_ids=torch.tensor([[1, 2, 3]]),
     )
 
-    rows = model._native_duplex_prompt_rows(
+    rows = model._minicpmo45_native_duplex_prompt_rows(
         metadata,
         unit_id=151683,
         batch_size=1,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 
@@ -86,10 +85,6 @@ class MiniCPMO45DuplexPolicy:
     OPTIONAL_TOKEN_FIELDS: dict[str, str] = {
         "audio_placeholder_token_id": "<|audio|>",
     }
-
-    @staticmethod
-    def profile_logs_enabled() -> bool:
-        return os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
 
     @classmethod
     def token_ids_from_tokenizer(cls, tokenizer: Any) -> dict[str, int]:
