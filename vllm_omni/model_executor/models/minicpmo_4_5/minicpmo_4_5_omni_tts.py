@@ -398,7 +398,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def _should_stream_output(self, info: dict[str, Any] | None = None) -> bool:
         if isinstance(info, dict):
-            for key in ("stream_output", "minicpmo45_native_duplex"):
+            for key in ("stream_output", "native_duplex"):
                 value = info.get(key)
                 if isinstance(value, bool):
                     return value
@@ -653,7 +653,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return get_tts_handoff(info)
 
     def _native_duplex_input_ends_turn(self, info: dict[str, Any]) -> bool:
-        if info.get("minicpmo45_native_duplex") is not True:
+        if info.get("native_duplex") is not True:
             return False
         meta = info.get("meta")
         if not isinstance(meta, dict):
@@ -839,8 +839,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if getattr(self, "_t2w_warmed", False):
             return
         self._t2w_warmed = True
-        if os.environ.get("MINICPMO45_SKIP_T2W_WARMUP") == "1":
-            return
         try:
             self._lazy_init_tts()
             if self.audio_tokenizer is None:
@@ -1004,40 +1002,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
         ).unsqueeze(0)
         condition = torch.cat([condition, audio_bos], dim=1)
-        profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-        if profile_enabled:
-            logger.info(
-                "4.5 Talker duplex unit: key=%s pending_tokens=%d turn_end=%s t2w_buffer=%d",
-                key,
-                len(pending_ids),
-                turn_end,
-                len(state.token2wav_buffer),
-            )
-
-        cond_dump_dir = os.environ.get("MINICPMO45_DUMP_TTS_COND")
-        if cond_dump_dir:
-            try:
-                if pending_ids:
-                    raw_hidden = (
-                        tts_hidden_states[consumed:]
-                        if isinstance(tts_hidden_states, list)
-                        else torch.as_tensor(tts_hidden_states)[consumed:]
-                    )
-                    _, hid_t = self._normalize_tts_handoff_tensors(pending_ids, raw_hidden)
-                    hid_np = hid_t.cpu().numpy().astype(np.float32)
-                else:
-                    hid_np = np.zeros((0, 4096), dtype=np.float32)
-                np.savez(
-                    f"{cond_dump_dir}/unit_{time.monotonic_ns()}.npz",
-                    ids=np.asarray(pending_ids, dtype=np.int64),
-                    hidden=hid_np,
-                    turn_end=np.asarray([int(bool(turn_end))]),
-                )
-            except Exception:
-                logger.exception("MiniCPM-o 4.5 tts condition dump failed")
-
-        unit_t0 = time.perf_counter()
-        gen_t0 = time.perf_counter()
         max_token_per_chunk = chunk_size + 1
         min_token_per_chunk = 0 if turn_end else max_token_per_chunk
         force_flush = False
@@ -1066,15 +1030,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             logits_processors=None,
             text_start_pos=state.text_start_pos,
         )
-        generate_ms = (time.perf_counter() - gen_t0) * 1000
         if turn_end:
             state.past_key_values = None
             state.text_start_pos = 0
         else:
             state.past_key_values = past_key_values
             state.text_start_pos += int(condition.shape[1]) + int(new_tokens.shape[1])
-        vocode_ms = 0.0
-        voc_t0 = time.perf_counter()
         waveforms = self._native_duplex_vocode_tokens(
             state,
             new_tokens,
@@ -1083,30 +1044,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             chunk_size=chunk_size,
         )
         self._talker_consumed_tokens[key] = len(ids_list)
-        vocode_ms = (time.perf_counter() - voc_t0) * 1000
         for waveform in waveforms:
             self._ar_last_emitted_text = _drain_native_duplex_emitted_text(
                 state,
                 has_audio=bool(torch.as_tensor(waveform).numel()),
             )
-            if profile_enabled:
-                logger.info(
-                    "4.5 Talker duplex unit timing: key=%s generate_ms=%.1f vocode_ms=%.1f total_ms=%.1f",
-                    key,
-                    generate_ms,
-                    vocode_ms,
-                    (time.perf_counter() - unit_t0) * 1000,
-                )
             yield waveform, False
-        if profile_enabled:
-            logger.info(
-                "4.5 Talker duplex unit end: key=%s turn_end=%s generate_ms=%.1f vocode_ms=%.1f total_ms=%.1f",
-                key,
-                turn_end,
-                generate_ms,
-                vocode_ms,
-                (time.perf_counter() - unit_t0) * 1000,
-            )
         if turn_end:
             self._close_turn_state(key)
             self._ar_last_emitted_text = ""
@@ -1122,7 +1065,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         through one scheduler step. The older streaming probe still concatenates
         chunks inside generate_speech(), so it cannot improve API TTFA.
         """
-        if info.get("minicpmo45_native_duplex") is True:
+        if info.get("native_duplex") is True:
             yield from self._create_native_duplex_stream_gen(info)
             return
         tts_token_ids, tts_hidden_states = self._extract_tts_handoff(info)
@@ -1174,8 +1117,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not hasattr(tts.model.config, "rope_theta"):
             tts.model.config.rope_theta = 10000.0
 
-        profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-        total_t0 = time.perf_counter()
         tts_embeds = self._build_tts_condition_embeds(tts_token_ids, tts_hidden_states)
         num_text = int(tts_token_ids.shape[-1]) if tts_token_ids.ndim > 0 else 0
         min_new_token, max_new_token = self._max_tts_tokens_for_text(num_text)
@@ -1218,11 +1159,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 return
             return _orig_save(uri, src, sample_rate, backend="soundfile", **kw)
 
-        first_audio_ms = None
-        num_chunks = 0
-        num_tokens = 0
-        generate_ms = 0.0
-        vocoder_ms = 0.0
         yielded_any = False
         try:
             torchaudio.save = _patched_save
@@ -1241,12 +1177,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 max_new_token=max_new_token,
             )
             while True:
-                iter_t0 = time.perf_counter()
                 try:
                     audio_token_chunk, is_last = next(token_iter)
                 except StopIteration:
                     break
-                generate_ms += (time.perf_counter() - iter_t0) * 1000
                 if audio_token_chunk is None:
                     break
 
@@ -1258,8 +1192,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                         break
                     continue
 
-                vocoder_t0 = time.perf_counter()
-                autocast_context, token2wav_autocast = self._token2wav_autocast_context()
+                autocast_context, _ = self._token2wav_autocast_context()
                 torchaudio.save = _patched_save
                 prev_dtype = torch.get_default_dtype()
                 torch.set_default_dtype(torch.float32)
@@ -1274,24 +1207,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 finally:
                     torch.set_default_dtype(prev_dtype)
                     torchaudio.save = _orig_save
-                vocoder_ms += (time.perf_counter() - vocoder_t0) * 1000
                 chunk = torch.as_tensor(np.asarray(wav_np).reshape(-1), dtype=torch.float32).cpu().contiguous()
-                if first_audio_ms is None:
-                    first_audio_ms = (time.perf_counter() - total_t0) * 1000
-                num_chunks += 1
-                num_tokens += len(token_list)
                 yielded_any = True
-                if profile_enabled:
-                    logger.info(
-                        "generate_speech stream_chunk: chunk=%d samples=%d tokens=%d is_last=%s "
-                        "first_audio_ms=%.3f token2wav_autocast=%s",
-                        num_chunks,
-                        chunk.numel(),
-                        len(token_list),
-                        bool(is_last),
-                        -1.0 if first_audio_ms is None else first_audio_ms,
-                        token2wav_autocast,
-                    )
                 yield chunk, bool(is_last)
                 if is_last:
                     break
@@ -1304,22 +1221,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     os.unlink(temp_prompt_wav_path)
                 except OSError:
                     pass
-            if profile_enabled:
-                logger.info(
-                    "generate_speech stream_profile: text_tokens=%d audio_tokens=%d chunks=%d "
-                    "tts_generate_ms=%.3f vocoder_ms=%.3f first_audio_ms=%.3f total_ms=%.3f "
-                    "min_new_token=%d max_new_token=%d token2wav_n_timesteps=%d",
-                    num_text,
-                    num_tokens,
-                    num_chunks,
-                    generate_ms,
-                    vocoder_ms,
-                    -1.0 if first_audio_ms is None else first_audio_ms,
-                    (time.perf_counter() - total_t0) * 1000,
-                    min_new_token,
-                    max_new_token,
-                    getattr(self, "_token2wav_n_timesteps", 10),
-                )
 
         if not yielded_any:
             yield self._empty_audio_chunk(), True
@@ -1361,8 +1262,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         tts = self.tts_obj
         device = tts.emb_text.weight.device
         dtype = tts.emb_text.weight.dtype
-        profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
-        total_t0 = time.perf_counter()
 
         llm_embeds = tts.emb_text(tts_token_ids.to(device))
         hidden_embeds = tts.projector_semantic(tts_hidden_states.to(device=device, dtype=dtype))
@@ -1375,9 +1274,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         spk_embeds = torch.zeros(0, tts.config.hidden_size, device=device, dtype=tts_embeds.dtype)
 
         inputs_embeds = torch.cat([spk_embeds, tts_embeds, text_eos, audio_bos], dim=0).unsqueeze(0)
-        prep_ms = (time.perf_counter() - total_t0) * 1000
-        if profile_enabled:
-            logger.info("generate_speech: inputs_embeds shape=%s", list(inputs_embeds.shape))
 
         # Scale max_new_token with input text length. A fixed 2048-token floor
         # can turn an EOS miss on a very short response into ~82s of audio and
@@ -1388,7 +1284,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         eos_token = torch.tensor([tts.config.num_audio_tokens - 1], dtype=torch.long, device=device)
         sampling_params = self._build_tts_sampling_params()
-        generate_t0 = time.perf_counter()
         generate_kwargs = {
             "inputs_embeds": inputs_embeds,
             "eos_token": eos_token,
@@ -1410,15 +1305,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         try:
             outputs = tts.generate(**generate_kwargs)
-            generate_ms = (time.perf_counter() - generate_t0) * 1000
             generated_tokens = outputs.new_ids.squeeze(-1)
-            if profile_enabled:
-                logger.info(
-                    "generate_speech: generated %d audio tokens (cap=%d, text_tokens=%d)",
-                    generated_tokens.shape[-1],
-                    max_new_token,
-                    num_text,
-                )
 
             import torchaudio
 
@@ -1434,8 +1321,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             torchaudio.save = _patched_save
             prev_dtype = torch.get_default_dtype()
             torch.set_default_dtype(torch.float32)
-            vocoder_t0 = time.perf_counter()
-            token2wav_direct_used = False
             try:
                 autocast_context, token2wav_autocast = self._token2wav_autocast_context()
                 with autocast_context:
@@ -1456,8 +1341,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     if num_tokens <= STREAM_THRESHOLD:
                         if self._should_use_direct_token2wav() and token2wav_autocast == "off":
                             try:
-                                waveform, sr = self._run_token2wav_direct(generated_tokens, prompt_wav_path)
-                                token2wav_direct_used = True
+                                waveform, _ = self._run_token2wav_direct(generated_tokens, prompt_wav_path)
                             except Exception as exc:
                                 logger.warning(
                                     "MiniCPM-o 4.5 direct Token2wav path failed; falling back to WAV path: %s",
@@ -1467,13 +1351,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                                 token_list = generated_tokens.squeeze(0).tolist()
                                 self._reset_token2wav_cache_if_needed(prompt_wav_path)
                                 wav_bytes = self.audio_tokenizer(token_list, prompt_wav_path)
-                                waveform, sr = sf.read(io.BytesIO(wav_bytes))
+                                waveform, _ = sf.read(io.BytesIO(wav_bytes))
                                 waveform = waveform.astype(np.float32)
                         else:
                             token_list = generated_tokens.squeeze(0).tolist()
                             self._reset_token2wav_cache_if_needed(prompt_wav_path)
                             wav_bytes = self.audio_tokenizer(token_list, prompt_wav_path)
-                            waveform, sr = sf.read(io.BytesIO(wav_bytes))
+                            waveform, _ = sf.read(io.BytesIO(wav_bytes))
                             waveform = waveform.astype(np.float32)
                     else:
                         token_list = generated_tokens.squeeze(0).tolist()
@@ -1511,36 +1395,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                                 )
                                 pieces.append(np.asarray(wav_np).reshape(-1))
                             waveform = np.concatenate(pieces, axis=0).astype(np.float32)
-                            sr = 24000
                         finally:
                             # Free per-request streaming state so the next request starts clean
                             self.audio_tokenizer.stream_cache = None
                             self.audio_tokenizer.hift_cache_dict = {}
             finally:
-                vocoder_ms = (time.perf_counter() - vocoder_t0) * 1000
                 torch.set_default_dtype(prev_dtype)
                 torchaudio.save = _orig_save
 
-            if profile_enabled:
-                logger.info("generate_speech: waveform %d samples, sr=%d", waveform.shape[0], sr)
-            if profile_enabled:
-                logger.info(
-                    "generate_speech profile: text_tokens=%d audio_tokens=%d prep_ms=%.3f "
-                    "tts_generate_ms=%.3f vocoder_ms=%.3f total_ms=%.3f "
-                    "min_new_token=%d max_new_token=%d token2wav_n_timesteps=%d "
-                    "token2wav_autocast=%s token2wav_direct=%s",
-                    num_text,
-                    num_tokens,
-                    prep_ms,
-                    generate_ms,
-                    vocoder_ms,
-                    (time.perf_counter() - total_t0) * 1000,
-                    min_new_token,
-                    max_new_token,
-                    getattr(self, "_token2wav_n_timesteps", 10),
-                    token2wav_autocast,
-                    token2wav_direct_used,
-                )
             return waveform
         finally:
             if temp_prompt_wav_path and not self._is_cached_ref_audio_prompt_wav(temp_prompt_wav_path):
@@ -1660,8 +1522,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         self._ar_last_chunk_flags = [True]
         self._ar_turn_end_flags = [False]
-        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-            logger.info("4.5 Talker: generating speech for %d tokens", tts_token_ids.shape[0])
         waveform = self.generate_speech(
             tts_token_ids,
             tts_hidden_states,
@@ -1696,27 +1556,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 logits[row, eos_id] = 1.0e6
             else:
                 logits[row, safe_id] = 1.0e6
-        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-            logger.info(
-                "4.5 Talker scheduler logits: rows=%d flags=%s default_is_last=%s eos_id=%d safe_id=%d sampled=%s",
-                num_rows,
-                flags,
-                default_is_last,
-                eos_id,
-                safe_id,
-                torch.argmax(logits, dim=-1).detach().cpu().tolist(),
-            )
         return logits
 
     def sample(self, logits, sampling_metadata):
         if logits is None or logits.numel() == 0:
             return None
         sampled = torch.argmax(logits, dim=-1).to(torch.int32)
-        if os.environ.get("MINICPMO45_PROFILE_LOGS") == "1":
-            logger.info(
-                "4.5 Talker scheduler sample: sampled=%s",
-                sampled.detach().cpu().tolist(),
-            )
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:

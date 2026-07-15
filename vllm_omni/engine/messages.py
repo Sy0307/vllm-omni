@@ -6,7 +6,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -57,6 +57,8 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     fence: DuplexFence
     session_id: str
     event: str
+    next_fence: DuplexFence | None = None
+    session_config: dict[str, object] | None = None
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):

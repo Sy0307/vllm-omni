@@ -1,6 +1,4 @@
 import logging
-import os
-import time
 from collections.abc import Callable, Mapping
 
 import torch
@@ -201,10 +199,14 @@ def _native_duplex_segment_output_ids(
         state["acc_tts_ids"] = []
         state["acc_tts_hidden"] = []
     segment_ids = output_ids[sent_len:]
-    decode_token_ids = bridge_states.get("minicpmo45_text_decoder")
+    decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
     if isinstance(decode_token_ids, Callable):
+        decode_ids = [int(token_id) for token_id in segment_ids]
         try:
-            segment_text = str(decode_token_ids(segment_ids))
+            try:
+                segment_text = str(decode_token_ids(decode_ids, skip_special_tokens=True))
+            except TypeError:
+                segment_text = str(decode_token_ids(decode_ids))
         except Exception:
             logger.exception("Failed to decode MiniCPM-o duplex token delta for request_id=%s", request_id)
             segment_text = ""
@@ -252,6 +254,9 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     session_id = duplex_state.get("session_id")
     if isinstance(session_id, str) and session_id:
         metadata["session_id"] = session_id
+    incarnation = duplex_state.get("incarnation")
+    if isinstance(incarnation, int):
+        metadata["incarnation"] = incarnation
     epoch = duplex_state.get("epoch")
     if isinstance(epoch, int):
         metadata["epoch"] = epoch
@@ -334,7 +339,6 @@ def llm2tts(
     if not isinstance(prompt, list):
         prompt = [prompt]
 
-    profile_enabled = os.environ.get("MINICPMO45_PROFILE_LOGS") == "1"
     multi_modal_data = {}
     for llm_output, p in zip(llm_outputs, prompt):
         if isinstance(p, dict):
@@ -342,8 +346,7 @@ def llm2tts(
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
 
-    for i, llm_output in enumerate(llm_outputs):
-        t0 = time.perf_counter()
+    for llm_output in llm_outputs:
         output = llm_output.outputs[0]
         mm_output = output.multimodal_output if isinstance(output.multimodal_output, Mapping) else {}
         special_token_ids = _special_token_ids_from_mm_output(mm_output)
@@ -515,32 +518,13 @@ def llm2tts(
                         .to(torch.float32)
                         .contiguous()
                     )
-        if profile_enabled:
-            logger.info(
-                "llm2tts profile req=%s prompt_tokens=%d output_tokens=%d hidden_shape=%s tts_tokens=%d total_ms=%.3f",
-                getattr(llm_output, "request_id", f"idx-{i}"),
-                prompt_token_ids_len,
-                len(llm_output_ids),
-                tuple(thinker_hidden_states.shape),
-                0 if tts_token_ids_slice is None else int(tts_token_ids_slice.shape[0]),
-                (time.perf_counter() - t0) * 1000,
-            )
-            logger.info(
-                "llm2tts token trace req=%s special=%s prompt_tail=%s output_head=%s output_tail=%s",
-                getattr(llm_output, "request_id", f"idx-{i}"),
-                special_token_ids,
-                prompt_token_ids[-16:],
-                llm_output_ids[:32],
-                llm_output_ids[-16:],
-            )
-
         model_intermediate_buffer = build_duplex_intermediate_buffer(
             request_id=str(llm_output.request_id),
             prompt_token_ids=prompt_token_ids,
             output_token_ids=llm_output_ids,
             output_text=thinker_text,
             stream_output=is_native_duplex_handoff,
-            minicpmo45_native_duplex=is_native_duplex_handoff,
+            native_duplex=is_native_duplex_handoff,
         )
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
@@ -578,12 +562,6 @@ def llm2tts(
                 handoff_hidden,
             )
             if not handoff_ids:
-                if profile_enabled:
-                    logger.info(
-                        "llm2tts native duplex skipped empty TTS handoff req=%s output_tokens=%d",
-                        getattr(llm_output, "request_id", f"idx-{i}"),
-                        len(llm_output_ids),
-                    )
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
         if native_turn_end_handoff:

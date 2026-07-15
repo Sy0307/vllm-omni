@@ -39,7 +39,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         self.stage_model = stage_model
         self.model_path = model_path
         self.device = device
-        self.sessions: dict[str, _MiniCPMO45Stage0SessionState] = {}
+        self.sessions: dict[tuple[str, int], _MiniCPMO45Stage0SessionState] = {}
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
         self.processor = (
             getattr(stage_model, "processor", None)

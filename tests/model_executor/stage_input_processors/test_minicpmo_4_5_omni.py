@@ -150,7 +150,7 @@ def test_llm2tts_accepts_flat_tokenizer_derived_special_token_metadata():
     assert converted[0]["prompt_token_ids"] == [11, 12]
     assert info["ids"]["tts"] == [11, 12]
     assert info["stream_output"] is True
-    assert info["minicpmo45_native_duplex"] is True
+    assert info["native_duplex"] is True
     assert torch.equal(torch.as_tensor(info["hidden_states"]["tts"]), latent[3:5].float())
     assert "tts_token_ids" not in info
     assert "tts_hidden_states" not in info
@@ -540,7 +540,7 @@ def test_native_duplex_talker_uses_generate_chunk_continuation(monkeypatch):
         "ids": {"tts": [21]},
         "hidden_states": {"tts": [[0.1, 0.2, 0.3, 0.4]]},
         "codes": {"ref": None},
-        "minicpmo45_native_duplex": True,
+        "native_duplex": True,
     }
     list(model._create_native_duplex_stream_gen(base_info))
 
@@ -626,7 +626,7 @@ def test_minicpmo_native_duplex_talker_turn_end_metadata_flushes_tail(monkeypatc
         "hidden_states": {"tts": [[0.1, 0.2, 0.3, 0.4]]},
         "codes": {"ref": None},
         "end_of_turn": True,
-        "minicpmo45_native_duplex": True,
+        "native_duplex": True,
     }
 
     list(model._create_native_duplex_stream_gen(info))
@@ -696,7 +696,7 @@ def test_minicpmo_native_duplex_terminal_only_new_turn_does_not_start_tts(monkey
                 "ids": {"tts": [9310]},
                 "hidden_states": {"tts": [[0.1, 0.2, 0.3, 0.4]]},
                 "codes": {"ref": None},
-                "minicpmo45_native_duplex": True,
+                "native_duplex": True,
             }
         )
     )
@@ -794,7 +794,7 @@ def test_minicpmo_native_duplex_talker_new_turn_reopens_session_keyed_state(monk
         "ids": {"tts": [21]},
         "hidden_states": {"tts": [[0.1, 0.2, 0.3, 0.4]]},
         "codes": {"ref": None},
-        "minicpmo45_native_duplex": True,
+        "native_duplex": True,
     }
 
     list(model._create_native_duplex_stream_gen(info))
@@ -861,7 +861,7 @@ def test_minicpmo_native_duplex_talker_segment_end_preserves_token2wav_stream_un
         "ids": {"tts": [21]},
         "hidden_states": {"tts": [[0.1, 0.2, 0.3, 0.4]]},
         "codes": {"ref": None},
-        "minicpmo45_native_duplex": True,
+        "native_duplex": True,
     }
 
     list(model._create_native_duplex_stream_gen(info))
@@ -938,14 +938,14 @@ def test_native_duplex_turn_end_detection_is_not_segment_end_detection():
 
     assert model._native_duplex_input_ends_turn(
         {
-            "minicpmo45_native_duplex": True,
+            "native_duplex": True,
             "ids": {"tts": [9304, 42, turn_eos_id]},
             "meta": {"turn_eos_token_id": turn_eos_id},
         }
     )
     assert not model._native_duplex_input_ends_turn(
         {
-            "minicpmo45_native_duplex": True,
+            "native_duplex": True,
             "ids": {"tts": [9304, 42, 9308]},
             "meta": {
                 "turn_eos_token_id": turn_eos_id,
@@ -995,7 +995,7 @@ def _install_native_duplex_decoder(streaming_context, token_text):
     def _decode(token_ids):
         return "".join(token_text.get(int(token_id), "") for token_id in token_ids)
 
-    streaming_context.bridge_states["minicpmo45_text_decoder"] = _decode
+    streaming_context.source_token_decoder = _decode
     return streaming_context
 
 
@@ -1128,6 +1128,7 @@ def test_llm2tts_native_duplex_marks_talker_handoff_as_data_plane():
         bridge_states={
             "duplex": {
                 "session_id": "sid-stage1-stop",
+                "incarnation": 2,
                 "epoch": 0,
                 "turn_id": 7,
                 "session_config": {
@@ -1147,6 +1148,7 @@ def test_llm2tts_native_duplex_marks_talker_handoff_as_data_plane():
     duplex = converted[0]["model_intermediate_buffer"]["duplex"]
     assert duplex["data_plane"] is True
     assert duplex["session_id"] == "sid-stage1-stop"
+    assert duplex["incarnation"] == 2
     assert duplex["epoch"] == 0
     assert duplex["turn_id"] == 7
     assert duplex["session_config"]["extra_body"]["duplex_stage_sampling_params"]["1"]["stop_token_ids"] == [151645]

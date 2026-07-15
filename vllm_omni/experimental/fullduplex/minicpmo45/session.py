@@ -13,7 +13,6 @@ class MiniCPMO45ServingSessionState:
     """Mutable serving state owned by one MiniCPM duplex session."""
 
     audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
-    response_emitted: bool = False
     input_since_commit: bool = False
     speech_since_commit: bool = False
     deferred_overlap_turn: bool = False

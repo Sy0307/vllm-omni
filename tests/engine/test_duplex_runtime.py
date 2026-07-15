@@ -1,6 +1,5 @@
 import pytest
 
-from vllm_omni.engine.orchestrator import _duplex_force_listen_count
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.omni import (
     DuplexInputMode,
@@ -25,8 +24,8 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
             input_modes={DuplexInputMode.APPEND_TOKENS},
         ),
     )
-    session.bind_stage_request(stage_id=0, request_id="req-stage0", replica_id=1, fence=session.fence)
-    session.bind_stage_request(stage_id=1, request_id="req-stage1", replica_id=0, fence=session.fence)
+    session.bind_stage_request(stage_id=0, request_id="req-stage0", fence=session.fence)
+    session.bind_stage_request(stage_id=1, request_id="req-stage1", fence=session.fence)
 
     update = session.append_input(mode=DuplexInputMode.APPEND_TOKENS, fence=session.fence)
     next_fence = DuplexFence("sid-1", epoch=1)
@@ -38,6 +37,105 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
     assert stale_request_ids == ["req-stage0", "req-stage1"]
     assert session.stage_bindings == {}
     assert session.input_seq == 0
+
+
+def test_duplex_runtime_cancel_fence_rejects_late_append_and_accepts_next_epoch():
+    manager = DuplexSessionRuntimeManager()
+    cancelled_fence = DuplexFence("sid-cancel-race")
+    next_fence = DuplexFence("sid-cancel-race", epoch=1)
+    session = manager.open_session(
+        cancelled_fence,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    session.bind_stage_request(
+        stage_id=0,
+        request_id="req-cancelled",
+        fence=cancelled_fence,
+    )
+
+    stale_request_ids = session.cancel_fence(cancelled_fence, next_fence)
+
+    assert stale_request_ids == ["req-cancelled"]
+    assert session.fence == next_fence
+    assert session.stage_bindings == {}
+    with pytest.raises(RuntimeError, match="fence mismatch"):
+        session.append_input(
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            fence=cancelled_fence,
+        )
+    update = session.append_input(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=next_fence,
+    )
+    assert update.seq == 1
+
+
+def test_duplex_runtime_stale_close_preserves_live_session_and_bindings():
+    manager = DuplexSessionRuntimeManager()
+    current_fence = DuplexFence("sid-stale-close", epoch=1)
+    session = manager.open_session(
+        current_fence,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    session.bind_stage_request(0, "req-live", fence=current_fence)
+
+    with pytest.raises(RuntimeError, match="fence mismatch"):
+        manager.close_session(DuplexFence("sid-stale-close"))
+
+    assert manager.get("sid-stale-close") is session
+    assert session.stage_request_ids() == ["req-live"]
+
+
+def test_duplex_runtime_reopen_rejects_late_append_from_old_incarnation():
+    manager = DuplexSessionRuntimeManager()
+    old_fence = DuplexFence("sid-reopen", incarnation=0)
+    old_session = manager.open_session(
+        old_fence,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    manager.close_session(old_fence)
+
+    new_fence = DuplexFence("sid-reopen", incarnation=1)
+    new_session = manager.open_session(
+        new_fence,
+        capabilities=old_session.capabilities,
+    )
+
+    with pytest.raises(RuntimeError, match="fence mismatch"):
+        new_session.append_input(
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            fence=old_fence,
+        )
+    assert (
+        new_session.append_input(
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            fence=new_fence,
+        ).seq
+        == 1
+    )
+
+
+def test_duplex_prompt_expands_incarnation_metadata():
+    fence = DuplexFence("sid-incarnation", incarnation=3)
+
+    prompt = build_duplex_data_plane_prompt(
+        request_id=duplex_resource_request_id(fence, "stage0"),
+        fence=fence,
+        session_config={},
+        seq=1,
+        turn_seq=1,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload={"is_speech": True},
+        final=False,
+    )
+
+    assert prompt["model_intermediate_buffer"]["duplex"]["incarnation"] == 3
 
 
 def test_duplex_runtime_tracks_turn_local_append_sequence():
@@ -178,13 +276,6 @@ def test_minicpmo_new_user_turn_prefix_variants_match_hf_duplex_streaming_prefil
     assert (
         MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_LISTEN_ONLY) == ""
     )
-
-
-def test_duplex_force_listen_default_matches_hf_zero():
-    assert _duplex_force_listen_count(None) == 0
-    assert _duplex_force_listen_count({}) == 0
-    assert _duplex_force_listen_count({"force_listen_count": 3}) == 3
-    assert _duplex_force_listen_count({"force_listen_count": "bad"}) == 0
 
 
 def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():

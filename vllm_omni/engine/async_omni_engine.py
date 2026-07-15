@@ -35,6 +35,7 @@ from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -51,6 +52,7 @@ from vllm_omni.engine.messages import (
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.rpc_result_router import RpcCorrelationKey, RpcResultRouter
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
@@ -59,6 +61,7 @@ from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
+    StageRuntime,
     StageRuntimeInfo,
     create_stage_runtime,
 )
@@ -67,7 +70,6 @@ from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -75,6 +77,9 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+_SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
+_SHUTDOWN_JOIN_TIMEOUT_S = 30.0
+_WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 
 
 # ============================================================================
@@ -178,26 +183,69 @@ def _weak_shutdown_async_omni_engine(
     request_queue: janus.Queue[EngineQueueMessage] | None,
     output_queue: janus.Queue[EngineQueueMessage] | None,
     rpc_output_queue: janus.Queue[EngineQueueMessage] | None,
+    rpc_result_router: RpcResultRouter | None,
 ) -> None:
     """Best-effort orchestrator cleanup for GC finalization."""
-    try:
-        if request_queue is not None:
-            request_queue.sync_q.put_nowait(ShutdownRequestMessage())
-    except Exception:
-        pass
+    request_queue_closed = False
+    shutdown_enqueued = _enqueue_orchestrator_shutdown(
+        request_queue,
+        timeout=_SHUTDOWN_ENQUEUE_TIMEOUT_S,
+    )
+    if request_queue is not None and not shutdown_enqueued:
+        try:
+            request_queue.close()
+            request_queue_closed = True
+        except Exception:
+            pass
+
+    if rpc_result_router is not None:
+        rpc_result_router.close()
 
     try:
         if orchestrator_thread is not None and orchestrator_thread.is_alive():
-            orchestrator_thread.join()
+            orchestrator_thread.join(timeout=_WEAK_SHUTDOWN_JOIN_TIMEOUT_S)
     except Exception:
         pass
 
     for q in (request_queue, output_queue, rpc_output_queue):
         try:
-            if q is not None:
+            if q is not None and not (q is request_queue and request_queue_closed):
                 q.close()
         except Exception:
             pass
+
+
+def _enqueue_orchestrator_shutdown(
+    request_queue: janus.Queue[EngineQueueMessage] | None,
+    *,
+    timeout: float,
+) -> bool:
+    """Deliver shutdown without waiting forever behind a full request queue."""
+    if request_queue is None:
+        return False
+    try:
+        request_queue.sync_q.put(ShutdownRequestMessage(), timeout=timeout)
+    except Exception:
+        return False
+    return True
+
+
+def _shutdown_runtime_after_orchestrator(
+    orchestrator_thread: threading.Thread,
+    runtime: StageRuntime,
+) -> None:
+    """Release StageRuntime once its orchestrator can no longer use it."""
+    try:
+        orchestrator_thread.join()
+    except Exception:
+        logger.exception("[AsyncOmniEngine] Failed while awaiting deferred Orchestrator shutdown")
+    if orchestrator_thread.is_alive():
+        logger.error("[AsyncOmniEngine] Orchestrator is still alive; StageRuntime cleanup remains deferred")
+        return
+    try:
+        runtime.shutdown()
+    except Exception:
+        logger.exception("[AsyncOmniEngine] Failed to shutdown deferred StageRuntime")
 
 
 class AsyncOmniEngine:
@@ -323,7 +371,7 @@ class AsyncOmniEngine:
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
-        self._rpc_lock = threading.Lock()
+        self._rpc_result_router: RpcResultRouter | None = None
         self._running_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
@@ -342,6 +390,7 @@ class AsyncOmniEngine:
         )
         self.orchestrator_thread.start()
         self._wait_for_orchestrator_init(startup_future, startup_timeout)
+        self._rpc_result_router = RpcResultRouter(self.rpc_output_queue.sync_q)
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self._weak_finalizer = weakref.finalize(
@@ -351,6 +400,7 @@ class AsyncOmniEngine:
             self.request_queue,
             self.output_queue,
             self.rpc_output_queue,
+            self._rpc_result_router,
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
@@ -1441,14 +1491,14 @@ class AsyncOmniEngine:
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Open an engine-level duplex session."""
         return self._duplex_control(
             OpenDuplexSessionMessage(
                 control_id=uuid.uuid4().hex,
-                fence=fence or DuplexFence(session_id),
+                fence=fence,
                 session_id=session_id,
                 session_mode=session_mode,
                 capabilities=dict(capabilities or {}),
@@ -1464,7 +1514,7 @@ class AsyncOmniEngine:
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for opening an engine-level duplex session."""
@@ -1489,11 +1539,11 @@ class AsyncOmniEngine:
         payload: object,
         final: bool = False,
         expected_epoch: int | None = None,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Append input to an engine-level duplex session."""
-        message_fence = fence or DuplexFence(session_id, epoch=expected_epoch or 0)
+        message_fence = fence
         if expected_epoch is not None and expected_epoch != message_fence.epoch:
             raise ValueError("expected_epoch must match fence.epoch")
         return self._duplex_control(
@@ -1517,7 +1567,7 @@ class AsyncOmniEngine:
         payload: object,
         final: bool = False,
         expected_epoch: int | None = None,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for appending duplex input."""
@@ -1540,16 +1590,20 @@ class AsyncOmniEngine:
         session_id: str,
         *,
         event: str,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Signal an engine-level duplex turn."""
         return self._duplex_control(
             SignalDuplexTurnMessage(
                 control_id=uuid.uuid4().hex,
-                fence=fence or DuplexFence(session_id),
+                fence=fence,
                 session_id=session_id,
                 event=event,
+                next_fence=next_fence,
+                session_config=dict(session_config) if session_config is not None else None,
             ),
             timeout=timeout,
         )
@@ -1559,7 +1613,9 @@ class AsyncOmniEngine:
         session_id: str,
         *,
         event: str,
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
+        next_fence: DuplexFence | None = None,
+        session_config: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for signaling a duplex turn."""
@@ -1570,6 +1626,8 @@ class AsyncOmniEngine:
                 session_id,
                 event=event,
                 fence=fence,
+                next_fence=next_fence,
+                session_config=session_config,
                 timeout=timeout,
             ),
         )
@@ -1579,14 +1637,14 @@ class AsyncOmniEngine:
         session_id: str,
         *,
         reason: str = "client_close",
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Close an engine-level duplex session."""
         return self._duplex_control(
             CloseDuplexSessionMessage(
                 control_id=uuid.uuid4().hex,
-                fence=fence or DuplexFence(session_id),
+                fence=fence,
                 session_id=session_id,
                 reason=reason,
             ),
@@ -1598,7 +1656,7 @@ class AsyncOmniEngine:
         session_id: str,
         *,
         reason: str = "client_close",
-        fence: DuplexFence | None = None,
+        fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for closing an engine-level duplex session."""
@@ -1619,49 +1677,57 @@ class AsyncOmniEngine:
         if self.rpc_output_queue is None:
             raise RuntimeError("rpc_output_queue is not initialized")
 
-        control_id = msg.control_id
-        with self._rpc_lock:
-            self.request_queue.sync_q.put_nowait(msg)
-            deadline = None if timeout is None else time.monotonic() + timeout
-            while True:
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                try:
-                    result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
-                except queue.Empty as exc:
-                    raise TimeoutError(f"duplex control timed out after {timeout} seconds") from exc
+        result_msg = self._submit_rpc_and_wait(
+            ("duplex", msg.control_id),
+            msg,
+            timeout=timeout,
+            timeout_message=f"duplex control timed out after {timeout} seconds",
+        )
+        if not isinstance(result_msg, DuplexControlResultMessage):
+            raise RuntimeError(f"unexpected duplex control result type: {type(result_msg).__name__}")
+        if result_msg.fence != msg.fence:
+            raise RuntimeError(f"duplex control fence mismatch: expected {msg.fence!r}, got {result_msg.fence!r}")
 
-                if isinstance(result_msg, ErrorMessage):
-                    raise RuntimeError(result_msg.error)
-                if not isinstance(result_msg, DuplexControlResultMessage):
-                    logger.warning(
-                        "[AsyncOmniEngine] Dropping unexpected duplex control queue message type=%s",
-                        getattr(result_msg, "type", type(result_msg).__name__),
-                    )
-                    continue
-                if result_msg.control_id != control_id:
-                    logger.warning(
-                        "[AsyncOmniEngine] Dropping mismatched duplex control result control_id=%s expected=%s",
-                        result_msg.control_id,
-                        control_id,
-                    )
-                    continue
-                if result_msg.fence != msg.fence:
-                    raise RuntimeError(
-                        f"duplex control fence mismatch: expected {msg.fence!r}, got {result_msg.fence!r}"
-                    )
+        result = {
+            "fence": result_msg.fence,
+            "operation": result_msg.operation,
+            "session_id": result_msg.session_id,
+            "ok": result_msg.ok,
+            "stage_results": list(result_msg.stage_results),
+            "unsupported_count": result_msg.unsupported_count,
+            "error_count": result_msg.error_count,
+        }
+        if result_msg.error_count:
+            raise RuntimeError(f"duplex {result_msg.operation} failed: {result}")
+        return result
 
-                result = {
-                    "fence": result_msg.fence,
-                    "operation": result_msg.operation,
-                    "session_id": result_msg.session_id,
-                    "ok": result_msg.ok,
-                    "stage_results": list(result_msg.stage_results),
-                    "unsupported_count": result_msg.unsupported_count,
-                    "error_count": result_msg.error_count,
-                }
-                if result_msg.error_count:
-                    raise RuntimeError(f"duplex {result_msg.operation} failed: {result}")
-                return result
+    def _submit_rpc_and_wait(
+        self,
+        key: RpcCorrelationKey,
+        msg: EngineQueueMessage,
+        *,
+        timeout: float | None,
+        timeout_message: str,
+        block_on_submit: bool = False,
+    ) -> EngineQueueMessage:
+        router = self._rpc_result_router
+        if router is None:
+            raise RuntimeError("RPC result router is not initialized")
+        waiter = router.register(key)
+        try:
+            if block_on_submit:
+                self.request_queue.sync_q.put(msg)
+            else:
+                self.request_queue.sync_q.put_nowait(msg)
+            try:
+                result_msg = waiter.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(timeout_message) from exc
+            if isinstance(result_msg, ErrorMessage):
+                raise RuntimeError(result_msg.error)
+            return result_msg
+        finally:
+            router.unregister(key, waiter)
 
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
         """Read one output message from the Orchestrator output queue."""
@@ -1718,36 +1784,16 @@ class AsyncOmniEngine:
             stage_ids=stage_ids,
         )
 
-        with self._rpc_lock:
-            self.request_queue.sync_q.put(msg)
-            deadline = None if timeout is None else time.monotonic() + timeout
-
-            while True:
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                try:
-                    result_msg = self.rpc_output_queue.sync_q.get(timeout=remaining)
-                except queue.Empty as exc:
-                    raise TimeoutError(f"collective_rpc timed out after {timeout} seconds") from exc
-
-                if isinstance(result_msg, ErrorMessage):
-                    raise RuntimeError(result_msg.error)
-
-                if not isinstance(result_msg, CollectiveRPCResultMessage):
-                    logger.warning(
-                        "[AsyncOmniEngine] Dropping unexpected rpc queue message type=%s",
-                        getattr(result_msg, "type", type(result_msg).__name__),
-                    )
-                    continue
-
-                if result_msg.rpc_id != rpc_id:
-                    logger.warning(
-                        "[AsyncOmniEngine] Dropping mismatched rpc result rpc_id=%s expected=%s",
-                        result_msg.rpc_id,
-                        rpc_id,
-                    )
-                    continue
-
-                return list(result_msg.results)
+        result_msg = self._submit_rpc_and_wait(
+            ("collective", rpc_id),
+            msg,
+            timeout=timeout,
+            timeout_message=f"collective_rpc timed out after {timeout} seconds",
+            block_on_submit=True,
+        )
+        if not isinstance(result_msg, CollectiveRPCResultMessage):
+            raise RuntimeError(f"unexpected collective RPC result type: {type(result_msg).__name__}")
+        return list(result_msg.results)
 
     async def collective_rpc_async(
         self,
@@ -1784,22 +1830,61 @@ class AsyncOmniEngine:
             finalizer.detach()
 
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
-        if self.request_queue is not None:
-            self.request_queue.sync_q.put_nowait(ShutdownRequestMessage())
-        if self.is_alive():
-            self.orchestrator_thread.join()
+        request_queue_closed = False
+        shutdown_enqueued = _enqueue_orchestrator_shutdown(
+            self.request_queue,
+            timeout=_SHUTDOWN_ENQUEUE_TIMEOUT_S,
+        )
+        if self.request_queue is not None and not shutdown_enqueued:
+            logger.error(
+                "[AsyncOmniEngine] Failed to enqueue orchestrator shutdown; "
+                "closing the request queue to wake the request handler"
+            )
+            try:
+                self.request_queue.close()
+                request_queue_closed = True
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to close the request queue")
+
+        if self._rpc_result_router is not None:
+            try:
+                self._rpc_result_router.close()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to close RPC result router")
+
+        orchestrator_stopped = False
+        try:
+            if self.is_alive():
+                self.orchestrator_thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_S)
+            orchestrator_stopped = not self.is_alive()
+            if not orchestrator_stopped:
+                logger.error(
+                    "[AsyncOmniEngine] Orchestrator did not stop within %.1f seconds; continuing cleanup",
+                    _SHUTDOWN_JOIN_TIMEOUT_S,
+                )
+        except Exception:
+            logger.exception("[AsyncOmniEngine] Failed to join Orchestrator thread")
 
         for q in (self.request_queue, self.output_queue, self.rpc_output_queue):
             try:
-                q.close()
+                if not (q is self.request_queue and request_queue_closed):
+                    q.close()
             except Exception:
                 pass
 
-        if hasattr(self, "_runtime") and self._runtime is not None:
+        if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:
                 self._runtime.shutdown()
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to shutdown StageRuntime")
+        elif hasattr(self, "_runtime") and self._runtime is not None:
+            logger.warning("[AsyncOmniEngine] Deferring StageRuntime shutdown until the Orchestrator exits")
+            threading.Thread(
+                target=_shutdown_runtime_after_orchestrator,
+                args=(self.orchestrator_thread, self._runtime),
+                daemon=True,
+                name="omni-stage-runtime-shutdown",
+            ).start()
 
         # ── Release CuMem allocator memory pool ──────────────────────────────
         # When enable_sleep_mode is in use, the CuMem (CUDA Virtual Memory

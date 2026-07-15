@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..core.identity import DuplexFence
+from vllm_omni.engine.duplex_types import DuplexFence
 
 
 class DuplexFenceMismatchError(RuntimeError):
@@ -43,7 +43,6 @@ class DuplexRuntimeCapabilities:
 class DuplexStageBinding:
     request_id: str
     fence: DuplexFence
-    replica_id: int | None = None
 
 
 @dataclass
@@ -78,7 +77,7 @@ class DuplexSessionRuntimeState:
         return self.fence.turn_id
 
     def accept_fence(self, fence: DuplexFence) -> None:
-        if fence.session_id != self.session_id:
+        if fence.session_id != self.session_id or fence.incarnation != self.fence.incarnation:
             raise DuplexFenceMismatchError(self.fence, fence)
         current = self.fence
         if fence.epoch < current.epoch or (
@@ -96,7 +95,6 @@ class DuplexSessionRuntimeState:
         self,
         stage_id: int,
         request_id: str,
-        replica_id: int | None = None,
         *,
         fence: DuplexFence,
     ) -> None:
@@ -104,7 +102,6 @@ class DuplexSessionRuntimeState:
         self.stage_bindings[stage_id] = DuplexStageBinding(
             request_id=request_id,
             fence=fence,
-            replica_id=replica_id,
         )
 
     def stage_request_ids(self, fence: DuplexFence | None = None) -> list[str]:
@@ -140,6 +137,33 @@ class DuplexSessionRuntimeState:
             stage_id: binding for stage_id, binding in self.stage_bindings.items() if binding.fence != fence
         }
         return stale
+
+    def cancel_fence(
+        self,
+        cancelled_fence: DuplexFence,
+        next_fence: DuplexFence,
+    ) -> list[str]:
+        if cancelled_fence.session_id != self.session_id or cancelled_fence.incarnation != self.fence.incarnation:
+            raise DuplexFenceMismatchError(self.fence, cancelled_fence)
+        if (
+            next_fence.session_id != self.session_id
+            or next_fence.incarnation != self.fence.incarnation
+            or next_fence.epoch <= cancelled_fence.epoch
+        ):
+            raise DuplexFenceMismatchError(cancelled_fence, next_fence)
+
+        current_key = (self.fence.epoch, self.fence.turn_id, self.fence.response_seq)
+        cancelled_key = (
+            cancelled_fence.epoch,
+            cancelled_fence.turn_id,
+            cancelled_fence.response_seq,
+        )
+        next_key = (next_fence.epoch, next_fence.turn_id, next_fence.response_seq)
+        if cancelled_key > current_key:
+            raise DuplexFenceMismatchError(self.fence, cancelled_fence)
+        if next_key > current_key:
+            self.accept_fence(next_fence)
+        return self.release_fence(cancelled_fence)
 
     def close(self, fence: DuplexFence | None = None) -> list[str]:
         if fence is not None:
@@ -184,9 +208,11 @@ class DuplexSessionRuntimeManager:
     def close_session(self, fence: DuplexFence) -> DuplexSessionRuntimeState | None:
         if not isinstance(fence, DuplexFence):
             raise TypeError("close_session requires DuplexFence")
-        session = self._sessions.pop(fence.session_id, None)
+        session = self._sessions.get(fence.session_id)
         if session is not None:
             session.close(fence)
+            if self._sessions.get(fence.session_id) is session:
+                self._sessions.pop(fence.session_id)
         return session
 
     def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]:
@@ -225,7 +251,8 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
     ):
         raise ValueError(f"invalid duplex resource role: {role!r}")
-    return f"duplex-{fence.session_id}-e{fence.epoch}-{role}"
+    incarnation = f"-i{fence.incarnation}" if fence.incarnation else ""
+    return f"duplex-{fence.session_id}{incarnation}-e{fence.epoch}-{role}"
 
 
 _DUPLEX_CHUNK_SAMPLES = 16000
@@ -374,6 +401,7 @@ def build_duplex_data_plane_prompt(
             "duplex": {
                 "fence": fence,
                 "session_id": fence.session_id,
+                "incarnation": fence.incarnation,
                 "epoch": fence.epoch,
                 "seq": seq,
                 "turn_id": fence.turn_id,
