@@ -7,6 +7,55 @@ from typing import Any
 import numpy as np
 
 
+class MiniCPMO45PcmAppendReservation:
+    __slots__ = (
+        "_active",
+        "_force_listen",
+        "_is_speech",
+        "_new_user_turn",
+        "_owner",
+        "_raw",
+        "_sample_rate_hz",
+        "_turn_had_speech",
+        "operation_id",
+        "payload",
+    )
+
+    def __init__(
+        self,
+        *,
+        owner: MiniCPMO45PcmAppendBuffer,
+        operation_id: str,
+        payload: dict[str, object] | None,
+        raw: bytes,
+        sample_rate_hz: int,
+        force_listen: bool,
+        is_speech: bool,
+        new_user_turn: bool,
+        turn_had_speech: bool = False,
+    ) -> None:
+        self._owner = owner
+        self.operation_id = operation_id
+        self.payload = payload
+        self._raw = raw
+        self._sample_rate_hz = sample_rate_hz
+        self._force_listen = force_listen
+        self._is_speech = is_speech
+        self._new_user_turn = new_user_turn
+        self._turn_had_speech = turn_had_speech
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def commit(self) -> None:
+        self._owner._commit_reservation(self)
+
+    def rollback(self) -> None:
+        self._owner._rollback_reservation(self)
+
+
 def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
     extra_body = session_config.get("extra_body")
     if not isinstance(extra_body, dict):
@@ -49,8 +98,13 @@ class MiniCPMO45PcmAppendBuffer:
         self._is_speech = False
         self._new_user_turn = False
         self._turn_had_speech = False
+        self._reservation_seq = 0
+        self._reservations: list[MiniCPMO45PcmAppendReservation] = []
 
     def clear(self) -> None:
+        for reservation in self._reservations:
+            reservation._active = False
+        self._reservations.clear()
         self._buffer.clear()
         self._sample_rate_hz = None
         self._force_listen = False
@@ -64,25 +118,47 @@ class MiniCPMO45PcmAppendBuffer:
     def has_pending(self) -> bool:
         return bool(self._buffer)
 
-    def append(
+    def _reserve_passthrough(
         self,
         payload: dict[str, object],
         *,
+        operation_id: str,
+    ) -> MiniCPMO45PcmAppendReservation:
+        sample_rate_hz = payload.get("sample_rate_hz")
+        reservation = MiniCPMO45PcmAppendReservation(
+            owner=self,
+            operation_id=operation_id,
+            payload=payload,
+            raw=b"",
+            sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else 0,
+            force_listen=bool(payload.get("force_listen", False)),
+            is_speech=bool(payload.get("is_speech", False)),
+            new_user_turn=bool(payload.get("new_user_turn", False)),
+            turn_had_speech=bool(payload.get("is_speech", False)),
+        )
+        self._reservations.append(reservation)
+        return reservation
+
+    def prepare_append(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str,
         chunk_period_ms: int,
         flush: bool = False,
         allow_emit: bool = True,
-    ) -> dict[str, object] | None:
+    ) -> MiniCPMO45PcmAppendReservation | None:
         fmt = payload.get("format")
         sample_rate_hz = payload.get("sample_rate_hz")
         audio = payload.get("audio")
         if fmt != "pcm_f32le" or not isinstance(sample_rate_hz, int) or not isinstance(audio, str):
-            return payload
+            return self._reserve_passthrough(payload, operation_id=operation_id)
         try:
             raw = base64.b64decode(audio, validate=True)
         except (binascii.Error, ValueError):
-            return payload
+            return self._reserve_passthrough(payload, operation_id=operation_id)
         if len(raw) % 4 != 0:
-            return payload
+            return self._reserve_passthrough(payload, operation_id=operation_id)
 
         if self._sample_rate_hz is not None and self._sample_rate_hz != sample_rate_hz:
             raise ValueError("MiniCPM-o native duplex audio append sample_rate_hz changed within a session")
@@ -113,7 +189,8 @@ class MiniCPMO45PcmAppendBuffer:
             emit_samples = buffered_samples - (buffered_samples % min_samples)
             pad_samples = 0
         emit_bytes = emit_samples * 4
-        emit_raw = bytes(self._buffer[:emit_bytes]) + b"\x00" * (pad_samples * 4)
+        reserved_raw = bytes(self._buffer[:emit_bytes])
+        emit_raw = reserved_raw + b"\x00" * (pad_samples * 4)
         del self._buffer[:emit_bytes]
 
         out = dict(payload)
@@ -128,7 +205,121 @@ class MiniCPMO45PcmAppendBuffer:
             self._force_listen = False
             self._is_speech = False
             self._new_user_turn = False
-        return out
+        reservation = MiniCPMO45PcmAppendReservation(
+            owner=self,
+            operation_id=operation_id,
+            payload=out,
+            raw=reserved_raw,
+            sample_rate_hz=sample_rate_hz,
+            force_listen=bool(out.get("force_listen", False)),
+            is_speech=bool(out.get("is_speech", False)),
+            new_user_turn=bool(out.get("new_user_turn", False)),
+            turn_had_speech=self._turn_had_speech,
+        )
+        self._reservations.append(reservation)
+        return reservation
+
+    def prepare_commit(
+        self,
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+    ) -> MiniCPMO45PcmAppendReservation:
+        """Reserve the terminal payload without invalidating prior appends."""
+        had_speech = self._turn_had_speech
+        reservation: MiniCPMO45PcmAppendReservation | None = None
+        if had_speech and self._buffer:
+            payload: dict[str, object] = {
+                "type": "audio",
+                "audio": "",
+                "format": "pcm_f32le",
+                "sample_rate_hz": self._sample_rate_hz or 16000,
+                "force_listen": self._force_listen,
+                "is_speech": self._is_speech,
+            }
+            if self._new_user_turn:
+                payload["new_user_turn"] = True
+            reservation = self.prepare_append(
+                payload,
+                operation_id=operation_id,
+                chunk_period_ms=chunk_period_ms,
+                flush=True,
+            )
+            assert reservation is not None
+            assert reservation.payload is not None
+            reservation.payload["final"] = True
+        if reservation is None:
+            reservation = MiniCPMO45PcmAppendReservation(
+                owner=self,
+                operation_id=operation_id,
+                payload=None,
+                raw=b"",
+                sample_rate_hz=self._sample_rate_hz or 0,
+                force_listen=self._force_listen,
+                is_speech=self._is_speech,
+                new_user_turn=self._new_user_turn,
+                turn_had_speech=had_speech,
+            )
+            self._reservations.append(reservation)
+
+        # Open the next physical input generation without touching already
+        # reserved appends. A rollback restores this generation's metadata.
+        self._sample_rate_hz = None
+        self._force_listen = False
+        self._is_speech = False
+        self._new_user_turn = False
+        self._turn_had_speech = False
+        return reservation
+
+    def append(
+        self,
+        payload: dict[str, object],
+        *,
+        chunk_period_ms: int,
+        flush: bool = False,
+        allow_emit: bool = True,
+    ) -> dict[str, object] | None:
+        self._reservation_seq += 1
+        reservation = self.prepare_append(
+            payload,
+            operation_id=f"immediate-{self._reservation_seq}",
+            chunk_period_ms=chunk_period_ms,
+            flush=flush,
+            allow_emit=allow_emit,
+        )
+        if reservation is None:
+            return None
+        reservation.commit()
+        assert reservation.payload is not None
+        return reservation.payload
+
+    def _commit_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
+        if not reservation._active:
+            return
+        if not self._reservations or self._reservations[0] is not reservation:
+            raise RuntimeError("PCM append reservations must commit in wire order")
+        self._reservations.pop(0)
+        reservation._active = False
+
+    def _rollback_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
+        if not reservation._active:
+            return
+        try:
+            index = self._reservations.index(reservation)
+        except ValueError:
+            reservation._active = False
+            return
+        rolled_back = self._reservations[index:]
+        restored = b"".join(item._raw for item in rolled_back)
+        self._buffer[:0] = restored
+        self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
+        self._force_listen = self._force_listen or any(item._force_listen for item in rolled_back)
+        self._is_speech = self._is_speech or any(item._is_speech for item in rolled_back)
+        self._new_user_turn = self._new_user_turn or any(item._new_user_turn for item in rolled_back)
+        self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
+        for item in rolled_back:
+            item._active = False
+        del self._reservations[index:]
 
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
         if not self._buffer:
@@ -153,15 +344,17 @@ class MiniCPMO45PcmAppendBuffer:
         synthesizing another unit would add a model decision that does not
         exist in the official continuous streaming loop.
         """
-        had_speech = self._turn_had_speech
-        payload = self.flush(chunk_period_ms=chunk_period_ms) if had_speech else None
-        if payload is not None:
-            payload["final"] = True
-        self.clear()
-        return payload
+        self._reservation_seq += 1
+        reservation = self.prepare_commit(
+            operation_id=f"immediate-commit-{self._reservation_seq}",
+            chunk_period_ms=chunk_period_ms,
+        )
+        reservation.commit()
+        return reservation.payload
 
 
 __all__ = [
+    "MiniCPMO45PcmAppendReservation",
     "MiniCPMO45PcmAppendBuffer",
     "decode_native_ref_audio_from_config",
     "validate_native_ref_audio_config",

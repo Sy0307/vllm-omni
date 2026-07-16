@@ -14,6 +14,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, _weak_shutdown_async_omni_engine
+from vllm_omni.engine.duplex_control_client import DuplexControlClient
 from vllm_omni.engine.messages import (
     AppendDuplexInputMessage,
     CollectiveRPCResultMessage,
@@ -22,8 +23,7 @@ from vllm_omni.engine.messages import (
     OutputMessage,
     SignalDuplexTurnMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.rpc_result_router import RpcResultRouter
+from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -170,9 +170,23 @@ def test_output_remains_on_shared_output_path(mocker: MockerFixture):
     assert output.request_id == "legacy-duplex-request"
 
 
-def test_duplex_control_api_requires_explicit_fence(mocker: MockerFixture):
+def test_duplex_control_client_uses_engine_owned_correlated_transport():
     engine = object.__new__(AsyncOmniEngine)
-    mocker.patch.object(engine, "_duplex_control", return_value={"ok": True})
+    engine._duplex_control_client = None
+    engine._correlated_rpc_client = CorrelatedRpcClient(queue.Queue(), queue.Queue())
+
+    try:
+        client = engine._get_duplex_control_client()
+
+        assert isinstance(client, DuplexControlClient)
+        assert client._transport is engine._correlated_rpc_client
+        assert not hasattr(engine, "_submit_rpc_and_wait")
+    finally:
+        engine._correlated_rpc_client.close()
+
+
+def test_duplex_control_api_requires_explicit_fence():
+    engine = object.__new__(AsyncOmniEngine)
 
     with pytest.raises(TypeError, match="fence"):
         engine.open_duplex_session("sid")
@@ -201,7 +215,8 @@ def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = RpcResultRouter(rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
     mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="ctrl-1"))
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -214,7 +229,7 @@ def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
 
     assert result["unsupported_count"] == 1
     assert result["stage_results"][0]["result"]["supported"] is False
-    engine._rpc_result_router.close()
+    engine._correlated_rpc_client.close()
 
 
 def test_signal_duplex_turn_message_carries_next_fence(mocker: MockerFixture):
@@ -234,7 +249,8 @@ def test_signal_duplex_turn_message_carries_next_fence(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = RpcResultRouter(rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
     mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="ctrl-signal"))
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -255,7 +271,7 @@ def test_signal_duplex_turn_message_carries_next_fence(mocker: MockerFixture):
         rpc_q.put(control_result)
         assert pending.result(timeout=1)["ok"] is True
 
-    engine._rpc_result_router.close()
+    engine._correlated_rpc_client.close()
 
 
 @pytest.mark.asyncio
@@ -297,7 +313,8 @@ def test_duplex_controls_route_out_of_order_without_global_lock():
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = RpcResultRouter(rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
     first_fence = DuplexFence("sid", epoch=1)
     second_fence = DuplexFence("sid", epoch=2)
     first = AppendDuplexInputMessage(
@@ -318,8 +335,9 @@ def test_duplex_controls_route_out_of_order_without_global_lock():
     )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first_result = executor.submit(engine._duplex_control, first, timeout=1)
-        second_result = executor.submit(engine._duplex_control, second, timeout=1)
+        client = engine._get_duplex_control_client()
+        first_result = executor.submit(client.execute, first, timeout=1)
+        second_result = executor.submit(client.execute, second, timeout=1)
         submitted = {request_q.get(timeout=1).control_id, request_q.get(timeout=1).control_id}
         assert submitted == {"first", "second"}
         rpc_q.put(
@@ -347,21 +365,24 @@ def test_duplex_controls_route_out_of_order_without_global_lock():
         assert second_result.result(timeout=1)["fence"] == second_fence
 
     assert not hasattr(engine, "_rpc_lock")
-    engine._rpc_result_router.close()
+    engine._correlated_rpc_client.close()
 
 
 def test_terminal_rpc_router_rejects_without_enqueuing_new_control():
     request_q = queue.Queue()
     rpc_q = queue.Queue()
-    router = RpcResultRouter(rpc_q)
-    pending = router.register(("duplex", "pending"))
-    rpc_q.put(ErrorMessage(error="orchestrator failed", fatal=True))
-    assert pending.get(timeout=1).fatal is True
-
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = router
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
+    pending_message = AppendDuplexInputMessage(
+        control_id="pending",
+        fence=DuplexFence("sid"),
+        session_id="sid",
+        mode="audio",
+        payload=b"audio",
+    )
     message = AppendDuplexInputMessage(
         control_id="after-fatal",
         fence=DuplexFence("sid"),
@@ -370,11 +391,20 @@ def test_terminal_rpc_router_rejects_without_enqueuing_new_control():
         payload=b"audio",
     )
 
-    with pytest.raises(RuntimeError, match="orchestrator failed"):
-        engine._duplex_control(message, timeout=1)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(engine._get_duplex_control_client().execute, pending_message, timeout=1)
+            assert request_q.get(timeout=1).control_id == "pending"
+            rpc_q.put(ErrorMessage(error="orchestrator failed", fatal=True))
+            with pytest.raises(RuntimeError, match="orchestrator failed"):
+                pending.result(timeout=1)
 
-    assert request_q.empty()
-    router.close()
+        with pytest.raises(RuntimeError, match="orchestrator failed"):
+            engine._get_duplex_control_client().execute(message, timeout=1)
+
+        assert request_q.empty()
+    finally:
+        engine._correlated_rpc_client.close()
 
 
 def test_collective_and_duplex_results_share_router_without_swapping(mocker: MockerFixture):
@@ -383,7 +413,8 @@ def test_collective_and_duplex_results_share_router_without_swapping(mocker: Moc
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = RpcResultRouter(rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
     fence = DuplexFence("sid")
     duplex = AppendDuplexInputMessage(
         control_id="duplex-control",
@@ -395,7 +426,7 @@ def test_collective_and_duplex_results_share_router_without_swapping(mocker: Moc
     mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="collective-rpc"))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        duplex_result = executor.submit(engine._duplex_control, duplex, timeout=1)
+        duplex_result = executor.submit(engine._get_duplex_control_client().execute, duplex, timeout=1)
         collective_result = executor.submit(engine.collective_rpc, "health", timeout=1)
         submitted_types = {request_q.get(timeout=1).type, request_q.get(timeout=1).type}
         assert submitted_types == {"append_duplex_input", "collective_rpc"}
@@ -421,7 +452,7 @@ def test_collective_and_duplex_results_share_router_without_swapping(mocker: Moc
         assert collective_result.result(timeout=1) == ["healthy"]
         assert duplex_result.result(timeout=1)["fence"] == fence
 
-    engine._rpc_result_router.close()
+    engine._correlated_rpc_client.close()
 
 
 def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixture):
@@ -441,7 +472,8 @@ def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixtu
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = RpcResultRouter(rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
     mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="blocked-rpc"))
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -461,63 +493,7 @@ def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixtu
         )
         assert pending.result(timeout=1) == ["healthy"]
 
-    engine._rpc_result_router.close()
-
-
-def _duplex_streaming_req_state(*, segment_finished: bool = True):
-    req_state = OrchestratorRequestState(request_id="req", final_stage_id=1)
-    req_state.streaming.enabled = True
-    req_state.streaming.segment_finished = segment_finished
-    req_state.streaming.bridge_states["duplex"] = {"session_id": "sid"}
-    return req_state
-
-
-def test_duplex_model_listen_segment_uses_raw_streaming_token_snapshot():
-    req_state = _duplex_streaming_req_state()
-    req_state.streaming.segment_token_ids = [151705]
-    req_state.streaming.segment_special_token_ids = {"listen_token_id": 151705}
-
-    output = SimpleNamespace(
-        outputs=[SimpleNamespace()],
-    )
-
-    assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
-
-
-@pytest.mark.parametrize("attr", ["token_ids", "cumulative_token_ids"])
-def test_duplex_model_listen_segment_does_not_use_output_level_history(attr):
-    req_state = _duplex_streaming_req_state()
-
-    output = SimpleNamespace(
-        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
-        outputs=[SimpleNamespace()],
-        **{attr: [42, 151705]},
-    )
-
-    assert not Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
-
-
-@pytest.mark.parametrize("attr", ["token_ids", "cumulative_token_ids"])
-def test_duplex_model_listen_segment_uses_completion_token_ids(attr):
-    req_state = _duplex_streaming_req_state()
-
-    output = SimpleNamespace(
-        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
-        outputs=[SimpleNamespace(**{attr: [42, 151705]})],
-    )
-
-    assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
-
-
-def test_duplex_model_listen_segment_uses_completion_stop_reason():
-    req_state = _duplex_streaming_req_state()
-
-    output = SimpleNamespace(
-        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
-        outputs=[SimpleNamespace(stop_reason=151705)],
-    )
-
-    assert Orchestrator._is_duplex_model_listen_segment(0, output, req_state)
+    engine._correlated_rpc_client.close()
 
 
 def test_open_duplex_session_raises_on_stage_control_error(mocker: MockerFixture):
@@ -537,7 +513,8 @@ def test_open_duplex_session_raises_on_stage_control_error(mocker: MockerFixture
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
-    engine._rpc_result_router = RpcResultRouter(rpc_q)
+    engine._correlated_rpc_client = CorrelatedRpcClient(request_q, rpc_q)
+    engine._duplex_control_client = None
     mocker.patch("vllm_omni.engine.async_omni_engine.uuid.uuid4", return_value=SimpleNamespace(hex="ctrl-error"))
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -546,7 +523,7 @@ def test_open_duplex_session_raises_on_stage_control_error(mocker: MockerFixture
         rpc_q.put(control_result)
         with pytest.raises(RuntimeError, match="duplex open failed"):
             pending.result(timeout=1)
-    engine._rpc_result_router.close()
+    engine._correlated_rpc_client.close()
 
 
 def test_shutdown_does_not_race_runtime_cleanup_with_live_orchestrator(mocker: MockerFixture):
@@ -557,7 +534,7 @@ def test_shutdown_does_not_race_runtime_cleanup_with_live_orchestrator(mocker: M
     engine.request_queue.sync_q.put.side_effect = queue.Full
     engine.output_queue = mocker.MagicMock()
     engine.rpc_output_queue = mocker.MagicMock()
-    engine._rpc_result_router = mocker.MagicMock()
+    engine._correlated_rpc_client = mocker.MagicMock()
     engine.orchestrator_thread = mocker.MagicMock()
     engine.orchestrator_thread.is_alive.return_value = True
     engine._runtime = mocker.MagicMock()
@@ -567,7 +544,7 @@ def test_shutdown_does_not_race_runtime_cleanup_with_live_orchestrator(mocker: M
     engine.request_queue.sync_q.put.assert_called_once()
     assert engine.request_queue.sync_q.put.call_args.kwargs["timeout"] > 0
     assert engine.orchestrator_thread.join.call_args_list[0].kwargs["timeout"] > 0
-    engine._rpc_result_router.close.assert_called_once_with()
+    engine._correlated_rpc_client.close.assert_called_once_with()
     engine.request_queue.close.assert_called_once_with()
     engine.output_queue.close.assert_called_once_with()
     engine.rpc_output_queue.close.assert_called_once_with()
@@ -581,7 +558,7 @@ def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixtur
     engine.request_queue = mocker.MagicMock()
     engine.output_queue = mocker.MagicMock()
     engine.rpc_output_queue = mocker.MagicMock()
-    engine._rpc_result_router = mocker.MagicMock()
+    engine._correlated_rpc_client = mocker.MagicMock()
     engine.orchestrator_thread = mocker.MagicMock()
     engine.orchestrator_thread.is_alive.side_effect = [True, False]
     engine._runtime = mocker.MagicMock()
@@ -614,7 +591,7 @@ def test_shutdown_defers_runtime_release_until_live_orchestrator_stops(mocker: M
     engine.request_queue = mocker.MagicMock()
     engine.output_queue = mocker.MagicMock()
     engine.rpc_output_queue = mocker.MagicMock()
-    engine._rpc_result_router = mocker.MagicMock()
+    engine._correlated_rpc_client = mocker.MagicMock()
     engine.orchestrator_thread = ControllableOrchestratorThread()
     engine._runtime = mocker.MagicMock()
     engine._runtime.shutdown.side_effect = runtime_released.set

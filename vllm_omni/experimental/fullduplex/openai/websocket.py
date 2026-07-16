@@ -78,7 +78,7 @@ class DuplexWebSocketActor:
     output_queue: asyncio.Queue[dict[str, object] | None] = field(default_factory=asyncio.Queue)
     mailbox: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
     outbound_protocol: Any | None = None
-    native_append_tasks: dict[asyncio.Task[None], DuplexAppendTaskMeta] = field(default_factory=dict)
+    native_append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
     active_response_task: asyncio.Task[None] | None = None
     closing: bool = False
     close_reason: str | None = None
@@ -145,7 +145,7 @@ class DuplexWebSocketActor:
 
     def track_append_task(
         self,
-        task: asyncio.Task[None],
+        task: asyncio.Task[bool],
         *,
         epoch: int,
         mode: str,

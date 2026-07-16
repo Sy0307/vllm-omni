@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import suppress
 from copy import deepcopy
 
@@ -10,6 +11,9 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import payload_turn_id
+from vllm_omni.experimental.fullduplex.minicpmo45.input import (
+    MiniCPMO45PcmAppendReservation,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     MiniCPMO45ServingSessionState,
 )
@@ -70,7 +74,7 @@ class DuplexSessionRunnerMixin:
                 session.mark_closing()
 
         event_emit_lock = asyncio.Lock()
-        native_append_tail: asyncio.Task[None] | None = None
+        native_append_tail: asyncio.Task[bool] | None = None
 
         async def emit_event(payload: dict[str, object]) -> None:
             async with event_emit_lock:
@@ -180,7 +184,15 @@ class DuplexSessionRunnerMixin:
                 return True
             return session.turn_state == DuplexTurnState.ASSISTANT_GENERATING
 
-        async def start_native_append(payload: object, *, final: bool, precreate_response: bool = False) -> None:
+        async def start_native_append(
+            payload: object,
+            *,
+            final: bool,
+            precreate_response: bool = False,
+            pcm_reservation: MiniCPMO45PcmAppendReservation | None = None,
+            operation_id: str | None = None,
+            retained_committed_payload: dict[str, object] | None = None,
+        ) -> asyncio.Task[bool] | None:
             nonlocal native_append_tail
             if session is None:
                 return
@@ -190,14 +202,13 @@ class DuplexSessionRunnerMixin:
                 append_turn_id = session.turn_id
             request_id = self._native_stage0_request_id(session, append_epoch)
             if final or precreate_response:
-                session.active_request_id = request_id
+                session.bind_request(request_id)
             if precreate_response:
-                session.active_response_turn_id = append_turn_id
+                session.bind_response_turn(append_turn_id)
             if final:
                 session.mark_assistant_generating()
             if precreate_response and session.active_response_id is None:
                 response_id = session.begin_response(turn_id=append_turn_id)
-                self._remember_response_conversation_mode(session, response_id)
                 await emit_event(
                     self._response_created_payload(
                         session,
@@ -205,33 +216,69 @@ class DuplexSessionRunnerMixin:
                         epoch=append_epoch,
                     )
                 )
+            precreated_response_id = session.active_response_id if precreate_response else None
 
-            async def _run() -> None:
+            async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
+                        operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
                         final=final,
                         send_json=emit_event,
                         mode="append_audio_chunk",
                         expected_epoch=append_epoch,
                     )
+                    if append_ok:
+                        if pcm_reservation is not None:
+                            pcm_reservation.commit()
+                        if (
+                            retained_committed_payload is not None
+                            and native.committed_audio_payload is retained_committed_payload
+                        ):
+                            native.committed_audio_payload = None
+                            native.committed_audio_operation_id = None
+                            native.deferred_response_create = False
+                    elif pcm_reservation is not None:
+                        pcm_reservation.rollback()
+                    if (
+                        not append_ok
+                        and precreated_response_id is not None
+                        and session.active_response_id == precreated_response_id
+                    ):
+                        session.end_response(commit_text=False)
+                        await emit_event(
+                            {
+                                "type": "response.done",
+                                "session_id": session.session_id,
+                                "response_id": precreated_response_id,
+                                "epoch": session.epoch,
+                                "committed": False,
+                                "status": "failed",
+                                "status_details": {
+                                    "type": "failed",
+                                    "reason": "runtime_append_failed",
+                                },
+                                "playback": session.playback.as_dict(),
+                            }
+                        )
                     if not append_ok and session.state == DuplexSessionState.CLOSED:
                         runtime_closed = True
-                        return
-                    if emitted_response and self._uses_native_input_append(session):
-                        native.audio_buffer.clear()
-                    elif not emitted_response and session.epoch == append_epoch:
+                        return False
+                    if not emitted_response and session.epoch == append_epoch:
                         if session.active_request_id == self._native_stage0_request_id(session, append_epoch):
-                            session.active_request_id = None
+                            session.clear_request(request_id)
                         if final:
                             await emit_event(
                                 self._turn_controller.signal(session, DuplexTurnEventType.USER_STARTED.value)
                             )
+                    return append_ok
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if pcm_reservation is not None:
+                        pcm_reservation.rollback()
                     logger.exception("Native duplex append task failed: %s", exc)
                     await self._send_runtime_error(emit_event, "runtime_append_task_failed", exc, session=session)
                     if session.state != DuplexSessionState.CLOSED:
@@ -250,20 +297,42 @@ class DuplexSessionRunnerMixin:
                                     "reason": "runtime_append_task_failed",
                                 }
                             )
+                    return False
 
-            async def _run_in_wire_order(predecessor: asyncio.Task[None] | None) -> None:
+            async def _run_in_wire_order(predecessor: asyncio.Task[bool] | None) -> bool:
                 if predecessor is not None:
                     try:
-                        await predecessor
+                        predecessor_ok = await predecessor
                     except asyncio.CancelledError:
                         current = asyncio.current_task()
                         if current is not None and current.cancelling():
                             raise
+                        predecessor_ok = False
                     except Exception:
-                        pass
-                await _run()
+                        predecessor_ok = False
+                    if not predecessor_ok:
+                        if pcm_reservation is not None:
+                            pcm_reservation.rollback()
+                        return False
+                if actor.closing or runtime_closed or session.state != DuplexSessionState.OPEN:
+                    if pcm_reservation is not None:
+                        pcm_reservation.rollback()
+                    return False
+                if pcm_reservation is not None and not pcm_reservation.active:
+                    return False
+                return await _run()
 
             predecessor = native_append_tail
+            if predecessor is not None and predecessor.done():
+                try:
+                    predecessor_ok = predecessor.result()
+                except (asyncio.CancelledError, Exception):
+                    predecessor_ok = False
+                if not predecessor_ok:
+                    # Appends already queued behind a failed predecessor keep
+                    # their captured dependency and stop. A later wire command
+                    # is an explicit retry and starts a new chain.
+                    predecessor = None
             task = asyncio.create_task(_run_in_wire_order(predecessor))
             native_append_tail = task
             actor.track_append_task(
@@ -276,6 +345,23 @@ class DuplexSessionRunnerMixin:
             # Let this wire-order effect start before the next mailbox event can
             # cancel it. Later native appends still serialize on predecessor.
             await asyncio.sleep(0)
+            return task
+
+        async def wait_for_native_append_tail() -> bool:
+            predecessor = native_append_tail
+            if predecessor is None:
+                return True
+            try:
+                return await predecessor
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                return False
+            except Exception:
+                # The append task already emitted its runtime error. Preserve
+                # wire order before the update path decides whether to continue.
+                return False
 
         async def start_runtime_append(
             payload: object,
@@ -359,7 +445,9 @@ class DuplexSessionRunnerMixin:
                     native.audio_buffer.clear()
                     native.input_since_commit = False
                     native.speech_since_commit = False
+                    native.clear_overlap_turn()
                     native.committed_audio_payload = None
+                    native.committed_audio_operation_id = None
                     native.deferred_response_create = False
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
@@ -416,7 +504,9 @@ class DuplexSessionRunnerMixin:
                     native.audio_buffer.clear()
                     native.input_since_commit = False
                     native.speech_since_commit = False
+                    native.clear_overlap_turn()
                     native.committed_audio_payload = None
+                    native.committed_audio_operation_id = None
                     native.deferred_response_create = False
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
@@ -442,7 +532,9 @@ class DuplexSessionRunnerMixin:
                     native.audio_buffer.clear()
                     native.input_since_commit = False
                     native.speech_since_commit = False
+                    native.clear_overlap_turn()
                     native.committed_audio_payload = None
+                    native.committed_audio_operation_id = None
                     native.deferred_response_create = False
                     cancelled = session.cancel_pending_input()
                     await emit_event(
@@ -508,7 +600,10 @@ class DuplexSessionRunnerMixin:
                     if event_type in {"input.cancel", "barge_in"}:
                         native.audio_buffer.clear()
                         native.input_since_commit = False
+                        native.speech_since_commit = False
+                        native.clear_overlap_turn()
                         native.committed_audio_payload = None
+                        native.committed_audio_operation_id = None
                         native.deferred_response_create = False
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
@@ -635,20 +730,36 @@ class DuplexSessionRunnerMixin:
                                     }
                                 )
                                 continue
-                            previous_config = deepcopy(session.config)
-                            update_error = self._apply_session_update(session, payload)
+                            if not await wait_for_native_append_tail():
+                                continue
+                            runtime_update_error = self._runtime_session_update_error(session, payload)
+                            if runtime_update_error is not None:
+                                await emit_event(runtime_update_error)
+                                continue
+                            previous_config = session.config
+                            candidate_config = deepcopy(previous_config)
+                            session.replace_config(candidate_config)
+                            try:
+                                update_error = self._apply_session_update(session, payload)
+                            finally:
+                                session.replace_config(previous_config)
                             if update_error is not None:
-                                session.config = previous_config
                                 await emit_event(update_error)
                                 continue
+                            candidate_runtime_config = self._runtime_config_for_session_update(
+                                session,
+                                candidate_config,
+                            )
                             if not await self._signal_runtime_session(
                                 session,
                                 turn_event,
                                 emit_event,
-                                session_config=session.config.as_dict(),
+                                session_config=candidate_config.as_dict(),
+                                runtime_config=candidate_runtime_config,
                             ):
-                                session.config = previous_config
                                 continue
+                            session.replace_config(candidate_config)
+                            session.replace_runtime_config(candidate_runtime_config)
                             await emit_event(
                                 {
                                     "type": "session.updated",
@@ -662,7 +773,7 @@ class DuplexSessionRunnerMixin:
                             message = self._realtime_item_to_history_message(item)
                             item_id = item.get("id") if isinstance(item, dict) else None
                             if message is not None:
-                                session.history.append(message)
+                                session.append_history_message(message)
                                 session.register_history_item(item_id if isinstance(item_id, str) else None, message)
                             await emit_event(
                                 {
@@ -811,6 +922,13 @@ class DuplexSessionRunnerMixin:
                                 session,
                                 event,
                             )
+                            if native.deferred_overlap_turn:
+                                native.reserve_overlap_turn(
+                                    session_turn_id=session.turn_id,
+                                    active_response_turn_id=session.active_response_turn_id,
+                                )
+                            else:
+                                native.clear_overlap_turn()
                         overlap_active = native.deferred_overlap_turn or (
                             not self._session_auto_responds(session) and native_response_in_progress()
                         )
@@ -828,7 +946,11 @@ class DuplexSessionRunnerMixin:
                             if action == "listen":
                                 buffer_overlap_audio = bool(decision.get("buffer_audio", True))
                                 defer_native_append = bool(decision.get("defer_runtime_append", True))
-                                if not buffer_overlap_audio and realtime_protocol is not None:
+                                if (
+                                    not buffer_overlap_audio
+                                    and realtime_protocol is not None
+                                    and decision.get("preserve_realtime_input") is not True
+                                ):
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=self._input_audio_duration_ms(event, payload)
                                     )
@@ -850,6 +972,7 @@ class DuplexSessionRunnerMixin:
                                 session.reset_overlap_speech()
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
+                                native.clear_overlap_turn()
                                 await actor.cancel_append_tasks()
                                 had_native_stream = native.data_plane_task is not None
                                 cancelled = await self._cancel_active_response(
@@ -958,8 +1081,9 @@ class DuplexSessionRunnerMixin:
                             event, payload, session=session
                         )
                         try:
-                            buffered_payload = native.audio_buffer.append(
+                            pcm_reservation = native.audio_buffer.prepare_append(
                                 payload,
+                                operation_id=uuid.uuid4().hex,
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                                 allow_emit=(
                                     not defer_native_append
@@ -976,32 +1100,58 @@ class DuplexSessionRunnerMixin:
                         except ValueError as exc:
                             await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
                             continue
-                        if buffered_payload is None:
+                        if pcm_reservation is None:
                             continue
-                        payload = buffered_payload
+                        payload = pcm_reservation.payload
                     else:
                         session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
                     if self._uses_native_input_append(session):
-                        await start_native_append(payload, final=False)
+                        await start_native_append(
+                            payload,
+                            final=False,
+                            pcm_reservation=pcm_reservation,
+                        )
                         continue
                     if session.capabilities.supports_input_append:
                         await start_runtime_append(payload, final=False, mode="append_audio_chunk")
                     continue
 
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
+                    realtime_item_id = event.get("realtime_item_id")
+                    committing_overlap_turn_id = (
+                        native.deferred_overlap_turn_id
+                        if event_type in {"input.commit", "input_audio_buffer.commit"}
+                        else None
+                    )
+                    realtime_validated_audio_commit = (
+                        event_type == "input_audio_buffer.commit"
+                        and isinstance(realtime_item_id, str)
+                        and bool(realtime_item_id)
+                    )
+                    if (
+                        self._uses_native_input_append(session)
+                        and event_type in {"input.commit", "input_audio_buffer.commit"}
+                        and not await wait_for_native_append_tail()
+                    ):
+                        continue
                     if event_type in {"input.commit", "input_audio_buffer.commit"}:
-                        native.deferred_overlap_turn = False
+                        native.clear_overlap_turn()
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
                         native.input_since_commit = False
                         native.speech_since_commit = False
                         native.audio_buffer.clear()
                         native.committed_audio_payload = None
+                        native.committed_audio_operation_id = None
                         native.deferred_response_create = False
                         await emit_event(
                             {
                                 "type": "input.committed",
                                 "session_id": session.session_id,
-                                "turn_id": session.turn_id,
+                                "turn_id": (
+                                    committing_overlap_turn_id
+                                    if committing_overlap_turn_id is not None
+                                    else session.turn_id
+                                ),
                                 "epoch": session.epoch,
                                 "empty": True,
                                 "is_speech": False,
@@ -1025,12 +1175,31 @@ class DuplexSessionRunnerMixin:
                     if event_type == "response.create":
                         response_payload = event.get("response")
                         if isinstance(response_payload, dict):
-                            self._apply_response_create_options(session, response_payload)
+                            response_options_error = self._apply_response_create_options(session, response_payload)
+                            if response_options_error is not None:
+                                error_message = (
+                                    "MiniCPM-o native duplex response.create does not support generation "
+                                    "overrides for instructions, voice, temperature, max tokens, tools, or "
+                                    "tool_choice."
+                                    if response_options_error == "unsupported_native_response_options"
+                                    else "response.create cannot reserve options while another response is active."
+                                )
+                                await emit_event(
+                                    {
+                                        "type": "error",
+                                        "session_id": session.session_id,
+                                        "epoch": session.epoch,
+                                        "code": response_options_error,
+                                        "error": error_message,
+                                    }
+                                )
+                                continue
                     if self._uses_native_input_append(session) and event_type == "input_audio_buffer.commit":
                         has_pending_native_audio = (
                             native.input_since_commit
                             or native.audio_buffer.has_pending()
                             or native.committed_audio_payload is not None
+                            or realtime_validated_audio_commit
                         )
                         if (
                             not has_pending_native_audio
@@ -1047,12 +1216,23 @@ class DuplexSessionRunnerMixin:
                                 }
                             )
                             continue
-                        if native_response_in_progress() and session.overlap_speech_ms > 0:
+                        waiting_input_commit_after_response = (
+                            self._session_auto_responds(session)
+                            and native.auto_response_waiting_for_speech
+                            and native.speech_since_commit
+                            and session.active_response_id is None
+                        )
+                        if (
+                            native_response_in_progress()
+                            and session.overlap_speech_ms > 0
+                            and not waiting_input_commit_after_response
+                        ):
                             if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
                                 native.audio_buffer.clear()
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
                                 native.committed_audio_payload = None
+                                native.committed_audio_operation_id = None
                                 native.deferred_response_create = False
                                 if realtime_protocol is not None:
                                     await realtime_protocol.discard_pending_input_audio(
@@ -1062,7 +1242,11 @@ class DuplexSessionRunnerMixin:
                                     {
                                         "type": "input.committed",
                                         "session_id": session.session_id,
-                                        "turn_id": session.turn_id,
+                                        "turn_id": (
+                                            committing_overlap_turn_id
+                                            if committing_overlap_turn_id is not None
+                                            else session.turn_id
+                                        ),
                                         "epoch": session.epoch,
                                         "empty": True,
                                         "is_speech": False,
@@ -1071,19 +1255,26 @@ class DuplexSessionRunnerMixin:
                                     }
                                 )
                                 session.reset_overlap_speech()
-                                session.config.extra_body.pop("realtime_response_conversation", None)
+                                session.discard_response_options()
                                 continue
 
-                            deferred_payload = native.audio_buffer.flush(
-                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000
+                            commit_reservation = native.audio_buffer.prepare_commit(
+                                operation_id=uuid.uuid4().hex,
+                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                             )
+                            deferred_payload = commit_reservation.payload
                             if deferred_payload is not None:
                                 if native.committed_audio_payload is not None:
                                     deferred_payload = self._merge_native_audio_payloads(
                                         native.committed_audio_payload,
                                         deferred_payload,
                                     )
+                                if committing_overlap_turn_id is not None:
+                                    deferred_payload = dict(deferred_payload)
+                                    deferred_payload["duplex_turn_id"] = committing_overlap_turn_id
                                 native.committed_audio_payload = deferred_payload
+                                native.committed_audio_operation_id = commit_reservation.operation_id
+                                commit_reservation.commit()
                                 native.deferred_response_create = should_create_response
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
@@ -1091,6 +1282,7 @@ class DuplexSessionRunnerMixin:
                                     session,
                                     realtime_item_id=event.get("realtime_item_id"),
                                     transcript=event.get("transcript"),
+                                    turn_id=committing_overlap_turn_id,
                                 )
                                 committed_payload = self._native_audio_committed_payload(
                                     session,
@@ -1107,9 +1299,11 @@ class DuplexSessionRunnerMixin:
                             and native.speech_since_commit
                             and session.active_response_id is None
                         ):
-                            committed_input = native.audio_buffer.commit(
-                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000
+                            commit_reservation = native.audio_buffer.prepare_commit(
+                                operation_id=uuid.uuid4().hex,
+                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                             )
+                            committed_input = commit_reservation.payload
                             final_payload = committed_input
                             if native.committed_audio_payload is not None:
                                 if final_payload is not None:
@@ -1119,15 +1313,22 @@ class DuplexSessionRunnerMixin:
                                     )
                                 else:
                                     final_payload = native.committed_audio_payload
-                                native.committed_audio_payload = None
-                                native.deferred_response_create = False
+                            commit_reservation.commit()
+                            native.committed_audio_payload = final_payload
+                            native.committed_audio_operation_id = commit_reservation.operation_id
+                            native.deferred_response_create = False
                             native.input_since_commit = False
                             native.speech_since_commit = False
-                            data_plane_turn_id = session.turn_id
+                            data_plane_turn_id = (
+                                committing_overlap_turn_id
+                                if committing_overlap_turn_id is not None
+                                else session.turn_id
+                            )
                             committed = self._commit_native_audio_input(
                                 session,
                                 realtime_item_id=event.get("realtime_item_id"),
                                 transcript=event.get("transcript"),
+                                turn_id=data_plane_turn_id,
                             )
                             await emit_event(
                                 self._native_audio_committed_payload(
@@ -1138,6 +1339,7 @@ class DuplexSessionRunnerMixin:
                                 )
                             )
                             if final_payload is not None:
+                                self._consume_auto_response_waiting_turn_payload(session, final_payload)
                                 await start_native_append(
                                     {
                                         **final_payload,
@@ -1145,6 +1347,8 @@ class DuplexSessionRunnerMixin:
                                     },
                                     final=True,
                                     precreate_response=False,
+                                    operation_id=commit_reservation.operation_id,
+                                    retained_committed_payload=final_payload,
                                 )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
@@ -1168,15 +1372,21 @@ class DuplexSessionRunnerMixin:
                                     "error": "response.create cannot start while another response is active.",
                                 }
                             )
-                            session.config.extra_body.pop("realtime_response_conversation", None)
+                            session.discard_response_options()
                             continue
                         if native.committed_audio_payload is not None:
                             committed_payload = native.committed_audio_payload
-                            native.committed_audio_payload = None
-                            native.input_since_commit = False
-                            native.speech_since_commit = False
-                            native.deferred_response_create = False
-                            await start_native_append(committed_payload, final=True, precreate_response=True)
+                            operation_id = native.committed_audio_operation_id
+                            if operation_id is None:
+                                operation_id = uuid.uuid4().hex
+                                native.committed_audio_operation_id = operation_id
+                            await start_native_append(
+                                committed_payload,
+                                final=True,
+                                precreate_response=True,
+                                operation_id=operation_id,
+                                retained_committed_payload=committed_payload,
+                            )
                             continue
                         await emit_event(
                             {
@@ -1187,11 +1397,21 @@ class DuplexSessionRunnerMixin:
                                 "error": "MiniCPM-o native duplex response.create requires committed audio input.",
                             }
                         )
-                        session.config.extra_body.pop("realtime_response_conversation", None)
+                        session.discard_response_options()
                         continue
                     if self._uses_native_input_append(session) and not native_response_in_progress():
-                        flushed = native.audio_buffer.flush(
-                            chunk_period_ms=session.capabilities.chunk_period_ms or 1000
+                        commit_reservation = (
+                            native.audio_buffer.prepare_commit(
+                                operation_id=uuid.uuid4().hex,
+                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                            )
+                            if event_type in {"input.commit", "input_audio_buffer.commit"}
+                            else None
+                        )
+                        flushed = (
+                            commit_reservation.payload
+                            if commit_reservation is not None
+                            else native.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
                         )
                         if native.committed_audio_payload is not None:
                             if flushed is not None:
@@ -1201,9 +1421,12 @@ class DuplexSessionRunnerMixin:
                                 )
                             else:
                                 flushed = native.committed_audio_payload
-                            native.committed_audio_payload = None
-                            native.deferred_response_create = False
+                        if commit_reservation is not None:
+                            commit_reservation.commit()
                         if flushed is not None:
+                            if committing_overlap_turn_id is not None:
+                                flushed = dict(flushed)
+                                flushed["duplex_turn_id"] = committing_overlap_turn_id
                             if self._should_force_listen_for_short_commit(session, event, flushed):
                                 flushed = dict(flushed)
                                 flushed["force_listen"] = True
@@ -1212,6 +1435,7 @@ class DuplexSessionRunnerMixin:
                                 session,
                                 realtime_item_id=event.get("realtime_item_id"),
                                 transcript=event.get("transcript"),
+                                turn_id=committing_overlap_turn_id,
                             )
                             await emit_event(
                                 self._native_audio_committed_payload(
@@ -1222,15 +1446,33 @@ class DuplexSessionRunnerMixin:
                                 )
                             )
                             if should_create_response:
-                                await start_native_append(flushed, final=True, precreate_response=True)
+                                native.committed_audio_payload = flushed
+                                native.committed_audio_operation_id = (
+                                    commit_reservation.operation_id
+                                    if commit_reservation is not None
+                                    else uuid.uuid4().hex
+                                )
+                                await start_native_append(
+                                    flushed,
+                                    final=True,
+                                    precreate_response=True,
+                                    operation_id=native.committed_audio_operation_id,
+                                    retained_committed_payload=flushed,
+                                )
                             else:
                                 native.committed_audio_payload = flushed
+                                native.committed_audio_operation_id = (
+                                    commit_reservation.operation_id
+                                    if commit_reservation is not None
+                                    else uuid.uuid4().hex
+                                )
                                 native.deferred_response_create = False
                             continue
                     native_had_uncommitted_audio = self._uses_native_input_append(session) and (
                         native.input_since_commit
                         or native.audio_buffer.has_pending()
                         or native.committed_audio_payload is not None
+                        or realtime_validated_audio_commit
                     )
                     committed = session.commit_user_input()
                     if self._uses_native_input_append(session) and event_type in {
@@ -1246,6 +1488,7 @@ class DuplexSessionRunnerMixin:
                                     session,
                                     realtime_item_id=event.get("realtime_item_id"),
                                     transcript=event.get("transcript"),
+                                    turn_id=committing_overlap_turn_id,
                                 )
                                 if native_had_uncommitted_audio
                                 else None

@@ -44,6 +44,16 @@ class TestRegistryDeclaration:
         assert pipeline.model_type == _PIPELINE_KEY
         assert pipeline.model_arch == "MiniCPMO45OmniForConditionalGeneration"
 
+    def test_native_duplex_control_is_explicit_and_server_limited(self) -> None:
+        pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
+        assert pipeline.duplex_control_enabled is True
+        assert pipeline.max_native_duplex_sessions == 1
+
+    def test_ordinary_pipeline_defaults_to_no_duplex_control(self) -> None:
+        pipeline = PipelineConfig(model_type="ordinary")
+        assert pipeline.duplex_control_enabled is False
+        assert pipeline.max_native_duplex_sessions is None
+
 
 class TestPipelineTopology:
     @pytest.fixture(scope="class")

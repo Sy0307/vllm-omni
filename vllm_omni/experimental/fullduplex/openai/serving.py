@@ -12,7 +12,13 @@ import numpy as np
 from fastapi import WebSocket
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex_runtime import duplex_resource_request_id
+from vllm_omni.engine.duplex_types import DuplexFence
+from vllm_omni.entrypoints.openai.duplex_capability import (
+    should_enable_duplex_endpoint,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
+    MiniCPMO45ClientRuntimeConfigError,
     MiniCPMO45NativeDuplexServingAdapter,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
@@ -38,6 +44,7 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSessionState,
     DuplexTurnController,
     DuplexTurnState,
+    ResponseCreateOptions,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
@@ -59,34 +66,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+__all__ = ["OmniDuplexSessionHandler", "should_enable_duplex_endpoint"]
+
 _DEFAULT_CONFIG_TIMEOUT_S = 10.0
 _DEFAULT_IDLE_TIMEOUT_S = 300.0
-
-
-def should_enable_duplex_endpoint(
-    stage_configs: list | None,
-    *,
-    config_path: str | None = None,
-) -> bool:
-    """Enable duplex routes only for deployments that explicitly opt in."""
-    if stage_configs:
-        for stage in stage_configs:
-            session_mode = (
-                stage.get("session_mode") if isinstance(stage, dict) else getattr(stage, "session_mode", None)
-            )
-            if session_mode == "duplex":
-                return True
-    if config_path:
-        try:
-            from omegaconf import OmegaConf
-
-            raw_config = OmegaConf.load(config_path)
-            session_mode = raw_config.get("session_mode") if hasattr(raw_config, "get") else None
-            if session_mode == "duplex":
-                return True
-        except Exception as exc:
-            logger.warning("Failed to inspect duplex session_mode from %s: %s", config_path, exc)
-    return False
 
 
 class OmniDuplexSessionHandler(
@@ -109,10 +92,16 @@ class OmniDuplexSessionHandler(
         chat_service: OmniOpenAIServingChat,
         config_timeout_s: float = _DEFAULT_CONFIG_TIMEOUT_S,
         idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
+        max_native_duplex_sessions: int | None = None,
     ) -> None:
         self._chat_service = chat_service
         self._config_timeout_s = config_timeout_s
         self._idle_timeout_s = idle_timeout_s
+        self._max_native_duplex_sessions = (
+            max_native_duplex_sessions
+            if max_native_duplex_sessions is not None and max_native_duplex_sessions > 0
+            else None
+        )
         self._registry = DuplexSessionRegistry(
             DuplexCapabilities(
                 supports_model_native_turn_policy=False,
@@ -126,7 +115,6 @@ class OmniDuplexSessionHandler(
         self._turn_controller = DuplexTurnController()
         self._minicpmo_data_plane = MiniCPMO45DataPlaneSession(self._encode_minicpmo_data_plane_audio)
         self._minicpmo_sessions: dict[str, MiniCPMO45ServingSessionState] = {}
-        self._response_conversation_modes: dict[str, str] = {}
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await self.handle_session(
@@ -163,7 +151,7 @@ class OmniDuplexSessionHandler(
                 session.mark_closing()
 
         if payload_type == "response.listen" and session is not None:
-            session.turn_state = DuplexTurnState.IDLE
+            session.transition_turn(DuplexTurnState.IDLE)
 
         if not is_terminal or session is None:
             return True, None
@@ -177,6 +165,20 @@ class OmniDuplexSessionHandler(
             "failed",
         }
         deferred_overlap_payload: dict[str, object] | None = None
+        realtime_input_still_open = (
+            can_promote_overlap
+            and realtime_protocol is not None
+            and native.input_since_commit
+            and not native.deferred_response_create
+        )
+        if realtime_input_still_open:
+            # response.done only closes the assistant response. It does not
+            # close the current Realtime input item. Latch its identity even
+            # when no later chunk has arrived yet, then buffer the remainder
+            # until input_audio_buffer.commit closes the complete item.
+            native.deferred_overlap_turn = True
+            session.reset_overlap_speech()
+            return True, None
         if can_promote_overlap and session.overlap_speech_ms > 0:
             has_deferred_overlap = native.audio_buffer.has_pending() or native.committed_audio_payload is not None
             should_promote_overlap = (
@@ -198,6 +200,7 @@ class OmniDuplexSessionHandler(
                     else:
                         deferred_overlap_payload = native.committed_audio_payload
                     native.committed_audio_payload = None
+                    native.committed_audio_operation_id = None
                 if self._session_auto_responds(session) and deferred_overlap_payload is not None:
                     deferred_overlap_payload = dict(deferred_overlap_payload)
                     deferred_overlap_payload["force_listen"] = False
@@ -212,6 +215,7 @@ class OmniDuplexSessionHandler(
                 native.input_since_commit = deferred_overlap_payload is not None
                 if realtime_protocol is not None:
                     native.committed_audio_payload = deferred_overlap_payload
+                    native.committed_audio_operation_id = None
                     native.deferred_response_create = True
                     deferred_overlap_payload = None
             else:
@@ -219,20 +223,23 @@ class OmniDuplexSessionHandler(
                 native.audio_buffer.clear()
                 native.input_since_commit = False
                 native.speech_since_commit = False
+                native.clear_overlap_turn()
                 if had_pending_overlap_audio and realtime_protocol is not None:
                     await realtime_protocol.discard_pending_input_audio(audio_end_ms=session.overlap_speech_ms)
                 if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
                     native.committed_audio_payload = None
+                    native.committed_audio_operation_id = None
                     native.deferred_response_create = False
 
         session.reset_overlap_speech()
         if can_promote_overlap and native.deferred_response_create and native.committed_audio_payload is not None:
             deferred_overlap_payload = native.committed_audio_payload
             native.committed_audio_payload = None
+            native.committed_audio_operation_id = None
             native.deferred_response_create = False
             native.input_since_commit = False
             native.speech_since_commit = False
-            native.deferred_overlap_turn = False
+            native.clear_overlap_turn()
         return True, deferred_overlap_payload
 
     @staticmethod
@@ -256,15 +263,12 @@ class OmniDuplexSessionHandler(
             playback=session.playback_for_response(response_id),
         )
 
-    def _remember_response_conversation_mode(self, session: DuplexSession, response_id: str) -> None:
-        mode = session.config.extra_body.pop("realtime_response_conversation", None)
-        if isinstance(mode, str):
-            self._response_conversation_modes[response_id] = mode.strip().lower()
-
-    def _should_commit_response_to_history(self, response_id: str | None) -> bool:
-        if response_id is None:
+    @staticmethod
+    def _should_commit_response_to_history(session: DuplexSession, response_id: str | None) -> bool:
+        if response_id is not None and response_id != session.active_response_id:
             return True
-        return self._response_conversation_modes.pop(response_id, "auto") != "none"
+        mode = session.response_config.extra_body.get("realtime_response_conversation")
+        return not isinstance(mode, str) or mode.strip().lower() != "none"
 
     def _response_created_payload(
         self,
@@ -274,24 +278,25 @@ class OmniDuplexSessionHandler(
         epoch: int,
         request_id: str | None = None,
     ) -> dict[str, object]:
+        response_config = session.response_config
         payload: dict[str, object] = {
             "type": "response.created",
             "session_id": session.session_id,
             "response_id": response_id,
             "epoch": epoch,
-            "modalities": list(session.config.modalities),
+            "modalities": list(response_config.modalities),
         }
         if request_id is not None:
             payload["request_id"] = request_id
-        metadata = session.config.extra_body.pop("realtime_response_metadata", None)
+        metadata = response_config.extra_body.get("realtime_response_metadata")
         if not isinstance(metadata, dict):
-            metadata = session.config.extra_body.get("realtime_metadata")
+            metadata = response_config.extra_body.get("realtime_metadata")
         if isinstance(metadata, dict):
             payload["metadata"] = dict(metadata)
-        conversation = session.config.extra_body.get("realtime_response_conversation")
+        conversation = response_config.extra_body.get("realtime_response_conversation")
         if isinstance(conversation, str):
             payload["conversation"] = conversation
-        prompt = session.config.extra_body.pop("realtime_response_prompt", None)
+        prompt = response_config.extra_body.get("realtime_response_prompt")
         if isinstance(prompt, dict):
             payload["prompt"] = dict(prompt)
         return payload
@@ -365,6 +370,7 @@ class OmniDuplexSessionHandler(
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": is_speech,
                 "defer_runtime_append": True,
+                "preserve_realtime_input": True,
             }
         if bool(event.get("force_listen", False)):
             session.reset_overlap_speech()
@@ -655,7 +661,13 @@ class OmniDuplexSessionHandler(
     ) -> bool:
         if not self._session_auto_responds(session):
             return False
-        if not self._minicpmo_session_state(session).auto_response_waiting_for_speech:
+        native = self._minicpmo_session_state(session)
+        if not native.auto_response_waiting_for_speech:
+            return False
+        if native.deferred_overlap_turn and native.input_since_commit:
+            # This chunk still belongs to the open Realtime input item that
+            # overlapped the previous response.  Preserve its silence as part
+            # of that item; only input_audio_buffer.commit may close it.
             return False
         if event.get("force_barge_in") is True:
             return False
@@ -683,6 +695,26 @@ class OmniDuplexSessionHandler(
             MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
         )
 
+    def _consume_auto_response_waiting_turn_payload(
+        self,
+        session: DuplexSession,
+        payload: dict[str, object],
+    ) -> bool:
+        """Attach the saved turn boundary to one complete input payload."""
+        if not self._session_auto_responds(session):
+            return False
+        native = self._minicpmo_session_state(session)
+        if not native.auto_response_waiting_for_speech:
+            return False
+        prefix_variant = native.auto_response_new_turn_prefix_variant
+        native.auto_response_waiting_for_speech = False
+        native.auto_response_new_turn_prefix_variant = None
+        payload["force_listen"] = False
+        if prefix_variant:
+            payload.setdefault("new_user_turn_prefix_variant", prefix_variant)
+        payload["new_user_turn"] = True
+        return True
+
     def _mark_auto_response_new_user_turn_payload(
         self,
         session: DuplexSession,
@@ -702,14 +734,15 @@ class OmniDuplexSessionHandler(
             )
             native.auto_response_new_turn_prefix_variant = None
         else:
+            if native.deferred_overlap_turn and native.input_since_commit:
+                return False
             if not native.auto_response_waiting_for_speech:
                 return False
             if self._assistant_playback_active(session):
                 return False
             if not self._input_looks_like_speech(event, payload, session=session):
                 return False
-            prefix_variant = native.auto_response_new_turn_prefix_variant
-            native.auto_response_new_turn_prefix_variant = None
+            return self._consume_auto_response_waiting_turn_payload(session, payload)
         native.auto_response_waiting_for_speech = False
         payload["force_listen"] = False
         if prefix_variant:
@@ -835,16 +868,20 @@ class OmniDuplexSessionHandler(
         if config.idle_timeout_s == _DEFAULT_IDLE_TIMEOUT_S:
             config.idle_timeout_s = self._idle_timeout_s
         use_minicpmo45_native = self._use_minicpmo45_native_duplex(config)
+        runtime_config: dict[str, object] = {}
         if use_minicpmo45_native:
             try:
-                await MiniCPMO45NativeDuplexServingAdapter.prepare_session_config(
+                runtime_config = await MiniCPMO45NativeDuplexServingAdapter.prepare_runtime_config(
                     config,
                     model_config=getattr(self._chat_service, "model_config", None),
                 )
+            except MiniCPMO45ClientRuntimeConfigError as exc:
+                await send_json({"type": "error", "error": str(exc), "code": "invalid_duplex_runtime_config"})
+                return None
             except ValueError as exc:
                 await send_json({"type": "error", "error": str(exc), "code": "unsupported_ref_audio_path"})
                 return None
-        max_sessions = self._max_duplex_sessions(config)
+        max_sessions = self._max_duplex_sessions()
         if max_sessions is not None and self._registry.active_count() >= max_sessions:
             await send_json(
                 {
@@ -859,20 +896,45 @@ class OmniDuplexSessionHandler(
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
         session = self._registry.create(config=config, session_id=session_id)
         if use_minicpmo45_native:
-            session.capabilities = DuplexCapabilities.minicpmo45_native()
+            session.replace_capabilities(DuplexCapabilities.minicpmo45_native())
+            session.replace_runtime_config(runtime_config)
         return session
 
-    @staticmethod
-    def _max_duplex_sessions(config: DuplexSessionConfig) -> int | None:
-        raw = config.extra_body.get("max_duplex_sessions") or config.extra_body.get("duplex_max_sessions")
-        try:
-            value = int(raw)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
+    def _max_duplex_sessions(self) -> int | None:
+        return self._max_native_duplex_sessions
 
     def _use_minicpmo45_native_duplex(self, config: DuplexSessionConfig) -> bool:
         return MiniCPMO45NativeDuplexServingAdapter.is_enabled(config)
+
+    def _runtime_session_update_error(
+        self,
+        session: DuplexSession,
+        payload: dict[str, object],
+    ) -> dict[str, object] | None:
+        if not self._uses_native_input_append(session):
+            return None
+        try:
+            MiniCPMO45NativeDuplexServingAdapter.validate_client_extra_body(payload.get("extra_body"))
+        except MiniCPMO45ClientRuntimeConfigError as exc:
+            return {
+                "type": "error",
+                "session_id": session.session_id,
+                "code": "invalid_duplex_runtime_config",
+                "error": str(exc),
+            }
+        return None
+
+    def _runtime_config_for_session_update(
+        self,
+        session: DuplexSession,
+        candidate_config: DuplexSessionConfig,
+    ) -> dict[str, object]:
+        if not self._uses_native_input_append(session):
+            return dict(session.runtime_config)
+        return MiniCPMO45NativeDuplexServingAdapter.runtime_config_for_update(
+            candidate_config,
+            dict(session.runtime_config),
+        )
 
     @staticmethod
     def _uses_native_input_append(session: DuplexSession) -> bool:
@@ -882,13 +944,15 @@ class OmniDuplexSessionHandler(
         )
 
     @staticmethod
-    def _is_minicpmo45_model(model: str) -> bool:
-        normalized = model.lower().replace("_", "-")
-        return "minicpm-o-4-5" in normalized or "minicpmo-4-5" in normalized or "minicpmo45" in normalized
-
-    @staticmethod
     def _native_stage0_request_id(session: DuplexSession, epoch: int) -> str:
-        return f"duplex-{session.session_id}-e{epoch}-stage0"
+        return duplex_resource_request_id(
+            DuplexFence(
+                session.session_id,
+                epoch=epoch,
+                incarnation=session.incarnation,
+            ),
+            "stage0",
+        )
 
     @staticmethod
     def _session_auto_responds(session: DuplexSession) -> bool:
@@ -948,9 +1012,13 @@ class OmniDuplexSessionHandler(
         *,
         realtime_item_id: object | None = None,
         transcript: object | None = None,
+        turn_id: int | None = None,
     ) -> DuplexCommittedInput:
         clean_transcript = transcript.strip() if isinstance(transcript, str) else None
-        committed = session.commit_native_audio_input(transcript=clean_transcript or None)
+        committed = session.commit_native_audio_input(
+            transcript=clean_transcript or None,
+            turn_id=turn_id,
+        )
         if isinstance(realtime_item_id, str) and realtime_item_id:
             session.register_history_item(realtime_item_id, committed.message)
         return committed
@@ -1130,37 +1198,46 @@ class OmniDuplexSessionHandler(
         return None
 
     @staticmethod
-    def _apply_response_create_options(session: DuplexSession, payload: dict[str, object]) -> None:
-        """Apply per-response Realtime options to the next duplex response.
-
-        OpenAI Realtime lets ``response.create`` override a subset of session
-        fields for the requested response. vLLM-Omni still stores those knobs
-        on the session config before scheduling the next response because the
-        downstream chat/native paths read a single config object.
-        """
-        if isinstance(payload.get("instructions"), str):
-            session.config.instructions = str(payload["instructions"])
+    def _apply_response_create_options(session: DuplexSession, payload: dict[str, object]) -> str | None:
+        """Reserve options that apply only to the next response lifecycle."""
         audio_config = payload.get("audio")
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
+        if session.capabilities.implementation_level == "model_native_duplex":
+            nested_voice = audio_output.get("voice") if isinstance(audio_output, dict) else None
+            unsupported = (
+                payload.get("instructions") is not None
+                or payload.get("voice") is not None
+                or nested_voice is not None
+                or payload.get("temperature") is not None
+                or any(
+                    payload.get(field_name) is not None
+                    for field_name in ("max_response_output_tokens", "max_output_tokens", "max_tokens")
+                )
+                or payload.get("tools") is not None
+                or payload.get("tool_choice") is not None
+            )
+            if unsupported:
+                return "unsupported_native_response_options"
+
+        instructions = str(payload["instructions"]) if isinstance(payload.get("instructions"), str) else None
         voice = payload.get("voice")
         if not isinstance(voice, str) and isinstance(audio_output, dict):
             voice = audio_output.get("voice")
-        if isinstance(voice, str):
-            session.config.voice = str(voice)
+        voice = str(voice) if isinstance(voice, str) else None
         response_format = payload.get("output_audio_format") or payload.get("response_format")
         if response_format is None and isinstance(audio_config, dict):
             if isinstance(audio_output, dict):
                 response_format = audio_output.get("format")
         response_format, _ = NativeRealtimeSessionProtocol._parse_realtime_audio_format(response_format)
         if isinstance(response_format, str) and response_format.lower() in REALTIME_OUTPUT_AUDIO_FORMATS:
-            session.config.response_format = NativeRealtimeSessionProtocol._duplex_response_format(response_format)
-        if isinstance(payload.get("temperature"), int | float):
-            session.config.temperature = float(payload["temperature"])
+            response_format = NativeRealtimeSessionProtocol._duplex_response_format(response_format)
+        else:
+            response_format = None
+        temperature = float(payload["temperature"]) if isinstance(payload.get("temperature"), int | float) else None
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
-        if isinstance(speed, int | float):
-            session.config.speed = float(speed)
+        speed = float(speed) if isinstance(speed, int | float) else None
         max_tokens = (
             payload.get("max_response_output_tokens")
             if "max_response_output_tokens" in payload
@@ -1169,28 +1246,54 @@ class OmniDuplexSessionHandler(
             else payload.get("max_tokens")
         )
         if "max_response_output_tokens" in payload or "max_output_tokens" in payload or "max_tokens" in payload:
-            session.config.max_tokens = NativeRealtimeSessionProtocol.realtime_max_output_tokens(max_tokens)
+            max_tokens = NativeRealtimeSessionProtocol.realtime_max_output_tokens(max_tokens)
+        else:
+            max_tokens = None
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
-            session.config.modalities = list(modalities)
+            modalities = tuple(modalities)
+        else:
+            modalities = None
+        response_extra: dict[str, object] = {}
         conversation = payload.get("conversation")
         if isinstance(conversation, str):
-            session.config.extra_body["realtime_response_conversation"] = conversation
-        elif "conversation" in payload and conversation is None:
-            session.config.extra_body.pop("realtime_response_conversation", None)
+            response_extra["realtime_response_conversation"] = conversation
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            session.config.extra_body["realtime_response_metadata"] = dict(metadata)
+            response_extra["realtime_response_metadata"] = dict(metadata)
         prompt = payload.get("prompt")
         if isinstance(prompt, dict):
-            session.config.extra_body["realtime_response_prompt"] = dict(prompt)
+            response_extra["realtime_response_prompt"] = dict(prompt)
         if isinstance(payload.get("tools"), list):
-            session.config.extra_body["realtime_response_tools"] = payload["tools"]
+            response_extra["realtime_response_tools"] = payload["tools"]
         if isinstance(payload.get("tool_choice"), str | dict):
-            session.config.extra_body["realtime_response_tool_choice"] = payload["tool_choice"]
+            response_extra["realtime_response_tool_choice"] = payload["tool_choice"]
         extra_body = payload.get("extra_body")
         if isinstance(extra_body, dict):
-            session.config.extra_body.update(extra_body)
+            if session.capabilities.implementation_level == "model_native_duplex":
+                response_extra.update(
+                    (key, value)
+                    for key, value in extra_body.items()
+                    if key not in MiniCPMO45NativeDuplexServingAdapter.PRIVATE_RUNTIME_CONFIG_KEYS
+                )
+            else:
+                response_extra.update(extra_body)
+        try:
+            session.reserve_response_options(
+                ResponseCreateOptions(
+                    instructions=instructions,
+                    voice=voice,
+                    response_format=response_format,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    speed=speed,
+                    modalities=modalities,
+                    extra_body=response_extra,
+                )
+            )
+        except RuntimeError:
+            return "response_already_active"
+        return None
 
     @staticmethod
     def _realtime_item_to_history_message(item: object) -> dict[str, object] | None:
@@ -1350,7 +1453,7 @@ class OmniDuplexSessionHandler(
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
         committed_message = session.end_response(
-            commit_text=self._should_commit_response_to_history(old_response_id),
+            commit_text=self._should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
         )
         if old_response_id is not None:

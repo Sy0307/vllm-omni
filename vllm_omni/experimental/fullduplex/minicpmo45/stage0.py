@@ -89,11 +89,13 @@ class MiniCPMO45Stage0DuplexRuntime:
         self,
         state: _MiniCPMO45Stage0SessionState,
         session_config: dict[str, Any],
+        *,
+        runtime_config: dict[str, Any] | None = None,
     ) -> None:
         if not self._stage_runtime_ready():
             return
         self._require_special_token_ids()
-        ref_audio = self._decode_ref_audio_from_session_config(session_config)
+        ref_audio = self._decode_ref_audio_from_session_config(runtime_config or {})
         # Matches MiniCPMODuplex.prepare() in the released checkpoint's
         # modeling_minicpmo.py: the <|audio_start|>/<|audio_end|> markers are
         # only present when reference audio is embedded between them. The
@@ -414,7 +416,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _decode_ref_audio_from_session_config(session_config: dict[str, Any]) -> Any | None:
         from vllm_omni.experimental.fullduplex.minicpmo45.input import decode_native_ref_audio_from_config
 
-        return decode_native_ref_audio_from_config(session_config)
+        return decode_native_ref_audio_from_config({"extra_body": session_config})
 
     def _stage_ref_audio_embeddings(
         self,

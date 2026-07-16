@@ -270,6 +270,15 @@ class PipelineConfig:
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Optional model-owned duplex planner loaded by the stable engine runtime.
+    duplex_runtime_extension: str | None = None
+    # Explicitly enable the stable duplex control mechanism. This is separate
+    # from the optional model extension because turn-commit-only deployments
+    # do not require a model planner.
+    duplex_control_enabled: bool = False
+    # Server-owned native duplex admission limit. Client session payloads must
+    # not be able to raise or disable this capacity boundary.
+    max_native_duplex_sessions: int | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""

@@ -23,9 +23,10 @@ joyvl/      JoyVL model-specific integration
 web/        MiniCPM browser demo and WebSocket proxy
 ```
 
-MiniCPM does not run through `core.DuplexRuntime`. Its active path uses the
-`openai` session controller, the `engine` compatibility adapter, the standard
-orchestrator/model runners, and the model-specific `minicpmo45` helpers.
+MiniCPM does not run through the removed experimental `core.DuplexRuntime`
+facade. Its active path uses the `openai` session controller, the stable engine
+duplex contract, the standard scheduler/model runners, and an injected
+MiniCPM-specific runtime extension from `minicpmo45/runtime.py`.
 
 ## Browser demo
 
