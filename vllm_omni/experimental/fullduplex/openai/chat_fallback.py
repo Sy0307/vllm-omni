@@ -19,10 +19,9 @@ class ChatFallbackProjectorMixin:
 
     async def _run_response(self, session: DuplexSession, send_json) -> None:
         response_id = session.begin_response()
-        self._remember_response_conversation_mode(session, response_id)
         epoch = session.epoch
         request_id = f"duplex-{session.session_id}-{epoch}-{session.input_commit_seq}"
-        session.active_request_id = f"chatcmpl-{request_id}"
+        session.bind_request(f"chatcmpl-{request_id}")
         await send_json(
             self._response_created_payload(
                 session,
@@ -44,7 +43,7 @@ class ChatFallbackProjectorMixin:
             else:
                 await self._emit_full_response(session, result, epoch, response_id, send_json)
             if session.epoch == epoch:
-                should_commit = self._should_commit_response_to_history(response_id)
+                should_commit = self._should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit)
                 if should_commit:
                     session.register_history_item(f"item_{response_id}", committed_message)
@@ -74,29 +73,46 @@ class ChatFallbackProjectorMixin:
             )
 
     def _build_chat_request(self, session: DuplexSession, request_id: str) -> ChatCompletionRequest:
+        response_config = session.response_config
         messages: list[dict[str, object]] = []
-        if session.config.instructions:
-            messages.append({"role": "system", "content": session.config.instructions})
+        if response_config.instructions:
+            messages.append({"role": "system", "content": response_config.instructions})
         messages.extend(session.history)
 
         kwargs: dict[str, Any] = {
-            "model": session.config.model or self._chat_service.model_config.model,
+            "model": response_config.model or self._chat_service.model_config.model,
             "messages": messages,
             "stream": True,
         }
-        if session.config.temperature is not None:
-            kwargs["temperature"] = session.config.temperature
-        if session.config.max_tokens is not None:
-            kwargs["max_tokens"] = session.config.max_tokens
-        kwargs.update(session.config.extra_body)
+        if response_config.temperature is not None:
+            kwargs["temperature"] = response_config.temperature
+        if response_config.max_tokens is not None:
+            kwargs["max_tokens"] = response_config.max_tokens
+        model_extra = dict(response_config.extra_body)
+        tools = model_extra.pop("realtime_response_tools", model_extra.pop("realtime_tools", None))
+        tool_choice = model_extra.pop(
+            "realtime_response_tool_choice",
+            model_extra.pop("realtime_tool_choice", None),
+        )
+        for protocol_key in (
+            "realtime_response_conversation",
+            "realtime_response_metadata",
+            "realtime_response_prompt",
+        ):
+            model_extra.pop(protocol_key, None)
+        kwargs.update(model_extra)
+        if isinstance(tools, list):
+            kwargs["tools"] = tools
+        if isinstance(tool_choice, str | dict):
+            kwargs["tool_choice"] = tool_choice
 
         request = ChatCompletionRequest(**kwargs)
-        object.__setattr__(request, "modalities", session.config.modalities)
+        object.__setattr__(request, "modalities", response_config.modalities)
         object.__setattr__(request, "request_id", request_id)
         object.__setattr__(
             request,
             "chat_template_kwargs",
-            {"use_tts_template": session.config.use_tts_template},
+            {"use_tts_template": response_config.use_tts_template},
         )
         return request
 
@@ -207,7 +223,7 @@ class ChatFallbackProjectorMixin:
                             "response_id": response_id,
                             "epoch": epoch,
                             "audio": content,
-                            "format": session.config.response_format,
+                            "format": session.response_config.response_format,
                         }
                     )
                 else:

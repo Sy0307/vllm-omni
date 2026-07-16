@@ -35,24 +35,24 @@ from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.duplex_control_client import DuplexControlClient
+from vllm_omni.engine.duplex_runtime import (
+    load_duplex_runtime_extension,
+    validate_duplex_runtime_extension,
+)
 from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
-    AppendDuplexInputMessage,
-    CloseDuplexSessionMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
-    DuplexControlResultMessage,
     EngineQueueMessage,
     ErrorMessage,
-    OpenDuplexSessionMessage,
     ShutdownRequestMessage,
-    SignalDuplexTurnMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
-from vllm_omni.engine.rpc_result_router import RpcCorrelationKey, RpcResultRouter
+from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
@@ -183,7 +183,7 @@ def _weak_shutdown_async_omni_engine(
     request_queue: janus.Queue[EngineQueueMessage] | None,
     output_queue: janus.Queue[EngineQueueMessage] | None,
     rpc_output_queue: janus.Queue[EngineQueueMessage] | None,
-    rpc_result_router: RpcResultRouter | None,
+    rpc_client: CorrelatedRpcClient | None,
 ) -> None:
     """Best-effort orchestrator cleanup for GC finalization."""
     request_queue_closed = False
@@ -198,8 +198,8 @@ def _weak_shutdown_async_omni_engine(
         except Exception:
             pass
 
-    if rpc_result_router is not None:
-        rpc_result_router.close()
+    if rpc_client is not None:
+        rpc_client.close()
 
     try:
         if orchestrator_thread is not None and orchestrator_thread.is_alive():
@@ -342,10 +342,18 @@ class AsyncOmniEngine:
         # restriction beforehand. TODO (Alex) make this cleaner and refactor
         # stage config resolution to remove kwargs hacks.
         deploy_config_path = kwargs.get("deploy_config")
-        self.endpoint_restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(
+        pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
             trust_remote_code=trust_remote_code,
             deploy_config_path=deploy_config_path,
+        )
+        self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        self._duplex_runtime_extension_path = (
+            pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
+        )
+        self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
+        self.max_native_duplex_sessions = (
+            pipeline_config.max_native_duplex_sessions if pipeline_config is not None else None
         )
 
         kwargs["trust_remote_code"] = trust_remote_code
@@ -375,7 +383,8 @@ class AsyncOmniEngine:
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
-        self._rpc_result_router: RpcResultRouter | None = None
+        self._correlated_rpc_client: CorrelatedRpcClient | None = None
+        self._duplex_control_client: DuplexControlClient | None = None
         self._running_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
@@ -394,7 +403,10 @@ class AsyncOmniEngine:
         )
         self.orchestrator_thread.start()
         self._wait_for_orchestrator_init(startup_future, startup_timeout)
-        self._rpc_result_router = RpcResultRouter(self.rpc_output_queue.sync_q)
+        self._correlated_rpc_client = CorrelatedRpcClient(
+            self.request_queue.sync_q,
+            self.rpc_output_queue.sync_q,
+        )
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self._weak_finalizer = weakref.finalize(
@@ -404,7 +416,7 @@ class AsyncOmniEngine:
             self.request_queue,
             self.output_queue,
             self.rpc_output_queue,
-            self._rpc_result_router,
+            self._correlated_rpc_client,
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
@@ -497,6 +509,14 @@ class AsyncOmniEngine:
             pd_config = self._detect_pd_config()
 
             membership_controller = self._runtime.create_membership_controller()
+            duplex_runtime_extension = load_duplex_runtime_extension(
+                getattr(self, "_duplex_runtime_extension_path", None)
+            )
+            if duplex_runtime_extension is not None:
+                validate_duplex_runtime_extension(
+                    duplex_runtime_extension,
+                    sampling_defaults=tuple(pool.stage_client.default_sampling_params for pool in self.stage_pools),
+                )
 
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
@@ -510,6 +530,8 @@ class AsyncOmniEngine:
                 transfer_emitter=self._transfer_emitter,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
+                duplex_runtime_extension=duplex_runtime_extension,
+                enable_duplex_control=self._duplex_control_enabled,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -1502,19 +1524,18 @@ class AsyncOmniEngine:
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
         fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Open an engine-level duplex session."""
-        return self._duplex_control(
-            OpenDuplexSessionMessage(
-                control_id=uuid.uuid4().hex,
-                fence=fence,
-                session_id=session_id,
-                session_mode=session_mode,
-                capabilities=dict(capabilities or {}),
-                session_config=dict(session_config or {}),
-            ),
+        return self._get_duplex_control_client().open(
+            session_id,
+            session_mode=session_mode,
+            capabilities=capabilities,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            fence=fence,
             timeout=timeout,
         )
 
@@ -1525,6 +1546,7 @@ class AsyncOmniEngine:
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
         fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
@@ -1537,6 +1559,7 @@ class AsyncOmniEngine:
                 session_mode=session_mode,
                 capabilities=capabilities,
                 session_config=session_config,
+                runtime_config=runtime_config,
                 fence=fence,
                 timeout=timeout,
             ),
@@ -1548,25 +1571,21 @@ class AsyncOmniEngine:
         *,
         mode: str,
         payload: object,
+        operation_id: str | None = None,
         final: bool = False,
         expected_epoch: int | None = None,
         fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Append input to an engine-level duplex session."""
-        message_fence = fence
-        if expected_epoch is not None and expected_epoch != message_fence.epoch:
-            raise ValueError("expected_epoch must match fence.epoch")
-        return self._duplex_control(
-            AppendDuplexInputMessage(
-                control_id=uuid.uuid4().hex,
-                fence=message_fence,
-                session_id=session_id,
-                expected_epoch=expected_epoch,
-                mode=mode,
-                payload=payload,
-                final=final,
-            ),
+        return self._get_duplex_control_client().append(
+            session_id,
+            mode=mode,
+            payload=payload,
+            operation_id=operation_id,
+            final=final,
+            expected_epoch=expected_epoch,
+            fence=fence,
             timeout=timeout,
         )
 
@@ -1576,6 +1595,7 @@ class AsyncOmniEngine:
         *,
         mode: str,
         payload: object,
+        operation_id: str | None = None,
         final: bool = False,
         expected_epoch: int | None = None,
         fence: DuplexFence,
@@ -1589,6 +1609,7 @@ class AsyncOmniEngine:
                 session_id,
                 mode=mode,
                 payload=payload,
+                operation_id=operation_id,
                 final=final,
                 expected_epoch=expected_epoch,
                 fence=fence,
@@ -1604,18 +1625,17 @@ class AsyncOmniEngine:
         fence: DuplexFence,
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Signal an engine-level duplex turn."""
-        return self._duplex_control(
-            SignalDuplexTurnMessage(
-                control_id=uuid.uuid4().hex,
-                fence=fence,
-                session_id=session_id,
-                event=event,
-                next_fence=next_fence,
-                session_config=dict(session_config) if session_config is not None else None,
-            ),
+        return self._get_duplex_control_client().signal(
+            session_id,
+            event=event,
+            fence=fence,
+            next_fence=next_fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
             timeout=timeout,
         )
 
@@ -1627,6 +1647,7 @@ class AsyncOmniEngine:
         fence: DuplexFence,
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Async wrapper for signaling a duplex turn."""
@@ -1639,6 +1660,7 @@ class AsyncOmniEngine:
                 fence=fence,
                 next_fence=next_fence,
                 session_config=session_config,
+                runtime_config=runtime_config,
                 timeout=timeout,
             ),
         )
@@ -1652,15 +1674,25 @@ class AsyncOmniEngine:
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Close an engine-level duplex session."""
-        return self._duplex_control(
-            CloseDuplexSessionMessage(
-                control_id=uuid.uuid4().hex,
-                fence=fence,
-                session_id=session_id,
-                reason=reason,
-            ),
+        return self._get_duplex_control_client().close(
+            session_id,
+            reason=reason,
+            fence=fence,
             timeout=timeout,
         )
+
+    def _get_duplex_control_client(self) -> DuplexControlClient:
+        client = getattr(self, "_duplex_control_client", None)
+        if client is None:
+            transport = getattr(self, "_correlated_rpc_client", None)
+            if transport is None:
+                raise RuntimeError("correlated RPC client is not initialized")
+            client = DuplexControlClient(
+                transport,
+                control_id_factory=lambda: uuid.uuid4().hex,
+            )
+            self._duplex_control_client = client
+        return client
 
     async def close_duplex_session_async(
         self,
@@ -1676,69 +1708,6 @@ class AsyncOmniEngine:
             None,
             lambda: self.close_duplex_session(session_id, reason=reason, fence=fence, timeout=timeout),
         )
-
-    def _duplex_control(
-        self,
-        msg: OpenDuplexSessionMessage | AppendDuplexInputMessage | SignalDuplexTurnMessage | CloseDuplexSessionMessage,
-        *,
-        timeout: float | None,
-    ) -> dict[str, object]:
-        if self.request_queue is None:
-            raise RuntimeError("request_queue is not initialized")
-        if self.rpc_output_queue is None:
-            raise RuntimeError("rpc_output_queue is not initialized")
-
-        result_msg = self._submit_rpc_and_wait(
-            ("duplex", msg.control_id),
-            msg,
-            timeout=timeout,
-            timeout_message=f"duplex control timed out after {timeout} seconds",
-        )
-        if not isinstance(result_msg, DuplexControlResultMessage):
-            raise RuntimeError(f"unexpected duplex control result type: {type(result_msg).__name__}")
-        if result_msg.fence != msg.fence:
-            raise RuntimeError(f"duplex control fence mismatch: expected {msg.fence!r}, got {result_msg.fence!r}")
-
-        result = {
-            "fence": result_msg.fence,
-            "operation": result_msg.operation,
-            "session_id": result_msg.session_id,
-            "ok": result_msg.ok,
-            "stage_results": list(result_msg.stage_results),
-            "unsupported_count": result_msg.unsupported_count,
-            "error_count": result_msg.error_count,
-        }
-        if result_msg.error_count:
-            raise RuntimeError(f"duplex {result_msg.operation} failed: {result}")
-        return result
-
-    def _submit_rpc_and_wait(
-        self,
-        key: RpcCorrelationKey,
-        msg: EngineQueueMessage,
-        *,
-        timeout: float | None,
-        timeout_message: str,
-        block_on_submit: bool = False,
-    ) -> EngineQueueMessage:
-        router = self._rpc_result_router
-        if router is None:
-            raise RuntimeError("RPC result router is not initialized")
-        waiter = router.register(key)
-        try:
-            if block_on_submit:
-                self.request_queue.sync_q.put(msg)
-            else:
-                self.request_queue.sync_q.put_nowait(msg)
-            try:
-                result_msg = waiter.get(timeout=timeout)
-            except queue.Empty as exc:
-                raise TimeoutError(timeout_message) from exc
-            if isinstance(result_msg, ErrorMessage):
-                raise RuntimeError(result_msg.error)
-            return result_msg
-        finally:
-            router.unregister(key, waiter)
 
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
         """Read one output message from the Orchestrator output queue."""
@@ -1795,7 +1764,10 @@ class AsyncOmniEngine:
             stage_ids=stage_ids,
         )
 
-        result_msg = self._submit_rpc_and_wait(
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+        result_msg = transport.execute(
             ("collective", rpc_id),
             msg,
             timeout=timeout,
@@ -1857,11 +1829,11 @@ class AsyncOmniEngine:
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to close the request queue")
 
-        if self._rpc_result_router is not None:
+        if self._correlated_rpc_client is not None:
             try:
-                self._rpc_result_router.close()
+                self._correlated_rpc_client.close()
             except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to close RPC result router")
+                logger.exception("[AsyncOmniEngine] Failed to close correlated RPC client")
 
         orchestrator_stopped = False
         try:

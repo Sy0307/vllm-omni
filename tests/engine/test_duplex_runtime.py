@@ -1,10 +1,18 @@
-import pytest
+from types import SimpleNamespace
 
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.omni import (
+import pytest
+from vllm.sampling_params import SamplingParams
+
+from vllm_omni.engine import duplex_runtime
+from vllm_omni.engine.duplex_runtime import (
     DuplexInputMode,
+    DuplexOutputAction,
+    DuplexOutputDecision,
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeManager,
+)
+from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.omni import (
     build_duplex_data_plane_prompt,
     duplex_data_plane_request_info,
     duplex_new_user_turn_prefix_reserve,
@@ -13,6 +21,9 @@ from vllm_omni.experimental.fullduplex.engine.omni import (
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
+)
+from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
+    MiniCPMO45DuplexRuntimeExtension,
 )
 
 
@@ -36,7 +47,175 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
     assert session.fence == next_fence
     assert stale_request_ids == ["req-stage0", "req-stage1"]
     assert session.stage_bindings == {}
+
+
+def test_duplex_runtime_tracks_same_request_id_for_each_pipeline_stage():
+    manager = DuplexSessionRuntimeManager()
+    fence = DuplexFence("sid-shared-pipeline-request")
+    session = manager.open_session(fence)
+
+    session.reserve_stage_request(0, "req-shared", fence=fence)
+    session.bind_stage_request(0, "req-shared", fence=fence)
+    session.bind_stage_request(1, "req-shared", fence=fence)
+
+    assert session.stage_bindings[0].request_id == "req-shared"
+    assert session.stage_bindings[1].request_id == "req-shared"
+    assert session.resource_request_ids() == ["req-shared"]
     assert session.input_seq == 0
+
+
+def test_experimental_runtime_types_are_stable_engine_reexports():
+    from vllm_omni.experimental.fullduplex.engine import omni as compatibility
+
+    assert compatibility.DuplexInputMode is DuplexInputMode
+    assert compatibility.DuplexRuntimeCapabilities is DuplexRuntimeCapabilities
+    assert compatibility.DuplexSessionRuntimeManager is DuplexSessionRuntimeManager
+
+
+def test_duplex_session_state_has_a_dedicated_stable_module():
+    from vllm_omni.engine import duplex_session
+
+    assert duplex_runtime.DuplexAppendReservation is duplex_session.DuplexAppendReservation
+    assert duplex_runtime.DuplexSessionRuntimeState is duplex_session.DuplexSessionRuntimeState
+    assert duplex_runtime.DuplexSessionRuntimeManager is duplex_session.DuplexSessionRuntimeManager
+
+
+def test_duplex_runtime_extension_validation_rejects_missing_methods():
+    class IncompleteExtension:
+        def configure_sampling_params(self, *, runtime_config, defaults):
+            del runtime_config
+            return defaults
+
+    with pytest.raises(TypeError, match="plan_append"):
+        duplex_runtime.validate_duplex_runtime_extension(IncompleteExtension())
+
+
+def test_duplex_runtime_extension_validation_rejects_stage_count_mismatch():
+    class WrongStageCountExtension(MiniCPMO45DuplexRuntimeExtension):
+        def configure_sampling_params(self, *, runtime_config, defaults):
+            del runtime_config
+            return defaults[:1]
+
+    with pytest.raises(ValueError, match="one sampling parameter per stage"):
+        duplex_runtime.validate_duplex_runtime_extension(
+            WrongStageCountExtension(),
+            sampling_defaults=(SamplingParams(), SamplingParams()),
+        )
+
+
+def test_duplex_runtime_extension_validation_rejects_sampling_type_mismatch():
+    class WrongSamplingTypeExtension(MiniCPMO45DuplexRuntimeExtension):
+        def configure_sampling_params(self, *, runtime_config, defaults):
+            del runtime_config
+            return tuple(object() for _ in defaults)
+
+    with pytest.raises(TypeError, match="sampling parameter type"):
+        duplex_runtime.validate_duplex_runtime_extension(
+            WrongSamplingTypeExtension(),
+            sampling_defaults=(SamplingParams(), SamplingParams()),
+        )
+
+
+def test_duplex_runtime_extension_validation_rejects_segment_policy_type():
+    class WrongSegmentPolicyExtension(MiniCPMO45DuplexRuntimeExtension):
+        def segment_policy(self, sampling_params):
+            del sampling_params
+            return object()
+
+    with pytest.raises(TypeError, match="ResumableSegmentPolicy"):
+        duplex_runtime.validate_duplex_runtime_extension(
+            WrongSegmentPolicyExtension(),
+            sampling_defaults=(SamplingParams(),),
+        )
+
+
+def test_duplex_output_decision_metadata_is_immutable():
+    decision = DuplexOutputDecision(
+        action=DuplexOutputAction.DIRECT_RESPONSE,
+        metadata={"model_listen": True},
+    )
+
+    with pytest.raises(TypeError):
+        decision.metadata["model_listen"] = False
+
+
+def _decide_minicpmo_output(
+    output: object,
+    *,
+    segment_token_ids: tuple[int, ...] = (),
+    segment_output_metadata: dict | None = None,
+):
+    return MiniCPMO45DuplexRuntimeExtension().decide_output(
+        stage_id=0,
+        final_stage_id=1,
+        segment_finished=True,
+        segment_token_ids=segment_token_ids,
+        segment_output_metadata=segment_output_metadata or {},
+        output=output,
+    )
+
+
+def test_minicpmo_extension_owns_stage_sampling_overrides():
+    defaults = (
+        SamplingParams(max_tokens=4),
+        SamplingParams(max_tokens=8),
+    )
+
+    configured = MiniCPMO45DuplexRuntimeExtension().configure_sampling_params(
+        runtime_config={
+            "duplex_stage_max_tokens": {"0": 20},
+            "duplex_stage_sampling_params": {"1": {"stop_token_ids": [151645]}},
+        },
+        defaults=defaults,
+    )
+
+    assert configured[0].max_tokens == 20
+    assert configured[1].stop_token_ids == [151645]
+    assert defaults[0].max_tokens == 4
+    assert 151645 not in (defaults[1].stop_token_ids or [])
+
+
+def test_minicpmo_output_decision_uses_raw_streaming_token_snapshot():
+    decision = _decide_minicpmo_output(
+        SimpleNamespace(outputs=[SimpleNamespace()]),
+        segment_token_ids=(151705,),
+        segment_output_metadata={"special_token_ids": {"listen_token_id": 151705}},
+    )
+
+    assert decision is not None
+    assert decision.action is DuplexOutputAction.DIRECT_RESPONSE
+    assert decision.metadata["duplex_native_decision"] == "listen"
+    assert decision.metadata["model_listen"] is True
+
+
+@pytest.mark.parametrize("attr", ["token_ids", "cumulative_token_ids"])
+def test_minicpmo_output_decision_ignores_output_level_token_history(attr):
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace()],
+        **{attr: [42, 151705]},
+    )
+
+    assert _decide_minicpmo_output(output) is None
+
+
+@pytest.mark.parametrize("attr", ["token_ids", "cumulative_token_ids"])
+def test_minicpmo_output_decision_uses_completion_token_ids(attr):
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace(**{attr: [42, 151705]})],
+    )
+
+    assert _decide_minicpmo_output(output) is not None
+
+
+def test_minicpmo_output_decision_uses_completion_stop_reason():
+    output = SimpleNamespace(
+        multimodal_output={"special_token_ids": {"listen_token_id": 151705}},
+        outputs=[SimpleNamespace(stop_reason=151705)],
+    )
+
+    assert _decide_minicpmo_output(output) is not None
 
 
 def test_duplex_runtime_cancel_fence_rejects_late_append_and_accepts_next_epoch():
@@ -128,6 +307,7 @@ def test_duplex_prompt_expands_incarnation_metadata():
         request_id=duplex_resource_request_id(fence, "stage0"),
         fence=fence,
         session_config={},
+        runtime_config={},
         seq=1,
         turn_seq=1,
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
@@ -239,19 +419,17 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
 
 
 def test_duplex_new_user_turn_prefix_reserve_uses_precomputed_count():
-    assert duplex_new_user_turn_prefix_reserve({"extra_body": {"duplex_new_user_turn_prefix_tokens": 7}}) == 7
+    assert duplex_new_user_turn_prefix_reserve({"duplex_new_user_turn_prefix_tokens": 7}) == 7
 
 
 def test_duplex_new_user_turn_prefix_reserve_uses_variant_count():
     assert (
         duplex_new_user_turn_prefix_reserve(
             {
-                "extra_body": {
-                    "duplex_new_user_turn_prefix_tokens": 99,
-                    "duplex_new_user_turn_prefix_tokens_by_variant": {
-                        MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE: 5,
-                    },
-                }
+                "duplex_new_user_turn_prefix_tokens": 99,
+                "duplex_new_user_turn_prefix_tokens_by_variant": {
+                    MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE: 5,
+                },
             },
             variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
         )
@@ -308,8 +486,21 @@ def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():
 def test_resource_request_id_is_derived_from_fence_and_role():
     fence = DuplexFence("sid-with-dashes", epoch=7, turn_id=11, response_seq=13)
 
-    assert duplex_resource_request_id(fence, "stage0") == "duplex-sid-with-dashes-e7-stage0"
-    assert duplex_resource_request_id(fence, "stage1") == "duplex-sid-with-dashes-e7-stage1"
+    assert duplex_resource_request_id(fence, "stage0") == "duplex-s.c2lkLXdpdGgtZGFzaGVz.i.0.e.7.r.stage0"
+    assert duplex_resource_request_id(fence, "stage1") == "duplex-s.c2lkLXdpdGgtZGFzaGVz.i.0.e.7.r.stage1"
+
+
+def test_resource_request_id_codec_separates_session_id_from_incarnation():
+    embedded_incarnation = duplex_resource_request_id(
+        DuplexFence("foo-i1", incarnation=0),
+        "stage0",
+    )
+    actual_incarnation = duplex_resource_request_id(
+        DuplexFence("foo", incarnation=1),
+        "stage0",
+    )
+
+    assert embedded_incarnation != actual_incarnation
 
 
 def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
@@ -318,6 +509,7 @@ def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
         request_id=duplex_resource_request_id(fence, "stage0"),
         fence=fence,
         session_config={},
+        runtime_config={},
         seq=2,
         turn_seq=1,
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,

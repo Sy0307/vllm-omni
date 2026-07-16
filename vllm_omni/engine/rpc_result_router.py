@@ -120,4 +120,45 @@ class RpcResultRouter:
         return None
 
 
-__all__ = ["RpcCorrelationKey", "RpcResultRouter", "RpcWaiter"]
+class CorrelatedRpcClient:
+    """Own request submission and correlated result waiting as one lifecycle."""
+
+    def __init__(self, request_queue, result_queue) -> None:
+        self._request_queue = request_queue
+        self._router = RpcResultRouter(result_queue)
+
+    def execute(
+        self,
+        key: RpcCorrelationKey,
+        message: EngineQueueMessage,
+        *,
+        timeout: float | None,
+        timeout_message: str,
+        block_on_submit: bool = False,
+    ) -> EngineQueueMessage:
+        waiter = self._router.register(key)
+        try:
+            if block_on_submit:
+                self._request_queue.put(message)
+            else:
+                self._request_queue.put_nowait(message)
+            try:
+                result = waiter.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(timeout_message) from exc
+            if isinstance(result, ErrorMessage):
+                raise RuntimeError(result.error)
+            return result
+        finally:
+            self._router.unregister(key, waiter)
+
+    def close(self) -> None:
+        self._router.close()
+
+
+__all__ = [
+    "CorrelatedRpcClient",
+    "RpcCorrelationKey",
+    "RpcResultRouter",
+    "RpcWaiter",
+]

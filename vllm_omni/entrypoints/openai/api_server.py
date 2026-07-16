@@ -94,6 +94,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
@@ -146,10 +147,6 @@ from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_reques
 from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
-from vllm_omni.experimental.fullduplex.openai.serving import (
-    OmniDuplexSessionHandler,
-    should_enable_duplex_endpoint,
-)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
@@ -1117,15 +1114,17 @@ async def omni_init_app_state(
         if state.openai_serving_chat is not None
         else None
     )
-    state.openai_serving_duplex = (
-        OmniDuplexSessionHandler(chat_service=state.openai_serving_chat)
-        if state.openai_serving_chat is not None
-        and should_enable_duplex_endpoint(
-            state.stage_configs,
-            config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+    state.openai_serving_duplex = None
+    if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
+        state.stage_configs,
+        config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+    ):
+        from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
+
+        state.openai_serving_duplex = OmniDuplexSessionHandler(
+            chat_service=state.openai_serving_chat,
+            max_native_duplex_sessions=getattr(engine_client, "max_native_duplex_sessions", None),
         )
-        else None
-    )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -1627,17 +1626,9 @@ async def streaming_video_output(websocket: WebSocket):
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
-    realtime_model = websocket.query_params.get("model")
     duplex_query = websocket.query_params.get("duplex")
-    minicpmo45_realtime_model = isinstance(realtime_model, str) and (
-        "minicpm-o-4-5" in realtime_model.lower().replace("_", "-")
-        or "minicpmo-4-5" in realtime_model.lower().replace("_", "-")
-        or "minicpmo45" in realtime_model.lower().replace("_", "-")
-    )
     use_duplex_realtime = (
-        duplex_handler is not None
-        and duplex_query not in {"0", "false", "False", "off"}
-        and (duplex_query in {"1", "true", "True", "on"} or minicpmo45_realtime_model)
+        duplex_handler is not None and isinstance(duplex_query, str) and duplex_query.lower() in {"1", "true", "on"}
     )
     if use_duplex_realtime and duplex_handler is not None:
         await duplex_handler.handle_realtime_session(websocket)

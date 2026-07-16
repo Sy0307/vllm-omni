@@ -24,6 +24,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
+    duplex_runtime_extension=("vllm_omni.experimental.fullduplex.minicpmo45.runtime.MiniCPMO45DuplexRuntimeExtension"),
+    duplex_control_enabled=True,
+    max_native_duplex_sessions=1,
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
     # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o
     # 1.0 / 2.6 checkpoints. The only field distinguishing the generations is

@@ -7,8 +7,8 @@ import inspect
 import numpy as np
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex_runtime import duplex_data_plane_request_info
 from vllm_omni.engine.duplex_types import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
     MiniCPMO45DataPlaneContext,
     coerce_int,
@@ -57,6 +57,8 @@ class NativeRuntimeBridgeMixin:
                 "session_config": session.config.as_dict(),
                 "timeout": self._runtime_control_timeout_s(session),
             }
+            if self._callable_accepts_keyword(open_session, "runtime_config"):
+                open_kwargs["runtime_config"] = dict(session.runtime_config)
             if self._callable_accepts_keyword(open_session, "fence"):
                 open_kwargs["fence"] = DuplexFence(
                     session.session_id,
@@ -90,6 +92,7 @@ class NativeRuntimeBridgeMixin:
         session: DuplexSession,
         payload: object,
         *,
+        operation_id: str | None = None,
         final: bool,
         send_json,
         mode: str = "append_tokens",
@@ -109,6 +112,8 @@ class NativeRuntimeBridgeMixin:
                 "final": final,
                 "timeout": self._runtime_control_timeout_s(session),
             }
+            if operation_id is not None and self._callable_accepts_keyword(append_input, "operation_id"):
+                append_kwargs["operation_id"] = operation_id
             if expected_epoch is not None and self._callable_accepts_keyword(append_input, "expected_epoch"):
                 append_kwargs["expected_epoch"] = expected_epoch
             if self._callable_accepts_keyword(append_input, "fence"):
@@ -224,7 +229,7 @@ class NativeRuntimeBridgeMixin:
         request_id, _ = self._data_plane_request_info(result)
         if request_id is None or self._data_plane_outputs_finished(result):
             return False
-        session.active_request_id = request_id
+        session.bind_request(request_id)
 
         native = self._minicpmo_session_state(session)
         old_task = native.data_plane_task
@@ -395,6 +400,7 @@ class NativeRuntimeBridgeMixin:
         fence: DuplexFence | None = None,
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
     ) -> bool:
         signal_turn = getattr(self._chat_service.engine_client, "signal_duplex_turn_async", None)
         if not callable(signal_turn):
@@ -415,6 +421,8 @@ class NativeRuntimeBridgeMixin:
                 signal_kwargs["next_fence"] = next_fence
             if session_config is not None and self._callable_accepts_keyword(signal_turn, "session_config"):
                 signal_kwargs["session_config"] = session_config
+            if runtime_config is not None and self._callable_accepts_keyword(signal_turn, "runtime_config"):
+                signal_kwargs["runtime_config"] = runtime_config
             result = await signal_turn(session.session_id, **signal_kwargs)
         except Exception as exc:
             logger.exception("Failed to signal duplex runtime session: %s", exc)
@@ -582,7 +590,7 @@ class NativeRuntimeBridgeMixin:
         if self._minicpmo_data_plane.is_terminal(request_id):
             return None, False
         if request_id is not None and session.active_request_id is None:
-            session.active_request_id = request_id
+            session.bind_request(request_id)
         context = self._minicpmo_data_plane_context(session)
         for native_result in self._minicpmo_data_plane.project(result, context=context):
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
@@ -692,15 +700,16 @@ class NativeRuntimeBridgeMixin:
         return duplex_data_plane_request_info(result)
 
     def _minicpmo_data_plane_context(self, session: DuplexSession) -> MiniCPMO45DataPlaneContext:
+        response_config = session.response_config
         return MiniCPMO45DataPlaneContext(
             epoch=session.epoch,
             turn_id=session.turn_id,
             active_response_turn_id=session.active_response_turn_id,
             active_response_id=session.active_response_id,
             auto_responds=self._session_auto_responds(session),
-            response_format=session.config.response_format,
-            speed=session.config.speed,
-            modalities=tuple(session.config.modalities),
+            response_format=response_config.response_format,
+            speed=response_config.speed,
+            modalities=tuple(response_config.modalities),
         )
 
     async def _send_one_native_duplex_event(
@@ -762,7 +771,7 @@ class NativeRuntimeBridgeMixin:
         is_listen = native_result.get("is_listen")
         if native_result.get("is_buffering") is True or native_result.get("prefill_success") is False:
             if native_result.get("data_plane_request_id") == session.active_request_id:
-                session.active_request_id = None
+                session.clear_request()
             payload = {
                 "type": "response.listen",
                 "session_id": session.session_id,
@@ -788,10 +797,10 @@ class NativeRuntimeBridgeMixin:
                     expected_epoch=expected_epoch,
                 )
                 return close_reason, emitted_response
-            session.turn_state = DuplexTurnState.IDLE
+            session.transition_turn(DuplexTurnState.IDLE)
             auto_response = self._session_auto_responds(session)
             if not auto_response and data_plane_request_id == session.active_request_id:
-                session.active_request_id = None
+                session.clear_request()
             model_listen = native_result.get("model_listen")
             if not isinstance(model_listen, bool):
                 model_listen = native_result.get("reason") in {None, "", "model_listen"}
@@ -865,20 +874,25 @@ class NativeRuntimeBridgeMixin:
         if end_of_turn and not has_text and not has_audio and session.active_response_id is None:
             if isinstance(data_plane_request_id, str):
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
-                    session.active_request_id = None
+                    session.clear_request()
                 if not self._session_auto_responds(session):
                     self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
             model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
             return close_reason, emitted_response
+        model_turn_id = coerce_int(native_result.get("model_turn_id"))
+        if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
+            # A continuation append can already be in flight when the prior
+            # response reaches turn EOS.  Its late audio still carries the
+            # completed model turn, so it must not reserve a second Realtime
+            # response for that turn.
+            return close_reason, emitted_response
         emitted_response = True
         response_created = False
         response_id = session.active_response_id
         if response_id is None:
-            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             response_id = session.begin_response(turn_id=model_turn_id)
-            self._remember_response_conversation_mode(session, response_id)
             response_created = True
             await send_json(
                 self._response_created_payload(
@@ -940,7 +954,7 @@ class NativeRuntimeBridgeMixin:
             "format": (
                 native_result.get("audio_format")
                 if isinstance(native_result.get("audio_format"), str)
-                else session.config.response_format
+                else session.response_config.response_format
             ),
             "end_of_turn": end_of_turn,
             "model_speak": True,
@@ -979,10 +993,10 @@ class NativeRuntimeBridgeMixin:
                 self._minicpmo_data_plane.close_stream(data_plane_request_id)
             if isinstance(data_plane_request_id, str):
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
-                    session.active_request_id = None
+                    session.clear_request()
                 if not self._session_auto_responds(session):
                     self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
-            should_commit = self._should_commit_response_to_history(response_id)
+            should_commit = self._should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(
                 commit_text=should_commit,
                 preserve_request=self._session_auto_responds(session),
@@ -1008,7 +1022,7 @@ class NativeRuntimeBridgeMixin:
                 }
             )
         elif response_created:
-            session.turn_state = DuplexTurnState.ASSISTANT_PLAYING
+            session.transition_turn(DuplexTurnState.ASSISTANT_PLAYING)
         return close_reason, emitted_response
 
     @staticmethod

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,10 @@ from vllm.multimodal.media import MediaConnector
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
+
+
+class MiniCPMO45ClientRuntimeConfigError(ValueError):
+    pass
 
 
 class MiniCPMO45NativeDuplexServingAdapter:
@@ -20,21 +25,72 @@ class MiniCPMO45NativeDuplexServingAdapter:
     normalized PCM payloads.  Server-owned model assets remain local paths here.
     """
 
-    @classmethod
-    def is_enabled(cls, config: DuplexSessionConfig) -> bool:
-        extra_body = config.extra_body
-        explicit = extra_body.get("native_duplex") or extra_body.get("minicpmo45_native_duplex")
-        if explicit is not None:
-            return bool(explicit)
-        mode = extra_body.get("duplex_mode") or extra_body.get("runtime")
-        return isinstance(mode, str) and mode.lower() in {"native", "model_native", "minicpmo45_native"}
+    PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
+        {
+            "duplex_stage_sampling_params",
+            "duplex_stage_max_tokens",
+            "duplex_stage0_max_tokens",
+            "duplex_scheduler_token_id",
+            "duplex_first_append_context_tokens",
+            "duplex_new_user_turn_prefix_tokens",
+            "duplex_new_user_turn_prefix_tokens_by_variant",
+            "ref_audio_data",
+            "ref_audio_format",
+            "ref_audio_sample_rate_hz",
+        }
+    )
 
     @classmethod
-    async def prepare_session_config(cls, config: DuplexSessionConfig, *, model_config: Any) -> None:
+    def is_enabled(cls, config: DuplexSessionConfig) -> bool:
+        return config.extra_body.get("minicpmo45_native_duplex") is True
+
+    @classmethod
+    def validate_client_config(cls, config: DuplexSessionConfig) -> None:
+        cls.validate_client_extra_body(config.extra_body)
+
+    @classmethod
+    def validate_client_extra_body(cls, extra_body: object) -> None:
+        if not isinstance(extra_body, dict):
+            return
+        private_keys = sorted(cls.PRIVATE_RUNTIME_CONFIG_KEYS.intersection(extra_body))
+        if private_keys:
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "native duplex runtime configuration is server-owned: " + ", ".join(private_keys)
+            )
+
+    @classmethod
+    def runtime_config_for_update(
+        cls,
+        config: DuplexSessionConfig,
+        current: object,
+    ) -> dict[str, object]:
+        runtime_config = deepcopy(dict(current)) if isinstance(current, dict) else {}
+        runtime_config["instructions"] = config.instructions
+        stage_max_tokens = runtime_config.get("duplex_stage_max_tokens")
+        stage_max_tokens = deepcopy(stage_max_tokens) if isinstance(stage_max_tokens, dict) else {}
+        stage_max_tokens["0"] = (
+            config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
+        )
+        stage_max_tokens.setdefault("1", 8192)
+        runtime_config["duplex_stage_max_tokens"] = stage_max_tokens
+
+        stage_sampling = runtime_config.get("duplex_stage_sampling_params")
+        stage_sampling = deepcopy(stage_sampling) if isinstance(stage_sampling, dict) else {}
+        stage0 = stage_sampling.get("0")
+        stage0 = deepcopy(stage0) if isinstance(stage0, dict) else {}
+        stage0["temperature"] = config.temperature if config.temperature is not None else 0.7
+        stage_sampling["0"] = stage0
+        runtime_config["duplex_stage_sampling_params"] = stage_sampling
+        return runtime_config
+
+    @classmethod
+    async def prepare_runtime_config(cls, config: DuplexSessionConfig, *, model_config: Any) -> dict[str, object]:
         extra_body = dict(config.extra_body)
         if any(key in extra_body for key in ("ref_audio_path", "tts_ref_audio_path")):
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
-        cls._apply_default_scheduler_policy(extra_body, model_config=model_config)
+        cls.validate_client_config(config)
+        runtime_config: dict[str, object] = {"instructions": config.instructions}
+        cls._apply_default_scheduler_policy(runtime_config, config=config, model_config=model_config)
 
         ref_audio = config.ref_audio
         if ref_audio is None and isinstance(extra_body.get("ref_audio"), str):
@@ -46,14 +102,14 @@ class MiniCPMO45NativeDuplexServingAdapter:
             default_ref = cls._default_ref_audio_path(config, model_config=model_config)
             if default_ref is None:
                 cls._apply_first_append_context_tokens(
-                    extra_body,
+                    runtime_config,
                     model_config=model_config,
                     instructions=config.instructions,
                     ref_sample_count=None,
                 )
-                cls._apply_new_user_turn_prefix_tokens(extra_body, model_config=model_config)
+                cls._apply_new_user_turn_prefix_tokens(runtime_config, model_config=model_config)
                 config.extra_body = extra_body
-                return
+                return runtime_config
             wav_np, sr = cls._load_local_ref_audio(default_ref)
         else:
             wav_np, sr = await cls.resolve_ref_audio(ref_audio, model_config=model_config)
@@ -66,48 +122,48 @@ class MiniCPMO45NativeDuplexServingAdapter:
         )
         wav_np = wav_np[:usable]
         ref_audio_bytes = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
-        extra_body["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
-        extra_body["ref_audio_format"] = "pcm_f32le"
-        extra_body["ref_audio_sample_rate_hz"] = 16000
+        runtime_config["ref_audio_data"] = base64.b64encode(ref_audio_bytes).decode("ascii")
+        runtime_config["ref_audio_format"] = "pcm_f32le"
+        runtime_config["ref_audio_sample_rate_hz"] = 16000
         cls._apply_first_append_context_tokens(
-            extra_body,
+            runtime_config,
             model_config=model_config,
             instructions=config.instructions,
             ref_sample_count=len(wav_np),
         )
-        cls._apply_new_user_turn_prefix_tokens(extra_body, model_config=model_config)
+        cls._apply_new_user_turn_prefix_tokens(runtime_config, model_config=model_config)
         config.extra_body = extra_body
         config.ref_audio = None
+        return runtime_config
 
     @classmethod
-    def _apply_default_scheduler_policy(cls, extra_body: dict[str, object], *, model_config: Any) -> None:
-        if "duplex_stage_max_tokens" in extra_body:
-            raw_stage0 = None
-        else:
-            raw_stage0 = extra_body.get("duplex_stage0_max_tokens")
-            if not isinstance(raw_stage0, int | float) or int(raw_stage0) <= 0:
-                raw_stage0 = 20
-            extra_body["duplex_stage_max_tokens"] = {"0": int(raw_stage0), "1": 8192}
-        if "duplex_stage_sampling_params" not in extra_body:
-            stage0_params: dict[str, object] = {
-                "temperature": 0.7,
-                "top_p": 0.8,
-                "top_k": 100,
-                "repetition_penalty": 1.05,
-            }
-            stop_token_ids = cls._native_stage0_stop_token_ids(model_config)
-            if stop_token_ids:
-                stage0_params["stop_token_ids"] = stop_token_ids
-            extra_body["duplex_stage_sampling_params"] = {"0": stage0_params}
-        if "duplex_scheduler_token_id" not in extra_body:
-            scheduler_token_id = cls._native_scheduler_token_id(model_config)
-            if scheduler_token_id is not None:
-                extra_body["duplex_scheduler_token_id"] = scheduler_token_id
+    def _apply_default_scheduler_policy(
+        cls,
+        runtime_config: dict[str, object],
+        *,
+        config: DuplexSessionConfig,
+        model_config: Any,
+    ) -> None:
+        stage0_max_tokens = config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
+        runtime_config["duplex_stage_max_tokens"] = {"0": stage0_max_tokens, "1": 8192}
+        stage0_params: dict[str, object] = {
+            "temperature": config.temperature if config.temperature is not None else 0.7,
+            "top_p": 0.8,
+            "top_k": 100,
+            "repetition_penalty": 1.05,
+        }
+        stop_token_ids = cls._native_stage0_stop_token_ids(model_config)
+        if stop_token_ids:
+            stage0_params["stop_token_ids"] = stop_token_ids
+        runtime_config["duplex_stage_sampling_params"] = {"0": stage0_params}
+        scheduler_token_id = cls._native_scheduler_token_id(model_config)
+        if scheduler_token_id is not None:
+            runtime_config["duplex_scheduler_token_id"] = scheduler_token_id
 
     @classmethod
     def _apply_first_append_context_tokens(
         cls,
-        extra_body: dict[str, object],
+        runtime_config: dict[str, object],
         *,
         model_config: Any,
         instructions: object,
@@ -122,7 +178,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         (deficit), so it is computed with the same template and pooling math
         the worker uses.
         """
-        if "duplex_first_append_context_tokens" in extra_body:
+        if "duplex_first_append_context_tokens" in runtime_config:
             return
         tokenizer = cls._load_native_tokenizer(model_config)
         if tokenizer is None:
@@ -137,16 +193,16 @@ class MiniCPMO45NativeDuplexServingAdapter:
         except Exception:
             return
         ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
-        extra_body["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+        runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
 
     @classmethod
     def _apply_new_user_turn_prefix_tokens(
         cls,
-        extra_body: dict[str, object],
+        runtime_config: dict[str, object],
         *,
         model_config: Any,
     ) -> None:
-        if "duplex_new_user_turn_prefix_tokens" in extra_body:
+        if "duplex_new_user_turn_prefix_tokens" in runtime_config:
             return
         tokenizer = cls._load_native_tokenizer(model_config)
         if tokenizer is None:
@@ -164,8 +220,8 @@ class MiniCPMO45NativeDuplexServingAdapter:
             }
         except Exception:
             return
-        extra_body["duplex_new_user_turn_prefix_tokens"] = len(prefix_ids)
-        extra_body["duplex_new_user_turn_prefix_tokens_by_variant"] = variant_counts
+        runtime_config["duplex_new_user_turn_prefix_tokens"] = len(prefix_ids)
+        runtime_config["duplex_new_user_turn_prefix_tokens_by_variant"] = variant_counts
 
     @staticmethod
     def _native_stage0_stop_token_ids(model_config: Any) -> list[int]:

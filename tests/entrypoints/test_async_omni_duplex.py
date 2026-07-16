@@ -2,11 +2,30 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.engine.duplex_runtime import (
+    DuplexOutputAction,
+    DuplexOutputDecision,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.duplex_request_client import DuplexRequestClient
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.outputs import OmniRequestOutput
+
+
+def test_async_omni_uses_extracted_duplex_request_client():
+    app = object.__new__(AsyncOmni)
+    app.engine = SimpleNamespace(num_stages=2)
+    app.request_states = {}
+    app._duplex_request_client = None
+
+    client = app._get_duplex_request_client()
+
+    assert isinstance(client, DuplexRequestClient)
+    assert not hasattr(client, "_async_omni")
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -64,6 +83,8 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         return {"ok": True}
 
     app = object.__new__(AsyncOmni)
+    app.request_states = {}
+    app._final_output_handler = lambda: None
     app.engine = SimpleNamespace(
         append_duplex_input_async=append_duplex_input_async,
         signal_duplex_turn_async=signal_duplex_turn_async,
@@ -123,21 +144,26 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
 
 @pytest.mark.asyncio
 async def test_async_omni_duplex_append_can_defer_data_plane_output_collection():
+    app = object.__new__(AsyncOmni)
+    request_id = duplex_resource_request_id(DuplexFence("sid"), "stage0")
+
     async def append_duplex_input_async(session_id, **kwargs):
         del session_id, kwargs
+        request_state = app.request_states.get(request_id)
+        assert request_state is not None
+        assert request_state.resumable is True
         return {
             "stage_results": [
                 {
                     "result": {
                         "data_plane_append": True,
-                        "request_id": "duplex-sid-e0-stage0",
+                        "request_id": request_id,
                         "response_stage_id": 1,
                     }
                 }
             ]
         }
 
-    app = object.__new__(AsyncOmni)
     app.engine = SimpleNamespace(append_duplex_input_async=append_duplex_input_async)
     app.request_states = {}
     app._final_output_handler = lambda: None
@@ -162,6 +188,8 @@ async def test_async_omni_duplex_append_forwards_fence():
         return {"ok": True}
 
     app = object.__new__(AsyncOmni)
+    app.request_states = {}
+    app._final_output_handler = lambda: None
     app.engine = SimpleNamespace(append_duplex_input_async=append_duplex_input_async)
     fence = DuplexFence("sid", epoch=1, turn_id=2)
 
@@ -219,6 +247,13 @@ async def test_async_omni_duplex_collect_waits_for_response_stage():
 
 
 def test_async_omni_duplex_direct_output_prefers_outer_control_metadata():
+    decision = DuplexOutputDecision(
+        action=DuplexOutputAction.DIRECT_RESPONSE,
+        metadata={
+            "duplex_direct_response": True,
+            "duplex_native_decision": "listen",
+        },
+    )
     output = OmniRequestOutput(
         request_id="duplex-sid-e0-stage0",
         stage_id=0,
@@ -226,13 +261,29 @@ def test_async_omni_duplex_direct_output_prefers_outer_control_metadata():
             outputs=[],
             multimodal_output=SimpleNamespace(kind="processed-payload"),
         ),
-        _multimodal_output={
-            "duplex_direct_response": True,
-            "duplex_native_decision": "listen",
-        },
+        duplex_output_decision=decision,
     )
 
     assert AsyncOmni._is_direct_duplex_data_plane_response(output)
+
+
+def test_async_omni_drops_unregistered_duplex_prefixed_output():
+    app = object.__new__(AsyncOmni)
+    app.request_states = {}
+    output = OmniRequestOutput(request_id="duplex-unregistered-e0-stage0", stage_id=0)
+
+    keep_processing, request_id, stage_id, request_state = app._handle_output_message(
+        OutputMessage(
+            request_id=output.request_id,
+            stage_id=0,
+            engine_outputs=output,
+            finished=False,
+        )
+    )
+
+    assert keep_processing is True
+    assert request_id is stage_id is request_state is None
+    assert app.request_states == {}
 
 
 @pytest.mark.asyncio

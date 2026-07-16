@@ -3,6 +3,8 @@ import importlib.util
 import sys
 import wave
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -30,6 +32,49 @@ def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
     ]
     with pytest.raises(ValueError, match="one --turn-input-wav"):
         demo._turn_input_paths(primary, ["second.wav"], turns=3)
+
+
+def test_realtime_duplex_demo_explicitly_enables_native_runtime_before_connect():
+    demo = _load_demo_module()
+
+    url = demo._url_with_model(
+        "ws://localhost:8099/v1/realtime?duplex=1",
+        "openbmb/MiniCPM-o-4_5",
+    )
+
+    query = parse_qs(urlsplit(url).query)
+    assert query["minicpmo45_native_duplex"] == ["1"]
+
+
+def test_realtime_duplex_demo_explicit_session_id_reaches_autostart_query():
+    demo = _load_demo_module()
+
+    url = demo._url_with_model(
+        "ws://localhost:8099/v1/realtime?duplex=1",
+        "openbmb/MiniCPM-o-4_5",
+        session_id="reopen-e2e",
+    )
+
+    query = parse_qs(urlsplit(url).query)
+    assert query["session_id"] == ["reopen-e2e"]
+
+
+def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
+    demo = _load_demo_module()
+
+    event = demo._session_update_event(
+        SimpleNamespace(
+            model="openbmb/MiniCPM-o-4_5",
+            output_audio_format="pcm16",
+            short_ack_ms=1200,
+            session_id="reopen-e2e",
+        )
+    )
+
+    assert event["type"] == "session.update"
+    assert "session_id" not in event
+    assert event["session"]["session_id"] == "reopen-e2e"
+    assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
 
 
 def test_realtime_duplex_demo_resolves_explicit_turn_durations():
@@ -487,6 +532,173 @@ def test_realtime_duplex_demo_model_policy_waits_for_speak_after_intermediate_li
 
     assert response_id == "resp-delayed"
     assert outcome == "speak"
+
+
+def test_realtime_duplex_demo_playback_gate_covers_unassigned_completed_response():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    for response_id in ("resp-assigned", "resp-unassigned"):
+        state.add({"type": "response.created", "response": {"id": response_id}})
+        state.add(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": response_id,
+                    "metadata": {"playback": {"sent_ms": 1200}},
+                },
+            }
+        )
+    state.add(
+        {
+            "type": "playback.acknowledged",
+            "event": {
+                "item_id": "item_resp-assigned",
+                "history_committed": True,
+            },
+        }
+    )
+
+    assert not demo._all_response_playback_history_committed(
+        state,
+        state.completed_response_ids(),
+    )
+
+
+def test_realtime_duplex_demo_acks_unassigned_completed_response():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    for response_id in ("resp-assigned", "resp-unassigned"):
+        state.add({"type": "response.created", "response": {"id": response_id}})
+        state.add(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": response_id,
+                    "metadata": {"playback": {"sent_ms": 1200}},
+                },
+            }
+        )
+    state.add(
+        {
+            "type": "playback.acknowledged",
+            "event": {
+                "item_id": "item_resp-assigned",
+                "history_committed": True,
+            },
+        }
+    )
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            message = demo.json.loads(payload)
+            self.messages.append(message)
+            state.add(
+                {
+                    "type": "playback.acknowledged",
+                    "event": {
+                        "item_id": message["item_id"],
+                        "history_committed": True,
+                    },
+                }
+            )
+
+    ws = FakeWebSocket()
+    asyncio.run(demo._ack_all_completed_response_playback(ws, state, timeout_s=0.1))
+
+    assert [message["response_id"] for message in ws.messages] == ["resp-unassigned"]
+    assert demo._all_response_playback_history_committed(state, state.completed_response_ids())
+
+
+def test_realtime_duplex_demo_model_policy_does_not_assume_one_response_per_physical_input():
+    demo = _load_demo_module()
+
+    assert demo._response_cardinality_ok(
+        ["resp-1", "resp-2", "resp-3", "resp-4"],
+        expected_turns=3,
+        validation_mode="model-policy",
+    )
+    assert not demo._response_cardinality_ok(
+        ["resp-1", "resp-2", "resp-3", "resp-4"],
+        expected_turns=3,
+        validation_mode="response-required",
+    )
+
+
+def test_realtime_duplex_demo_only_requires_cross_turn_independence_for_response_required():
+    demo = _load_demo_module()
+
+    assert not demo._requires_cross_turn_independence(
+        validation_mode="model-policy",
+        distinct_inputs_required=True,
+    )
+    assert demo._requires_cross_turn_independence(
+        validation_mode="response-required",
+        distinct_inputs_required=True,
+    )
+    assert not demo._requires_cross_turn_independence(
+        validation_mode="response-required",
+        distinct_inputs_required=False,
+    )
+
+
+def test_realtime_duplex_demo_drains_late_model_response_before_close():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response": {"id": "resp-first"}})
+    state.add({"type": "response.done", "response": {"id": "resp-first"}})
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            self.messages.append(demo.json.loads(payload))
+
+    async def run_fixture():
+        async def finish_late_response():
+            await asyncio.sleep(0.01)
+            state.add({"type": "response.created", "response": {"id": "resp-late"}})
+            await asyncio.sleep(0.01)
+            state.add({"type": "response.done", "response": {"id": "resp-late"}})
+
+        late_response = asyncio.create_task(finish_late_response())
+        ws = FakeWebSocket()
+        await demo._drain_model_policy_responses(
+            ws,
+            state,
+            timeout_s=0.2,
+            settle_s=0.03,
+        )
+        await late_response
+        return ws
+
+    ws = asyncio.run(run_fixture())
+
+    assert state.completed_response_ids() == ["resp-first", "resp-late"]
+    assert not [message for message in ws.messages if message.get("type") == "session.close"]
+
+
+def test_realtime_duplex_demo_model_response_drain_times_out_with_active_ids():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response": {"id": "resp-active"}})
+
+    class FakeWebSocket:
+        async def send(self, payload):
+            del payload
+
+    with pytest.raises(TimeoutError, match="resp-active"):
+        asyncio.run(
+            demo._drain_model_policy_responses(
+                FakeWebSocket(),
+                state,
+                timeout_s=0.03,
+                settle_s=0.01,
+            )
+        )
 
 
 def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_done(monkeypatch):

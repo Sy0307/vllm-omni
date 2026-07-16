@@ -481,12 +481,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.omni_prefix_cache.discard_deferred_mm_outputs(req_id)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
-            if hasattr(self, "_duplex_force_listen_applied_segments"):
-                self._duplex_force_listen_applied_segments = {
-                    key
-                    for key in self._duplex_force_listen_applied_segments
-                    if not (isinstance(key, tuple) and key and key[0] == req_id)
-                }
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
@@ -2013,27 +2007,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             inc_info = deserialize_additional_information(payload_info)
         if not isinstance(inc_info, dict) or not inc_info:
             return
-        accumulated_keys: set[tuple[str, str]] = set()
-        if hasattr(self, "model") and hasattr(self.model, "streaming_accumulated_keys"):
-            accumulated_keys = self.model.streaming_accumulated_keys
         merged_info = dict(cached_additional_info) if isinstance(cached_additional_info, dict) else {}
         for key, value in inc_info.items():
             if isinstance(value, dict):
                 existing_sub = merged_info.get(key)
                 merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                 for sk, sv in value.items():
-                    if (key, sk) in accumulated_keys and isinstance(sv, torch.Tensor):
-                        inc_tensor = sv.detach().to("cpu").contiguous()
-                        old_tensor = merged_sub.get(sk)
-                        if old_tensor is None:
-                            merged_sub[sk] = inc_tensor
-                        else:
-                            merged_sub[sk] = torch.cat((old_tensor, inc_tensor), dim=0)
-                    elif (key, sk) in accumulated_keys and isinstance(sv, list):
-                        old_list = merged_sub.get(sk)
-                        merged_sub[sk] = (list(old_list) if isinstance(old_list, list) else []) + sv
-                    else:
-                        merged_sub[sk] = sv
+                    merged_sub[sk] = sv
                 merged_info[key] = merged_sub
             else:
                 merged_info[key] = value

@@ -136,7 +136,12 @@ class MiniCPMO45DataPlaneSession:
         outputs = getattr(output, "outputs", None)
         completion = outputs[0] if isinstance(outputs, list) and outputs else None
         text = getattr(completion, "text", "") if completion is not None else ""
-        mm_output = getattr(output, "multimodal_output", None)
+        direct_decision = getattr(output, "duplex_output_decision", None)
+        direct_metadata = getattr(direct_decision, "metadata", None)
+        if isinstance(direct_metadata, Mapping):
+            mm_output = direct_metadata
+        else:
+            mm_output = getattr(output, "multimodal_output", None)
         if not isinstance(mm_output, Mapping):
             mm_output = getattr(completion, "multimodal_output", {}) if completion is not None else {}
         if not mm_output:

@@ -384,12 +384,41 @@ class DemoState:
         return stale
 
 
-def _url_with_model(url: str, model: str) -> str:
+def _url_with_model(url: str, model: str, *, session_id: str | None = None) -> str:
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query.setdefault("duplex", "1")
     query.setdefault("model", model)
+    query.setdefault("minicpmo45_native_duplex", "1")
+    if session_id:
+        query.setdefault("session_id", session_id)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
+    session_payload: dict[str, object] = {
+        "model": args.model,
+        "modalities": ["audio", "text"],
+        "input_audio_format": "pcm16",
+        "output_audio_format": args.output_audio_format,
+        "turn_detection": None,
+        "overlap_policy": "listen_only",
+        "overlap_short_ack_ms": args.short_ack_ms,
+        "playback_commit_policy": "ack_only",
+        "extra_body": {
+            "auto_response": True,
+            "minicpmo45_native_duplex": True,
+            "force_listen_count": 0,
+        },
+    }
+    event: dict[str, object] = {
+        "type": "session.update",
+        "session": session_payload,
+    }
+    session_id = getattr(args, "session_id", None)
+    if session_id:
+        session_payload["session_id"] = session_id
+    return event
 
 
 def _read_wav_pcm16(path: Path) -> bytes:
@@ -551,6 +580,33 @@ def _all_audio_responses_have_transcript(state: DemoState, response_ids: list[st
         or bool(_canonical_transcript(state.response_transcript_delta(response_id)))
         for response_id in response_ids
     )
+
+
+def _all_response_playback_history_committed(state: DemoState, response_ids: list[str]) -> bool:
+    return all(
+        state.response_playback_history_committed(response_id)
+        for response_id in response_ids
+        if state.response_playback_sent_ms(response_id) > 0
+    )
+
+
+def _response_cardinality_ok(
+    completed_response_ids: list[str],
+    *,
+    expected_turns: int,
+    validation_mode: str,
+) -> bool:
+    if validation_mode == "response-required":
+        return len(completed_response_ids) == expected_turns
+    return True
+
+
+def _requires_cross_turn_independence(
+    *,
+    validation_mode: str,
+    distinct_inputs_required: bool,
+) -> bool:
+    return distinct_inputs_required and validation_mode == "response-required"
 
 
 def _input_transcription_ok(count: int, *, transcript_hints_enabled: bool) -> bool:
@@ -868,6 +924,72 @@ async def _ack_response_playback(
     )
 
 
+async def _ack_all_completed_response_playback(
+    ws,
+    state: DemoState,
+    *,
+    timeout_s: float,
+) -> None:
+    for response_id in state.completed_response_ids():
+        if state.response_playback_sent_ms(response_id) <= 0:
+            continue
+        if state.response_playback_history_committed(response_id):
+            continue
+        await _ack_response_playback(
+            ws,
+            state,
+            response_id,
+            timeout_s=timeout_s,
+            label=response_id,
+        )
+
+
+async def _drain_model_policy_responses(
+    ws,
+    state: DemoState,
+    *,
+    timeout_s: float,
+    settle_s: float,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    settle_s = max(0.0, settle_s)
+    observed_created_count = state.count("response.created")
+    quiet_since: float | None = None
+
+    while True:
+        remaining_s = deadline - time.monotonic()
+        active_response_ids = [
+            response_id for response_id in state.response_ids if not state.response_done(response_id)
+        ]
+        if remaining_s <= 0:
+            raise TimeoutError(f"Timed out draining model-policy responses; active response ids: {active_response_ids}")
+
+        await _ack_all_completed_response_playback(
+            ws,
+            state,
+            timeout_s=remaining_s,
+        )
+
+        now = time.monotonic()
+        created_count = state.count("response.created")
+        if created_count != observed_created_count:
+            observed_created_count = created_count
+            quiet_since = None
+
+        active_response_ids = [
+            response_id for response_id in state.response_ids if not state.response_done(response_id)
+        ]
+        if active_response_ids:
+            quiet_since = None
+        else:
+            if quiet_since is None:
+                quiet_since = now
+            if now - quiet_since >= settle_s:
+                return
+
+        await asyncio.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+
+
 def _event_index_for_response(state: DemoState, event_type: str, response_id: str) -> int | None:
     return state.first_index(
         event_type,
@@ -1015,7 +1137,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     distinct_turn_inputs = _turn_inputs_are_distinct(turn_input_paths, turn_pcm16)
     if getattr(args, "require_distinct_inputs", False) and not distinct_turn_inputs:
         raise ValueError("--require-distinct-inputs requires a different WAV path and audio payload for every turn")
-    url = _url_with_model(args.url, args.model)
+    url = _url_with_model(args.url, args.model, session_id=getattr(args, "session_id", None))
     state = DemoState()
     stop = asyncio.Event()
     output_dir = Path(args.output_dir)
@@ -1032,27 +1154,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
         reader = asyncio.create_task(_reader(ws, state, stop))
         try:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "session.update",
-                        "session": {
-                            "model": args.model,
-                            "modalities": ["audio", "text"],
-                            "input_audio_format": "pcm16",
-                            "output_audio_format": args.output_audio_format,
-                            "turn_detection": None,
-                            "overlap_policy": "listen_only",
-                            "overlap_short_ack_ms": args.short_ack_ms,
-                            "playback_commit_policy": "ack_only",
-                            "extra_body": {
-                                "auto_response": True,
-                                "force_listen_count": 0,
-                            },
-                        },
-                    }
-                )
-            )
+            await ws.send(json.dumps(_session_update_event(args)))
             await _wait_for(state, lambda: state.count("session.created") > 0, timeout_s=20, label="session.created")
 
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
@@ -1108,6 +1210,18 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
 
+            if validation_mode == "model-policy":
+                await _drain_model_policy_responses(
+                    ws,
+                    state,
+                    timeout_s=args.timeout_s,
+                    settle_s=max(0.0, args.model_policy_settle_ms / 1000),
+                )
+            await _ack_all_completed_response_playback(
+                ws,
+                state,
+                timeout_s=args.timeout_s,
+            )
             await ws.send(json.dumps({"type": "session.close"}))
             await _wait_for(state, lambda: state.count("session.closed") > 0, timeout_s=20, label="session.closed")
         finally:
@@ -1144,7 +1258,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         state,
         observed_turn_response_ids,
         expected_empty_response_ids=expected_empty_response_ids,
-        require_cross_turn_independence=getattr(args, "require_distinct_inputs", False),
+        require_cross_turn_independence=_requires_cross_turn_independence(
+            validation_mode=validation_mode,
+            distinct_inputs_required=getattr(args, "require_distinct_inputs", False),
+        ),
         require_terminal_punctuation=getattr(args, "require_distinct_inputs", False),
     )
     response_speak_contract = _evaluate_response_speak_contract(state)
@@ -1154,6 +1271,11 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         and len(state.response_ids) == len(completed_response_ids)
         and len(completed_response_ids) == len(set(completed_response_ids))
         and state.count("response.audio.done") <= state.count("response.done")
+        and _response_cardinality_ok(
+            completed_response_ids,
+            expected_turns=expected_turns,
+            validation_mode=validation_mode,
+        )
     )
     turn_outcomes_ok = len(turn_outcomes) == expected_turns and (
         validation_mode == "model-policy" or all(outcome == "speak" for outcome in turn_outcomes)
@@ -1163,10 +1285,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         for response_id in observed_turn_response_ids
         if response_id not in expected_empty_response_ids
     )
-    playback_history_committed_ok = all(
-        state.response_playback_history_committed(response_id)
-        for response_id in observed_turn_response_ids
-        if state.response_playback_sent_ms(response_id) > 0
+    playback_history_committed_ok = _all_response_playback_history_committed(
+        state,
+        completed_response_ids,
     )
     if validation_mode == "response-required":
         full_audio_response_ok = (
@@ -1284,6 +1405,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
+    parser.add_argument("--session-id", help="Use an explicit public session ID, including for close/reopen tests.")
     parser.add_argument("--input-wav", required=True)
     parser.add_argument(
         "--turn-input-wav",
@@ -1302,7 +1424,7 @@ def parse_args() -> argparse.Namespace:
         "--model-policy-settle-ms",
         type=int,
         default=2000,
-        help="Wait after an intermediate model-listen event for a delayed response.created.",
+        help="Wait for a delayed response.created after model-listen and before closing the session.",
     )
     parser.add_argument("--first-turn-ms", type=int, default=1400)
     parser.add_argument(

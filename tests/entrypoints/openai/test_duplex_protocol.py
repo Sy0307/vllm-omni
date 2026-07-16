@@ -1,3 +1,8 @@
+import asyncio
+import json
+
+import pytest
+
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
@@ -7,6 +12,10 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexTurnController,
     DuplexTurnEventType,
     DuplexTurnState,
+    ResponseCreateOptions,
+)
+from vllm_omni.experimental.fullduplex.openai.realtime_session import (
+    NativeRealtimeSessionProtocol,
 )
 
 
@@ -29,6 +38,94 @@ def test_duplex_session_commits_text_and_audio_as_one_turn():
     assert content[1]["type"] == "audio_url"
     assert content[1]["audio_url"]["url"] == "data:audio/wav;base64,YWJj"
     assert session.turn_state == DuplexTurnState.USER_COMMITTED
+
+
+def test_response_options_apply_to_one_response_without_mutating_session_defaults():
+    session = DuplexSession(
+        session_id="sid-response-options",
+        config=DuplexSessionConfig(instructions="base", voice="base-voice", max_tokens=64),
+    )
+    session.reserve_response_options(
+        ResponseCreateOptions(
+            instructions="one response",
+            voice="override-voice",
+            max_tokens=8,
+        )
+    )
+
+    assert session.config.instructions == "base"
+    assert session.config.voice == "base-voice"
+    session.begin_response()
+    assert session.config.instructions == "base"
+    assert session.config.voice == "base-voice"
+    assert session.response_config.instructions == "one response"
+    assert session.response_config.voice == "override-voice"
+    assert session.response_config.max_tokens == 8
+
+    session.end_response()
+    assert session.config.instructions == "base"
+    assert session.config.voice == "base-voice"
+    assert session.config.max_tokens == 64
+
+
+def test_response_options_cannot_overwrite_an_unconsumed_reservation():
+    session = DuplexSession(
+        session_id="sid-response-options-pending",
+        config=DuplexSessionConfig(instructions="base"),
+    )
+    session.reserve_response_options(ResponseCreateOptions(instructions="first"))
+
+    with pytest.raises(RuntimeError, match="already reserved"):
+        session.reserve_response_options(ResponseCreateOptions(instructions="second"))
+
+    session.begin_response()
+    assert session.response_config.instructions == "first"
+
+
+def test_response_options_cannot_be_reserved_while_response_is_active():
+    session = DuplexSession(
+        session_id="sid-response-options-active",
+        config=DuplexSessionConfig(instructions="base"),
+    )
+    session.begin_response()
+
+    with pytest.raises(RuntimeError, match="active"):
+        session.reserve_response_options(ResponseCreateOptions(instructions="too late"))
+
+
+def test_realtime_model_name_does_not_implicitly_enable_native_duplex():
+    protocol = NativeRealtimeSessionProtocol({})
+
+    event = protocol._session_create_from_realtime({"model": "openbmb/MiniCPM-o-4_5"})
+
+    assert "minicpmo45_native_duplex" not in event["session"]["extra_body"]
+
+
+def test_realtime_explicit_native_duplex_flag_is_preserved():
+    protocol = NativeRealtimeSessionProtocol({})
+
+    event = protocol._session_create_from_realtime(
+        {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "extra_body": {"minicpmo45_native_duplex": True},
+        }
+    )
+
+    assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
+
+
+def test_realtime_explicit_query_native_duplex_flag_is_available_before_autostart():
+    protocol = NativeRealtimeSessionProtocol(
+        {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "minicpmo45_native_duplex": "1",
+        }
+    )
+
+    event = json.loads(asyncio.run(protocol.receive_internal_event_text(None)))
+
+    assert event["type"] == "session.create"
+    assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
 
 
 def test_duplex_session_registry_advances_incarnation_when_id_is_reused():
@@ -72,11 +169,37 @@ def test_duplex_session_owns_response_and_overlap_identity():
     assert session.overlap_speech_ms == 0
 
 
+def test_duplex_session_composes_single_owner_ledgers():
+    session = DuplexSession(session_id="sid-ledgers", config=DuplexSessionConfig())
+
+    session.append_text("hello")
+    session.bind_request("req-1")
+    response_id = session.begin_response(turn_id=3)
+    session.mark_audio_sent(duration_ms=240)
+
+    assert not hasattr(session, "input")
+    assert not hasattr(session, "response")
+    assert not hasattr(session, "playback_ledger")
+    assert not hasattr(session, "conversation")
+    assert session.pending_text == ("hello",)
+    assert session.active_request_id == "req-1"
+    assert session.active_response_id == response_id
+    assert session.active_response_turn_id == 3
+    assert session.playback.sent_ms == 240
+
+    try:
+        session.playback.sent_ms = 480
+    except (AttributeError, TypeError):
+        pass
+    else:
+        raise AssertionError("playback view must be immutable")
+
+
 def test_duplex_barge_in_advances_epoch_and_drops_uncommitted_assistant_text():
     registry = DuplexSessionRegistry()
     session = registry.create()
     response_id = session.begin_response()
-    session.active_request_id = "chatcmpl-duplex-test"
+    session.bind_request("chatcmpl-duplex-test")
     session.append_assistant_text("unplayed answer")
 
     new_epoch = session.barge_in()
@@ -86,8 +209,8 @@ def test_duplex_barge_in_advances_epoch_and_drops_uncommitted_assistant_text():
     assert session.epoch == 1
     assert session.active_request_id is None
     assert session.active_response_id is None
-    assert session.assistant_text_buffer == []
-    assert session.history == []
+    assert session.assistant_text_buffer == ()
+    assert session.history == ()
     assert session.turn_state == DuplexTurnState.BARGE_IN
 
 

@@ -51,6 +51,8 @@ async def test_async_omni_forwards_fence_for_all_runtime_operations():
     engine = FenceRecordingEngine()
     app = object.__new__(AsyncOmni)
     app.engine = engine
+    app.request_states = {}
+    app._final_output_handler = lambda: None
     fence = DuplexFence("sid", epoch=1, turn_id=2)
 
     await app.open_duplex_session_async("sid", fence=fence)

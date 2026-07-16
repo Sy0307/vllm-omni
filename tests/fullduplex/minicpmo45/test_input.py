@@ -47,3 +47,72 @@ def test_commit_resets_cumulative_turn_accounting():
     empty = buffer.commit(chunk_period_ms=1_000)
 
     assert empty is None
+
+
+def test_pcm_append_reservation_rollback_restores_emitted_audio():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    original = pcm_payload(16_000)
+
+    reservation = buffer.prepare_append(
+        original,
+        operation_id="append-1",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation is not None
+    assert not buffer.has_pending()
+    reservation.rollback()
+    assert buffer.has_pending()
+
+    retried = buffer.flush(chunk_period_ms=1_000)
+    assert retried is not None
+    assert base64.b64decode(retried["audio"]) == base64.b64decode(original["audio"])
+
+
+def test_pcm_commit_keeps_prior_append_reservation_active():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    append_reservation = buffer.prepare_append(
+        pcm_payload(16_000),
+        operation_id="append-before-commit",
+        chunk_period_ms=1_000,
+    )
+
+    commit_reservation = buffer.prepare_commit(
+        operation_id="commit-after-append",
+        chunk_period_ms=1_000,
+    )
+
+    assert append_reservation is not None
+    assert append_reservation.active
+    assert commit_reservation.payload is None
+    append_reservation.commit()
+    commit_reservation.commit()
+
+
+def test_pcm_commit_reservation_rollback_restores_residual_audio():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    original = pcm_payload(8_000)
+    assert (
+        buffer.prepare_append(
+            original,
+            operation_id="buffer-half-chunk",
+            chunk_period_ms=1_000,
+        )
+        is None
+    )
+
+    reservation = buffer.prepare_commit(
+        operation_id="final-half-chunk",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation.payload is not None
+    assert reservation.payload["final"] is True
+    reservation.rollback()
+
+    retried = buffer.prepare_commit(
+        operation_id="retry-final-half-chunk",
+        chunk_period_ms=1_000,
+    )
+    assert retried.payload is not None
+    assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
