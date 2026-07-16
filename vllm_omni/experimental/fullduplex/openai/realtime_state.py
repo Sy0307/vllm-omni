@@ -4,12 +4,6 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-
-def is_minicpmo45_model(model: str) -> bool:
-    normalized = model.lower().replace("_", "-")
-    return "minicpm-o-4-5" in normalized or "minicpmo-4-5" in normalized or "minicpmo45" in normalized
-
-
 REALTIME_INPUT_AUDIO_FORMATS = {
     "pcm16",
     "pcm_s16le",
@@ -103,6 +97,7 @@ class RealtimeSessionState:
     _hold_realtime_output_until_session_created: bool = True
     _default_model: object | None = None
     _default_session_id: object | None = None
+    _default_extra_body: dict[str, object] = field(default_factory=dict)
     _input_audio_format: str = "pcm16"
     _input_sample_rate_hz: int = 16000
     _output_audio_format: str = "pcm16"
@@ -128,9 +123,14 @@ class RealtimeSessionState:
         if hasattr(query_params, "query_params"):
             query_params = query_params.query_params
         getter = query_params.get if hasattr(query_params, "get") else None
+        native_duplex = getter("minicpmo45_native_duplex") if getter is not None else None
+        default_extra_body = {}
+        if str(native_duplex).strip().lower() in {"1", "true", "yes", "on"}:
+            default_extra_body["minicpmo45_native_duplex"] = True
         return cls(
             _default_model=getter("model") if getter is not None else None,
             _default_session_id=(getter("session_id") if getter is not None else None),
+            _default_extra_body=default_extra_body,
         )
 
 

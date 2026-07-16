@@ -393,16 +393,12 @@ class OmniBase(PDDisaggregationMixin):
 
         req_state = self.request_states.get(req_id)
         if req_state is None:
-            if req_id.startswith("duplex-"):
-                req_state = ClientRequestState(req_id)
-                self.request_states[req_id] = req_state
-            else:
-                logger.debug(
-                    "[%s] dropping output for unknown req %s",
-                    self.__class__.__name__,
-                    req_id,
-                )
-                return True, None, None, None
+            logger.debug(
+                "[%s] dropping output for unknown req %s",
+                self.__class__.__name__,
+                req_id,
+            )
+            return True, None, None, None
 
         req_state.stage_id = stage_id
 

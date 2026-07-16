@@ -14,7 +14,6 @@ from vllm_omni.experimental.fullduplex.openai.audio import (
 from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_INPUT_AUDIO_FORMATS,
     REALTIME_OUTPUT_AUDIO_FORMATS,
-    is_minicpmo45_model,
 )
 
 
@@ -626,8 +625,6 @@ class RealtimeInputTranslator:
         extra_body = (
             dict(session_payload.get("extra_body")) if isinstance(session_payload.get("extra_body"), dict) else {}
         )
-        if isinstance(model, str) and is_minicpmo45_model(model):
-            extra_body.setdefault("minicpmo45_native_duplex", True)
         extra_body["realtime_session_payload"] = self._json_safe_realtime_payload(session_payload)
         if isinstance(session_payload.get("tools"), list):
             extra_body["realtime_tools"] = session_payload["tools"]

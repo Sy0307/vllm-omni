@@ -20,7 +20,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 
 from vllm_omni.engine import PromptEmbedsPayload
-from vllm_omni.request import OmniRequest
+from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -32,7 +33,12 @@ def test_omni_params_are_keyword_only():
     came first positionally and broke positional ``Request(...)`` construction.
     """
     params = inspect.signature(OmniRequest.__init__).parameters
-    for name in ("prompt_embeds", "external_req_id", "additional_information"):
+    for name in (
+        "prompt_embeds",
+        "external_req_id",
+        "additional_information",
+        "resumable_segment_policy",
+    ):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
 
 
@@ -87,3 +93,21 @@ def test_keyword_omni_params_round_trip():
     # The serialized payload is retained and decoded into a tensor on the base.
     assert req.prompt_embeds_payload is payload
     assert torch.equal(req.prompt_embeds, torch.from_numpy(arr))
+
+
+def test_resumable_segment_policy_round_trips_to_streaming_update():
+    policy = ResumableSegmentPolicy(stop_token_ids=(7,), max_segment_tokens=16)
+    request = OmniRequest(
+        request_id="req-policy",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=16),
+        pooling_params=None,
+        resumable=True,
+        resumable_segment_policy=policy,
+    )
+
+    update = OmniStreamingUpdate.from_request(request)
+
+    assert update is not None
+    assert request.resumable_segment_policy is policy
+    assert update.resumable_segment_policy is policy

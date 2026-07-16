@@ -30,12 +30,15 @@ from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeT
 from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.duplex_request_client import (
+    DuplexRequestClient,
+    DuplexRequestOutputPort,
+)
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.experimental.fullduplex.engine.omni import duplex_data_plane_request_info
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -145,12 +148,14 @@ class AsyncOmni(EngineClient, OmniBase):
         self._paused: bool = False
         self._sleeping_tags: set[str] = set()
         self._level2_sleeping: bool = False
+        self._duplex_request_client: DuplexRequestClient | None = None
         self.final_output_task: asyncio.Task | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
         self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.max_native_duplex_sessions = self.engine.max_native_duplex_sessions
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -263,18 +268,20 @@ class AsyncOmni(EngineClient, OmniBase):
         session_mode: str = "duplex",
         capabilities: dict[str, object] | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
         fence: DuplexFence,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Open an engine-level duplex session when the backend supports it."""
-        kwargs = {
-            "session_mode": session_mode,
-            "capabilities": capabilities,
-            "session_config": session_config,
-            "timeout": timeout,
-        }
-        kwargs["fence"] = fence
-        return await self.engine.open_duplex_session_async(session_id, **kwargs)
+        return await self._get_duplex_request_client().open(
+            session_id,
+            session_mode=session_mode,
+            capabilities=capabilities,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            fence=fence,
+            timeout=timeout,
+        )
 
     async def append_duplex_input_async(
         self,
@@ -282,6 +289,7 @@ class AsyncOmni(EngineClient, OmniBase):
         *,
         mode: str,
         payload: object,
+        operation_id: str | None = None,
         final: bool = False,
         expected_epoch: int | None = None,
         fence: DuplexFence,
@@ -289,32 +297,17 @@ class AsyncOmni(EngineClient, OmniBase):
         collect_outputs: bool = True,
     ) -> dict[str, object]:
         """Append input to an engine-level duplex session."""
-        kwargs = {
-            "mode": mode,
-            "payload": payload,
-            "final": final,
-            "expected_epoch": expected_epoch,
-            "timeout": timeout,
-        }
-        kwargs["fence"] = fence
-        result = await self.engine.append_duplex_input_async(session_id, **kwargs)
-        request_id, response_stage_id = self._duplex_data_plane_request_info(result)
-        if request_id is None:
-            return result
-        self._final_output_handler()
-        req_state = self.request_states.setdefault(request_id, ClientRequestState(request_id))
-        if not collect_outputs:
-            return result
-        outputs = await self._collect_duplex_data_plane_outputs(
-            request_id,
-            req_state,
-            response_stage_id=response_stage_id,
+        return await self._get_duplex_request_client().append(
+            session_id,
+            mode=mode,
+            payload=payload,
+            operation_id=operation_id,
+            final=final,
+            expected_epoch=expected_epoch,
+            fence=fence,
             timeout=timeout,
+            collect_outputs=collect_outputs,
         )
-        if outputs:
-            result = dict(result)
-            result["data_plane_outputs"] = outputs
-        return result
 
     async def collect_duplex_data_plane_outputs_async(
         self,
@@ -324,13 +317,8 @@ class AsyncOmni(EngineClient, OmniBase):
         timeout: float | None = 10.0,
     ) -> list[OmniRequestOutput]:
         """Collect the next duplex data-plane output batch for a live request."""
-        self._final_output_handler()
-        req_state = self.request_states.get(request_id)
-        if req_state is None:
-            return []
-        return await self._collect_duplex_data_plane_outputs(
+        return await self._get_duplex_request_client().collect_registered_outputs(
             request_id,
-            req_state,
             response_stage_id=response_stage_id,
             timeout=timeout,
         )
@@ -343,19 +331,19 @@ class AsyncOmni(EngineClient, OmniBase):
         fence: DuplexFence,
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
+        runtime_config: dict[str, object] | None = None,
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Send a turn/control signal to an engine-level duplex session."""
-        kwargs = {
-            "event": event,
-            "timeout": timeout,
-        }
-        kwargs["fence"] = fence
-        if next_fence is not None:
-            kwargs["next_fence"] = next_fence
-        if session_config is not None:
-            kwargs["session_config"] = session_config
-        return await self.engine.signal_duplex_turn_async(session_id, **kwargs)
+        return await self._get_duplex_request_client().signal(
+            session_id,
+            event=event,
+            fence=fence,
+            next_fence=next_fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            timeout=timeout,
+        )
 
     async def close_duplex_session_async(
         self,
@@ -366,13 +354,33 @@ class AsyncOmni(EngineClient, OmniBase):
         timeout: float | None = 10.0,
     ) -> dict[str, object]:
         """Close an engine-level duplex session."""
-        kwargs = {"reason": reason, "timeout": timeout}
-        kwargs["fence"] = fence
-        return await self.engine.close_duplex_session_async(session_id, **kwargs)
+        return await self._get_duplex_request_client().close(
+            session_id,
+            reason=reason,
+            fence=fence,
+            timeout=timeout,
+        )
+
+    def _get_duplex_request_client(self) -> DuplexRequestClient:
+        client = getattr(self, "_duplex_request_client", None)
+        if client is None:
+            engine = getattr(self, "engine", None)
+            client = DuplexRequestClient(
+                engine,
+                DuplexRequestOutputPort(
+                    request_states=getattr(self, "request_states", {}),
+                    num_stages=getattr(engine, "num_stages", 1),
+                    log_stats=getattr(self, "log_stats", False),
+                    start_output_handler=self._final_output_handler,
+                    process_single_result=self._process_single_result,
+                ),
+            )
+            self._duplex_request_client = client
+        return client
 
     @staticmethod
     def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
-        return duplex_data_plane_request_info(result)
+        return DuplexRequestClient.request_info(result)
 
     async def _collect_duplex_data_plane_outputs(
         self,
@@ -382,105 +390,20 @@ class AsyncOmni(EngineClient, OmniBase):
         response_stage_id: int | None,
         timeout: float | None,
     ) -> list[OmniRequestOutput]:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        wall_start_ts = time.time()
-        final_stage_id = (
-            response_stage_id if response_stage_id is not None else max(0, getattr(self, "num_stages", 1) - 1)
+        return await self._get_duplex_request_client().collect_outputs(
+            request_id,
+            req_state,
+            response_stage_id=response_stage_id,
+            timeout=timeout,
         )
-        num_stages = max(getattr(self, "num_stages", final_stage_id + 1), final_stage_id + 1)
-        metrics = getattr(req_state, "metrics", None) or OrchestratorMetrics(
-            num_stages,
-            getattr(self, "log_stats", False),
-            wall_start_ts,
-            final_stage_id,
-        )
-        req_start_ts = {request_id: wall_start_ts}
-        outputs: list[OmniRequestOutput] = []
-        while True:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            if remaining == 0.0:
-                break
-            try:
-                msg = await asyncio.wait_for(req_state.queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
-            if isinstance(msg, ErrorMessage):
-                raise RuntimeError(msg.error)
-            if not isinstance(msg, OutputMessage):
-                continue
-            engine_outputs = msg.engine_outputs
-            is_response_stage = response_stage_id is None or msg.stage_id >= response_stage_id
-            is_direct_duplex_response = self._is_direct_duplex_data_plane_response(engine_outputs)
-            output_to_collect = None
-            if isinstance(engine_outputs, OmniRequestOutput):
-                output_to_collect = engine_outputs
-            elif is_response_stage:
-                output_to_collect = self._process_single_result(
-                    msg,
-                    msg.stage_id,
-                    metrics,
-                    req_start_ts,
-                    wall_start_ts,
-                    final_stage_id,
-                )
-            if output_to_collect is not None and (is_response_stage or is_direct_duplex_response):
-                if msg.finished:
-                    output_to_collect.finished = True
-                outputs.append(output_to_collect)
-            if msg.finished or outputs:
-                break
-        request_states = getattr(self, "request_states", None)
-        if (
-            outputs
-            and outputs[-1].finished
-            and isinstance(request_states, dict)
-            # Duplex data-plane requests are resumable sessions: every segment
-            # ends with finished=True but the logical request lives on. Keep
-            # the request state so decision events produced between appends
-            # are routed to the queue the drain task is reading instead of an
-            # orphaned auto-created replacement.
-            and not request_id.startswith("duplex-")
-        ):
-            request_states.pop(request_id, None)
-        return outputs
 
     @classmethod
     def _is_direct_duplex_data_plane_response(cls, output: object) -> bool:
-        mm_output = cls._duplex_multimodal_output(output)
-        if not mm_output:
-            return False
-        return mm_output.get("duplex_direct_response") is True or mm_output.get("duplex_native_decision") in {
-            "listen",
-            "speak",
-        }
+        return DuplexRequestClient.is_direct_response(output)
 
     @classmethod
     def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
-        if isinstance(output, OmniRequestOutput):
-            private_mm = getattr(output, "_multimodal_output", None)
-            if isinstance(private_mm, dict) and (
-                private_mm.get("duplex_direct_response") is True
-                or private_mm.get("duplex_native_decision") in {"listen", "speak"}
-            ):
-                return private_mm
-            mm_output = output.multimodal_output
-            if isinstance(mm_output, dict) and mm_output:
-                return mm_output
-            inner_output = getattr(output, "request_output", None)
-            if inner_output is not None and inner_output is not output:
-                inner_mm = cls._duplex_multimodal_output(inner_output)
-                if inner_mm:
-                    return inner_mm
-            if isinstance(private_mm, dict):
-                return private_mm
-            return mm_output if isinstance(mm_output, dict) else {}
-        mm_output = getattr(output, "multimodal_output", None)
-        if isinstance(mm_output, dict):
-            return mm_output
-        outputs = getattr(output, "outputs", None)
-        completion = outputs[0] if isinstance(outputs, list) and outputs else None
-        mm_output = getattr(completion, "multimodal_output", None) if completion is not None else None
-        return mm_output if isinstance(mm_output, dict) else {}
+        return DuplexRequestClient.multimodal_output(output)
 
     # ==================== Generate Method ====================
 

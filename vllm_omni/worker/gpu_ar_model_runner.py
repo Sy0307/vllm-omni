@@ -329,6 +329,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._duplex_sampling_hook = None
+        self._duplex_sampling_hook_resolved = False
+        self._duplex_sampling_hook_active = False
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        self._resolve_duplex_sampling_hook(force=True)
+
+    def _resolve_duplex_sampling_hook(self, *, force: bool = False):
+        if not force and getattr(self, "_duplex_sampling_hook_resolved", False):
+            return self._duplex_sampling_hook
+        candidate = getattr(getattr(self, "model", None), "prepare_duplex_sampling", None)
+        self._duplex_sampling_hook = candidate if callable(candidate) else None
+        self._duplex_sampling_hook_resolved = True
+        if self._duplex_sampling_hook is not None and not hasattr(self, "_active_duplex_request_ids"):
+            self._active_duplex_request_ids: set[str] = set()
+        return self._duplex_sampling_hook
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -396,11 +413,41 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
 
+    @staticmethod
+    def _is_duplex_data_plane_info(info: object) -> bool:
+        duplex = info.get("duplex") if isinstance(info, dict) else None
+        return isinstance(duplex, dict) and duplex.get("data_plane") is True
+
+    def _refresh_active_duplex_request(self, req_id: str) -> None:
+        if self._resolve_duplex_sampling_hook() is None:
+            return
+        active_ids = getattr(self, "_active_duplex_request_ids", None)
+        if active_ids is None:
+            active_ids = set()
+            self._active_duplex_request_ids = active_ids
+        if self._is_duplex_data_plane_info(self._request_duplex_intermediate_info(req_id)):
+            active_ids.add(req_id)
+        else:
+            active_ids.discard(req_id)
+
+    def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
+        deferred_state_corrections_fn = super()._update_states(scheduler_output)
+        if self._resolve_duplex_sampling_hook() is None:
+            return deferred_state_corrections_fn
+        active_ids = self._active_duplex_request_ids
+        active_ids.difference_update(str(req_id) for req_id in scheduler_output.finished_req_ids)
+        for request in scheduler_output.scheduled_new_reqs:
+            self._refresh_active_duplex_request(str(request.req_id))
+        return deferred_state_corrections_fn
+
     def _duplex_sampling_rows(self) -> tuple[DuplexSamplingRow, ...]:
         rows: list[DuplexSamplingRow] = []
+        active_ids = self._active_duplex_request_ids
         req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
         requests = getattr(self, "requests", {})
         for row_idx, req_id in enumerate(req_ids):
+            if req_id not in active_ids:
+                continue
             info = self._request_duplex_intermediate_info(req_id)
             duplex = info.get("duplex") if isinstance(info, dict) else None
             if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
@@ -573,6 +620,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._downstream_payload_cache.clear()
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.clear()
+        if hasattr(self, "_active_duplex_request_ids"):
+            self._active_duplex_request_ids.clear()
+        self._duplex_sampling_hook_active = False
 
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
@@ -1472,7 +1522,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
-            duplex_rows = self._duplex_sampling_rows()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
@@ -1485,9 +1534,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
-                prepare_duplex_sampling = getattr(self.model, "prepare_duplex_sampling", None)
-                if callable(prepare_duplex_sampling):
-                    prepare_duplex_sampling(logits, prepared_sampling_metadata, duplex_rows)
+                prepare_duplex_sampling = self._resolve_duplex_sampling_hook()
+                if prepare_duplex_sampling is not None:
+                    rows = self._duplex_sampling_rows() if getattr(self, "_active_duplex_request_ids", ()) else ()
+                    if rows or getattr(self, "_duplex_sampling_hook_active", False):
+                        prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
+                    self._duplex_sampling_hook_active = bool(rows)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output

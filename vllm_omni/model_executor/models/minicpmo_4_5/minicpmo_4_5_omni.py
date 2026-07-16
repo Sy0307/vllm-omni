@@ -382,10 +382,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper.sessions[session_key] = state
             session_config = duplex.get("session_config")
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
+            runtime_config = duplex.get("runtime_config")
+            runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor()
-            helper._prepare_session_context(state, session_config)
+            helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
 
         audio_waveform = helper._decode_audio_payload(payload)
         seq = duplex.get("seq")

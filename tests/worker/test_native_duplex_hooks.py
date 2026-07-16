@@ -179,6 +179,7 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
             sampling_params=SimpleNamespace(max_tokens=32),
         )
     }
+    runner._active_duplex_request_ids = {"req-duplex"}
 
     rows = runner._duplex_sampling_rows()
 
@@ -190,6 +191,81 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
     assert rows[0].seq == 4
     assert rows[0].payload == {"is_speech": True}
     assert rows[0].max_tokens == 32
+
+
+def test_generic_ar_runner_skips_duplex_rows_without_model_hook():
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=object(),
+        update_async_output_token_ids=lambda: None,
+    )
+    runner.model = SimpleNamespace(sample=lambda *_args, **_kwargs: None, prefer_model_sampler=False)
+    runner.sampler = lambda **_kwargs: "standard-sampler"
+    runner._duplex_sampling_rows = lambda: pytest.fail("duplex rows built without a model hook")
+
+    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "standard-sampler"
+
+
+def test_plain_model_hook_resolution_does_not_allocate_duplex_tracking():
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace()
+    runner._duplex_sampling_hook = None
+    runner._duplex_sampling_hook_resolved = False
+
+    assert runner._resolve_duplex_sampling_hook() is None
+    assert not hasattr(runner, "_active_duplex_request_ids")
+
+
+def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    calls = []
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=SimpleNamespace(output_token_ids=[]),
+        update_async_output_token_ids=lambda: None,
+    )
+    runner.model = SimpleNamespace(
+        sample=lambda *_args, **_kwargs: "model-sampler",
+        prefer_model_sampler=True,
+        skips_model_sampler_output_token_history=True,
+        prepare_duplex_sampling=lambda *_args: calls.append("prepare"),
+    )
+    runner.sampler = SimpleNamespace()
+    runner._active_duplex_request_ids = set()
+    runner._duplex_sampling_rows = lambda: pytest.fail("non-duplex MiniCPM scanned request rows")
+
+    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
+    assert calls == []
+
+
+def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    calls = []
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=SimpleNamespace(output_token_ids=[]),
+        update_async_output_token_ids=lambda: None,
+    )
+    runner.model = SimpleNamespace(
+        sample=lambda *_args, **_kwargs: "model-sampler",
+        prefer_model_sampler=True,
+        skips_model_sampler_output_token_history=True,
+        prepare_duplex_sampling=lambda _logits, _metadata, rows: calls.append(rows),
+    )
+    runner.sampler = SimpleNamespace()
+    runner._active_duplex_request_ids = set()
+    runner._duplex_sampling_hook_active = True
+    runner._duplex_sampling_rows = lambda: pytest.fail("duplex cleanup scanned request rows")
+
+    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
+    assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
+    assert calls == [()]
 
 
 def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
@@ -235,10 +311,8 @@ def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
     with pytest.raises(ValueError, match="invalid native duplex ref_audio_data"):
         MiniCPMO45Stage0DuplexRuntime._decode_ref_audio_from_session_config(
             {
-                "extra_body": {
-                    "ref_audio_data": "a",
-                    "ref_audio_format": "pcm_f32le",
-                }
+                "ref_audio_data": "a",
+                "ref_audio_format": "pcm_f32le",
             }
         )
 

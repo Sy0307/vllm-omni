@@ -38,11 +38,13 @@ class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     session_mode: str = "duplex"
     capabilities: dict[str, object]
     session_config: dict[str, object] | None = None
+    runtime_config: dict[str, object] | None = None
 
 
 class AppendDuplexInputMessage(EngineQueueMessage, kw_only=True):
     type: Literal["append_duplex_input"] = "append_duplex_input"
     control_id: str
+    operation_id: str | None = None
     fence: DuplexFence
     session_id: str
     expected_epoch: int | None = None
@@ -59,6 +61,7 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     event: str
     next_fence: DuplexFence | None = None
     session_config: dict[str, object] | None = None
+    runtime_config: dict[str, object] | None = None
 
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):

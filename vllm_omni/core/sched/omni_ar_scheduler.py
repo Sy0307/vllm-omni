@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.resumable import ResumableSegmentPolicy
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
@@ -137,68 +138,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
-    @staticmethod
-    def _duplex_data_plane_info(request: Request) -> dict[str, Any] | None:
-        info = getattr(request, "model_intermediate_buffer", None)
-        if not isinstance(info, dict):
-            return None
-        duplex = info.get("duplex")
-        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
-            return None
-        return duplex
-
-    def _duplex_stage_stop_token_ids(self, request: Request) -> set[int]:
-        stop_token_ids: set[int] = set()
-        sampling_params = getattr(request, "sampling_params", None)
-        for source in (
-            getattr(sampling_params, "stop_token_ids", None),
-            getattr(sampling_params, "_all_stop_token_ids", None),
-        ):
-            if isinstance(source, (list, tuple, set)):
-                for token_id in source:
-                    try:
-                        token_id = int(token_id)
-                    except (TypeError, ValueError):
-                        continue
-                    if token_id >= 0:
-                        stop_token_ids.add(token_id)
-        return stop_token_ids
-
-    def _is_duplex_segment_boundary(
+    def _is_resumable_segment_boundary(
         self,
         request: Request,
         new_token_ids: list[int],
     ) -> bool:
         if not getattr(request, "resumable", False):
             return False
-        if self._duplex_data_plane_info(request) is None:
+        policy = getattr(request, "resumable_segment_policy", None)
+        if not isinstance(policy, ResumableSegmentPolicy):
             return False
-
-        stop_token_ids = self._duplex_stage_stop_token_ids(request)
-        if stop_token_ids and any(int(token_id) in stop_token_ids for token_id in new_token_ids):
+        output_token_ids = getattr(request, "output_token_ids", None)
+        output_token_count = len(output_token_ids) if isinstance(output_token_ids, list) else 0
+        if not policy.reached_boundary(new_token_ids, output_token_count):
+            return False
+        if policy.stop_token_ids and any(int(token_id) in policy.stop_token_ids for token_id in new_token_ids):
             logger.info(
-                "[OmniARScheduler] duplex segment boundary by stop token: req=%s tokens=%s stop_token_ids=%s",
+                "[OmniARScheduler] resumable segment boundary by stop token: req=%s tokens=%s stop_token_ids=%s",
                 request.request_id,
                 new_token_ids,
-                sorted(stop_token_ids),
+                policy.stop_token_ids,
             )
             return True
-
-        max_tokens = getattr(request, "max_tokens", None)
-        try:
-            max_tokens = int(max_tokens)
-        except (TypeError, ValueError):
-            max_tokens = 0
-        output_token_ids = getattr(request, "output_token_ids", None)
-        if max_tokens > 0 and isinstance(output_token_ids, list) and len(output_token_ids) >= max_tokens:
+        if policy.max_segment_tokens is not None:
             logger.info(
-                "[OmniARScheduler] duplex segment boundary by max_tokens: req=%s output_len=%d max_tokens=%d",
+                "[OmniARScheduler] resumable segment boundary by max tokens: req=%s output_len=%d max_tokens=%d",
                 request.request_id,
-                len(output_token_ids),
-                max_tokens,
+                output_token_count,
+                policy.max_segment_tokens,
             )
             return True
-
         return False
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
@@ -486,7 +455,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
-            if not stopped and new_token_ids and self._is_duplex_segment_boundary(request, new_token_ids):
+            if not stopped and new_token_ids and self._is_resumable_segment_boundary(request, new_token_ids):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
@@ -782,6 +751,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []
+        if hasattr(update, "resumable_segment_policy"):
+            session.resumable_segment_policy = update.resumable_segment_policy
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if self.vllm_config.model_config.stage_id != 0:
