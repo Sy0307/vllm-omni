@@ -74,10 +74,12 @@ def test_experimental_runtime_types_are_stable_engine_reexports():
 
 def test_duplex_session_state_has_a_dedicated_stable_module():
     from vllm_omni.engine import duplex_session
+    from vllm_omni.engine.duplex_lease import DuplexLeaseConfig
 
     assert duplex_runtime.DuplexAppendReservation is duplex_session.DuplexAppendReservation
     assert duplex_runtime.DuplexSessionRuntimeState is duplex_session.DuplexSessionRuntimeState
     assert duplex_runtime.DuplexSessionRuntimeManager is duplex_session.DuplexSessionRuntimeManager
+    assert duplex_runtime.DuplexLeaseConfig is DuplexLeaseConfig
 
 
 def test_duplex_runtime_extension_validation_rejects_missing_methods():

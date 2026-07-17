@@ -3,9 +3,17 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vllm_omni.engine.duplex_lease import (
+    DuplexLeaseActivity,
+    DuplexLeaseConfig,
+    DuplexLeaseState,
+    DuplexSessionExpiry,
+)
 from vllm_omni.engine.duplex_types import DuplexFence
 
 if TYPE_CHECKING:
@@ -73,6 +81,8 @@ class DuplexSessionRuntimeState:
     """Engine resource handles associated with a core-owned identity fence."""
 
     fence: DuplexFence
+    lease: DuplexLeaseState
+    _clock: Callable[[], float] = field(repr=False)
     capabilities: DuplexRuntimeCapabilities = field(default_factory=_default_capabilities)
     session_config: dict[str, Any] = field(default_factory=dict)
     runtime_config: dict[str, Any] = field(default_factory=dict)
@@ -113,6 +123,29 @@ class DuplexSessionRuntimeState:
             self.input_turn_seq = 0
             self._append_turn_key = None
         self.fence = fence
+
+    def touch(self, fence: DuplexFence, activity: DuplexLeaseActivity) -> None:
+        self._validate_fence(fence)
+        self.lease.touch(self._clock(), activity)
+
+    def detach(self, fence: DuplexFence) -> None:
+        self._validate_fence(fence)
+        self.lease.detach(self._clock())
+
+    def resume(self, fence: DuplexFence, *, expected_lease_generation: int) -> int:
+        self._validate_fence(fence)
+        return self.lease.resume(
+            self._clock(),
+            expected_generation=expected_lease_generation,
+        )
+
+    def begin_operation(self, fence: DuplexFence, operation_id: str) -> None:
+        self._validate_fence(fence)
+        self.lease.begin_operation(self._clock(), operation_id)
+
+    def end_operation(self, fence: DuplexFence, operation_id: str) -> None:
+        self._validate_fence(fence)
+        self.lease.end_operation(self._clock(), operation_id)
 
     def replace_session_config(self, session_config: dict[str, Any]) -> None:
         self.session_config = dict(session_config)
@@ -281,10 +314,18 @@ class DuplexSessionRuntimeState:
         self.request_resources.clear()
         return stale
 
+    def terminate(self, fence: DuplexFence, *, reason: str) -> bool:
+        self._validate_fence(fence)
+        if not self.lease.mark_terminal(reason):
+            return False
+        self.close(fence)
+        return True
+
 
 class DuplexSessionRuntimeManager:
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
         self._sessions: dict[str, DuplexSessionRuntimeState] = {}
+        self._clock = clock or time.monotonic
 
     def open_session(
         self,
@@ -293,6 +334,7 @@ class DuplexSessionRuntimeManager:
         capabilities: DuplexRuntimeCapabilities | None = None,
         session_config: dict[str, Any] | None = None,
         runtime_config: dict[str, Any] | None = None,
+        lease_config: DuplexLeaseConfig | None = None,
     ) -> DuplexSessionRuntimeState:
         if not isinstance(fence, DuplexFence):
             raise TypeError("open_session requires DuplexFence")
@@ -300,6 +342,12 @@ class DuplexSessionRuntimeManager:
             raise ValueError(f"Duplex session already exists: {fence.session_id}")
         session = DuplexSessionRuntimeState(
             fence=fence,
+            lease=DuplexLeaseState(
+                config=lease_config or DuplexLeaseConfig(),
+                generation=0,
+                last_activity=self._clock(),
+            ),
+            _clock=self._clock,
             capabilities=capabilities or _default_capabilities(),
             session_config=dict(session_config or {}),
             runtime_config=dict(runtime_config or {}),
@@ -316,15 +364,44 @@ class DuplexSessionRuntimeManager:
             raise KeyError(f"Unknown duplex session: {session_id}")
         return session
 
-    def close_session(self, fence: DuplexFence) -> DuplexSessionRuntimeState | None:
+    def close_session(
+        self,
+        fence: DuplexFence,
+        *,
+        reason: str = "explicit_close",
+    ) -> DuplexSessionRuntimeState | None:
         if not isinstance(fence, DuplexFence):
             raise TypeError("close_session requires DuplexFence")
         session = self._sessions.get(fence.session_id)
         if session is not None:
-            session.close(fence)
+            if not session.terminate(fence, reason=reason):
+                return None
             if self._sessions.get(fence.session_id) is session:
                 self._sessions.pop(fence.session_id)
         return session
+
+    def collect_expired(self, now: float | None = None) -> list[DuplexSessionExpiry]:
+        effective_now = self._clock() if now is None else now
+        expired: list[DuplexSessionExpiry] = []
+        for session_id, session in list(self._sessions.items()):
+            if not session.lease.idle_expired(effective_now):
+                continue
+            submitted = tuple(session.resource_request_ids(submitted=True))
+            reserved = tuple(session.resource_request_ids(submitted=False))
+            if not session.terminate(session.fence, reason="idle_ttl_expired"):
+                continue
+            self._sessions.pop(session_id, None)
+            expired.append(
+                DuplexSessionExpiry(
+                    session_id=session_id,
+                    fence=session.fence,
+                    lease_generation=session.lease.generation,
+                    reason="idle_ttl_expired",
+                    submitted_request_ids=submitted,
+                    reserved_request_ids=reserved,
+                )
+            )
+        return expired
 
     def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]:
         request_id_set = set(request_ids)
@@ -333,8 +410,9 @@ class DuplexSessionRuntimeManager:
             stale = session.resource_request_ids()
             if request_id_set.isdisjoint(stale):
                 continue
+            if not session.terminate(session.fence, reason="request_cleanup"):
+                continue
             self._sessions.pop(session_id, None)
-            session.close()
             closed[session_id] = stale
         return closed
 
@@ -344,7 +422,11 @@ __all__ = [
     "DuplexCompletedAppend",
     "DuplexFenceMismatchError",
     "DuplexInputAppend",
+    "DuplexLeaseActivity",
+    "DuplexLeaseConfig",
+    "DuplexLeaseState",
     "DuplexRequestResource",
+    "DuplexSessionExpiry",
     "DuplexSessionRuntimeManager",
     "DuplexSessionRuntimeState",
     "DuplexStageBinding",

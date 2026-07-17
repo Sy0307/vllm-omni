@@ -140,12 +140,16 @@ def validate_duplex_runtime_extension(
     return typed_extension
 
 
-from vllm_omni.engine.duplex_session import (  # noqa: E402
+from vllm_omni.engine.duplex_session import (  # noqa: E402, F401
     DuplexAppendReservation,
     DuplexCompletedAppend,
     DuplexFenceMismatchError,
     DuplexInputAppend,
+    DuplexLeaseActivity,
+    DuplexLeaseConfig,
+    DuplexLeaseState,
     DuplexRequestResource,
+    DuplexSessionExpiry,
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
     DuplexStageBinding,
