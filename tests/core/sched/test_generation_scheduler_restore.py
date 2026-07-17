@@ -10,11 +10,23 @@ from collections import deque
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.v1.core.sched.interface import PauseState
 
-from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import (
+    OmniGenerationScheduler,
+    _has_async_chunk_payload_to_run,
+)
+from vllm_omni.engine.serialization import serialize_additional_information
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_generation_scheduler_recognizes_serialized_terminal_codec_payload() -> None:
+    payload = serialize_additional_information({"codes": {"audio": torch.tensor([[1, 2, 3]], dtype=torch.long)}})
+
+    assert payload is not None
+    assert _has_async_chunk_payload_to_run(SimpleNamespace(additional_information=payload))
 
 
 class FakeAdapter:
@@ -204,7 +216,9 @@ def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeyp
         mm_features=None,
         lora_request=None,
         prompt_is_token_ids=True,
-        additional_information={"codes": {"audio": "payload"}},
+        additional_information=serialize_additional_information(
+            {"codes": {"audio": torch.tensor([[1, 2, 3]], dtype=torch.long)}}
+        ),
         external_req_id="terminal",
         record_event=lambda *args, **kwargs: None,
     )

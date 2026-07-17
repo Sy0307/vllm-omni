@@ -300,28 +300,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # Convert raw model output to OmniOutput.
         if not isinstance(model_output, OmniOutput):
             buffer_list = self.model_state.intermediate_buffer.gather(input_batch)
-            try:
-                make_output_kwargs = {"model_intermediate_buffer": buffer_list}
-                if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
-                    make_output_kwargs["runtime_additional_information"] = buffer_list
-                model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
-            except Exception:
-                logger.error(
-                    "make_omni_output failed; returning empty output",
-                    exc_info=True,
-                )
-                self._gen_model_output = None
-                self.execute_model_state = _make_execute_model_state(
-                    input_batch=input_batch,
-                    attn_metadata=None,
-                    slot_mappings_by_layer=None,
-                    hidden_states=self._dummy_hidden,
-                    aux_hidden_states=None,
-                    finished_req_ids=scheduler_output.finished_req_ids,
-                    kv_connector_output=kv_connector_output,
-                    num_tokens_across_dp=None,
-                )
-                return None
+            make_output_kwargs = {"model_intermediate_buffer": buffer_list}
+            if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
+                make_output_kwargs["runtime_additional_information"] = buffer_list
+            model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 
         self._gen_model_output = model_output
         self._gen_input_batch = input_batch

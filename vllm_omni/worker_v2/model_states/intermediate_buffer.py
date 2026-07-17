@@ -10,31 +10,28 @@ from typing import Any
 
 import numpy as np
 import torch
-from vllm.logger import init_logger
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_omni.worker.payload_span import get_tensor_span, merge_tensor_spans
-
-logger = init_logger(__name__)
 
 
 def _resolve_prompt_embeds(pe: Any) -> torch.Tensor | None:
     """Convert a prompt_embeds payload to a contiguous CPU tensor."""
     if pe is None:
         return None
+    if isinstance(pe, torch.Tensor):
+        return pe.detach().cpu().contiguous()
     try:
-        if isinstance(pe, torch.Tensor):
-            return pe.detach().cpu().contiguous()
         data = getattr(pe, "data", None)
         shape = getattr(pe, "shape", None)
         if data is not None and shape is not None:
             dt = np.dtype(getattr(pe, "dtype", "float32"))
             arr = np.frombuffer(data, dtype=dt).reshape(shape)
             return torch.from_numpy(arr.copy())
-    except Exception:
-        logger.exception("Failed to decode prompt_embeds payload")
-    return None
+    except Exception as exc:
+        raise ValueError("Failed to decode prompt_embeds payload") from exc
+    raise TypeError(f"Unsupported prompt_embeds payload type: {type(pe).__name__}")
 
 
 def _resolve_additional_information(payload: Any) -> dict[str, Any]:
@@ -48,10 +45,11 @@ def _resolve_additional_information(payload: Any) -> dict[str, Any]:
         info = deserialize_additional_information(payload)
         if isinstance(info, dict) and any(isinstance(key, str) and "." in key for key in info):
             info = unflatten_payload(info)
-        return info if isinstance(info, dict) else {}
-    except Exception:
-        logger.exception("Failed to decode additional_information payload")
-    return {}
+    except Exception as exc:
+        raise ValueError("Failed to decode additional_information payload") from exc
+    if not isinstance(info, dict):
+        raise TypeError(f"Decoded additional_information must be a dict, got {type(info).__name__}")
+    return info
 
 
 class OmniIntermediateBuffer:
