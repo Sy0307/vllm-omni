@@ -38,7 +38,10 @@ from vllm_omni.engine import (
 from vllm_omni.engine import (
     OmniEngineCoreOutputs as EngineCoreOutputs,
 )
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -72,7 +75,7 @@ def _set_request_num_cached_tokens_if_present(request, value: int) -> None:
 def _has_async_chunk_payload_to_run(request: Request) -> bool:
     additional_information = getattr(request, "additional_information", None)
     if not isinstance(additional_information, dict):
-        return False
+        additional_information = deserialize_additional_information(additional_information)
 
     codes = additional_information.get("codes")
     audio = codes.get("audio") if isinstance(codes, dict) else additional_information.get("codes.audio")

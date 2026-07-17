@@ -477,6 +477,13 @@ def test_thinker2talker_async_chunk_marks_absolute_decode_token_span() -> None:
     assert payload.embed.decode_token_end == 8
 
 
+def test_first_decode_row_follows_the_first_sampled_thinker_token() -> None:
+    # The first sampled token is produced with the prefill rows. The next
+    # forward processes that token and samples token two, so one decode row is
+    # paired with output_token_count=2 rather than the unreachable (1, 1).
+    assert q3._thinker_decode_token_span(output_token_count=2, row_count=1) == (0, 1)
+
+
 def test_thinker2talker_batch_processor_coalesces_decode_d2h(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

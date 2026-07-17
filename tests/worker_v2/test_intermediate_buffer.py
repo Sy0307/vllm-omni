@@ -5,6 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    PromptEmbedsPayload,
+)
 from vllm_omni.worker.payload_span import merge_tensor_spans
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
@@ -61,6 +66,17 @@ def test_resolve_prompt_embeds_none():
     assert _resolve_prompt_embeds(None) is None
 
 
+def test_resolve_prompt_embeds_rejects_malformed_wire_payload():
+    payload = PromptEmbedsPayload(
+        data=b"\x00",
+        shape=[2, 2],
+        dtype="float32",
+    )
+
+    with pytest.raises(ValueError, match="Failed to decode prompt_embeds payload"):
+        _resolve_prompt_embeds(payload)
+
+
 # ---------------------------------------------------------------
 # _resolve_additional_information
 # ---------------------------------------------------------------
@@ -73,6 +89,21 @@ def test_resolve_additional_information_dict_passthrough():
 
 def test_resolve_additional_information_none():
     assert _resolve_additional_information(None) == {}
+
+
+def test_resolve_additional_information_rejects_malformed_wire_payload():
+    payload = AdditionalInformationPayload(
+        entries={
+            "embed.decode": AdditionalInformationEntry(
+                tensor_data=b"\x00",
+                tensor_shape=[2],
+                tensor_dtype="float32",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="Failed to decode additional_information payload"):
+        _resolve_additional_information(payload)
 
 
 # ---------------------------------------------------------------

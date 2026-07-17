@@ -12,16 +12,103 @@ Covers the core multimodal_outputs construction paths via _build_pooler_output:
 
 import inspect
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 pytestmark = []
+
+
+def test_execute_model_propagates_make_omni_output_failure(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as generation_runner
+
+    runner = object.__new__(generation_runner.OmniGenerationModelRunner)
+    runner._prepare_native_data_plane = MagicMock()
+    runner.finish_requests = MagicMock()
+    runner.free_states = MagicMock()
+    runner._handle_async_chunk_updates = MagicMock()
+    runner.add_requests = MagicMock()
+    runner.update_requests = MagicMock()
+    runner._sync_native_data_plane_payloads = MagicMock()
+    runner._apply_block_table_staged_writes_if_available = MagicMock()
+    runner._dispatch_batch_descriptor = MagicMock(return_value=(SimpleNamespace(num_tokens=1, cg_mode=None), None))
+    input_batch = SimpleNamespace(
+        positions=torch.zeros(1, dtype=torch.long),
+        num_tokens_after_padding=1,
+    )
+    runner.prepare_inputs = MagicMock(return_value=input_batch)
+    runner._prepare_mm_inputs = MagicMock(return_value=(torch.zeros(1, dtype=torch.long), None))
+    runner._add_legacy_forward_inputs = MagicMock()
+    runner.model_state = SimpleNamespace(
+        prepare_inputs=lambda *_args: {},
+        intermediate_buffer=SimpleNamespace(gather=lambda _batch: [{}]),
+    )
+    runner.req_states = object()
+    runner.lora_config = None
+    runner.vllm_config = object()
+    runner._dummy_hidden = torch.zeros(1)
+    runner.kv_connector = SimpleNamespace(
+        pre_forward=lambda _output: None,
+        post_forward=lambda _finished: None,
+    )
+    runner.model = MagicMock(return_value=torch.zeros(1))
+    runner.model.requires_native_model_intermediate_buffer = True
+    runner.model.make_omni_output.side_effect = RuntimeError("broken Code2Wav output")
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 1},
+        total_num_scheduled_tokens=1,
+        finished_req_ids=set(),
+    )
+    monkeypatch.setattr(generation_runner, "set_forward_context", lambda *_args, **_kwargs: nullcontext())
+
+    with pytest.raises(RuntimeError, match="broken Code2Wav output"):
+        generation_runner.OmniGenerationModelRunner.execute_model(runner, scheduler_output)
+
+
+def test_vllm_025_add_requests_accepts_released_chunk_projection():
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = object.__new__(GPUModelRunner)
+    runner._remove_request = MagicMock()
+    runner.req_states = SimpleNamespace(
+        add_request=MagicMock(),
+        req_id_to_index={"req": 0},
+        apply_staged_writes=MagicMock(),
+    )
+    runner.encoder_cache = None
+    runner.model_state = SimpleNamespace(
+        add_request=MagicMock(),
+        apply_staged_writes=MagicMock(),
+    )
+    runner.block_tables = SimpleNamespace(append_block_ids=MagicMock())
+    runner.lora_state = SimpleNamespace(add_request=MagicMock())
+    runner.is_last_pp_rank = False
+    runner.sampler = None
+    request = SimpleNamespace(
+        req_id="req",
+        prompt_token_ids=[1],
+        prefill_token_ids=[1],
+        sampling_params=None,
+        num_computed_tokens=0,
+        mm_features=[],
+        block_ids=(),
+        lora_request=None,
+    )
+
+    GPUModelRunner.add_requests(
+        runner,
+        SimpleNamespace(scheduled_new_reqs=[request]),
+    )
+
+    runner.req_states.add_request.assert_called_once()
+    runner.model_state.add_request.assert_called_once_with(0, request)
 
 
 def test_execute_model_does_not_reference_removed_perf_hook():
