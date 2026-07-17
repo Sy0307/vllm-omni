@@ -4,6 +4,11 @@
   const config = window.FULL_DUPLEX_CONFIG || {};
   const callButton = document.getElementById('callButton');
   const muteButton = document.getElementById('muteButton');
+  const cameraButton = document.getElementById('cameraButton');
+  const cameraPreview = document.getElementById('cameraPreview');
+  const autoCommitToggle = document.getElementById('autoCommitToggle');
+  const promptPreset = document.getElementById('promptPreset');
+  const systemPromptInput = document.getElementById('systemPrompt');
   const connectionState = document.getElementById('connectionState');
   const modelState = document.getElementById('modelState');
   const playbackState = document.getElementById('playbackState');
@@ -20,6 +25,25 @@
   const OUTPUT_RATE = 24000;
   const SEND_INTERVAL_MS = 200;
   const ECHO_GUARD_MS = 300;
+  // If the server has not started a response this long after a commit,
+  // send response.create (the auto-response only fires on the first turn).
+  const RESPONSE_CREATE_FALLBACK_MS = 900;
+  // A "still active" response with no deltas for this long is considered
+  // dead (e.g. truncated by barge-in without a terminal lifecycle event).
+  const RESPONSE_STALL_MS = 2000;
+
+  // Default prompts mirroring the official MiniCPM-o-Demo presets
+  // (assets/presets/{omni,audio_duplex}/*.yaml).
+  const PROMPT_PRESETS = {
+    omni: 'Streaming Omni Conversation.',
+    chinese_call: '扮演一个具有以上声音特征的助手。请认真、高质量地回复用户的问题。'
+      + '请用高自然度的方式和用户聊天。你处于双工模式，可以一边听、一边说。'
+      + '你是由面壁智能开发的人工智能助手：面壁小钢炮。',
+    english_call: 'Replicate the tone and style from the input audio. Your task is to be '
+      + 'a helpful assistant using this voice pattern. Please answer the user\'s questions '
+      + 'seriously and in a high quality. Please chat with the user in a high naturalness '
+      + 'style. You are in duplex mode, where you can listen and speak at the same time.',
+  };
 
   let socket = null;
   let mediaStream = null;
@@ -34,6 +58,12 @@
   let muted = false;
   let assistantActive = false;
   let captureRate = INPUT_RATE;
+  let cameraStream = null;
+  let uploadHadSpeech = false;
+  let uploadSilenceMs = 0;
+  let cameraTimer = null;
+  let cameraPendingFrame = null;
+  const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
   let currentResponseId = null;
@@ -41,6 +71,50 @@
   let logCount = 0;
   let liveUserTurn = null;
   let liveAssistantTurn = null;
+  let responseCreateTimer = null;
+  let responseActiveNow = false;
+  let lastResponseDeltaAt = 0;
+
+  if (promptPreset && systemPromptInput) {
+    promptPreset.addEventListener('change', () => {
+      const preset = PROMPT_PRESETS[promptPreset.value];
+      if (preset !== undefined) systemPromptInput.value = preset;
+    });
+    systemPromptInput.addEventListener('input', () => {
+      promptPreset.value = 'custom';
+    });
+  }
+
+  /**
+   * Arm the post-commit fallback: the runtime auto-responds to the first
+   * input_audio_buffer.commit but not to later ones (post-response commits
+   * are mis-deferred as barge-in of an already-finished response). If the
+   * assistant is mid-response the commit was deferred server-side and starts
+   * on its own, so re-check instead of firing — unless deltas stalled, which
+   * means the response was truncated without a terminal event.
+   */
+  function armResponseCreateFallback() {
+    if (responseCreateTimer) clearTimeout(responseCreateTimer);
+    responseCreateTimer = setTimeout(() => {
+      responseCreateTimer = null;
+      if (!socket || socket.readyState !== WebSocket.OPEN || !running) return;
+      const streaming = responseActiveNow
+        && (performance.now() - lastResponseDeltaAt) < RESPONSE_STALL_MS;
+      if (streaming) {
+        armResponseCreateFallback();
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'response.create' }));
+      appendLog('response.create fallback sent (auto-response missing)');
+    }, RESPONSE_CREATE_FALLBACK_MS);
+  }
+
+  function disarmResponseCreateFallback() {
+    if (responseCreateTimer) {
+      clearTimeout(responseCreateTimer);
+      responseCreateTimer = null;
+    }
+  }
 
   function realtimeUrl() {
     const url = new URL(config.realtimePath, window.location.href);
@@ -229,12 +303,45 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, INPUT_RATE);
-    socket.send(JSON.stringify({
+    const appendEvent = {
       type: 'input_audio_buffer.append',
       audio: int16ToBase64(pcm),
       format: 'pcm16',
       sample_rate_hz: INPUT_RATE,
-    }));
+    };
+    // Optional end-of-utterance commit: the current duplex runtime only
+    // schedules a response on input_audio_buffer.commit, so by default the
+    // client detects ~0.5 s of post-speech silence and commits the turn.
+    // Untick "Auto-commit" for the original pure auto-response design (the
+    // runtime must then create responses from server-side decisions).
+    if (autoCommitToggle && autoCommitToggle.checked) {
+      let sumSq = 0;
+      for (let i = 0; i < pcm.length; i += 1) sumSq += (pcm[i] / 32768) * (pcm[i] / 32768);
+      const rms = Math.sqrt(sumSq / Math.max(1, pcm.length));
+      if (rms > 0.015) {
+        uploadHadSpeech = true;
+        uploadSilenceMs = 0;
+      } else if (uploadHadSpeech) {
+        uploadSilenceMs += SEND_INTERVAL_MS;
+      }
+    } else {
+      uploadHadSpeech = false;
+      uploadSilenceMs = 0;
+    }
+    // Omni duplex: ~1 fps camera frame rides the audio append (official
+    // MiniCPM-o-Demo contract: one base64 JPEG per ~1 s chunk).
+    if (cameraPendingFrame) {
+      appendEvent.video_frames = [cameraPendingFrame];
+      cameraPendingFrame = null;
+    }
+    socket.send(JSON.stringify(appendEvent));
+    if (uploadHadSpeech && uploadSilenceMs >= 500) {
+      uploadHadSpeech = false;
+      uploadSilenceMs = 0;
+      socket.send(JSON.stringify({ type: 'input_audio_buffer.commit', final: true }));
+      appendLog('turn committed (end of utterance)');
+      armResponseCreateFallback();
+    }
   }
 
   function beginAssistant(responseId) {
@@ -299,10 +406,15 @@
         setModel('Listening');
         break;
       case 'response.created':
+        responseActiveNow = true;
+        disarmResponseCreateFallback();
+        beginAssistant(responseId);
+        break;
       case 'response.speak':
         beginAssistant(responseId);
         break;
       case 'response.audio.delta':
+        lastResponseDeltaAt = performance.now();
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');
@@ -314,6 +426,7 @@
         requestPlaybackDrain(responseId);
         break;
       case 'response.audio_transcript.delta':
+        lastResponseDeltaAt = performance.now();
         addTranscript('assistant', event.delta || '');
         break;
       case 'response.audio_transcript.done':
@@ -326,6 +439,7 @@
         finishTranscript('user', event.transcript || '');
         break;
       case 'response.done':
+        responseActiveNow = false;
         finishTranscript('assistant');
         if (!responseHasAudio) requestPlaybackDrain(responseId);
         break;
@@ -335,10 +449,18 @@
           runtimeDetail.textContent = `Playback committed ${acknowledgement.committed_ms || 0} ms`;
         }
         break;
-      case 'error':
+      case 'error': {
+        const errorCode = event.code || (event.error && event.error.code);
+        if (errorCode === 'response_already_active') {
+          // The fallback raced a response that is still winding down;
+          // retry quietly until the deferred turn starts.
+          armResponseCreateFallback();
+          break;
+        }
         setConnection('Error', 'error');
         runtimeDetail.textContent = String(event.error || event.code || 'Server error');
         break;
+      }
       default:
         break;
     }
@@ -395,17 +517,21 @@
       let settled = false;
       socket.onopen = () => {
         settled = true;
-        socket.send(JSON.stringify({
-          type: 'session.update',
-          session: {
-            modalities: ['audio', 'text'],
-            voice: 'default',
-            extra_body: {
-              auto_response: true,
-              minicpmo45_native_duplex: true,
-            },
-          },
-        }));
+        const extraBody = {
+          auto_response: true,
+          minicpmo45_native_duplex: true,
+        };
+        // Reference voice for TTS cloning, provided by the server via
+        // --ref-audio (mirrors the official demo's default ref audio).
+        if (config.refAudio) extraBody.ref_audio = config.refAudio;
+        const session = {
+          modalities: ['audio', 'text'],
+          voice: 'default',
+          extra_body: extraBody,
+        };
+        const instructions = systemPromptInput ? systemPromptInput.value.trim() : '';
+        if (instructions) session.instructions = instructions;
+        socket.send(JSON.stringify({ type: 'session.update', session }));
         runtimeDetail.textContent = `${captureRate} Hz capture / ${playbackRate} Hz playback`;
         appendLog(`websocket open  ${url}`);
         resolve();
@@ -458,11 +584,14 @@
       running = true;
       muted = false;
       assistantActive = false;
+      uploadHadSpeech = false;
+      uploadSilenceMs = 0;
       sendTimer = window.setInterval(flushCapture, SEND_INTERVAL_MS);
       startClock();
       callButton.textContent = 'End session';
       callButton.classList.add('is-active');
       muteButton.disabled = false;
+      cameraButton.disabled = false;
       setConnection('Connected', 'online');
       setModel('Listening');
       appendLog('session started');
@@ -476,9 +605,54 @@
     }
   }
 
+  async function startCamera() {
+    if (cameraStream) return;
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    cameraPreview.srcObject = cameraStream;
+    cameraPreview.style.display = '';
+    await cameraPreview.play().catch(() => {});
+    // Official omni-duplex cadence: one JPEG (quality 0.7) per ~1 s chunk,
+    // no client-side resize (the server normalizes at scale_resolution=448).
+    cameraTimer = window.setInterval(() => {
+      if (!cameraStream || cameraPreview.videoWidth === 0) return;
+      cameraCanvas.width = cameraPreview.videoWidth;
+      cameraCanvas.height = cameraPreview.videoHeight;
+      cameraCanvas.getContext('2d').drawImage(cameraPreview, 0, 0);
+      cameraPendingFrame = cameraCanvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+    }, 1000);
+    cameraButton.textContent = 'Camera off';
+    cameraButton.classList.add('is-active');
+    appendLog('camera on (1 fps omni frames)');
+  }
+
+  function stopCamera() {
+    if (cameraTimer !== null) clearInterval(cameraTimer);
+    cameraTimer = null;
+    if (cameraStream) {
+      for (const track of cameraStream.getTracks()) track.stop();
+    }
+    cameraStream = null;
+    cameraPendingFrame = null;
+    cameraPreview.srcObject = null;
+    cameraPreview.style.display = 'none';
+    cameraButton.textContent = 'Camera';
+    cameraButton.classList.remove('is-active');
+  }
+
+  cameraButton.addEventListener('click', () => {
+    if (cameraStream) {
+      stopCamera();
+      appendLog('camera off');
+      return;
+    }
+    startCamera().catch((error) => appendLog(`camera failed: ${error.message || error}`, true));
+  });
+
   async function stopSession() {
     running = false;
     assistantActive = false;
+    responseActiveNow = false;
+    disarmResponseCreateFallback();
     pendingCapture = [];
     if (sendTimer !== null) clearInterval(sendTimer);
     if (clockTimer !== null) clearInterval(clockTimer);
@@ -495,6 +669,8 @@
       for (const track of mediaStream.getTracks()) track.stop();
     }
     mediaStream = null;
+    stopCamera();
+    cameraButton.disabled = true;
     if (captureContext) await captureContext.close().catch(() => {});
     if (playbackContext) await playbackContext.close().catch(() => {});
     captureContext = null;
