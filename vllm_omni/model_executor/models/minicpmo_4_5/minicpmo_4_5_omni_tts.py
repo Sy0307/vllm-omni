@@ -458,6 +458,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             cache.move_to_end(cache_key)
             while len(cache) > cache_size:
                 _, evicted_path = cache.popitem(last=False)
+                self._t2w_base_caches.pop(evicted_path, None)
                 try:
                     os.unlink(evicted_path)
                 except OSError:
@@ -800,6 +801,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self.audio_tokenizer.hift_cache_dict = {}
         temp_path = state.temp_prompt_wav_path
         if temp_path and not self._is_cached_ref_audio_prompt_wav(temp_path):
+            self._t2w_base_caches.pop(temp_path, None)
             try:
                 os.unlink(temp_path)
             except OSError:

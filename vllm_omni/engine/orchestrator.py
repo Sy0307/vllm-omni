@@ -277,6 +277,7 @@ class _OrchestratorDuplexStagePort:
             {
                 "session_id": context.session_id,
                 "fence": context.fence,
+                "incarnation": context.fence.incarnation,
                 "epoch": context.fence.epoch,
                 "turn_id": context.fence.turn_id,
                 "response_seq": context.fence.response_seq,
