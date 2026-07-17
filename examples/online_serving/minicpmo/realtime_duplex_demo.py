@@ -749,14 +749,14 @@ async def _send_pcm16(
     realtime_delay: bool,
     hints: dict[str, object] | None = None,
     first_chunk_hints: dict[str, object] | None = None,
-    on_model_unit_ready=None,
+    frame_b64: str | None = None,
 ) -> None:
     hints = hints or {}
     first_chunk_hints = first_chunk_hints or {}
     chunk_bytes = max(PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000, PCM16_BYTES_PER_SAMPLE)
     model_unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     audio_ms = 0
-    next_model_unit_bytes = model_unit_bytes
+    frames_sent = 0
     for offset in range(0, len(pcm16), chunk_bytes):
         chunk = pcm16[offset : offset + chunk_bytes]
         duration_ms = int(len(chunk) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE) * 1000)
@@ -764,6 +764,10 @@ async def _send_pcm16(
         chunk_hints = dict(hints)
         if offset == 0:
             chunk_hints.update(first_chunk_hints)
+        if frame_b64 is not None and audio_ms > frames_sent * 1000:
+            # Omni duplex cadence: one camera frame per 1 s of audio.
+            chunk_hints["video_frames"] = [frame_b64]
+            frames_sent += 1
         await ws.send(
             json.dumps(
                 {
@@ -842,7 +846,7 @@ async def _send_clean_turn(
     send_transcript_hint: bool = True,
     realtime_input: bool = False,
     model_policy_settle_s: float = 2.0,
-    commit_input: bool = True,
+    frame_b64: str | None = None,
 ) -> tuple[str | None, str]:
     before_created = state.count("response.created")
     before_model_listen = state.model_listen_count
@@ -864,6 +868,7 @@ async def _send_clean_turn(
         chunk_ms=chunk_ms,
         realtime_delay=realtime_input,
         hints={"transcript": transcript} if send_transcript_hint else {},
+        frame_b64=frame_b64,
     )
     if commit_input:
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
@@ -1169,6 +1174,9 @@ async def _send_listen_only_overlap_pair(
 
 
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
+    demo_frame_b64: str | None = None
+    if getattr(args, "frame_image", None):
+        demo_frame_b64 = base64.b64encode(Path(args.frame_image).read_bytes()).decode("ascii")
     turn_input_paths = _turn_input_paths(
         Path(args.input_wav),
         list(getattr(args, "turn_input_wav", []) or []),
@@ -1229,7 +1237,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     send_transcript_hint=transcript_hints_enabled,
                     realtime_input=realtime_input,
                     model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
-                    silence_ms=max(0, args.silence_ms),
+                    frame_b64=demo_frame_b64,
                 )
                 for turn_index in range(2, len(turn_specs)):
                     transcript, duration_ms = turn_specs[turn_index]
@@ -1246,7 +1254,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         send_transcript_hint=transcript_hints_enabled,
                         realtime_input=realtime_input,
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
-                        commit_input=not continuous_input,
+                        frame_b64=demo_frame_b64,
                     )
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
@@ -1265,7 +1273,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         send_transcript_hint=transcript_hints_enabled,
                         realtime_input=realtime_input,
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
-                        commit_input=not continuous_input,
+                        frame_b64=demo_frame_b64,
                     )
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
@@ -1474,6 +1482,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--session-id", help="Use an explicit public session ID, including for close/reopen tests.")
     parser.add_argument("--input-wav", required=True)
+    parser.add_argument(
+        "--frame-image",
+        default=None,
+        help="Optional image file sent as an omni-duplex camera frame (one per 1 s of audio)",
+    )
     parser.add_argument(
         "--turn-input-wav",
         action="append",
