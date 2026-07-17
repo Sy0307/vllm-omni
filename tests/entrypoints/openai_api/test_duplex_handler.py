@@ -611,17 +611,15 @@ async def test_native_realtime_protocol_rejects_nested_vad_even_when_top_level_i
     assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
 
 
-def test_native_duplex_admission_limit_is_server_owned():
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(FakeEngineClient()),
-        max_native_duplex_sessions=2,
-    )
+def test_native_duplex_handler_has_no_fixed_session_admission_cap():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
     client_config = DuplexSessionConfig(
         extra_body={"max_duplex_sessions": 99, "duplex_max_sessions": 99},
     )
 
-    assert handler._max_duplex_sessions() == 2
-    assert handler._max_duplex_sessions() != client_config.extra_body["max_duplex_sessions"]
+    assert not hasattr(handler, "_max_native_duplex_sessions")
+    assert not hasattr(handler, "_max_duplex_sessions")
+    assert client_config.extra_body["max_duplex_sessions"] == 99
 
 
 def test_native_response_options_ignore_private_runtime_config():

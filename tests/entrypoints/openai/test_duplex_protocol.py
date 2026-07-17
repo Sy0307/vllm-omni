@@ -289,8 +289,11 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_audio_truncate"] is True
     assert caps["supports_barge_in"] is False
     assert caps["target_barge_in_latency_ms"] is None
-    assert caps["supports_multi_session"] is False
-    assert caps["supports_multi_session_same_replica"] is False
+    assert caps["supports_multi_session"] is True
+    assert caps["supports_multi_session_same_replica"] is True
+    assert caps["supports_session_lease"] is True
+    assert caps["supports_session_resume"] is True
+    assert caps["session_admission_mode"] == "scheduler_managed"
     assert caps["stage_handoff_transport"] == "scheduler_data_plane"
 
 
