@@ -56,6 +56,8 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 
 class _ModelEngineOverrides(TypedDict, total=False):
     active_stream_window: int
+    use_v2_model_runner: bool
+    supports_native_mrv2_data_plane: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
@@ -257,6 +259,8 @@ class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -966,7 +970,7 @@ def _build_common_stage_config_kwargs(
     return (
         {
             "stage_pipeline_config": topology,
-            "model_config": _build_model_config(topology, stage_deploy, engine.model),
+            "model_config": _build_model_config(deploy, topology, stage_deploy, engine.model),
             "load_config": _build_load_config(engine.load),
             "cache_config": _build_cache_config(deploy, engine.cache),
             "scheduler_config": _build_scheduler_config(deploy, engine.scheduler),
@@ -1116,12 +1120,18 @@ def _build_quantization_config(
 
 
 def _build_model_config(
+    deploy: DeployConfig,
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
+    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    kwargs.setdefault(
+        "supports_native_mrv2_data_plane",
+        topology.supports_native_mrv2_data_plane,
+    )
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:

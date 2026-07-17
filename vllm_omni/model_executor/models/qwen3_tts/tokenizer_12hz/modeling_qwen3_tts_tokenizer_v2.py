@@ -46,7 +46,6 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
 
 logger = logging.get_logger(__name__)
 
-
 def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
     """Vanilla sinusoidal RoPE (no scaling).
 
@@ -524,7 +523,6 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
-
         # Code2Wav is cache-free and every decoder layer uses sliding attention.
         # Cache an exact, compact mask per warmup shape instead of retaining a
         # max_position_embeddings square buffer. CUDA Graph warmup populates
@@ -624,7 +622,8 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         ):
             raise ValueError("Cached Code2Wav masks require contiguous zero-based cache_position")
 
-        if position_ids is None:
+        auto_position_ids = position_ids is None
+        if auto_position_ids:
             position_ids = cache_position.unsqueeze(0)
         elif attention_mask is None:
             expected_position_ids = expected_cache_position.unsqueeze(0)

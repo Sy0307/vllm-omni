@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.stage_input_processors import (
+    qwen3_tts as qwen3_tts_processors,
+)
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     compute_ramp_emit,
@@ -29,7 +32,7 @@ _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 
 
-def _req(rid, *, finished, initial_codec_chunk_frames=None):
+def _req(rid, *, finished, initial_codec_chunk_frames=None, output_token_ids=None):
     ai = None
     if initial_codec_chunk_frames is not None:
         entry = SimpleNamespace(list_data=[initial_codec_chunk_frames])
@@ -38,6 +41,7 @@ def _req(rid, *, finished, initial_codec_chunk_frames=None):
         external_req_id=rid,
         is_finished=lambda: finished,
         additional_information=ai,
+        output_token_ids=output_token_ids or [],
     )
 
 
@@ -103,6 +107,131 @@ def test_flush_on_finish():
     assert p is not None
     assert p.meta.finished.item() is True
     assert len(p.codes.audio) == _Q * 24
+
+
+def test_async_chunk_accumulates_tensor_frames_without_list_roundtrip():
+    tm = _tm()
+    rid = "r-tensor-cache"
+
+    p1 = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
+        is_finished=False,
+    )
+    assert p1 is None
+    assert isinstance(tm.code_prompt_token_ids[rid][0], torch.Tensor)
+
+    p2 = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.tensor([[5, 6, 7, 8]])}},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
+        is_finished=False,
+    )
+
+    assert p2 is not None
+    assert all(isinstance(frame, torch.Tensor) for frame in tm.code_prompt_token_ids[rid])
+    assert p2.codes.audio.tolist() == [1, 5, 2, 6, 3, 7, 4, 8]
+
+
+def test_async_chunk_skips_prefill_placeholder_without_gpu_value_check():
+    tm = _tm()
+    rid = "r-prefill"
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={
+            "codes": {"audio": torch.zeros((4, _Q), dtype=torch.long)},
+            "meta": {"talker_prefill_offset": 4},
+        },
+        request=_req(rid, finished=False, initial_codec_chunk_frames=1),
+        is_finished=False,
+    )
+
+    assert payload is None
+    assert tm.code_prompt_token_ids[rid] == []
+
+
+def test_async_chunk_skips_stop_token_zero_frame_without_gpu_value_check():
+    tm = _tm()
+    rid = "r-stop"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:]]
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.zeros((1, _Q), dtype=torch.long)}},
+        request=_req(rid, finished=True, initial_codec_chunk_frames=2, output_token_ids=[2150]),
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.tolist() == _FRAME
+    assert len(tm.code_prompt_token_ids[rid]) == 1
+
+
+def test_async_chunk_keeps_cuda_frame_cache_on_device_when_available():
+    if not torch.cuda.is_available():
+        return
+    tm = _tm()
+    rid = "r-cuda-cache"
+
+    talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]], device="cuda")}},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
+        is_finished=False,
+    )
+
+    assert tm.code_prompt_token_ids[rid][0].device.type == "cuda"
+
+
+def test_async_chunk_batch_matches_scalar_payloads_and_state():
+    batch_builder = getattr(qwen3_tts_processors, "talker2code2wav_async_chunk_batch", None)
+    assert callable(batch_builder), "Qwen3-TTS must provide the native MRv2 batch payload builder"
+
+    scalar_tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=1)
+    batch_tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=1)
+    requests = [
+        _req("r-batch-0", finished=False, output_token_ids=[7]),
+        _req("r-batch-1", finished=False, output_token_ids=[8]),
+    ]
+    ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    outputs = [
+        {"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
+        {"codes": {"audio": torch.tensor([[5, 6, 7, 8]])}},
+    ]
+
+    scalar_payloads = [
+        talker2code2wav_async_chunk(
+            transfer_manager=scalar_tm,
+            multimodal_output=output,
+            request=request,
+            is_finished=False,
+        )
+        for request, output in zip(requests, outputs)
+    ]
+    batch_payloads = batch_builder(
+        transfer_manager=batch_tm,
+        pooling_outputs=outputs,
+        requests=requests,
+        is_finished=[False, False],
+    )
+
+    assert len(batch_payloads) == len(scalar_payloads)
+    for scalar, batched in zip(scalar_payloads, batch_payloads):
+        assert scalar is not None and batched is not None
+        torch.testing.assert_close(batched.codes.audio, scalar.codes.audio)
+        assert batched.meta.left_context_size == scalar.meta.left_context_size
+        assert batched.meta.finished.item() == scalar.meta.finished.item()
+        assert batched.speaker == scalar.speaker
+        assert batched.language == scalar.language
+    for request in requests:
+        rid = request.external_req_id
+        torch.testing.assert_close(
+            torch.stack(batch_tm.code_prompt_token_ids[rid]),
+            torch.stack(scalar_tm.code_prompt_token_ids[rid]),
+        )
+    torch.testing.assert_close(batch_tm.request_payload["r-batch-0"], scalar_tm.request_payload["r-batch-0"])
 
 
 _CASES = [

@@ -920,30 +920,36 @@ class Orchestrator:
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
+                                if req_state is None:
                                     continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.segment_token_ids = (
-                                    self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                                    if req_state.streaming.segment_finished
-                                    else []
-                                )
-                                raw_mm = self._completion_multimodal_output(eco, None)
-                                req_state.streaming.segment_output_metadata = (
-                                    dict(raw_mm)
-                                    if req_state.streaming.segment_finished and isinstance(raw_mm, dict)
-                                    else {}
-                                )
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
                                 if req_state.streaming.enabled:
-                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
-                            iteration_stats = (
-                                IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
-                            )
+                                    req_state.streaming.segment_finished = bool(
+                                        getattr(eco, "is_segment_finished", False)
+                                    )
+                                    req_state.streaming.segment_token_ids = (
+                                        self._coerce_int_list(getattr(eco, "new_token_ids", None))
+                                        if req_state.streaming.segment_finished
+                                        else []
+                                    )
+                                    raw_mm = self._completion_multimodal_output(eco, None)
+                                    req_state.streaming.segment_output_metadata = (
+                                        dict(raw_mm)
+                                        if req_state.streaming.segment_finished and isinstance(raw_mm, dict)
+                                        else {}
+                                    )
+                                    req_state.streaming.new_prompt_len_snapshot = getattr(
+                                        eco,
+                                        "new_prompt_len_snapshot",
+                                        None,
+                                    )
+                                await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
+                            record_stats = self._stat_logger is not None and raw_outputs.scheduler_stats is not None
+                            iteration_stats = IterationStats() if record_stats else None
                             raw_output = await pool.process_llm_raw_outputs(
                                 replica_id,
                                 raw_outputs,
@@ -1270,6 +1276,15 @@ class Orchestrator:
         ):
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+            if stage_id == req_state.final_stage_id:
+                # In a linear staged pipeline, the terminal stage can only finish
+                # after upstream final-output stages have supplied the data it
+                # depends on. Some vLLM raw terminal markers are consumed before
+                # they become processed outputs; do not leave the request active
+                # forever waiting for a marker from an already-drained upstream.
+                req_state.finished_final_output_stage_ids.update(
+                    sid for sid in final_output_stage_ids if sid <= stage_id
+                )
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
         # Duplex stage-0 segment boundaries are not client-visible outputs:
         # direct decisions are emitted by the model runtime extension below,

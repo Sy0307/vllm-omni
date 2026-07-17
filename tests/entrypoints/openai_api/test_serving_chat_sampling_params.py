@@ -436,6 +436,26 @@ def test_request_seed_overrides_yaml_default(serving_chat, mock_request):
     assert comprehension_params.temperature == 0.4  # Preserved from YAML
 
 
+def test_explicit_seed_propagates_to_talker_sampler_and_local_mtp(
+    serving_chat,
+    mock_request,
+    mock_other_stage,
+):
+    mock_other_stage.model_stage = None
+    mock_other_stage.engine_args = SimpleNamespace(model_stage="talker")
+    mock_request.seed = 123
+    mock_request.model_fields_set = {"seed"}
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    talker_params = result[1]
+    assert talker_params.seed == 123
+    assert talker_params.extra_args["tts_local_seed"] == 123
+    assert talker_params.temperature == 0.9
+    assert talker_params.top_k == 50
+    assert talker_params.max_tokens == 4096
+
+
 def test_request_frequency_penalty_overrides(serving_chat, mock_request):
     """Test that request frequency_penalty is applied."""
     mock_request.frequency_penalty = 0.5
@@ -745,6 +765,77 @@ def test_to_sampling_params_list_pads_missing_tail_stage_with_defaults():
     assert len(result) == 4
     assert [params.max_tokens for params in result] == [1, 2, 3, 40]
     assert result[3] is not default_params[3]
+
+
+def test_to_sampling_params_list_seeds_talker_sampler_and_residual_mtp():
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    instance = object.__new__(OmniOpenAIServingChat)
+    instance.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="llm",
+                engine_args=SimpleNamespace(model_stage="comprehension"),
+            ),
+            SimpleNamespace(
+                stage_type="llm",
+                engine_args=SimpleNamespace(model_stage="talker"),
+            ),
+            SimpleNamespace(
+                stage_type="llm",
+                engine_args=SimpleNamespace(model_stage="code2wav"),
+            ),
+        ],
+        default_sampling_params_list=[],
+    )
+
+    result = instance._to_sampling_params_list(
+        [
+            {"seed": 11},
+            {"seed": 22},
+            {"seed": 33},
+        ]
+    )
+
+    assert [params.seed for params in result] == [11, 22, 33]
+    assert result[1].extra_args == {"tts_local_seed": 22}
+    assert result[0].extra_args is None
+    assert result[2].extra_args is None
+
+
+def test_to_sampling_params_list_request_seed_overrides_every_stage():
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    instance = object.__new__(OmniOpenAIServingChat)
+    instance.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="llm",
+                engine_args=SimpleNamespace(model_stage="comprehension"),
+            ),
+            SimpleNamespace(
+                stage_type="llm",
+                engine_args=SimpleNamespace(model_stage="talker"),
+            ),
+            SimpleNamespace(
+                stage_type="llm",
+                engine_args=SimpleNamespace(model_stage="code2wav"),
+            ),
+        ],
+        default_sampling_params_list=[],
+    )
+
+    result = instance._to_sampling_params_list(
+        [
+            {"seed": 11},
+            {"seed": 22},
+            {"seed": 33},
+        ],
+        explicit_seed=42,
+    )
+
+    assert [params.seed for params in result] == [42, 42, 42]
+    assert result[1].extra_args == {"tts_local_seed": 42}
 
 
 # =============================================================================

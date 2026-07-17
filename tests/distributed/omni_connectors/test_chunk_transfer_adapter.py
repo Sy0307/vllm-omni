@@ -311,6 +311,40 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
 
 
+def test_save_async_snapshots_request_token_history_for_background_processor(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+    request = _req("req-snapshot", RequestStatus.WAITING, external_req_id="external-snapshot")
+    request.prompt_token_ids = [10, 11]
+    request.output_token_ids = [20, 21, 22]
+    request.all_token_ids = [10, 11, 20, 21, 22]
+    observed = {}
+
+    def capture_request(*, request, **_kwargs):
+        observed["prompt"] = list(request.prompt_token_ids)
+        observed["output"] = list(request.output_token_ids)
+        observed["all"] = list(request.all_token_ids)
+        observed["output_token_count"] = request.output_token_count
+        observed["finished"] = request.is_finished()
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = capture_request
+    adapter.save_async(multimodal_output={"step": 1}, request=request)
+
+    request.prompt_token_ids.append(12)
+    request.output_token_ids.append(23)
+    request.all_token_ids.extend([12, 23])
+    request.status = RequestStatus.FINISHED_STOPPED
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert observed == {
+        "prompt": [10, 11],
+        "output": [20, 21, 22],
+        "all": [10, 11, 20, 21, 22],
+        "output_token_count": 3,
+        "finished": False,
+    }
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``
