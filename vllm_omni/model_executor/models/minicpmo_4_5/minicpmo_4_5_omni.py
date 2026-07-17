@@ -390,6 +390,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
 
         audio_waveform = helper._decode_audio_payload(payload)
+        try:
+            video_frames = helper._decode_video_frames_payload(payload)
+        except ValueError as exc:
+            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
         seq = duplex.get("seq")
         try:
             seq = int(seq) if seq is not None else None
@@ -398,6 +403,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         result = helper._stage_prefill_embeddings_only(
             state,
             audio_waveform,
+            video_frames=video_frames,
             seq=seq,
             final=bool(duplex.get("final")),
             new_user_turn=payload.get("new_user_turn") is True,
