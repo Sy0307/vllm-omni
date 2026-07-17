@@ -1994,3 +1994,51 @@ def test_orchestrator_does_not_re_introduce_global_stats_throttle() -> None:
         "raw_outputs.scheduler_stats being non-None — the per-scheduler 1Hz "
         "throttle in OmniSchedulerMixin.make_stats() is the only gate needed."
     )
+
+
+@pytest.mark.asyncio
+async def test_duplex_reaper_loop_waits_between_ticks():
+    class _Plane:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def reap_expired(self) -> int:
+            self.calls += 1
+            return 0
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.duplex_control_plane = _Plane()
+    orchestrator._duplex_reaper_interval_s = 0.01
+    orchestrator._shutdown_event = asyncio.Event()
+
+    task = asyncio.create_task(orchestrator._duplex_reaper_loop())
+    await asyncio.sleep(0.035)
+    orchestrator._shutdown_event.set()
+    await task
+
+    assert 2 <= orchestrator.duplex_control_plane.calls <= 5
+
+
+@pytest.mark.asyncio
+async def test_duplex_reaper_loop_survives_one_cleanup_failure():
+    class _Plane:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def reap_expired(self) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient cleanup failure")
+            return 0
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.duplex_control_plane = _Plane()
+    orchestrator._duplex_reaper_interval_s = 0.01
+    orchestrator._shutdown_event = asyncio.Event()
+
+    task = asyncio.create_task(orchestrator._duplex_reaper_loop())
+    await asyncio.sleep(0.035)
+    orchestrator._shutdown_event.set()
+    await task
+
+    assert orchestrator.duplex_control_plane.calls >= 2

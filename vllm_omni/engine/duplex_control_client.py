@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Callable
 from typing import Protocol
 
+from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import (
     AppendDuplexInputMessage,
@@ -14,12 +15,19 @@ from vllm_omni.engine.messages import (
     DuplexControlResultMessage,
     EngineQueueMessage,
     OpenDuplexSessionMessage,
+    ResumeDuplexSessionMessage,
     SignalDuplexTurnMessage,
+    TouchDuplexSessionMessage,
 )
 from vllm_omni.engine.rpc_result_router import RpcCorrelationKey
 
 DuplexControlMessage = (
-    OpenDuplexSessionMessage | AppendDuplexInputMessage | SignalDuplexTurnMessage | CloseDuplexSessionMessage
+    OpenDuplexSessionMessage
+    | AppendDuplexInputMessage
+    | SignalDuplexTurnMessage
+    | CloseDuplexSessionMessage
+    | TouchDuplexSessionMessage
+    | ResumeDuplexSessionMessage
 )
 
 
@@ -163,6 +171,42 @@ class DuplexControlClient:
                 fence=fence,
                 session_id=session_id,
                 reason=reason,
+            ),
+            timeout=timeout,
+        )
+
+    def touch(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None,
+    ) -> dict[str, object]:
+        return self.execute(
+            TouchDuplexSessionMessage(
+                control_id=self._control_id_factory(),
+                fence=fence,
+                session_id=session_id,
+                activity=activity.value,
+            ),
+            timeout=timeout,
+        )
+
+    def resume(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None,
+    ) -> dict[str, object]:
+        return self.execute(
+            ResumeDuplexSessionMessage(
+                control_id=self._control_id_factory(),
+                fence=fence,
+                session_id=session_id,
+                expected_lease_generation=expected_lease_generation,
             ),
             timeout=timeout,
         )

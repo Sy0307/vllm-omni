@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex_runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
@@ -82,6 +83,14 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         calls.append(("close", session_id, kwargs))
         return {"ok": True}
 
+    async def touch_duplex_session_async(session_id, **kwargs):
+        calls.append(("touch", session_id, kwargs))
+        return {"ok": True}
+
+    async def resume_duplex_session_async(session_id, **kwargs):
+        calls.append(("resume", session_id, kwargs))
+        return {"ok": True}
+
     app = object.__new__(AsyncOmni)
     app.request_states = {}
     app._final_output_handler = lambda: None
@@ -89,6 +98,8 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         append_duplex_input_async=append_duplex_input_async,
         signal_duplex_turn_async=signal_duplex_turn_async,
         close_duplex_session_async=close_duplex_session_async,
+        touch_duplex_session_async=touch_duplex_session_async,
+        resume_duplex_session_async=resume_duplex_session_async,
     )
 
     await app.append_duplex_input_async(
@@ -106,6 +117,18 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         timeout=13.5,
     )
     await app.close_duplex_session_async("sid", reason="done", fence=next_fence, timeout=14.5)
+    await app.touch_duplex_session_async(
+        "sid",
+        fence=next_fence,
+        activity=DuplexLeaseActivity.HEARTBEAT,
+        timeout=15.5,
+    )
+    await app.resume_duplex_session_async(
+        "sid",
+        fence=next_fence,
+        expected_lease_generation=3,
+        timeout=16.5,
+    )
 
     assert calls == [
         (
@@ -137,6 +160,24 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
                 "reason": "done",
                 "fence": next_fence,
                 "timeout": 14.5,
+            },
+        ),
+        (
+            "touch",
+            "sid",
+            {
+                "fence": next_fence,
+                "activity": DuplexLeaseActivity.HEARTBEAT,
+                "timeout": 15.5,
+            },
+        ),
+        (
+            "resume",
+            "sid",
+            {
+                "fence": next_fence,
+                "expected_lease_generation": 3,
+                "timeout": 16.5,
             },
         ),
     ]

@@ -72,6 +72,33 @@ class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     reason: str = "client_close"
 
 
+class TouchDuplexSessionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["touch_duplex_session"] = "touch_duplex_session"
+    control_id: str
+    fence: DuplexFence
+    session_id: str
+    activity: str
+
+
+class ResumeDuplexSessionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["resume_duplex_session"] = "resume_duplex_session"
+    control_id: str
+    fence: DuplexFence
+    session_id: str
+    expected_lease_generation: int
+
+
+class DuplexSessionLifecycleMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["duplex_session_lifecycle"] = "duplex_session_lifecycle"
+    fence: DuplexFence
+    session_id: str
+    event: str
+    reason: str
+    lease_generation: int
+    submitted_request_ids: list[str]
+    reserved_request_ids: list[str]
+
+
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["add_companion_request"] = "add_companion_request"
     companion_id: str
