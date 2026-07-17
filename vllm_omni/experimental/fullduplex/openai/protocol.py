@@ -82,6 +82,9 @@ class DuplexCapabilities:
     supports_realtime_endpoint: bool = False
     supports_multi_session: bool = False
     supports_multi_session_same_replica: bool = False
+    supports_session_lease: bool = False
+    supports_session_resume: bool = False
+    session_admission_mode: str = "serving_managed"
     supports_audio_truncate: bool = False
     requires_model_runner_kv: bool = False
     requires_native_stage_role: bool = False
@@ -111,8 +114,11 @@ class DuplexCapabilities:
             supports_stage_connector_handoff=True,
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
-            supports_multi_session=False,
-            supports_multi_session_same_replica=False,
+            supports_multi_session=True,
+            supports_multi_session_same_replica=True,
+            supports_session_lease=True,
+            supports_session_resume=True,
+            session_admission_mode="scheduler_managed",
             supports_audio_truncate=True,
             requires_model_runner_kv=True,
             requires_native_stage_role=True,
@@ -149,6 +155,9 @@ class DuplexCapabilities:
             "supports_realtime_endpoint": self.supports_realtime_endpoint,
             "supports_multi_session": self.supports_multi_session,
             "supports_multi_session_same_replica": self.supports_multi_session_same_replica,
+            "supports_session_lease": self.supports_session_lease,
+            "supports_session_resume": self.supports_session_resume,
+            "session_admission_mode": self.session_admission_mode,
             "supports_audio_truncate": self.supports_audio_truncate,
             "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,

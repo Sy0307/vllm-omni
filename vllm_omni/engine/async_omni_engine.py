@@ -31,7 +31,11 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import strip_parent_engine_args
+from vllm_omni.config.stage_config import (
+    DuplexSessionRuntimeConfig,
+    load_deploy_config,
+    strip_parent_engine_args,
+)
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -352,9 +356,9 @@ class AsyncOmniEngine:
             pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
-        self.max_native_duplex_sessions = (
-            pipeline_config.max_native_duplex_sessions if pipeline_config is not None else None
-        )
+        self.duplex_session_config = DuplexSessionRuntimeConfig()
+        if deploy_config_path is not None:
+            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
         kwargs["trust_remote_code"] = trust_remote_code
         self.config_path, self.stage_configs = self._resolve_stage_configs(

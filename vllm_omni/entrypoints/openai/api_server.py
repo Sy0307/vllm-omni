@@ -1123,7 +1123,7 @@ async def omni_init_app_state(
 
         state.openai_serving_duplex = OmniDuplexSessionHandler(
             chat_service=state.openai_serving_chat,
-            max_native_duplex_sessions=getattr(engine_client, "max_native_duplex_sessions", None),
+            duplex_session_config=getattr(engine_client, "duplex_session_config", None),
         )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,

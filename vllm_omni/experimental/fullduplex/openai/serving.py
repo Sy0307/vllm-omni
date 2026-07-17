@@ -12,6 +12,7 @@ import numpy as np
 from fastapi import WebSocket
 from vllm.logger import init_logger
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.entrypoints.openai.duplex_capability import (
@@ -92,16 +93,12 @@ class OmniDuplexSessionHandler(
         chat_service: OmniOpenAIServingChat,
         config_timeout_s: float = _DEFAULT_CONFIG_TIMEOUT_S,
         idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
-        max_native_duplex_sessions: int | None = None,
+        duplex_session_config: DuplexSessionRuntimeConfig | None = None,
     ) -> None:
         self._chat_service = chat_service
         self._config_timeout_s = config_timeout_s
         self._idle_timeout_s = idle_timeout_s
-        self._max_native_duplex_sessions = (
-            max_native_duplex_sessions
-            if max_native_duplex_sessions is not None and max_native_duplex_sessions > 0
-            else None
-        )
+        self._duplex_session_config = duplex_session_config or DuplexSessionRuntimeConfig()
         self._registry = DuplexSessionRegistry(
             DuplexCapabilities(
                 supports_model_native_turn_policy=False,
@@ -881,27 +878,12 @@ class OmniDuplexSessionHandler(
             except ValueError as exc:
                 await send_json({"type": "error", "error": str(exc), "code": "unsupported_ref_audio_path"})
                 return None
-        max_sessions = self._max_duplex_sessions()
-        if max_sessions is not None and self._registry.active_count() >= max_sessions:
-            await send_json(
-                {
-                    "type": "error",
-                    "error": "Duplex session admission limit reached",
-                    "code": "duplex_session_busy",
-                    "active_sessions": self._registry.active_count(),
-                    "max_sessions": max_sessions,
-                }
-            )
-            return None
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
         session = self._registry.create(config=config, session_id=session_id)
         if use_minicpmo45_native:
             session.replace_capabilities(DuplexCapabilities.minicpmo45_native())
             session.replace_runtime_config(runtime_config)
         return session
-
-    def _max_duplex_sessions(self) -> int | None:
-        return self._max_native_duplex_sessions
 
     def _use_minicpmo45_native_duplex(self, config: DuplexSessionConfig) -> bool:
         return MiniCPMO45NativeDuplexServingAdapter.is_enabled(config)
