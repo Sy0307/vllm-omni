@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex_lease import (
+    DuplexLeaseActivity,
+    DuplexLeaseConfig,
+)
 from vllm_omni.engine.duplex_runtime import (
     DuplexAppendPlan,
     DuplexInputMode,
@@ -21,6 +25,7 @@ from vllm_omni.engine.duplex_runtime import (
 )
 from vllm_omni.engine.duplex_session import (
     DuplexAppendReservation,
+    DuplexSessionExpiry,
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
 )
@@ -29,8 +34,11 @@ from vllm_omni.engine.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
+    DuplexSessionLifecycleMessage,
     OpenDuplexSessionMessage,
+    ResumeDuplexSessionMessage,
     SignalDuplexTurnMessage,
+    TouchDuplexSessionMessage,
 )
 from vllm_omni.engine.resumable import ResumableSegmentPolicy
 
@@ -127,12 +135,18 @@ class DuplexResultSink(Protocol):
     async def put(self, message: DuplexControlResultMessage) -> None: ...
 
 
+class DuplexLifecycleSink(Protocol):
+    async def put(self, message: DuplexSessionLifecycleMessage) -> None: ...
+
+
 class DuplexControlPlane:
     _MESSAGE_TYPES = (
         OpenDuplexSessionMessage,
         AppendDuplexInputMessage,
         SignalDuplexTurnMessage,
         CloseDuplexSessionMessage,
+        TouchDuplexSessionMessage,
+        ResumeDuplexSessionMessage,
     )
 
     def __init__(
@@ -141,11 +155,17 @@ class DuplexControlPlane:
         extension: DuplexRuntimeExtension | None,
         stage_port: DuplexStagePort,
         result_sink: DuplexResultSink,
+        lifecycle_sink: DuplexLifecycleSink | None = None,
+        lease_config: DuplexLeaseConfig | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._extension = extension
         self._stage_port = stage_port
         self._result_sink = result_sink
-        self._sessions = DuplexSessionRuntimeManager()
+        self._lifecycle_sink = lifecycle_sink
+        self._lease_config = lease_config or DuplexLeaseConfig()
+        self._sessions = DuplexSessionRuntimeManager(clock=clock)
+        self._pending_expirations: dict[tuple[str, int], DuplexSessionExpiry] = {}
 
     @property
     def sessions(self) -> DuplexSessionRuntimeManager:
@@ -163,6 +183,10 @@ class DuplexControlPlane:
             await self.handle_signal(message)
         elif isinstance(message, CloseDuplexSessionMessage):
             await self.handle_close(message)
+        elif isinstance(message, TouchDuplexSessionMessage):
+            await self.handle_touch(message)
+        elif isinstance(message, ResumeDuplexSessionMessage):
+            await self.handle_resume(message)
         else:
             raise TypeError(f"Unsupported duplex control message: {type(message).__name__}")
 
@@ -242,6 +266,7 @@ class DuplexControlPlane:
                 capabilities=capabilities,
                 session_config=message.session_config,
                 runtime_config=message.runtime_config,
+                lease_config=self._lease_config,
             )
             request_context = self.ensure_stage_request(session, stage_id=0)
             await self.put_result(
@@ -280,6 +305,9 @@ class DuplexControlPlane:
             )
 
     async def handle_append(self, message: AppendDuplexInputMessage) -> None:
+        session: DuplexSessionRuntimeState | None = None
+        lease_operation_id = f"append:{message.control_id}"
+        operation_started = False
         try:
             session = self.sessions.require(message.session_id)
             if message.expected_epoch is not None and message.expected_epoch != message.fence.epoch:
@@ -293,6 +321,7 @@ class DuplexControlPlane:
                     final=message.final,
                 )
                 if completed is not None:
+                    session.touch(message.fence, DuplexLeaseActivity.APPEND)
                     await self.put_result(
                         message.control_id,
                         fence=message.fence,
@@ -301,6 +330,8 @@ class DuplexControlPlane:
                         stage_results=completed,
                     )
                     return
+            session.begin_operation(message.fence, lease_operation_id)
+            operation_started = True
             reservation = session.prepare_append(mode=mode, fence=message.fence)
             stage_results = await self.append_via_data_plane(
                 message,
@@ -333,6 +364,9 @@ class DuplexControlPlane:
                 stage_results=[],
                 error=str(exc),
             )
+        finally:
+            if session is not None and operation_started and lease_operation_id in session.lease.active_operations:
+                session.end_operation(session.fence, lease_operation_id)
 
     async def append_via_data_plane(
         self,
@@ -429,6 +463,7 @@ class DuplexControlPlane:
             if message.runtime_config is not None:
                 self.sampling_params_for_config(message.runtime_config)
                 session.replace_runtime_config(message.runtime_config)
+            session.touch(session.fence, DuplexLeaseActivity.SIGNAL)
             await self.put_result(
                 message.control_id,
                 fence=message.fence,
@@ -473,7 +508,7 @@ class DuplexControlPlane:
                 return
             stale_request_ids = session.resource_request_ids()
             submitted_request_ids = set(session.resource_request_ids(submitted=True))
-            self.sessions.close_session(message.fence)
+            self.sessions.close_session(message.fence, reason=message.reason)
             submitted = [request_id for request_id in stale_request_ids if request_id in submitted_request_ids]
             reserved = [request_id for request_id in stale_request_ids if request_id not in submitted_request_ids]
             if submitted:
@@ -507,6 +542,104 @@ class DuplexControlPlane:
                 stage_results=[],
                 error=str(exc),
             )
+
+    async def handle_touch(self, message: TouchDuplexSessionMessage) -> None:
+        try:
+            session = self.sessions.require(message.session_id)
+            activity = DuplexLeaseActivity(message.activity)
+            if activity is DuplexLeaseActivity.DETACH:
+                session.detach(message.fence)
+            else:
+                session.touch(message.fence, activity)
+            await self.put_result(
+                message.control_id,
+                fence=message.fence,
+                operation="touch",
+                session_id=message.session_id,
+                stage_results=[
+                    {
+                        "stage_id": -1,
+                        "replica_id": -1,
+                        "result": {
+                            "supported": True,
+                            "activity": activity.value,
+                            "lease_generation": session.lease.generation,
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:
+            logger.exception("touch_duplex_session failed: %s", exc)
+            await self.put_result(
+                message.control_id,
+                fence=message.fence,
+                operation="touch",
+                session_id=message.session_id,
+                stage_results=[],
+                error=str(exc),
+            )
+
+    async def handle_resume(self, message: ResumeDuplexSessionMessage) -> None:
+        try:
+            session = self.sessions.require(message.session_id)
+            generation = session.resume(
+                message.fence,
+                expected_lease_generation=message.expected_lease_generation,
+            )
+            await self.put_result(
+                message.control_id,
+                fence=message.fence,
+                operation="resume",
+                session_id=message.session_id,
+                stage_results=[
+                    {
+                        "stage_id": -1,
+                        "replica_id": -1,
+                        "result": {
+                            "supported": True,
+                            "lease_generation": generation,
+                        },
+                    }
+                ],
+            )
+        except Exception as exc:
+            logger.exception("resume_duplex_session failed: %s", exc)
+            await self.put_result(
+                message.control_id,
+                fence=message.fence,
+                operation="resume",
+                session_id=message.session_id,
+                stage_results=[],
+                error=str(exc),
+            )
+
+    async def reap_expired(self, now: float | None = None) -> int:
+        for item in self.sessions.collect_expired(now):
+            self._pending_expirations.setdefault(
+                (item.session_id, item.lease_generation),
+                item,
+            )
+        completed = 0
+        for key, item in list(self._pending_expirations.items()):
+            if item.submitted_request_ids:
+                await self._stage_port.cleanup(list(item.submitted_request_ids), abort=True)
+            if item.reserved_request_ids:
+                await self._stage_port.cleanup(list(item.reserved_request_ids))
+            if self._lifecycle_sink is not None:
+                await self._lifecycle_sink.put(
+                    DuplexSessionLifecycleMessage(
+                        fence=item.fence,
+                        session_id=item.session_id,
+                        event="expired",
+                        reason=item.reason,
+                        lease_generation=item.lease_generation,
+                        submitted_request_ids=list(item.submitted_request_ids),
+                        reserved_request_ids=list(item.reserved_request_ids),
+                    )
+                )
+            self._pending_expirations.pop(key, None)
+            completed += 1
+        return completed
 
     @classmethod
     def _iter_result_dicts(cls, result: object):
@@ -581,6 +714,12 @@ class DuplexControlPlane:
     ) -> DuplexOutputDecision | None:
         if context is None or self._extension is None:
             return None
+        session = self._sessions.get(context.identity.session_id)
+        if session is not None:
+            try:
+                session.touch(context.identity.fence, DuplexLeaseActivity.MODEL_OUTPUT)
+            except RuntimeError:
+                pass
         decision = self._extension.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,
@@ -607,6 +746,7 @@ __all__ = [
     "DuplexOutputContext",
     "DuplexRequestIdentity",
     "DuplexResultSink",
+    "DuplexLifecycleSink",
     "DuplexStagePort",
     "DuplexStageRequestContext",
     "DuplexStageSubmission",

@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, MutableMapping
 from typing import Protocol
 
+from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex_runtime import (
     duplex_data_plane_request_info,
     duplex_resource_request_id,
@@ -27,6 +28,10 @@ class DuplexEnginePort(Protocol):
     async def signal_duplex_turn_async(self, session_id: str, **kwargs) -> dict[str, object]: ...
 
     async def close_duplex_session_async(self, session_id: str, **kwargs) -> dict[str, object]: ...
+
+    async def touch_duplex_session_async(self, session_id: str, **kwargs) -> dict[str, object]: ...
+
+    async def resume_duplex_session_async(self, session_id: str, **kwargs) -> dict[str, object]: ...
 
 
 class DuplexRequestOutputPort:
@@ -209,6 +214,36 @@ class DuplexRequestClient:
             )
         finally:
             self.output_port.request_states.pop(duplex_resource_request_id(fence, "stage0"), None)
+
+    async def touch(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None,
+    ) -> dict[str, object]:
+        return await self.engine.touch_duplex_session_async(
+            session_id,
+            fence=fence,
+            activity=activity,
+            timeout=timeout,
+        )
+
+    async def resume(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None,
+    ) -> dict[str, object]:
+        return await self.engine.resume_duplex_session_async(
+            session_id,
+            fence=fence,
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
 
     async def collect_outputs(
         self,

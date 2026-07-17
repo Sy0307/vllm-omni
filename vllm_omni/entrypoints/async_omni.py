@@ -27,8 +27,9 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex_types import DuplexFence
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import DuplexSessionLifecycleMessage, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.duplex_request_client import (
     DuplexRequestClient,
@@ -149,6 +150,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self._sleeping_tags: set[str] = set()
         self._level2_sleeping: bool = False
         self._duplex_request_client: DuplexRequestClient | None = None
+        self.duplex_lifecycle_events: asyncio.Queue[DuplexSessionLifecycleMessage] = asyncio.Queue()
         self.final_output_task: asyncio.Task | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
@@ -358,6 +360,36 @@ class AsyncOmni(EngineClient, OmniBase):
             session_id,
             reason=reason,
             fence=fence,
+            timeout=timeout,
+        )
+
+    async def touch_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        activity: DuplexLeaseActivity,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return await self._get_duplex_request_client().touch(
+            session_id,
+            fence=fence,
+            activity=activity,
+            timeout=timeout,
+        )
+
+    async def resume_duplex_session_async(
+        self,
+        session_id: str,
+        *,
+        fence: DuplexFence,
+        expected_lease_generation: int,
+        timeout: float | None = 10.0,
+    ) -> dict[str, object]:
+        return await self._get_duplex_request_client().resume(
+            session_id,
+            fence=fence,
+            expected_lease_generation=expected_lease_generation,
             timeout=timeout,
         )
 
@@ -842,6 +874,10 @@ class AsyncOmni(EngineClient, OmniBase):
                         tid = getattr(msg, "task_id")
                         logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
                         await self.event_resolver.resolve(msg)
+                        continue
+
+                    if isinstance(msg, DuplexSessionLifecycleMessage):
+                        await self.duplex_lifecycle_events.put(msg)
                         continue
 
                     if isinstance(msg, ErrorMessage) and not msg.fatal:

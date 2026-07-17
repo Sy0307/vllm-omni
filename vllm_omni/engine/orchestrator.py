@@ -28,6 +28,7 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.duplex_control_plane import (
@@ -38,6 +39,7 @@ from vllm_omni.engine.duplex_control_plane import (
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
 )
+from vllm_omni.engine.duplex_lease import DuplexLeaseConfig
 from vllm_omni.engine.duplex_runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
@@ -365,6 +367,7 @@ class Orchestrator:
         enable_orch_monitor: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = True,
+        duplex_session_config: DuplexSessionRuntimeConfig | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -397,6 +400,8 @@ class Orchestrator:
         self._stage_input_processors: dict[int, Any] = {}
 
         self.duplex_control_plane: DuplexControlPlane | None = None
+        runtime_session_config = duplex_session_config or DuplexSessionRuntimeConfig()
+        self._duplex_reaper_interval_s = runtime_session_config.reaper_interval_s
         if enable_duplex_control:
             self.duplex_control_plane = DuplexControlPlane(
                 extension=duplex_runtime_extension,
@@ -407,6 +412,11 @@ class Orchestrator:
                     cleanup_request_ids=self._cleanup_request_ids,
                 ),
                 result_sink=self.rpc_async_queue,
+                lifecycle_sink=self.output_async_queue,
+                lease_config=DuplexLeaseConfig(
+                    idle_ttl_s=runtime_session_config.idle_ttl_s,
+                    disconnect_grace_s=runtime_session_config.disconnect_grace_s,
+                ),
             )
 
         self._shutdown_event = asyncio.Event()
@@ -513,6 +523,8 @@ class Orchestrator:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        if self.duplex_control_plane is not None:
+            tasks.append(asyncio.create_task(self._duplex_reaper_loop(), name="orchestrator-duplex-reaper"))
         if membership_watcher is not None:
             tasks.append(membership_watcher)
 
@@ -608,6 +620,21 @@ class Orchestrator:
                 break
             else:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
+
+    async def _duplex_reaper_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self._duplex_reaper_interval_s,
+                )
+            except TimeoutError:
+                plane = self.duplex_control_plane
+                if plane is not None:
+                    try:
+                        await plane.reap_expired()
+                    except Exception:
+                        logger.exception("[Orchestrator] Duplex expiry cleanup failed; retrying on next tick")
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
