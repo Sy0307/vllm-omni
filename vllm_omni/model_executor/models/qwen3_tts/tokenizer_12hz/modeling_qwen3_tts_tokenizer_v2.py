@@ -15,6 +15,7 @@
 
 import inspect
 import math
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -48,6 +49,8 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
 )
 
 logger = logging.get_logger(__name__)
+
+_DECODER_MASK_CACHE_MAX_ENTRIES = 64
 
 
 def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
@@ -528,9 +531,90 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
+        self._mask_create_accepts_input_embeds: bool | None = None
+        self._causal_mask_cache: OrderedDict[
+            tuple[torch.device, torch.dtype, int, int, bool],
+            dict[str, torch.Tensor | None],
+        ] = OrderedDict()
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _build_causal_mask_mapping(
+        self,
+        *,
+        attention_mask: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        past_key_values: Cache | None,
+        cache_position: torch.Tensor,
+    ) -> dict[str, torch.Tensor | None]:
+        mask_kwargs = {
+            "config": self.config,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+        if self._mask_create_accepts_input_embeds is None:
+            sig = inspect.signature(create_causal_mask)
+            self._mask_create_accepts_input_embeds = "input_embeds" in sig.parameters
+        if self._mask_create_accepts_input_embeds:
+            mask_kwargs["input_embeds"] = inputs_embeds
+            mask_kwargs["cache_position"] = cache_position
+        else:
+            mask_kwargs["inputs_embeds"] = inputs_embeds
+
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+        }
+        if self.has_sliding_layers:
+            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        return causal_mask_mapping
+
+    def _get_cached_causal_mask_mapping(
+        self,
+        *,
+        attention_mask: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        past_key_values: Cache | None,
+        cache_position: torch.Tensor,
+    ) -> dict[str, torch.Tensor | None]:
+        if attention_mask is not None or past_key_values is not None:
+            return self._build_causal_mask_mapping(
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+            )
+
+        # Code2Wav decoder uses fixed chunk shapes without an explicit mask.
+        # Cache the HF mask metadata to avoid rebuilding packed indices.
+        key = (
+            inputs_embeds.device,
+            inputs_embeds.dtype,
+            int(inputs_embeds.shape[0]),
+            int(inputs_embeds.shape[1]),
+            bool(self.has_sliding_layers),
+        )
+        cached = self._causal_mask_cache.get(key)
+        if cached is not None:
+            self._causal_mask_cache.move_to_end(key)
+            return cached
+
+        mask_mapping = self._build_causal_mask_mapping(
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+        )
+        self._causal_mask_cache[key] = mask_mapping
+        self._causal_mask_cache.move_to_end(key)
+        while len(self._causal_mask_cache) > _DECODER_MASK_CACHE_MAX_ENTRIES:
+            self._causal_mask_cache.popitem(last=False)
+        return mask_mapping
 
     # Note: @check_model_inputs decorator removed for vLLM compatibility
     # The decorator causes "unexpected keyword argument 'inputs_embeds'" error
@@ -569,32 +653,23 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        if position_ids is None:
+        auto_position_ids = position_ids is None
+        if auto_position_ids:
             position_ids = cache_position.unsqueeze(0)
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            # Handle API changes across transformers versions
-            sig = inspect.signature(create_causal_mask)
-            if "input_embeds" in sig.parameters:
-                mask_kwargs["input_embeds"] = inputs_embeds
-                mask_kwargs["cache_position"] = cache_position
-            else:
-                mask_kwargs["inputs_embeds"] = inputs_embeds
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
-            # The sliding window alternating layers are not always activated depending on the config
-            if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            causal_mask_mapping = self._get_cached_causal_mask_mapping(
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                # Auto-generated arange positions describe one contiguous
+                # sequence per batch row. Passing them into Transformers'
+                # mask helper needlessly runs packed-sequence detection, whose
+                # dynamic `.all()` check synchronizes CUDA for every new shape.
+                position_ids=None if auto_position_ids else position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+            )
 
         hidden_states = inputs_embeds
 

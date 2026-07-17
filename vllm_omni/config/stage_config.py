@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -226,6 +226,7 @@ class StagePipelineConfig:
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    supports_native_mrv2_data_plane: bool = False
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
@@ -416,6 +417,7 @@ class DeployConfig:
     """
 
     async_chunk: bool = True
+    model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     connectors: dict[str, Any] | None = None
@@ -605,8 +607,13 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
+    model_runner = raw_dict.get("model_runner", "v1")
+    if model_runner not in ("v1", "v2"):
+        raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
+
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
+        "model_runner": model_runner,
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
@@ -798,6 +805,8 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
+    engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
@@ -941,6 +950,7 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
+        engine_args["final_output"] = self.final_output
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:

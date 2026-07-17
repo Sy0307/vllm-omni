@@ -32,7 +32,11 @@ class HiddenStates(TypedDict, total=False):
 class Embeddings(TypedDict, total=False):
     prefill: torch.Tensor
     decode: torch.Tensor
+    decode_token_start: int
+    decode_token_end: int
     cached_decode: torch.Tensor
+    cached_decode_token_start: int
+    cached_decode_token_end: int
     tts_bos: torch.Tensor
     tts_eos: torch.Tensor
     tts_pad: torch.Tensor
@@ -67,6 +71,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
+    next_stage_prompt_ids: list[int]
     ar_width: int
     eol_token_id: int
     visual_token_start_id: int
@@ -82,6 +87,10 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    codec_chunk_frames: int
+    codec_left_context_frames: int
+    code_flat_numel: int
+    omni_final_stage_id: int
 
 
 class OmniPayload(TypedDict, total=False):
@@ -121,6 +130,8 @@ class EmbeddingsStruct(_StructBase):
     decode_token_start: int | None = None
     decode_token_end: int | None = None
     cached_decode: torch.Tensor | None = None
+    cached_decode_token_start: int | None = None
+    cached_decode_token_end: int | None = None
     tts_bos: torch.Tensor | None = None
     tts_eos: torch.Tensor | None = None
     tts_pad: torch.Tensor | None = None
@@ -156,6 +167,7 @@ class MetaStruct(_StructBase):
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
+    next_stage_prompt_ids: list[int] | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None
@@ -338,18 +350,31 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
+    try:
+        tensor_data = t_cpu.numpy().tobytes()
+    except TypeError:
+        # numpy has no equivalent for some torch dtypes (bfloat16, float8_*).
+        # Fall back to a raw byte view; _deserialize_tensor reconstructs via torch.
+        tensor_data = t_cpu.view(torch.uint8).numpy().tobytes()
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=tensor_data,
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
-    arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-    arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    name = entry.tensor_dtype or "float32"
+    try:
+        dt = np.dtype(name)
+        arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
+        return torch.from_numpy(arr.copy().reshape(entry.tensor_shape))
+    except TypeError:
+        # numpy can't represent this dtype (bfloat16, float8_*): reconstruct from
+        # the raw byte view written by _serialize_tensor.
+        torch_dtype = getattr(torch, name)
+        flat = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch_dtype)
+        return flat.reshape(entry.tensor_shape).clone()
 
 
 def serialize_payload(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -11,6 +12,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
@@ -40,11 +42,44 @@ except ValueError:
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    def _init_omni_connector_output_inbox(self) -> None:
+        self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
+
+    def enqueue_omni_connector_output(self, output: OmniConnectorOutput) -> None:
+        """Accept a lightweight readiness event from the local runner thread."""
+        self._omni_connector_output_inbox.put(output)
+
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
+
+    def _async_chunk_transport_enabled(self) -> bool:
+        return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
+            getattr(self, "_native_data_plane", False)
+        )
+
+    def _get_async_chunk_reserved_running_slots(self) -> int:
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        live_requests = self.requests
+        reserved_ids: set[str] = set()
+        if adapter is not None:
+            parked = getattr(adapter, "waiting_for_chunk_running_requests", ())
+            held = getattr(adapter, "_held_non_active", ())
+        else:
+            coordinator = getattr(self, "input_coordinator", None)
+            parked = getattr(coordinator, "_waiting_for_chunk_running", ())
+            held = ()
+        for request in parked:
+            req_id = getattr(request, "request_id", None)
+            if req_id in live_requests:
+                reserved_ids.add(req_id)
+        for request in held:
+            req_id = getattr(request, "request_id", None)
+            if req_id in live_requests:
+                reserved_ids.add(req_id)
+        return len(reserved_ids)
 
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
@@ -57,20 +92,56 @@ class OmniSchedulerMixin:
         AR and generation schedulers except for the ``model_mode`` argument
         forwarded to ``update_request_metadata``.
         """
+        connector_outputs: list[OmniConnectorOutput] = []
+        inbox = getattr(self, "_omni_connector_output_inbox", None)
+        if inbox is not None:
+            while True:
+                try:
+                    connector_outputs.append(inbox.get_nowait())
+                except queue.Empty:
+                    break
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
+        if connector_output is not None:
+            connector_outputs.append(connector_output)
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
-        if connector_output and connector_output.request_metadata:
+        request_metadata: dict[str, dict[str, Any]] = {}
+        chunk_ready_req_ids: set[str] = set()
+        chunk_finished_req_ids: set[str] = set()
+        stage_recv_req_ids: set[str] = set()
+        for output in connector_outputs:
+            request_metadata.update(output.request_metadata)
+            chunk_ready_req_ids.update(output.chunk_ready_req_ids)
+            chunk_finished_req_ids.update(output.chunk_finished_req_ids)
+            stage_recv_req_ids.update(output.stage_recv_req_ids)
+        live_request_ids = self.requests.keys()
+        request_metadata = {
+            req_id: metadata for req_id, metadata in request_metadata.items() if req_id in live_request_ids
+        }
+        chunk_ready_req_ids.intersection_update(live_request_ids)
+        chunk_finished_req_ids.intersection_update(live_request_ids)
+        stage_recv_req_ids.intersection_update(live_request_ids)
+        if request_metadata:
             input_coordinator.update_request_metadata(
-                self.requests, connector_output.request_metadata, model_mode=model_mode
+                self.requests,
+                request_metadata,
+                model_mode=model_mode,
             )
-        input_coordinator.process_pending_full_payload_inputs(
-            self.waiting,
-            self.running,
-            connector_output.stage_recv_req_ids if connector_output else set(),
-        )
+        if input_coordinator._async_chunk:
+            input_coordinator.process_pending_chunks(
+                self.waiting,
+                self.running,
+                chunk_ready_req_ids,
+                chunk_finished_req_ids,
+            )
+        else:
+            input_coordinator.process_pending_full_payload_inputs(
+                self.waiting,
+                self.running,
+                stage_recv_req_ids,
+            )
 
     def _process_pending_input_timeouts(self) -> None:
         """Force-fail requests waiting on the full-payload coordinator too long.
@@ -134,6 +205,8 @@ class OmniSchedulerMixin:
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+        data_plane_terminal_req_ids: set[str] | None = None,
+        input_terminal_req_ids: set[str] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -144,11 +217,31 @@ class OmniSchedulerMixin:
         base_data = {name: getattr(base, name) for name in SchedulerOutput.__dataclass_fields__}
         input_coordinator = getattr(self, "input_coordinator", None)
         if pending_input_registrations is None:
-            pending_input_registrations = input_coordinator.pending_input_registrations if input_coordinator else []
+            if input_coordinator is None:
+                pending_input_registrations = []
+            elif input_coordinator._async_chunk:
+                pending_input_registrations = input_coordinator.pending_chunk_registrations
+            else:
+                pending_input_registrations = input_coordinator.pending_input_registrations
+        if data_plane_terminal_req_ids is None:
+            pending_terminal = getattr(self, "_pending_data_plane_terminal_req_ids", set())
+            data_plane_terminal_req_ids = set(pending_terminal)
+            pending_terminal.clear()
+        if input_coordinator is not None:
+            scheduled_terminal_req_ids = input_coordinator.get_scheduled_input_terminal_req_ids(base)
+            if input_terminal_req_ids is None:
+                input_terminal_req_ids = scheduled_terminal_req_ids
+            else:
+                input_terminal_req_ids = set(input_terminal_req_ids).union(
+                    scheduled_terminal_req_ids,
+                )
+            input_coordinator.postprocess_scheduler_output(base)
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
+            data_plane_terminal_req_ids=data_plane_terminal_req_ids,
+            input_terminal_req_ids=input_terminal_req_ids or set(),
         )
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:

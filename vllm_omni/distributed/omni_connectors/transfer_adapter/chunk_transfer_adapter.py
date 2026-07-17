@@ -4,6 +4,7 @@
 import importlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
+from copy import copy
 from typing import Any
 
 import torch
@@ -60,11 +61,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
+        self.custom_prepare_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
+            self.custom_prepare_next_stage_input_func = getattr(module, f"{func_name}_prepare", None)
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -181,13 +184,59 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             return
 
+        prepared_payload = None
+        if self.custom_prepare_next_stage_input_func is not None:
+            try:
+                prepared_payload = self.custom_prepare_next_stage_input_func(
+                    transfer_manager=self,
+                    multimodal_output=unflatten_payload(multimodal_output)
+                    if isinstance(multimodal_output, Mapping)
+                    else multimodal_output,
+                    request=request,
+                    is_finished=is_segment_finished,
+                )
+            except Exception as e:
+                logger.error(f"Failed to use custom_prepare_input_func for payload extraction: {e}")
+            if prepared_payload is None and not (is_segment_finished or is_finished):
+                return
+
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
             "multimodal_output": multimodal_output,
-            "request": request,
+            "request": self._snapshot_request_for_background_send(request),
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
+            "prepared_payload": prepared_payload,
+            "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
         }
+        self._enqueue_save_task(task)
+
+    @staticmethod
+    def _snapshot_request_for_background_send(request: Request) -> Request:
+        """Freeze request state paired with one deferred model output.
+
+        The scheduler may advance the live request before the save thread builds
+        its payload. Keep identity/configuration by shallow copy, but detach the
+        mutable token histories used to align model-output rows.
+        """
+        snapshot = copy(request)
+        for public_name, private_name in (
+            ("prompt_token_ids", None),
+            ("output_token_ids", "_output_token_ids"),
+            ("all_token_ids", "_all_token_ids"),
+        ):
+            values = getattr(request, public_name, None)
+            if values is None:
+                continue
+            frozen_values = list(values)
+            setattr(snapshot, public_name, frozen_values)
+            if private_name is not None and hasattr(snapshot, private_name):
+                setattr(snapshot, private_name, frozen_values)
+
+        snapshot.output_token_count = len(getattr(snapshot, "output_token_ids", ()) or ())
+        return snapshot
+
+    def _enqueue_save_task(self, task: dict[str, Any]) -> None:
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
@@ -214,7 +263,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if result is None:
             return False
         payload_data, size = result
-
         if payload_data:
             # Update connector state
             self.get_req_chunk[req_id] += 1
@@ -303,16 +351,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
+        payload_data: OmniPayloadStruct | None = task.get("prepared_payload")
         if self.custom_process_next_stage_input_func:
             try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    multimodal_output=multimodal_output,
-                    request=request,
-                    # Existing processors use is_finished as a flush signal.
-                    is_finished=is_segment_finished,
-                )
+                if payload_data is None:
+                    payload_data = self.custom_process_next_stage_input_func(
+                        transfer_manager=self,
+                        multimodal_output=multimodal_output,
+                        request=request,
+                        # Existing processors use is_finished as a flush signal.
+                        is_finished=is_segment_finished,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
@@ -327,14 +376,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_data.meta = MetaStruct()
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
-
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
-
         if success:
             self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")

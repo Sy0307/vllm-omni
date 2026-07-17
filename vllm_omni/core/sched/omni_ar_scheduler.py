@@ -14,26 +14,75 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreEventType, FinishReason
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.compat import make_filtered_call
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
+    uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine import (
+    OmniEngineCoreOutput as EngineCoreOutput,
+)
+from vllm_omni.engine import (
+    OmniEngineCoreOutputs as EngineCoreOutputs,
+)
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+_KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS = {
+    "num_cached_tokens",
+    "num_external_computed_tokens",
+    "is_segment_finished",
+    "new_prompt_len_snapshot",
+}
+
+
+def _make_engine_core_output(**kwargs):
+    output, unknown = make_filtered_call(
+        EngineCoreOutput,
+        known_extra_fields=_KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS,
+        **kwargs,
+    )
+    if unknown:
+        logger.warning("Unknown fields passed to EngineCoreOutput: %s", sorted(unknown))
+    return output
+
+
+def _get_request_num_cached_tokens(request) -> int:
+    return max(getattr(request, "num_cached_tokens", 0), 0)
+
+
+def _get_request_num_external_computed_tokens(request) -> int:
+    return max(getattr(request, "num_external_computed_tokens", 0), 0)
+
+
+def _should_emit_engine_output(
+    model_config: Any,
+    *,
+    stopped: bool,
+    has_control: bool,
+) -> bool:
+    if stopped or has_control:
+        return True
+    return not (
+        bool(getattr(model_config, "async_chunk", False)) and not bool(getattr(model_config, "final_output", False))
+    )
 
 
 @dataclass
@@ -81,17 +130,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
+        self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
+        self._native_data_plane = uses_native_mrv2_data_plane(
+            model_config,
+            use_v2_model_runner=self.use_v2_model_runner,
+        )
         self.chunk_transfer_adapter = None
-        if getattr(model_config, "async_chunk", False):
+        if getattr(model_config, "async_chunk", False) and not self._native_data_plane:
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self.input_coordinator: OmniSchedulingCoordinator | None = None
-        if uses_full_payload_input_coordinator(model_config):
+        if self._native_data_plane:
+            self.input_coordinator = OmniSchedulingCoordinator(
+                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                stage_id=getattr(model_config, "stage_id", 0),
+                async_chunk=True,
+            )
+        elif uses_full_payload_input_coordinator(model_config):
             self.input_coordinator = OmniSchedulingCoordinator(
                 scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
                 async_chunk=False,
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        self._init_omni_connector_output_inbox()
+        self._pending_data_plane_terminal_req_ids: set[str] = set()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
 
@@ -225,15 +287,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
-
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
+        original_max_num_running_reqs = self.max_num_running_reqs
+        async_chunk_transport = self._async_chunk_transport_enabled()
+        reserved_running_slots = self._get_async_chunk_reserved_running_slots() if async_chunk_transport else 0
+        if reserved_running_slots:
+            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_running_reqs = original_max_num_running_reqs
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -263,6 +330,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     req_id=nr.req_id,
                     external_req_id=(getattr(request, "external_req_id", None) if request else None),
                     prompt_token_ids=nr.prompt_token_ids,
+                    prefill_token_ids=getattr(nr, "prefill_token_ids", None),
                     mm_features=nr.mm_features,
                     sampling_params=nr.sampling_params,
                     pooling_params=nr.pooling_params,
@@ -336,7 +404,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     req = self.requests.get(req_id)
                     if req is not None and not req.is_finished():
                         outputs[req.client_index].append(
-                            OmniEngineCoreOutput(
+                            _make_engine_core_output(
                                 request_id=req_id,
                                 new_token_ids=[],
                                 kv_transfer_params={"kv_ready": True},
@@ -442,6 +510,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finish_reason = request.get_finished_reason()
                 is_segment_finished = True
                 finished = self._handle_stopped_request(request)
+                if self._native_data_plane:
+                    self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -474,22 +544,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            has_stage_output = (
+                bool(new_token_ids)
+                or mm_output is not None
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+            )
+            if has_stage_output and _should_emit_engine_output(
+                self.vllm_config.model_config,
+                stopped=stopped,
+                has_control=kv_transfer_params is not None,
+            ):
+                # vLLM 0.23 strictly decodes EngineCoreOutput.pooling_output as a
+                # torch.Tensor. MR V2 runners hand off a per-request dict here, so
+                # serialize it onto the bytes channel; StagePool._poll_stage_raw
+                # rehydrates it. Tensor pooling outputs ride pooling_output as before.
+                pooling_output_wire = pooler_output
+                pooling_output_payload = None
+                if isinstance(pooler_output, dict):
+                    pooling_output_payload = serialize_additional_information(pooler_output)
+                    pooling_output_wire = None
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
-                    OmniEngineCoreOutput(
+                    _make_engine_core_output(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=pooling_output_wire,
+                        pooling_output_payload=pooling_output_payload,
                         multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
+                        num_cached_tokens=_get_request_num_cached_tokens(request),
+                        num_external_computed_tokens=_get_request_num_external_computed_tokens(request),
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
@@ -521,12 +614,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
-                    OmniEngineCoreOutput(
+                    _make_engine_core_output(
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
+                        num_cached_tokens=_get_request_num_cached_tokens(request),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:

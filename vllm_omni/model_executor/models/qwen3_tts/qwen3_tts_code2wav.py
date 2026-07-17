@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
 
@@ -74,20 +73,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decode_variable_chunk_batch_min_frames = self._decode_chunk_frames + self._decode_left_context_frames + 1
         self._logged_codec_stats = False
         self._logged_malformed_codec_lengths: set[tuple[int, int]] = set()
-        self._batch_stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        self._batch_stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY", "0") or 0)
-        self._batch_stats_forwards = 0
-        self._batch_stats_groups = 0
-        self._batch_stats_requests = 0
-        self._batch_stats_padded_frames = 0
-        self._batch_stats_decoded_frames = 0
-        self._batch_stats_actual_frames: Counter[int] = Counter()
-        self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -195,23 +180,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return bucket_frames
         return actual_frames
 
-    def _record_decode_batch_stats(
-        self,
-        *,
-        group_size: int,
-        bucket_frames: int,
-        actual_frames: list[int],
-    ) -> None:
-        if not self._batch_stats_enabled:
-            return
-
-        self._batch_stats_groups += 1
-        self._batch_stats_requests += group_size
-        self._batch_stats_decoded_frames += group_size * bucket_frames
-        self._batch_stats_padded_frames += sum(bucket_frames - frames for frames in actual_frames)
-        self._batch_stats_actual_frames.update(actual_frames)
-        self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
-
     @staticmethod
     def _tensor_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel() * tensor.element_size())
@@ -255,27 +223,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         if cached is not None:
             self._ref_context_cache_bytes -= self._tensor_nbytes(cached)
 
-    def log_decode_batch_stats(self) -> None:
-        if not self._batch_stats_enabled or self._batch_stats_requests == 0:
-            return
-
-        avg_group_size = self._batch_stats_requests / max(1, self._batch_stats_groups)
-        pad_ratio = self._batch_stats_padded_frames / max(1, self._batch_stats_decoded_frames)
-        logger.info(
-            "Code2Wav batch stats: forwards=%d groups=%d requests=%d "
-            "avg_group_size=%.2f padded_frames=%d decoded_frames=%d pad_ratio=%.2f%% "
-            "top_actual_frames=%s top_bucket_groups=%s",
-            self._batch_stats_forwards,
-            self._batch_stats_groups,
-            self._batch_stats_requests,
-            avg_group_size,
-            self._batch_stats_padded_frames,
-            self._batch_stats_decoded_frames,
-            100.0 * pad_ratio,
-            self._batch_stats_actual_frames.most_common(12),
-            self._batch_stats_bucket_groups.most_common(12),
-        )
-
     @torch.no_grad()
     def forward(
         self,
@@ -296,7 +243,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         Length management is done here instead of relying on HF's padding=-1
         sentinel logic.
         """
-        self._batch_stats_forwards += 1
         decoder = self.decoder
         q = int(self._num_quantizers)
         upsample = int(self._total_upsample)
@@ -425,12 +371,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             try:
                 c = valid_codes_qf[0]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] batch=%d",
+                    "Code2Wav codec: frames=%d q=%d batch=%d",
                     c.shape[1],
                     q,
-                    int(torch.unique(c).numel()),
-                    int(c.min().item()),
-                    int(c.max().item()),
                     len(valid_codes_qf),
                 )
             except Exception:
@@ -458,11 +401,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codes_bqf = first.new_zeros((len(group_chunk), q, target_frames))
                     for row, (_, codes_qf) in enumerate(group_chunk):
                         codes_bqf[row, :, : codes_qf.shape[1]] = codes_qf
-                self._record_decode_batch_stats(
-                    group_size=len(group_chunk),
-                    bucket_frames=target_frames,
-                    actual_frames=actual_frames,
-                )
                 try:
                     if use_variable_length_batch:
                         wav_batch = decoder.batched_chunked_decode(
@@ -522,9 +460,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             else:
                 group_chunks = [group]
             _decode_group_chunks(group_chunks)
-
-        if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
-            self.log_decode_batch_stats()
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req

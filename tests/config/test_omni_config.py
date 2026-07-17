@@ -330,6 +330,75 @@ def test_from_registry_dispatches_async_chunk_processors_without_mutating_topolo
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
+def test_native_mrv2_data_plane_capability_is_declared_by_pipeline_stage():
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+
+    assert all(stage.supports_native_mrv2_data_plane for stage in QWEN3_OMNI_PIPELINE.stages)
+
+    omni_config = VllmOmniConfig.from_registry("qwen3_tts")
+    for stage_id in (0, 1):
+        stage = omni_config.stage_by_id(stage_id)
+        assert stage.stage_pipeline_config.supports_native_mrv2_data_plane is True
+        assert stage.model_config.supports_native_mrv2_data_plane is True
+
+
+def test_deploy_model_runner_v2_propagates_to_every_stage(tmp_path: Path):
+    deploy_path = tmp_path / "qwen3_tts_v2.yaml"
+    deploy_path.write_text(
+        """\
+pipeline: qwen3_tts
+model_runner: v2
+async_chunk: true
+stages:
+  - stage_id: 0
+  - stage_id: 1
+"""
+    )
+
+    deploy = load_deploy_config(deploy_path)
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    legacy_stages = merge_pipeline_deploy(pipeline, deploy)
+    structured = VllmOmniConfig.from_registry("qwen3_tts", deploy_config_path=str(deploy_path))
+
+    assert deploy.model_runner == "v2"
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in legacy_stages)
+    assert all(stage.model_config.use_v2_model_runner is True for stage in structured.stage_configs)
+
+
+def test_deploy_model_runner_defaults_to_v1_for_every_stage():
+    deploy = DeployConfig()
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+
+    legacy_stages = merge_pipeline_deploy(pipeline, deploy)
+
+    assert deploy.model_runner == "v1"
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] is False for stage in legacy_stages)
+
+
+def test_deploy_model_runner_rejects_unknown_value(tmp_path: Path):
+    deploy_path = tmp_path / "invalid_runner.yaml"
+    deploy_path.write_text("model_runner: experimental\n")
+
+    with pytest.raises(ValueError, match="model_runner must be one of"):
+        load_deploy_config(deploy_path)
+
+
+@pytest.mark.parametrize(
+    ("default_name", "mrv2_name"),
+    [
+        ("qwen3_omni_moe.yaml", "qwen3_omni_moe_mrv2.yaml"),
+        ("qwen3_tts.yaml", "qwen3_tts_mrv2.yaml"),
+        (
+            "qwen3_tts_high_concurrency.yaml",
+            "qwen3_tts_high_concurrency_mrv2.yaml",
+        ),
+    ],
+)
+def test_qwen3_mrv2_profiles_are_explicit_opt_in(default_name: str, mrv2_name: str):
+    assert load_deploy_config(_DEPLOY_DIR / default_name).model_runner == "v1"
+    assert load_deploy_config(_DEPLOY_DIR / mrv2_name).model_runner == "v2"
+
+
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
     assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
@@ -368,6 +437,7 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
 def test_sub_config_fields_match_rfc_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "active_stream_window",
+        "use_v2_model_runner",
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",
@@ -375,6 +445,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "custom_voice_dir",
         "task_type",
         "codec_frame_rate_hz",
+        "supports_native_mrv2_data_plane",
         "enforce_eager",
         "enable_flashinfer_autotune",
         "compilation_config",
