@@ -9,6 +9,9 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 DEMO_PATH = Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
+MULTI_DEMO_PATH = (
+    Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_duplex_multi_session_e2e.py"
+)
 
 
 def _load_demo_module():
@@ -18,6 +21,42 @@ def _load_demo_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_multi_demo_module():
+    spec = importlib.util.spec_from_file_location("minicpmo_realtime_duplex_multi_session_test", MULTI_DEMO_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_realtime_duplex_multi_session_resume_url_disables_autostart():
+    demo = _load_multi_demo_module()
+
+    url = demo._with_resume_mode("ws://localhost:8113/v1/realtime?duplex=1&model=openbmb%2FMiniCPM-o-4_5")
+
+    query = parse_qs(urlsplit(url).query)
+    assert query["model"] == ["openbmb/MiniCPM-o-4_5"]
+    assert query["resume"] == ["1"]
+
+
+def test_realtime_duplex_multi_session_rejects_cross_session_response_identity():
+    demo = _load_multi_demo_module()
+
+    assert demo._validate_identity_isolation(
+        [
+            {"completed_response_ids": ["resp-a"]},
+            {"completed_response_ids": ["resp-b"]},
+        ]
+    )
+    assert not demo._validate_identity_isolation(
+        [
+            {"completed_response_ids": ["resp-shared"]},
+            {"completed_response_ids": ["resp-shared"]},
+        ]
+    )
 
 
 def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
@@ -135,6 +174,23 @@ def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn(
         state.add({"type": "input_audio_buffer.committed", "turn": turn})
 
     assert state.model_policy_event_order_ok(expected_turns=3)
+
+
+def test_realtime_duplex_demo_model_policy_accepts_continuous_input_without_commits():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "session.created"})
+    state.add({"type": "input_audio_buffer.speech_started"})
+    for _ in range(3):
+        state.add(
+            {
+                "type": "response.listen",
+                "response": {"metadata": {"model_listen": True}},
+            }
+        )
+
+    assert not state.model_policy_event_order_ok(expected_turns=3)
+    assert state.model_policy_event_order_ok(expected_turns=3, require_input_commit=False)
 
 
 def test_realtime_duplex_demo_full_turn_duration_does_not_slice_audio():
@@ -471,6 +527,45 @@ def test_realtime_duplex_demo_no_hint_realtime_turn_omits_transcript_hint(monkey
     assert captured["realtime_delay"] is True
 
 
+def test_realtime_duplex_demo_continuous_input_omits_browser_commit(monkeypatch):
+    demo = _load_demo_module()
+    state = demo.DemoState()
+
+    async def fake_send_pcm16(*args, **kwargs):
+        del args, kwargs
+        state.add({"type": "response.created", "response": {"id": "resp-continuous"}})
+        _add_response_transcript(state, "resp-continuous", transcript="连续输入", audio=True)
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            self.messages.append(demo.json.loads(payload))
+
+    monkeypatch.setattr(demo, "_send_pcm16", fake_send_pcm16)
+    ws = FakeWebSocket()
+
+    response_id, outcome = asyncio.run(
+        demo._send_clean_turn(
+            ws,
+            state,
+            b"\x00\x00",
+            transcript="fixture",
+            duration_ms=None,
+            chunk_ms=200,
+            timeout_s=0.1,
+            require_audio=True,
+            validation_mode="response-required",
+            commit_input=False,
+        )
+    )
+
+    assert response_id == "resp-continuous"
+    assert outcome == "speak"
+    assert not any(message.get("type") == "input_audio_buffer.commit" for message in ws.messages)
+
+
 def test_realtime_duplex_demo_no_hint_gate_does_not_require_transcription_event():
     demo = _load_demo_module()
 
@@ -701,6 +796,40 @@ def test_realtime_duplex_demo_model_response_drain_times_out_with_active_ids():
         )
 
 
+def test_realtime_duplex_demo_waits_at_each_model_unit_and_stops_after_speak():
+    demo = _load_demo_module()
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, payload):
+            self.messages.append(demo.json.loads(payload))
+
+    async def run_fixture():
+        ws = FakeWebSocket()
+        model_unit_message_counts = []
+
+        async def on_model_unit_ready():
+            model_unit_message_counts.append(len(ws.messages))
+            await asyncio.sleep(0)
+            return len(model_unit_message_counts) < 2
+
+        await demo._send_pcm16(
+            ws,
+            b"\x01\x00" * (demo.PCM16_SAMPLE_RATE * 3),
+            chunk_ms=200,
+            realtime_delay=False,
+            on_model_unit_ready=on_model_unit_ready,
+        )
+        return ws, model_unit_message_counts
+
+    ws, model_unit_message_counts = asyncio.run(run_fixture())
+
+    assert model_unit_message_counts == [5, 10]
+    assert len(ws.messages) == 10
+
+
 def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_done(monkeypatch):
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -708,9 +837,9 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
 
     async def fake_send_pcm16(*args, **kwargs):
         nonlocal send_calls
-        del args, kwargs
         send_calls += 1
         if send_calls == 1:
+            assert len(args[1]) == 2 + demo.PCM16_SAMPLE_RATE * demo.PCM16_BYTES_PER_SAMPLE
             state.add({"type": "input_audio_buffer.speech_started", "turn": 1})
             state.add({"type": "response.created", "response": {"id": "resp-first"}})
             state.add(
@@ -720,9 +849,12 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
                     "delta": "YQ==",
                 }
             )
+            assert await kwargs["on_model_unit_ready"]() is False
             return
 
+        del args
         assert not state.response_done("resp-first")
+        kwargs["on_model_unit_ready"]()
         state.add({"type": "input_audio_buffer.speech_started", "turn": 2})
         _add_response_transcript(state, "resp-first", transcript="第一轮完成", audio=False)
         state.add({"type": "response.created", "response": {"id": "resp-second"}})
@@ -751,6 +883,7 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
             send_transcript_hint=False,
             realtime_input=True,
             model_policy_settle_s=0.01,
+            silence_ms=1000,
         )
     )
 

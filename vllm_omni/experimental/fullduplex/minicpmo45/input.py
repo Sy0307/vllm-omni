@@ -49,6 +49,10 @@ class MiniCPMO45PcmAppendReservation:
     def active(self) -> bool:
         return self._active
 
+    @property
+    def byte_count(self) -> int:
+        return len(self._raw)
+
     def commit(self) -> None:
         self._owner._commit_reservation(self)
 
@@ -117,6 +121,10 @@ class MiniCPMO45PcmAppendBuffer:
 
     def has_pending(self) -> bool:
         return bool(self._buffer)
+
+    @property
+    def pending_byte_count(self) -> int:
+        return len(self._buffer)
 
     def _reserve_passthrough(
         self,

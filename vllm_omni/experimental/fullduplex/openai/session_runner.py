@@ -9,6 +9,7 @@ from copy import deepcopy
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
+from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import payload_turn_id
 from vllm_omni.experimental.fullduplex.minicpmo45.input import (
@@ -27,6 +28,9 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
+)
+from vllm_omni.experimental.fullduplex.openai.session_attachment import (
+    DuplexJournalOverflowError,
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import (
     DuplexWebSocketActor,
@@ -57,9 +61,60 @@ class DuplexSessionRunnerMixin:
         )
         runtime_opened = False
         runtime_closed = False
+        attachment_ready = False
+        attachment_generation: int | None = None
+        resume_credential_delivered = False
+        transport_detached = False
+
+        async def attachment_send(payload: dict[str, object]) -> None:
+            await websocket.send_json(payload)
+
+        async def attachment_close(reason: str) -> None:
+            close = getattr(websocket, "close", None)
+            if callable(close):
+                await close(code=1000, reason=reason)
+
+        async def send_attachment_payload(payload: dict[str, object], *, journal: bool) -> None:
+            assert session is not None
+            session_id = session.session_id
+            should_journal = journal and session_id not in self._resync_required_sessions
+            try:
+                await self._attachment_registry.send_event(
+                    session_id,
+                    payload,
+                    journal=should_journal,
+                )
+            except DuplexJournalOverflowError:
+                first_overflow = session_id not in self._resync_required_sessions
+                self._resync_required_sessions.add(session_id)
+                if first_overflow:
+                    resync_payload: dict[str, object] = {
+                        "type": "session.resync_required",
+                        "session_id": session_id,
+                        "reason": "journal_overflow",
+                    }
+                    if realtime_protocol is not None:
+                        resync_payload = realtime_protocol.encode_outbound_event(resync_payload)[0]
+                    await self._attachment_registry.send_event(
+                        session_id,
+                        resync_payload,
+                        journal=False,
+                    )
+                await self._attachment_registry.send_event(
+                    session_id,
+                    payload,
+                    journal=False,
+                )
+
         if realtime_protocol is not None:
 
             async def send_realtime_raw(payload: dict[str, object]) -> None:
+                if attachment_ready and session is not None:
+                    await send_attachment_payload(
+                        payload,
+                        journal=payload.get("type") not in {"session.created", "session.resumed"},
+                    )
+                    return
                 raw_payload = dict(payload)
                 raw_payload["_realtime_raw"] = True
                 await actor.send_json(raw_payload)
@@ -76,6 +131,22 @@ class DuplexSessionRunnerMixin:
         event_emit_lock = asyncio.Lock()
         native_append_tail: asyncio.Task[bool] | None = None
 
+        async def send_outbound(payload: dict[str, object]) -> None:
+            if not attachment_ready or session is None:
+                await actor.send_json(dict(payload))
+                return
+            if realtime_protocol is None:
+                await send_attachment_payload(
+                    payload,
+                    journal=payload.get("type") not in {"session.created", "session.resumed"},
+                )
+                return
+            for projected in realtime_protocol.encode_outbound_event(payload):
+                await send_attachment_payload(
+                    projected,
+                    journal=projected.get("type") not in {"session.created", "session.resumed"},
+                )
+
         async def emit_event(payload: dict[str, object]) -> None:
             async with event_emit_lock:
                 accepted, deferred_overlap_payload = await self._apply_outbound_session_event(
@@ -87,9 +158,17 @@ class DuplexSessionRunnerMixin:
                 )
                 if not accepted:
                     return
-                await actor.send_json(dict(payload))
+                await send_outbound(payload)
             if deferred_overlap_payload is not None and session is not None and not actor.closing:
-                await start_native_append(deferred_overlap_payload, final=True, precreate_response=True)
+                await start_native_append(
+                    deferred_overlap_payload,
+                    final=True,
+                    precreate_response=True,
+                    operation_id=native.committed_audio_operation_id,
+                    retained_committed_payload=(
+                        deferred_overlap_payload if native.committed_audio_payload is deferred_overlap_payload else None
+                    ),
+                )
 
         writer_task = asyncio.create_task(actor.writer_loop(), name="duplex-session-writer")
         reader_task: asyncio.Task[None] | None = None
@@ -131,6 +210,19 @@ class DuplexSessionRunnerMixin:
                             {"type": "error", "error": "Duplex event missing string type", "code": "bad_event"}
                         )
                         continue
+                    if event_type in {"input.commit", "input_audio_buffer.commit"}:
+                        if not session.reserve_pending_turn(
+                            limit=self._duplex_session_config.max_pending_turns_per_session
+                        ):
+                            await emit_event(
+                                {
+                                    "type": "error",
+                                    "error": "Duplex session has too many pending input turns",
+                                    "code": "input_backpressure",
+                                }
+                            )
+                            continue
+                        event["_duplex_pending_turn_reserved"] = True
                     if is_input_event(event_type) and native_response_in_progress():
                         event["_duplex_overlap_candidate"] = True
                     await actor.enqueue_event(event)
@@ -138,7 +230,10 @@ class DuplexSessionRunnerMixin:
                 await actor.enqueue_event({"type": "__disconnect__"})
 
         async def next_actor_event() -> dict[str, object]:
-            return await actor.next_event()
+            event = await actor.next_event()
+            if event.pop("_duplex_pending_turn_reserved", False) and session is not None:
+                session.release_pending_turn()
+            return event
 
         async def flush_native_audio_buffer(*, emit_event) -> tuple[bool, bool]:
             if session is None:
@@ -169,8 +264,6 @@ class DuplexSessionRunnerMixin:
                 return False
             if session.active_response_id is not None:
                 return True
-            if session.active_request_id is not None:
-                return True
             if (
                 session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value
                 and session.playback.sent_ms > session.playback.committed_ms
@@ -179,8 +272,6 @@ class DuplexSessionRunnerMixin:
             if actor.active_response_task is not None and not actor.active_response_task.done():
                 return True
             if actor.has_response_bound_append_tasks():
-                return True
-            if native.data_plane_task is not None:
                 return True
             return session.turn_state == DuplexTurnState.ASSISTANT_GENERATING
 
@@ -233,13 +324,12 @@ class DuplexSessionRunnerMixin:
                     if append_ok:
                         if pcm_reservation is not None:
                             pcm_reservation.commit()
+                            session.release_input_bytes(pcm_reservation.byte_count)
                         if (
                             retained_committed_payload is not None
                             and native.committed_audio_payload is retained_committed_payload
                         ):
-                            native.committed_audio_payload = None
-                            native.committed_audio_operation_id = None
-                            native.deferred_response_create = False
+                            session.release_input_bytes(native.clear_committed_audio())
                     elif pcm_reservation is not None:
                         pcm_reservation.rollback()
                     if (
@@ -413,28 +503,69 @@ class DuplexSessionRunnerMixin:
             )
 
         try:
-            session = await self._open_session(
+            handshake = await self._open_session(
                 websocket,
                 emit_event,
                 realtime_protocol=realtime_protocol,
+                attachment_send=attachment_send,
+                attachment_close=attachment_close,
             )
-            if session is None:
+            if handshake is None:
                 return
-            self._minicpmo_sessions[session.session_id] = native
+            session = handshake.session
+            if handshake.resumed:
+                native = self._minicpmo_sessions[session.session_id]
+                actor.tasks = self._session_tasks[session.session_id]
+                persisted_protocol = self._realtime_protocols.get(session.session_id)
+                if persisted_protocol is None:
+                    raise RuntimeError(f"Missing Realtime protocol state for resumed session {session.session_id}")
+                realtime_protocol = persisted_protocol
+                realtime_protocol.bind_sender(send_realtime_raw)
+                attachment_generation = handshake.attachment_generation
+                attachment_ready = True
+                resume_credential_delivered = True
+                runtime_opened = True
+                self._ensure_lifecycle_listener()
+                reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
+            else:
+                self._minicpmo_sessions[session.session_id] = native
+                self._session_tasks[session.session_id] = actor.tasks
+                if realtime_protocol is not None:
+                    self._realtime_protocols[session.session_id] = realtime_protocol
             if realtime_protocol is not None:
                 session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
-            open_result = await self._open_runtime_session(session, emit_event)
-            if open_result is False:
-                return
-            runtime_opened = True
-            created_payload: dict[str, object] = {
-                "type": "session.created",
-                "session": session.as_public_dict(),
-            }
-            if isinstance(open_result, dict):
-                created_payload["runtime_control"] = self._redact_runtime_control_result(open_result)
-            await emit_event(created_payload)
-            reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
+            if not handshake.resumed:
+                open_result = await self._open_runtime_session(session, emit_event)
+                if open_result is False:
+                    return
+                runtime_opened = True
+                created_attachment = await self._attachment_registry.create(
+                    session.session_id,
+                    incarnation=session.incarnation,
+                    send=attachment_send,
+                    close=attachment_close,
+                )
+                attachment_generation = created_attachment.attachment_generation
+                attachment_ready = True
+                self._lease_generations[session.session_id] = 0
+                self._ensure_lifecycle_listener()
+                created_payload: dict[str, object] = {
+                    "type": "session.created",
+                    "session": session.as_public_dict(),
+                }
+                if session.capabilities.supports_session_resume:
+                    created_payload.update(
+                        {
+                            "incarnation": session.incarnation,
+                            "attachment_generation": attachment_generation,
+                            "resume_token": created_attachment.resume_token.plaintext,
+                        }
+                    )
+                if isinstance(open_result, dict):
+                    created_payload["runtime_control"] = self._redact_runtime_control_result(open_result)
+                await emit_event(created_payload)
+                resume_credential_delivered = session.capabilities.supports_session_resume
+                reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
 
             while True:
                 event = await next_actor_event()
@@ -443,12 +574,11 @@ class DuplexSessionRunnerMixin:
                 if event_type == "__timeout__":
                     begin_close("timeout")
                     native.audio_buffer.clear()
+                    session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
                     native.clear_overlap_turn()
-                    native.committed_audio_payload = None
-                    native.committed_audio_operation_id = None
-                    native.deferred_response_create = False
+                    native.clear_committed_audio()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -477,9 +607,72 @@ class DuplexSessionRunnerMixin:
                     return
 
                 if event_type == "__disconnect__":
+                    transport_detached = True
                     return
 
                 if not isinstance(event_type, str):
+                    continue
+
+                if event_type == "session.heartbeat":
+                    touch_session = getattr(self._chat_service.engine_client, "touch_duplex_session_async", None)
+                    if not callable(touch_session):
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "error": "Duplex runtime does not expose heartbeat control",
+                                "code": "runtime_touch_unsupported",
+                            }
+                        )
+                        continue
+                    try:
+                        await touch_session(
+                            session.session_id,
+                            fence=DuplexFence(
+                                session.session_id,
+                                epoch=session.epoch,
+                                turn_id=session.turn_id,
+                                incarnation=session.incarnation,
+                            ),
+                            activity=DuplexLeaseActivity.HEARTBEAT,
+                        )
+                    except Exception as exc:
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "error": str(exc),
+                                "code": "runtime_touch_failed",
+                            }
+                        )
+                        continue
+                    await emit_event(
+                        {
+                            "type": "session.heartbeat_ack",
+                            "session_id": session.session_id,
+                        }
+                    )
+                    continue
+
+                if event_type == "session.event_ack":
+                    acknowledged = event.get("server_event_seq")
+                    if not isinstance(acknowledged, int) or acknowledged < 0:
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "error": "session.event_ack requires a non-negative server_event_seq",
+                                "code": "invalid_event_ack",
+                            }
+                        )
+                        continue
+                    try:
+                        await self._attachment_registry.acknowledge(session.session_id, acknowledged)
+                    except ValueError as exc:
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "error": str(exc),
+                                "code": "invalid_event_ack",
+                            }
+                        )
                     continue
 
                 if event_type in {"turn.signal", "signal_turn"} and event.get("event") in {
@@ -502,12 +695,11 @@ class DuplexSessionRunnerMixin:
                         runtime_closed = True
                         return
                     native.audio_buffer.clear()
+                    session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
                     native.clear_overlap_turn()
-                    native.committed_audio_payload = None
-                    native.committed_audio_operation_id = None
-                    native.deferred_response_create = False
+                    native.clear_committed_audio()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -530,12 +722,11 @@ class DuplexSessionRunnerMixin:
 
                 if event_type == "input_audio_buffer.clear":
                     native.audio_buffer.clear()
+                    session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
                     native.clear_overlap_turn()
-                    native.committed_audio_payload = None
-                    native.committed_audio_operation_id = None
-                    native.deferred_response_create = False
+                    native.clear_committed_audio()
                     cancelled = session.cancel_pending_input()
                     await emit_event(
                         {
@@ -599,12 +790,11 @@ class DuplexSessionRunnerMixin:
                     playback_was_active = self._assistant_playback_active(session)
                     if event_type in {"input.cancel", "barge_in"}:
                         native.audio_buffer.clear()
+                        session.release_all_input_bytes()
                         native.input_since_commit = False
                         native.speech_since_commit = False
                         native.clear_overlap_turn()
-                        native.committed_audio_payload = None
-                        native.committed_audio_operation_id = None
-                        native.deferred_response_create = False
+                        native.clear_committed_audio()
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
@@ -954,7 +1144,8 @@ class DuplexSessionRunnerMixin:
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=self._input_audio_duration_ms(event, payload)
                                     )
-                                payload["force_listen"] = True
+                                if decision.get("force_listen", True) is True:
+                                    payload["force_listen"] = True
                                 session.mark_assistant_generating()
                             else:
                                 event["force_barge_in"] = True
@@ -1081,6 +1272,19 @@ class DuplexSessionRunnerMixin:
                             event, payload, session=session
                         )
                         try:
+                            raw_audio_bytes = self._native_audio_payload_size_bytes(payload)
+                            if not session.reserve_input_bytes(
+                                raw_audio_bytes,
+                                limit=self._duplex_session_config.max_pending_input_bytes_per_session,
+                            ):
+                                await emit_event(
+                                    {
+                                        "type": "error",
+                                        "error": "Duplex session pending input exceeds server limit",
+                                        "code": "input_backpressure",
+                                    }
+                                )
+                                continue
                             pcm_reservation = native.audio_buffer.prepare_append(
                                 payload,
                                 operation_id=uuid.uuid4().hex,
@@ -1098,10 +1302,13 @@ class DuplexSessionRunnerMixin:
                                 ),
                             )
                         except ValueError as exc:
+                            session.release_input_bytes(raw_audio_bytes)
                             await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
                             continue
                         if pcm_reservation is None:
                             continue
+                        if pcm_reservation.byte_count == 0:
+                            session.release_input_bytes(raw_audio_bytes)
                         payload = pcm_reservation.payload
                     else:
                         session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
@@ -1140,9 +1347,8 @@ class DuplexSessionRunnerMixin:
                         native.input_since_commit = False
                         native.speech_since_commit = False
                         native.audio_buffer.clear()
-                        native.committed_audio_payload = None
-                        native.committed_audio_operation_id = None
-                        native.deferred_response_create = False
+                        session.release_all_input_bytes()
+                        native.clear_committed_audio()
                         await emit_event(
                             {
                                 "type": "input.committed",
@@ -1229,11 +1435,10 @@ class DuplexSessionRunnerMixin:
                         ):
                             if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
                                 native.audio_buffer.clear()
+                                session.release_all_input_bytes()
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
-                                native.committed_audio_payload = None
-                                native.committed_audio_operation_id = None
-                                native.deferred_response_create = False
+                                native.clear_committed_audio()
                                 if realtime_protocol is not None:
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=session.overlap_speech_ms
@@ -1263,7 +1468,9 @@ class DuplexSessionRunnerMixin:
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
                             )
                             deferred_payload = commit_reservation.payload
-                            if deferred_payload is not None:
+                            if deferred_payload is None:
+                                commit_reservation.commit()
+                            else:
                                 if native.committed_audio_payload is not None:
                                     deferred_payload = self._merge_native_audio_payloads(
                                         native.committed_audio_payload,
@@ -1272,8 +1479,11 @@ class DuplexSessionRunnerMixin:
                                 if committing_overlap_turn_id is not None:
                                     deferred_payload = dict(deferred_payload)
                                     deferred_payload["duplex_turn_id"] = committing_overlap_turn_id
-                                native.committed_audio_payload = deferred_payload
-                                native.committed_audio_operation_id = commit_reservation.operation_id
+                                native.retain_committed_audio(
+                                    deferred_payload,
+                                    operation_id=commit_reservation.operation_id,
+                                    reserved_bytes=commit_reservation.byte_count,
+                                )
                                 commit_reservation.commit()
                                 native.deferred_response_create = should_create_response
                                 native.input_since_commit = False
@@ -1314,8 +1524,12 @@ class DuplexSessionRunnerMixin:
                                 else:
                                     final_payload = native.committed_audio_payload
                             commit_reservation.commit()
-                            native.committed_audio_payload = final_payload
-                            native.committed_audio_operation_id = commit_reservation.operation_id
+                            if final_payload is not None:
+                                native.retain_committed_audio(
+                                    final_payload,
+                                    operation_id=commit_reservation.operation_id,
+                                    reserved_bytes=commit_reservation.byte_count,
+                                )
                             native.deferred_response_create = False
                             native.input_since_commit = False
                             native.speech_since_commit = False
@@ -1408,6 +1622,9 @@ class DuplexSessionRunnerMixin:
                             if event_type in {"input.commit", "input_audio_buffer.commit"}
                             else None
                         )
+                        flushed_buffer_reserved_bytes = (
+                            native.audio_buffer.pending_byte_count if commit_reservation is None else 0
+                        )
                         flushed = (
                             commit_reservation.payload
                             if commit_reservation is not None
@@ -1446,11 +1663,18 @@ class DuplexSessionRunnerMixin:
                                 )
                             )
                             if should_create_response:
-                                native.committed_audio_payload = flushed
-                                native.committed_audio_operation_id = (
-                                    commit_reservation.operation_id
-                                    if commit_reservation is not None
-                                    else uuid.uuid4().hex
+                                native.retain_committed_audio(
+                                    flushed,
+                                    operation_id=(
+                                        commit_reservation.operation_id
+                                        if commit_reservation is not None
+                                        else uuid.uuid4().hex
+                                    ),
+                                    reserved_bytes=(
+                                        commit_reservation.byte_count
+                                        if commit_reservation is not None
+                                        else flushed_buffer_reserved_bytes
+                                    ),
                                 )
                                 await start_native_append(
                                     flushed,
@@ -1460,11 +1684,18 @@ class DuplexSessionRunnerMixin:
                                     retained_committed_payload=flushed,
                                 )
                             else:
-                                native.committed_audio_payload = flushed
-                                native.committed_audio_operation_id = (
-                                    commit_reservation.operation_id
-                                    if commit_reservation is not None
-                                    else uuid.uuid4().hex
+                                native.retain_committed_audio(
+                                    flushed,
+                                    operation_id=(
+                                        commit_reservation.operation_id
+                                        if commit_reservation is not None
+                                        else uuid.uuid4().hex
+                                    ),
+                                    reserved_bytes=(
+                                        commit_reservation.byte_count
+                                        if commit_reservation is not None
+                                        else flushed_buffer_reserved_bytes
+                                    ),
                                 )
                                 native.deferred_response_create = False
                             continue
@@ -1544,30 +1775,85 @@ class DuplexSessionRunnerMixin:
 
         except WebSocketDisconnect:
             logger.info("Duplex session disconnected")
+            transport_detached = True
         except Exception as exc:
             logger.exception("Duplex session failed: %s", exc)
             with suppress(Exception):
                 await emit_event({"type": "error", "error": str(exc), "code": "internal_error"})
         finally:
             if session is not None:
-                begin_close(actor.close_reason or "disconnect")
                 if reader_task is not None and not reader_task.done():
                     reader_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await reader_task
-                await actor.cancel_append_tasks()
-                await self._cancel_native_data_plane_stream(session)
-                await self._cancel_active_response(
-                    session,
-                    actor.active_response_task,
-                    emit_event,
-                    reason="disconnect",
-                    notify=False,
+                session.clear_pending_turn_reservations()
+                resumable_detach = (
+                    transport_detached
+                    and runtime_opened
+                    and not runtime_closed
+                    and session.state == DuplexSessionState.OPEN
+                    and session.capabilities.supports_session_resume
+                    and attachment_generation is not None
+                    and resume_credential_delivered
                 )
-                if runtime_opened and not runtime_closed and session.state != DuplexSessionState.CLOSED:
-                    await self._close_runtime_session(session, reason="disconnect")
-                self._cleanup_duplex_session_state(session)
-                self._registry.close(session.session_id)
+                if resumable_detach:
+
+                    async def cancel_orphan_response_after_grace() -> None:
+                        tasks = self._session_tasks.get(session.session_id)
+                        current_session = self._registry.get(session.session_id)
+                        if tasks is None or current_session is not session or session.state != DuplexSessionState.OPEN:
+                            return
+                        await tasks.cancel_append_tasks(response_bound_only=True)
+                        await self._cancel_native_data_plane_stream(session)
+                        await self._cancel_active_response(
+                            session,
+                            tasks.active_response_task,
+                            emit_event,
+                            reason="disconnect_grace_expired",
+                            notify=False,
+                        )
+                        tasks.active_response_task = None
+
+                    detached = await self._attachment_registry.detach(
+                        session.session_id,
+                        attachment_generation=attachment_generation,
+                        on_grace_expired=cancel_orphan_response_after_grace,
+                    )
+                    touch_session = getattr(self._chat_service.engine_client, "touch_duplex_session_async", None)
+                    if detached and callable(touch_session):
+                        with suppress(Exception):
+                            await touch_session(
+                                session.session_id,
+                                fence=DuplexFence(
+                                    session.session_id,
+                                    epoch=session.epoch,
+                                    turn_id=session.turn_id,
+                                    incarnation=session.incarnation,
+                                ),
+                                activity=DuplexLeaseActivity.DETACH,
+                            )
+                else:
+                    begin_close(actor.close_reason or "disconnect")
+                    await actor.cancel_append_tasks()
+                    await self._cancel_native_data_plane_stream(session)
+                    await self._cancel_active_response(
+                        session,
+                        actor.active_response_task,
+                        emit_event,
+                        reason="disconnect",
+                        notify=False,
+                    )
+                    if runtime_opened and not runtime_closed and session.state != DuplexSessionState.CLOSED:
+                        await self._close_runtime_session(session, reason="disconnect")
+                    self._cleanup_duplex_session_state(session)
+                    self._registry.close(session.session_id)
+                    self._session_tasks.pop(session.session_id, None)
+                    self._realtime_protocols.pop(session.session_id, None)
+                    self._lease_generations.pop(session.session_id, None)
+                    self._resync_required_sessions.discard(session.session_id)
+                    with suppress(Exception):
+                        await self._attachment_registry.close(session.session_id)
+                    self._stop_lifecycle_listener_if_idle()
             await actor.close_writer()
             with suppress(Exception):
                 await asyncio.wait_for(actor.output_queue.join(), timeout=2.0)

@@ -16,7 +16,15 @@ class RealtimeOutputProjector:
         event_type = event.get("type")
         if event_type == "session.created":
             session = self._realtime_session_payload(event.get("session"))
-            payloads: list[dict[str, object]] = [{"type": "session.created", "session": session}]
+            created: dict[str, object] = {"type": "session.created", "session": session}
+            for key in (
+                "incarnation",
+                "attachment_generation",
+                "resume_token",
+            ):
+                if key in event:
+                    created[key] = event[key]
+            payloads: list[dict[str, object]] = [created]
             if self._initial_session_update:
                 payloads.append({"type": "session.updated", "session": session})
                 self._initial_session_update = False
@@ -28,6 +36,16 @@ class RealtimeOutputProjector:
         if event_type == "session.updated":
             session = self._realtime_session_payload(event.get("session"))
             return [{"type": "session.updated", "session": session}]
+        if event_type in {
+            "session.resumed",
+            "session.heartbeat_ack",
+            "session.replaced",
+            "session.expired",
+            "session.resync_required",
+        }:
+            if event_type == "session.resumed":
+                self._hold_realtime_output_until_session_created = False
+            return [dict(event)]
         if event_type == "response.created":
             response_id = event.get("response_id")
             if isinstance(response_id, str) and response_id:

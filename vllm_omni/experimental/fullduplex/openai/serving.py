@@ -6,6 +6,8 @@ import binascii
 import inspect
 import json
 from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -15,6 +17,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.engine.duplex_types import DuplexFence
+from vllm_omni.engine.messages import DuplexSessionLifecycleMessage
 from vllm_omni.entrypoints.openai.duplex_capability import (
     should_enable_duplex_endpoint,
 )
@@ -54,11 +57,17 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
 from vllm_omni.experimental.fullduplex.openai.runtime_bridge import (
     NativeRuntimeBridgeMixin,
 )
+from vllm_omni.experimental.fullduplex.openai.session_attachment import (
+    DuplexJournalGapError,
+    DuplexSessionAttachmentRegistry,
+    InvalidResumeTokenError,
+)
 from vllm_omni.experimental.fullduplex.openai.session_runner import (
     DuplexSessionRunnerMixin,
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import (
     DOMAIN_TERMINAL_EVENTS,
+    DuplexSessionTasks,
     DuplexWebSocketActor,
 )
 
@@ -71,6 +80,13 @@ __all__ = ["OmniDuplexSessionHandler", "should_enable_duplex_endpoint"]
 
 _DEFAULT_CONFIG_TIMEOUT_S = 10.0
 _DEFAULT_IDLE_TIMEOUT_S = 300.0
+
+
+@dataclass(frozen=True)
+class _DuplexSessionHandshake:
+    session: DuplexSession
+    resumed: bool = False
+    attachment_generation: int | None = None
 
 
 class OmniDuplexSessionHandler(
@@ -112,12 +128,125 @@ class OmniDuplexSessionHandler(
         self._turn_controller = DuplexTurnController()
         self._minicpmo_data_plane = MiniCPMO45DataPlaneSession(self._encode_minicpmo_data_plane_audio)
         self._minicpmo_sessions: dict[str, MiniCPMO45ServingSessionState] = {}
+        self._session_tasks: dict[str, DuplexSessionTasks] = {}
+        self._realtime_protocols: dict[str, NativeRealtimeSessionProtocol] = {}
+        self._lease_generations: dict[str, int] = {}
+        self._resync_required_sessions: set[str] = set()
+        self._lifecycle_queue = getattr(self._chat_service.engine_client, "duplex_lifecycle_events", None)
+        self._lifecycle_task: asyncio.Task[None] | None = None
+        self._attachment_registry = DuplexSessionAttachmentRegistry(
+            replay_ttl_s=self._duplex_session_config.resume_replay_ttl_s,
+            replay_max_bytes_per_session=self._duplex_session_config.resume_replay_max_bytes_per_session,
+            disconnect_grace_s=self._duplex_session_config.disconnect_grace_s,
+        )
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
         await self.handle_session(
             websocket,
             realtime_protocol=NativeRealtimeSessionProtocol(websocket.query_params),
         )
+
+    def _ensure_lifecycle_listener(self) -> None:
+        if not isinstance(self._lifecycle_queue, asyncio.Queue):
+            return
+        if self._lifecycle_task is None or self._lifecycle_task.done():
+            self._lifecycle_task = asyncio.create_task(
+                self._run_lifecycle_listener(),
+                name="duplex-serving-lifecycle",
+            )
+
+    async def _run_lifecycle_listener(self) -> None:
+        queue = self._lifecycle_queue
+        if not isinstance(queue, asyncio.Queue):
+            return
+        try:
+            while True:
+                message = await queue.get()
+                try:
+                    if isinstance(message, DuplexSessionLifecycleMessage):
+                        await self._apply_runtime_lifecycle(message)
+                finally:
+                    queue.task_done()
+                if self._registry.active_count() == 0:
+                    return
+        finally:
+            if self._lifecycle_task is asyncio.current_task():
+                self._lifecycle_task = None
+
+    async def _apply_runtime_lifecycle(self, message: DuplexSessionLifecycleMessage) -> None:
+        session = self._registry.get(message.session_id)
+        if session is None:
+            return
+        fence = message.fence
+        if (
+            fence.session_id != session.session_id
+            or fence.incarnation != session.incarnation
+            or fence.epoch < session.epoch
+        ):
+            return
+        current_generation = self._lease_generations.get(session.session_id, 0)
+        if message.lease_generation < current_generation:
+            return
+        protocol = self._realtime_protocols.get(session.session_id)
+        expired_payload: dict[str, object] = {
+            "type": "session.expired",
+            "session_id": session.session_id,
+            "incarnation": session.incarnation,
+            "reason": message.reason,
+        }
+        if protocol is not None:
+            expired_payload = protocol.encode_outbound_event(expired_payload)[0]
+        with suppress(Exception):
+            await self._attachment_registry.send_event(
+                session.session_id,
+                expired_payload,
+                journal=False,
+            )
+
+        tasks = self._session_tasks.pop(session.session_id, None)
+        if tasks is not None:
+            await tasks.cancel_append_tasks()
+            active_response_task = tasks.active_response_task
+            if active_response_task is not None and not active_response_task.done():
+                active_response_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await active_response_task
+        native = self._minicpmo_sessions.get(session.session_id)
+        if native is not None and native.data_plane_task is not None:
+            data_plane_task = native.data_plane_task
+            native.data_plane_task = None
+            data_plane_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await data_plane_task
+        if session.active_response_id is not None:
+            session.end_response(commit_text=False)
+        self._cleanup_duplex_session_state(session)
+        self._registry.close(session.session_id)
+        self._realtime_protocols.pop(session.session_id, None)
+        self._lease_generations.pop(session.session_id, None)
+        self._resync_required_sessions.discard(session.session_id)
+        attachment = await self._attachment_registry.close(session.session_id)
+        if attachment is not None:
+            with suppress(Exception):
+                await attachment.close("session_expired")
+
+    def _stop_lifecycle_listener_if_idle(self) -> None:
+        task = self._lifecycle_task
+        if self._registry.active_count() != 0 or task is None or task.done():
+            return
+        if task is not asyncio.current_task():
+            task.cancel()
+            self._lifecycle_task = None
+
+    @staticmethod
+    def _native_audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
+        audio = payload.get("audio") or payload.get("data")
+        if not isinstance(audio, str):
+            return 0
+        try:
+            return len(base64.b64decode(audio, validate=True))
+        except (ValueError, binascii.Error):
+            return 0
 
     async def _apply_outbound_session_event(
         self,
@@ -157,11 +286,28 @@ class OmniDuplexSessionHandler(
         terminal_status_details = payload.get("status_details")
         if terminal_status is None and isinstance(terminal_status_details, dict):
             terminal_status = terminal_status_details.get("type")
-        can_promote_overlap = payload_type in {"response.done", "response.listen"} and terminal_status not in {
-            "cancelled",
-            "failed",
-        }
+        response_terminal = payload_type == "response.done" or (
+            payload_type == "response.listen" and session.active_response_id is not None
+        )
+        can_promote_overlap = response_terminal and terminal_status not in {"cancelled", "failed"}
         deferred_overlap_payload: dict[str, object] | None = None
+        continuous_input_crosses_terminal = (
+            can_promote_overlap
+            and realtime_protocol is not None
+            and self._session_auto_responds(session)
+            and native.input_since_commit
+            and not native.deferred_response_create
+        )
+        if continuous_input_crosses_terminal:
+            # Auto-response is a model-owned continuous stream. A response
+            # terminal advances the model turn without requiring the browser
+            # to close its Realtime input item. Keep any partial model unit so
+            # later PCM can complete it, but remove the commit-gated overlap
+            # latch left by the previous response.
+            native.deferred_overlap_turn = False
+            native.clear_overlap_turn()
+            session.reset_overlap_speech()
+            return True, None
         realtime_input_still_open = (
             can_promote_overlap
             and realtime_protocol is not None
@@ -185,6 +331,7 @@ class OmniDuplexSessionHandler(
                 and session.overlap_speech_ms > session.config.overlap_short_ack_ms
             )
             if should_promote_overlap:
+                flushed_reserved_bytes = native.audio_buffer.pending_byte_count
                 deferred_overlap_payload = native.audio_buffer.flush(
                     chunk_period_ms=session.capabilities.chunk_period_ms or 1000
                 )
@@ -196,8 +343,6 @@ class OmniDuplexSessionHandler(
                         )
                     else:
                         deferred_overlap_payload = native.committed_audio_payload
-                    native.committed_audio_payload = None
-                    native.committed_audio_operation_id = None
                 if self._session_auto_responds(session) and deferred_overlap_payload is not None:
                     deferred_overlap_payload = dict(deferred_overlap_payload)
                     deferred_overlap_payload["force_listen"] = False
@@ -209,10 +354,14 @@ class OmniDuplexSessionHandler(
                     )
                     native.auto_response_new_turn_prefix_variant = None
                     native.auto_response_waiting_for_speech = False
+                if deferred_overlap_payload is not None:
+                    native.retain_committed_audio(
+                        deferred_overlap_payload,
+                        operation_id=native.committed_audio_operation_id,
+                        reserved_bytes=flushed_reserved_bytes,
+                    )
                 native.input_since_commit = deferred_overlap_payload is not None
                 if realtime_protocol is not None:
-                    native.committed_audio_payload = deferred_overlap_payload
-                    native.committed_audio_operation_id = None
                     native.deferred_response_create = True
                     deferred_overlap_payload = None
             else:
@@ -224,15 +373,11 @@ class OmniDuplexSessionHandler(
                 if had_pending_overlap_audio and realtime_protocol is not None:
                     await realtime_protocol.discard_pending_input_audio(audio_end_ms=session.overlap_speech_ms)
                 if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
-                    native.committed_audio_payload = None
-                    native.committed_audio_operation_id = None
-                    native.deferred_response_create = False
+                    session.release_input_bytes(native.clear_committed_audio())
 
         session.reset_overlap_speech()
         if can_promote_overlap and native.deferred_response_create and native.committed_audio_payload is not None:
             deferred_overlap_payload = native.committed_audio_payload
-            native.committed_audio_payload = None
-            native.committed_audio_operation_id = None
             native.deferred_response_create = False
             native.input_since_commit = False
             native.speech_since_commit = False
@@ -353,11 +498,9 @@ class OmniDuplexSessionHandler(
                 "buffer_audio": True,
             }
         if self._session_auto_responds(session):
-            # Full-duplex: continuous input while the model is speaking is the
-            # normal case (the client streams the mic non-stop). Buffer it as the
-            # next turn's input and let the model finish its current response,
-            # instead of auto-cancelling on every overlapping chunk. Explicit
-            # barge-in (force_barge_in / overlap_action above) still interrupts.
+            # Full-duplex input remains model-owned while output is active. Feed
+            # complete model units into the existing Stage0 stream immediately;
+            # playback only controls history ACKs, not model admission.
             if is_speech:
                 session.accumulate_overlap_speech(duration_ms)
             return {
@@ -365,8 +508,9 @@ class OmniDuplexSessionHandler(
                 "reason": "auto_response_continuous",
                 "duration_ms": duration_ms,
                 "overlap_speech_ms": session.overlap_speech_ms,
-                "buffer_audio": is_speech,
-                "defer_runtime_append": True,
+                "buffer_audio": True,
+                "defer_runtime_append": False,
+                "force_listen": False,
                 "preserve_realtime_input": True,
             }
         if bool(event.get("force_listen", False)):
@@ -624,19 +768,7 @@ class OmniDuplexSessionHandler(
             return False
         if event.get("force_barge_in") is True:
             return False
-        if event.get("force_listen") is True or payload.get("force_listen") is True:
-            return True
-        looks_like_speech = self._input_looks_like_speech(event, payload, session=session)
-        native = self._minicpmo_session_state(session)
-        if native.auto_response_waiting_for_speech:
-            return False
-        if self._assistant_playback_active(session):
-            return True
-        if looks_like_speech:
-            native.auto_response_waiting_for_speech = False
-            native.auto_response_new_turn_prefix_variant = None
-            return False
-        return False
+        return event.get("force_listen") is True or payload.get("force_listen") is True
 
     def _should_start_deferred_native_auto_response_overlap(
         self,
@@ -731,11 +863,7 @@ class OmniDuplexSessionHandler(
             )
             native.auto_response_new_turn_prefix_variant = None
         else:
-            if native.deferred_overlap_turn and native.input_since_commit:
-                return False
             if not native.auto_response_waiting_for_speech:
-                return False
-            if self._assistant_playback_active(session):
                 return False
             if not self._input_looks_like_speech(event, payload, session=session):
                 return False
@@ -837,7 +965,9 @@ class OmniDuplexSessionHandler(
         send_json,
         *,
         realtime_protocol: NativeRealtimeSessionProtocol | None = None,
-    ) -> DuplexSession | None:
+        attachment_send=None,
+        attachment_close=None,
+    ) -> _DuplexSessionHandshake | None:
         raw = await self._receive_text(
             websocket,
             self._config_timeout_s,
@@ -851,6 +981,23 @@ class OmniDuplexSessionHandler(
         except json.JSONDecodeError:
             await send_json({"type": "error", "error": "Invalid JSON in session.create", "code": "invalid_json"})
             return None
+        if isinstance(event, dict) and event.get("type") == "session.resume":
+            if realtime_protocol is None:
+                await send_json(
+                    {
+                        "type": "error",
+                        "error": "session.resume requires the Realtime protocol",
+                        "code": "unsupported_session_resume",
+                    }
+                )
+                return None
+            return await self._resume_session_handshake(
+                event,
+                send_json=send_json,
+                realtime_protocol=realtime_protocol,
+                attachment_send=attachment_send,
+                attachment_close=attachment_close,
+            )
         if not isinstance(event, dict) or event.get("type") not in {"session.create", "open_session", "session.config"}:
             await send_json(
                 {
@@ -883,7 +1030,204 @@ class OmniDuplexSessionHandler(
         if use_minicpmo45_native:
             session.replace_capabilities(DuplexCapabilities.minicpmo45_native())
             session.replace_runtime_config(runtime_config)
-        return session
+        return _DuplexSessionHandshake(session=session)
+
+    async def _resume_session_handshake(
+        self,
+        event: dict[str, object],
+        *,
+        send_json,
+        realtime_protocol: NativeRealtimeSessionProtocol,
+        attachment_send,
+        attachment_close,
+    ) -> _DuplexSessionHandshake | None:
+        session_id = event.get("session_id")
+        incarnation = event.get("incarnation")
+        resume_token = event.get("resume_token")
+        last_received = event.get("last_received_server_event_seq", 0)
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(incarnation, int)
+            or incarnation < 0
+            or not isinstance(resume_token, str)
+            or not resume_token
+            or not isinstance(last_received, int)
+            or last_received < 0
+        ):
+            await send_json(
+                {
+                    "type": "error",
+                    "error": (
+                        "session.resume requires session_id, incarnation, resume_token, "
+                        "and a non-negative event sequence"
+                    ),
+                    "code": "invalid_session_resume",
+                }
+            )
+            return None
+        session = self._registry.get(session_id)
+        if session is None or session.state != DuplexSessionState.OPEN:
+            await send_json(
+                {
+                    "type": "error",
+                    "error": f"Unknown or expired duplex session: {session_id}",
+                    "code": "session_resume_expired",
+                }
+            )
+            return None
+        if not session.capabilities.supports_session_resume:
+            await send_json(
+                {
+                    "type": "error",
+                    "error": f"Session does not support resume: {session_id}",
+                    "code": "unsupported_session_resume",
+                }
+            )
+            return None
+        try:
+            await self._attachment_registry.authenticate_resume(
+                session_id,
+                incarnation=incarnation,
+                resume_token=resume_token,
+                last_received_server_event_seq=last_received,
+            )
+        except InvalidResumeTokenError:
+            await send_json(
+                {
+                    "type": "error",
+                    "error": "Invalid duplex session resume token",
+                    "code": "invalid_resume_token",
+                }
+            )
+            return None
+        except DuplexJournalGapError:
+            await send_json(
+                {
+                    "type": "session.resync_required",
+                    "session_id": session_id,
+                    "reason": "journal_gap",
+                }
+            )
+            return None
+        except (KeyError, ValueError) as exc:
+            await send_json(
+                {
+                    "type": "error",
+                    "error": str(exc),
+                    "code": "session_resume_conflict",
+                }
+            )
+            return None
+
+        resume_runtime = getattr(self._chat_service.engine_client, "resume_duplex_session_async", None)
+        if not callable(resume_runtime):
+            await send_json(
+                {
+                    "type": "error",
+                    "error": "Duplex runtime does not expose session resume control",
+                    "code": "runtime_resume_unsupported",
+                }
+            )
+            return None
+        expected_generation = self._lease_generations.get(session_id, 0)
+        try:
+            runtime_result = await resume_runtime(
+                session_id,
+                fence=DuplexFence(
+                    session.session_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                    incarnation=session.incarnation,
+                ),
+                expected_lease_generation=expected_generation,
+            )
+            lease_generation = self._runtime_lease_generation(runtime_result)
+            if lease_generation is None:
+                raise RuntimeError("runtime resume result omitted lease_generation")
+        except Exception as exc:
+            await send_json(
+                {
+                    "type": "error",
+                    "error": str(exc),
+                    "code": "runtime_resume_failed",
+                }
+            )
+            return None
+
+        if not callable(attachment_send) or not callable(attachment_close):
+            raise RuntimeError("session.resume requires transport attachment callbacks")
+
+        def activation_payload_factory(token, generation: int) -> dict[str, object]:
+            internal = {
+                "type": "session.resumed",
+                "session_id": session_id,
+                "incarnation": incarnation,
+                "attachment_generation": generation,
+                "resume_token": token.plaintext,
+            }
+            return realtime_protocol.encode_outbound_event(internal)[0]
+
+        try:
+            resumed = await self._attachment_registry.resume(
+                session_id,
+                incarnation=incarnation,
+                resume_token=resume_token,
+                last_received_server_event_seq=last_received,
+                send=attachment_send,
+                close=attachment_close,
+                activation_payload_factory=activation_payload_factory,
+            )
+        except Exception as exc:
+            # The engine-side CAS already advanced even if the transport
+            # vanished before it received the rotated token. Keep that
+            # generation so the registry's one-shot recovery token can retry.
+            self._lease_generations[session_id] = lease_generation
+            await send_json(
+                {
+                    "type": "error",
+                    "error": str(exc),
+                    "code": "session_resume_conflict",
+                }
+            )
+            return None
+        self._lease_generations[session_id] = lease_generation
+        replaced = resumed.replaced_attachment
+        if replaced is not None:
+            replaced_payload = realtime_protocol.encode_outbound_event(
+                {
+                    "type": "session.replaced",
+                    "session_id": session_id,
+                    "attachment_generation": replaced.generation,
+                }
+            )[0]
+            with suppress(Exception):
+                await replaced.send(replaced_payload)
+            with suppress(Exception):
+                await replaced.close("session_replaced")
+        return _DuplexSessionHandshake(
+            session=session,
+            resumed=True,
+            attachment_generation=resumed.attachment_generation,
+        )
+
+    @classmethod
+    def _runtime_lease_generation(cls, result: object) -> int | None:
+        if isinstance(result, dict):
+            generation = result.get("lease_generation")
+            if isinstance(generation, int):
+                return generation
+            for key in ("stage_results", "result"):
+                generation = cls._runtime_lease_generation(result.get(key))
+                if generation is not None:
+                    return generation
+            return None
+        if isinstance(result, list | tuple):
+            for item in result:
+                generation = cls._runtime_lease_generation(item)
+                if generation is not None:
+                    return generation
+        return None
 
     def _use_minicpmo45_native_duplex(self, config: DuplexSessionConfig) -> bool:
         return MiniCPMO45NativeDuplexServingAdapter.is_enabled(config)

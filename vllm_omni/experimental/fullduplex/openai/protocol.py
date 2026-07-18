@@ -375,6 +375,8 @@ class InputBufferState:
     pending_text: list[str] = field(default_factory=list)
     pending_audio: list[DuplexAudioChunk] = field(default_factory=list)
     overlap_speech_ms: int = 0
+    reserved_input_bytes: int = 0
+    pending_turns: int = 0
 
 
 @dataclass
@@ -548,6 +550,14 @@ class DuplexSession:
     def bind_response_turn(self, turn_id: int | None) -> None:
         self._response.active_response_turn_id = turn_id
 
+    def active_response_accepts_model_turn(self, turn_id: int | None) -> bool:
+        if self._response.active_response_id is None:
+            return False
+        if turn_id is None:
+            return True
+        active_turn_id = self._response.active_response_turn_id
+        return active_turn_id is None or int(turn_id) == active_turn_id
+
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
 
@@ -559,6 +569,39 @@ class DuplexSession:
             return
         self._input.pending_text.append(text)
         self.turn_state = DuplexTurnState.USER_SPEAKING
+
+    @property
+    def pending_input_bytes(self) -> int:
+        return self._input.reserved_input_bytes
+
+    @property
+    def pending_input_turns(self) -> int:
+        return self._input.pending_turns
+
+    def reserve_input_bytes(self, size: int, *, limit: int) -> bool:
+        size = max(0, int(size))
+        if self._input.reserved_input_bytes + size > int(limit):
+            return False
+        self._input.reserved_input_bytes += size
+        return True
+
+    def release_input_bytes(self, size: int) -> None:
+        self._input.reserved_input_bytes = max(0, self._input.reserved_input_bytes - max(0, int(size)))
+
+    def release_all_input_bytes(self) -> None:
+        self._input.reserved_input_bytes = 0
+
+    def reserve_pending_turn(self, *, limit: int) -> bool:
+        if self._input.pending_turns >= int(limit):
+            return False
+        self._input.pending_turns += 1
+        return True
+
+    def release_pending_turn(self) -> None:
+        self._input.pending_turns = max(0, self._input.pending_turns - 1)
+
+    def clear_pending_turn_reservations(self) -> None:
+        self._input.pending_turns = 0
 
     def append_audio(self, data: str, *, fmt: str = "wav", sample_rate_hz: int | None = None) -> None:
         if not data:
@@ -579,6 +622,8 @@ class DuplexSession:
         }
         self._input.pending_text.clear()
         self._input.pending_audio.clear()
+        self._input.reserved_input_bytes = 0
+        self._input.pending_turns = 0
         self.turn_state = DuplexTurnState.IDLE
         return cancelled
 
@@ -611,6 +656,7 @@ class DuplexSession:
         self._conversation.messages.append(message)
         self._input.pending_text.clear()
         self._input.pending_audio.clear()
+        self._input.reserved_input_bytes = 0
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
             message=message,

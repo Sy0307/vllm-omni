@@ -784,6 +784,13 @@ class NativeRuntimeBridgeMixin:
             await send_json(payload)
             return close_reason, emitted_response
         if is_listen is True:
+            model_turn_id = coerce_int(native_result.get("model_turn_id"))
+            if (
+                session.active_response_id is not None
+                and model_turn_id is not None
+                and not session.active_response_accepts_model_turn(model_turn_id)
+            ):
+                return close_reason, emitted_response
             non_terminal_auto_listen = (
                 self._session_auto_responds(session)
                 and session.active_response_id is not None
@@ -887,6 +894,12 @@ class NativeRuntimeBridgeMixin:
             # response reaches turn EOS.  Its late audio still carries the
             # completed model turn, so it must not reserve a second Realtime
             # response for that turn.
+            return close_reason, emitted_response
+        if (
+            session.active_response_id is not None
+            and model_turn_id is not None
+            and not session.active_response_accepts_model_turn(model_turn_id)
+        ):
             return close_reason, emitted_response
         emitted_response = True
         response_created = False

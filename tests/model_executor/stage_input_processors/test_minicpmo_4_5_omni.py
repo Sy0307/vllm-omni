@@ -31,6 +31,43 @@ def test_native_duplex_transcript_waits_for_buffered_vocoder_audio():
     assert _drain_native_duplex_emitted_text(state, has_audio=True) == ""
 
 
+def test_native_duplex_token2wav_cache_isolated_across_interleaved_sessions():
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    model.audio_tokenizer = SimpleNamespace(stream_cache=None, hift_cache_dict={})
+    observed = []
+
+    def stream_window(token_list, _prompt, *, last_chunk):
+        del token_list, last_chunk
+        marker = model.audio_tokenizer.stream_cache["marker"]
+        observed.append(marker)
+        prefix = marker[0]
+        index = int(marker[1:]) + 1
+        model.audio_tokenizer.stream_cache = {"marker": f"{prefix}{index}"}
+        model.audio_tokenizer.hift_cache_dict = {"marker": f"{prefix}{index}"}
+        return torch.ones(1)
+
+    model._t2w_stream_window = stream_window
+    a = _TalkerTurnState(None, None)
+    b = _TalkerTurnState(None, None)
+    a.stream_cache = {"marker": "A0"}
+    a.hift_cache_dict = {"marker": "A0"}
+    a.vocoder_initialized = True
+    b.stream_cache = {"marker": "B0"}
+    b.hift_cache_dict = {"marker": "B0"}
+    b.vocoder_initialized = True
+
+    model._run_vocoder_window(a, [1], last_chunk=False)
+    model._run_vocoder_window(b, [1], last_chunk=False)
+    model._run_vocoder_window(a, [1], last_chunk=False)
+    model._run_vocoder_window(b, [1], last_chunk=True)
+
+    assert observed == ["A0", "B0", "A1", "B1"]
+    assert a.stream_cache == {"marker": "A2"}
+    assert b.stream_cache == {"marker": "B2"}
+    assert model.audio_tokenizer.stream_cache is None
+    assert model.audio_tokenizer.hift_cache_dict == {}
+
+
 def test_extract_first_audio_ref_accepts_dict_stereo_audio():
     ref = _extract_first_audio_ref(
         {
@@ -520,7 +557,7 @@ def test_native_duplex_talker_uses_generate_chunk_continuation(monkeypatch):
     )
     monkeypatch.setattr(model, "_tts_runtime_config", lambda: SimpleNamespace(streaming_generator_chunk=2))
     monkeypatch.setattr(model, "_resolve_prompt_wav_path", lambda ref, sr: ("/tmp/ref.wav", None))
-    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt: None)
+    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt, **kwargs: None)
     monkeypatch.setattr(model, "_t2w_pre_lookahead", lambda: 1)
     monkeypatch.setattr(
         model,
@@ -602,7 +639,7 @@ def test_minicpmo_native_duplex_talker_turn_end_metadata_flushes_tail(monkeypatc
     )
     monkeypatch.setattr(model, "_tts_runtime_config", lambda: SimpleNamespace(streaming_generator_chunk=25))
     monkeypatch.setattr(model, "_resolve_prompt_wav_path", lambda ref, sr: ("/tmp/ref.wav", None))
-    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt: None)
+    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt, **kwargs: None)
     monkeypatch.setattr(model, "_t2w_pre_lookahead", lambda: 5)
     monkeypatch.setattr(
         model,
@@ -674,7 +711,7 @@ def test_minicpmo_native_duplex_terminal_only_new_turn_does_not_start_tts(monkey
     )
     monkeypatch.setattr(model, "_tts_runtime_config", lambda: SimpleNamespace(streaming_generator_chunk=25))
     monkeypatch.setattr(model, "_resolve_prompt_wav_path", lambda ref, sr: ("/tmp/ref.wav", None))
-    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt: None)
+    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt, **kwargs: None)
     monkeypatch.setattr(model, "_t2w_pre_lookahead", lambda: 5)
     monkeypatch.setattr(
         model,
@@ -774,7 +811,7 @@ def test_minicpmo_native_duplex_talker_new_turn_reopens_session_keyed_state(monk
     )
     monkeypatch.setattr(model, "_tts_runtime_config", lambda: SimpleNamespace(streaming_generator_chunk=25))
     monkeypatch.setattr(model, "_resolve_prompt_wav_path", lambda ref, sr: ("/tmp/ref.wav", None))
-    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt: None)
+    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt, **kwargs: None)
     monkeypatch.setattr(model, "_t2w_pre_lookahead", lambda: 5)
     monkeypatch.setattr(
         model,
@@ -838,7 +875,7 @@ def test_minicpmo_native_duplex_talker_segment_end_preserves_token2wav_stream_un
     )
     monkeypatch.setattr(model, "_tts_runtime_config", lambda: SimpleNamespace(streaming_generator_chunk=25))
     monkeypatch.setattr(model, "_resolve_prompt_wav_path", lambda ref, sr: ("/tmp/ref.wav", None))
-    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt: None)
+    monkeypatch.setattr(model, "_begin_turn_vocoder_cache", lambda prompt, **kwargs: None)
     monkeypatch.setattr(model, "_t2w_pre_lookahead", lambda: 5)
     monkeypatch.setattr(
         model,

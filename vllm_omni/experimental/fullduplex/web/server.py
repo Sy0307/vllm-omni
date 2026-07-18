@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -65,21 +66,27 @@ def build_app(
     *,
     ws_backend: str = "ws://127.0.0.1:8099",
     model: str = "openbmb/MiniCPM-o-4_5",
+    public_realtime_url: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Experimental Full-Duplex Web Demo")
     index_path = STATIC_DIR / "index.html"
+    app_version = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
         config = json.dumps(
-            {"model": model, "realtimePath": "v1/realtime"},
+            {
+                "model": model,
+                "realtimePath": public_realtime_url or "v1/realtime",
+            },
             ensure_ascii=True,
         )
-        html = index_path.read_text(encoding="utf-8").replace(
-            "__FULL_DUPLEX_CONFIG__",
-            config,
+        html = (
+            index_path.read_text(encoding="utf-8")
+            .replace("__FULL_DUPLEX_CONFIG__", config)
+            .replace("__FULL_DUPLEX_APP_VERSION__", app_version)
         )
-        return HTMLResponse(html)
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
     @app.get("/healthz")
     def healthz() -> Response:
@@ -126,12 +133,20 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument("--ws-backend", default="ws://127.0.0.1:8099")
+    parser.add_argument(
+        "--public-realtime-url",
+        help="Browser-visible ws:// or wss:// Realtime URL; defaults to the same-origin proxy.",
+    )
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
-        build_app(ws_backend=args.ws_backend, model=args.model),
+        build_app(
+            ws_backend=args.ws_backend,
+            model=args.model,
+            public_realtime_url=args.public_realtime_url,
+        ),
         host=args.host,
         port=args.port,
         log_level="info",

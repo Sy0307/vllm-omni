@@ -51,7 +51,7 @@ class NativeRealtimeSessionProtocol(
     async def receive_internal_event_text(self, websocket: WebSocket) -> str:
         if not self._pending_outbound.empty():
             return json.dumps(await self._pending_outbound.get())
-        if not self._opened and not self._autostarted_default_session and self._default_model:
+        if not self._opened and not self._resume_only and not self._autostarted_default_session and self._default_model:
             self._opened = True
             self._autostarted_default_session = True
             return json.dumps(self._session_create_from_realtime(self._default_session_payload()))
@@ -65,6 +65,21 @@ class NativeRealtimeSessionProtocol(
                 return raw
             if not isinstance(event, dict):
                 return raw
+            if not self._opened and event.get("type") == "session.resume":
+                self._opened = True
+                translated = await self._to_duplex_event(event)
+                if translated is None:
+                    if not self._pending_outbound.empty():
+                        return json.dumps(await self._pending_outbound.get())
+                    continue
+                return json.dumps(translated)
+            if not self._opened and self._resume_only:
+                translated = await self._to_duplex_event(event)
+                if translated is None:
+                    if not self._pending_outbound.empty():
+                        return json.dumps(await self._pending_outbound.get())
+                    continue
+                return json.dumps(translated)
             if not self._opened and event.get("type") != "session.update":
                 self._opened = True
                 await self._pending_outbound.put(self._session_create_from_realtime(self._default_session_payload()))

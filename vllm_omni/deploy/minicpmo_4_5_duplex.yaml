@@ -18,9 +18,11 @@ duplex_session:
 
 stages:
   - stage_id: 0
+    max_num_seqs: 2
     async_scheduling: false
 
   - stage_id: 1
+    max_num_seqs: 2
     async_scheduling: false
     default_sampling_params:
       max_tokens: 4096

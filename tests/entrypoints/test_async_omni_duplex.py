@@ -34,6 +34,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.asyncio
 async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
     calls = []
+    output_handler_starts = 0
 
     async def open_duplex_session_async(session_id, **kwargs):
         calls.append((session_id, kwargs))
@@ -41,6 +42,12 @@ async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
 
     app = object.__new__(AsyncOmni)
     app.engine = SimpleNamespace(open_duplex_session_async=open_duplex_session_async)
+
+    def start_output_handler():
+        nonlocal output_handler_starts
+        output_handler_starts += 1
+
+    app._final_output_handler = start_output_handler
 
     result = await app.open_duplex_session_async(
         "sid",
@@ -51,6 +58,7 @@ async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
     )
 
     assert result == {"ok": True}
+    assert output_handler_starts == 1
     assert calls == [
         (
             "sid",

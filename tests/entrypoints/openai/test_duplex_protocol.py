@@ -19,6 +19,16 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
 )
 
 
+class _ProtocolWebSocket:
+    def __init__(self, *events: dict[str, object]) -> None:
+        self._events = asyncio.Queue()
+        for event in events:
+            self._events.put_nowait(json.dumps(event))
+
+    async def receive_text(self) -> str:
+        return await self._events.get()
+
+
 def test_duplex_session_commits_text_and_audio_as_one_turn():
     registry = DuplexSessionRegistry()
     session = registry.create(DuplexSessionConfig(model="test-model"))
@@ -126,6 +136,153 @@ def test_realtime_explicit_query_native_duplex_flag_is_available_before_autostar
 
     assert event["type"] == "session.create"
     assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
+
+
+@pytest.mark.asyncio
+async def test_realtime_resume_heartbeat_and_event_ack_translate_without_session_autostart():
+    protocol = NativeRealtimeSessionProtocol(
+        {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "minicpmo45_native_duplex": "1",
+        }
+    )
+
+    resume = await protocol._to_duplex_event(
+        {
+            "type": "session.resume",
+            "session_id": "sid-resume",
+            "incarnation": 3,
+            "resume_token": "opaque-token",
+            "last_received_server_event_seq": 17,
+        }
+    )
+    heartbeat = await protocol._to_duplex_event(
+        {
+            "type": "session.heartbeat",
+            "event_id": "event-heartbeat",
+        }
+    )
+    event_ack = await protocol._to_duplex_event(
+        {
+            "type": "session.event_ack",
+            "server_event_seq": 19,
+        }
+    )
+
+    assert resume == {
+        "type": "session.resume",
+        "session_id": "sid-resume",
+        "incarnation": 3,
+        "resume_token": "opaque-token",
+        "last_received_server_event_seq": 17,
+    }
+    assert heartbeat == {
+        "type": "session.heartbeat",
+        "event_id": "event-heartbeat",
+    }
+    assert event_ack == {
+        "type": "session.event_ack",
+        "server_event_seq": 19,
+    }
+    assert protocol._opened is False
+
+    wire_protocol = NativeRealtimeSessionProtocol({})
+    first_wire_event = json.loads(
+        await wire_protocol.receive_internal_event_text(
+            _ProtocolWebSocket(
+                {
+                    "type": "session.resume",
+                    "session_id": "sid-resume",
+                    "incarnation": 3,
+                    "resume_token": "opaque-token",
+                    "last_received_server_event_seq": 17,
+                }
+            )
+        )
+    )
+
+    assert first_wire_event["type"] == "session.resume"
+
+
+@pytest.mark.asyncio
+async def test_realtime_resume_query_suppresses_model_autostart_on_same_url():
+    protocol = NativeRealtimeSessionProtocol(
+        {
+            "model": "openbmb/MiniCPM-o-4_5",
+            "minicpmo45_native_duplex": "1",
+            "resume": "1",
+        }
+    )
+    resume = {
+        "type": "session.resume",
+        "session_id": "sid-resume",
+        "incarnation": 3,
+        "resume_token": "opaque-token",
+        "last_received_server_event_seq": 17,
+    }
+
+    first_wire_event = json.loads(await protocol.receive_internal_event_text(_ProtocolWebSocket(resume)))
+
+    assert first_wire_event == resume
+    assert protocol._autostarted_default_session is False
+
+
+def test_realtime_projects_resume_lifecycle_events_without_duplex_prefix():
+    protocol = NativeRealtimeSessionProtocol({})
+
+    created = protocol.encode_outbound_event(
+        {
+            "type": "session.created",
+            "session": {"id": "sid-resume"},
+            "incarnation": 3,
+            "attachment_generation": 1,
+            "resume_token": "first-token",
+        }
+    )[0]
+    resumed = protocol.encode_outbound_event(
+        {
+            "type": "session.resumed",
+            "session_id": "sid-resume",
+            "incarnation": 3,
+            "attachment_generation": 2,
+            "resume_token": "second-token",
+        }
+    )[0]
+    heartbeat = protocol.encode_outbound_event(
+        {
+            "type": "session.heartbeat_ack",
+            "session_id": "sid-resume",
+        }
+    )[0]
+    replaced = protocol.encode_outbound_event(
+        {
+            "type": "session.replaced",
+            "session_id": "sid-resume",
+            "attachment_generation": 1,
+        }
+    )[0]
+    resync = protocol.encode_outbound_event(
+        {
+            "type": "session.resync_required",
+            "session_id": "sid-resume",
+            "reason": "journal_gap",
+        }
+    )[0]
+
+    assert created["type"] == "session.created"
+    assert created["incarnation"] == 3
+    assert created["attachment_generation"] == 1
+    assert created["resume_token"] == "first-token"
+    assert resumed["type"] == "session.resumed"
+    assert resumed["resume_token"] == "second-token"
+    assert heartbeat["type"] == "session.heartbeat_ack"
+    assert replaced["type"] == "session.replaced"
+    assert resync == {
+        "type": "session.resync_required",
+        "session_id": "sid-resume",
+        "reason": "journal_gap",
+        "event_id": resync["event_id"],
+    }
 
 
 def test_duplex_session_registry_advances_incarnation_when_id_is_reused():
