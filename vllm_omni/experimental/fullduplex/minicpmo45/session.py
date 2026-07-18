@@ -19,6 +19,7 @@ class MiniCPMO45ServingSessionState:
     deferred_overlap_turn_id: int | None = None
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
+    committed_audio_reserved_bytes: int = 0
     deferred_response_create: bool = False
     auto_response_waiting_for_speech: bool = False
     auto_response_new_turn_prefix_variant: str | None = None
@@ -43,6 +44,25 @@ class MiniCPMO45ServingSessionState:
     def clear_overlap_turn(self) -> None:
         self.deferred_overlap_turn = False
         self.deferred_overlap_turn_id = None
+
+    def retain_committed_audio(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str | None,
+        reserved_bytes: int = 0,
+    ) -> None:
+        self.committed_audio_payload = payload
+        self.committed_audio_operation_id = operation_id
+        self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+
+    def clear_committed_audio(self) -> int:
+        reserved_bytes = self.committed_audio_reserved_bytes
+        self.committed_audio_payload = None
+        self.committed_audio_operation_id = None
+        self.committed_audio_reserved_bytes = 0
+        self.deferred_response_create = False
+        return reserved_bytes
 
     def clear_continuation(self) -> None:
         self.continuation_response_id = None

@@ -169,6 +169,107 @@ async def test_registry_resume_rotates_token_replays_and_atomically_replaces_att
 
 
 @pytest.mark.asyncio
+async def test_registry_resume_sends_activation_then_replay_before_new_live_events() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+    wire = []
+    activation_started = asyncio.Event()
+    release_activation = asyncio.Event()
+
+    async def old_send(payload):
+        del payload
+
+    async def close(reason):
+        del reason
+
+    async def new_send(payload):
+        wire.append(payload["type"])
+        if payload["type"] == "session.resumed":
+            activation_started.set()
+            await release_activation.wait()
+
+    created = await registry.create("sid-order", incarnation=0, send=old_send, close=close)
+    await registry.record_event("sid-order", {"type": "replayed"})
+    await registry.detach("sid-order", attachment_generation=1)
+    resume_task = asyncio.create_task(
+        registry.resume(
+            "sid-order",
+            incarnation=0,
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=new_send,
+            close=close,
+            activation_payload_factory=lambda _token, _generation: {"type": "session.resumed"},
+        )
+    )
+    await activation_started.wait()
+    live_task = asyncio.create_task(registry.send_event("sid-order", {"type": "live"}))
+
+    release_activation.set()
+    await asyncio.gather(resume_task, live_task)
+
+    assert wire == ["session.resumed", "replayed", "live"]
+
+
+@pytest.mark.asyncio
+async def test_registry_resume_delivery_failure_keeps_one_shot_old_token_recovery() -> None:
+    registry = DuplexSessionAttachmentRegistry(
+        replay_ttl_s=60.0,
+        replay_max_bytes_per_session=4096,
+    )
+
+    async def send(payload):
+        del payload
+
+    async def failing_send(payload):
+        del payload
+        raise RuntimeError("transport lost before rotated token arrived")
+
+    async def close(reason):
+        del reason
+
+    created = await registry.create("sid-recovery", incarnation=0, send=send, close=close)
+    await registry.detach("sid-recovery", attachment_generation=1)
+
+    with pytest.raises(RuntimeError, match="transport lost"):
+        await registry.resume(
+            "sid-recovery",
+            incarnation=0,
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=failing_send,
+            close=close,
+            activation_payload_factory=lambda token, generation: {
+                "type": "session.resumed",
+                "resume_token": token.plaintext,
+                "attachment_generation": generation,
+            },
+        )
+
+    recovered = await registry.resume(
+        "sid-recovery",
+        incarnation=0,
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=close,
+    )
+
+    assert recovered.attachment_generation == 3
+    with pytest.raises(InvalidResumeTokenError):
+        await registry.resume(
+            "sid-recovery",
+            incarnation=0,
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=send,
+            close=close,
+        )
+
+
+@pytest.mark.asyncio
 async def test_registry_concurrent_resume_allows_exactly_one_rotated_token_winner() -> None:
     registry = DuplexSessionAttachmentRegistry(
         replay_ttl_s=60.0,

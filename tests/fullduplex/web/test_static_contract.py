@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3] / "vllm_omni" / "experimental" / "fullduplex" / "web" / "static"
@@ -25,6 +26,7 @@ def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
     assert "url.searchParams.set('minicpmo45_native_duplex', '1')" in source
     assert "auto_response: true" in source
     assert "input_audio_buffer.append" in source
+    assert "input_audio_buffer.commit" not in source
     assert "playback.ack" in source
     assert "event.event || event" in source
     assert "response.audio.delta" in source
@@ -44,6 +46,18 @@ def test_client_has_transactional_cleanup_and_visible_event_logging():
     assert "clearInterval(sendTimer)" in source
     assert "appendEventLog(event)" in source
     assert "addEventListener('beforeunload'" in source
+
+
+def test_client_keeps_microphone_upload_active_during_assistant_playback():
+    source = (ROOT / "app.js").read_text(encoding="utf-8")
+    upload_gate = re.search(r"function microphoneUploadEnabled\(\) \{(?P<body>.*?)\n  \}", source, re.DOTALL)
+    begin_assistant = re.search(r"function beginAssistant\(responseId\) \{(?P<body>.*?)\n  \}", source, re.DOTALL)
+
+    assert upload_gate is not None
+    assert "return running && !muted;" in upload_gate.group("body")
+    assert "assistantActive" not in upload_gate.group("body")
+    assert begin_assistant is not None
+    assert "pendingCapture = []" not in begin_assistant.group("body")
 
 
 def test_audio_worklets_define_capture_and_playback_processors():

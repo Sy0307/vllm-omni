@@ -81,6 +81,10 @@ class DuplexRequestClient:
         fence: DuplexFence,
         timeout: float | None,
     ) -> dict[str, object]:
+        # Lifecycle expiry messages share the engine output channel. Start its
+        # sole dispatcher before open so an idle session can be reaped even if
+        # it never submits an append request.
+        self.output_port.start_output_handler()
         kwargs: dict[str, object] = {
             "session_mode": session_mode,
             "capabilities": capabilities,

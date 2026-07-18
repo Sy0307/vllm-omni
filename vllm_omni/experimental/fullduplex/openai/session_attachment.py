@@ -203,6 +203,9 @@ class _DuplexSessionAttachmentState:
     journal: DuplexEventJournal
     attachment: DuplexTransportAttachment | None
     attachment_generation: int
+    outbound_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    recovery_token_digest: bytes | None = field(default=None, repr=False)
+    grace_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
 class DuplexSessionAttachmentRegistry:
@@ -211,14 +214,18 @@ class DuplexSessionAttachmentRegistry:
         *,
         replay_ttl_s: float,
         replay_max_bytes_per_session: int,
+        disconnect_grace_s: float = 30.0,
         clock: Callable[[], float] | None = None,
     ) -> None:
         if replay_ttl_s <= 0:
             raise ValueError("replay_ttl_s must be positive")
         if replay_max_bytes_per_session <= 0:
             raise ValueError("replay_max_bytes_per_session must be positive")
+        if disconnect_grace_s <= 0:
+            raise ValueError("disconnect_grace_s must be positive")
         self._replay_ttl_s = replay_ttl_s
         self._replay_max_bytes_per_session = replay_max_bytes_per_session
+        self._disconnect_grace_s = disconnect_grace_s
         self._clock = clock or time.monotonic
         self._sessions: dict[str, _DuplexSessionAttachmentState] = {}
         self._lock = asyncio.Lock()
@@ -266,17 +273,80 @@ class DuplexSessionAttachmentRegistry:
         async with self._lock:
             return self._require(session_id).journal.record(payload)
 
+    async def send_event(
+        self,
+        session_id: str,
+        payload: Mapping[str, object],
+        *,
+        journal: bool = True,
+    ) -> JournalEntry | None:
+        """Sequence and dispatch one event to the current attachment.
+
+        The per-session lock keeps wire order equal to journal order without
+        serializing unrelated sessions. A detached session still records
+        replayable events, but has no transport side effect.
+        """
+        async with self._lock:
+            state = self._require(session_id)
+        async with state.outbound_lock:
+            async with self._lock:
+                if self._sessions.get(session_id) is not state:
+                    raise KeyError(f"unknown duplex attachment session: {session_id}")
+                entry = state.journal.record(payload) if journal else None
+                attachment = state.attachment
+                wire_payload = dict(entry.payload) if entry is not None else dict(payload)
+            if attachment is not None:
+                await attachment.send(wire_payload)
+            return entry
+
     async def acknowledge(self, session_id: str, sequence: int) -> int:
         async with self._lock:
             return self._require(session_id).journal.acknowledge(sequence)
 
-    async def detach(self, session_id: str, *, attachment_generation: int) -> bool:
+    async def detach(
+        self,
+        session_id: str,
+        *,
+        attachment_generation: int,
+        on_grace_expired: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         async with self._lock:
             state = self._sessions.get(session_id)
             if state is None or state.attachment_generation != attachment_generation:
                 return False
             state.attachment = None
+            if state.grace_task is not None:
+                state.grace_task.cancel()
+            state.grace_task = (
+                asyncio.create_task(
+                    self._run_disconnect_grace(
+                        state,
+                        attachment_generation=attachment_generation,
+                        callback=on_grace_expired,
+                    )
+                )
+                if on_grace_expired is not None
+                else None
+            )
             return True
+
+    async def authenticate_resume(
+        self,
+        session_id: str,
+        *,
+        incarnation: int,
+        resume_token: str,
+        last_received_server_event_seq: int,
+    ) -> None:
+        """Validate transport credentials before any engine resume control."""
+        async with self._lock:
+            state = self._require(session_id)
+            self._validate_resume_identity(
+                state,
+                incarnation=incarnation,
+                resume_token=resume_token,
+            )
+            state.journal.replay_after(last_received_server_event_seq)
 
     async def resume(
         self,
@@ -287,28 +357,54 @@ class DuplexSessionAttachmentRegistry:
         last_received_server_event_seq: int,
         send: Callable[[dict[str, object]], Awaitable[None]],
         close: Callable[[str], Awaitable[None]],
+        activation_payload_factory: Callable[[ResumeToken, int], Mapping[str, object]] | None = None,
     ) -> DuplexSessionResumeResult:
         async with self._lock:
             state = self._require(session_id)
-            if incarnation != state.incarnation:
-                raise ValueError(
-                    f"duplex attachment incarnation mismatch: expected {state.incarnation}, got {incarnation}"
+        async with state.outbound_lock:
+            async with self._lock:
+                if self._sessions.get(session_id) is not state:
+                    raise KeyError(f"unknown duplex attachment session: {session_id}")
+                used_recovery = self._validate_resume_identity(
+                    state,
+                    incarnation=incarnation,
+                    resume_token=resume_token,
                 )
-            if not state.credential.verify(resume_token):
-                raise InvalidResumeTokenError(f"invalid resume token for duplex session {session_id}")
-            replay_entries = state.journal.replay_after(last_received_server_event_seq)
-            rotated_token = state.credential.rotate()
-            replaced = state.attachment
-            state.attachment_generation += 1
-            state.attachment = DuplexTransportAttachment(
-                generation=state.attachment_generation,
-                send=send,
-                close=close,
-            )
+                replay_entries = state.journal.replay_after(last_received_server_event_seq)
+                accepted_token_digest = (
+                    state.recovery_token_digest if used_recovery else bytes(state.credential.token_digest)
+                )
+                if state.grace_task is not None:
+                    state.grace_task.cancel()
+                    state.grace_task = None
+                state.recovery_token_digest = None
+                rotated_token = state.credential.rotate()
+                replaced = state.attachment
+                state.attachment_generation += 1
+                attachment_generation = state.attachment_generation
+                state.attachment = DuplexTransportAttachment(
+                    generation=attachment_generation,
+                    send=send,
+                    close=close,
+                )
+            if activation_payload_factory is not None:
+                try:
+                    await send(dict(activation_payload_factory(rotated_token, attachment_generation)))
+                    for entry in replay_entries:
+                        await send(dict(entry.payload))
+                except Exception:
+                    async with self._lock:
+                        if (
+                            self._sessions.get(session_id) is state
+                            and state.attachment_generation == attachment_generation
+                        ):
+                            state.attachment = None
+                            state.recovery_token_digest = accepted_token_digest
+                    raise
             return DuplexSessionResumeResult(
                 session_id=session_id,
                 incarnation=incarnation,
-                attachment_generation=state.attachment_generation,
+                attachment_generation=attachment_generation,
                 resume_token=rotated_token,
                 replay_entries=replay_entries,
                 replaced_attachment=replaced,
@@ -317,13 +413,57 @@ class DuplexSessionAttachmentRegistry:
     async def close(self, session_id: str) -> DuplexTransportAttachment | None:
         async with self._lock:
             state = self._sessions.pop(session_id, None)
+            if state is not None and state.grace_task is not None:
+                state.grace_task.cancel()
             return state.attachment if state is not None else None
+
+    async def _run_disconnect_grace(
+        self,
+        state: _DuplexSessionAttachmentState,
+        *,
+        attachment_generation: int,
+        callback: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        try:
+            await asyncio.sleep(self._disconnect_grace_s)
+        except asyncio.CancelledError:
+            return
+        async with self._lock:
+            if (
+                self._sessions.get(state.session_id) is not state
+                or state.attachment is not None
+                or state.attachment_generation != attachment_generation
+            ):
+                return
+            state.grace_task = None
+        if callback is not None:
+            await callback()
 
     def _require(self, session_id: str) -> _DuplexSessionAttachmentState:
         state = self._sessions.get(session_id)
         if state is None:
             raise KeyError(f"unknown duplex attachment session: {session_id}")
         return state
+
+    @staticmethod
+    def _validate_resume_identity(
+        state: _DuplexSessionAttachmentState,
+        *,
+        incarnation: int,
+        resume_token: str,
+    ) -> bool:
+        if incarnation != state.incarnation:
+            raise ValueError(f"duplex attachment incarnation mismatch: expected {state.incarnation}, got {incarnation}")
+        if state.credential.verify(resume_token):
+            return False
+        recovery_digest = state.recovery_token_digest
+        if (
+            state.attachment is None
+            and recovery_digest is not None
+            and hmac.compare_digest(recovery_digest, DuplexResumeCredential._digest(resume_token))
+        ):
+            return True
+        raise InvalidResumeTokenError(f"invalid resume token for duplex session {state.session_id}")
 
 
 __all__ = [

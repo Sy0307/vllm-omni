@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import sys
 import time
 from contextlib import suppress
@@ -18,6 +19,7 @@ _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
 @dataclass
 class _MiniCPMO45Stage0SessionState:
     session_id: str
+    streaming_processor: Any | None = None
     audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     audio_chunk_idx: int = 0
     context_embeds: list[Any] = field(default_factory=list)
@@ -56,10 +58,24 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _stage_runtime_ready(self) -> bool:
         return self.processor is not None and self.tokenizer is not None and self.thinker is not None
 
-    def _configure_streaming_processor(self) -> None:
-        if self.processor is None:
+    def _configure_streaming_processor(
+        self,
+        state: _MiniCPMO45Stage0SessionState | None = None,
+    ) -> Any | None:
+        processor = self.processor
+        if processor is None:
+            return None
+        if state is not None:
+            if state.streaming_processor is not None:
+                return state.streaming_processor
+            processor = copy.copy(processor)
+            shared_mel = getattr(self.processor, "_streaming_mel_processor", None)
+            if shared_mel is not None:
+                processor._streaming_mel_processor = copy.deepcopy(shared_mel)
+            state.streaming_processor = processor
+        if processor is None:
             return
-        set_streaming_mode = getattr(self.processor, "set_streaming_mode", None)
+        set_streaming_mode = getattr(processor, "set_streaming_mode", None)
         if callable(set_streaming_mode):
             set_streaming_mode(
                 mode="exact",
@@ -72,11 +88,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
             # Match official init_streaming_processor: reset the streaming mel-processor
             # buffers at session init (modeling_minicpmo_unified.py:207).
-            reset_streaming = getattr(self.processor, "reset_streaming", None)
+            reset_streaming = getattr(processor, "reset_streaming", None)
             if callable(reset_streaming):
                 reset_streaming()
-            return
-        configure_streaming = getattr(self.processor, "configure_streaming", None)
+            return processor
+        configure_streaming = getattr(processor, "configure_streaming", None)
         if callable(configure_streaming):
             configure_streaming(
                 chunk_ms=int(self._stage_param("chunk_ms", 1000)),
@@ -84,6 +100,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 slide_trigger_seconds=30.0,
                 slide_stride_seconds=10.0,
             )
+        return processor
 
     def _prepare_session_context(
         self,
@@ -135,6 +152,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         and owns attention metadata, block tables, KV cache, and sampling.
         """
         start_time = time.time()
+        processor = self._configure_streaming_processor(state)
         if seq is not None and state.prepared_seq == seq and state.prepared_inputs_embeds is not None:
             result = dict(state.prepared_result)
             result["inputs_embeds"] = state.prepared_inputs_embeds
@@ -147,8 +165,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         if prefix_new_user_turn:
             state.current_turn_ended = True
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
-        chunk_size = self._streaming_chunk_size()
-        self._pad_first_audio_chunk_if_needed(state)
+        chunk_size = self._streaming_chunk_size(processor)
+        self._pad_first_audio_chunk_if_needed(state, processor)
         if len(state.audio_buffer) < chunk_size:
             return self._stage_prefill_result(
                 False,
@@ -181,7 +199,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 pad = np.zeros(chunk_size - len(state.audio_buffer), dtype=np.float32)
                 state.audio_buffer = np.concatenate([state.audio_buffer, pad])
             audio_chunk = state.audio_buffer[:chunk_size]
-            batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx)
+            batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx, processor=processor)
             for name, value in (
                 ("chunk_idx", state.audio_chunk_idx),
                 ("use_extra_context", True),
@@ -219,10 +237,12 @@ class MiniCPMO45Stage0DuplexRuntime:
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
             )
-            state.audio_buffer = state.audio_buffer[self._consumed_audio_samples(state.audio_chunk_idx, chunk_size) :]
+            state.audio_buffer = state.audio_buffer[
+                self._consumed_audio_samples(state.audio_chunk_idx, chunk_size, processor=processor) :
+            ]
             state.audio_chunk_idx += 1
             units_built += 1
-            chunk_size = self._streaming_chunk_size()
+            chunk_size = self._streaming_chunk_size(processor)
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
@@ -305,29 +325,39 @@ class MiniCPMO45Stage0DuplexRuntime:
             pass
         return self.device
 
-    def _streaming_chunk_size(self) -> int:
-        get_chunk = getattr(self.processor, "get_streaming_chunk_size", None)
+    def _streaming_chunk_size(self, processor: Any | None = None) -> int:
+        processor = processor or self.processor
+        get_chunk = getattr(processor, "get_streaming_chunk_size", None)
         if callable(get_chunk):
             return int(get_chunk())
         return 16000
 
-    def _sample_rate(self) -> int:
+    def _sample_rate(self, processor: Any | None = None) -> int:
+        processor = processor or self.processor
         return int(
             self._stage_param(
                 "sample_rate",
-                getattr(getattr(self.processor, "_streaming_mel_processor", None), "sample_rate", 16000),
+                getattr(getattr(processor, "_streaming_mel_processor", None), "sample_rate", 16000),
             )
         )
 
-    def _first_chunk_samples(self, default_chunk_size: int) -> int:
-        if getattr(self.processor, "_streaming_mel_processor", None) is None:
+    def _first_chunk_samples(self, default_chunk_size: int, processor: Any | None = None) -> int:
+        processor = processor or self.processor
+        if getattr(processor, "_streaming_mel_processor", None) is None:
             return default_chunk_size
-        return int(self._stage_param("first_chunk_ms", 1035) * self._sample_rate() / 1000)
+        return int(self._stage_param("first_chunk_ms", 1035) * self._sample_rate(processor) / 1000)
 
-    def _pad_first_audio_chunk_if_needed(self, state: _MiniCPMO45Stage0SessionState) -> None:
+    def _pad_first_audio_chunk_if_needed(
+        self,
+        state: _MiniCPMO45Stage0SessionState,
+        processor: Any | None = None,
+    ) -> None:
         if state.audio_chunk_idx != 0 or len(state.audio_buffer) == 0:
             return
-        first_chunk_samples = self._first_chunk_samples(self._streaming_chunk_size())
+        first_chunk_samples = self._first_chunk_samples(
+            self._streaming_chunk_size(processor),
+            processor,
+        )
         if len(state.audio_buffer) >= first_chunk_samples:
             return
         padding = np.zeros(first_chunk_samples - len(state.audio_buffer), dtype=np.float32)
@@ -343,21 +373,35 @@ class MiniCPMO45Stage0DuplexRuntime:
                 return value
         return default
 
-    def _consumed_audio_samples(self, chunk_idx: int, default_chunk_size: int) -> int:
+    def _consumed_audio_samples(
+        self,
+        chunk_idx: int,
+        default_chunk_size: int,
+        *,
+        processor: Any | None = None,
+    ) -> int:
+        processor = processor or self.processor
         if chunk_idx != 0:
             chunk_ms = int(self._stage_param("chunk_ms", 1000))
-            return int(chunk_ms * self._sample_rate() / 1000)
-        mel_processor = getattr(self.processor, "_streaming_mel_processor", None)
+            return int(chunk_ms * self._sample_rate(processor) / 1000)
+        mel_processor = getattr(processor, "_streaming_mel_processor", None)
         get_config = getattr(mel_processor, "get_config", None)
         if callable(get_config):
             cfg = get_config()
             if isinstance(cfg, dict):
                 consumed_ms = int(cfg.get("effective_first_chunk_ms", self._stage_param("first_chunk_ms", 1035)))
-                return int(consumed_ms * self._sample_rate() / 1000)
+                return int(consumed_ms * self._sample_rate(processor) / 1000)
         return default_chunk_size
 
-    def _process_streaming_audio(self, audio_chunk: Any, chunk_idx: int) -> Any:
-        process = getattr(self.processor, "process_audio_streaming", None)
+    def _process_streaming_audio(
+        self,
+        audio_chunk: Any,
+        chunk_idx: int,
+        *,
+        processor: Any | None = None,
+    ) -> Any:
+        processor = processor or self.processor
+        process = getattr(processor, "process_audio_streaming", None)
         if callable(process):
             try:
                 return process(audio_chunk, reset=False, return_batch_feature=True)
@@ -452,7 +496,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         # path.  Use it as a fallback so the server-resolved reference audio is
         # still represented in the same system context location as official
         # MiniCPM-o prepare().
-        batch_feature = self._process_streaming_audio(ref_audio, 0)
+        processor = state.streaming_processor if state is not None else self.processor
+        batch_feature = self._process_streaming_audio(ref_audio, 0, processor=processor)
         for name, value in (
             ("chunk_idx", 0),
             ("use_extra_context", True),

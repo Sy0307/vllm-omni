@@ -18,19 +18,21 @@ not introduce another reducer, controller, worker provider, or shadow runtime.
 - Published diff: 93 files, approximately `+29.2k/-0.6k`
 - Local runtime and pytest validation: intentionally not used
 - Required validation environment: an NVIDIA H20 CUDA host
-- Validated local commit: `945cc70a54ba9d6d7ccd194aefca1b1bfa20ea64`
+- Base commit for the current dirty tree:
+  `c9b5374a96388a0f83d7daecd793a6f014af3b90`
 - Validated tree: the uncommitted refactor synchronized file-for-file to the
-  isolated H20 worktree on 2026-07-16
+  isolated H20 worktree on 2026-07-18
 
-The current tree has received fresh H20 validation. The affected matrix passed
-415 tests, and the same public session ID completed two independent three-turn
-audio E2E runs with a close/reopen boundary against vLLM 0.25.0. The validated
-tree includes the stable runtime extension, typed resumable policy, extracted
-control plane and clients, request preregistration, typed direct-output
-decision, server-owned single-session admission, separate public/runtime
-configuration channels, private Session ledgers, ordered `session.update`, the
-MiniCPM runner fast path, and the final Realtime input-lifecycle fixes. Exact
-evidence and scope limits are recorded below.
+The current tree has received fresh H20 focused and E2E validation against vLLM
+0.25.0. Its latest broad affected matrix is not green because ten tests expose
+incomplete multi-session work already present in the dirty branch; that result
+is recorded rather than hidden. The validated paths include the stable runtime
+extension, typed resumable policy, extracted control plane and clients, request
+preregistration, typed direct-output decision, server-owned single-session
+admission, separate public/runtime configuration channels, private Session
+ledgers, ordered `session.update`, the MiniCPM runner fast path, continuous
+browser input, and the final Realtime input-lifecycle fixes. Exact evidence and
+scope limits are recorded below.
 
 ## Scope
 
@@ -39,6 +41,8 @@ The checkpoint keeps these verified contracts:
 - MiniCPM Stage0 conversation KV continuity;
 - Stage1 TTS and Token2Wav continuity;
 - model-owned listen/speak decisions on the normal auto-response path;
+- continuous browser PCM upload during assistant playback, without browser VAD
+  or browser-generated input commits;
 - segment EOS and turn EOS as different boundaries;
 - transcript/audio cursors scoped to a response and turn;
 - playback acknowledgement and history commit;
@@ -50,7 +54,8 @@ The checkpoint keeps these verified contracts:
 The checkpoint does not claim:
 
 - scheduler-native KV append;
-- automatic or VAD barge-in;
+- deterministic VAD-triggered interruption (the browser intentionally does not
+  run VAD; MiniCPM owns listen/speak decisions at model-unit boundaries);
 - multi-session admission, fairness, or isolation;
 - bounded long-session KV;
 - production capacity or fault recovery;
@@ -479,17 +484,25 @@ machine.
 
 ### Realtime input ownership
 
-The Realtime translator validates the wire input buffer before producing a
+The browser is a continuous PCM producer. While the session is open and the
+microphone is unmuted, it sends `input_audio_buffer.append` every 200 ms,
+including while assistant audio is being generated or played. It does not run
+VAD and does not send `input_audio_buffer.commit`. Native Stage0 consumes the
+stream in approximately one-second model units; MiniCPM listen, speak, and turn
+EOS decisions advance the model conversation.
+
+Explicit Realtime clients may still use `input_audio_buffer.commit` to create a
+conversation item. The translator validates that wire input before producing a
 commit carrying `realtime_item_id`. Native auto-response may already have
-streamed those PCM samples into the runtime, so the runner accepts that
-validated commit even when no runtime-side chunk remains and still commits the
-conversation item. A truly empty wire buffer continues to return
-`input_audio_buffer_empty`.
+streamed those PCM samples into the runtime, so the runner accepts a validated
+commit even when no runtime-side chunk remains. A truly empty explicit buffer
+continues to return `input_audio_buffer_empty`.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
 item". Silent overlap no longer discards earlier user PCM. This is an input
-ownership correction, not a VAD policy or an automatic barge-in claim.
+ownership correction. It does not add a VAD policy: overlap is admitted to
+Stage0 and the model decides whether to listen or speak.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS
@@ -498,12 +511,13 @@ promotion release the reservation.
 
 ### Physical input and model-turn identity
 
-A Realtime input item, its `input_audio_buffer.commit`, and a MiniCPM model turn
-are intentionally different identities. Native Stage0 evaluates streamed audio
-in approximately one-second model units. A sampled `<|turn_eos|>` closes the
-current model turn and may allow the next streamed unit to start another turn
-before the client commits its physical input item. Conversely, a committed
-input may produce only model-listen decisions and no spoken response.
+A Realtime input item, an optional `input_audio_buffer.commit`, and a MiniCPM
+model turn are intentionally different identities. The browser normally keeps
+one input stream open without commits. Native Stage0 evaluates that stream in
+approximately one-second model units. A sampled `<|turn_eos|>` closes the
+current model turn and allows a later streamed unit to start another turn.
+Explicitly committed input may also produce only model-listen decisions and no
+spoken response.
 
 Therefore neither `model_turn_id` nor response cardinality is derived from the
 number of physical inputs. `model_turn_id` advances at model EOS. The
@@ -578,36 +592,59 @@ All pytest and runtime evidence for this branch must run on the remote H20.
 
 ### Current synchronized tree
 
-The current dirty tree was synchronized file-for-file to an isolated H20
-worktree. The base commit on both sides was
-`945cc70a54ba9d6d7ccd194aefca1b1bfa20ea64`; SHA-256 comparison covered all 62
-modified or untracked files before final validation, with zero mismatches.
+The current dirty tree was synchronized to the isolated H20 worktree at
+`/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-model-unit-overlap-0717`.
+SHA-256 comparison covered the runtime, demo, handler-test, demo-test, Web, and
+Web-contract files changed by the final continuous-input fixes, with zero
+mismatches.
 
-- Full affected matrix: 460 passed, 19 warnings in 16.47 seconds. The combined
-  run is task `08435ce3` (`/tmp/remote_gpu_logs/08435ce3.log`) and includes the
-  extracted ControlPlane/ControlClient/RequestClient, correlated RPC routing,
-  transactional open/append/update, admission, lazy-load, scheduler, runner,
-  fence, mailbox, protocol, serving, and Realtime helper/web regressions.
-- Model-policy E2E: three distinct WAV inputs were sent without transcript
-  hints in 200 ms real-time chunks. It completed three input commits, two
-  model-owned spoken responses, 34 audio/transcript deltas, and two playback
-  history commits. It had zero error/cancel/truncate/stale events and exactly
-  one `response.speak` per response. Physical inputs, model turns, and response
-  cardinality were deliberately not treated as a 1:1 mapping. The client task
-  is `e6757f74` (`/tmp/remote_gpu_logs/e6757f74.log`).
-- Pinned response-required E2E: the first 1400 ms of the SHA-pinned fixture
-  produced one complete spoken response, 14 audio/transcript deltas, and one
-  playback history commit, with symmetric created/audio-done/done lifecycle
-  and no duplicate `response.speak`. The client task is `2615ca06`
-  (`/tmp/remote_gpu_logs/2615ca06.log`).
-- The pinned output is 24 kHz mono 16-bit PCM, 13.68 seconds, with RMS amplitude
-  0.096499 and peak amplitude 0.944733. Whisper-small independently produced a
-  non-empty Chinese transcription semantically consistent with the protocol
-  transcript; the ASR task is `4bb31d78`
-  (`/tmp/remote_gpu_logs/4bb31d78.log`).
-- The validation server task `bf2f8b78` exited cleanly, port 8107 was released,
-  and the two GPUs used by that service returned to idle. Other workloads on
-  the host were not modified.
+- Latest broad affected matrix: 489 passed, 10 failed, 19 warnings. The ten
+  failures are in incomplete multi-session session/fence/attachment/resume work
+  already present in this dirty branch, so the current tree does not have a
+  green full-matrix claim. The run is task `4e21896f`
+  (`/tmp/remote_gpu_logs/4e21896f.log`).
+- Latest focused handler/demo/Web suite: 226 passed, 19 warnings. The run is
+  task `5f9a83b5` (`/tmp/remote_gpu_logs/5f9a83b5.log`). The Web contract also
+  explicitly rejects browser VAD markers and browser-generated input commits.
+- No-response listen and residual accounting: the focused handler regressions
+  passed after first reproducing both failures. A model-listen unit without a
+  Realtime response no longer defers the next committed input, and three
+  consecutive 1.2-second `pcm_f32le` inputs each returned pending input bytes
+  to zero.
+- Model-unit overlap E2E: a 3.6-second first input produced assistant audio,
+  then a distinct 1.4-second input was streamed in 200 ms chunks while that
+  response was active. All seven overlap decisions had
+  `defer_runtime_append=false`; the one-second model-unit boundary occurred
+  before the first response terminal. The run completed two input commits, two
+  spoken responses, 11 audio/transcript deltas, and two playback history
+  commits with zero error/cancel/truncate/stale events. The client task is
+  `657e59b9` (`/tmp/remote_gpu_logs/657e59b9.log`).
+- Pinned response-required E2E: the first 1400 ms of the pinned fixture produced
+  one complete spoken response, five audio/transcript deltas, and one playback
+  history commit, with symmetric created/audio-done/done lifecycle and no
+  duplicate `response.speak`. The client task is `a76dec52`
+  (`/tmp/remote_gpu_logs/a76dec52.log`).
+- Continuous-input model-policy E2E: 36 browser-like 200 ms chunks produced
+  seven model-listen decisions with zero input commits and no
+  error/cancel/truncate/stale events. The client task is `fb256595`; artifacts
+  are in `/tmp/minicpmo_pr3907_continuous_model_policy_20260718`.
+- Three-response continuous-input E2E: three consecutive 9469 ms streams,
+  composed of the original fixture plus four seconds of silence, produced three
+  spoken responses in one session. All three completed `response.done`, audio
+  transcript, playback ACK, and history commit; the run had 22 audio/transcript
+  deltas, zero input commits, and no error/cancel/truncate/stale events. This is
+  lifecycle evidence, not semantic cross-input independence, because the same
+  fixture was repeated. The client task is `2a5f29f0`; artifacts are in
+  `/tmp/minicpmo_pr3907_continuous_three_response_20260718`.
+- The fresh backend remains available as task `b65accf7` on port 8123. The Web
+  demo is task `552fb419` on port 40880; its browser-visible Realtime URL points
+  directly at the public port-8123 endpoint because the page proxy serves HTTP
+  but does not forward WebSocket upgrades. Its served `app.js` keeps microphone
+  upload active during assistant playback and no longer clears captured input
+  from `beginAssistant()`. The index is `no-store` and loads the bundle through
+  a content-hash query so a stale half-duplex client cannot survive a refresh.
+  Audio-quality and ASR evaluation were not rerun for these lifecycle-only
+  changes. Other GPU workloads were not modified.
 
 ### Regression lineage
 
@@ -631,9 +668,10 @@ different trees in the acceptance argument.
 
 Run two deliberately separate fixture contracts:
 
-- model-policy uses three distinct inputs, no transcript hints, and 200 ms
-  real-time pacing. It allows natural listen or speak decisions and assumes no
-  1:1 mapping between physical inputs, model turns, and responses;
+- model-policy uses three distinct inputs, no transcript hints, 200 ms
+  real-time pacing, and continuous input with no browser commit. It allows
+  natural listen or speak decisions and assumes no 1:1 mapping between
+  physical inputs, model turns, and responses;
 - response-required uses `minicpmo_pr3907_jiayan_16k.wav` pinned to SHA-256
   `2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941`,
   sends its first 1400 ms, and requires one complete spoken response.
@@ -672,8 +710,9 @@ This checkpoint is ready to publish only when:
 
 Passing this checkpoint supports the statement:
 
-> Single-session, no-barge MiniCPM-o 4.5 native duplex is reviewable on the
+> Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
 > validated H20 configuration.
 
-It does not support claims for automatic barge-in, multi-session production
-concurrency, bounded long-session KV, scheduler-native append, or video input.
+It does not support claims for deterministic VAD-triggered interruption,
+multi-session production concurrency, bounded long-session KV,
+scheduler-native append, or video input.

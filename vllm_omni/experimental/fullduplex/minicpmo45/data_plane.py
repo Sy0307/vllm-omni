@@ -265,10 +265,10 @@ class MiniCPMO45DataPlaneSession:
             if context.auto_responds:
                 if delta_text and text_turn_state is not None:
                     text_turn_state.has_text = True
-                response_turn_bound = context.active_response_id is not None or (
-                    context.active_response_turn_id is not None
-                    and output_turn_id is not None
-                    and context.active_response_turn_id == output_turn_id
+                response_turn_bound = context.active_response_id is not None and (
+                    output_turn_id is None
+                    or context.active_response_turn_id is None
+                    or context.active_response_turn_id == output_turn_id
                 )
                 turn_has_text = text_turn_state is not None and text_turn_state.has_text
                 if not response_turn_bound and not turn_has_text:

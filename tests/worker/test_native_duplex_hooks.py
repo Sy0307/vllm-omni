@@ -519,6 +519,51 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     assert result["prompt_suffix_len"] == 0
 
 
+def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _Mel:
+        def __init__(self):
+            self.counter = 0
+
+    class _Processor:
+        def __init__(self):
+            self._streaming_mel_processor = _Mel()
+
+        def set_streaming_mode(self, **_kwargs):
+            return None
+
+        def reset_streaming(self):
+            self._streaming_mel_processor.counter = 0
+
+        def process_audio_streaming(self, _audio, **_kwargs):
+            self._streaming_mel_processor.counter += 1
+            return self._streaming_mel_processor.counter
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.processor = _Processor()
+    runtime.stage_model = SimpleNamespace()
+    runtime.thinker = runtime.stage_model
+    a = _MiniCPMO45Stage0SessionState(session_id="a")
+    b = _MiniCPMO45Stage0SessionState(session_id="b")
+    processor_a = runtime._configure_streaming_processor(a)
+    processor_b = runtime._configure_streaming_processor(b)
+
+    observed = [
+        runtime._process_streaming_audio([], 0, processor=processor_a),
+        runtime._process_streaming_audio([], 0, processor=processor_b),
+        runtime._process_streaming_audio([], 1, processor=processor_a),
+        runtime._process_streaming_audio([], 1, processor=processor_b),
+    ]
+
+    assert observed == [1, 1, 2, 2]
+    assert processor_a is not processor_b
+    assert runtime.processor._streaming_mel_processor.counter == 0
+
+
 def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
     import torch
 

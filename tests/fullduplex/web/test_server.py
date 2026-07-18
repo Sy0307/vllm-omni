@@ -1,6 +1,8 @@
+import hashlib
+
 from fastapi.testclient import TestClient
 
-from vllm_omni.experimental.fullduplex.web.server import _join_ws_url, build_app
+from vllm_omni.experimental.fullduplex.web.server import STATIC_DIR, _join_ws_url, build_app
 
 
 def test_join_ws_url_preserves_realtime_query():
@@ -30,6 +32,31 @@ def test_build_app_serves_health_and_injected_client_config():
     assert '"model": "local/MiniCPM-o-4_5"' in index.text
     assert '"realtimePath": "v1/realtime"' in index.text
     assert "__FULL_DUPLEX_CONFIG__" not in index.text
+
+
+def test_build_app_injects_public_realtime_url():
+    public_realtime_url = "wss://proxy.example.test/backend/v1/realtime"
+    app = build_app(
+        ws_backend="ws://127.0.0.1:9001",
+        public_realtime_url=public_realtime_url,
+    )
+    client = TestClient(app)
+
+    index = client.get("/")
+
+    assert index.status_code == 200
+    assert f'"realtimePath": "{public_realtime_url}"' in index.text
+
+
+def test_build_app_versions_client_bundle_and_disables_index_cache():
+    client = TestClient(build_app())
+    expected_version = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
+
+    index = client.get("/")
+
+    assert index.status_code == 200
+    assert f'src="static/app.js?v={expected_version}"' in index.text
+    assert index.headers["cache-control"] == "no-store"
 
 
 def test_build_app_exposes_realtime_websocket_and_static_assets():

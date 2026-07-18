@@ -211,7 +211,7 @@
   }
 
   function microphoneUploadEnabled() {
-    return running && !muted && !assistantActive;
+    return running && !muted;
   }
 
   function flushCapture() {
@@ -241,7 +241,6 @@
     currentResponseId = responseId || currentResponseId;
     responseHasAudio = false;
     assistantActive = true;
-    pendingCapture = [];
     setModel('Speaking');
   }
 

@@ -69,6 +69,43 @@ class DuplexAppendTaskMeta:
 
 
 @dataclass
+class DuplexSessionTasks:
+    """Connection-independent task handles for one resumable session."""
+
+    native_append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
+    active_response_task: asyncio.Task[None] | None = None
+
+    def track_append_task(
+        self,
+        task: asyncio.Task[bool],
+        *,
+        epoch: int,
+        mode: str,
+        final: bool,
+        response_bound: bool,
+    ) -> None:
+        self.native_append_tasks[task] = DuplexAppendTaskMeta(epoch, mode, final, response_bound)
+        task.add_done_callback(self.native_append_tasks.pop)
+
+    def has_response_bound_append_tasks(self) -> bool:
+        return any(meta.response_bound for meta in self.native_append_tasks.values())
+
+    async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
+        tasks = [
+            task for task, meta in self.native_append_tasks.items() if not response_bound_only or meta.response_bound
+        ]
+        if not tasks:
+            return False
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
+        except TimeoutError:
+            pass
+        return True
+
+
+@dataclass
 class DuplexWebSocketActor:
     """Own ordered WebSocket I/O queues, but no domain identity."""
 
@@ -78,11 +115,22 @@ class DuplexWebSocketActor:
     output_queue: asyncio.Queue[dict[str, object] | None] = field(default_factory=asyncio.Queue)
     mailbox: asyncio.Queue[dict[str, object]] = field(default_factory=asyncio.Queue)
     outbound_protocol: Any | None = None
-    native_append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
-    active_response_task: asyncio.Task[None] | None = None
+    tasks: DuplexSessionTasks = field(default_factory=DuplexSessionTasks)
     closing: bool = False
     close_reason: str | None = None
     stale_output_dropped: int = 0
+
+    @property
+    def native_append_tasks(self) -> dict[asyncio.Task[bool], DuplexAppendTaskMeta]:
+        return self.tasks.native_append_tasks
+
+    @property
+    def active_response_task(self) -> asyncio.Task[None] | None:
+        return self.tasks.active_response_task
+
+    @active_response_task.setter
+    def active_response_task(self, task: asyncio.Task[None] | None) -> None:
+        self.tasks.active_response_task = task
 
     async def enqueue_event(self, event: dict[str, object]) -> None:
         await self.mailbox.put(event)
@@ -152,30 +200,25 @@ class DuplexWebSocketActor:
         final: bool,
         response_bound: bool,
     ) -> None:
-        self.native_append_tasks[task] = DuplexAppendTaskMeta(epoch, mode, final, response_bound)
-        task.add_done_callback(self.native_append_tasks.pop)
+        self.tasks.track_append_task(
+            task,
+            epoch=epoch,
+            mode=mode,
+            final=final,
+            response_bound=response_bound,
+        )
 
     def has_response_bound_append_tasks(self) -> bool:
-        return any(meta.response_bound for meta in self.native_append_tasks.values())
+        return self.tasks.has_response_bound_append_tasks()
 
     async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
-        tasks = [
-            task for task, meta in self.native_append_tasks.items() if not response_bound_only or meta.response_bound
-        ]
-        if not tasks:
-            return False
-        for task in tasks:
-            task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except TimeoutError:
-            pass
-        return True
+        return await self.tasks.cancel_append_tasks(timeout_s, response_bound_only=response_bound_only)
 
 
 __all__ = [
     "DOMAIN_TERMINAL_EVENTS",
     "DuplexAppendTaskMeta",
+    "DuplexSessionTasks",
     "DuplexWebSocketActor",
     "is_input_event",
 ]

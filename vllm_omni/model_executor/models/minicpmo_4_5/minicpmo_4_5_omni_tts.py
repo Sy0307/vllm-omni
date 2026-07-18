@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
@@ -124,6 +125,9 @@ class _TalkerTurnState:
         "epoch",
         "turn_id",
         "pending_text",
+        "stream_cache",
+        "hift_cache_dict",
+        "vocoder_initialized",
     )
 
     def __init__(
@@ -145,6 +149,9 @@ class _TalkerTurnState:
         self.epoch = epoch
         self.turn_id = turn_id
         self.pending_text = ""
+        self.stream_cache = None
+        self.hift_cache_dict: dict[str, Any] = {}
+        self.vocoder_initialized = False
 
 
 def _queue_native_duplex_segment_text(state: _TalkerTurnState, text: object) -> None:
@@ -212,6 +219,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._talker_consumed_tokens: dict[str, int] = {}
         self._talker_request_keys: dict[str, str] = {}
         self._t2w_base_caches: dict[str, tuple[Any, Any]] = {}
+        self._token2wav_state_lock = threading.RLock()
         self._ar_last_chunk_flags: list[bool] = [True]
         self._ar_turn_end_flags: list[bool] = [False]
         self._ar_last_emitted_text = ""
@@ -695,29 +703,51 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         except (TypeError, ValueError):
             return 3
 
-    def _begin_turn_vocoder_cache(self, prompt_wav_path: str | None) -> None:
+    def _token2wav_lock(self) -> threading.RLock:
+        lock = getattr(self, "_token2wav_state_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._token2wav_state_lock = lock
+        return lock
+
+    def _begin_turn_vocoder_cache(
+        self,
+        prompt_wav_path: str | None,
+        *,
+        state: _TalkerTurnState | None = None,
+    ) -> None:
         """Restore a fresh per-turn clone of the ref-audio vocoder caches."""
         import torchaudio
 
-        cache_key = prompt_wav_path or ""
-        base = self._t2w_base_caches.get(cache_key)
-        if base is None:
-            _orig_save = torchaudio.save
-            prev_dtype = torch.get_default_dtype()
-            torch.set_default_dtype(torch.float32)
-            try:
-                torchaudio.save = _soundfile_patched_save(_orig_save)
-                stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
-            finally:
-                torch.set_default_dtype(prev_dtype)
-                torchaudio.save = _orig_save
-            base = (
-                _torch_clone_recursive(stream_cache),
-                _torch_clone_recursive(hift_cache_dict),
-            )
-            self._t2w_base_caches[cache_key] = base
-        self.audio_tokenizer.stream_cache = _torch_clone_recursive(base[0])
-        self.audio_tokenizer.hift_cache_dict = _torch_clone_recursive(base[1])
+        with self._token2wav_lock():
+            cache_key = prompt_wav_path or ""
+            base = self._t2w_base_caches.get(cache_key)
+            if base is None:
+                _orig_save = torchaudio.save
+                prev_dtype = torch.get_default_dtype()
+                torch.set_default_dtype(torch.float32)
+                try:
+                    torchaudio.save = _soundfile_patched_save(_orig_save)
+                    stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
+                finally:
+                    torch.set_default_dtype(prev_dtype)
+                    torchaudio.save = _orig_save
+                base = (
+                    _torch_clone_recursive(stream_cache),
+                    _torch_clone_recursive(hift_cache_dict),
+                )
+                self._t2w_base_caches[cache_key] = base
+            stream_cache = _torch_clone_recursive(base[0])
+            hift_cache_dict = _torch_clone_recursive(base[1])
+            if state is None:
+                self.audio_tokenizer.stream_cache = stream_cache
+                self.audio_tokenizer.hift_cache_dict = hift_cache_dict
+            else:
+                state.stream_cache = stream_cache
+                state.hift_cache_dict = hift_cache_dict
+                state.vocoder_initialized = True
+                self.audio_tokenizer.stream_cache = None
+                self.audio_tokenizer.hift_cache_dict = {}
 
     def _t2w_stream_window(self, token_list: list[int], prompt_wav_path: str | None, *, last_chunk: bool):
         import torchaudio
@@ -740,6 +770,31 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             torchaudio.save = _orig_save
         return torch.as_tensor(np.asarray(wav_np).reshape(-1), dtype=torch.float32).cpu().contiguous()
 
+    def _run_vocoder_window(
+        self,
+        state: _TalkerTurnState,
+        token_list: list[int],
+        *,
+        last_chunk: bool,
+    ) -> torch.Tensor:
+        with self._token2wav_lock():
+            if not state.vocoder_initialized:
+                self._begin_turn_vocoder_cache(state.prompt_wav_path, state=state)
+            self.audio_tokenizer.stream_cache = _torch_clone_recursive(state.stream_cache)
+            self.audio_tokenizer.hift_cache_dict = _torch_clone_recursive(state.hift_cache_dict)
+            try:
+                waveform = self._t2w_stream_window(
+                    token_list,
+                    state.prompt_wav_path,
+                    last_chunk=last_chunk,
+                )
+                state.stream_cache = _torch_clone_recursive(self.audio_tokenizer.stream_cache)
+                state.hift_cache_dict = _torch_clone_recursive(self.audio_tokenizer.hift_cache_dict)
+                return waveform
+            finally:
+                self.audio_tokenizer.stream_cache = None
+                self.audio_tokenizer.hift_cache_dict = {}
+
     def _native_duplex_vocode_tokens(
         self,
         state: _TalkerTurnState,
@@ -759,19 +814,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             while len(state.token2wav_buffer) >= pre_lookahead + 5:
                 chunk_to_process = min(chunk_size + pre_lookahead, len(state.token2wav_buffer))
                 window = state.token2wav_buffer[:chunk_to_process]
-                pieces.append(self._t2w_stream_window(window, state.prompt_wav_path, last_chunk=False))
+                pieces.append(self._run_vocoder_window(state, window, last_chunk=False))
                 state.token2wav_buffer = state.token2wav_buffer[min(chunk_size, chunk_to_process - pre_lookahead) :]
         else:
             while len(state.token2wav_buffer) >= chunk_size + pre_lookahead:
                 window = state.token2wav_buffer[: chunk_size + pre_lookahead]
-                pieces.append(self._t2w_stream_window(window, state.prompt_wav_path, last_chunk=False))
+                pieces.append(self._run_vocoder_window(state, window, last_chunk=False))
                 state.token2wav_buffer = state.token2wav_buffer[chunk_size:]
 
         if turn_end and state.token2wav_buffer:
             pieces.append(
-                self._t2w_stream_window(
+                self._run_vocoder_window(
+                    state,
                     list(state.token2wav_buffer),
-                    state.prompt_wav_path,
                     last_chunk=True,
                 )
             )
@@ -812,8 +867,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if state is None:
             return True
         if self.audio_tokenizer is not None:
-            self.audio_tokenizer.stream_cache = None
-            self.audio_tokenizer.hift_cache_dict = {}
+            with self._token2wav_lock():
+                self.audio_tokenizer.stream_cache = None
+                self.audio_tokenizer.hift_cache_dict = {}
         temp_path = state.temp_prompt_wav_path
         if temp_path and not self._is_cached_ref_audio_prompt_wav(temp_path):
             try:
@@ -985,13 +1041,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ref_audio = codes_info.get("ref", info.get("ref_audio"))
             ref_audio_sr = meta_info.get("ref_audio_sr", info.get("ref_audio_sr"))
             prompt_wav_path, temp_prompt_wav_path = self._resolve_prompt_wav_path(ref_audio, ref_audio_sr)
-            self._begin_turn_vocoder_cache(prompt_wav_path)
             state = _TalkerTurnState(
                 prompt_wav_path,
                 temp_prompt_wav_path,
                 epoch=stream_epoch,
                 turn_id=stream_turn_id,
             )
+            self._begin_turn_vocoder_cache(prompt_wav_path, state=state)
             self._talker_turn_states[key] = state
 
         _queue_native_duplex_segment_text(

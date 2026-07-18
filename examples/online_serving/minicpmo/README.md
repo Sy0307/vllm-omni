@@ -91,8 +91,11 @@ Clients enable the model-native path explicitly:
 
 The normal vLLM model runner still owns attention metadata, sampling, and
 request KV. The current append path is not a scheduler-native append primitive
-or persistent KV lease. MiniCPM advertises neither automatic/VAD barge-in nor
-production multi-session concurrency. See
+or persistent KV lease. The browser continuously uploads PCM while unmuted,
+including during assistant playback; it does not run VAD or generate
+`input_audio_buffer.commit`. MiniCPM owns listen/speak progression at model-unit
+boundaries. This is not a deterministic VAD-triggered barge-in guarantee, and
+the checkpoint does not advertise production multi-session concurrency. See
 [`docs/design/minicpmo45_duplex_runtime_architecture.md`](../../../docs/design/minicpmo45_duplex_runtime_architecture.md)
 for the active runtime path, lifecycle invariants, capability boundary, and
 validation scope.
@@ -236,6 +239,16 @@ python -m vllm_omni.experimental.fullduplex.web \
 Open `http://<host>:7862/`. When using a reverse proxy, open the proxy URL that
 maps to port `7862`. The browser derives its WebSocket endpoint relative to
 that URL, preserving any proxy path prefix.
+
+If the page proxy serves HTTP but does not forward WebSocket upgrades, point
+the browser directly at a separately exposed Realtime endpoint:
+
+```bash
+python -m vllm_omni.experimental.fullduplex.web \
+    --port 7862 \
+    --ws-backend ws://127.0.0.1:8099 \
+    --public-realtime-url wss://public.example/v1/realtime
+```
 
 ## Notes
 
