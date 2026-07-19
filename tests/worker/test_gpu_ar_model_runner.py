@@ -391,6 +391,71 @@ def test_async_omni_output_guard_requires_safe_conditions():
     runner.model.eager_omni_postprocess_before_async_output = True
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
+    runner.model.eager_omni_postprocess_before_async_output = False
+    runner.model.supports_async_omni_postprocess = True
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
+
+
+def test_resolve_pending_omni_postprocess_builds_snapshot_payload_without_live_request_state():
+    runner = _make_async_output_runner()
+    # The next async scheduler step may already have removed a normally
+    # finished request from runner.requests.  Resolving the previous step must
+    # therefore build that step's immutable wire payload instead of racing on
+    # the runner's mutable request/intermediate-buffer state.
+    runner.requests = {}
+    seen = []
+
+    class Pending:
+        request_ids = ("r-live", "r-finished")
+
+        def resolve(self):
+            return {
+                "r-live": {"codes": {"audio": torch.tensor([[1, 2]], dtype=torch.int32)}},
+                "r-finished": {"codes": {"audio": torch.tensor([[3, 4]], dtype=torch.int32)}},
+            }
+
+    runner._update_intermediate_buffer = lambda req_id, update: seen.append((req_id, update))
+
+    applied, multimodal_outputs = GPUARModelRunner._resolve_pending_omni_postprocess(
+        runner,
+        Pending(),
+        req_ids_snapshot=["r-finished", "r-live"],
+        multimodal_outputs=None,
+    )
+
+    assert applied is True
+    assert seen == []
+    assert torch.equal(multimodal_outputs["codes"]["audio"][0], torch.tensor([[3, 4]], dtype=torch.int32))
+    assert torch.equal(multimodal_outputs["codes"]["audio"][1], torch.tensor([[1, 2]], dtype=torch.int32))
+
+
+def test_model_sampler_can_run_without_text_logits_when_model_opts_in():
+    """A model-owned audio sampler may consume hidden state without an LM head."""
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    seen = []
+
+    class LogitsFreeModel:
+        prefer_model_sampler = True
+        supports_logits_free_model_sampler = True
+
+        def sample(self, logits, sampling_metadata):
+            seen.append((logits, sampling_metadata))
+            return SimpleNamespace(sampled_token_ids=torch.tensor([[7]]))
+
+    metadata = SimpleNamespace()
+    runner.model = LogitsFreeModel()
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=metadata,
+        update_async_output_token_ids=lambda: None,
+    )
+    runner._sampling_metadata_for_model_sampler = lambda value: value
+    runner.sampler = lambda **kwargs: (_ for _ in ()).throw(AssertionError("stock sampler must not run"))
+
+    output = GPUARModelRunner._sample(runner, None, None)
+
+    assert output.sampled_token_ids.item() == 7
+    assert seen == [(None, metadata)]
+
 
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")

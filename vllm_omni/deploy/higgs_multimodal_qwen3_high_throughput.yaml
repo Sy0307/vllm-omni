@@ -39,13 +39,13 @@ stages:
     enforce_eager: true
     attention_backend: FLASHINFER
     trust_remote_code: true
-    # Stage-0 prefix caching is on by default. The talker's HS opt-out and
-    # deferred ``codes.audio`` mm-output write (see higgs_audio_v3_talker.py)
-    # keep per-step bookkeeping negligible; any shared text prefix across
-    # concurrent requests is a net throughput win. Stage 1 (codec decoder)
-    # has no KV cache and stays disabled.
-    enable_prefix_caching: true
-    async_scheduling: false
+    # Request-aware pending postprocess overlap currently requires prefix
+    # caching to stay disabled. Stage 1 has no KV cache and also stays off.
+    enable_prefix_caching: false
+    async_scheduling: true
+    hf_overrides:
+      audio_state_step_mode: compile
+      audio_sampler_mode: flashinfer
     max_num_batched_tokens: 4096
     max_model_len: 8192
     devices: "0"
@@ -60,7 +60,9 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 16
+    # Match the Stage-0 admission ceiling so c64 waves are not throttled while
+    # pending codec chunks drain through Stage 1.
+    max_num_seqs: 64
     gpu_memory_utilization: 0.25
     enforce_eager: true
     trust_remote_code: true

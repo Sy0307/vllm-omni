@@ -1922,6 +1922,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 positions=positions,
                 inputs_embeds=inputs_embeds,
                 omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
+                req_ids=list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
             )
 
         model_output = super()._model_forward(
