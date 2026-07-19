@@ -8,6 +8,7 @@ without requiring the actual checkpoint or GPU.
 
 import asyncio
 import hashlib
+import inspect
 import json
 import time
 from collections import OrderedDict, defaultdict
@@ -551,8 +552,18 @@ class TestSamplerMethods:
         t.lm_head = object()
         metadata = SimpleNamespace(
             max_num_logprobs=None,
+            logprob_token_ids=None,
             allowed_token_ids_mask=None,
             bad_words_token_ids=None,
+            no_penalties=True,
+            logitsprocs=SimpleNamespace(
+                all=(
+                    SimpleNamespace(min_toks={}),
+                    SimpleNamespace(biases={}),
+                    SimpleNamespace(min_p_count=0),
+                )
+            ),
+            thinking_budget_state_holder=None,
         )
         hidden = torch.randn(2, 16)
 
@@ -564,6 +575,82 @@ class TestSamplerMethods:
         logits = t.compute_logits(hidden, sampling_metadata=metadata)
         assert logits.shape == (2, 3)
         assert len(calls) == 1
+
+    def test_compute_logits_keeps_text_head_when_runner_requires_it(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        cls = mod.HiggsAudioV3TalkerForConditionalGeneration
+        assert "force_text_logits" in inspect.signature(cls.compute_logits).parameters
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t.compute_logits = cls.compute_logits.__get__(t)
+        t._last_step_input_ids = torch.tensor([10], dtype=torch.long)
+        t._active_request_ids = ("req-a",)
+        t._fast_audio_direct_request_ids.add("req-a")
+        t.logits_processor = lambda head, hidden: torch.ones(1, 3)
+        t.lm_head = object()
+
+        logits = t.compute_logits(
+            torch.randn(1, 16),
+            sampling_metadata=None,
+            force_text_logits=True,
+        )
+
+        assert logits.shape == (1, 3)
+
+    @pytest.mark.parametrize(
+        "metadata_overrides",
+        [
+            {"logprob_token_ids": {0: [7]}},
+            {"no_penalties": False},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(min_toks={0: (2, [], {1})}),))},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(biases={0: {7: 1.0}}),))},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(min_p_count=1),))},
+            {"logitsprocs": SimpleNamespace(all=(SimpleNamespace(req_info={0: object()}),))},
+            {"logitsprocs": SimpleNamespace(all=(object(),))},
+            {"thinking_budget_state_holder": SimpleNamespace(has_tracked_requests=lambda: True)},
+        ],
+        ids=(
+            "specific-token-logprobs",
+            "penalties",
+            "min-tokens",
+            "logit-bias",
+            "min-p",
+            "adapter-processor",
+            "unknown-custom-processor",
+            "thinking-budget",
+        ),
+    )
+    def test_compute_logits_keeps_text_head_for_active_sampling_dependencies(
+        self,
+        metadata_overrides,
+    ):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t.compute_logits = mod.HiggsAudioV3TalkerForConditionalGeneration.compute_logits.__get__(t)
+        t._last_step_input_ids = torch.tensor([10], dtype=torch.long)
+        t._active_request_ids = ("req-a",)
+        t._fast_audio_direct_request_ids.add("req-a")
+        t.logits_processor = lambda head, hidden: torch.ones(1, 3)
+        t.lm_head = object()
+        metadata_fields = {
+            "max_num_logprobs": None,
+            "logprob_token_ids": None,
+            "allowed_token_ids_mask": None,
+            "bad_words_token_ids": None,
+            "no_penalties": True,
+            "logitsprocs": SimpleNamespace(all=()),
+            "thinking_budget_state_holder": None,
+        }
+        metadata_fields.update(metadata_overrides)
+
+        logits = t.compute_logits(
+            torch.randn(1, 16),
+            sampling_metadata=SimpleNamespace(**metadata_fields),
+        )
+
+        assert logits.shape == (1, 3)
 
     def test_seeded_audio_sampling_is_request_independent_under_reorder(self):
         """A request seed must produce the same code row after batch reorder."""
@@ -2004,7 +2091,23 @@ class TestRegistry:
             config = yaml.safe_load(f)
         overrides = config["stages"][0]["hf_overrides"]
         assert overrides["audio_state_step_mode"] == "compile"
-        assert overrides["audio_sampler_mode"] == "flashinfer"
+        assert overrides["audio_sampler_mode"] == "torch"
+
+    def test_higgs_stage0_deploys_do_not_pin_sampling_seed(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
+        for name in (
+            "higgs_multimodal_qwen3.yaml",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+            "higgs_multimodal_qwen3_low_latency.yaml",
+        ):
+            with open(os.path.join(deploy_dir, name), encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+            assert "seed" not in config["stages"][0]["default_sampling_params"]
 
     def test_high_throughput_deploy_selects_c64_full_decode_runtime(self):
         import os

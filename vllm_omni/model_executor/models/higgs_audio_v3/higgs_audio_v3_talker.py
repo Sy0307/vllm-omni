@@ -467,6 +467,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     # Request-certified audio rows consume hidden states directly; the runner
     # may therefore call sample() with no text-vocabulary logits.
     supports_logits_free_model_sampler: bool = True
+    supports_force_text_logits: bool = True
     # Tell the runner to call postprocess() to emit per-step audio codes.
     have_multimodal_outputs: bool = True
     has_postprocess: bool = True
@@ -1020,28 +1021,72 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 self._fast_audio_direct_request_ids.discard(req_id)
 
     @staticmethod
+    def _logits_processor_requires_text_logits(processor: Any) -> bool:
+        """Return whether a loaded processor has active request state.
+
+        vLLM always constructs its builtin processors, so their mere presence
+        cannot disable the logits-free path. Unknown/custom processors are
+        conservative: unless they expose a recognized empty request-state
+        container, preserve text logits.
+        """
+        for state_name in ("min_toks", "biases", "min_p_count", "req_info"):
+            if hasattr(processor, state_name):
+                return bool(getattr(processor, state_name))
+        return True
+
+    @staticmethod
     def _sampling_metadata_requires_text_logits(sampling_metadata: Any) -> bool:
         if sampling_metadata is None:
             return False
         if getattr(sampling_metadata, "max_num_logprobs", None) is not None:
             return True
+        if getattr(sampling_metadata, "logprob_token_ids", None):
+            return True
         if getattr(sampling_metadata, "allowed_token_ids_mask", None) is not None:
             return True
-        return bool(getattr(sampling_metadata, "bad_words_token_ids", None))
+        if getattr(sampling_metadata, "bad_words_token_ids", None):
+            return True
+        if not bool(getattr(sampling_metadata, "no_penalties", True)):
+            return True
+
+        logitsprocs = getattr(sampling_metadata, "logitsprocs", None)
+        if logitsprocs is not None:
+            processors = getattr(logitsprocs, "all", None)
+            if processors is None:
+                return True
+            if callable(processors):
+                processors = processors()
+            if any(
+                HiggsAudioV3TalkerForConditionalGeneration._logits_processor_requires_text_logits(processor)
+                for processor in processors
+            ):
+                return True
+
+        holder = getattr(sampling_metadata, "thinking_budget_state_holder", None)
+        if holder is not None:
+            has_tracked_requests = getattr(holder, "has_tracked_requests", None)
+            if not callable(has_tracked_requests) or has_tracked_requests():
+                return True
+        return False
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: Any = None,
+        force_text_logits: bool = False,
     ) -> torch.Tensor | None:
         self._last_logits_hidden = hidden_states
         num_rows = int(hidden_states.shape[0])
         ids = getattr(self, "_last_step_input_ids", None)
         decode_only = isinstance(ids, torch.Tensor) and int(ids.numel()) == num_rows
-        if self._can_use_logits_free_audio_sampler(
-            num_rows,
-            decode_only,
-        ) and not self._sampling_metadata_requires_text_logits(sampling_metadata):
+        if (
+            self._can_use_logits_free_audio_sampler(
+                num_rows,
+                decode_only,
+            )
+            and not force_text_logits
+            and not self._sampling_metadata_requires_text_logits(sampling_metadata)
+        ):
             return None
         return self.logits_processor(self.lm_head, hidden_states)
 

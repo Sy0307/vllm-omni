@@ -488,6 +488,43 @@ def test_model_sampler_can_run_without_text_logits_when_model_opts_in():
     assert seen == [(None, metadata)]
 
 
+@pytest.mark.parametrize("has_structured_output_requests", [False, True])
+def test_compute_model_logits_passes_structured_output_requirement(
+    has_structured_output_requests,
+):
+    assert hasattr(GPUARModelRunner, "_compute_model_logits")
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    seen = []
+
+    class Model:
+        supports_force_text_logits = True
+
+        def compute_logits(
+            self,
+            hidden_states,
+            *,
+            sampling_metadata,
+            force_text_logits,
+        ):
+            seen.append((hidden_states, sampling_metadata, force_text_logits))
+            return torch.ones(1, 3)
+
+    metadata = object()
+    hidden_states = torch.randn(1, 4)
+    runner.model = Model()
+    runner.input_batch = SimpleNamespace(sampling_metadata=metadata)
+    scheduler_output = SimpleNamespace(
+        has_structured_output_requests=has_structured_output_requests,
+    )
+
+    logits = runner._compute_model_logits(hidden_states, scheduler_output)
+
+    assert logits.shape == (1, 3)
+    assert seen == [
+        (hidden_states, metadata, has_structured_output_requests),
+    ]
+
+
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False

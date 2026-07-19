@@ -33,7 +33,7 @@ PyTorch sampler) unless they set these `hf_overrides` explicitly.
 
 `higgs_multimodal_qwen3.yaml` is kept as the auto-discovered default deploy
 config for `model_type=higgs_multimodal_qwen3`. It keeps the local MLP graph,
-FlashInfer audio sampler, 25-frame codec chunks, and a conservative
+PyTorch audio sampler, 25-frame codec chunks, and a conservative
 `max_num_seqs: 16`; the explicit high-throughput profile raises both stages to
 64 and uses the full-decode graph, PyTorch sampler, and 75-frame codec chunks.
 

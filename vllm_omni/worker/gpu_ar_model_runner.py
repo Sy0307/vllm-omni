@@ -1364,13 +1364,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
 
                 sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
-                # Try with sampling_metadata first; fall back to without for models that don't support it
-                try:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                    )
-                except TypeError:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_model_logits(sample_hidden_states, scheduler_output)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -1387,13 +1381,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     logits = None
                 else:
-                    # Try with sampling_metadata first; fall back to without for models that don't support it
-                    try:
-                        logits = self.model.compute_logits(
-                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                        )
-                    except TypeError:
-                        logits = self.model.compute_logits(sample_hidden_states)
+                    logits = self._compute_model_logits(sample_hidden_states, scheduler_output)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -1428,6 +1416,29 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._omni_routed_experts_d2h(scheduler_output)
 
         return None
+
+    def _compute_model_logits(
+        self,
+        sample_hidden_states: torch.Tensor,
+        scheduler_output: SchedulerOutput,
+    ) -> torch.Tensor | None:
+        sampling_metadata = self.input_batch.sampling_metadata
+        if getattr(self.model, "supports_force_text_logits", False):
+            return self.model.compute_logits(
+                sample_hidden_states,
+                sampling_metadata=sampling_metadata,
+                force_text_logits=bool(getattr(scheduler_output, "has_structured_output_requests", False)),
+            )
+
+        # Preserve compatibility with models whose compute_logits predates
+        # sampling_metadata support.
+        try:
+            return self.model.compute_logits(
+                sample_hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
+        except TypeError:
+            return self.model.compute_logits(sample_hidden_states)
 
     def _sample(
         self,
