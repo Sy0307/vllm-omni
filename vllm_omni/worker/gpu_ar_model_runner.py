@@ -51,6 +51,19 @@ from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
 
+_OMNI_CONNECTOR_INIT_ARCHS = {
+    "Qwen3OmniMoeForConditionalGeneration",
+    "Qwen2_5OmniForConditionalGeneration",
+    "CovoAudioForConditionalGeneration",
+    "MiMoAudioModel",
+    "Qwen3TTSTalkerForConditionalGeneration",
+    "Qwen3TTSCode2Wav",
+    "MiniCPMO45OmniForConditionalGeneration",
+    "CosyVoice3Model",
+    "DyninOmniForConditionalGeneration",
+    "IndexTTS2TalkerForConditionalGeneration",
+}
+
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach()
@@ -310,17 +323,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # separately as `(model_arch, model_stage)` tuples in
         # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
         # forgetting that produces a Stage-1 hang on the consumer.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "CosyVoice3Model",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2TalkerForConditionalGeneration",
-        }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 model_config=self.model_config,
@@ -1528,6 +1530,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return None
         return wire_payloads
 
+    def _uses_async_output_connector(self) -> bool:
+        """Whether this stage streams its outputs through a connector."""
+        connector_config = getattr(self.model_config, "stage_connector_config", {})
+        connector_extra = connector_config.get("extra", {}) if isinstance(connector_config, dict) else {}
+        role = connector_extra.get("role")
+        if role is not None:
+            return role == "sender"
+        # Preserve the legacy partitioning default, except for a stage-0
+        # orchestrator bridge that has no configured outgoing connector.
+        return getattr(self.model_config, "stage_id", None) != 0
+
     def _snapshot_query_start_loc_cpu(self) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu
         if callable(query_start_loc_cpu):
@@ -1841,14 +1854,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        if self._async_chunk:
+        if self._async_chunk and self._uses_async_output_connector():
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            # Non-async-chunk still ships the full payload to the next stage (via
-            # accumulate_full_payload_output and the inter_stage_outputs field); only
-            # client mm keys are split out when async_chunk is enabled. #4527 set this
-            # to (None, pooler_output), which skipped accumulation and starved the
-            # downstream stage (300s connector-input timeout / empty audio). (PR #4792)
+            # Stages without an outgoing async connector still need their
+            # inter-stage payload on the normal RequestOutput bridge.
             pooler_inter, pooler_client = pooler_output, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():

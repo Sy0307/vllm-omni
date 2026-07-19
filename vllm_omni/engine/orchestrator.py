@@ -1243,7 +1243,10 @@ class Orchestrator:
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and not self.async_chunk
+            and (
+                not self.async_chunk
+                or not self._stage_receives_async_chunks(stage_id + 1)
+            )
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
@@ -1290,6 +1293,17 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        """Whether a stage's connector supplies its runtime inputs."""
+        pool = self.stage_pools[stage_id]
+        connector_config = getattr(
+            getattr(pool.stage_vllm_config, "model_config", None),
+            "stage_connector_config",
+            {},
+        )
+        connector_extra = connector_config.get("extra", {}) if isinstance(connector_config, dict) else {}
+        return connector_extra.get("role") != "sender"
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1963,6 +1977,11 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            if not self._stage_receives_async_chunks(next_stage_id):
+                # Outgoing-only stages receive their first real input from the
+                # orchestrator. Pre-submitting a placeholder lets it race and
+                # execute before that conditioning payload arrives.
+                continue
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()

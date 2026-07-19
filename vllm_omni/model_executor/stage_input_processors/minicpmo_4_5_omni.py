@@ -590,14 +590,27 @@ def llm2tts(
             if not handoff_ids:
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        if handoff_ids is not None and handoff_hidden is not None:
+            # The strict three-stage Talker consumes flat tensor aliases while
+            # the full-duplex transport keeps the canonical nested handoff.
+            # Carry both representations so ordinary streaming and native
+            # full-duplex requests use the same stage bridge.
+            tts_ids_tensor = torch.as_tensor(handoff_ids, dtype=torch.long)
+            tts_hidden_tensor = torch.as_tensor(handoff_hidden, dtype=torch.float32)
+            model_intermediate_buffer["tts_token_ids"] = tts_ids_tensor
+            model_intermediate_buffer["tts_hidden_states"] = tts_hidden_tensor
         if native_turn_end_handoff:
             _reset_native_tts_handoff(_streaming_context)
 
-        scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
-            tts_token_ids_slice,
-            llm_output_ids,
-            prompt_token_ids,
-        )
+        if handoff_ids is not None and handoff_hidden is not None:
+            condition_length = max(len(handoff_ids), len(handoff_hidden)) + 2
+            scheduler_prompt_token_ids = [0] * condition_length
+        else:
+            scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
+                tts_token_ids_slice,
+                llm_output_ids,
+                prompt_token_ids,
+            )
         tts_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=scheduler_prompt_token_ids,

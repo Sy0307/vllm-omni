@@ -44,6 +44,19 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 
 logger = logging.getLogger(__name__)
 
+_OMNI_CONNECTOR_INIT_ARCHS = {
+    "Qwen3OmniMoeForConditionalGeneration",
+    "Qwen2_5OmniForConditionalGeneration",
+    "CovoAudioForConditionalGeneration",
+    "MiMoAudioModel",
+    "Qwen3TTSTalkerForConditionalGeneration",
+    "Qwen3TTSCode2Wav",
+    "MiniCPMO45Code2Wav",
+    "CosyVoice3Model",
+    "DyninOmniForConditionalGeneration",
+    "IndexTTS2S2MelDecoder",
+}
+
 
 class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Generation model runner for vLLM-Omni (non-autoregressive).
@@ -57,17 +70,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
         # Mirrors the init allowlist in gpu_ar_model_runner.py.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "CosyVoice3Model",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2S2MelDecoder",
-        }
         if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 model_config=self.model_config,
@@ -317,6 +319,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             )
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
+            # Stateful generation stages must key caches by the same internal
+            # IDs reported in ``finished_req_ids`` during cleanup.
+            if getattr(self.model_config, "model_arch", None) == "MiniCPMO45Code2Wav":
+                model_kwargs["request_ids"] = list(req_ids)
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

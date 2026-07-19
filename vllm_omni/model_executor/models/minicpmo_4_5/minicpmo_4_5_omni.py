@@ -58,9 +58,11 @@ logger = init_logger(__name__)
 class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
     """MiniCPM-o 4.5 Omni model for conditional generation.
 
-    This model has two pipeline stages:
-    - llm: multimodal thinker and text generation
-    - tts: talker generation followed by its built-in Token2Wav vocoder
+    Three-stage pipeline:
+    - thinker (model_stage="llm"): image / video / audio encoders + 3D
+      resampler + the omni LLM that emits text + hidden states.
+    - talker  (model_stage="tts"): native continuous MiniCPMTTS AR that emits
+      codec-token deltas for the separate Code2Wav stage.
     """
 
     @classmethod
@@ -106,7 +108,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         elif self.model_stage == "tts":
             self.thinker = None
-            # Initialize talker model (LLM generation)
+            # The Talker is always the runner-owned continuous codec producer.
             self.talker = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "talker"),
@@ -125,6 +127,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.make_empty_intermediate_tensors = (
             (self.thinker.make_empty_intermediate_tensors)
             if self.model_stage == "llm" and self.thinker is not None
+            else self.talker.make_empty_intermediate_tensors
+            if self.talker is not None
             else lambda: None
         )
 
@@ -658,8 +662,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         Forward pass for MiniCPM-o Omni model.
 
         Workflow:
-        1) LLM: multimodal thinker → hidden states and text tokens
-        2) TTS: talker + Token2Wav → speech waveform
+        1) Thinker (model_stage="llm"): Image / video / audio encoders +
+           3D resampler + omni LLM → text + hidden states.
+        2) Talker (model_stage="tts"): native MiniCPMTTS AR → codec deltas.
         """
         if self.model_stage == "llm":
             # Normalize to batched inputs if caller provides 1D/2D unbatched tensors
@@ -778,56 +783,28 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 multimodal_outputs=multimodal_outputs,
             )
 
-        # Talker stage: runs TTS generation and its built-in Token2Wav vocoder.
+        # Talker stage: runner-owned native AR only. Waveform generation belongs
+        # to the separate Code2Wav stage.
         if self.model_stage == "tts":
-            if input_ids is not None:
-                num_tokens = input_ids.shape[0]
-                device = input_ids.device
-            elif inputs_embeds is not None:
-                num_tokens = inputs_embeds.shape[0]
-                device = inputs_embeds.device
-            else:
-                num_tokens = 1
-                device = current_omni_platform.get_torch_device()
-            hidden_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 2560
-
-            # Profile/dummy run: both input_ids and inputs_embeds are None.
-            # Note: SupportsMultiModal preprocessing converts input_ids to
-            # inputs_embeds, so input_ids=None alone does NOT indicate a dummy run.
-            if input_ids is None and inputs_embeds is None:
-                dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
-
-            runtime_info = kwargs.get("runtime_additional_information")
-            request_token_spans = kwargs.get("request_token_spans")
-            if isinstance(runtime_info, list) and (len(runtime_info) > 1 or request_token_spans is not None):
-                return self._run_batched_tts_requests(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    runtime_info=runtime_info,
-                    request_token_spans=request_token_spans,
-                    num_tokens=num_tokens,
-                    hidden_dim=hidden_dim,
-                    device=device,
-                )
-            talker_info = {}
-            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-            dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
-            mm_out, _, _ = self._run_tts_request(
+            return self.talker(
                 input_ids=input_ids,
                 positions=positions,
+                intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
-                talker_info=talker_info,
-                device=device,
+                **kwargs,
             )
-            if mm_out is not None:
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=mm_out)
-
-            return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
+
+    def preprocess(self, *args, **kwargs):
+        if self.model_stage != "tts":
+            raise RuntimeError("MiniCPM-o preprocess is only available for the Talker stage")
+        return self.talker.preprocess(*args, **kwargs)
+
+    def make_omni_output(self, model_outputs, **kwargs):
+        if self.model_stage != "tts":
+            return model_outputs
+        return self.talker.make_omni_output(model_outputs, **kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
@@ -1261,7 +1238,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         # MiniCPM-o checkpoint prefixes → stage mapping:
         #   thinker: vpm, resampler, llm, apm, audio_projection_layer
-        #   talker:  tts (ConditionalChatTTS)
+        #   talker:  tts (native MiniCPMTTS AR codec producer)
         for k, v in weights:
             if k.startswith(("vpm.", "resampler.", "llm.", "apm.", "audio_projection_layer.")):
                 thinker_weights.append((k, v))

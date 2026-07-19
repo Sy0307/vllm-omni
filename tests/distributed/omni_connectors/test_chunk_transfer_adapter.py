@@ -81,6 +81,10 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
+            stage_connector_config={
+                "name": "SharedMemoryConnector",
+                "extra": connector_extra or {},
+            },
         )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
@@ -379,6 +383,26 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     # AR mode now forwards the latest payload directly.
     assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
+
+
+def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, connector_extra={"role": "sender"})
+    request = _req("req-1", RequestStatus.WAITING)
+    request.additional_information = {"tts_token_ids": torch.tensor([1])}
+    waiting_queue = DummyWaitingQueue([request])
+    running_queue = []
+
+    adapter.load_async(request)
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
+
+    assert waiting_queue == [request]
+    assert request.status == RequestStatus.WAITING
+    assert request.additional_information["tts_token_ids"].item() == 1
+    assert adapter._pending_load_reqs == deque()
 
 
 def test_process_and_restore_queues(build_adapter):

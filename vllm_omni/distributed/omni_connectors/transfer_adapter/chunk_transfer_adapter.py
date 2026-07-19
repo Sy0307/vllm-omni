@@ -56,6 +56,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._active_window,
             )
         self.connector = self.create_connector(model_config)
+        connector_config = getattr(model_config, "stage_connector_config", {}) or {}
+        if isinstance(connector_config, dict):
+            connector_extra = connector_config.get("extra", {})
+        else:
+            connector_extra = getattr(connector_config, "extra", {})
+        self.receives_chunks = connector_extra.get("role") != "sender"
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -135,7 +141,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         stage_id = self.connector.stage_id
 
-        if stage_id == 0:
+        if stage_id == 0 or not self.receives_chunks:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
@@ -464,6 +470,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         callers that don't track aborts may omit it to keep the prior
         (unguarded) behaviour.
         """
+        if not self.receives_chunks:
+            return
         if self.connector.stage_id == 0:
             return
 
@@ -628,6 +636,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         every parked request is restored unconditionally (the
         pre-purge behavior).
         """
+        if not self.receives_chunks:
+            return
         if scheduler_requests is not None:
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
@@ -659,6 +669,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Add additional info for cached requests and
         clean up ready chunks from scheduler output.
         """
+        if not self.receives_chunks:
+            return
         stage_id = self.connector.stage_id
 
         if stage_id == 0:

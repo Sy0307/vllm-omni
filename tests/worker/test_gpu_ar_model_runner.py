@@ -7,6 +7,7 @@ import torch
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import (
+    _OMNI_CONNECTOR_INIT_ARCHS,
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
@@ -14,6 +15,25 @@ from vllm_omni.worker.gpu_ar_model_runner import (
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_minicpmo_talker_initializes_omni_connectors():
+    assert "MiniCPMO45OmniForConditionalGeneration" in _OMNI_CONNECTOR_INIT_ARCHS
+
+
+@pytest.mark.parametrize(
+    ("role", "stage_id", "expected"),
+    [("sender", 0, True), ("receiver", 1, False), (None, 0, False), (None, None, True)],
+)
+def test_async_output_connector_respects_role_and_stage_zero_bridge(role, stage_id, expected):
+    runner = object.__new__(GPUARModelRunner)
+    extra = {} if role is None else {"role": role}
+    runner.model_config = SimpleNamespace(
+        stage_id=stage_id,
+        stage_connector_config={"extra": extra},
+    )
+
+    assert runner._uses_async_output_connector() is expected
 
 
 def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -> GPUARModelRunner:
