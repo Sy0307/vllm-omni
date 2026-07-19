@@ -1880,22 +1880,42 @@ class TestRegistry:
             assert config["stages"][0]["enable_prefix_caching"] is False
             assert config["stages"][1]["async_scheduling"] is False
 
-    def test_high_throughput_deploys_select_validated_audio_runtime(self):
+    def test_default_deploy_selects_validated_audio_runtime(self):
         import os
 
         import yaml
 
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
         deploy_dir = os.path.join(repo_root, "vllm_omni", "deploy")
-        for name in (
-            "higgs_multimodal_qwen3.yaml",
+        with open(os.path.join(deploy_dir, "higgs_multimodal_qwen3.yaml"), encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        overrides = config["stages"][0]["hf_overrides"]
+        assert overrides["audio_state_step_mode"] == "compile"
+        assert overrides["audio_sampler_mode"] == "flashinfer"
+
+    def test_high_throughput_deploy_selects_c64_full_decode_runtime(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(
+            repo_root,
+            "vllm_omni",
+            "deploy",
             "higgs_multimodal_qwen3_high_throughput.yaml",
-        ):
-            with open(os.path.join(deploy_dir, name), encoding="utf-8") as f:
-                config = yaml.safe_load(f)
-            overrides = config["stages"][0]["hf_overrides"]
-            assert overrides["audio_state_step_mode"] == "compile"
-            assert overrides["audio_sampler_mode"] == "flashinfer"
+        )
+        with open(yaml_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        stage0 = config["stages"][0]
+        overrides = stage0["hf_overrides"]
+        assert overrides["audio_state_step_mode"] == "compile"
+        assert overrides["audio_sampler_mode"] == "torch"
+        assert stage0["enforce_eager"] is False
+        compilation = stage0["compilation_config"]
+        assert compilation["custom_ops"] == ["none"]
+        assert compilation["cudagraph_mode"] == "FULL_DECODE_ONLY"
+        assert compilation["cudagraph_capture_sizes"] == [1, 2, 4, 8, 16, 32, 64]
 
     def test_high_throughput_deploy_matches_stage_concurrency(self):
         import os
@@ -1913,6 +1933,24 @@ class TestRegistry:
             config = yaml.safe_load(f)
         assert config["stages"][0]["max_num_seqs"] == 64
         assert config["stages"][1]["max_num_seqs"] == 64
+
+    def test_high_throughput_deploy_uses_large_steady_state_codec_chunks(self):
+        import os
+
+        import yaml
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        yaml_path = os.path.join(
+            repo_root,
+            "vllm_omni",
+            "deploy",
+            "higgs_multimodal_qwen3_high_throughput.yaml",
+        )
+        with open(yaml_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        connector = config["connectors"]["connector_of_shared_memory"]["extra"]
+        assert connector["codec_chunk_frames"] == 75
+        assert connector["initial_codec_chunk_frames"] == 1
 
     def test_talker_registered(self):
         from vllm_omni.model_executor.models.registry import _OMNI_MODELS

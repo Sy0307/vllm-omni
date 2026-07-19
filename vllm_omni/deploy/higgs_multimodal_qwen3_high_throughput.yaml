@@ -1,9 +1,8 @@
 # Higgs-audio v3 deploy, high-throughput profile.
 #
 # This is the default production profile for medium/high concurrency serving.
-# Stage 0 keeps enforce_eager=true so Higgs' local MLP CUDA graph remains active.
-# Do not enable vLLM FULL_DECODE graph here: it replaces the local MLP graph
-# path instead of stacking on top of it.
+# Stage 0 uses vLLM FULL_DECODE_ONLY CUDA graph with a c64 capture bucket to
+# amortize decode launch overhead at high concurrency.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
@@ -24,7 +23,9 @@ connectors:
       #   codec_right_holdback_frames trailing frames held back so the codec
       #                              has future context for emit-region tail samples
       #   initial_codec_chunk_frames smaller first chunk to minimize TTFA
-      codec_chunk_frames: 25
+      # Amortize Stage-1 codec scheduling and decode overhead at c64. Keep the
+      # first chunk small so this throughput profile preserves prompt TTFA.
+      codec_chunk_frames: 75
       codec_left_context_frames: 25
       codec_right_holdback_frames: 4
       initial_codec_chunk_frames: 1
@@ -36,7 +37,7 @@ stages:
   - stage_id: 0
     max_num_seqs: 64
     gpu_memory_utilization: 0.6
-    enforce_eager: true
+    enforce_eager: false
     attention_backend: FLASHINFER
     trust_remote_code: true
     # Request-aware pending postprocess overlap currently requires prefix
@@ -45,7 +46,14 @@ stages:
     async_scheduling: true
     hf_overrides:
       audio_state_step_mode: compile
-      audio_sampler_mode: flashinfer
+      audio_sampler_mode: torch
+    compilation_config:
+      # A100 c64 validation is faster with the compileable native ops exposed
+      # to Inductor than with every custom op kept opaque.
+      custom_ops: ["none"]
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_num_of_warmups: 1
     max_num_batched_tokens: 4096
     max_model_len: 8192
     devices: "0"
