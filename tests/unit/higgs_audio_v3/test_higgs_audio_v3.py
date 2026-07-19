@@ -598,6 +598,16 @@ class TestSamplerMethods:
 
         assert logits.shape == (1, 3)
 
+    def test_logits_processor_checks_all_known_state_containers(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        processor = SimpleNamespace(
+            min_toks={},
+            biases={0: {7: 1.0}},
+        )
+
+        assert mod.HiggsAudioV3TalkerForConditionalGeneration._logits_processor_requires_text_logits(processor)
+
     @pytest.mark.parametrize(
         "metadata_overrides",
         [
@@ -1066,7 +1076,7 @@ class TestSamplerMethods:
         t._update_delay_state_batched = lambda *args, **kwargs: None
         t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
 
-        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+        sampler_output = t.sample(None, sampling_metadata=object())
 
         assert not getattr(
             mod.HiggsAudioV3TalkerForConditionalGeneration, "supports_sampled_token_ids_cpu_override", False
@@ -1098,9 +1108,55 @@ class TestSamplerMethods:
         t._update_delay_state_batched = lambda *args, **kwargs: None
         t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
 
-        sampler_output = t.sample(torch.zeros(2, 200000), sampling_metadata=object())
+        sampler_output = t.sample(None, sampling_metadata=object())
 
         assert sampler_output.sampled_token_ids.tolist() == [[99999], [99999]]
+
+    def test_nonempty_logits_preserve_stock_sampler_step_decision(self):
+        """A logits-producing step must not be reclassified as direct audio."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=1)
+        t._resolve_token_ids = lambda: None
+        t._audio_continuation_id = 99999
+        t._eos_token_id = 151671
+        t._last_logits_hidden = torch.zeros(1, 16)
+        t._last_step_input_ids = torch.tensor([99999])
+        t._last_step_query_start_loc = None
+        t._decode_has_codes = torch.tensor([True])
+        t._decode_generation_done = torch.tensor([False])
+        t._decode_delay_count = torch.zeros(1, dtype=torch.long)
+        t._decode_eoc_countdown = torch.full((1,), -1, dtype=torch.long)
+        t._active_request_ids = ("req-a",)
+        t._fast_audio_direct_request_ids.add("req-a")
+        t._fast_audio_sampler_gpu_fallback_reason = lambda **kwargs: None
+        t._apply_audio_mode_bias_batched = lambda *args, **kwargs: None
+        t._audio_codebook_logits_from_rows = lambda hidden, rows, all_rows=False: torch.zeros(1, 8, 1026)
+        t._apply_delay_pattern_masking_batched = lambda cb_logits, audio_rows, all_rows=False: None
+        t._sample_audio_codes = lambda logits_2d, **kwargs: torch.zeros(int(logits_2d.shape[0]), dtype=torch.long)
+        t._update_delay_state_batched = lambda *args, **kwargs: None
+        t.sample = mod.HiggsAudioV3TalkerForConditionalGeneration.sample.__get__(t)
+
+        expected_logprobs = object()
+        expected_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[99999]]),
+            logprobs_tensors=expected_logprobs,
+        )
+        stock_sampler_calls = []
+
+        def stock_sampler(*, logits, sampling_metadata):
+            stock_sampler_calls.append((logits, sampling_metadata))
+            return expected_output
+
+        t._stock_sampler = stock_sampler
+        logits = torch.zeros(1, 200000)
+        sampling_metadata = SimpleNamespace(logprob_token_ids={0: [7]})
+
+        sampler_output = t.sample(logits, sampling_metadata=sampling_metadata)
+
+        assert sampler_output is expected_output
+        assert stock_sampler_calls == [(logits, sampling_metadata)]
+        assert sampler_output.logprobs_tensors is expected_logprobs
 
     def test_logits_free_sample_keeps_compute_step_decision_after_certification_changes(self):
         """Async resolve may update certification after compute_logits returns None."""

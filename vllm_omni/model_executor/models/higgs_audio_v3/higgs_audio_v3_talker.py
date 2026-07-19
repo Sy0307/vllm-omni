@@ -1029,10 +1029,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         conservative: unless they expose a recognized empty request-state
         container, preserve text logits.
         """
+        recognized_state = False
         for state_name in ("min_toks", "biases", "min_p_count", "req_info"):
             if hasattr(processor, state_name):
-                return bool(getattr(processor, state_name))
-        return True
+                recognized_state = True
+                if bool(getattr(processor, state_name)):
+                    return True
+        return not recognized_state
 
     @staticmethod
     def _sampling_metadata_requires_text_logits(sampling_metadata: Any) -> bool:
@@ -1657,7 +1660,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         # for this exact sampling step. Async output resolution may update the
         # live request certification set before sample_tokens consumes it, so
         # do not re-decide a logits-free step from mutable model state here.
-        direct_audio_batch = logits is None or self._can_use_logits_free_audio_sampler(num_rows, decode_only)
+        direct_audio_batch = logits is None
         if not decode_only:
             pfmask = self._prefill_row_mask(num_rows, hidden.device)
             self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
