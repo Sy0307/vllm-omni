@@ -64,7 +64,6 @@ stages:
       top_p: 0.95
       top_k: 50
       max_tokens: 2048
-      seed: 42
       repetition_penalty: 1.0
 
   - stage_id: 1
@@ -86,5 +85,4 @@ stages:
       top_p: 1.0
       top_k: -1
       max_tokens: 65536
-      seed: 42
       repetition_penalty: 1.0

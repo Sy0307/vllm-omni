@@ -77,6 +77,37 @@ def test_runner_assisted_full_attention_metadata_request_is_opt_in():
     assert request is None
 
 
+def test_register_model_request_sampling_seeds_uses_effective_seed_at_admission():
+    registered = []
+
+    class Model:
+        def register_request_sampling_seeds(self, seeds):
+            registered.append(dict(seeds))
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = Model()
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id="req-a",
+                sampling_params=SimpleNamespace(extra_args={"tts_effective_seed": 111}),
+            ),
+            SimpleNamespace(
+                req_id="req-b",
+                sampling_params=SimpleNamespace(extra_args={"tts_effective_seed": 222}),
+            ),
+            SimpleNamespace(
+                req_id="req-unseeded-direct-engine",
+                sampling_params=SimpleNamespace(extra_args=None),
+            ),
+        ]
+    )
+
+    runner._register_model_request_sampling_seeds(scheduler_output)
+
+    assert registered == [{"req-a": 111, "req-b": 222}]
+
+
 def test_runner_assisted_full_attention_metadata_request_and_context_hooks():
     calls = []
 

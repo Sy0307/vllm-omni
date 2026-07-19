@@ -155,6 +155,86 @@ _MODALITY_HEAD_PREFIX = "tied.head.modality_heads.0."
 _CODEC_PREFIX = "tied.embedding.modality_embeddings.0.model."
 
 
+class _HiggsAudioTrajectoryRecorder:
+    """Opt-in request trajectory JSONL recorder for determinism diagnosis."""
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = os.fspath(path)
+        self._lock = threading.Lock()
+        self._next_step_by_id: dict[str, int] = {}
+
+    def record(
+        self,
+        request_ids: tuple[str, ...],
+        request_seeds: tuple[int | None, ...],
+        sampling_seeds: tuple[int | None, ...],
+        sampling_post_steps: tuple[int | None, ...],
+        hidden_snapshot: torch.Tensor | None,
+        host_staging: torch.Tensor,
+        valid: list[int],
+        done: list[int],
+        num_codebooks: int,
+    ) -> None:
+        import hashlib
+        import json
+
+        lines: list[str] = []
+        hidden_cpu = None
+        if hidden_snapshot is not None:
+            hidden_cpu = hidden_snapshot.detach().to(device="cpu").contiguous()
+        with self._lock:
+            snapshots = zip(
+                request_ids,
+                request_seeds,
+                sampling_seeds,
+                sampling_post_steps,
+                strict=True,
+            )
+            for row, (req_id, seed, sampling_seed, sampling_post_step) in enumerate(snapshots):
+                is_valid = bool(valid[row])
+                step = self._next_step_by_id.get(req_id, 0)
+                sampling_decode_step = sampling_post_step
+                if sampling_decode_step is not None and is_valid:
+                    sampling_decode_step -= 1
+                codes_hash = None
+                hidden_hash = None
+                if hidden_cpu is not None:
+                    hidden_row = hidden_cpu[row].contiguous()
+                    hidden_bytes = hidden_row.view(torch.uint8)
+                    hidden_hash = hashlib.sha256(hidden_bytes.numpy().tobytes()).hexdigest()
+                if is_valid:
+                    codes = host_staging[row, :num_codebooks].detach().cpu().contiguous()
+                    codes_hash = hashlib.sha256(codes.numpy().tobytes()).hexdigest()
+                    self._next_step_by_id[req_id] = step + 1
+                lines.append(
+                    json.dumps(
+                        {
+                            "request_id": req_id,
+                            "effective_seed": seed,
+                            "decode_step": step,
+                            "sampling_seed": sampling_seed,
+                            "sampling_decode_step": sampling_decode_step,
+                            "sampling_post_step": sampling_post_step,
+                            "hidden_hash": hidden_hash,
+                            "sampled_codes_hash": codes_hash,
+                            "valid": is_valid,
+                            "done": bool(done[row]),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            parent = os.path.dirname(self.path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as trace_file:
+                trace_file.write("\n".join(lines) + "\n")
+
+
+def _create_higgs_audio_trajectory_recorder() -> _HiggsAudioTrajectoryRecorder | None:
+    path = os.getenv("HIGGS_AUDIO_V3_TRAJECTORY_PATH")
+    return _HiggsAudioTrajectoryRecorder(path) if path else None
+
+
 class _HiggsAudioHostStagingLease:
     """Exclusive ownership of one ping-pong host staging slot."""
 
@@ -229,8 +309,13 @@ class HiggsAudioV3PendingStep:
     host_staging: torch.Tensor
     event: Any
     num_codebooks: int
+    request_seeds: tuple[int | None, ...]
+    sampling_seeds: tuple[int | None, ...]
+    sampling_post_steps: tuple[int | None, ...]
+    hidden_snapshot: torch.Tensor | None
     _release: Callable[[], None]
     _on_resolve: Callable[[tuple[str, ...], list[int], list[int]], None] | None
+    _trajectory_recorder: _HiggsAudioTrajectoryRecorder | None
 
     @classmethod
     def create(
@@ -242,6 +327,11 @@ class HiggsAudioV3PendingStep:
         num_codebooks: int,
         release: Callable[[], None],
         on_resolve: Callable[[tuple[str, ...], list[int], list[int]], None] | None = None,
+        request_seeds: Sequence[int | None] | None = None,
+        sampling_seeds: Sequence[int | None] | None = None,
+        sampling_post_steps: Sequence[int | None] | None = None,
+        hidden_snapshot: torch.Tensor | None = None,
+        trajectory_recorder: _HiggsAudioTrajectoryRecorder | None = None,
     ) -> HiggsAudioV3PendingStep:
         ids = tuple(str(req_id) for req_id in request_ids)
         if len(ids) != int(host_staging.shape[0]):
@@ -250,14 +340,37 @@ class HiggsAudioV3PendingStep:
                 "Higgs pending audio rows must match the launch-time request snapshot: "
                 f"{int(host_staging.shape[0])} rows for {len(ids)} requests"
             )
+        seed_snapshot = tuple(request_seeds) if request_seeds is not None else (None,) * len(ids)
+        if len(seed_snapshot) != len(ids):
+            release()
+            raise ValueError(
+                "Higgs pending audio seeds must match the launch-time request snapshot: "
+                f"{len(seed_snapshot)} seeds for {len(ids)} requests"
+            )
+        sampling_seed_snapshot = tuple(sampling_seeds) if sampling_seeds is not None else seed_snapshot
+        sampling_post_step_snapshot = (
+            tuple(sampling_post_steps) if sampling_post_steps is not None else (None,) * len(ids)
+        )
+        if len(sampling_seed_snapshot) != len(ids) or len(sampling_post_step_snapshot) != len(ids):
+            release()
+            raise ValueError("Higgs pending audio sampling state must match the launch-time request snapshot")
+        if hidden_snapshot is not None and int(hidden_snapshot.shape[0]) != len(ids):
+            release()
+            raise ValueError("Higgs pending hidden rows must match the launch-time request snapshot")
+        immutable_hidden = hidden_snapshot.detach().clone() if hidden_snapshot is not None else None
         return cls(
             request_ids=ids,
             request_id_to_row=MappingProxyType({req_id: row for row, req_id in enumerate(ids)}),
             host_staging=host_staging,
             event=event,
             num_codebooks=int(num_codebooks),
+            request_seeds=seed_snapshot,
+            sampling_seeds=sampling_seed_snapshot,
+            sampling_post_steps=sampling_post_step_snapshot,
+            hidden_snapshot=immutable_hidden,
             _release=release,
             _on_resolve=on_resolve,
+            _trajectory_recorder=trajectory_recorder,
         )
 
     def release(self) -> None:
@@ -273,6 +386,18 @@ class HiggsAudioV3PendingStep:
             # in the immutable snapshot even though downstream only consumes
             # valid audio rows; finish/cancel filtering is runner-owned.
             done = self.host_staging[:, self.num_codebooks + 1].tolist()
+            if self._trajectory_recorder is not None:
+                self._trajectory_recorder.record(
+                    self.request_ids,
+                    self.request_seeds,
+                    self.sampling_seeds,
+                    self.sampling_post_steps,
+                    self.hidden_snapshot,
+                    self.host_staging,
+                    valid,
+                    done,
+                    self.num_codebooks,
+                )
             if self._on_resolve is not None:
                 self._on_resolve(self.request_ids, valid, done)
             resolved: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
@@ -439,6 +564,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_audio_staging_event: torch.cuda.Event | None = None
         self._last_audio_valid_flags: list[int] | None = None
         self._last_audio_done_flags: list[int] | None = None
+        self._trajectory_hidden_snapshot: torch.Tensor | None = None
         self._audio_host_staging_pool = _HiggsAudioHostStagingPool(
             width=self.num_codebooks + 2,
             pin_memory=torch.cuda.is_available(),
@@ -545,6 +671,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._request_state_next_row: int = 0
         self._active_request_ids: tuple[str, ...] = ()
         self._request_sampling_seed_by_id: dict[str, int] = {}
+        self._trajectory_recorder = _create_higgs_audio_trajectory_recorder()
 
         # PrefixCache compatibility hooks (mirror qwen3_tts pattern):
         # 1. The talker only consumes the last token's hidden state, so the
@@ -1283,6 +1410,20 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if newly_allocated:
             self._reset_request_state_pool_rows(torch.tensor(newly_allocated, dtype=torch.long, device=device))
 
+        seeded_pool_rows: list[int] = []
+        seeded_values: list[int] = []
+        for req_id, pool_row in zip(req_ids_tuple, pool_rows, strict=True):
+            seed = self._request_sampling_seed_by_id.get(req_id)
+            if seed is not None:
+                seeded_pool_rows.append(pool_row)
+                seeded_values.append(seed)
+        if seeded_pool_rows:
+            self._request_decode_seed.index_copy_(
+                0,
+                torch.tensor(seeded_pool_rows, dtype=torch.long, device=device),
+                torch.tensor(seeded_values, dtype=torch.long, device=device),
+            )
+
         rows = torch.tensor(pool_rows, dtype=torch.long, device=device)
         num_rows = len(pool_rows)
         if num_rows:
@@ -1414,6 +1555,18 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self._request_sampling_seed_by_id[req_id] = seed
             self._decode_seed[row] = seed
 
+    def register_request_sampling_seeds(self, seeds: Mapping[str, int]) -> None:
+        """Register immutable serving-owned seeds before request materialization."""
+        for req_id, seed_value in seeds.items():
+            req_id = str(req_id)
+            seed = int(seed_value)
+            previous = self._request_sampling_seed_by_id.get(req_id)
+            if previous is not None and previous != seed:
+                raise ValueError(
+                    f"Higgs request {req_id!r} already owns effective seed {previous}, cannot replace it with {seed}"
+                )
+            self._request_sampling_seed_by_id[req_id] = seed
+
     # ------------------------------------------------------------------ sampling
     def sample(self, logits: torch.Tensor | None, sampling_metadata: Any) -> Any:
         """Model-owned sampler with delay-pattern audio dispatch.
@@ -1423,6 +1576,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         and accumulate per-request state.
         """
         self._resolve_token_ids()
+        self._trajectory_hidden_snapshot = None
 
         audio_id = self._audio_continuation_id
 
@@ -1448,6 +1602,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             return sampler_output
 
         num_rows = int(hidden.shape[0])
+        if self._trajectory_recorder is not None:
+            self._trajectory_hidden_snapshot = hidden.reshape(-1, hidden.shape[-1])[:num_rows].detach()
         self._ensure_decode_state_capacity(num_rows, hidden.device)
         self._refresh_request_sampling_seeds(sampling_metadata, num_rows)
         ids = getattr(self, "_last_step_input_ids", None)
@@ -1684,13 +1840,25 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         lease = self._last_audio_host_lease
         if host_staging is None or lease is None:
             return None
+        trajectory_recorder = getattr(self, "_trajectory_recorder", None)
+        sampling_seeds: list[int] | None = None
+        sampling_post_steps: list[int] | None = None
+        if trajectory_recorder is not None:
+            num_rows = len(request_ids)
+            sampling_seeds = self._decode_seed[:num_rows].detach().cpu().tolist()
+            sampling_post_steps = self._decode_step_count[:num_rows].detach().cpu().tolist()
         pending = HiggsAudioV3PendingStep.create(
             request_ids=request_ids,
+            request_seeds=[self._request_sampling_seed_by_id.get(str(req_id)) for req_id in request_ids],
+            sampling_seeds=sampling_seeds,
+            sampling_post_steps=sampling_post_steps,
+            hidden_snapshot=self._trajectory_hidden_snapshot,
             host_staging=host_staging,
             event=self._last_audio_staging_event,
             num_codebooks=self.num_codebooks,
             release=lease.release,
             on_resolve=self._mark_audio_direct_requests,
+            trajectory_recorder=trajectory_recorder,
         )
         # Ownership moved to the immutable pending handle. The next sample may
         # acquire the other slot without touching this step's host snapshot.
@@ -1699,6 +1867,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_audio_staging_event = None
         self._last_audio_valid_flags = None
         self._last_audio_done_flags = None
+        self._trajectory_hidden_snapshot = None
         self._postprocess_cursor = 0
         return pending
 

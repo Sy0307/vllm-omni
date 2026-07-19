@@ -602,6 +602,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         model = getattr(self, "model", None)
         return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
 
+    def _register_model_request_sampling_seeds(self, scheduler_output: SchedulerOutput) -> None:
+        """Pass serving-owned request seeds to opt-in models at admission."""
+        register = getattr(self.model, "register_request_sampling_seeds", None)
+        if not callable(register):
+            return
+
+        seeds: dict[str, int] = {}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            sampling_params = getattr(new_req, "sampling_params", None)
+            extra_args = getattr(sampling_params, "extra_args", None)
+            if not isinstance(extra_args, dict):
+                continue
+            effective_seed = extra_args.get("tts_effective_seed")
+            if effective_seed is not None:
+                seeds[str(new_req.req_id)] = int(effective_seed)
+        if seeds:
+            register(seeds)
+
     def _get_runner_assisted_full_attention_metadata_request(
         self,
         *,
@@ -1041,6 +1059,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Notify model of finished requests for state cleanup
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
+            self._register_model_request_sampling_seeds(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(

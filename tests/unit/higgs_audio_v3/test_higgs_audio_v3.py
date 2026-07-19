@@ -7,6 +7,7 @@ without requiring the actual checkpoint or GPU.
 """
 
 import asyncio
+import hashlib
 import json
 import time
 from collections import OrderedDict, defaultdict
@@ -366,6 +367,7 @@ class TestSamplerMethods:
         t._active_request_ids = ()
         t._request_sampling_seed_by_id = {}
         t._fast_audio_direct_request_ids = set()
+        t._trajectory_recorder = None
         t._audio_state_step_mode = "legacy"
         t._compiled_audio_state_step = None
 
@@ -414,6 +416,59 @@ class TestSamplerMethods:
         assert t._decode_last_codes[0].eq(22).all()
         assert t._decode_delay_count[0].item() == 7
         assert t._decode_has_codes[0].item() is True
+
+    def test_registered_request_seeds_initialize_pool_and_survive_reorder(self):
+        """Effective seeds are request-owned before active rows are materialized."""
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=4)
+        t.register_request_sampling_seeds = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration.register_request_sampling_seeds.__get__(t)
+        )
+
+        t.register_request_sampling_seeds({"req-a": 111, "req-b": 222})
+        t._prepare_request_state(["req-a", "req-b"], torch.device("cpu"))
+
+        assert t._decode_seed[:2].tolist() == [111, 222]
+
+        t._decode_step_count[:2] = torch.tensor([7, 9])
+        t._commit_request_state(2)
+        t._prepare_request_state(["req-b"], torch.device("cpu"))
+
+        assert t._decode_seed[0].item() == 222
+        assert t._decode_step_count[0].item() == 9
+
+    def test_register_request_sampling_seed_rejects_live_conflict(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t.register_request_sampling_seeds = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration.register_request_sampling_seeds.__get__(t)
+        )
+
+        t.register_request_sampling_seeds({"req-a": 111})
+
+        with pytest.raises(ValueError, match="req-a"):
+            t.register_request_sampling_seeds({"req-a": 222})
+
+    def test_finished_request_seed_is_cleared_before_pool_row_reuse(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        t = self._make_batched_sampler_talker(num_rows=2)
+        t.register_request_sampling_seeds = (
+            mod.HiggsAudioV3TalkerForConditionalGeneration.register_request_sampling_seeds.__get__(t)
+        )
+        t.register_request_sampling_seeds({"req-a": 111})
+        first_rows = t._prepare_request_state(["req-a"], torch.device("cpu"))
+        first_pool_row = int(first_rows[0])
+
+        t.on_requests_finished({"req-a"})
+        t.register_request_sampling_seeds({"req-b": 222})
+        second_rows = t._prepare_request_state(["req-b"], torch.device("cpu"))
+
+        assert int(second_rows[0]) == first_pool_row
+        assert t._decode_seed[0].item() == 222
+        assert "req-a" not in t._request_sampling_seed_by_id
 
     def test_finished_request_state_row_is_reset_before_reuse(self):
         """Finish/cancel cleanup must not leak codec state into the next owner."""
@@ -1143,6 +1198,64 @@ class TestFeedbackMethods:
             resolved["req-b"]["codes"]["audio"],
             torch.tensor([[21, 22, 23, 24, 25, 26, 27, 28]], dtype=torch.int32),
         )
+
+    def test_pending_audio_step_writes_request_trajectory_fingerprint(self, tmp_path):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3PendingStep,
+            _HiggsAudioTrajectoryRecorder,
+        )
+
+        path = tmp_path / "trajectory.jsonl"
+        recorder = _HiggsAudioTrajectoryRecorder(path)
+        host = torch.tensor(
+            [
+                [11, 12, 13, 14, 15, 16, 17, 18, 1, 0],
+                [21, 22, 23, 24, 25, 26, 27, 28, 0, 1],
+            ],
+            dtype=torch.int32,
+        )
+        pending = HiggsAudioV3PendingStep.create(
+            request_ids=["req-a", "req-b"],
+            request_seeds=[111, 222],
+            sampling_seeds=[111, 333],
+            sampling_post_steps=[1, 7],
+            hidden_snapshot=torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16),
+            host_staging=host,
+            event=None,
+            num_codebooks=8,
+            release=lambda: None,
+            trajectory_recorder=recorder,
+        )
+
+        pending.resolve()
+
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [(record["request_id"], record["effective_seed"]) for record in records] == [
+            ("req-a", 111),
+            ("req-b", 222),
+        ]
+        assert [record["sampling_seed"] for record in records] == [111, 333]
+        assert [record["decode_step"] for record in records] == [0, 0]
+        assert [record["sampling_decode_step"] for record in records] == [0, 7]
+        assert [record["sampling_post_step"] for record in records] == [1, 7]
+        expected_hidden_hashes = [
+            hashlib.sha256(row.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+            for row in torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+        ]
+        assert [record["hidden_hash"] for record in records] == expected_hidden_hashes
+        assert [record["valid"] for record in records] == [True, False]
+        assert [record["done"] for record in records] == [False, True]
+        assert records[0]["sampled_codes_hash"] == hashlib.sha256(host[0, :8].numpy().tobytes()).hexdigest()
+        assert records[1]["sampled_codes_hash"] is None
+
+    def test_trajectory_recorder_is_absent_without_opt_in(self, monkeypatch):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            _create_higgs_audio_trajectory_recorder,
+        )
+
+        monkeypatch.delenv("HIGGS_AUDIO_V3_TRAJECTORY_PATH", raising=False)
+
+        assert _create_higgs_audio_trajectory_recorder() is None
 
     def test_pending_audio_step_keeps_invalid_rows_as_empty_payloads(self):
         """An authoritative async snapshot must clear stale audio rows."""
