@@ -12,6 +12,7 @@ import hashlib
 import io
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -31,21 +32,39 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key, get_tts_handoff
+from vllm_omni.platforms import current_omni_platform
 
-# Preserve the established external vocoder on CUDA. Ascend uses the in-tree
-# adapter because ``stepaudio2-minicpmo`` hard-codes CUDA device placement.
+# The external vocoder hard-codes CUDA placement. Ascend uses the in-tree
+# adapter, with the external package retained as a fallback for compatibility.
+_stepaudio2_import_error: ImportError | None = None
 if current_omni_platform.is_npu():
     try:
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
             MiniCPMO45Token2wav as _Token2wav,
         )
 
-    _stepaudio2_available = True
-    _stepaudio2_import_error = None
-except ImportError as e:
-    _Token2wav = None
-    _stepaudio2_available = False
-    _stepaudio2_import_error = e
+        _token2wav_backend = "step_audio2_core"
+    except ImportError as e:
+        _stepaudio2_import_error = e
+        try:
+            from stepaudio2 import Token2wav as _Token2wav
+
+            _token2wav_backend = "stepaudio2_pkg"
+        except ImportError as fallback_error:
+            _Token2wav = None
+            _token2wav_backend = None
+            _stepaudio2_import_error = fallback_error
+else:
+    try:
+        from stepaudio2 import Token2wav as _Token2wav
+
+        _token2wav_backend = "stepaudio2_pkg"
+    except ImportError as e:
+        _Token2wav = None
+        _token2wav_backend = None
+        _stepaudio2_import_error = e
+
+_stepaudio2_available = _Token2wav is not None
 
 logger = logging.getLogger(__name__)
 
@@ -304,17 +323,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._assets_loaded = True
         try:
             model_path = self.vllm_config.model_config.model
-
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
             from transformers import AutoImageProcessor
             from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-            # openbmb/MiniCPM-o-4_5/processing_minicpmo.py registers via a
-            # string: AutoImageProcessor.register("MiniCPMVImageProcessor", ...),
-            # which crashes on transformers>=5 (register reads key.__module__).
-            # Loading MiniCPMTTS imports that module, so no-op the string form
-            # (unused by the standalone talker) while it runs, then restore.
+            # The remote processing module registers an image processor by
+            # string, which transformers>=5 rejects. The standalone talker does
+            # not use that registration, so ignore only the string form while
+            # importing MiniCPMTTS and restore the global method immediately.
             original_register = AutoImageProcessor.register
             AutoImageProcessor.register = (  # type: ignore[method-assign]
                 lambda key, *a, **k: None if isinstance(key, str) else original_register(key, *a, **k)
@@ -335,6 +352,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ):
                     if not hasattr(self._tts_config, name):
                         setattr(self._tts_config, name, default)
+                self._tts_config.attn_implementation = "sdpa"
                 self.tts_obj = MiniCPMTTS(config=self._tts_config, audio_tokenizer=None)
             finally:
                 torch.set_default_dtype(prev_dtype)
@@ -370,8 +388,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     torch.set_default_dtype(prev_dtype2)
                 self.tts_obj.audio_tokenizer = self.audio_tokenizer
                 logger.info(
-                    "Loaded Token2wav from %s (n_timesteps=%d)",
+                    "Loaded Token2wav from %s (backend=%s, n_timesteps=%d)",
                     token2wav_dir,
+                    _token2wav_backend,
                     self._token2wav_n_timesteps,
                 )
         except ImportError:
@@ -409,12 +428,34 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def _token2wav_autocast_context(self):
         dtype = self._tts_runtime_config().token2wav_autocast_dtype
+        device_type = str(current_omni_platform.device_type)
         if dtype is None:
-            return torch.amp.autocast("cuda", enabled=False), "off"
+            return (
+                current_omni_platform.create_autocast_context(
+                    device_type=device_type,
+                    dtype=torch.float32,
+                    enabled=False,
+                ),
+                "off",
+            )
         if dtype is torch.bfloat16:
-            return torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16), "bf16"
+            return (
+                current_omni_platform.create_autocast_context(
+                    device_type=device_type,
+                    dtype=torch.bfloat16,
+                    enabled=True,
+                ),
+                "bf16",
+            )
         if dtype is torch.float16:
-            return torch.amp.autocast("cuda", enabled=True, dtype=torch.float16), "fp16"
+            return (
+                current_omni_platform.create_autocast_context(
+                    device_type=device_type,
+                    dtype=torch.float16,
+                    enabled=True,
+                ),
+                "fp16",
+            )
         raise ValueError("MiniCPM-o 4.5 token2wav autocast only supports None, bfloat16, or float16")
 
     def _should_use_direct_token2wav(self) -> bool:
@@ -1301,11 +1342,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not yielded_any:
             yield self._empty_audio_chunk(), True
 
-    def _move_tts_modules_to_cuda(self) -> torch.dtype:
-        target_dtype = self._target_tts_dtype()
+    def _move_tts_modules_to_device(self) -> torch.dtype:
+        device = current_omni_platform.get_torch_device()
+        target_dtype = torch.bfloat16 if current_omni_platform.is_npu() else self._target_tts_dtype()
         if target_dtype is torch.float32:
-            self.tts_obj = self.tts_obj.to("cuda")
-            logger.info("Moved MiniCPM-o 4.5 TTS object to cuda dtype=%s", target_dtype)
+            self.tts_obj = self.tts_obj.to(device)
+            logger.info("Moved MiniCPM-o 4.5 TTS object to %s dtype=%s", device, target_dtype)
             return target_dtype
 
         for module_name in (
@@ -1318,8 +1360,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         ):
             module = getattr(self.tts_obj, module_name, None)
             if module is not None:
-                module.to(device="cuda", dtype=target_dtype)
-        logger.info("Moved MiniCPM-o 4.5 TTS AR modules to cuda dtype=%s", target_dtype)
+                module.to(device=device, dtype=target_dtype)
+        logger.info("Moved MiniCPM-o 4.5 TTS AR modules to %s dtype=%s", device, target_dtype)
         return target_dtype
 
     def generate_speech(
@@ -1340,14 +1382,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         dtype = tts.emb_text.weight.dtype
 
         llm_embeds = tts.emb_text(tts_token_ids.to(device))
-        hidden_embeds = tts.projector_semantic(tts_hidden_states.to(device=device, dtype=ar_dtype))
+        hidden_embeds = tts.projector_semantic(tts_hidden_states.to(device=device, dtype=dtype))
         if getattr(tts.config, "normalize_projected_hidden", False):
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
-        tts_embeds = (llm_embeds + hidden_embeds).to(dtype=ar_dtype)
+        tts_embeds = llm_embeds + hidden_embeds
 
         text_eos = tts.emb_text(torch.tensor([tts.config.text_eos_token_id], device=device, dtype=torch.long))
         audio_bos = tts.emb_text(torch.tensor([tts.audio_bos_token_id], device=device, dtype=torch.long))
-        spk_embeds = torch.zeros(0, tts.config.hidden_size, device=device, dtype=ar_dtype)
+        spk_embeds = torch.zeros(0, tts.config.hidden_size, device=device, dtype=tts_embeds.dtype)
 
         inputs_embeds = torch.cat([spk_embeds, tts_embeds, text_eos, audio_bos], dim=0).unsqueeze(0)
 
@@ -1679,12 +1721,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     logger.warning("TTS missing keys (%d): %s", len(missing), missing[:5])
                 if unexpected:
                     logger.warning("TTS unexpected keys (%d): %s", len(unexpected), unexpected[:5])
-                tts_dtype = self._move_tts_modules_to_cuda()
-                if self.audio_tokenizer is not None and hasattr(self.audio_tokenizer, "to"):
+                tts_dtype = self._move_tts_modules_to_device()
+                if (
+                    not current_omni_platform.is_npu()
+                    and self.audio_tokenizer is not None
+                    and hasattr(self.audio_tokenizer, "to")
+                ):
                     self.audio_tokenizer.to("cuda")
                 self.emb_text = self.tts_obj.emb_text
                 self.projector_semantic = self.tts_obj.projector_semantic
-                logger.info("Loaded %d TTS weights, moved AR modules to cuda dtype=%s", len(tts_weights), tts_dtype)
+                logger.info(
+                    "Loaded %d TTS weights, moved AR modules to %s dtype=%s",
+                    len(tts_weights),
+                    current_omni_platform.get_torch_device(),
+                    tts_dtype,
+                )
 
         return loaded
 

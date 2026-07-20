@@ -263,12 +263,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             ]
             state.audio_chunk_idx += 1
             units_built += 1
-            chunk_size = self._streaming_chunk_size()
+            chunk_size = self._streaming_chunk_size(processor)
         if frame_blocks:
-            # The engine reserved 66 scheduler slots per frame in this append;
-            # leaving a frame unfed would desynchronize the reservation from
-            # the built span. Serving aligns frames to whole units, so this
-            # only fires on a protocol violation.
+            # Each frame reserves one image block in the append plan. A frame
+            # without a matching audio unit would desynchronize that plan.
             return self._stage_prefill_result(
                 False,
                 start_time,

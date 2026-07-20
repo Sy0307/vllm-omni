@@ -1123,7 +1123,7 @@ class TestDeployConfigLoading:
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "minicpmo_4_5_duplex.yaml"
 
         deploy = load_deploy_config(deploy_path)
-        pipeline = StageConfigFactory.resolve_pipeline_config("minicpmo_4_5")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
 
         stages = merge_pipeline_deploy(pipeline, deploy)
@@ -1156,7 +1156,7 @@ class TestDeployConfigLoading:
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / filename
 
         deploy = load_deploy_config(deploy_path)
-        pipeline = StageConfigFactory.resolve_pipeline_config("minicpmo_4_5")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
 
         stages = merge_pipeline_deploy(pipeline, deploy)
