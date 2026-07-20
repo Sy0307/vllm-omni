@@ -297,16 +297,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         hidden_state: torch.Tensor,
         history: torch.Tensor,
         request_id: str,
+        step: int,
     ) -> torch.Tensor:
         logits = self.head_code[0](hidden_state).float() / 0.8
+        eos_id = self._num_audio_tokens - 1
         logits = _apply_repetition_penalty(
             logits,
             history,
             penalty=1.05,
             window_size=_REPETITION_WINDOW,
         )
-        if history.numel() < 50:
-            logits[..., self._num_audio_tokens - 1] = float("-inf")
+        if step < 50:
+            logits[..., eos_id] = float("-inf")
         logits = _apply_top_k_top_p(
             logits,
             top_k=25,
@@ -377,7 +379,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             request_id = str(info.get("request_id", index))
-            sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id)
+            step = int(state.get("step", 0))
+            sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
             is_eos = int(sampled.item()) == self._num_audio_tokens - 1
             state["step"] = int(state.get("step", 0)) + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
