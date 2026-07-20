@@ -28,13 +28,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex_types import DuplexFence
-from vllm_omni.engine.messages import DuplexSessionLifecycleMessage, ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import DuplexFence, DuplexSessionLifecycleMessage, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.duplex_request_client import (
-    DuplexRequestClient,
-    DuplexRequestOutputPort,
-)
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
@@ -50,6 +45,7 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
+    from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
     from vllm_omni.inputs.data import OmniPromptType
 
 logger = init_logger(__name__)
@@ -158,6 +154,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self.input_processor = self.engine.input_processor
         self.endpoint_restrictions = self.engine.endpoint_restrictions
         self.duplex_session_config = self.engine.duplex_session_config
+        self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -394,6 +391,11 @@ class AsyncOmni(EngineClient, OmniBase):
         )
 
     def _get_duplex_request_client(self) -> DuplexRequestClient:
+        from vllm_omni.experimental.fullduplex.request_client import (
+            DuplexRequestClient,
+            DuplexRequestOutputPort,
+        )
+
         client = getattr(self, "_duplex_request_client", None)
         if client is None:
             engine = getattr(self, "engine", None)
@@ -412,6 +414,8 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @staticmethod
     def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
         return DuplexRequestClient.request_info(result)
 
     async def _collect_duplex_data_plane_outputs(
@@ -431,10 +435,14 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @classmethod
     def _is_direct_duplex_data_plane_response(cls, output: object) -> bool:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
         return DuplexRequestClient.is_direct_response(output)
 
     @classmethod
     def _duplex_multimodal_output(cls, output: object) -> dict[str, object]:
+        from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
+
         return DuplexRequestClient.multimodal_output(output)
 
     # ==================== Generate Method ====================

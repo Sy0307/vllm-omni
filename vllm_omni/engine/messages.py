@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -14,6 +14,17 @@ from vllm_omni.outputs import OmniRequestOutput
 
 class EngineQueueMessage(msgspec.Struct, forbid_unknown_fields=True):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexFence:
+    """Identity fence carried by experimental duplex control messages."""
+
+    session_id: str
+    epoch: int = 0
+    turn_id: int = 0
+    response_seq: int = 0
+    incarnation: int = 0
 
 
 class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
@@ -178,6 +189,12 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     results: list[object]
 
 
+class DuplexControlError(EngineQueueMessage, kw_only=True):
+    code: str
+    message: str
+    retryable: bool = False
+
+
 class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     type: Literal["duplex_control_result"] = "duplex_control_result"
     control_id: str
@@ -188,3 +205,6 @@ class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     stage_results: list[dict[str, object]]
     unsupported_count: int = 0
     error_count: int = 0
+    error: DuplexControlError | None = None
+    accepted_fence: DuplexFence | None = None
+    lease_generation: int | None = None

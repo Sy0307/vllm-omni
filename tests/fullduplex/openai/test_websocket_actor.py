@@ -5,7 +5,12 @@ import asyncio
 
 import pytest
 
-from vllm_omni.experimental.fullduplex.openai.websocket import DuplexWebSocketActor
+from vllm_omni.experimental.fullduplex.openai.websocket import (
+    DuplexWebSocketActor,
+    normalize_duplex_input_event,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class FakeWebSocket:
@@ -14,6 +19,28 @@ class FakeWebSocket:
 
     async def send_json(self, payload: dict[str, object]) -> None:
         self.sent.append(dict(payload))
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"type": "signal_turn", "event": "barge_in"}, {"type": "turn.signal", "event": "barge_in"}),
+        ({"type": "close_session"}, {"type": "session.close"}),
+        ({"type": "audio.playback_ack", "played_ms": 1}, {"type": "playback.ack", "played_ms": 1}),
+        ({"type": "input_text.append", "text": "a"}, {"type": "input.text.append", "text": "a"}),
+        ({"type": "push_text", "text": "b"}, {"type": "input.text.append", "text": "b"}),
+        (
+            {"type": "input.audio.append", "audio": "wav"},
+            {"type": "input_audio_buffer.append", "audio": "wav", "format": "wav"},
+        ),
+        (
+            {"type": "push_chunk", "audio": "wav", "format": "pcm_f32le"},
+            {"type": "input_audio_buffer.append", "audio": "wav", "format": "pcm_f32le"},
+        ),
+    ],
+)
+def test_input_aliases_normalize_once_at_mailbox_boundary(event, expected):
+    assert normalize_duplex_input_event(event) == expected
 
 
 def test_actor_uses_one_fifo_mailbox_for_inbound_events():

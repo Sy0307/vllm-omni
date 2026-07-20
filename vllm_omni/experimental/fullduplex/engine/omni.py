@@ -3,7 +3,7 @@
 
 """Compatibility exports for the stable engine contract and MiniCPM planner."""
 
-from vllm_omni.engine.duplex_runtime import (
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexFenceMismatchError,
     DuplexInputAppend,
     DuplexInputMode,

@@ -13,16 +13,40 @@ from fastapi import WebSocketDisconnect
 INPUT_EVENTS = frozenset(
     {
         "input.text.append",
-        "input_text.append",
-        "push_text",
-        "input.audio.append",
         "input_audio_buffer.append",
-        "push_chunk",
         "input.commit",
         "input_audio_buffer.commit",
         "response.create",
     }
 )
+
+_INPUT_EVENT_ALIASES = {
+    "signal_turn": "turn.signal",
+    "close_session": "session.close",
+    "audio.playback_ack": "playback.ack",
+    "input_text.append": "input.text.append",
+    "push_text": "input.text.append",
+    "input.audio.append": "input_audio_buffer.append",
+    "push_chunk": "input_audio_buffer.append",
+}
+_WAV_AUDIO_ALIASES = frozenset({"input.audio.append", "push_chunk"})
+
+
+def normalize_duplex_input_event(event: dict[str, object]) -> dict[str, object]:
+    """Normalize compatibility aliases before an event enters the mailbox."""
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return event
+    canonical_type = _INPUT_EVENT_ALIASES.get(event_type)
+    if canonical_type is None:
+        return event
+    normalized = dict(event)
+    normalized["type"] = canonical_type
+    if event_type in _WAV_AUDIO_ALIASES:
+        normalized.setdefault("format", "wav")
+    return normalized
+
+
 MODEL_OUTPUT_EVENTS = frozenset(
     {
         "response.created",
@@ -73,6 +97,7 @@ class DuplexSessionTasks:
     """Connection-independent task handles for one resumable session."""
 
     native_append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
+    native_append_tail: asyncio.Task[bool] | None = None
     active_response_task: asyncio.Task[None] | None = None
 
     def track_append_task(
@@ -131,6 +156,14 @@ class DuplexWebSocketActor:
     @active_response_task.setter
     def active_response_task(self, task: asyncio.Task[None] | None) -> None:
         self.tasks.active_response_task = task
+
+    @property
+    def native_append_tail(self) -> asyncio.Task[bool] | None:
+        return self.tasks.native_append_tail
+
+    @native_append_tail.setter
+    def native_append_tail(self, task: asyncio.Task[bool] | None) -> None:
+        self.tasks.native_append_tail = task
 
     async def enqueue_event(self, event: dict[str, object]) -> None:
         await self.mailbox.put(event)

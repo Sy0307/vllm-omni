@@ -4,7 +4,11 @@ from vllm_omni.metrics import OrchestratorAggregator
 
 
 class ClientRequestState:
-    """Tracks the state of an individual request in the orchestrator."""
+    """Tracks one entrypoint request and its output queue.
+
+    ``resumable`` keeps the client state registered when a scheduler segment
+    finishes so a later append can continue the same logical request.
+    """
 
     def __init__(
         self,

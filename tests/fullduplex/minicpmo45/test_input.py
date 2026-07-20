@@ -4,8 +4,11 @@
 import base64
 
 import numpy as np
+import pytest
 
 from vllm_omni.experimental.fullduplex.minicpmo45.input import MiniCPMO45PcmAppendBuffer
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def pcm_payload(samples: int, *, speech: bool = True) -> dict[str, object]:

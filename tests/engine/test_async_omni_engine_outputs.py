@@ -13,8 +13,8 @@ from types import SimpleNamespace
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, _weak_shutdown_async_omni_engine
-from vllm_omni.engine.duplex_control_client import DuplexControlClient
+from vllm_omni.engine.async_engine_utils import weak_shutdown_async_omni_engine
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     AppendDuplexInputMessage,
     CollectiveRPCResultMessage,
@@ -25,6 +25,10 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
+    DuplexControlClient,
+    DuplexControlRequestError,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -53,7 +57,7 @@ def test_weak_shutdown_closes_rpc_router_before_joining_orchestrator(mocker: Moc
 
     orchestrator_thread.join.side_effect = assert_router_closed_before_join
 
-    _weak_shutdown_async_omni_engine(
+    weak_shutdown_async_omni_engine(
         orchestrator_thread,
         request_queue,
         output_queue,
@@ -225,10 +229,11 @@ def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
         assert msg.type == "open_duplex_session"
         assert msg.control_id == "ctrl-1"
         rpc_q.put(control_result)
-        result = pending.result(timeout=1)
+        with pytest.raises(DuplexControlRequestError) as exc_info:
+            pending.result(timeout=1)
 
-    assert result["unsupported_count"] == 1
-    assert result["stage_results"][0]["result"]["supported"] is False
+    assert exc_info.value.result["unsupported_count"] == 1
+    assert exc_info.value.result["stage_results"][0]["result"]["supported"] is False
     engine._correlated_rpc_client.close()
 
 
@@ -618,7 +623,7 @@ def test_weak_shutdown_is_bounded_when_request_queue_is_full(mocker: MockerFixtu
     orchestrator_thread = mocker.MagicMock()
     orchestrator_thread.is_alive.return_value = True
 
-    _weak_shutdown_async_omni_engine(
+    weak_shutdown_async_omni_engine(
         orchestrator_thread,
         request_queue,
         output_queue,

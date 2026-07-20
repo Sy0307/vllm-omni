@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import math
 import wave
 
 import numpy as np
@@ -14,6 +15,21 @@ try:
     from audioop import alaw2lin, lin2alaw, lin2ulaw, ulaw2lin
 except ImportError:  # pragma: no cover - audioop is removed in newer Python.
     alaw2lin = lin2alaw = lin2ulaw = ulaw2lin = None
+
+
+MIN_INPUT_SAMPLE_RATE_HZ = 8_000
+MAX_INPUT_SAMPLE_RATE_HZ = 192_000
+
+
+def validate_input_sample_rate_hz(sample_rate_hz: int | float) -> int:
+    if isinstance(sample_rate_hz, bool) or (isinstance(sample_rate_hz, float) and not math.isfinite(sample_rate_hz)):
+        raise ValueError("sample_rate_hz must be a finite integer")
+    rate = int(sample_rate_hz)
+    if rate != sample_rate_hz:
+        raise ValueError("sample_rate_hz must be an integer")
+    if not MIN_INPUT_SAMPLE_RATE_HZ <= rate <= MAX_INPUT_SAMPLE_RATE_HZ:
+        raise ValueError(f"sample_rate_hz must be between {MIN_INPUT_SAMPLE_RATE_HZ} and {MAX_INPUT_SAMPLE_RATE_HZ}")
+    return rate
 
 
 def resample_pcm16_mono(raw: bytes, *, source_rate_hz: int, target_rate_hz: int) -> bytes:
@@ -112,6 +128,8 @@ def convert_input_audio_with_rate(
     normalized = fmt.lower()
     if normalized not in {"pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"}:
         return audio, fmt, sample_rate_hz
+    if isinstance(sample_rate_hz, int | float):
+        sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
     try:
         raw = base64.b64decode(audio.strip(), validate=False)
     except (binascii.Error, ValueError):
@@ -124,7 +142,7 @@ def convert_input_audio_with_rate(
         sample_rate_hz = sample_rate_hz if isinstance(sample_rate_hz, int | float) else 8_000
     elif len(raw) % 2:
         return audio, fmt, sample_rate_hz
-    if isinstance(sample_rate_hz, int | float) and sample_rate_hz > 0 and int(sample_rate_hz) != target_sample_rate_hz:
+    if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) != target_sample_rate_hz:
         raw = resample_pcm16_mono(
             raw,
             source_rate_hz=int(sample_rate_hz),

@@ -18,7 +18,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
 import torch
@@ -38,35 +38,33 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
-from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.engine.duplex_control_client import DuplexControlClient
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex_runtime import (
-    load_duplex_runtime_extension,
-    validate_duplex_runtime_extension,
+from vllm_omni.engine.async_engine_utils import (
+    SHUTDOWN_ENQUEUE_TIMEOUT_S,
+    SHUTDOWN_JOIN_TIMEOUT_S,
+    apply_omni_final_stage_metadata,
+    enqueue_orchestrator_shutdown,
+    inject_global_id,
+    shutdown_runtime_after_orchestrator,
+    upgrade_to_omni_request,
+    weak_shutdown_async_omni_engine,
 )
-from vllm_omni.engine.duplex_types import DuplexFence
+from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    DuplexFence,
     EngineQueueMessage,
     ErrorMessage,
-    ShutdownRequestMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
-from vllm_omni.engine.serialization import (
-    deserialize_additional_information,
-    serialize_additional_information,
-)
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
-    StageRuntime,
     StageRuntimeInfo,
     create_stage_runtime,
 )
@@ -80,13 +78,11 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
+
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
-_SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
-_SHUTDOWN_JOIN_TIMEOUT_S = 30.0
-_WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
-
-
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
 # AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
@@ -120,137 +116,6 @@ _PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
 # their presence as an override is never a surprise — suppress the
 # "override ignored" warning for these.
 _PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
-
-
-def _inject_global_id(target: Any, request_id: str) -> None:
-    """Inject global_request_id into a prompt dict's additional_information."""
-    if isinstance(target, dict):
-        if "additional_information" not in target:
-            target["additional_information"] = {}
-        if target["additional_information"] is None:
-            target["additional_information"] = {}
-        if isinstance(target["additional_information"], dict):
-            target["additional_information"]["global_request_id"] = [str(request_id)]
-
-
-def _upgrade_to_omni_request(
-    request: EngineCoreRequest,
-    raw_prompt: Any,
-) -> EngineCoreRequest:
-    """Restore omni-only fields omitted by upstream InputProcessor."""
-    prompt_embeds = request.prompt_embeds
-    additional_information = None
-    wire_payload = None
-    model_intermediate_buffer = None
-
-    if isinstance(raw_prompt, dict):
-        if prompt_embeds is None:
-            raw_prompt_embeds = raw_prompt.get("prompt_embeds")
-            if isinstance(raw_prompt_embeds, torch.Tensor):
-                prompt_embeds = raw_prompt_embeds
-        raw_info = raw_prompt.get("additional_information")
-        raw_buffer = raw_prompt.get("model_intermediate_buffer")
-        if isinstance(raw_info, dict):
-            wire_payload = dict(raw_info)
-        if isinstance(raw_buffer, dict):
-            model_intermediate_buffer = raw_buffer
-        additional_information = serialize_additional_information(wire_payload, log_prefix="AsyncOmniEngine")
-
-    if prompt_embeds is None and additional_information is None and model_intermediate_buffer is None:
-        return request
-
-    return OmniEngineCoreRequest.from_request(
-        request,
-        prompt_embeds=prompt_embeds,
-        additional_information=additional_information,
-        model_intermediate_buffer=model_intermediate_buffer,
-    )
-
-
-def _apply_omni_final_stage_metadata(
-    request: EngineCoreRequest,
-    final_stage_id: int,
-) -> EngineCoreRequest:
-    """Tag EngineCoreRequest so OmniARScheduler can skip DiT KV when final_stage_id is 0."""
-    merged: dict[str, Any] = {}
-    if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
-        merged = deserialize_additional_information(request.additional_information)
-    merged["omni_final_stage_id"] = final_stage_id
-    payload = serialize_additional_information(merged)
-    return OmniEngineCoreRequest.from_request(
-        request,
-        additional_information=payload,
-    )
-
-
-def _weak_shutdown_async_omni_engine(
-    orchestrator_thread: threading.Thread | None,
-    request_queue: janus.Queue[EngineQueueMessage] | None,
-    output_queue: janus.Queue[EngineQueueMessage] | None,
-    rpc_output_queue: janus.Queue[EngineQueueMessage] | None,
-    rpc_client: CorrelatedRpcClient | None,
-) -> None:
-    """Best-effort orchestrator cleanup for GC finalization."""
-    request_queue_closed = False
-    shutdown_enqueued = _enqueue_orchestrator_shutdown(
-        request_queue,
-        timeout=_SHUTDOWN_ENQUEUE_TIMEOUT_S,
-    )
-    if request_queue is not None and not shutdown_enqueued:
-        try:
-            request_queue.close()
-            request_queue_closed = True
-        except Exception:
-            pass
-
-    if rpc_client is not None:
-        rpc_client.close()
-
-    try:
-        if orchestrator_thread is not None and orchestrator_thread.is_alive():
-            orchestrator_thread.join(timeout=_WEAK_SHUTDOWN_JOIN_TIMEOUT_S)
-    except Exception:
-        pass
-
-    for q in (request_queue, output_queue, rpc_output_queue):
-        try:
-            if q is not None and not (q is request_queue and request_queue_closed):
-                q.close()
-        except Exception:
-            pass
-
-
-def _enqueue_orchestrator_shutdown(
-    request_queue: janus.Queue[EngineQueueMessage] | None,
-    *,
-    timeout: float,
-) -> bool:
-    """Deliver shutdown without waiting forever behind a full request queue."""
-    if request_queue is None:
-        return False
-    try:
-        request_queue.sync_q.put(ShutdownRequestMessage(), timeout=timeout)
-    except Exception:
-        return False
-    return True
-
-
-def _shutdown_runtime_after_orchestrator(
-    orchestrator_thread: threading.Thread,
-    runtime: StageRuntime,
-) -> None:
-    """Release StageRuntime once its orchestrator can no longer use it."""
-    try:
-        orchestrator_thread.join()
-    except Exception:
-        logger.exception("[AsyncOmniEngine] Failed while awaiting deferred Orchestrator shutdown")
-    if orchestrator_thread.is_alive():
-        logger.error("[AsyncOmniEngine] Orchestrator is still alive; StageRuntime cleanup remains deferred")
-        return
-    try:
-        runtime.shutdown()
-    except Exception:
-        logger.exception("[AsyncOmniEngine] Failed to shutdown deferred StageRuntime")
 
 
 class AsyncOmniEngine:
@@ -356,6 +221,9 @@ class AsyncOmniEngine:
         self._duplex_runtime_extension_path = (
             pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
         )
+        self.duplex_serving_adapter_path = (
+            pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
+        )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
@@ -416,7 +284,7 @@ class AsyncOmniEngine:
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self._weak_finalizer = weakref.finalize(
             self,
-            _weak_shutdown_async_omni_engine,
+            weak_shutdown_async_omni_engine,
             self.orchestrator_thread,
             self.request_queue,
             self.output_queue,
@@ -514,14 +382,21 @@ class AsyncOmniEngine:
             pd_config = self._detect_pd_config()
 
             membership_controller = self._runtime.create_membership_controller()
-            duplex_runtime_extension = load_duplex_runtime_extension(
-                getattr(self, "_duplex_runtime_extension_path", None)
-            )
-            if duplex_runtime_extension is not None:
-                validate_duplex_runtime_extension(
-                    duplex_runtime_extension,
-                    sampling_defaults=tuple(pool.stage_client.default_sampling_params for pool in self.stage_pools),
+            duplex_runtime_extension = None
+            if self._duplex_control_enabled:
+                from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+                    load_duplex_runtime_extension,
+                    validate_duplex_runtime_extension,
                 )
+
+                duplex_runtime_extension = load_duplex_runtime_extension(
+                    getattr(self, "_duplex_runtime_extension_path", None)
+                )
+                if duplex_runtime_extension is not None:
+                    validate_duplex_runtime_extension(
+                        duplex_runtime_extension,
+                        sampling_defaults=tuple(pool.stage_client.default_sampling_params for pool in self.stage_pools),
+                    )
 
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
@@ -808,10 +683,10 @@ class AsyncOmniEngine:
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
-                _inject_global_id(prompt, request_id)
+                inject_global_id(prompt, request_id)
             elif isinstance(prompt, list):
                 for item in prompt:
-                    _inject_global_id(item, request_id)
+                    inject_global_id(item, request_id)
 
             preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
@@ -841,7 +716,7 @@ class AsyncOmniEngine:
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
-            request = _upgrade_to_omni_request(request, prompt)
+            request = upgrade_to_omni_request(request, prompt)
 
             if reasoning_ended is not None:
                 request.reasoning_ended = reasoning_ended
@@ -853,7 +728,7 @@ class AsyncOmniEngine:
             # to match the key used in Orchestrator.request_states so that
             # output routing (output.request_id lookup) can find the req_state.
             request.external_req_id = request_id
-            request = _apply_omni_final_stage_metadata(request, final_stage_id)
+            request = apply_omni_final_stage_metadata(request, final_stage_id)
 
             # Registration with stage 0's output processor is deferred to the
             # orchestrator thread (see Orchestrator._handle_add_request), which
@@ -901,7 +776,7 @@ class AsyncOmniEngine:
             companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
 
             if isinstance(companion_prompt, dict):
-                _inject_global_id(companion_prompt, cid)
+                inject_global_id(companion_prompt, cid)
 
             request = self.input_processor.process_inputs(
                 request_id=cid,
@@ -1756,6 +1631,8 @@ class AsyncOmniEngine:
         )
 
     def _get_duplex_control_client(self) -> DuplexControlClient:
+        from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
+
         client = getattr(self, "_duplex_control_client", None)
         if client is None:
             transport = getattr(self, "_correlated_rpc_client", None)
@@ -1888,9 +1765,9 @@ class AsyncOmniEngine:
 
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
         request_queue_closed = False
-        shutdown_enqueued = _enqueue_orchestrator_shutdown(
+        shutdown_enqueued = enqueue_orchestrator_shutdown(
             self.request_queue,
-            timeout=_SHUTDOWN_ENQUEUE_TIMEOUT_S,
+            timeout=SHUTDOWN_ENQUEUE_TIMEOUT_S,
         )
         if self.request_queue is not None and not shutdown_enqueued:
             logger.error(
@@ -1912,12 +1789,12 @@ class AsyncOmniEngine:
         orchestrator_stopped = False
         try:
             if self.is_alive():
-                self.orchestrator_thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_S)
+                self.orchestrator_thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
             orchestrator_stopped = not self.is_alive()
             if not orchestrator_stopped:
                 logger.error(
                     "[AsyncOmniEngine] Orchestrator did not stop within %.1f seconds; continuing cleanup",
-                    _SHUTDOWN_JOIN_TIMEOUT_S,
+                    SHUTDOWN_JOIN_TIMEOUT_S,
                 )
         except Exception:
             logger.exception("[AsyncOmniEngine] Failed to join Orchestrator thread")
@@ -1937,7 +1814,7 @@ class AsyncOmniEngine:
         elif hasattr(self, "_runtime") and self._runtime is not None:
             logger.warning("[AsyncOmniEngine] Deferring StageRuntime shutdown until the Orchestrator exits")
             threading.Thread(
-                target=_shutdown_runtime_after_orchestrator,
+                target=shutdown_runtime_after_orchestrator,
                 args=(self.orchestrator_thread, self._runtime),
                 daemon=True,
                 name="omni-stage-runtime-shutdown",

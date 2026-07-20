@@ -112,7 +112,7 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            return self._conversation_item_to_duplex(event)
+            return await self._conversation_item_to_duplex(event)
         if event_type == "conversation.item.delete":
             item_id = event.get("item_id")
             if not isinstance(item_id, str) or not item_id:
@@ -259,11 +259,22 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
-                audio,
-                fmt,
-                sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
-            )
+            try:
+                audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+                    audio,
+                    fmt,
+                    sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
+                )
+            except ValueError as exc:
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "bad_event",
+                        str(exc),
+                        event_id=event.get("event_id"),
+                        param="sample_rate_hz",
+                    )
+                )
+                return None
             looks_like_speech = self._input_looks_like_speech(event, audio=audio, fmt=fmt)
             self._input_audio_buffer_has_audio = self._input_audio_buffer_has_audio or (
                 looks_like_speech and isinstance(audio, str) and bool(audio)
@@ -1030,7 +1041,7 @@ class RealtimeInputTranslator:
             return int(value)
         return None
 
-    def _conversation_item_to_duplex(self, event: dict[str, object]) -> dict[str, object] | None:
+    async def _conversation_item_to_duplex(self, event: dict[str, object]) -> dict[str, object] | None:
         item = event.get("item")
         if not isinstance(item, dict):
             return None
@@ -1066,11 +1077,22 @@ class RealtimeInputTranslator:
                 )
                 if not self._is_supported_realtime_input_format(fmt):
                     continue
-                audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
-                    audio,
-                    fmt,
-                    sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
-                )
+                try:
+                    audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+                        audio,
+                        fmt,
+                        sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
+                    )
+                except ValueError as exc:
+                    await self._send_realtime_payload(
+                        self._realtime_error_payload(
+                            "bad_event",
+                            str(exc),
+                            event_id=event.get("event_id"),
+                            param="sample_rate_hz",
+                        )
+                    )
+                    return None
                 if not isinstance(audio, str) or not audio:
                     continue
                 speech_hints = dict(event)

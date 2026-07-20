@@ -15,25 +15,12 @@ from fastapi import WebSocket
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex_runtime import duplex_resource_request_id
-from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import DuplexSessionLifecycleMessage
 from vllm_omni.entrypoints.openai.duplex_capability import (
     should_enable_duplex_endpoint,
 )
-from vllm_omni.experimental.fullduplex.minicpmo45 import (
-    MiniCPMO45ClientRuntimeConfigError,
-    MiniCPMO45NativeDuplexServingAdapter,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
-    MiniCPMO45DataPlaneSession,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.session import (
-    MiniCPMO45ServingSessionState,
-)
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.chat_fallback import (
     ChatFallbackProjectorMixin,
 )
@@ -53,6 +40,13 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
     NativeRealtimeSessionProtocol,
+)
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    ServingRuntimeAdapter,
+    ServingRuntimeConfigError,
+    ServingRuntimeSessionState,
+    load_serving_runtime_adapter,
+    validate_serving_runtime_adapter,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_bridge import (
     NativeRuntimeBridgeMixin,
@@ -110,6 +104,8 @@ class OmniDuplexSessionHandler(
         config_timeout_s: float = _DEFAULT_CONFIG_TIMEOUT_S,
         idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
+        serving_runtime_adapter: ServingRuntimeAdapter | None = None,
+        serving_runtime_adapter_path: str | None = None,
     ) -> None:
         self._chat_service = chat_service
         self._config_timeout_s = config_timeout_s
@@ -126,8 +122,20 @@ class OmniDuplexSessionHandler(
             )
         )
         self._turn_controller = DuplexTurnController()
-        self._minicpmo_data_plane = MiniCPMO45DataPlaneSession(self._encode_minicpmo_data_plane_audio)
-        self._minicpmo_sessions: dict[str, MiniCPMO45ServingSessionState] = {}
+        adapter_path = serving_runtime_adapter_path or getattr(
+            chat_service,
+            "duplex_serving_adapter_path",
+            None,
+        )
+        if serving_runtime_adapter is not None:
+            self._serving_runtime_adapter = validate_serving_runtime_adapter(serving_runtime_adapter)
+        elif isinstance(adapter_path, str) and adapter_path:
+            self._serving_runtime_adapter = load_serving_runtime_adapter(
+                adapter_path,
+                self._encode_native_data_plane_audio,
+            )
+        else:
+            raise ValueError("A duplex serving runtime adapter must be explicitly configured")
         self._session_tasks: dict[str, DuplexSessionTasks] = {}
         self._realtime_protocols: dict[str, NativeRealtimeSessionProtocol] = {}
         self._lease_generations: dict[str, int] = {}
@@ -211,7 +219,7 @@ class OmniDuplexSessionHandler(
                 active_response_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await active_response_task
-        native = self._minicpmo_sessions.get(session.session_id)
+        native = self._serving_runtime_adapter.session_states.get(session.session_id)
         if native is not None and native.data_plane_task is not None:
             data_plane_task = native.data_plane_task
             native.data_plane_task = None
@@ -254,7 +262,7 @@ class OmniDuplexSessionHandler(
         *,
         session: DuplexSession | None,
         actor: DuplexWebSocketActor,
-        native: MiniCPMO45ServingSessionState,
+        native: ServingRuntimeSessionState,
         realtime_protocol: NativeRealtimeSessionProtocol | None,
     ) -> tuple[bool, dict[str, object] | None]:
         """Apply domain transitions before an event is queued for transport."""
@@ -350,7 +358,7 @@ class OmniDuplexSessionHandler(
                     deferred_overlap_payload.setdefault(
                         "new_user_turn_prefix_variant",
                         native.auto_response_new_turn_prefix_variant
-                        or MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+                        or self._serving_runtime_adapter.clean_response_done_prefix,
                     )
                     native.auto_response_new_turn_prefix_variant = None
                     native.auto_response_waiting_for_speech = False
@@ -762,12 +770,20 @@ class OmniDuplexSessionHandler(
         duration_ms = cls._input_audio_duration_ms(event, payload)
         return 0 < duration_ms <= session.config.overlap_short_ack_ms
 
-    def _minicpmo_session_state(self, session: DuplexSession) -> MiniCPMO45ServingSessionState:
-        state = self._minicpmo_sessions.get(session.session_id)
-        if state is None:
-            state = MiniCPMO45ServingSessionState()
-            self._minicpmo_sessions[session.session_id] = state
-        return state
+    def _runtime_session_state(self, session: DuplexSession) -> ServingRuntimeSessionState:
+        return self._serving_runtime_adapter.session_state(session.session_id)
+
+    # Temporary compatibility accessors for downstream tests and extensions.
+    def _minicpmo_session_state(self, session: DuplexSession) -> ServingRuntimeSessionState:
+        return self._runtime_session_state(session)
+
+    @property
+    def _minicpmo_sessions(self):
+        return self._serving_runtime_adapter.session_states
+
+    @property
+    def _minicpmo_data_plane(self):
+        return self._serving_runtime_adapter.data_plane
 
     def _should_force_listen_for_auto_response_overlap(
         self,
@@ -801,7 +817,7 @@ class OmniDuplexSessionHandler(
     ) -> bool:
         if not self._session_auto_responds(session):
             return False
-        native = self._minicpmo_session_state(session)
+        native = self._runtime_session_state(session)
         if not native.auto_response_waiting_for_speech:
             return False
         if native.deferred_overlap_turn and native.input_since_commit:
@@ -823,16 +839,15 @@ class OmniDuplexSessionHandler(
     ) -> None:
         if not self._session_auto_responds(session):
             return
-        native = self._minicpmo_session_state(session)
+        native = self._runtime_session_state(session)
         native.auto_response_waiting_for_speech = True
         native.auto_response_new_turn_prefix_variant = prefix_variant
 
-    @staticmethod
-    def _mark_barge_in_new_user_turn_payload(payload: dict[str, object]) -> None:
+    def _mark_barge_in_new_user_turn_payload(self, payload: dict[str, object]) -> None:
         payload["new_user_turn"] = True
         payload.setdefault(
             "new_user_turn_prefix_variant",
-            MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
+            self._serving_runtime_adapter.interrupted_tts_prefix,
         )
 
     def _consume_auto_response_waiting_turn_payload(
@@ -843,7 +858,7 @@ class OmniDuplexSessionHandler(
         """Attach the saved turn boundary to one complete input payload."""
         if not self._session_auto_responds(session):
             return False
-        native = self._minicpmo_session_state(session)
+        native = self._runtime_session_state(session)
         if not native.auto_response_waiting_for_speech:
             return False
         prefix_variant = native.auto_response_new_turn_prefix_variant
@@ -866,11 +881,10 @@ class OmniDuplexSessionHandler(
         if event.get("force_listen") is True:
             return False
         force_barge_in = event.get("force_barge_in") is True
-        native = self._minicpmo_session_state(session)
+        native = self._runtime_session_state(session)
         if force_barge_in:
             prefix_variant = (
-                native.auto_response_new_turn_prefix_variant
-                or MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS
+                native.auto_response_new_turn_prefix_variant or self._serving_runtime_adapter.interrupted_tts_prefix
             )
             native.auto_response_new_turn_prefix_variant = None
         else:
@@ -936,23 +950,6 @@ class OmniDuplexSessionHandler(
             rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32)))))
             return rms >= session.config.overlap_silence_rms
         return True
-
-    @staticmethod
-    def _input_explicitly_non_speech(event: dict[str, object]) -> bool:
-        for key in ("is_speech", "speech"):
-            value = event.get(key)
-            if isinstance(value, bool):
-                return not value
-        vad = event.get("vad")
-        if isinstance(vad, dict):
-            value = vad.get("is_speech")
-            if isinstance(value, bool):
-                return not value
-            probability = vad.get("speech_probability", vad.get("probability"))
-            if isinstance(probability, int | float):
-                return float(probability) < 0.5
-        probability = event.get("speech_probability")
-        return isinstance(probability, int | float) and float(probability) < 0.5
 
     async def _emit_overlap_decision(
         self,
@@ -1022,15 +1019,15 @@ class OmniDuplexSessionHandler(
         config = DuplexSessionConfig.from_event(event)
         if config.idle_timeout_s == _DEFAULT_IDLE_TIMEOUT_S:
             config.idle_timeout_s = self._idle_timeout_s
-        use_minicpmo45_native = self._use_minicpmo45_native_duplex(config)
+        use_native_runtime = self._uses_serving_runtime_adapter(config)
         runtime_config: dict[str, object] = {}
-        if use_minicpmo45_native:
+        if use_native_runtime:
             try:
-                runtime_config = await MiniCPMO45NativeDuplexServingAdapter.prepare_runtime_config(
+                runtime_config = await self._serving_runtime_adapter.prepare_runtime_config(
                     config,
                     model_config=getattr(self._chat_service, "model_config", None),
                 )
-            except MiniCPMO45ClientRuntimeConfigError as exc:
+            except ServingRuntimeConfigError as exc:
                 await send_json({"type": "error", "error": str(exc), "code": "invalid_duplex_runtime_config"})
                 return None
             except ValueError as exc:
@@ -1038,8 +1035,12 @@ class OmniDuplexSessionHandler(
                 return None
         session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
         session = self._registry.create(config=config, session_id=session_id)
-        if use_minicpmo45_native:
-            session.replace_capabilities(DuplexCapabilities.minicpmo45_native())
+        if use_native_runtime:
+            session.replace_capabilities(
+                self._serving_runtime_adapter.capabilities(
+                    max_sessions=self._duplex_session_config.max_sessions,
+                )
+            )
             session.replace_runtime_config(runtime_config)
         return _DuplexSessionHandshake(session=session)
 
@@ -1240,8 +1241,8 @@ class OmniDuplexSessionHandler(
                     return generation
         return None
 
-    def _use_minicpmo45_native_duplex(self, config: DuplexSessionConfig) -> bool:
-        return MiniCPMO45NativeDuplexServingAdapter.is_enabled(config)
+    def _uses_serving_runtime_adapter(self, config: DuplexSessionConfig) -> bool:
+        return self._serving_runtime_adapter.is_enabled(config)
 
     def _runtime_session_update_error(
         self,
@@ -1251,8 +1252,8 @@ class OmniDuplexSessionHandler(
         if not self._uses_native_input_append(session):
             return None
         try:
-            MiniCPMO45NativeDuplexServingAdapter.validate_client_extra_body(payload.get("extra_body"))
-        except MiniCPMO45ClientRuntimeConfigError as exc:
+            self._serving_runtime_adapter.validate_client_extra_body(payload.get("extra_body"))
+        except ServingRuntimeConfigError as exc:
             return {
                 "type": "error",
                 "session_id": session.session_id,
@@ -1268,7 +1269,7 @@ class OmniDuplexSessionHandler(
     ) -> dict[str, object]:
         if not self._uses_native_input_append(session):
             return dict(session.runtime_config)
-        return MiniCPMO45NativeDuplexServingAdapter.runtime_config_for_update(
+        return self._serving_runtime_adapter.runtime_config_for_update(
             candidate_config,
             dict(session.runtime_config),
         )
@@ -1534,8 +1535,11 @@ class OmniDuplexSessionHandler(
         )
         return None
 
-    @staticmethod
-    def _apply_response_create_options(session: DuplexSession, payload: dict[str, object]) -> str | None:
+    def _apply_response_create_options(
+        self,
+        session: DuplexSession,
+        payload: dict[str, object],
+    ) -> str | None:
         """Reserve options that apply only to the next response lifecycle."""
         audio_config = payload.get("audio")
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
@@ -1611,7 +1615,7 @@ class OmniDuplexSessionHandler(
                 response_extra.update(
                     (key, value)
                     for key, value in extra_body.items()
-                    if key not in MiniCPMO45NativeDuplexServingAdapter.PRIVATE_RUNTIME_CONFIG_KEYS
+                    if key not in self._serving_runtime_adapter.private_runtime_config_keys
                 )
             else:
                 response_extra.update(extra_body)

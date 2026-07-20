@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -10,9 +11,11 @@ import torch
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 
+from vllm_omni.outputs import output_processor
 from vllm_omni.outputs.output_modality import OutputModalityNames
-from vllm_omni.outputs.output_processor import OmniRequestState
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -60,6 +63,65 @@ def test_init_empty_dict():
     """Ensure mm_accumulated is initially empty."""
     assert _make_state(RequestOutputKind.CUMULATIVE).mm_accumulated == {}
     assert _make_state(RequestOutputKind.DELTA).mm_accumulated == {}
+
+
+def test_streaming_update_resets_native_text_metrics_for_next_segment():
+    state = _make_state(RequestOutputKind.DELTA)
+    state.native_text_stats.num_generation_tokens = 12
+    state.native_text_stats.first_token_ts = 10.0
+    state.native_text_stats.last_token_ts = 10.2
+
+    state.apply_streaming_update(
+        SimpleNamespace(
+            final=False,
+            prompt=None,
+            prompt_token_ids=[],
+            arrival_time=20.0,
+        )
+    )
+
+    assert state.native_text_stats.arrival_time == 20.0
+    assert state.native_text_stats.num_generation_tokens == 0
+    assert state.native_text_stats.first_token_ts == 0.0
+    assert state.native_text_stats.last_token_ts == 0.0
+
+
+def test_native_text_tpot_snapshot_matches_vllm_finished_metric_definition():
+    calculate = getattr(output_processor, "_mean_time_per_output_token_ms", None)
+    assert calculate is not None
+    stats = SimpleNamespace(
+        num_generation_tokens=4,
+        first_token_ts=10.0,
+        last_token_ts=10.045,
+    )
+
+    assert calculate(stats) == pytest.approx(15.0)
+
+
+def test_native_text_metrics_include_segment_generation_token_count(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = {}
+    state = _make_state(RequestOutputKind.DELTA)
+    state.is_prefilling = False
+    iteration_stats = MagicMock()
+
+    def update_native_stats(_output, _timestamp, _was_prefilling, native_stats, *_args):
+        native_stats.num_generation_tokens = 27
+        native_stats.first_token_ts = 10.0
+        native_stats.last_token_ts = 10.26
+
+    iteration_stats.update_from_output.side_effect = update_native_stats
+
+    processor._update_stats_from_output(
+        state,
+        SimpleNamespace(),
+        10.26,
+        iteration_stats,
+    )
+
+    assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
 
 
 def test_delta_drains_output_modality_per_step():

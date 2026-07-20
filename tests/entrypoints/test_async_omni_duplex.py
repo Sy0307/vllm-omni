@@ -2,17 +2,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex_runtime import (
-    DuplexOutputAction,
-    DuplexOutputDecision,
-    duplex_resource_request_id,
-)
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.duplex_request_client import DuplexRequestClient
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+    DuplexOutputAction,
+    DuplexOutputDecision,
+    duplex_resource_request_id,
+)
+from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
 
 
@@ -201,6 +202,7 @@ async def test_async_omni_duplex_append_can_defer_data_plane_output_collection()
         request_state = app.request_states.get(request_id)
         assert request_state is not None
         assert request_state.resumable is True
+        assert request_state.metrics is not None
         return {
             "stage_results": [
                 {
@@ -293,6 +295,134 @@ async def test_async_omni_duplex_collect_waits_for_response_stage():
     )
 
     assert outputs == [stage1_output]
+
+
+@pytest.mark.asyncio
+async def test_async_omni_duplex_direct_output_keeps_stage_metrics():
+    app = object.__new__(AsyncOmni)
+    app._duplex_request_client = None
+    app._final_output_handler = lambda: None
+    request_id = "duplex-sid-e0-stage0"
+    req_state = ClientRequestState(request_id, resumable=True)
+    decision = DuplexOutputDecision(
+        action=DuplexOutputAction.DIRECT_RESPONSE,
+        metadata={
+            "duplex_direct_response": True,
+            "duplex_native_decision": "speak",
+        },
+    )
+    direct_output = OmniRequestOutput(
+        request_id=request_id,
+        stage_id=0,
+        final_output_type="text",
+        finished=True,
+        duplex_output_decision=decision,
+    )
+    await req_state.queue.put(
+        OutputMessage(
+            request_id=request_id,
+            stage_id=0,
+            engine_outputs=direct_output,
+            metrics=StageRequestStats(
+                batch_id=1,
+                batch_size=1,
+                num_tokens_in=160,
+                num_tokens_out=8,
+                stage_gen_time_ms=80.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+                stage_stats=StageStats(total_token=8, total_gen_time_ms=80.0),
+                vllm_ttft_ms=12.5,
+                vllm_tpot_ms=9.0,
+                vllm_itl_ms=8.75,
+                vllm_itls_ms=[8.0, 9.5],
+            ),
+            finished=True,
+        )
+    )
+
+    outputs = await app._collect_duplex_data_plane_outputs(
+        request_id,
+        req_state,
+        response_stage_id=1,
+        timeout=1.0,
+    )
+
+    assert outputs == [direct_output]
+    assert direct_output.metrics["stage_metrics"]["0"]["vllm_ttft_ms"] == 12.5
+    assert direct_output.metrics["stage_metrics"]["0"]["vllm_tpot_ms"] == 9.0
+    assert direct_output.metrics["stage_metrics"]["0"]["vllm_itls_ms"] == [8.0, 9.5]
+
+
+@pytest.mark.asyncio
+async def test_duplex_metrics_cursor_isolates_resumable_collect_windows():
+    app = object.__new__(AsyncOmni)
+    app._duplex_request_client = None
+    app._final_output_handler = lambda: None
+    request_id = "duplex-sid-e0-stage0"
+    req_state = ClientRequestState(request_id, resumable=True)
+    req_state.metrics = OrchestratorAggregator(
+        num_stages=2,
+        log_stats=False,
+        wall_start_ts=0.0,
+        final_stage_id_for_e2e=1,
+    )
+
+    def stage_message(*, batch_id: int, tokens: int, ttft_ms: float, itls: list[float]) -> OutputMessage:
+        decision = DuplexOutputDecision(
+            action=DuplexOutputAction.DIRECT_RESPONSE,
+            metadata={"duplex_direct_response": True, "duplex_native_decision": "speak"},
+        )
+        output = OmniRequestOutput(
+            request_id=request_id,
+            stage_id=0,
+            final_output_type="text",
+            finished=True,
+            duplex_output_decision=decision,
+        )
+        return OutputMessage(
+            request_id=request_id,
+            stage_id=0,
+            engine_outputs=output,
+            metrics=StageRequestStats(
+                batch_id=batch_id,
+                batch_size=1,
+                num_tokens_in=160,
+                num_tokens_out=tokens,
+                stage_gen_time_ms=80.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+                stage_stats=StageStats(total_token=tokens, total_gen_time_ms=80.0),
+                vllm_ttft_ms=ttft_ms,
+                vllm_tpot_ms=9.0,
+                vllm_itl_ms=sum(itls) / len(itls),
+                vllm_itls_ms=itls,
+            ),
+            finished=True,
+        )
+
+    await req_state.queue.put(stage_message(batch_id=1, tokens=71, ttft_ms=62.5, itls=[10.0, 11.0]))
+    first = await app._collect_duplex_data_plane_outputs(
+        request_id,
+        req_state,
+        response_stage_id=1,
+        timeout=1.0,
+    )
+    await req_state.queue.put(stage_message(batch_id=2, tokens=155, ttft_ms=81.0, itls=[12.0, 13.0, 14.0]))
+    second = await app._collect_duplex_data_plane_outputs(
+        request_id,
+        req_state,
+        response_stage_id=1,
+        timeout=1.0,
+    )
+
+    assert first[0].metrics["stage_metrics"]["0"]["num_tokens_out"] == 71
+    second_stage0 = second[0].metrics["stage_metrics"]["0"]
+    assert second_stage0["num_tokens_out"] == 155
+    assert second_stage0["vllm_ttft_ms"] == 81.0
+    assert second_stage0["vllm_itls_ms"] == [12.0, 13.0, 14.0]
 
 
 def test_async_omni_duplex_direct_output_prefers_outer_control_metadata():
@@ -401,3 +531,24 @@ def test_async_omni_duplex_request_info_includes_response_stage():
 
     assert request_id == "duplex-sid-e0-stage0"
     assert response_stage_id == 1
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_retains_output_route_when_close_fails():
+    fence = DuplexFence("sid-close-route")
+    request_id = duplex_resource_request_id(fence, "stage0")
+    request_states = {request_id: ClientRequestState(request_id, resumable=True)}
+
+    async def close_duplex_session_async(session_id, **kwargs):
+        del session_id, kwargs
+        raise RuntimeError("close failed")
+
+    client = DuplexRequestClient(
+        SimpleNamespace(close_duplex_session_async=close_duplex_session_async),
+        SimpleNamespace(request_states=request_states),
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await client.close(fence.session_id, reason="test", fence=fence, timeout=1.0)
+
+    assert request_id in request_states

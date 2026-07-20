@@ -18,19 +18,26 @@ not introduce another reducer, controller, worker provider, or shadow runtime.
 - Published diff: 93 files, approximately `+29.2k/-0.6k`
 - Local runtime and pytest validation: intentionally not used
 - Required validation environment: an NVIDIA H20 CUDA host
-- Base commit for the current dirty tree:
-  `c9b5374a96388a0f83d7daecd793a6f014af3b90`
+- PR head reviewed for the current cleanup:
+  `f4f78fa555af4d65e46b003022d352ca2ea9d703`
 - Validated tree: the uncommitted refactor synchronized file-for-file to the
-  isolated H20 worktree on 2026-07-18
+  isolated H20 worktree on 2026-07-20
 
 The current tree has received fresh H20 focused and E2E validation against vLLM
-0.25.0. Its latest broad affected matrix is not green because ten tests expose
-incomplete multi-session work already present in the dirty branch; that result
-is recorded rather than hidden. The validated paths include the stable runtime
+0.25.0. The latest broad affected matrix before the final pre-response
+continuation fix was green; that fix has separate focused and E2E evidence and
+still requires one final broad-matrix rerun. The checked-in MiniCPM
+profile admits two concurrent sessions through an engine-owned limit; a third
+session was rejected and capacity returned after one session closed. The two
+accepted sessions independently completed their audio, transcript, response,
+playback, and close lifecycles. This is isolation and admission evidence for the
+tested two-session deployment, not a production fairness, arbitrary-capacity,
+or failure-recovery claim. The validated paths include the experimental runtime
 extension, typed resumable policy, extracted control plane and clients, request
-preregistration, typed direct-output decision, server-owned single-session
-admission, separate public/runtime configuration channels, private Session
-ledgers, ordered `session.update`, the MiniCPM runner fast path, continuous
+preregistration, typed direct-output decision, engine-managed two-session
+capacity in the checked-in deploy profile, separate public/runtime configuration
+channels, private Session ledgers, ordered `session.update`, the MiniCPM runner
+fast path, continuous
 browser input, and the final Realtime input-lifecycle fixes. Exact evidence and
 scope limits are recorded below.
 
@@ -46,6 +53,9 @@ The checkpoint keeps these verified contracts:
 - segment EOS and turn EOS as different boundaries;
 - transcript/audio cursors scoped to a response and turn;
 - playback acknowledgement and history commit;
+- Stage0 request metadata routed per batch row rather than inherited from the
+  first request in the batch;
+- Stage0 token timing snapshots and client-observed audio chunk cadence;
 - scheduler data-plane append over a resumable request;
 - stale epoch/turn/response fencing;
 - `/v1/duplex` and OpenAI Realtime projection;
@@ -56,9 +66,8 @@ The checkpoint does not claim:
 - scheduler-native KV append;
 - deterministic VAD-triggered interruption (the browser intentionally does not
   run VAD; MiniCPM owns listen/speak decisions at model-unit boundaries);
-- multi-session admission, fairness, or isolation;
+- production multi-session admission, fairness, capacity, or failure recovery;
 - bounded long-session KV;
-- production capacity or fault recovery;
 - video input or audio/video synchronization.
 
 ## Active Runtime Path
@@ -73,7 +82,7 @@ WebSocket
   -> AsyncOmni thin open/append/signal/close proxies
   -> DuplexControlClient over the engine-owned correlated RPC transport
   -> DuplexControlPlane + DuplexSessionRuntimeManager
-  -> stable DuplexRuntimeExtension + engine session/stage bindings
+  -> experimental DuplexRuntimeExtension + engine session/stage bindings
   -> StagePool
   -> resumable scheduler request
   -> MiniCPM Stage0
@@ -106,8 +115,10 @@ Important distinctions:
 - Engine fences duplicate identity across a process boundary by design; they
   are immutable validation snapshots.
 - Stage bindings are engine resources, not serving response state.
-- `continuation_response_id` scopes an effect counter to one response; it is
-  not the authoritative active response ID.
+- `continuation_owner_id` scopes an effect counter either to a visible response
+  or, before `response.created`, to an explicit model turn. A pre-response
+  continuation also revalidates request, epoch, turn state, and model-turn
+  identity immediately before append; it cannot survive turn completion.
 - runtime open/close acknowledgements are handler-local effect bookkeeping,
   not Session lifecycle.
 
@@ -167,15 +178,19 @@ ordering guarantee.
 
 ### Extracted control ownership
 
-The stable engine mechanism is split by responsibility:
+The model-neutral engine mechanism is split by responsibility:
 
 | Module | Responsibility |
 | --- | --- |
-| `engine.duplex_runtime` | immutable contracts, extension validation, typed decisions, request-ID codec |
-| `engine.duplex_session` | session resources, fences, append reservations, idempotency cache, binding cleanup |
-| `engine.duplex_control_plane` | control algorithms and the narrow `DuplexStagePort` used to submit and clean up stage requests |
-| `engine.duplex_control_client` | typed control-message construction and calls through the engine-owned correlated RPC transport |
-| `entrypoints.duplex_request_client` | deterministic request identity, client-state preregistration, acknowledgement validation, data-plane collection, rollback |
+| `engine.duplex_contracts` | model-neutral immutable DTOs, extension/stage protocols, typed decisions, request-ID codec |
+| `engine.duplex_lease` | generic resource lease activity, TTL/grace configuration, and expiry records |
+| `engine.messages` | identity fence and correlated control message/result envelopes |
+| `engine.resumable` | scheduler segment policy and resumable lifecycle contract |
+| `experimental.fullduplex.engine.duplex_runtime` | extension loading, validation, and compatibility exports |
+| `experimental.fullduplex.engine.duplex_session` | session resources, fences, append reservations, idempotency cache, binding cleanup |
+| `experimental.fullduplex.engine.duplex_control_plane` | control algorithms and the narrow `DuplexStagePort` used to submit and clean up stage requests |
+| `experimental.fullduplex.engine.duplex_control_client` | typed control-message construction and calls through the engine-owned correlated RPC transport |
+| `experimental.fullduplex.request_client` | deterministic request identity, client-state preregistration, acknowledgement validation, data-plane collection, rollback |
 
 `Orchestrator`, `AsyncOmniEngine`, and `AsyncOmni` retain explicit wiring and
 compatibility proxies. They no longer own the corresponding duplex algorithms.
@@ -200,6 +215,13 @@ session, reserved request resources, and any preregistered request state before
 returning the error. Cleanup distinguishes a reserved resource from a submitted
 request, so it does not decrement the running counter for unrelated work.
 Closing a session that never appended also removes the preregistered resource.
+
+Expiry and request-triggered cleanup use a two-step close. The runtime manager
+first marks the session closing but retains it in the admission set. Only a
+successful stage cleanup finalizes and removes the session. A blocked or failed
+cleanup therefore continues to consume its server-owned slot and is retried;
+replacement admission cannot overlap request or KV resources that are still
+owned by the closing session.
 
 Append uses prepare/submit/commit ordering. `prepare_append()` computes the
 next sequence values without mutating the session. Prompt planning and stage
@@ -328,30 +350,44 @@ it because close or epoch state changed while it waited in the output queue.
 Streaming audio/text deltas still receive late stale filtering at send time,
 which prevents queued old audio from leaking after a cancel or epoch bump.
 
-## Stable Type Boundary
+## Runtime Type Boundary
 
-The stable engine contract now lives in:
+The stable model-neutral kernel is deliberately limited to:
 
 ```text
-vllm_omni.engine.duplex_types          # identity fence
-vllm_omni.engine.duplex_runtime        # immutable contracts and extension protocol
-vllm_omni.engine.duplex_session        # session and resource ownership
-vllm_omni.engine.duplex_control_plane  # engine-side control algorithms
-vllm_omni.engine.duplex_control_client # correlated control client
-vllm_omni.engine.resumable             # scheduler segment policy
+vllm_omni.engine.messages                  # identity fence and RPC envelopes
+vllm_omni.engine.duplex_contracts          # immutable DTOs and narrow protocols
+vllm_omni.engine.duplex_lease              # generic resource lease primitives
+vllm_omni.engine.resumable                 # scheduler segment policy
 ```
 
-Stable engine, orchestrator, messages, and entrypoint modules import that type.
-The experimental identity module re-exports the same class for compatibility.
-This removes the `DuplexFence` stable-to-experimental dependency without
-creating a second identity type. Stable engine, scheduler, worker, and request
-modules no longer import `experimental.fullduplex`.
+The full-duplex implementation remains experimental:
+
+```text
+vllm_omni.experimental.fullduplex.engine.duplex_runtime
+                                           # extension loading and validation
+vllm_omni.experimental.fullduplex.engine.duplex_session
+                                           # session transaction implementation
+vllm_omni.experimental.fullduplex.engine.duplex_control_plane
+                                           # engine-side control algorithms
+vllm_omni.experimental.fullduplex.engine.duplex_control_client
+                                           # correlated control client
+vllm_omni.experimental.fullduplex.request_client
+                                           # entrypoint request/output lifecycle
+```
+
+Stable engine and entrypoint modules import only the kernel at module load.
+They load the experimental ControlPlane, ControlClient, request client, and
+runtime extension inside duplex-only construction or call paths. Importing
+`Orchestrator`, `AsyncOmniEngine`, or `AsyncOmni` for an ordinary deployment
+therefore does not import `vllm_omni.experimental.fullduplex`. Compatibility
+exports remain lazy and are not part of ordinary startup.
 
 `PipelineConfig.duplex_control_enabled` enables the generic mechanism, while
 `PipelineConfig.duplex_runtime_extension` separately selects the model adapter.
 The MiniCPM pipeline opts into both and installs
 `MiniCPMO45DuplexRuntimeExtension`; ordinary pipelines construct neither a
-ControlPlane nor a ControlClient. The stable protocol exposes
+ControlPlane nor a ControlClient. The model-neutral protocol exposes
 sampling-parameter configuration, append planning, a typed
 `ResumableSegmentPolicy`, and a typed stage-output decision. MiniCPM owns
 stage-specific overrides, PCM-to-token budgeting, force-listen payload policy,
@@ -367,6 +403,20 @@ Direct listen/speak outcomes use `DuplexOutputDecision` on
 `OmniRequestOutput`. That typed envelope is authoritative over inner completion
 metadata for native projection, so a processed output cannot hide a listen
 decision merely because it retains unrelated multimodal metadata.
+
+Generic multimodal chunk accumulation lives in
+`vllm_omni.outputs.multimodal_accumulation`. It owns snapshot replacement,
+DELTA draining, and audio-finality interpretation; `OmniRequestState` only
+invokes that policy while assembling request output. Model output processors no
+longer need to add chunk-retention rules to the main output orchestration file.
+
+The strict chunk-transfer schema still contains `hidden_states.tts` as the
+generic AR-stage-to-TTS handoff and several MiniCPM streaming token IDs as
+compatibility wire fields. The latter are not a preferred generic model
+contract. Moving them behind a model-namespaced metadata envelope requires a
+versioned producer/consumer migration because unknown msgspec fields are
+rejected; silently deleting or renaming them in this checkpoint would break
+existing Stage0-to-Stage1 transfer.
 
 ### Public and runtime configuration channels
 
@@ -545,14 +595,25 @@ The following work is deliberately not hidden inside this checkpoint.
 
 ### Serving composition
 
-State ownership is narrower, but serving behavior is still composed through
-`DuplexSessionRunnerMixin`, `NativeRuntimeBridgeMixin`, and
-`ChatFallbackProjectorMixin`. The generic handler, runner, bridge, and protocol
-modules remain a large, mutually dependent behavior surface. A later refactor
-should replace host-method coupling with explicit `ServingRuntimeAdapter`,
-protocol, and effect-runner dependencies while preserving one actor mailbox and
-one `DuplexSession` transition owner. Splitting those components must not create
-a second reducer or concurrent state machine.
+The generic runner and runtime bridge now depend on the model-neutral
+`ServingRuntimeAdapter` protocol and no longer import MiniCPM modules. The
+`MiniCPMO45ServingRuntimeAdapter` owns MiniCPM serving state, PCM preparation,
+data-plane projection, client/runtime configuration validation, prefix policy,
+and capability projection. `PipelineConfig.duplex_serving_adapter` explicitly
+selects its import path; `AsyncOmniEngine` and `AsyncOmni` carry that path to the
+API server, which passes it into the generic handler. The handler has no model
+default and fails startup when the duplex endpoint is enabled without an
+adapter. Tests may inject an adapter instance directly. Import-boundary tests
+verify that loading the generic runner, bridge, or handler does not load MiniCPM
+modules.
+
+Behavior is still assembled through `DuplexSessionRunnerMixin`,
+`NativeRuntimeBridgeMixin`, and `ChatFallbackProjectorMixin`, so explicit
+adapter composition is only the model-policy boundary, not a completed removal
+of host-method coupling. A later refactor may replace the remaining mixins with
+explicit protocol and effect-runner dependencies while preserving one actor
+mailbox and one `DuplexSession` transition owner. Splitting those components
+must not create a second reducer or concurrent state machine.
 
 The four private Session ledgers are data partitions, not independent owners.
 `DuplexSession` intentionally remains the aggregate root. Further encapsulation
@@ -561,11 +622,11 @@ state changes through Session transitions.
 
 ### Plugin descriptor and typed payloads
 
-The pipeline selects the MiniCPM engine extension, and the Realtime request
-selects the MiniCPM serving adapter, but there is not yet one versioned plugin
-descriptor that binds those identities in an open handshake. Adding a second
-native model should first introduce that descriptor and reject serving/engine
-plugin mismatches explicitly.
+The pipeline currently selects the MiniCPM engine extension and Serving adapter
+through two explicit fields, but there is not yet one versioned plugin descriptor
+that binds those identities in an open handshake. Realtime client payloads do
+not select either implementation. Adding a second native model should first
+introduce that descriptor and reject serving/engine plugin mismatches explicitly.
 
 The stable boundary has typed fences, plans, policies, decisions, and control
 messages, but `session_config`, `runtime_config`, and append payloads still use
@@ -573,18 +634,57 @@ generic mappings or objects at the extension boundary. Model-neutral typed
 session and input-chunk contracts remain follow-up work, especially before
 adding video.
 
+### Output modality policy
+
+The current Realtime duplex contract supports text and audio output. Unknown
+output modalities fail closed with `unsupported_response_modality`; they are
+never silently projected as text. This checkpoint deliberately does not add a
+modality registry because there is only one native text/audio projection path
+to register.
+
+A registry becomes justified when a second non-audio/non-text implementation
+uses the same validation, encoding, lifecycle, and projection contract. At that
+point the abstraction must be extracted from two working adapters and retain
+the same fail-closed behavior. A speculative registry before that condition
+would add selection state without removing any existing branch.
+
+### Performance measurement contract
+
+Stage0 token timing comes only from the engine's per-segment metric snapshot:
+`vllm_ttft_ms`, `vllm_tpot_ms`, and `vllm_itls_ms`. A resumable Stage0 request
+exports its segment-local `num_generation_tokens`; ordinary requests retain the
+existing output-token fallback. Realtime response state clears its metric
+accumulator at `response.created`, combines only model units owned by that
+response, and ignores session-level events with no matching `response_id`.
+Realtime projection carries the result under
+`metadata.vllm_omni.stage_metrics`; clients do not estimate TPOT from transcript
+deltas or subtract cumulative snapshots.
+
+Audio timing uses the client's monotonic receive clock and is partitioned by
+`response_id`. `response_created_to_first_audio_ms` measures projection startup
+after `response.created`; `commit_to_first_audio_ms` measures end-to-end output
+from an explicit input commit. Neither field is called TTFP without naming its
+origin. Reports also include inter-chunk and chunk-duration
+count/mean/p50/p95/max plus maximum chunk gap. Engine and client measurements
+have different clock origins and must not be merged into one timeline.
+
 ### Resource capabilities
 
-The MiniCPM pipeline currently sets the server-owned
-`max_native_duplex_sessions` limit to one. The API handler receives that deploy
-value from the engine and uses it as the admission gate; client session fields
-cannot raise or disable the limit. This is a deterministic single-session
-checkpoint, not a production admission controller.
+The checked-in MiniCPM duplex deploy profile sets Stage0 and Stage1
+`max_num_seqs` to two and configures the engine runtime manager with
+`max_sessions=2`. The Realtime capability response therefore advertises
+multi-session and same-replica multi-session support with
+`session_admission_mode="engine_managed"`. Client session fields cannot raise
+this server-owned limit. Fresh E2E evidence covers two concurrent sessions in
+both model-policy and response-required modes, rejection of a third session,
+and admission of a replacement after one accepted session closes. It does not
+establish behavior beyond that configured limit.
 
-Session leases, lease TTL, orphan reaping, fairness, KV-aware capacity,
-backpressure, and same-replica multi-session isolation belong to a later
-production-capability change. The current capability response must remain
-`false` for those features.
+Session leases, lease TTL, resumable attachment, orphan reaping, and bounded
+Serving input/backpressure are implemented. A production admission controller,
+KV-aware capacity budgeting, fairness, starvation metrics, and multi-session
+worker-failure recovery remain follow-up work. Capability claims must stay
+limited to the mechanisms and two-session execution shape validated here.
 
 ## Validation Evidence
 
@@ -593,32 +693,122 @@ All pytest and runtime evidence for this branch must run on the remote H20.
 ### Current synchronized tree
 
 The current dirty tree was synchronized to the isolated H20 worktree at
-`/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-model-unit-overlap-0717`.
-SHA-256 comparison covered the runtime, demo, handler-test, demo-test, Web, and
-Web-contract files changed by the final continuous-input fixes, with zero
-mismatches.
+`/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-control-plane-0719`.
 
-- Latest broad affected matrix: 489 passed, 10 failed, 19 warnings. The ten
-  failures are in incomplete multi-session session/fence/attachment/resume work
-  already present in this dirty branch, so the current tree does not have a
-  green full-matrix claim. The run is task `4e21896f`
-  (`/tmp/remote_gpu_logs/4e21896f.log`).
-- Latest focused handler/demo/Web suite: 226 passed, 19 warnings. The run is
-  task `5f9a83b5` (`/tmp/remote_gpu_logs/5f9a83b5.log`). The Web contract also
-  explicitly rejects browser VAD markers and browser-generated input commits.
+- Latest broad affected matrix before the final pre-response continuation fix:
+  608 passed, 19 warnings. This includes the
+  Stage0 row-routing regression, cleanup-held admission regressions,
+  segment-local token accounting, response-owned metric filtering, the generic
+  output-processor suite, direct E2E script execution, and continuous-response
+  overlap ownership. The run is task `e2146318`
+  (`/tmp/remote_gpu_logs/e2146318.log`).
+- The pre-response continuation regression group passed 5 focused tests. The
+  response-required two-turn scenario then passed 5/5 repeated runs in task
+  `afe93659`; two-session semantic isolation plus resume, takeover, and
+  admission passed in task `49225794`; model-unit overlap passed in task
+  `3888387d`. A final broad affected-matrix rerun remains required after this
+  lifecycle fix.
+- Serving plugin selection was first reproduced as three RED tests: the generic
+  handler silently selected MiniCPM and the pipeline had no explicit Serving
+  adapter field. The final pipeline/import/fail-fast group passed 9 tests in task
+  `4db6d959` (`/tmp/remote_gpu_logs/4db6d959.log`). The token-metric and client
+  audio-cadence producer-to-consumer group passed 8 tests in task `cf80f6b2`
+  (`/tmp/remote_gpu_logs/cf80f6b2.log`).
+- Stable-import isolation was first reproduced as a RED that loaded twelve
+  `experimental.fullduplex` modules. After extracting the kernel and making
+  implementation loading conditional, the isolated import regression passed.
+  The focused ControlPlane/ControlClient/session/runtime/Orchestrator/AsyncOmni
+  suite then passed 139 tests in task `fad613ea`
+  (`/tmp/remote_gpu_logs/fad613ea.log`).
+  After the final contract-import cleanup, the import-boundary, runtime, and
+  lease suites passed 45 tests in task `bc138887`
+  (`/tmp/remote_gpu_logs/bc138887.log`).
+- Concurrency and failure-path hardening now has direct regressions for
+  single-flight cancel/close cleanup, cleanup retry without dropping request
+  resources, failed-replica affinity cleanup and same-address reattachment,
+  append ordering across resume, takeover ownership of pending-turn
+  reservations, and a closed-transport send immediately after resumable
+  credentials are delivered. The final focused resume/takeover group passed 5
+  tests in task `dc2ac96e` (`/tmp/remote_gpu_logs/dc2ac96e.log`).
+- Stage1 batching regression: the focused test first failed because only the
+  first request in `runtime_additional_information` reached the talker. After
+  routing every request by `request_token_spans`, preserving per-row terminal
+  flags, and emitting request-keyed sparse audio, the complete MiniCPM duplex
+  hook file passed 42 tests.
+- Stage0 batching regression: two requests in one batch now retain different
+  `duplex_prompt_token_ids` and `special_token_ids`. The model emits row-aligned
+  payload elements, so Stage0 no longer copies request zero's duplex metadata to
+  later sessions.
+- Admission finalization regressions cover `max_sessions=1` with blocked and
+  failed expiry cleanup plus request-triggered cleanup. Every replacement is
+  rejected with `resource_exhausted` until stage resources are cleaned and the
+  old session is explicitly finalized.
+- Resumable token accounting exports each model unit's native generation-token
+  count instead of recounting the request's cumulative token IDs. Realtime
+  response state resets and accumulates those segment snapshots, and the client
+  ignores unowned session-level metrics while summarizing a response.
+- Engine-owned admission and two-session model-policy E2E: two random session
+  IDs were admitted and remained isolated, a third was rejected with
+  `resource_exhausted`, closing one accepted session returned capacity, and a
+  random replacement session was admitted. The capability projection reported
+  `configured_limit=2`, `advertised_multi_session=true`, and
+  `session_admission_mode=engine_managed`. In the same run one session selected
+  speak and the other selected listen without identity leakage. Detach/resume
+  advanced attachment generation from one to two and rotated its token; active
+  takeover rejected all four writes from the replaced connection. The run is
+  task `1d9dd1ed` (`/tmp/remote_gpu_logs/1d9dd1ed.log`), with artifacts under
+  `/tmp/pr3907_resume_takeover_native_metrics`.
+- Concurrent two-session, two-turn response-required E2E: both sessions produced
+  two complete spoken responses, committed two playback acknowledgements and
+  history records, and emitted no error, cancel, truncate, or stale events. The
+  semantically distinct inputs produced isolated transcripts containing
+  "当时" and "一加一" respectively. Per-response Stage0 output counts were 20,
+  38, 32, and 33 tokens rather than cumulative request totals. The run is task
+  `a16f1467` (`/tmp/remote_gpu_logs/a16f1467.log`), with artifacts under
+  `/tmp/pr3907_semantic_2turn_native_metrics`.
+- Disconnect-grace E2E: a detached session expired after the configured
+  30-second engine grace, and a later resume was rejected with
+  `session_resume_expired`. The run is task `9872d50c`, with artifacts under
+  `/tmp/pr3907_0719_disconnect_grace_expiry`.
+- A separate black-box takeover client exercised the current backend with two
+  semantically distinct concurrent inputs. Active resume replayed 17 events
+  including five audio deltas and committed playback history; takeover rejected
+  all four stale-attachment sends, emitted `session.replaced`, and preserved
+  attachment/session isolation. Both transcripts contained only their expected
+  semantic token. The client task is `6773bd34`
+  (`/tmp/remote_gpu_logs/6773bd34.log`), with artifacts under
+  `/tmp/pr3907_gaohan_final_takeover`. The backend task was `5abcd1ee`.
+- Across the final response-required, overlap, and resume/takeover runs, engine
+  Stage0 TTFT ranged from 31.17 to 310.18 ms, TPOT from 15.18 to 21.18 ms, and
+  reported ITL p95 from 16.35 to 32.83 ms. Explicit
+  `commit_to_first_audio_ms` ranged from 386.80 to 1033.25 ms, while the
+  client-monotonic maximum audio chunk gap ranged from 388.30 to 1316.37 ms.
+  These are response-scoped observations from a small, warm-state-sensitive
+  sample, not an SLO claim. The slowest response still does not satisfy a 200 ms
+  end-to-end first-output target.
+- Post-merge focused handler/demo/Web/Stage0/runner/video suite: 324 passed,
+  19 warnings. The run is task `f78cb7a8`
+  (`/tmp/remote_gpu_logs/f78cb7a8.log`). The Web contract explicitly rejects
+  browser VAD markers and browser-generated input commits while the merged
+  video path retains camera-frame admission.
 - No-response listen and residual accounting: the focused handler regressions
   passed after first reproducing both failures. A model-listen unit without a
   Realtime response no longer defers the next committed input, and three
   consecutive 1.2-second `pcm_f32le` inputs each returned pending input bytes
   to zero.
-- Model-unit overlap E2E: a 3.6-second first input produced assistant audio,
-  then a distinct 1.4-second input was streamed in 200 ms chunks while that
-  response was active. All seven overlap decisions had
+- Model-unit overlap E2E: the second physical input streamed while the first
+  response remained active. Seven overlap decisions had
   `defer_runtime_append=false`; the one-second model-unit boundary occurred
-  before the first response terminal. The run completed two input commits, two
-  spoken responses, 11 audio/transcript deltas, and two playback history
-  commits with zero error/cancel/truncate/stale events. The client task is
-  `657e59b9` (`/tmp/remote_gpu_logs/657e59b9.log`).
+  before the first `response.done`, and no barge-in, cancel, truncate, stale, or
+  error event occurred. The model-policy contract accepts a later unit ending
+  the continuous response instead of requiring a second physical-input-owned
+  response. The two response-owned Stage0 snapshots independently reported 20
+  tokens / 152.8 ms TTFT and 19 tokens / 43.3 ms TTFT. The run is task
+  `a4977622` (`/tmp/remote_gpu_logs/a4977622.log`), with artifacts under
+  `/tmp/pr3907_overlap_native_metrics_scoped`.
+- The split multi-session E2E runner is directly executable from the repository
+  even when another installed package owns the top-level `tests` name. Its
+  script-import and continuous-terminal regressions passed in task `f11b106c`.
 - Pinned response-required E2E: the first 1400 ms of the pinned fixture produced
   one complete spoken response, five audio/transcript deltas, and one playback
   history commit, with symmetric created/audio-done/done lifecycle and no
@@ -636,15 +826,9 @@ mismatches.
   lifecycle evidence, not semantic cross-input independence, because the same
   fixture was repeated. The client task is `2a5f29f0`; artifacts are in
   `/tmp/minicpmo_pr3907_continuous_three_response_20260718`.
-- The fresh backend remains available as task `b65accf7` on port 8123. The Web
-  demo is task `552fb419` on port 40880; its browser-visible Realtime URL points
-  directly at the public port-8123 endpoint because the page proxy serves HTTP
-  but does not forward WebSocket upgrades. Its served `app.js` keeps microphone
-  upload active during assistant playback and no longer clears captured input
-  from `beginAssistant()`. The index is `no-store` and loads the bundle through
-  a content-hash query so a stale half-duplex client cannot survive a refresh.
-  Audio-quality and ASR evaluation were not rerun for these lifecycle-only
-  changes. Other GPU workloads were not modified.
+- The fresh validation backend was stopped after the E2E runs and GPU0/1 returned
+  to baseline. Audio-quality and ASR evaluation were not rerun for these
+  lifecycle-only changes. Other GPU workloads were not modified.
 
 ### Regression lineage
 

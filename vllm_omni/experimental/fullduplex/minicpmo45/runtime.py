@@ -9,14 +9,14 @@ from typing import Any
 
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.duplex_runtime import (
+from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexAppendPlan,
     DuplexInputMode,
     DuplexOutputAction,
     DuplexOutputDecision,
 )
-from vllm_omni.engine.duplex_types import DuplexFence
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600

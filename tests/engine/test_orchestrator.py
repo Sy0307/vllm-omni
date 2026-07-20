@@ -16,13 +16,6 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.engine.duplex_control_plane import DuplexControlPlane
-from vllm_omni.engine.duplex_runtime import (
-    DuplexInputMode,
-    DuplexRuntimeCapabilities,
-    DuplexSessionRuntimeState,
-    duplex_resource_request_id,
-)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -46,6 +39,13 @@ from vllm_omni.engine.orchestrator import (
 from vllm_omni.engine.resumable import ResumableSegmentPolicy
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+    DuplexInputMode,
+    DuplexRuntimeCapabilities,
+    DuplexSessionRuntimeState,
+    duplex_resource_request_id,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -1714,6 +1714,50 @@ async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops_polling() -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    pool._addr_to_replica_id["tcp://replica-0"] = 0
+    pool.bind("distributed-request", "tcp://replica-0")
+    pool._request_bindings["legacy-request"] = 0
+
+    affected = pool.mark_replica_unavailable(0)
+
+    assert set(affected) == {"distributed-request", "legacy-request"}
+    assert pool.get_bound_replica_id("distributed-request") is None
+    assert pool.get_bound_replica_id("legacy-request") is None
+    assert await pool.poll_llm_raw_output(0) is None
+
+
+def test_stage_pool_reattached_replica_becomes_available_again() -> None:
+    failed_client = FakeStageClient(stage_type="llm", final_output=False)
+    replacement_client = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [failed_client],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    input_addr = "tcp://replica-0"
+    pool._addr_to_replica_id[input_addr] = 0
+    pool.mark_replica_unavailable(0)
+    removed = pool.remove_client(input_addr)
+
+    replica_id = pool.add_client(input_addr, replacement_client)
+
+    assert removed is failed_client
+    assert replica_id == 0
+    assert len(pool.clients) == 1
+    assert pool.clients[0] is replacement_client
+    assert pool.available_replica_ids() == [0]
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_submit_update_refreshes_output_processor_state() -> None:
     output_processor = FakeOutputProcessor()
 
@@ -1793,6 +1837,73 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 
     assert pool.calls == [("req-stream", "segment-2")]
     assert orchestrator.request_states["req-stream"].streaming.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
+    built_metrics = SimpleNamespace(pipeline_timings={})
+
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.calls: list[list[Any]] = []
+
+        def build_stage_metrics(self, outputs, **_kwargs):
+            self.calls.append(outputs)
+            return built_metrics
+
+    pool = RecordingPool()
+    orchestrator = object.__new__(Orchestrator)
+    req_state = OrchestratorRequestState(
+        request_id="req-stream",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    req_state.streaming.enabled = True
+    req_state.streaming.segment_finished = True
+    req_state.stage_submit_ts[0] = time.time()
+    orchestrator.request_states = {"req-stream": req_state}
+    orchestrator.stage_pools = [pool]
+    routed: list[Any] = []
+
+    async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
+        routed.append(stage_metrics)
+
+    orchestrator._route_output = record_route
+    output = SimpleNamespace(request_id="req-stream", error=None, finished=False)
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    assert pool.calls == [[output]]
+    assert routed == [built_metrics]
+
+
+def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
+    class SegmentMetricsOutputProcessor(FakeOutputProcessor):
+        def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
+            assert request_id == "req-stream"
+            return {"num_generation_tokens": 3}
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=SegmentMetricsOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    output = SimpleNamespace(
+        request_id="req-stream",
+        outputs=[SimpleNamespace(cumulative_token_ids=list(range(11)))],
+    )
+
+    metrics = pool.build_stage_metrics(
+        [output],
+        submit_ts=time.time(),
+        request_timestamp=time.time(),
+        replica_id=0,
+    )
+
+    assert metrics.num_tokens_out == 3
+    assert metrics.output_unit_count == 3
 
 
 @pytest.mark.asyncio
@@ -2042,3 +2153,84 @@ async def test_duplex_reaper_loop_survives_one_cleanup_failure():
     await task
 
     assert orchestrator.duplex_control_plane.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_abort_retry_does_not_repeat_successful_stage_abort():
+    class _Pool:
+        def __init__(self, *, fail_once: bool = False) -> None:
+            self.bound = {"req-a"}
+            self.fail_once = fail_once
+            self.physical_abort_calls = 0
+
+        async def abort_requests(self, request_ids: list[str]) -> None:
+            active = self.bound.intersection(request_ids)
+            if not active:
+                return
+            self.physical_abort_calls += 1
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("stage abort failed")
+
+        def release_bindings(self, request_ids: list[str]) -> None:
+            self.bound.difference_update(request_ids)
+
+    first = _Pool()
+    second = _Pool(fail_once=True)
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [first, second]
+
+    with pytest.raises(RuntimeError, match="stage abort failed"):
+        await orchestrator._abort_request_ids(["req-a"])
+
+    assert first.bound == set()
+    assert first.physical_abort_calls == 1
+    assert second.bound == {"req-a"}
+
+    await orchestrator._abort_request_ids(["req-a"])
+
+    assert first.physical_abort_calls == 1
+    assert second.physical_abort_calls == 2
+    assert second.bound == set()
+
+
+@pytest.mark.asyncio
+async def test_request_cleanup_failure_is_deferred_to_control_plane():
+    class _FailingPool:
+        async def abort_requests(self, request_ids: list[str]) -> None:
+            raise RuntimeError("stage abort failed")
+
+        def release_bindings(self, request_ids: list[str]) -> None:
+            pass
+
+    class _Plane:
+        def __init__(self) -> None:
+            self.deferred: list[str] = []
+            self.finalized: list[str] = []
+
+        def close_sessions_for_request_ids(self, request_ids: list[str], **kwargs):
+            assert kwargs == {"abort": True, "cleanup_in_progress": True}
+            return {"sid-cleanup": ["req-a"]}
+
+        def defer_request_cleanups(self, session_ids: list[str]) -> None:
+            self.deferred.extend(session_ids)
+
+        def finalize_closed_sessions(self, session_ids: list[str]) -> None:
+            self.finalized.extend(session_ids)
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [_FailingPool()]
+    orchestrator.duplex_control_plane = _Plane()
+    orchestrator._pd_kv_params = {}
+    orchestrator.request_states = {}
+    orchestrator._running_counter = None
+
+    with pytest.raises(RuntimeError, match="stage abort failed"):
+        await orchestrator._cleanup_request_ids(
+            ["req-a"],
+            abort=True,
+            close_duplex_sessions=True,
+        )
+
+    assert orchestrator.duplex_control_plane.deferred == ["sid-cleanup"]
+    assert orchestrator.duplex_control_plane.finalized == []

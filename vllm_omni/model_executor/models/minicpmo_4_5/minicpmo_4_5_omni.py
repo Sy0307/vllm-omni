@@ -29,6 +29,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.model_executor.duplex import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
@@ -506,6 +507,172 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
         return self.get_multimodal_embeddings(**kwargs)
 
+    def _run_tts_request(
+        self,
+        *,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        talker_info: dict[str, Any],
+        device: torch.device,
+    ) -> tuple[dict[str, Any] | None, bool, bool]:
+        meta_info = talker_info.get("meta") if isinstance(talker_info.get("meta"), dict) else {}
+        if talker_info.get("native_duplex") is True:
+            # ids/hidden_states may be accumulated for the talker KV stream,
+            # but displayed transcript belongs to the current thinker segment.
+            tts_text = meta_info.get("native_duplex_segment_text", "")
+        else:
+            tts_text = talker_info.get("llm_output_text", "")
+        if isinstance(tts_text, list):
+            tts_text = (
+                tts_text[-1]
+                if talker_info.get("native_duplex") is True and tts_text
+                else (tts_text[0] if tts_text else "")
+            )
+        if not isinstance(tts_text, str):
+            tts_text = ""
+
+        with torch.inference_mode():
+            talker_result = self.talker(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                additional_information=talker_info,
+            )
+        chunk_flags = getattr(self.talker, "_ar_last_chunk_flags", [True])
+        chunk_is_last = bool(chunk_flags[-1]) if chunk_flags else True
+        turn_end_flags = getattr(self.talker, "_ar_turn_end_flags", [False])
+        turn_ended = bool(turn_end_flags[-1]) if turn_end_flags else False
+        if talker_info.get("native_duplex") is True:
+            emitted_text = getattr(self.talker, "_ar_last_emitted_text", "")
+            tts_text = emitted_text if isinstance(emitted_text, str) else ""
+
+        if not (isinstance(talker_result, tuple) and len(talker_result) == 2):
+            return None, chunk_is_last, turn_ended
+
+        mel_spec, waveform = talker_result
+        mm_out: dict[str, Any] = {}
+        duplex_info = talker_info.get("duplex") if isinstance(talker_info.get("duplex"), dict) else {}
+        if talker_info.get("native_duplex") is True:
+            turn_id = duplex_info.get("turn_id")
+            if isinstance(turn_id, int):
+                mm_out["meta.duplex_turn_id"] = torch.tensor([turn_id], dtype=torch.int32, device=device)
+            epoch = duplex_info.get("epoch")
+            if isinstance(epoch, int):
+                mm_out["meta.duplex_epoch"] = torch.tensor([epoch], dtype=torch.int32, device=device)
+        mm_out["meta.tts_is_last_chunk"] = torch.tensor(
+            [int(chunk_is_last)],
+            dtype=torch.int32,
+            device=device,
+        )
+        if talker_info.get("native_duplex") is True:
+            mm_out["meta.turn_end"] = torch.tensor(
+                [int(turn_ended)],
+                dtype=torch.int32,
+                device=device,
+            )
+        if tts_text or talker_info.get("native_duplex") is True:
+            mm_out["meta.llm_output_text_utf8"] = torch.tensor(
+                list(tts_text.encode("utf-8")),
+                dtype=torch.uint8,
+                device=device,
+            )
+            mm_out["meta.audio_text_total_chars"] = torch.tensor(
+                [len(tts_text)],
+                dtype=torch.int32,
+                device=device,
+            )
+        if mel_spec is not None:
+            mm_out["mel_spec"] = [mel_spec]
+        if waveform is not None:
+            mm_out["model_outputs"] = [waveform]
+        elif mel_spec is not None:
+            mm_out["model_outputs"] = [mel_spec]
+        return mm_out, chunk_is_last, turn_ended
+
+    @staticmethod
+    def _slice_tts_request_rows(value: torch.Tensor | None, start: int, end: int) -> torch.Tensor | None:
+        return value[start:end] if isinstance(value, torch.Tensor) else value
+
+    def _run_batched_tts_requests(
+        self,
+        *,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        runtime_info: list[object],
+        request_token_spans: object,
+        num_tokens: int,
+        hidden_dim: int,
+        device: torch.device,
+    ) -> OmniOutput:
+        if not isinstance(request_token_spans, list) or len(request_token_spans) != len(runtime_info):
+            raise RuntimeError(
+                "MiniCPM-o 4.5 batched TTS requires one request_token_spans entry "
+                f"per request; got {request_token_spans!r} for {len(runtime_info)} requests"
+            )
+
+        request_ids: list[str] = []
+        request_outputs: list[dict[str, Any]] = []
+        row_chunk_flags = [True] * num_tokens
+        row_turn_end_flags = [False] * num_tokens
+        previous_end = 0
+        for index, raw_info in enumerate(runtime_info):
+            if not isinstance(raw_info, dict):
+                raise RuntimeError(f"MiniCPM-o 4.5 TTS request metadata at index {index} is not a dict")
+            span = request_token_spans[index]
+            if not (
+                isinstance(span, (list, tuple)) and len(span) == 2 and all(isinstance(value, int) for value in span)
+            ):
+                raise RuntimeError(f"Invalid MiniCPM-o 4.5 TTS token span at index {index}: {span!r}")
+            start, end = span
+            if start != previous_end or start < 0 or end < start or end > num_tokens:
+                raise RuntimeError(
+                    f"Invalid MiniCPM-o 4.5 TTS token span at index {index}: "
+                    f"expected start {previous_end} and 0 <= start <= end <= {num_tokens}, got {span!r}"
+                )
+            previous_end = end
+            if start == end:
+                continue
+            mm_out, chunk_is_last, turn_ended = self._run_tts_request(
+                input_ids=self._slice_tts_request_rows(input_ids, start, end),
+                positions=self._slice_tts_request_rows(positions, start, end),
+                inputs_embeds=self._slice_tts_request_rows(inputs_embeds, start, end),
+                talker_info=raw_info,
+                device=device,
+            )
+            row_chunk_flags[start:end] = [chunk_is_last] * (end - start)
+            row_turn_end_flags[start:end] = [turn_ended] * (end - start)
+            if mm_out is not None:
+                request_ids.append(get_stream_request_key(raw_info))
+                request_outputs.append(mm_out)
+        if previous_end != num_tokens:
+            raise RuntimeError(f"MiniCPM-o 4.5 TTS token spans cover {previous_end} of {num_tokens} scheduled tokens")
+
+        self.talker._ar_last_chunk_flags = row_chunk_flags
+        self.talker._ar_turn_end_flags = row_turn_end_flags
+        dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
+        if not request_outputs:
+            return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
+
+        sparse_output: dict[str, Any] = {
+            "meta.req_id": request_ids,
+            "meta.sparse_audio": ["1"],
+        }
+        output_keys = set().union(*(output.keys() for output in request_outputs))
+        for key in output_keys:
+            values: list[Any] = []
+            for output in request_outputs:
+                value = output.get(key)
+                if isinstance(value, list) and len(value) == 1:
+                    value = value[0]
+                if value is None:
+                    dtype = torch.uint8 if key == "meta.llm_output_text_utf8" else torch.float32
+                    value = torch.empty(0, dtype=dtype, device=device)
+                values.append(value)
+            sparse_output[key] = values
+        return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=sparse_output)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -591,27 +758,57 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             multimodal_outputs = {"latent": text_hidden_states}
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                req_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-                duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
-                if isinstance(duplex_info, dict):
+                duplex_rows = []
+                for req_info in runtime_info:
+                    duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
+                    duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
+
+                prompt_rows = []
+                for duplex_info in duplex_rows:
                     prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
-                    if isinstance(prompt_token_ids, list):
-                        multimodal_outputs["duplex_prompt_token_ids"] = torch.tensor(
+                    prompt_rows.append(
+                        torch.tensor(
                             [prompt_token_ids],
                             dtype=torch.long,
                             device=text_hidden_states.device,
                         )
-                    special_token_ids = duplex_info.get("special_token_ids")
-                    if isinstance(special_token_ids, dict):
-                        multimodal_outputs["meta"] = {
-                            key: torch.tensor(
+                        if isinstance(prompt_token_ids, list)
+                        else None
+                    )
+                if any(row is not None for row in prompt_rows):
+                    multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
+
+                special_keys = {
+                    key
+                    for duplex_info in duplex_rows
+                    for key, value in (
+                        duplex_info.get("special_token_ids", {}).items()
+                        if isinstance(duplex_info.get("special_token_ids"), dict)
+                        else ()
+                    )
+                    if isinstance(key, str) and isinstance(value, int) and value >= 0
+                }
+                if special_keys:
+                    multimodal_outputs["meta"] = {
+                        key: [
+                            torch.tensor(
                                 [int(value)],
                                 dtype=torch.long,
                                 device=text_hidden_states.device,
                             )
-                            for key, value in special_token_ids.items()
-                            if isinstance(key, str) and isinstance(value, int) and value >= 0
-                        }
+                            if isinstance(value, int) and value >= 0
+                            else None
+                            for duplex_info in duplex_rows
+                            for value in [
+                                (
+                                    duplex_info.get("special_token_ids", {}).get(key)
+                                    if isinstance(duplex_info.get("special_token_ids"), dict)
+                                    else None
+                                )
+                            ]
+                        ]
+                        for key in sorted(special_keys)
+                    }
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -638,82 +835,29 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
             runtime_info = kwargs.get("runtime_additional_information")
-            talker_info = {}
-            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-            meta_info = talker_info.get("meta") if isinstance(talker_info.get("meta"), dict) else {}
-            if talker_info.get("native_duplex") is True:
-                # ids/hidden_states may be accumulated for the talker KV stream,
-                # but displayed transcript belongs to the current thinker segment.
-                tts_text = meta_info.get("native_duplex_segment_text", "")
-            else:
-                tts_text = talker_info.get("llm_output_text", "")
-            if isinstance(tts_text, list):
-                tts_text = (
-                    tts_text[-1]
-                    if talker_info.get("native_duplex") is True and tts_text
-                    else (tts_text[0] if tts_text else "")
-                )
-            if not isinstance(tts_text, str):
-                tts_text = ""
-
-            with torch.inference_mode():
-                talker_result = self.talker(
+            if isinstance(runtime_info, list) and len(runtime_info) > 1:
+                return self._run_batched_tts_requests(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
-                    additional_information=talker_info,
-                )
-            if talker_info.get("native_duplex") is True:
-                emitted_text = getattr(self.talker, "_ar_last_emitted_text", "")
-                tts_text = emitted_text if isinstance(emitted_text, str) else ""
-
-            dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
-
-            # talker returns (mel_spec, waveform_or_None) tuple
-            if isinstance(talker_result, tuple) and len(talker_result) == 2:
-                mel_spec, waveform = talker_result
-                mm_out = {}
-                duplex_info = talker_info.get("duplex") if isinstance(talker_info.get("duplex"), dict) else {}
-                if talker_info.get("native_duplex") is True and isinstance(duplex_info, dict):
-                    turn_id = duplex_info.get("turn_id")
-                    if isinstance(turn_id, int):
-                        mm_out["meta.duplex_turn_id"] = torch.tensor([turn_id], dtype=torch.int32, device=device)
-                    epoch = duplex_info.get("epoch")
-                    if isinstance(epoch, int):
-                        mm_out["meta.duplex_epoch"] = torch.tensor([epoch], dtype=torch.int32, device=device)
-                chunk_flags = getattr(self.talker, "_ar_last_chunk_flags", [True])
-                chunk_is_last = bool(chunk_flags[-1]) if chunk_flags else True
-                mm_out["meta.tts_is_last_chunk"] = torch.tensor(
-                    [int(chunk_is_last)],
-                    dtype=torch.int32,
+                    runtime_info=runtime_info,
+                    request_token_spans=kwargs.get("request_token_spans"),
+                    num_tokens=num_tokens,
+                    hidden_dim=hidden_dim,
                     device=device,
                 )
-                turn_end_flags = getattr(self.talker, "_ar_turn_end_flags", [False])
-                turn_ended = bool(turn_end_flags[-1]) if turn_end_flags else False
-                if talker_info.get("native_duplex") is True:
-                    mm_out["meta.turn_end"] = torch.tensor(
-                        [int(turn_ended)],
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                if isinstance(tts_text, str) and (tts_text or talker_info.get("native_duplex") is True):
-                    mm_out["meta.llm_output_text_utf8"] = torch.tensor(
-                        list(tts_text.encode("utf-8")),
-                        dtype=torch.uint8,
-                        device=device,
-                    )
-                    mm_out["meta.audio_text_total_chars"] = torch.tensor(
-                        [len(tts_text)],
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                if mel_spec is not None:
-                    mm_out["mel_spec"] = [mel_spec]
-                if waveform is not None:
-                    mm_out["model_outputs"] = [waveform]
-                elif mel_spec is not None:
-                    mm_out["model_outputs"] = [mel_spec]
+            talker_info = {}
+            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
+                talker_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
+            dummy_hidden = torch.zeros(num_tokens, hidden_dim, device=device)
+            mm_out, _, _ = self._run_tts_request(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                talker_info=talker_info,
+                device=device,
+            )
+            if mm_out is not None:
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=mm_out)
 
             return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)

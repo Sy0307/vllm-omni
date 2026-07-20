@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -27,7 +26,7 @@ class OmniNewRequestData(NewRequestData):
 
     external_req_id: str | None = None
     additional_information: AdditionalInformationPayload | None = None
-    model_intermediate_buffer: dict[str, Any] | None = None
+    model_intermediate_buffer: dict[str, object] | None = None
 
     @classmethod
     def from_request(

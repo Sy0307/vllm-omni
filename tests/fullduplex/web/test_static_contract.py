@@ -1,7 +1,11 @@
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3] / "vllm_omni" / "experimental" / "fullduplex" / "web" / "static"
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_page_exposes_focused_call_conversation_and_log_surfaces():
