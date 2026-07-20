@@ -483,11 +483,18 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
-    parser.add_argument(
+    config_group = parser.add_mutually_exclusive_group()
+    config_group.add_argument(
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a legacy stage configs file.",
+    )
+    config_group.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Path to a structured deploy config file.",
     )
     parser.add_argument(
         "--video-path",

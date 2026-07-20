@@ -46,6 +46,7 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
 
 logger = logging.get_logger(__name__)
 
+
 def _default_rope_init(config, device=None, seq_len=None, layer_type=None):
     """Vanilla sinusoidal RoPE (no scaling).
 

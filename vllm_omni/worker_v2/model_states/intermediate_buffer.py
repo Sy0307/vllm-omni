@@ -112,7 +112,14 @@ class OmniIntermediateBuffer:
                 dest[key] = value.detach().cpu().contiguous()
         elif isinstance(value, list):
             dest[key] = [
-                (item.detach().cpu().contiguous() if isinstance(item, torch.Tensor) else item) for item in value
+                (
+                    item.detach().clone()
+                    if key in gpu_keys and isinstance(item, torch.Tensor)
+                    else item.detach().cpu().contiguous()
+                    if isinstance(item, torch.Tensor)
+                    else item
+                )
+                for item in value
             ]
         else:
             dest[key] = value

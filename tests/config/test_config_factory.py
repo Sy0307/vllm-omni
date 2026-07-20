@@ -1816,7 +1816,7 @@ class TestQwen2_5OmniPipeline:
         s = p.get_stage(1)
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
-        assert s.sampling_constraints["stop_token_ids"] == [8292, 8294]
+        assert s.sampling_constraints["stop_token_ids"] == [8294]
         # thinker2talker was removed: qwen2_5_omni has no async_chunk support,
         # so sync_process_input_func always wins and custom_process_input_func
         # was dead code.

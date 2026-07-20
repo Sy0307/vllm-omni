@@ -1,9 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_omni.engine import stage_engine_core_proc as core_proc_module
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_uniproc_tp1_binds_native_data_plane_to_scheduler_inbox() -> None:

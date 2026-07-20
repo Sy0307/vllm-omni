@@ -144,9 +144,11 @@ def test_thinker2talker_async_chunk_flushes_cached_first_chunk_on_terminal() -> 
         is_finished=True,
     )
 
-    assert payload["meta"]["finished"].item() is True
-    assert torch.equal(payload["embed"]["prefill"], cached_prefill)
-    assert torch.equal(payload["hidden_states"]["output"], cached_hidden)
+    assert isinstance(payload, q3.OmniPayloadStruct)
+    payload_dict = q3.to_dict(payload)
+    assert payload_dict["meta"]["finished"].item() is True
+    assert torch.equal(payload_dict["embed"]["prefill"], cached_prefill)
+    assert torch.equal(payload_dict["hidden_states"]["output"], cached_hidden)
     assert "r-cached" not in transfer_manager.request_payload
 
 
@@ -309,7 +311,7 @@ def test_talker2code2wav_batch_processor_uses_one_d2h_and_preserves_rows(
     )
 
 
-def test_talker2code2wav_batch_processor_drops_all_zero_placeholder() -> None:
+def test_talker2code2wav_batch_processor_keeps_explicitly_valid_all_zero_frame() -> None:
     transfer_manager = SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         put_req_chunk=defaultdict(int),
@@ -318,19 +320,133 @@ def test_talker2code2wav_batch_processor_drops_all_zero_placeholder() -> None:
     request = SimpleNamespace(
         request_id="batch-zero",
         external_req_id="batch-zero",
-        output_token_ids=[],
+        output_token_ids=[0],
         sampling_params=SimpleNamespace(stop_token_ids=[], stop_token_id=None),
     )
 
     payloads = q3.talker2code2wav_async_chunk_batch(
         transfer_manager=transfer_manager,
-        pooling_outputs=[{"codes": {"audio": torch.zeros((1, 16), dtype=torch.long)}}],
+        pooling_outputs=[
+            {
+                "codes": {"audio": torch.zeros((1, 16), dtype=torch.long)},
+                "meta": {"codec_frame_valid": torch.tensor([True])},
+            }
+        ],
+        requests=[request],
+        is_finished=[False],
+    )
+
+    assert payloads[0] is not None
+    assert len(transfer_manager.code_prompt_token_ids["batch-zero"]) == 1
+    assert torch.equal(payloads[0].codes.audio, torch.zeros(16, dtype=torch.long))
+
+
+def test_talker2code2wav_scalar_processor_keeps_explicitly_valid_all_zero_frame() -> None:
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1, "codec_left_context_frames": 0}}),
+    )
+    request = SimpleNamespace(
+        request_id="scalar-zero",
+        external_req_id="scalar-zero",
+        output_token_ids=[0],
+        sampling_params=SimpleNamespace(stop_token_ids=[], stop_token_id=None),
+    )
+
+    payload = q3.talker2code2wav_async_chunk_prepare(
+        transfer_manager=transfer_manager,
+        multimodal_output={
+            "codes": {"audio": torch.zeros((1, 16), dtype=torch.long)},
+            "meta": {"codec_frame_valid": torch.tensor(True)},
+        },
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert len(transfer_manager.code_prompt_token_ids["scalar-zero"]) == 1
+    assert torch.equal(payload.codes.audio, torch.zeros(16, dtype=torch.long))
+
+
+def test_talker2code2wav_batch_processor_drops_explicitly_invalid_nonzero_frame() -> None:
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1, "codec_left_context_frames": 0}}),
+    )
+    request = SimpleNamespace(
+        request_id="batch-placeholder",
+        external_req_id="batch-placeholder",
+        output_token_ids=[1],
+        sampling_params=SimpleNamespace(stop_token_ids=[], stop_token_id=None),
+    )
+
+    payloads = q3.talker2code2wav_async_chunk_batch(
+        transfer_manager=transfer_manager,
+        pooling_outputs=[
+            {
+                "codes": {"audio": torch.ones((1, 16), dtype=torch.long)},
+                "meta": {"codec_frame_valid": torch.tensor(False)},
+            }
+        ],
         requests=[request],
         is_finished=[False],
     )
 
     assert payloads == [None]
-    assert transfer_manager.code_prompt_token_ids["batch-zero"] == []
+    assert transfer_manager.code_prompt_token_ids["batch-placeholder"] == []
+
+
+def test_talker2code2wav_scalar_processor_drops_explicitly_invalid_nonzero_frame() -> None:
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1, "codec_left_context_frames": 0}}),
+    )
+    request = SimpleNamespace(
+        request_id="scalar-placeholder",
+        external_req_id="scalar-placeholder",
+        output_token_ids=[1],
+        sampling_params=SimpleNamespace(stop_token_ids=[], stop_token_id=None),
+    )
+
+    payload = q3.talker2code2wav_async_chunk_prepare(
+        transfer_manager=transfer_manager,
+        multimodal_output={
+            "codes": {"audio": torch.ones((1, 16), dtype=torch.long)},
+            "meta": {"codec_frame_valid": torch.tensor(False)},
+        },
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload is None
+    assert transfer_manager.code_prompt_token_ids["scalar-placeholder"] == []
+
+
+def test_talker2code2wav_scalar_legacy_payload_keeps_zero_placeholder_compatibility() -> None:
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 1, "codec_left_context_frames": 0}}),
+    )
+    request = SimpleNamespace(
+        request_id="legacy-placeholder",
+        external_req_id="legacy-placeholder",
+        output_token_ids=[0],
+        sampling_params=SimpleNamespace(stop_token_ids=[], stop_token_id=None),
+    )
+
+    payload = q3.talker2code2wav_async_chunk_prepare(
+        transfer_manager=transfer_manager,
+        multimodal_output={"codes": {"audio": torch.zeros((1, 16), dtype=torch.long)}},
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload is None
+    assert transfer_manager.code_prompt_token_ids["legacy-placeholder"] == []
 
 
 def test_streaming_input_prefill_chunk_is_cached() -> None:
@@ -397,6 +513,30 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     assert payload.ids.all == [151644, 872, 100]
     assert payload.ids.prompt == [151644, 872]
     assert "rt-2" not in transfer_manager._pending_streaming_prefills
+
+
+def test_streaming_input_decode_marks_absolute_token_span() -> None:
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
+    request = SimpleNamespace(
+        external_req_id="rt-span",
+        output_token_ids=[100, 101],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        torch.ones(1, 3),
+        torch.full((1, 3), 2.0),
+        transfer_manager,
+    )
+
+    assert payload is not None
+    assert payload.embed.decode_token_start == 0
+    assert payload.embed.decode_token_end == 1
 
 
 def test_thinker2talker_async_chunk_keeps_multirow_decode_payload() -> None:
@@ -475,6 +615,58 @@ def test_thinker2talker_async_chunk_marks_absolute_decode_token_span() -> None:
     assert payload is not None
     assert payload.embed.decode_token_start == 2
     assert payload.embed.decode_token_end == 8
+
+
+def test_qwen3_code2wav_chunk_boundary_is_independent_of_connector_ack() -> None:
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 2, "codec_left_context_frames": 0}}),
+    )
+    request_id = "producer-boundary"
+    frames = transfer_manager.code_prompt_token_ids[request_id]
+    frames.extend(torch.tensor([value], dtype=torch.long) for value in (1, 2))
+
+    first = q3._build_qwen3_async_code2wav_payload_from_buffer(
+        transfer_manager,
+        request_id,
+        is_finished=False,
+    )
+    # The connector save thread has not acknowledged the first payload yet.
+    assert transfer_manager.put_req_chunk[request_id] == 0
+    frames.extend(torch.tensor([value], dtype=torch.long) for value in (3, 4))
+    second = q3._build_qwen3_async_code2wav_payload_from_buffer(
+        transfer_manager,
+        request_id,
+        is_finished=False,
+    )
+
+    assert first is not None and first.codes.audio.tolist() == [1, 2]
+    assert second is not None and second.codes.audio.tolist() == [3, 4]
+
+
+def test_finished_cached_thinker_payload_remains_structured() -> None:
+    transfer_manager = SimpleNamespace(
+        put_req_chunk=defaultdict(int),
+        request_payload={
+            "cached-terminal": {
+                "embed": {"prefill": torch.ones(2, 3)},
+                "meta": {"finished": torch.tensor(False)},
+            }
+        },
+    )
+    request = SimpleNamespace(external_req_id="cached-terminal")
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        None,
+        request,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.meta.finished.item() is True
+    assert torch.equal(payload.embed.prefill, torch.ones(2, 3))
 
 
 def test_first_decode_row_follows_the_first_sampled_thinker_token() -> None:
@@ -639,6 +831,7 @@ def test_talker2code2wav_async_chunk_flushes_cached_tail_on_stop_token() -> None
     transfer_manager = SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         put_req_chunk=defaultdict(int, {request_id: 2}),
+        _qwen3_omni_emitted_frames={request_id: 29},
         connector=SimpleNamespace(
             config={
                 "extra": {

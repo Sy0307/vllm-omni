@@ -36,6 +36,7 @@ def _make_minimal_talker(
     """
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
+    model._codebook_vocab_size = 2048
     model._embedding_dtype = torch.bfloat16
     if tts_pad_embed is None:
         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
@@ -334,6 +335,30 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text[65:])
 
 
+def test_decode_marks_codec_frame_validity_from_processed_input_token():
+    model = _make_minimal_talker()
+    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
+    common = {
+        "input_embeds": None,
+        "text": ["hello"],
+        "task_type": ["CustomVoice"],
+        "hidden_states": {
+            "trailing_text": torch.ones((2, 4)),
+            "last": torch.ones(4),
+        },
+        "meta": {"talker_text_offset": 0},
+        "_omni_is_prefill": False,
+        "_omni_num_computed_tokens": 2,
+        "_omni_prompt_len": 2,
+    }
+
+    _, _, valid_update = model.preprocess(input_ids=torch.tensor([123]), **common)
+    _, _, eos_update = model.preprocess(input_ids=torch.tensor([4198]), **common)
+
+    assert valid_update["meta"]["codec_frame_valid"].item() is True
+    assert eos_update["meta"]["codec_frame_valid"].item() is False
+
+
 def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
     model = _make_minimal_talker()
 
@@ -361,7 +386,8 @@ def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
         out_embeds.cpu(),
         torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=torch.bfloat16),
     )
-    assert update == {"meta": {"codec_streaming": True}}
+    assert update["meta"]["codec_streaming"] is True
+    assert update["meta"]["codec_frame_valid"].item() is False
 
 
 def test_decode_batch_preprocess_matches_decode_state_updates():
@@ -402,9 +428,11 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     assert torch.equal(text_step[1].cpu(), tts_pad.reshape(-1).to(torch.bfloat16))
     assert updates[0]["meta"]["talker_text_offset"] == 2
     assert updates[0]["meta"]["codec_streaming"] is True
+    assert updates[0]["meta"]["codec_frame_valid"].item() is True
     assert "hidden_states" not in updates[0]
     assert updates[1]["meta"]["talker_text_offset"] == 0
     assert updates[1]["meta"]["codec_streaming"] is False
+    assert updates[1]["meta"]["codec_frame_valid"].item() is True
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
 
 

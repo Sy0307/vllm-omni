@@ -176,7 +176,6 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         connector = MockConnector(stage_id=1)
         sender = MixinHost()
         sender.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True),
         )
         sender._omni_connector = connector
@@ -223,7 +222,6 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         connector = MockConnector(stage_id=1)
         sender = MixinHost()
         sender.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True),
         )
         sender._omni_connector = connector
@@ -250,7 +248,6 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         connector = MockConnector(stage_id=1)
         sender = MixinHost()
         sender.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True),
         )
         sender._omni_connector = connector
@@ -277,6 +274,39 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
             )
 
         self.assertEqual(sender._put_req_chunk["req-0"], 0)
+        sender.shutdown_omni_connectors()
+
+    def test_scalar_send_chunks_builds_every_payload_before_enqueue(self):
+        connector = MockConnector(stage_id=1)
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=1, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 1
+        sender._next_stage_id = 2
+        sender._custom_process_batch_func = None
+
+        requests = [_make_request("req-0"), _make_request("req-1")]
+        for request in requests:
+            request.is_finished = lambda: False
+
+        def scalar_process(transfer_manager, pooling_output, request, is_finished=False):
+            if request.request_id == "req-1":
+                raise RuntimeError("second payload failed")
+            return {"data": pooling_output}
+
+        sender._custom_process_func = scalar_process
+
+        with self.assertRaisesRegex(RuntimeError, "second payload failed"):
+            sender.send_chunks(
+                [(requests[0], 10), (requests[1], 20)],
+                propagate_errors=True,
+            )
+
+        self.assertEqual(sender._put_req_chunk["req-0"], 0)
+        self.assertEqual(sender._put_req_chunk["req-1"], 0)
+        self.assertEqual(connector._store, {})
         sender.shutdown_omni_connectors()
 
 
@@ -527,7 +557,6 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=0, async_chunk=True),
         )
         host._custom_process_func = async_func
@@ -1524,7 +1553,6 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
 
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         host._chunk_ready_req_ids = _BarrierCollection()
@@ -1544,7 +1572,6 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
     def test_recv_thread_publishes_consumable_chunk_to_direct_sink_once(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         host._omni_connector = MagicMock()
@@ -1580,7 +1607,6 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
     def test_recv_pass_publishes_ready_cohort_once(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         host._omni_connector = MagicMock()
@@ -1609,7 +1635,6 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
     def test_unbound_sink_preserves_output_carried_fallback(self):
         host = MixinHost()
         host.init_omni_connectors(
-            vllm_config=None,
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         host._finished_load_reqs.add("r1")

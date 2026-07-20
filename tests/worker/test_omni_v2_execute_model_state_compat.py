@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm_omni.worker_v2.omni_model_runner import _make_execute_model_state
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_make_execute_model_state_ignores_fields_missing_from_current_vllm():

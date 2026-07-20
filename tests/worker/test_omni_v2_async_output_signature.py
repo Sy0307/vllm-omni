@@ -3,7 +3,11 @@
 
 import inspect
 
+import pytest
+
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniAsyncOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_omni_async_output_does_not_require_external_copy_event():

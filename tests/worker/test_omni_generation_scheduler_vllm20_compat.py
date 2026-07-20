@@ -3,10 +3,14 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_omni.core.sched.omni_generation_scheduler import (
     _get_request_num_cached_tokens,
     _make_engine_core_output,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_get_request_num_cached_tokens_defaults_to_zero_when_field_is_missing():

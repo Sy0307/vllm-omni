@@ -7,10 +7,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.model_states.omni_model_state import (
+    OmniModelState,
+    _make_safe_get_rope,
+)
 from vllm_omni.worker_v2.model_states.plugin import OmniModelStatePlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +79,7 @@ def _make_state(
     model.talker_mtp_accepts_per_row_generators = False
     model.talker_mtp_accepts_req_infos = False
     model.talker_mtp_output_key = ("codes", "audio")
+    model.talker_mtp_validity_key = None
     model.requires_native_model_intermediate_buffer = False
     model.preprocess_batch_mrv2 = None
     model.preprocess_decode_batch_mrv2 = None
@@ -140,6 +145,31 @@ def test_add_request_dispatches_to_plugins():
 
     assert len(plugin.add_calls) == 1
     assert plugin.add_calls[0][0] == 0
+
+
+def test_add_request_initializes_declared_validity_for_upstream_warmup():
+    state = _make_state()
+    state.model.talker_mtp_validity_key = ("meta", "codec_frame_valid")
+    req = _make_new_req_data("_warmup_0_")
+
+    with patch.object(type(state).__bases__[0], "add_request", return_value=None):
+        state.add_request(0, req)
+
+    validity = state.intermediate_buffer.buffers[0]["meta"]["codec_frame_valid"]
+    assert isinstance(validity, torch.Tensor)
+    assert validity.dtype == torch.bool
+    assert validity.item() is False
+
+
+def test_add_request_does_not_mask_missing_validity_for_real_requests():
+    state = _make_state()
+    state.model.talker_mtp_validity_key = ("meta", "codec_frame_valid")
+    req = _make_new_req_data("r1")
+
+    with patch.object(type(state).__bases__[0], "add_request", return_value=None):
+        state.add_request(0, req)
+
+    assert "meta" not in state.intermediate_buffer.buffers[0]
 
 
 def test_add_request_unflattens_serialized_additional_information():
@@ -1039,6 +1069,7 @@ def test_run_batched_mtp_batches_gpu_codec_state_writeback():
         input_embeds,
         source_codes,
     )
+    state.model.talker_mtp_validity_key = ("meta", "codec_frame_valid")
     state.intermediate_buffer.update = MagicMock(
         side_effect=AssertionError("GPU codec rows must not use scalar update")
     )
@@ -1057,14 +1088,20 @@ def test_run_batched_mtp_batches_gpu_codec_state_writeback():
             input_ids,
             embeds,
             batch,
-            {("codes", "audio")},
+            {("codes", "audio"), ("meta", "codec_frame_valid")},
         )
 
-    state.intermediate_buffer.update_gpu_tensor_rows.assert_called_once()
-    req_indices, key, values = state.intermediate_buffer.update_gpu_tensor_rows.call_args.args
+    assert state.intermediate_buffer.update_gpu_tensor_rows.call_count == 2
+    code_call, validity_call = state.intermediate_buffer.update_gpu_tensor_rows.call_args_list
+    req_indices, key, values = code_call.args
     assert req_indices == [0, 1]
     assert key == ("codes", "audio")
     assert values.data_ptr() == source_codes.data_ptr()
+    req_indices, key, values = validity_call.args
+    assert req_indices == [0, 1]
+    assert key == ("meta", "codec_frame_valid")
+    assert torch.equal(values, torch.ones(2, dtype=torch.bool))
+    assert validity_call.kwargs == {"keepdim": False}
 
 
 def test_seeded_talker_mtp_bypasses_outer_graph_runner():
@@ -1173,3 +1210,85 @@ def test_run_batched_mtp_uses_scalar_fallback_without_per_row_generators():
         state._run_batched_mtp(mtp_batches, input_ids, embeds, batch, {("codes", "audio")})
 
     assert call_batch_sizes == [1, 1]
+
+
+def test_prepare_attn_delegates_complete_vllm_025_contract():
+    state = _make_state()
+    input_batch = object()
+    block_tables = (object(),)
+    slot_mappings = object()
+    attn_groups = [[object()]]
+    kv_cache_config = object()
+    expected = {"attn": object()}
+
+    with patch.object(
+        type(state).__bases__[0],
+        "prepare_attn",
+        return_value=expected,
+    ) as upstream:
+        result = state.prepare_attn(
+            input_batch,
+            CUDAGraphMode.FULL,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture=True,
+        )
+
+    assert result is expected
+    upstream.assert_called_once_with(
+        input_batch,
+        CUDAGraphMode.FULL,
+        block_tables,
+        slot_mappings,
+        attn_groups,
+        kv_cache_config,
+        True,
+    )
+
+
+def test_safe_get_rope_does_not_hide_signature_type_errors():
+    def broken_get_rope(*_args, **_kwargs):
+        raise TypeError("vLLM rope API drift")
+
+    wrapped = _make_safe_get_rope(broken_get_rope)
+
+    with pytest.raises(TypeError, match="rope API drift"):
+        wrapped(SimpleNamespace(uses_mrope=False), object())
+
+
+def test_request_state_num_computed_wins_when_input_batch_is_full():
+    state = _make_state(max_num_reqs=2, has_preprocess=True)
+    state.intermediate_buffer.buffers[1] = {"req_id": "r1"}
+    state.model.preprocess.return_value = (
+        torch.tensor([1]),
+        torch.zeros(1, 2),
+        {},
+    )
+    batch = _DummyInputBatch([1, 0], num_computed_tokens_cpu=[100, 200])
+    batch.input_ids = torch.tensor([1, 2])
+    batch.num_tokens = 2
+    req_states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([5, 5], dtype=np.int32)),
+        num_computed_tokens=SimpleNamespace(np=np.array([3, 4], dtype=np.int32)),
+    )
+
+    state.run_preprocess(
+        batch,
+        {"input_ids": batch.input_ids, "inputs_embeds": torch.zeros(2, 2)},
+        req_states,
+    )
+
+    info = state.model.preprocess.call_args.kwargs
+    assert info["_omni_num_computed_tokens"] == 4
+    assert info["_omni_is_prefill"] is True
+
+
+def test_postprocess_model_output_propagates_make_output_failure():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.make_omni_output.side_effect = RuntimeError("broken payload")
+    input_batch = _DummyInputBatch([0])
+
+    with pytest.raises(RuntimeError, match="broken payload"):
+        state.postprocess_model_output((torch.zeros(1, 2), []), input_batch, object())

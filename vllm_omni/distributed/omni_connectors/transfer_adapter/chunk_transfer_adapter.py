@@ -429,6 +429,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
+            emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
+            if emitted_frames is not None:
+                emitted_frames.pop(external_req_id, None)
             self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
@@ -504,6 +507,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
+        emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
+        if emitted_frames is not None:
+            emitted_frames.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)

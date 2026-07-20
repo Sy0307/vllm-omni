@@ -630,6 +630,16 @@ def _merge_platforms(
     return merged
 
 
+def _merge_connectors(
+    base: dict[str, Any] | None,
+    overlay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Deep-merge named connector definitions from a deploy overlay."""
+    if not base and not overlay:
+        return None
+    return _get_recursively_merged_dict(base or {}, overlay or {})
+
+
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
@@ -642,12 +652,15 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     base_path = Path(path).parent / base_path
     base_dict = resolve_deploy_yaml(base_path)
 
-    # Merge top-level scalars: overlay wins. ``stages:`` and ``platforms:``
-    # are deep-merged below so an overlay can layer on top of the base.
+    # Merge top-level scalars: overlay wins. Structured sections are merged
+    # below so a thin overlay does not discard inherited runtime contracts.
     merged = {
         **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms")},
+        **{k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
     }
+    merged_connectors = _merge_connectors(base_dict.get("connectors"), raw_dict.get("connectors"))
+    if merged_connectors is not None:
+        merged["connectors"] = merged_connectors
     merged["stages"] = _merge_stage_lists(base_dict.get("stages"), raw_dict.get("stages"))
     merged_platforms = _merge_platforms(base_dict.get("platforms"), raw_dict.get("platforms"))
     if merged_platforms is not None:
@@ -728,6 +741,11 @@ def _apply_platform_overrides(
 
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
+    if deploy.model_runner == "v2" and platform in {"npu", "xpu"}:
+        raise NotImplementedError(
+            f"Model Runner V2 is not supported on {platform.upper()}: "
+            "the platform worker still uses the legacy chunk-transfer data plane."
+        )
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
@@ -863,7 +881,7 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
-    engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
+    engine_args.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)

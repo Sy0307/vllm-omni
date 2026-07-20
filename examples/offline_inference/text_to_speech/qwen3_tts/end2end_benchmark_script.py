@@ -14,6 +14,7 @@ import soundfile as sf
 import torch
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from examples.offline_inference.text_to_speech.qwen3_tts.end2end import _StreamingAudioAccumulator
 from vllm_omni import AsyncOmni, Omni
 
 logger = logging.getLogger(__name__)
@@ -435,12 +436,17 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    config_kwargs = (
+        {"deploy_config": args.deploy_config}
+        if args.deploy_config is not None
+        else {"stage_configs_path": args.stage_configs_path}
+    )
     omni = Omni(
         model=model_name,
-        stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        **config_kwargs,
     )
 
     collector = _SummaryCollector(omni)
@@ -486,12 +492,17 @@ async def main_streaming(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    config_kwargs = (
+        {"deploy_config": args.deploy_config}
+        if args.deploy_config is not None
+        else {"stage_configs_path": args.stage_configs_path}
+    )
     omni = AsyncOmni(
         model=model_name,
-        stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        **config_kwargs,
     )
 
     collector = _SummaryCollector(omni)
@@ -516,8 +527,10 @@ async def main_streaming(args):
             t_req_start = time.perf_counter()
             t_prev = t_req_start
             chunk_idx = 0
+            audio_accumulator = _StreamingAudioAccumulator()
             async for stage_output in omni.generate(prompt, request_id=request_id):
                 mm = stage_output.request_output.outputs[0].multimodal_output
+                audio_accumulator.add(mm)
                 if not stage_output.finished:
                     t_now = time.perf_counter()
                     audio = mm.get("audio")
@@ -536,7 +549,7 @@ async def main_streaming(args):
                     t_end = time.perf_counter()
                     total_ms = (t_end - t_req_start) * 1000
                     logger.info("Request %s: done total=%.1fms chunks=%d", request_id, total_ms, chunk_idx)
-                    _save_wav(output_dir, request_id, mm)
+                    _save_wav(output_dir, request_id, audio_accumulator.as_multimodal_output())
         elapsed = time.perf_counter() - t_start
         round_times.append(elapsed)
         print(f"[Test {r}/{args.test_rounds}] done in {elapsed:.3f}s")
@@ -590,11 +603,18 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line.",
     )
-    parser.add_argument(
+    config_group = parser.add_mutually_exclusive_group()
+    config_group.add_argument(
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a legacy stage configs file.",
+    )
+    config_group.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Path to a structured deploy config file.",
     )
     parser.add_argument(
         "--use-batch-sample",
@@ -626,7 +646,10 @@ def parse_args():
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.test_rounds <= 0:
+        parser.error("--test-rounds must be greater than zero")
+    return args
 
 
 if __name__ == "__main__":

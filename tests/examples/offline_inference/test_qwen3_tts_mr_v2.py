@@ -55,7 +55,7 @@ def test_custom_voice():
         command = [
             "python",
             END2END,
-            "--stage-configs-path",
+            "--deploy-config",
             MR_V2_DEPLOY_CONFIG,
             "--model",
             CUSTOM_VOICE_MODEL,
@@ -76,7 +76,7 @@ def test_voice_design():
         command = [
             "python",
             END2END,
-            "--stage-configs-path",
+            "--deploy-config",
             MR_V2_DEPLOY_CONFIG,
             "--model",
             VOICE_DESIGN_MODEL,
@@ -97,7 +97,7 @@ def test_base_icl():
         command = [
             "python",
             END2END,
-            "--stage-configs-path",
+            "--deploy-config",
             MR_V2_DEPLOY_CONFIG,
             "--model",
             BASE_MODEL,
@@ -120,7 +120,7 @@ def test_custom_voice_streaming():
         command = [
             "python",
             END2END,
-            "--stage-configs-path",
+            "--deploy-config",
             MR_V2_DEPLOY_CONFIG,
             "--model",
             CUSTOM_VOICE_MODEL,

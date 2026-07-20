@@ -1,6 +1,7 @@
 """Unit tests for OmniARModelRunner v2."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -181,6 +182,32 @@ def test_async_mm_snapshot_keeps_separate_shape_buckets() -> None:
     assert len(slot) == 2
     assert first.shape == (1, 2)
     assert second.shape == (4, 2)
+
+
+def test_async_mm_snapshot_cache_is_bounded_without_evicting_existing_buffers(monkeypatch) -> None:
+    monkeypatch.setattr(omni_ar_model_runner, "_ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT", 1)
+    slot = {}
+    first = omni_ar_model_runner._copy_mm_to_snapshot_slot(torch.ones(1, 2), slot)
+    second = omni_ar_model_runner._copy_mm_to_snapshot_slot(torch.ones(4, 2), slot)
+
+    assert len(slot) == 1
+    assert next(iter(slot.values())) is first
+    assert second.shape == (4, 2)
+    assert second.data_ptr() != first.data_ptr()
+
+
+def test_non_async_pooler_copy_blocks_next_graph_replay():
+    main_stream = MagicMock()
+    copy_event = object()
+
+    omni_ar_model_runner._guard_graph_replay_for_pooler_copy(
+        main_stream,
+        copy_event,
+        need_pooler=True,
+        async_chunk=False,
+    )
+
+    main_stream.wait_event.assert_called_once_with(copy_event)
 
 
 def test_has_cuda_tensor_recurses_nested_payloads() -> None:
@@ -519,6 +546,22 @@ def test_copy_mm_to_cpu_empty():
     assert _async_copy_mm({}, 10) == {}
 
 
+def test_copy_mm_to_cpu_fails_entire_payload_when_one_leaf_copy_fails(monkeypatch):
+    good = torch.randn(2)
+    bad = torch.randn(2)
+    original = omni_ar_model_runner._async_copy_mm_value
+
+    def copy_or_fail(value, **kwargs):
+        if value is bad:
+            raise RuntimeError("injected D2H failure")
+        return original(value, **kwargs)
+
+    monkeypatch.setattr(omni_ar_model_runner, "_async_copy_mm_value", copy_or_fail)
+
+    with pytest.raises(RuntimeError, match="injected D2H failure"):
+        _async_copy_mm({"good": good, "bad": bad}, 10)
+
+
 # ---------------------------------------------------------------
 # Slicing via _build_pooler_output_from_cpu (was _slice_mm_payload)
 # ---------------------------------------------------------------
@@ -660,93 +703,28 @@ def test_build_pooler_output_preserves_qwen3_nested_payload():
     assert payload["embed"]["tts_bos"].shape == (1, 1, 4)
 
 
-def test_clamp_sampling_prompt_token_ids_to_logits_vocab():
-    prompt_token_ids = torch.tensor([[3, 99, 152064]])
-    input_batch = SimpleNamespace(
-        vocab_size=152064,
-        sampling_metadata=SimpleNamespace(
-            no_penalties=False,
-            prompt_token_ids=prompt_token_ids,
-        ),
-    )
-
-    OmniARModelRunner._clamp_sampling_prompt_token_ids(
-        input_batch,
-        logits_vocab_size=10,
-    )
-
-    assert prompt_token_ids.tolist() == [[3, 9, 9]]
-
-
-def test_sample_clamps_prompt_token_ids_from_actual_logits_vocab():
+def test_kv_transfer_uses_global_request_id_from_intermediate_buffer():
     runner = object.__new__(OmniARModelRunner)
-
-    class Model:
-        def compute_logits(self, *_args, **_kwargs):
-            return torch.empty(1, 7)
-
-    runner.model = Model()
-    prompt_token_ids = torch.tensor([[3, 99, 152064]])
-    input_batch = SimpleNamespace(
-        vocab_size=152064,
-        sampling_metadata=SimpleNamespace(
-            no_penalties=False,
-            prompt_token_ids=prompt_token_ids,
+    runner.req_states = SimpleNamespace(req_id_to_index={"local": 1})
+    runner.model_state = SimpleNamespace(
+        intermediate_buffer=SimpleNamespace(
+            buffers=[{}, {"global_request_id": "global"}],
         ),
     )
-    sample_seen_prompt_ids = []
+    runner.model = object()
+    runner.kv_caches = [object()]
+    runner.cache_config = SimpleNamespace(block_size=16, cache_dtype="auto")
+    manager = MagicMock()
+    manager.handle_finished_requests_kv_transfer.return_value = ["local"]
+    runner._ensure_kv_transfer_manager = MagicMock(return_value=manager)
 
-    def sample(text_hidden, input_batch_arg, grammar_output):
-        assert grammar_output is None
-        runner.model.compute_logits(text_hidden)
-        sample_seen_prompt_ids.append(input_batch_arg.sampling_metadata.prompt_token_ids.clone())
-        return "sampler", "num_sampled", "num_rejected"
-
-    runner.sample = sample
-
-    result = runner._sample_with_prompt_token_compat(
-        torch.empty(1, 4),
-        input_batch,
-        None,
+    runner._handle_kv_transfer_pre(
+        SimpleNamespace(
+            finished_requests_needing_kv_transfer={
+                "local": {"block_ids": [1], "seq_len": 3},
+            }
+        )
     )
 
-    assert result == ("sampler", "num_sampled", "num_rejected")
-    assert prompt_token_ids.tolist() == [[3, 6, 6]]
-    assert sample_seen_prompt_ids[0].tolist() == [[3, 6, 6]]
-    assert runner.model.compute_logits.__func__ is Model.compute_logits
-    assert "compute_logits" not in runner.model.__dict__
-
-
-def test_native_data_plane_samples_without_prompt_compat_monkey_patch():
-    runner = object.__new__(OmniARModelRunner)
-    runner._omni_data_plane = object()
-
-    class Model:
-        def compute_logits(self, *_args, **_kwargs):
-            return torch.empty(1, 7)
-
-    runner.model = Model()
-    prompt_token_ids = torch.tensor([[3, 99, 152064]])
-    input_batch = SimpleNamespace(
-        vocab_size=152064,
-        sampling_metadata=SimpleNamespace(
-            no_penalties=False,
-            prompt_token_ids=prompt_token_ids,
-        ),
-    )
-
-    def sample(_text_hidden, input_batch_arg, _grammar_output):
-        assert "compute_logits" not in runner.model.__dict__
-        assert input_batch_arg.sampling_metadata.prompt_token_ids.tolist() == [[3, 99, 152064]]
-        return "sampler", "num_sampled", "num_rejected"
-
-    runner.sample = sample
-
-    result = runner._sample_with_prompt_token_compat(
-        torch.empty(1, 4),
-        input_batch,
-        None,
-    )
-
-    assert result == ("sampler", "num_sampled", "num_rejected")
-    assert prompt_token_ids.tolist() == [[3, 99, 152064]]
+    resolver = manager.handle_finished_requests_kv_transfer.call_args.kwargs["request_id_resolver"]
+    assert resolver("local") == "global"

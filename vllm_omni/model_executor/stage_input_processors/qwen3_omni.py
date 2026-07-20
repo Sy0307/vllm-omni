@@ -20,6 +20,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
     to_dict,
+    to_struct,
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -354,11 +355,19 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                     )
                     _attach_talker_scheduler_prompt_metadata(payload)
                     return payload
+            decode_token_start, decode_token_end = _thinker_decode_token_span(
+                len(output_token_ids),
+                int(emb_cpu.shape[0]),
+            )
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
                 ),
-                embed=EmbeddingsStruct(decode=emb_cpu),
+                embed=EmbeddingsStruct(
+                    decode=emb_cpu,
+                    decode_token_start=decode_token_start,
+                    decode_token_end=decode_token_end,
+                ),
                 hidden_states=HiddenStatesStruct(output=hid_cpu),
                 ids=IdsStruct(output=output_token_ids),
                 speaker=speaker,
@@ -368,13 +377,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
         if not is_finished:
             # do not send async chunk mode placeholder token or embedding/hidden of the stop token
             return None
-        return OmniPayloadStruct(
-            meta=MetaStruct(finished=finished),
-            embed=EmbeddingsStruct(decode=emb_cpu),
-            hidden_states=HiddenStatesStruct(output=hid_cpu),
-            speaker=speaker,
-            language=language,
-        )
+        return OmniPayloadStruct(meta=MetaStruct(finished=finished))
 
 
 @dataclass
@@ -595,7 +598,7 @@ def thinker2talker_async_chunk(
             if cached_payload is not None:
                 meta = cached_payload.setdefault("meta", {})
                 meta["finished"] = torch.tensor(True, dtype=torch.bool)
-                return cached_payload
+                return to_struct(cached_payload)
             return OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None
@@ -927,6 +930,41 @@ def _copy_qwen3_codec_batch_to_cpu(rows: torch.Tensor) -> torch.Tensor:
     return rows.detach().to(dtype=torch.long, device="cpu")
 
 
+def _codec_frame_valid_mask(
+    multimodal_output: Mapping[str, Any],
+    *,
+    row_count: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return the producer's authoritative per-row codec validity mask.
+
+    ``None`` identifies a legacy payload. Those payloads retain their existing
+    value-based placeholder compatibility below; native MRv2 always supplies
+    this field and never infers validity from codec IDs.
+    """
+    meta = multimodal_output.get("meta", {})
+    if not isinstance(meta, Mapping):
+        return None
+    raw_validity = meta.get("codec_frame_valid")
+    if raw_validity is None:
+        return None
+    if isinstance(raw_validity, torch.Tensor):
+        if raw_validity.numel() == 0:
+            raise ValueError("codec_frame_valid must not be empty")
+        validity = raw_validity.detach().to(device=device, dtype=torch.bool).reshape(-1)
+    elif isinstance(raw_validity, bool):
+        validity = torch.tensor([raw_validity], dtype=torch.bool, device=device)
+    else:
+        raise TypeError(f"codec_frame_valid must be a bool or tensor, got {type(raw_validity).__name__}")
+    if validity.numel() == 1:
+        return validity.expand(row_count)
+    if validity.numel() != row_count:
+        raise ValueError(
+            f"codec_frame_valid changed the codec row axis: expected={row_count} actual={validity.numel()}"
+        )
+    return validity
+
+
 def _codec_stop_token_ids(request: Any) -> set[int]:
     sampling_params = getattr(request, "sampling_params", None)
     stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
@@ -953,6 +991,7 @@ def talker2code2wav_async_chunk_batch(
 
     tensors: list[torch.Tensor] = []
     row_counts = [0] * len(requests)
+    validity_masks: list[torch.Tensor | None] = [None] * len(requests)
     for index, pooling_output in enumerate(pooling_outputs):
         if not isinstance(pooling_output, Mapping):
             continue
@@ -963,6 +1002,11 @@ def talker2code2wav_async_chunk_batch(
         if not isinstance(rows, torch.Tensor) or rows.ndim != 2 or rows.numel() == 0:
             continue
         row_counts[index] = int(rows.shape[0])
+        validity_masks[index] = _codec_frame_valid_mask(
+            pooling_output,
+            row_count=row_counts[index],
+            device=rows.device,
+        )
         tensors.append(rows.detach())
 
     cpu_rows_by_request: list[torch.Tensor | None] = [None] * len(requests)
@@ -975,12 +1019,21 @@ def talker2code2wav_async_chunk_batch(
             rows_cpu = combined_cpu[offset : offset + row_count]
             offset += row_count
             valid_mask = (rows_cpu >= 0).all(dim=1) & (rows_cpu < _QWEN3_CODEC_CODEBOOK_SIZE).all(dim=1)
+            explicit_validity = validity_masks[index]
+            if explicit_validity is not None:
+                valid_mask &= explicit_validity.to(device="cpu", dtype=torch.bool)
             cpu_rows_by_request[index] = rows_cpu[valid_mask]
 
     payloads: list[OmniPayloadStruct | None] = []
-    for request, rows_cpu, finished in zip(requests, cpu_rows_by_request, is_finished):
+    for request, rows_cpu, finished, explicit_validity in zip(
+        requests,
+        cpu_rows_by_request,
+        is_finished,
+        validity_masks,
+        strict=True,
+    ):
         request_id = request.external_req_id
-        if rows_cpu is not None and rows_cpu.numel() > 0 and bool(rows_cpu.any()):
+        if rows_cpu is not None and rows_cpu.numel() > 0 and (explicit_validity is not None or bool(rows_cpu.any())):
             stop_token_ids = _codec_stop_token_ids(request)
             first_codebook = int(rows_cpu[0, 0])
             if first_codebook not in stop_token_ids:
@@ -1016,16 +1069,15 @@ def _build_qwen3_async_code2wav_payload_from_buffer(
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    chunk_id = transfer_manager.put_req_chunk[request_id]
-    if configured_initial_chunk_size > 0 and chunk_id == 0:
-        previous_emit = 0
+    emitted_by_req = getattr(transfer_manager, "_qwen3_omni_emitted_frames", None)
+    if emitted_by_req is None:
+        emitted_by_req = {}
+        transfer_manager._qwen3_omni_emitted_frames = emitted_by_req
+    previous_emit = int(emitted_by_req.get(request_id, 0))
+    if configured_initial_chunk_size > 0 and previous_emit == 0:
         target_emit = min(length, configured_initial_chunk_size) if is_finished else configured_initial_chunk_size
-    elif configured_initial_chunk_size > 0:
-        previous_emit = configured_initial_chunk_size + (chunk_id - 1) * chunk_size_config
-        target_emit = length if is_finished else configured_initial_chunk_size + chunk_id * chunk_size_config
     else:
-        previous_emit = chunk_id * chunk_size_config
-        target_emit = length if is_finished else (chunk_id + 1) * chunk_size_config
+        target_emit = length if is_finished else previous_emit + chunk_size_config
 
     if length < target_emit:
         return None
@@ -1039,6 +1091,7 @@ def _build_qwen3_async_code2wav_payload_from_buffer(
     window_start = max(0, target_emit - context_length - left_context_size)
     window_frames = token_frames[window_start:target_emit]
     codes = torch.stack(window_frames, dim=0).transpose(0, 1).reshape(-1)
+    emitted_by_req[request_id] = target_emit
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
@@ -1088,7 +1141,23 @@ def talker2code2wav_async_chunk_prepare(
             is_finished=is_finished,
         )
 
-    if not code_predictor_codes.any():
+    explicit_validity = _codec_frame_valid_mask(
+        multimodal_output,
+        row_count=int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim == 2 else 1,
+        device=code_predictor_codes.device,
+    )
+    if explicit_validity is not None:
+        if code_predictor_codes.ndim == 2:
+            code_predictor_codes = code_predictor_codes[explicit_validity]
+        elif not bool(explicit_validity[-1].item()):
+            code_predictor_codes = code_predictor_codes[:0]
+        if code_predictor_codes.numel() == 0:
+            return _build_qwen3_async_code2wav_payload_from_buffer(
+                transfer_manager,
+                request_id,
+                is_finished=is_finished,
+            )
+    elif not code_predictor_codes.any():
         return _build_qwen3_async_code2wav_payload_from_buffer(
             transfer_manager,
             request_id,

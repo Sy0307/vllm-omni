@@ -3,11 +3,14 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.core.sched.output import OmniCachedRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Array:
@@ -62,7 +65,11 @@ class _IntermediateBuffer:
 def test_async_chunk_update_clears_stale_intermediate_buffer():
     runner = object.__new__(OmniGenerationModelRunner)
     runner.req_states = _ReqStates()
-    runner.model_state = SimpleNamespace(intermediate_buffer=_IntermediateBuffer())
+    intermediate_buffer = _IntermediateBuffer()
+    runner.model_state = SimpleNamespace(
+        intermediate_buffer=intermediate_buffer,
+        remove_request=intermediate_buffer.remove_request,
+    )
     cached = OmniCachedRequestData(
         req_ids=["r1"],
         resumed_req_ids=set(),

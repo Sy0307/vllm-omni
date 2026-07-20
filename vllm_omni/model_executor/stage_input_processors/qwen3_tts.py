@@ -70,28 +70,25 @@ def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torc
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
-def _is_prefill_placeholder(multimodal_output: OmniPayload | dict[str, Any]) -> bool:
+def _should_append_async_frame(
+    multimodal_output: OmniPayload | dict[str, Any],
+    frame: torch.Tensor,
+) -> bool:
     meta = multimodal_output.get("meta", {})
-    return isinstance(meta, Mapping) and "talker_prefill_offset" in meta
-
-
-def _last_output_token_id(request: Any) -> int | None:
-    output_token_ids = getattr(request, "output_token_ids", None)
-    if not output_token_ids:
-        return None
-    try:
-        return int(output_token_ids[-1])
-    except (TypeError, ValueError):
-        return None
-
-
-def _should_append_async_frame(multimodal_output: OmniPayload | dict[str, Any], request: Any) -> bool:
-    if _is_prefill_placeholder(multimodal_output):
-        return False
-    token_id = _last_output_token_id(request)
-    if token_id is None:
-        return True
-    return 0 <= token_id < _CODEBOOK_SIZE
+    frame_valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
+    if isinstance(frame_valid, torch.Tensor):
+        if frame_valid.numel() == 0:
+            raise ValueError("codec_frame_valid must not be empty")
+        # A single request can carry a multi-token prefill span. The model
+        # emits one validity entry per codec row, while _extract_last_frame()
+        # selects the final row from that span.
+        return bool(frame_valid.reshape(-1)[-1].item())
+    if frame_valid is not None:
+        return bool(frame_valid)
+    # Compatibility for payload producers predating the explicit validity
+    # contract. Real Qwen3-TTS outputs carry codec_frame_valid and avoid this
+    # value-dependent synchronization.
+    return bool(frame.any().item())
 
 
 def _append_tensor_frame(transfer_manager: Any, request_id: str, frame: torch.Tensor) -> None:
@@ -138,7 +135,7 @@ def talker2code2wav_async_chunk(
 
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
-        if frame is not None and _should_append_async_frame(multimodal_output, request):
+        if frame is not None and _should_append_async_frame(multimodal_output, frame):
             _append_tensor_frame(transfer_manager, request_id, frame)
         ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
@@ -368,7 +365,7 @@ def talker2code2wav_async_chunk_batch(
             continue
         request_id = request.external_req_id
         frame = _extract_last_frame(pooling_output)
-        if frame is not None and _should_append_async_frame(pooling_output, request):
+        if frame is not None and _should_append_async_frame(pooling_output, frame):
             selected.append(frame)
             destinations.append(("frame", request_id, tuple(frame.shape)))
 

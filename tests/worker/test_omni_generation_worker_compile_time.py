@@ -3,8 +3,12 @@
 
 import inspect
 
+import pytest
+
 import vllm_omni.worker.gpu_generation_worker as worker
-from vllm_omni.worker.gpu_generation_worker import _make_compilation_times
+from vllm_omni.worker.gpu_generation_worker import _make_compilation_times, _supports_generation_device_type
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_make_compilation_times_matches_current_vllm_shape():
@@ -34,3 +38,9 @@ def test_make_compilation_times_filters_to_current_fields():
 def test_compilation_times_import_is_lazy():
     source_before_helper = inspect.getsource(worker).split("def _make_compilation_times", 1)[0]
     assert "CompilationTimes" not in source_before_helper
+
+
+def test_generation_worker_keeps_musa_support():
+    assert _supports_generation_device_type("cuda")
+    assert _supports_generation_device_type("musa")
+    assert not _supports_generation_device_type("cpu")

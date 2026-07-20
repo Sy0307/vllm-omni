@@ -3,9 +3,12 @@
 
 from types import SimpleNamespace
 
+import pytest
 from vllm.compilation.cuda_graph import CUDAGraphMode
 
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_eager_dispatch_uses_eager_without_cudagraph_manager():

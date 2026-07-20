@@ -9,7 +9,6 @@
 # Profile validated for the c64 / PROMPTS=512 performance experiments:
 # Stage 0 talker on GPU 0 with S0=64, Stage 1 Code2Wav on GPU 1 with S1=10.
 #
-# model_runner: v2  # Opt in via qwen3_tts_high_concurrency_mrv2.yaml.
 async_chunk: true
 
 connectors:
@@ -26,15 +25,10 @@ connectors:
       # These keys are consumed by Qwen3-TTS talker and ignored by Code2Wav.
       code_predictor_prefix_graphs: true
       code_predictor_prefix_graph_buckets: [64]
-      # Sparse even spans cover the predictor's c64 steady-state cohorts while
-      # avoiding capture and dispatch overhead for low-hit odd spans.
-      code_predictor_prefix_graph_seq_lens: [2, 4, 6, 8, 10, 12, 14]
+      code_predictor_prefix_graph_seq_lens: [2, 3, 4, 5, 6, 7, 8]
       # Keep voice-clone reference context bounded so Stage1 chunk lengths are
       # stable across different reference-audio durations.
       ref_code_context_frames: 72
-      # Retain repeated voice-clone artifacts across a c64 working set. Each
-      # entry only stores the GPU ref code and speaker embedding.
-      ref_audio_artifact_cache_max_entries: 1024
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
       # Chunk ramp (opt-in): gradual size increase for first N chunks to
@@ -52,12 +46,8 @@ connectors:
       # Keep B>1 graph capture opt-in; H20 c64 e2e validation regressed with it.
       decode_cudagraph_batch_sizes: [1]
       decode_compile_shapes: []
-      # Eager B=2 improves sustained c64 throughput without a TTFP regression;
-      # B=4 adds padding/decoder cost and regresses the saturated cold run.
-      decode_batch_max_size: 2
-      # Group uneven terminal windows in 25-frame steps. This keeps eager B=2
-      # decoder calls dense while limiting right-padding to at most 24 frames.
-      decode_batch_bucket_frames: [73, 98, 123, 148, 169]
+      decode_batch_max_size: 1
+      decode_batch_bucket_frames: []
       decode_enable_tf32: false
 
 stages:
@@ -70,10 +60,6 @@ stages:
     max_num_batched_tokens: 512
     max_model_len: 4096
     devices: "0"
-    # Include the observed 60-row cohort instead of padding it to 64. The
-    # remaining sizes preserve the standard power-of-two and c64 buckets.
-    compilation_config:
-      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 60, 64]
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:

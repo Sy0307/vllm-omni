@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -160,7 +161,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 )
                 continue
 
-            self.model_state.intermediate_buffer.remove_request(req_idx)
+            self.model_state.remove_request(req_idx)
 
             # In-place update token state — same slot, no remove/re-add.
             # .np[] = direct write (no GPU buffer); stage_write = GPU-synced.
@@ -280,9 +281,14 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         }
         self._add_legacy_forward_inputs(model_inputs, input_batch)
 
+        eplb = getattr(self, "eplb", None)
+        if eplb is not None:
+            eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+
         batch_descriptor = BatchDescriptor(
             num_tokens=input_batch.num_tokens_after_padding,
             has_lora=self.lora_config is not None,
+            num_active_loras=batch_desc.num_active_loras,
         )
         with set_forward_context(
             attn_metadata,
@@ -291,9 +297,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             cudagraph_runtime_mode=batch_desc.cg_mode,
             batch_descriptor=batch_descriptor,
             slot_mapping=slot_mappings_by_layer,
+            is_padding=input_batch.is_padding,
         ):
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.model(**model_inputs)
+            if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                assert self.cudagraph_manager is not None
+                model_output = self.cudagraph_manager.run_pw_graph(
+                    self.model,
+                    model_inputs,
+                )
+            else:
+                model_output = self.model(**model_inputs)
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output.finished_req_ids)
 
@@ -403,6 +417,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # CPU and synchronous schedulers keep the established materialization
         # path. Final generation stages publish audio only through
         # multimodal_outputs, matching the V1 generation-runner contract.
+        self._reserve_native_data_plane_outputs(list(req_ids))
         multimodal_outputs = self._build_pooler_output(model_output, num_reqs)
         output.multimodal_outputs = [
             _ensure_tensor_values(payload) if payload else {} for payload in multimodal_outputs

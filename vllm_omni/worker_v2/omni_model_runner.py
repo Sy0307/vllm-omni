@@ -197,6 +197,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._validate_parallel_support()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -205,6 +206,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             else None
         )
+
+    def _validate_parallel_support(self) -> None:
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Omni Model Runner V2 does not support pipeline parallel; "
+                "use model_runner: v1 when pipeline_parallel_size > 1"
+            )
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         logits_processor = getattr(self.model, "logits_processor", None)
@@ -404,14 +412,23 @@ class OmniGPUModelRunner(GPUModelRunner):
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
-        batch_desc, _ = self._dispatch_batch_descriptor(
-            num_reqs=num_mtp_reqs,
-            num_toks=num_mtp_reqs,
-            uniform_tok_count=1,
-            num_active_loras=0,
-            use_eager=False,
+        capture_sizes = self.model_state._get_talker_mtp_capture_sizes()
+        captured_bucket = next(
+            (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
+            None,
         )
-        return batch_desc
+        if captured_bucket is None:
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_mtp_reqs,
+                num_reqs=num_mtp_reqs,
+            )
+        return self.cudagraph_manager.dispatch(
+            captured_bucket,
+            captured_bucket,
+            1,
+            0,
+        )
 
     def _dispatch_batch_descriptor(
         self,
@@ -500,6 +517,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run:
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            self.model_state.preprocess_state(
+                input_batch,
+                block_tables,
+                self.kv_cache_config,
+                self.req_states.num_computed_tokens.gpu,
+            )
 
             if self.lora_config:
                 lora_inputs = self.lora_state.make_lora_inputs(
@@ -536,7 +559,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.attn_groups,
                 self.kv_cache_config,
             )
-
         input_ids, inputs_embeds = self._prepare_mm_inputs(
             scheduler_output,
             input_batch,
@@ -570,6 +592,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._dispatch_mtp_batch_descriptor,
             )
 
+        self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+
         # --- Model forward ---
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # FULL graph replay.  Preprocess already wrote to the static
@@ -585,6 +609,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
+                num_active_loras=batch_desc.num_active_loras,
             )
             with set_forward_context(
                 attn_metadata,
@@ -595,9 +620,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
+                is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.model(**model_inputs)
+                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                    assert self.cudagraph_manager is not None
+                    model_output = self.cudagraph_manager.run_pw_graph(
+                        self.model,
+                        model_inputs,
+                    )
+                else:
+                    model_output = self.model(**model_inputs)
 
             # Extract hidden_states from model output.
             self._last_aux_output = None

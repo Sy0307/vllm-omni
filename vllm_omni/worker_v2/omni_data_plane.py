@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from queue import Full, Queue
@@ -10,6 +11,10 @@ from typing import Any
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
+)
+from vllm_omni.worker_v2.delivery import (
+    DeliveryTimeoutError,
+    OmniDeliveryManager,
 )
 
 
@@ -55,6 +60,8 @@ class _NativeOutputBatch:
 
 _NATIVE_OUTPUT_STOP = object()
 _NATIVE_OUTPUT_QUEUE_DEPTH = 8
+_DEFAULT_DELIVERY_TIMEOUT_S = 30.0
+_DEFAULT_SHUTDOWN_TIMEOUT_S = 5.0
 
 
 class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
@@ -66,9 +73,31 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_send_lock = threading.Lock()
         self._native_outputs_in_flight: dict[str, int] = defaultdict(int)
         self._native_terminal_pending: set[str] = set()
-        self.init_omni_connectors(vllm_config=vllm_config, model_config=model_config)
+        self.init_omni_connectors(model_config=model_config)
+        self._delivery_manager = OmniDeliveryManager(
+            delivery_timeout_s=self._connector_delivery_timeout(),
+            shutdown_timeout_s=_DEFAULT_SHUTDOWN_TIMEOUT_S,
+        )
         self._can_send = self._custom_process_func is not None
         self._start_output_worker(max_pending_batches=_NATIVE_OUTPUT_QUEUE_DEPTH)
+
+    def _connector_delivery_timeout(self) -> float:
+        config = getattr(getattr(self, "_omni_connector", None), "config", None)
+        extra = config.get("extra", {}) if isinstance(config, dict) else {}
+        value = extra.get("delivery_timeout_s", _DEFAULT_DELIVERY_TIMEOUT_S)
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid connector delivery_timeout_s: {value!r}") from error
+        if timeout <= 0:
+            raise ValueError("connector delivery_timeout_s must be positive")
+        return timeout
+
+    def _create_send_completion(self, *, request_id: str, put_key: str) -> Any:
+        return self._delivery_manager.create_ticket(
+            request_id=request_id,
+            put_key=put_key,
+        )
 
     def _start_output_worker(self, *, max_pending_batches: int) -> None:
         if max_pending_batches <= 0:
@@ -76,6 +105,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_output_queue: Queue[_NativeOutputBatch | object] = Queue(maxsize=max_pending_batches)
         self._native_output_error_lock = threading.Lock()
         self._native_output_error: BaseException | None = None
+        self._connector_send_error_sink = self._record_output_error
         self._native_output_closed = False
         stage_id = getattr(self, "_stage_id", "unknown")
         self._native_output_worker = threading.Thread(
@@ -86,9 +116,15 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_output_worker.start()
 
     def _record_output_error(self, error: BaseException) -> None:
+        first_error = False
         with self._native_output_error_lock:
             if self._native_output_error is None:
                 self._native_output_error = error
+                first_error = True
+        if first_error:
+            manager = getattr(self, "_delivery_manager", None)
+            if manager is not None:
+                manager.quarantine(error)
 
     def _raise_output_error(self) -> None:
         with self._native_output_error_lock:
@@ -140,7 +176,24 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._raise_output_error()
 
     def drain_outputs(self) -> None:
-        self._native_output_queue.join()
+        queue = self._native_output_queue
+        pending_batches = max(1, queue.qsize() + 1)
+        timeout_s = self._delivery_manager.delivery_timeout_s * pending_batches
+        deadline = time.monotonic() + timeout_s
+        while queue.unfinished_tasks:
+            self._raise_output_error()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error = DeliveryTimeoutError(
+                    "native output queue drain timed out after "
+                    f"{timeout_s:.3f}s with {queue.unfinished_tasks} "
+                    "unfinished batch(es)"
+                )
+                self._record_output_error(error)
+                self._raise_output_error()
+            with queue.all_tasks_done:
+                if queue.unfinished_tasks:
+                    queue.all_tasks_done.wait(timeout=min(0.05, remaining))
         self._raise_output_error()
 
     def _stop_output_worker(self) -> None:
@@ -148,8 +201,23 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         if worker is None:
             return
         self._native_output_closed = True
-        self._native_output_queue.put(_NATIVE_OUTPUT_STOP)
-        worker.join()
+        self._delivery_manager.shutdown(RuntimeError("MRv2 output worker shutdown"))
+        deadline = time.monotonic() + self._delivery_manager.shutdown_timeout_s
+        while worker.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self._native_output_queue.put(
+                    _NATIVE_OUTPUT_STOP,
+                    timeout=min(0.05, remaining),
+                )
+                break
+            except Full:
+                continue
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if worker.is_alive():
+            raise RuntimeError("MRv2 output worker did not stop within its shutdown deadline")
         self._native_output_worker = None
 
     def register_request(self, request_data: Any) -> None:
@@ -329,7 +397,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         terminal_req_ids: set[str],
     ) -> tuple[list[tuple[Any, Any | None]], list[str]]:
         if not getattr(self, "_can_send", True):
-            return [], []
+            finished_req_ids = [req_id for req_id in sorted(terminal_req_ids) if req_id in self._native_requests]
+            return [], finished_req_ids
         payload_by_req = {
             req_id: inter_stage_outputs[index]
             for index, req_id in enumerate(req_ids)
@@ -373,23 +442,92 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         if not entries:
             return 0
         if send_lock_held:
-            return self.send_chunks(entries, propagate_errors=True)
+            return self.send_chunks(
+                entries,
+                propagate_errors=True,
+                wait_for_delivery=True,
+            )
         with self._native_send_lock:
-            return self.send_chunks(entries, propagate_errors=True)
+            return self.send_chunks(
+                entries,
+                propagate_errors=True,
+                wait_for_delivery=True,
+            )
 
     def _cleanup_finished_entries(self, finished_req_ids: list[str]) -> None:
         for req_id in finished_req_ids:
             self._native_requests.pop(req_id, None)
             self.cleanup_finished_request(req_id)
 
+    def shutdown_omni_connectors(self) -> None:
+        """Bound MRv2 shutdown even if a connector call cannot be cancelled.
+
+        Connector ``close()`` runs concurrently with the I/O threads so a
+        backend that supports cancellation can release a blocked ``put()``.
+        Backends that do not support it are quarantined and left only on
+        daemon threads after the bounded deadline; V1 keeps its existing
+        shutdown implementation in the shared mixin.
+        """
+        timeout_s = self._delivery_manager.shutdown_timeout_s
+        deadline = time.monotonic() + timeout_s
+        self._delivery_manager.shutdown(RuntimeError("MRv2 connector shutdown"))
+        self._stop_event.set()
+        self._work_available.set()
+
+        close_errors: list[BaseException] = []
+        connector = getattr(self, "_omni_connector", None)
+
+        def close_connector() -> None:
+            if connector is None:
+                return
+            try:
+                connector.close()
+            except BaseException as error:
+                close_errors.append(error)
+
+        close_thread = threading.Thread(
+            target=close_connector,
+            name=f"omni-native-connector-close-{getattr(self, '_stage_id', 'unknown')}",
+            daemon=True,
+        )
+        close_thread.start()
+
+        live_threads: list[str] = []
+        for name, thread in (
+            ("recv", getattr(self, "_recv_thread", None)),
+            ("save", getattr(self, "_save_thread", None)),
+            ("connector-close", close_thread),
+        ):
+            if thread is None:
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                live_threads.append(name)
+
+        if close_errors:
+            raise RuntimeError("MRv2 connector close failed") from close_errors[0]
+        if live_threads:
+            raise RuntimeError(
+                f"MRv2 connector shutdown exceeded {timeout_s:.3f}s; blocked thread(s): {', '.join(live_threads)}"
+            )
+
     def close(self) -> None:
-        error = None
+        error: BaseException | None = None
         try:
             self.drain_outputs()
         except BaseException as exc:
             error = exc
         finally:
-            self._stop_output_worker()
-            self.shutdown_omni_connectors()
+            self._delivery_manager.shutdown(error or RuntimeError("MRv2 data plane close"))
+            try:
+                self._stop_output_worker()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            try:
+                self.shutdown_omni_connectors()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
         if error is not None:
             raise error

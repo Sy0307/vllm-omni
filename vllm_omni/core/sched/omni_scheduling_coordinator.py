@@ -191,6 +191,7 @@ class OmniSchedulingCoordinator:
             # real preemption), so PREEMPTED would be incorrect.
             request.status = RequestStatus.WAITING
             waiting_queue.prepend_requests([request])
+
     def process_pending_full_payload_inputs(
         self,
         waiting_queue: Any,

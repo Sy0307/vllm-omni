@@ -347,6 +347,7 @@ def test_native_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatc
     sched.waiting = []
     sched.running = []
     sched._native_data_plane = True
+    sched.use_v2_model_runner = True
     sched.max_num_running_reqs = 8
     sched.input_coordinator = SimpleNamespace(
         _waiting_for_chunk_running=[parked],
@@ -370,3 +371,37 @@ def test_native_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatc
 
     assert observed_limits == [7]
     assert sched.max_num_running_reqs == 8
+
+
+def test_mrv1_async_chunk_does_not_reserve_parked_slots_during_ar_admission(monkeypatch) -> None:
+    sched = _make_scheduler(stage_id=1)
+    parked = SimpleNamespace(request_id="parked")
+    sched.requests = {"parked": parked}
+    sched.waiting = []
+    sched.running = []
+    sched._native_data_plane = False
+    sched.use_v2_model_runner = False
+    sched.max_num_running_reqs = 8
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[parked],
+        _held_non_active=[],
+        process_pending_chunks=lambda *_args, **_kwargs: None,
+        restore_queues=lambda *_args, **_kwargs: None,
+    )
+    sched.input_coordinator = None
+    sched._consume_pending_connector_output = lambda *, model_mode: None
+    sched._process_pending_input_timeouts = lambda: None
+    sched._should_defer_waiting_admission = lambda: False
+    sched.get_finished_requests_needing_kv_transfer = lambda: {}
+    sched._wrap_omni_scheduler_output = lambda output, **_kwargs: output
+    observed_limits: list[int] = []
+
+    def fake_schedule(self, _throttle_prefills=False):
+        observed_limits.append(self.max_num_running_reqs)
+        return SimpleNamespace(scheduled_new_reqs=[])
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
+
+    sched.schedule()
+
+    assert observed_limits == [8]

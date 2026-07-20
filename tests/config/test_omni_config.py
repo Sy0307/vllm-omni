@@ -36,8 +36,10 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    resolve_deploy_yaml,
 )
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
@@ -346,7 +348,7 @@ def test_native_mrv2_data_plane_capability_is_declared_by_pipeline_stage():
 
     assert all(stage.supports_native_mrv2_data_plane for stage in QWEN3_OMNI_PIPELINE.stages)
 
-    omni_config = VllmOmniConfig.from_registry("qwen3_tts")
+    omni_config = _from_pipeline_key("qwen3_tts")
     for stage_id in (0, 1):
         stage = omni_config.stage_by_id(stage_id)
         assert stage.stage_pipeline_config.supports_native_mrv2_data_plane is True
@@ -369,7 +371,7 @@ stages:
     deploy = load_deploy_config(deploy_path)
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stages = merge_pipeline_deploy(pipeline, deploy)
-    structured = VllmOmniConfig.from_registry("qwen3_tts", deploy_config_path=str(deploy_path))
+    structured = _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
 
     assert deploy.model_runner == "v2"
     assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in legacy_stages)
@@ -394,6 +396,33 @@ def test_deploy_model_runner_rejects_unknown_value(tmp_path: Path):
         load_deploy_config(deploy_path)
 
 
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
+def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+    with pytest.raises(NotImplementedError, match="Model Runner V2"):
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+
+
+def test_per_stage_model_runner_override_is_not_clobbered(tmp_path: Path):
+    deploy_path = tmp_path / "qwen3_tts_stage_override.yaml"
+    deploy_path.write_text(
+        """\
+pipeline: qwen3_tts
+model_runner: v2
+stages:
+  - stage_id: 0
+    use_v2_model_runner: false
+  - stage_id: 1
+"""
+    )
+
+    deploy = load_deploy_config(deploy_path)
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+
+    assert stages[0].yaml_engine_args["use_v2_model_runner"] is False
+    assert stages[1].yaml_engine_args["use_v2_model_runner"] is True
+
+
 @pytest.mark.parametrize(
     ("default_name", "mrv2_name"),
     [
@@ -408,6 +437,29 @@ def test_deploy_model_runner_rejects_unknown_value(tmp_path: Path):
 def test_qwen3_mrv2_profiles_are_explicit_opt_in(default_name: str, mrv2_name: str):
     assert load_deploy_config(_DEPLOY_DIR / default_name).model_runner == "v1"
     assert load_deploy_config(_DEPLOY_DIR / mrv2_name).model_runner == "v2"
+
+
+def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
+    default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
+    mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
+    default_connector = default["connectors"]["connector_of_shared_memory"]
+    mrv2_connector = mrv2["connectors"]["connector_of_shared_memory"]
+    default_extra = default["connectors"]["connector_of_shared_memory"]["extra"]
+    mrv2_extra = mrv2["connectors"]["connector_of_shared_memory"]["extra"]
+
+    assert default_extra["decode_batch_max_size"] == 1
+    assert default_extra["decode_batch_bucket_frames"] == []
+    assert default_extra["code_predictor_prefix_graph_seq_lens"] == [2, 3, 4, 5, 6, 7, 8]
+    assert "ref_audio_artifact_cache_max_entries" not in default_extra
+    assert "compilation_config" not in default["stages"][0]
+
+    assert mrv2_connector["name"] == default_connector["name"]
+    assert mrv2_extra["codec_streaming"] is True
+    assert mrv2_extra["codec_chunk_frames"] == default_extra["codec_chunk_frames"]
+    assert mrv2_extra["codec_left_context_frames"] == default_extra["codec_left_context_frames"]
+    assert mrv2_extra["decode_batch_max_size"] == 2
+    assert mrv2_extra["ref_audio_artifact_cache_max_entries"] == 1024
+    assert mrv2["stages"][0]["compilation_config"]["cudagraph_capture_sizes"][-1] == 64
 
 
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():

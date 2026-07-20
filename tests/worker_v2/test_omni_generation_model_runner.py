@@ -14,7 +14,7 @@ import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -23,7 +23,7 @@ import torch
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 
-pytestmark = []
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_execute_model_propagates_make_omni_output_failure(monkeypatch):
@@ -38,10 +38,21 @@ def test_execute_model_propagates_make_omni_output_failure(monkeypatch):
     runner.update_requests = MagicMock()
     runner._sync_native_data_plane_payloads = MagicMock()
     runner._apply_block_table_staged_writes_if_available = MagicMock()
-    runner._dispatch_batch_descriptor = MagicMock(return_value=(SimpleNamespace(num_tokens=1, cg_mode=None), None))
+    runner._dispatch_batch_descriptor = MagicMock(
+        return_value=(
+            SimpleNamespace(
+                num_tokens=1,
+                num_active_loras=0,
+                cg_mode=None,
+            ),
+            None,
+        )
+    )
     input_batch = SimpleNamespace(
         positions=torch.zeros(1, dtype=torch.long),
+        num_tokens=1,
         num_tokens_after_padding=1,
+        is_padding=False,
     )
     runner.prepare_inputs = MagicMock(return_value=input_batch)
     runner._prepare_mm_inputs = MagicMock(return_value=(torch.zeros(1, dtype=torch.long), None))
@@ -417,6 +428,20 @@ def test_sample_tokens_keeps_sync_output_for_cpu(monkeypatch):
     assert result.multimodal_outputs[0]["model_outputs"].device.type == "cpu"
 
 
+def test_sample_tokens_reserves_native_output_before_sync_finalize(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as generation_runner
+
+    output = _make_omni_output({"model_outputs": [torch.randn(4)]})
+    runner = _make_runner(output, num_reqs=1)
+    runner._reserve_native_data_plane_outputs = MagicMock()
+    runner._finalize_native_data_plane_output = MagicMock(side_effect=lambda value: value)
+    monkeypatch.setattr(generation_runner, "_uses_async_output", lambda _runner: False)
+
+    generation_runner.OmniGenerationModelRunner.sample_tokens(runner)
+
+    runner._reserve_native_data_plane_outputs.assert_called_once_with(["req-0"])
+
+
 class TestMultimodalOutputsPassthrough(unittest.TestCase):
     """multimodal_outputs is a per-request list (tensor-only) on OmniModelRunnerOutput.
 
@@ -472,6 +497,43 @@ class TestBlockTableWrites(unittest.TestCase):
         runner._apply_block_table_staged_writes_if_available()
 
         block_tables.apply_staged_writes.assert_called_once_with()
+
+
+def test_async_chunk_slot_recycle_notifies_model_state_plugins():
+    from vllm_omni.worker_v2.omni_generation_model_runner import (
+        OmniGenerationModelRunner,
+    )
+
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={"req": 0},
+        prompt_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
+        prefill_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
+        total_len=MagicMock(),
+        all_token_ids=MagicMock(),
+        num_computed_tokens=MagicMock(),
+        num_computed_prefill_tokens=np.zeros(1, dtype=np.int32),
+        apply_staged_writes=MagicMock(),
+    )
+    runner.model_state = SimpleNamespace(
+        remove_request=MagicMock(),
+        intermediate_buffer=SimpleNamespace(remove_request=MagicMock()),
+    )
+    cached = SimpleNamespace(
+        req_ids=["req"],
+        prompt_token_ids={"req": [7]},
+        new_block_ids=[()],
+        additional_information={},
+    )
+
+    with patch(
+        "vllm_omni.worker_v2.omni_generation_model_runner.OmniCachedRequestData",
+        type(cached),
+    ):
+        runner._handle_async_chunk_updates(SimpleNamespace(scheduled_cached_reqs=cached))
+
+    runner.model_state.remove_request.assert_called_once_with(0)
+    runner.model_state.intermediate_buffer.remove_request.assert_not_called()
 
 
 if __name__ == "__main__":

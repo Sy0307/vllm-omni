@@ -71,7 +71,7 @@ run_test() {
     local start_time
     start_time=$(date +%s)
 
-    if python "$END2END" "$@" --stage-configs-path "$DEPLOY_CONFIG" \
+    if python "$END2END" "$@" --deploy-config "$DEPLOY_CONFIG" \
         --output-dir "$output_dir" > "$log_file" 2>&1; then
         local end_time
         end_time=$(date +%s)

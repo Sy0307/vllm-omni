@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_qwen3_tts_talker_declares_prefill_and_ref_gpu_resident() -> None:
@@ -15,7 +18,7 @@ def test_intermediate_buffer_keeps_nested_gpu_resident_tensor_on_device() -> Non
     from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
     if not torch.cuda.is_available():
-        return
+        pytest.skip("CUDA is required to verify GPU residency")
     buffer = OmniIntermediateBuffer(max_num_reqs=1)
     tensor = torch.ones((2, 3), device="cuda")
     buffer.update(0, {"embed": {"prefill": tensor}}, gpu_resident_keys={("embed", "prefill")})
@@ -29,7 +32,7 @@ def test_intermediate_buffer_keeps_codes_ref_on_device() -> None:
     from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
     if not torch.cuda.is_available():
-        return
+        pytest.skip("CUDA is required to verify GPU residency")
     buffer = OmniIntermediateBuffer(max_num_reqs=1)
     ref_code = torch.ones((4, 16), device="cuda", dtype=torch.long)
     buffer.update(0, {"codes": {"ref": ref_code}}, gpu_resident_keys={("codes", "ref")})
@@ -45,12 +48,6 @@ def test_qwen3_tts_code2wav_codec_stats_log_does_not_extract_gpu_values() -> Non
     block = source[start : start + 500]
     assert ".item()" not in block
     assert "torch.unique" not in block
-
-
-def test_omni_model_state_uses_cpu_seq_len_upper_bound_when_available() -> None:
-    source = Path("vllm_omni/worker_v2/model_states/omni_model_state.py").read_text()
-    assert 'seq_lens_cpu_upper_bound = getattr(input_batch, "seq_lens_cpu_upper_bound", None)' in source
-    assert "max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())" in source
 
 
 def test_prompt_builder_long_tensor_cache_reuses_tensor() -> None:

@@ -616,3 +616,47 @@ def test_dispatch_batch_descriptor_passes_lora_count_to_dp_sync():
         1,
         num_active_loras=3,
     )
+
+
+def test_mrv2_rejects_pipeline_parallel_at_runner_startup():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+
+    with pytest.raises(NotImplementedError, match="pipeline parallel"):
+        runner._validate_parallel_support()
+
+
+def test_mtp_descriptor_dispatch_is_local_and_uses_captured_bucket():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=6)
+    runner.model_state = SimpleNamespace(
+        _get_talker_mtp_capture_sizes=MagicMock(return_value=[4, 2, 1]),
+    )
+    expected = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_tokens=4)
+    runner.cudagraph_manager = SimpleNamespace(
+        dispatch=MagicMock(return_value=expected),
+    )
+    runner.dp_size = 2
+
+    result = runner._dispatch_mtp_batch_descriptor(3)
+
+    assert result is expected
+    runner.cudagraph_manager.dispatch.assert_called_once_with(4, 4, 1, 0)
+
+
+def test_mtp_descriptor_falls_back_to_eager_when_no_bucket_was_captured():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=6)
+    runner.model_state = SimpleNamespace(
+        _get_talker_mtp_capture_sizes=MagicMock(return_value=[4, 2, 1]),
+    )
+    runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock())
+
+    result = runner._dispatch_mtp_batch_descriptor(6)
+
+    assert result.cg_mode == CUDAGraphMode.NONE
+    assert result.num_reqs == 6
+    assert result.num_tokens == 6
+    runner.cudagraph_manager.dispatch.assert_not_called()

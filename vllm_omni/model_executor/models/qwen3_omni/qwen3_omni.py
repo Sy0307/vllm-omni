@@ -210,6 +210,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # suppress tokens by setting their probability to ~1e-9 (finite very small)
             self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
+            self.talker_mtp_validity_key = ("meta", "codec_frame_valid")
             # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
             self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
                 ("hidden_states", "last"),
@@ -220,6 +221,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 # talker MTP codec codes must stay on GPU to avoid a per-step D2H
                 # sync stall; build_mm_cpu handles the eventual D2H at payload time.
                 ("codes", "audio"),
+                ("meta", "codec_frame_valid"),
             }
             self.batched_gpu_staging_keys: set[tuple[str, str]] = {
                 ("embed", "decode"),
@@ -597,7 +599,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             if info_dicts is None:
                 raise RuntimeError("Qwen3-Omni MRv2 native talker output requires model_intermediate_buffer.")
             code_predictor_codes = [info.get("codes", {}).get("audio") for info in info_dicts]
-            multimodal_outputs: OmniPayload = {"codes": {"audio": code_predictor_codes}}
+            codec_frame_valid = []
+            for info in info_dicts:
+                validity = info.get("meta", {}).get("codec_frame_valid")
+                if validity is None:
+                    raise RuntimeError("Qwen3-Omni MRv2 talker output is missing meta.codec_frame_valid")
+                codec_frame_valid.append(validity)
+            multimodal_outputs: OmniPayload = {
+                "codes": {"audio": code_predictor_codes},
+                "meta": {"codec_frame_valid": codec_frame_valid},
+            }
             return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "code2wav":
             audio_tensors = model_outputs
@@ -806,6 +817,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
+        # Prefill codes are placeholders and decode codes are not real until
+        # the MTP writeback succeeds. Set this after the branch because the
+        # prefill helper returns a replacement update dict.
+        update_dict.setdefault("meta", {})["codec_frame_valid"] = torch.zeros(
+            (), dtype=torch.bool, device=input_ids.device
+        )
         update_dict.setdefault("meta", {})["num_processed_tokens"] = meta.get("num_processed_tokens", 0) + span_len
         return input_ids, input_embeds, update_dict
 
@@ -1225,7 +1242,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         for row, info in enumerate(req_infos):
             payload: OmniPayload = info
             meta = payload.setdefault("meta", {})
-            updates: OmniPayload = {}
+            updates: OmniPayload = {
+                "meta": {
+                    "codec_frame_valid": torch.zeros((), dtype=torch.bool, device=input_ids.device),
+                }
+            }
             if not meta.get("decode_flag", False):
                 prefill_consumed_text_tokens = meta.get("prefill_consumed_text_tokens")
                 if prefill_consumed_text_tokens is None:

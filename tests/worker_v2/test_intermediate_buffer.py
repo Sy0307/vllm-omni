@@ -230,6 +230,22 @@ def test_update_list_values():
     assert stored[1] == "text"
 
 
+def test_gpu_resident_list_values_do_not_call_cpu(monkeypatch):
+    buf = OmniIntermediateBuffer(max_num_reqs=1)
+    buf.add_request(0, _make_new_req_data(req_id="r0"))
+    tensor = torch.randn(2)
+
+    def fail_cpu(_self, *_args, **_kwargs):
+        raise AssertionError("GPU-resident list item must not move to CPU")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", fail_cpu)
+    buf.update(0, {"items": [tensor]}, gpu_resident_keys={"items"})
+
+    stored = buf.buffers[0]["items"][0]
+    assert stored.data_ptr() != tensor.data_ptr()
+    assert torch.equal(stored, tensor)
+
+
 def test_update_empty_is_noop():
     buf = OmniIntermediateBuffer(max_num_reqs=2)
     buf.add_request(0, _make_new_req_data(req_id="r0"))
@@ -292,3 +308,14 @@ def test_update_merges_pending_absolute_decode_spans_until_ack() -> None:
     )
 
     assert buf.buffers[0]["embed"]["decode"] is None
+
+
+def test_update_gpu_resident_list_keeps_tensor_items_on_device():
+    buf = OmniIntermediateBuffer(max_num_reqs=1)
+    source = torch.tensor([1.0])
+
+    buf.update(0, {"items": [source]}, gpu_resident_keys={"items"})
+
+    stored = buf.buffers[0]["items"][0]
+    assert stored.device == source.device
+    assert stored is not source

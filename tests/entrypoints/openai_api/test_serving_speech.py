@@ -60,6 +60,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 logger = logging.getLogger(__name__)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_speaker_samples_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+
+
 class TestAudioMixin:
     @pytest.fixture
     def audio_mixin(self):
@@ -3717,13 +3722,36 @@ class TestTTSAsyncOffloading:
         }
         assert qwen3_tts_server.engine_client.default_sampling_params_list[0].seed == 42
 
+    def test_prepare_speech_generation_adds_missing_talker_seed_from_default(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        qwen3_tts_server.engine_client.default_sampling_params_list = [
+            SimpleNamespace(
+                max_tokens=2048,
+                seed=42,
+                stop_token_ids=[2150],
+                extra_args={"voice": "Vivian"},
+            )
+        ]
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+
+        stage0_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.extra_args == {"voice": "Vivian", "tts_local_seed": 42}
+        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args == {"voice": "Vivian"}
+
     def test_prepare_speech_generation_qwen3_request_seed_reaches_both_samplers(
         self, qwen3_tts_server, mocker: MockerFixture
     ):
         qwen3_tts_server.engine_client.default_sampling_params_list = [
             SimpleNamespace(max_tokens=4096, seed=None, stop_token_ids=[2150], extra_args=None)
         ]
-        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )

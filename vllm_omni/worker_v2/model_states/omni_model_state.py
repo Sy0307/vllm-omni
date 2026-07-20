@@ -66,7 +66,7 @@ def _make_safe_get_rope(orig_get_rope):
     def _safe_get_rope(model_config: Any, mdl: Any, **kwargs: Any) -> Any:
         try:
             result = orig_get_rope(model_config, mdl, **kwargs)
-        except (AssertionError, TypeError):
+        except AssertionError:
             result = None
 
         needs_mrope = bool(getattr(model_config, "uses_mrope", False))
@@ -272,7 +272,7 @@ class OmniModelState(DefaultModelState):
         return 0
 
     # ------------------------------------------------------------------
-    # Attention metadata: use actual max_seq_len, not max_model_len
+    # Attention metadata
     # ------------------------------------------------------------------
 
     def prepare_attn(
@@ -285,54 +285,14 @@ class OmniModelState(DefaultModelState):
         kv_cache_config: Any,
         for_capture: bool = False,
     ) -> dict[str, Any]:
-        """Override to use actual max_seq_len instead of max_model_len.
-
-        Upstream DefaultModelState uses ``self.max_model_len`` as
-        ``max_seq_len`` for attention metadata.  This causes
-        FlashAttention to use a different scheduler/tiling strategy
-        than V1 MR (which uses the actual maximum sequence length).
-        The different tiling changes the float accumulation order in
-        bf16, causing numerically different attention outputs that
-        snowball through the transformer layers and produce completely
-        different logits—leading to 30x more decode steps for TTS.
-        """
-        from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
-
-        if cudagraph_mode == CUDAGraphMode.FULL:
-            num_reqs = input_batch.num_reqs_after_padding
-            num_tokens = input_batch.num_tokens_after_padding
-        else:
-            num_reqs = input_batch.num_reqs
-            num_tokens = input_batch.num_tokens
-
-        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
-
-        # Use actual max seq_len (matching V1 MR behavior) instead of
-        # max_model_len.  For CUDA graph capture, use max_model_len to
-        # ensure the captured kernel covers all possible seq_lens.
-        if for_capture:
-            max_seq_len = self.max_model_len
-        else:
-            seq_lens_cpu_upper_bound = getattr(input_batch, "seq_lens_cpu_upper_bound", None)
-            if seq_lens_cpu_upper_bound is not None:
-                max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
-            else:
-                max_seq_len = int(input_batch.seq_lens[:num_reqs].max().item())
-
-        return build_attn_metadata(
-            attn_groups=attn_groups,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=input_batch.query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=input_batch.seq_lens,
-            max_seq_len=max_seq_len,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=kv_cache_config,
-            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+        return super().prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture,
         )
 
     # ------------------------------------------------------------------
@@ -349,8 +309,30 @@ class OmniModelState(DefaultModelState):
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         self.intermediate_buffer.add_request(req_index, new_req_data)
+        self._initialize_upstream_warmup_buffer(req_index, new_req_data.req_id)
         for plugin in self.plugins:
             plugin.on_add_request(req_index, new_req_data)
+
+    def _initialize_upstream_warmup_buffer(self, req_index: int, req_id: str) -> None:
+        """Satisfy model-declared output contracts for vLLM warmup requests."""
+        if not str(req_id).startswith("_warmup_"):
+            return
+
+        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+        if validity_key is None:
+            return
+
+        validity = torch.zeros((), dtype=torch.bool)
+        buffer = self.intermediate_buffer.buffers[req_index]
+        if isinstance(validity_key, tuple) and len(validity_key) == 2:
+            buffer.setdefault(validity_key[0], {})[validity_key[1]] = validity
+        elif isinstance(validity_key, str):
+            buffer[validity_key] = validity
+        else:
+            raise TypeError(
+                "talker_mtp_validity_key must be a string or 2-tuple, "
+                f"got {type(validity_key).__name__}: {validity_key!r}"
+            )
 
     def _resolve_req_index(self, req_index_or_id: int | str) -> int | None:
         if isinstance(req_index_or_id, int):
@@ -538,14 +520,15 @@ class OmniModelState(DefaultModelState):
 
             info = {key: value for key, value in buf.items() if isinstance(key, str)}
             prompt_len = None
-            num_computed_tokens = self._get_input_batch_num_computed(input_batch, req_idx, i)
+            num_computed_tokens = None
             if req_states is not None:
                 prompt_len = self._get_req_state_value(getattr(req_states, "prompt_len", None), req_idx)
-                if num_computed_tokens is None:
-                    num_computed_tokens = self._get_req_state_value(
-                        getattr(req_states, "num_computed_tokens", None),
-                        req_idx,
-                    )
+                num_computed_tokens = self._get_req_state_value(
+                    getattr(req_states, "num_computed_tokens", None),
+                    req_idx,
+                )
+            if num_computed_tokens is None:
+                num_computed_tokens = self._get_input_batch_num_computed(input_batch, req_idx, i)
             if prompt_len is not None:
                 info["_omni_prompt_len"] = int(prompt_len)
             if num_computed_tokens is not None:
@@ -868,12 +851,23 @@ class OmniModelState(DefaultModelState):
 
         embeds.index_copy_(0, batch_offsets, new_emb[:bsz].reshape(bsz, -1))
         audio_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
+        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+        valid_rows = None
+        if codes is not None and validity_key is not None:
+            valid_rows = torch.ones((bsz,), dtype=torch.bool, device=codes.device)
         if codes is not None and audio_key in gpu_keys:
             self.intermediate_buffer.update_gpu_tensor_rows(
                 req_indices,
                 audio_key,
                 codes[:bsz],
             )
+            if valid_rows is not None:
+                self.intermediate_buffer.update_gpu_tensor_rows(
+                    req_indices,
+                    validity_key,
+                    valid_rows,
+                    keepdim=False,
+                )
             return
         for j, (i, _start, _) in enumerate(mtp_batches):
             if codes is None:
@@ -887,6 +881,16 @@ class OmniModelState(DefaultModelState):
                 raise TypeError(
                     f"talker_mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
                 )
+            if valid_rows is not None:
+                if isinstance(validity_key, tuple) and len(validity_key) == 2:
+                    updates.setdefault(validity_key[0], {})[validity_key[1]] = valid_rows[j]
+                elif isinstance(validity_key, str):
+                    updates[validity_key] = valid_rows[j]
+                else:
+                    raise TypeError(
+                        "talker_mtp_validity_key must be a string or 2-tuple, "
+                        f"got {type(validity_key).__name__}: {validity_key!r}"
+                    )
             self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
     def _get_talker_mtp_base_sampling_kwargs(self) -> dict[str, Any]:
@@ -1099,20 +1103,10 @@ class OmniModelState(DefaultModelState):
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             if isinstance(model_output, (list, tuple)) or self.have_multimodal_outputs:
                 buffer_list = self.intermediate_buffer.gather(input_batch)
-                try:
-                    make_output_kwargs = {"model_intermediate_buffer": buffer_list}
-                    if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
-                        make_output_kwargs["runtime_additional_information"] = buffer_list
-                    model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
-                except Exception:
-                    _desc = type(model_output).__name__
-                    if isinstance(model_output, (list, tuple)):
-                        _desc += f"(len={len(model_output)})"
-                    logger.warning(
-                        "make_omni_output failed for %s; multimodal outputs will be empty",
-                        _desc,
-                        exc_info=True,
-                    )
+                make_output_kwargs = {"model_intermediate_buffer": buffer_list}
+                if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
+                    make_output_kwargs["runtime_additional_information"] = buffer_list
+                model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 
         if isinstance(model_output, OmniOutput):
             text_hidden = model_output.text_hidden_states

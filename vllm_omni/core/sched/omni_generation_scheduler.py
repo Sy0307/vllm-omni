@@ -202,16 +202,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.running, scheduler_requests=self.requests
             )
         async_chunk_transport = self._async_chunk_transport_enabled()
-        # MRv2 generation runners release their model-state slot after every
-        # chunk. Parked requests therefore own only scheduler/connector state,
-        # not one of the next execute_model() batch slots. Reserving them here
-        # limits Code2Wav to max_num_seqs request lifetimes and creates c64
-        # admission convoys. MRv1 keeps its existing resident-slot accounting.
-        reserved_running_slots = (
-            self._get_async_chunk_reserved_running_slots()
-            if async_chunk_transport and not self.use_v2_model_runner
-            else 0
-        )
+        # Generation runners execute only requests with ready chunks. Parked
+        # request lifetimes do not consume a model batch slot in either runner,
+        # so they must not reduce admission capacity.
+        reserved_running_slots = 0
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled

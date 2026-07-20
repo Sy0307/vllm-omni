@@ -82,7 +82,9 @@ def _should_emit_engine_output(
     if stopped or has_control:
         return True
     return not (
-        bool(getattr(model_config, "async_chunk", False)) and not bool(getattr(model_config, "final_output", False))
+        bool(getattr(model_config, "use_v2_model_runner", False))
+        and bool(getattr(model_config, "async_chunk", False))
+        and not bool(getattr(model_config, "final_output", False))
     )
 
 
@@ -327,7 +329,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         original_max_num_running_reqs = self.max_num_running_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
-        reserved_running_slots = self._get_async_chunk_reserved_running_slots() if async_chunk_transport else 0
+        reserved_running_slots = (
+            self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
+        )
         if reserved_running_slots:
             self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
         try:
@@ -347,7 +351,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     scheduler_requests=self.requests,
                 )
             if self.input_coordinator:
-                self.input_coordinator.restore_queues(self.waiting)
+                self.input_coordinator.restore_queues(self.waiting, self.running)
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
