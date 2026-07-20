@@ -476,6 +476,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     postprocess_uses_multimodal_outputs: bool = False
     postprocess_uses_req_infos: bool = False
     supports_omni_query_start_loc: bool = True
+    requires_request_ids_for_decode_state: bool = True
     # Stage 1 consumes request-local codes.audio only. Publish those tensors
     # before the async output snapshot and omit the unused talker hidden state.
     use_async_omni_output: bool = True
