@@ -19,7 +19,8 @@ Pick a deploy config that matches your GPU layout:
 
 | config | GPUs | TP | Notes |
 |---|---|---|---|
-| `minicpmo_4_5.yaml` | 2 | 1 | Thinker on GPU0, talker+t2w on GPU1. |
+| `minicpmo_4_5.yaml` | 1 | 1 | Thinker and talker+t2w co-located on GPU0. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | 1 | Thinker on GPU0, talker+t2w on GPU1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | 2 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | 4 | Thinker 4-way TP on GPU0-3, talker+t2w on GPU4. |
 | `minicpmo_4_5_3gpu_stage1_replicas.yaml` | 3 | 1 | Thinker on GPU0, two talker+Token2wav replicas on GPU1/2 for concurrent text+audio serving. |
@@ -273,6 +274,16 @@ Open `http://<host>:7862/`. When using a reverse proxy, open the proxy URL that
 maps to port `7862`. The browser derives its WebSocket endpoint relative to
 that URL, preserving any proxy path prefix.
 
+If the page proxy serves HTTP but does not forward WebSocket upgrades, point
+the browser directly at a separately exposed Realtime endpoint:
+
+```bash
+python -m vllm_omni.experimental.fullduplex.web \
+    --port 7862 \
+    --ws-backend ws://127.0.0.1:8099 \
+    --public-realtime-url wss://public.example/v1/realtime
+```
+
 Client behavior and options:
 
 - **Prompt presets**: the system prompt defaults to the official
@@ -286,10 +297,9 @@ Client behavior and options:
 - **Camera**: the **Camera** button streams ~1 fps JPEG frames riding the
   audio appends (`video_frames` on `input_audio_buffer.append`, the official
   omni contract) so the model sees while it listens.
-- **Auto-commit (client VAD)**: on by default; commits the turn after ~0.5 s
-  of post-speech silence. If the runtime does not start a response after a
-  commit (its auto-response currently only fires on the first turn), the
-  client requests one with `response.create` after a short fallback window.
+- **Continuous input**: the browser does not run VAD, send
+  `input_audio_buffer.commit`, or request `response.create`. It streams PCM
+  while unmuted and lets MiniCPM own listen/speak/turn progression.
 
 ## Notes
 

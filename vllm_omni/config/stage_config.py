@@ -279,6 +279,9 @@ class PipelineConfig:
     # from the optional model extension because turn-commit-only deployments
     # do not require a model planner.
     duplex_control_enabled: bool = False
+    # Bundled deploy defaults for this concrete pipeline topology. The file is
+    # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
+    default_deploy_config_name: str | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""

@@ -67,6 +67,7 @@ def build_app(
     *,
     ws_backend: str = "ws://127.0.0.1:8099",
     model: str = "openbmb/MiniCPM-o-4_5",
+    public_realtime_url: str | None = None,
     ref_audio: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Experimental Full-Duplex Web Demo")
@@ -84,7 +85,11 @@ def build_app(
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
         config = json.dumps(
-            {"model": model, "realtimePath": "v1/realtime", "refAudio": ref_audio_uri},
+            {
+                "model": model,
+                "realtimePath": public_realtime_url or "v1/realtime",
+                "refAudio": ref_audio_uri,
+            },
             ensure_ascii=True,
         )
         html = (
@@ -156,7 +161,12 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
-        build_app(ws_backend=args.ws_backend, model=args.model, ref_audio=args.ref_audio),
+        build_app(
+            ws_backend=args.ws_backend,
+            model=args.model,
+            public_realtime_url=args.public_realtime_url,
+            ref_audio=args.ref_audio,
+        ),
         host=args.host,
         port=args.port,
         log_level="info",
