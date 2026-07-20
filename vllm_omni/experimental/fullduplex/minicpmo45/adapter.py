@@ -10,9 +10,12 @@ from vllm.multimodal.media import MediaConnector
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    ServingRuntimeConfigError,
+)
 
 
-class MiniCPMO45ClientRuntimeConfigError(ValueError):
+class MiniCPMO45ClientRuntimeConfigError(ServingRuntimeConfigError):
     pass
 
 

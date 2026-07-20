@@ -15,6 +15,8 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _request(rpc_id: str) -> CollectiveRPCRequestMessage:
     return CollectiveRPCRequestMessage(

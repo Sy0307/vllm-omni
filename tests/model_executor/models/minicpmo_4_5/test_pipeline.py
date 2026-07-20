@@ -47,11 +47,15 @@ class TestRegistryDeclaration:
     def test_native_duplex_control_is_explicit_without_a_fixed_session_cap(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         assert pipeline.duplex_control_enabled is True
+        assert pipeline.duplex_serving_adapter == (
+            "vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
+        )
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
     def test_ordinary_pipeline_defaults_to_no_duplex_control(self) -> None:
         pipeline = PipelineConfig(model_type="ordinary")
         assert pipeline.duplex_control_enabled is False
+        assert pipeline.duplex_serving_adapter is None
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
 

@@ -5,21 +5,19 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from typing import Protocol
 
+from vllm_omni.engine.duplex_contracts import CorrelatedRpcTransport
 from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
-    EngineQueueMessage,
+    DuplexFence,
     OpenDuplexSessionMessage,
     ResumeDuplexSessionMessage,
     SignalDuplexTurnMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.rpc_result_router import RpcCorrelationKey
 
 DuplexControlMessage = (
     OpenDuplexSessionMessage
@@ -31,16 +29,20 @@ DuplexControlMessage = (
 )
 
 
-class CorrelatedRpcTransport(Protocol):
-    def execute(
-        self,
-        key: RpcCorrelationKey,
-        message: EngineQueueMessage,
-        *,
-        timeout: float | None,
-        timeout_message: str,
-        block_on_submit: bool = False,
-    ) -> EngineQueueMessage: ...
+class DuplexControlRequestError(RuntimeError):
+    """Typed client-side failure returned by the duplex control plane."""
+
+    def __init__(self, result: dict[str, object]) -> None:
+        error = result.get("error")
+        error_data = error if isinstance(error, dict) else {}
+        self.result = result
+        self.code = str(error_data.get("code") or "internal_error")
+        self.retryable = bool(error_data.get("retryable", False))
+        accepted_fence = result.get("accepted_fence")
+        self.accepted_fence = accepted_fence if isinstance(accepted_fence, DuplexFence) else None
+        lease_generation = result.get("lease_generation")
+        self.lease_generation = lease_generation if isinstance(lease_generation, int) else None
+        super().__init__(f"duplex {result.get('operation')} failed: {result}")
 
 
 class DuplexControlClient:
@@ -76,9 +78,20 @@ class DuplexControlClient:
             "stage_results": list(result_message.stage_results),
             "unsupported_count": result_message.unsupported_count,
             "error_count": result_message.error_count,
+            "accepted_fence": result_message.accepted_fence,
+            "lease_generation": result_message.lease_generation,
+            "error": (
+                {
+                    "code": result_message.error.code,
+                    "message": result_message.error.message,
+                    "retryable": result_message.error.retryable,
+                }
+                if result_message.error is not None
+                else None
+            ),
         }
-        if result_message.error_count:
-            raise RuntimeError(f"duplex {result_message.operation} failed: {result}")
+        if not result_message.ok:
+            raise DuplexControlRequestError(result)
         return result
 
     def open(

@@ -17,6 +17,14 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
 )
+from vllm_omni.experimental.fullduplex.openai.realtime_state import RealtimeStateOwner
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_realtime_state_owner_uses_explicit_bindings_not_dynamic_attribute_proxy():
+    assert "__getattr__" not in RealtimeStateOwner.__dict__
+    assert "__setattr__" not in RealtimeStateOwner.__dict__
 
 
 class _ProtocolWebSocket:
@@ -428,7 +436,7 @@ def test_duplex_capabilities_do_not_claim_core_kv_or_input_append():
 
 
 def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
-    caps = DuplexCapabilities.minicpmo45_native().as_dict()
+    caps = DuplexCapabilities.minicpmo45_native(max_sessions=2).as_dict()
 
     assert caps["implementation_level"] == "model_native_duplex"
     assert caps["supports_input_append"] is True
@@ -450,8 +458,15 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_multi_session_same_replica"] is True
     assert caps["supports_session_lease"] is True
     assert caps["supports_session_resume"] is True
-    assert caps["session_admission_mode"] == "scheduler_managed"
+    assert caps["session_admission_mode"] == "engine_managed"
     assert caps["stage_handoff_transport"] == "scheduler_data_plane"
+
+
+def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment():
+    caps = DuplexCapabilities.minicpmo45_native(max_sessions=1).as_dict()
+
+    assert caps["supports_multi_session"] is False
+    assert caps["supports_multi_session_same_replica"] is False
 
 
 def test_duplex_overlap_policy_defaults_and_invalid_values_to_listen_only():

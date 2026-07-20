@@ -3,24 +3,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+from collections.abc import Mapping
 
 import numpy as np
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex_runtime import duplex_data_plane_request_info
-from vllm_omni.engine.duplex_types import DuplexFence
-from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
-    MiniCPMO45DataPlaneContext,
-    coerce_int,
-    payload_turn_id,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
+from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_plane_request_info
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
     DuplexTurnState,
+)
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    coerce_int,
+    payload_turn_id,
 )
 
 logger = init_logger(__name__)
@@ -68,7 +66,10 @@ class NativeRuntimeBridgeMixin:
                 )
             result = await open_session(session.session_id, **open_kwargs)
         except Exception as exc:
-            logger.exception("Failed to open duplex runtime session: %s", exc)
+            if isinstance(exc, DuplexControlRequestError) and exc.code == "resource_exhausted":
+                logger.info("Duplex runtime session admission rejected: %s", exc)
+            else:
+                logger.exception("Failed to open duplex runtime session: %s", exc)
             await self._send_runtime_error(send_json, "runtime_open_failed", exc, session=session)
             return False
         if (
@@ -153,7 +154,7 @@ class NativeRuntimeBridgeMixin:
         await self._send_runtime_control_if_needed(send_json, result, session=session)
         request_id, _ = self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
         if request_id is not None:
-            self._minicpmo_data_plane.begin_request(request_id)
+            self._serving_runtime_adapter.data_plane.begin_request(request_id)
         close_reason, emitted_response = await self._send_native_duplex_events(
             send_json,
             result,
@@ -231,7 +232,7 @@ class NativeRuntimeBridgeMixin:
             return False
         session.bind_request(request_id)
 
-        native = self._minicpmo_session_state(session)
+        native = self._runtime_session_state(session)
         old_task = native.data_plane_task
         if old_task is not None and not old_task.done():
             if self._session_auto_responds(session):
@@ -239,6 +240,7 @@ class NativeRuntimeBridgeMixin:
                 # single synchronous loop: the resumable data-plane request id
                 # is stable, and cancel/restart on every append orphans any
                 # decision that lands in the swap window.
+                native.data_plane_restart_requested = True
                 return False
             old_task.cancel()
             try:
@@ -284,13 +286,28 @@ class NativeRuntimeBridgeMixin:
             finally:
                 if native.data_plane_task is task:
                     native.data_plane_task = None
+                restart_requested = (
+                    native.data_plane_restart_requested
+                    and close_reason is None
+                    and session.state != DuplexSessionState.CLOSED
+                    and session.active_request_id == request_id
+                    and (expected_epoch is None or session.epoch == expected_epoch)
+                )
+                native.data_plane_restart_requested = False
                 if close_reason is None and not self._session_auto_responds(session):
                     # Auto-respond sessions keep one resumable stage-1 stream
                     # whose audio accumulates across speak units; the offset
                     # must survive drain-task turnover or every unit re-sends
                     # the reply audio from the start.
-                    self._minicpmo_data_plane.close_stream(request_id)
-            if close_reason is None:
+                    self._serving_runtime_adapter.data_plane.close_stream(request_id)
+            if restart_requested:
+                await self._start_native_data_plane_stream_task(
+                    send_json,
+                    result,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                )
+            elif close_reason is None:
                 self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
         task = asyncio.create_task(_run())
@@ -314,8 +331,9 @@ class NativeRuntimeBridgeMixin:
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
         if self._session_auto_responds(session):
             return True
-        native = self._minicpmo_session_state(session)
-        count = native.continuation_units if native.continuation_response_id == response_id else 0
+        native = self._runtime_session_state(session)
+        owner_id = f"response:{response_id}"
+        count = native.continuation_units if native.continuation_owner_id == owner_id else 0
         return count < self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
 
     def _maybe_continue_native_response(
@@ -324,17 +342,18 @@ class NativeRuntimeBridgeMixin:
         *,
         session: DuplexSession,
         expected_epoch: int | None,
+        expected_model_turn_id: int | None = None,
     ) -> None:
-        """Keep an open spoken response going with silence units.
+        """Give an active model turn another silence unit.
 
-        The model generates one unit per append; official replies span
-        several units, so while a response is still open after a segment
-        finishes, append a silence unit (the official microphone-keeps-
-        streaming beat) until the model ends the turn or the cap is reached.
+        A model turn can need another unit before it has emitted visible
+        text/audio and therefore before a Realtime response exists. Bind that
+        continuation to the model-turn identity; once a response exists, its
+        response/turn ownership remains the continuation fence.
         """
         response_id = session.active_response_id
-        native = self._minicpmo_session_state(session)
-        if response_id is None or session.state == DuplexSessionState.CLOSED:
+        native = self._runtime_session_state(session)
+        if session.state == DuplexSessionState.CLOSED:
             native.clear_continuation()
             return
         request_id = session.active_request_id
@@ -343,25 +362,46 @@ class NativeRuntimeBridgeMixin:
             return
         if expected_epoch is not None and session.epoch != expected_epoch:
             return
-        count = native.continuation_units if native.continuation_response_id == response_id else 0
         auto_response = self._session_auto_responds(session)
+        response_owned = response_id is not None
+        if response_owned:
+            owner_id = f"response:{response_id}"
+            payload_turn_id = (
+                session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
+            )
+        else:
+            if (
+                not auto_response
+                or expected_model_turn_id is None
+                or session.turn_state != DuplexTurnState.ASSISTANT_GENERATING
+                or session.turn_id != expected_model_turn_id
+            ):
+                native.clear_continuation()
+                return
+            owner_id = f"model-turn:{expected_model_turn_id}"
+            payload_turn_id = expected_model_turn_id
+        count = native.continuation_units if native.continuation_owner_id == owner_id else 0
         if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
-        native.continuation_response_id = response_id
+        native.continuation_owner_id = owner_id
         native.continuation_units = count + 1
         payload = self._native_silence_unit_payload()
-        payload["duplex_turn_id"] = (
-            session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
-        )
+        payload["duplex_turn_id"] = payload_turn_id
 
         async def _continue() -> None:
             try:
-                if (
+                stale_common_owner = (
                     session.state == DuplexSessionState.CLOSED
-                    or session.active_response_id != response_id
                     or session.active_request_id != request_id
                     or (expected_epoch is not None and session.epoch != expected_epoch)
-                ):
+                )
+                stale_response_owner = response_owned and session.active_response_id != response_id
+                stale_model_turn_owner = not response_owned and (
+                    session.active_response_id is not None
+                    or session.turn_state != DuplexTurnState.ASSISTANT_GENERATING
+                    or session.turn_id != expected_model_turn_id
+                )
+                if stale_common_owner or stale_response_owner or stale_model_turn_owner:
                     return
                 await self._append_runtime_input(
                     session,
@@ -377,9 +417,10 @@ class NativeRuntimeBridgeMixin:
         asyncio.create_task(_continue())
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
-        native = self._minicpmo_session_state(session)
+        native = self._runtime_session_state(session)
         task = native.data_plane_task
         native.data_plane_task = None
+        native.data_plane_restart_requested = False
         if task is None or task.done():
             return False
         task.cancel()
@@ -587,12 +628,12 @@ class NativeRuntimeBridgeMixin:
         close_reason: str | None = None
         emitted_response = False
         request_id, _ = self._data_plane_request_info(result)
-        if self._minicpmo_data_plane.is_terminal(request_id):
+        if self._serving_runtime_adapter.data_plane.is_terminal(request_id):
             return None, False
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
-        context = self._minicpmo_data_plane_context(session)
-        for native_result in self._minicpmo_data_plane.project(result, context=context):
+        context = self._runtime_data_plane_context(session)
+        for native_result in self._serving_runtime_adapter.data_plane.project(result, context=context):
             close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                 send_json,
                 native_result,
@@ -629,7 +670,7 @@ class NativeRuntimeBridgeMixin:
         close_reason: str | None = None
         empty_polls = 0
         while close_reason is None:
-            if self._minicpmo_data_plane.is_terminal(request_id):
+            if self._serving_runtime_adapter.data_plane.is_terminal(request_id):
                 return None
             if self._session_auto_responds(session):
                 active_request_id = session.active_request_id
@@ -699,9 +740,9 @@ class NativeRuntimeBridgeMixin:
             return None, None
         return duplex_data_plane_request_info(result)
 
-    def _minicpmo_data_plane_context(self, session: DuplexSession) -> MiniCPMO45DataPlaneContext:
+    def _runtime_data_plane_context(self, session: DuplexSession) -> object:
         response_config = session.response_config
-        return MiniCPMO45DataPlaneContext(
+        return self._serving_runtime_adapter.data_plane_context(
             epoch=session.epoch,
             turn_id=session.turn_id,
             active_response_turn_id=session.active_response_turn_id,
@@ -725,7 +766,9 @@ class NativeRuntimeBridgeMixin:
         if expected_epoch is not None and session.epoch != expected_epoch:
             return close_reason, emitted_response
         data_plane_request_id = native_result.get("data_plane_request_id")
-        if isinstance(data_plane_request_id, str) and self._minicpmo_data_plane.is_terminal(data_plane_request_id):
+        if isinstance(data_plane_request_id, str) and self._serving_runtime_adapter.data_plane.is_terminal(
+            data_plane_request_id
+        ):
             return close_reason, emitted_response
         active_request_matches = session.active_request_id == data_plane_request_id or (
             self._session_auto_responds(session) and session.active_request_id is None
@@ -813,7 +856,7 @@ class NativeRuntimeBridgeMixin:
                 model_listen = native_result.get("reason") in {None, "", "model_listen"}
             response_id = session.active_response_id
             if isinstance(data_plane_request_id, str) and not auto_response:
-                self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
+                self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             emitted_response = True
             payload = {
                 "type": "response.listen",
@@ -848,7 +891,7 @@ class NativeRuntimeBridgeMixin:
                 if auto_response:
                     self._mark_auto_response_waiting_for_speech(
                         session,
-                        prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+                        prefix_variant=self._serving_runtime_adapter.clean_response_done_prefix,
                     )
                 await send_json(
                     {
@@ -871,11 +914,13 @@ class NativeRuntimeBridgeMixin:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
             )
-            if tts_segment_ended and self._session_auto_responds(session):
+            model_turn_id = coerce_int(native_result.get("model_turn_id"))
+            if tts_segment_ended and self._session_auto_responds(session) and model_turn_id is not None:
                 self._maybe_continue_native_response(
                     send_json,
                     session=session,
                     expected_epoch=expected_epoch,
+                    expected_model_turn_id=model_turn_id,
                 )
             return close_reason, emitted_response
         if end_of_turn and not has_text and not has_audio and session.active_response_id is None:
@@ -883,7 +928,7 @@ class NativeRuntimeBridgeMixin:
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
                     session.clear_request()
                 if not self._session_auto_responds(session):
-                    self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
+                    self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
@@ -914,6 +959,10 @@ class NativeRuntimeBridgeMixin:
                     epoch=session.epoch,
                 )
             )
+        response_stage_metrics = session.accumulate_response_stage_metrics(
+            native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
+        )
+        if response_created:
             speak_payload = {
                 "type": "response.speak",
                 "session_id": session.session_id,
@@ -923,7 +972,11 @@ class NativeRuntimeBridgeMixin:
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
             }
-            self._attach_native_runtime_metadata(speak_payload, native_result)
+            self._attach_native_runtime_metadata(
+                speak_payload,
+                native_result,
+                stage_metrics=response_stage_metrics,
+            )
             await send_json(speak_payload)
         previous_sent_ms = session.playback.sent_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
@@ -987,7 +1040,11 @@ class NativeRuntimeBridgeMixin:
         sample_rate_hz = native_result.get("sample_rate_hz") or native_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_native_runtime_metadata(payload, native_result)
+        self._attach_native_runtime_metadata(
+            payload,
+            native_result,
+            stage_metrics=response_stage_metrics,
+        )
         await send_json(payload)
         if (
             not end_of_turn
@@ -1003,12 +1060,12 @@ class NativeRuntimeBridgeMixin:
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
             if isinstance(data_plane_request_id, str) and not self._session_auto_responds(session):
-                self._minicpmo_data_plane.close_stream(data_plane_request_id)
+                self._serving_runtime_adapter.data_plane.close_stream(data_plane_request_id)
             if isinstance(data_plane_request_id, str):
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
                     session.clear_request()
                 if not self._session_auto_responds(session):
-                    self._minicpmo_data_plane.mark_terminal(data_plane_request_id)
+                    self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             should_commit = self._should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(
                 commit_text=should_commit,
@@ -1020,7 +1077,7 @@ class NativeRuntimeBridgeMixin:
             if self._session_auto_responds(session):
                 self._mark_auto_response_waiting_for_speech(
                     session,
-                    prefix_variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
+                    prefix_variant=self._serving_runtime_adapter.clean_response_done_prefix,
                 )
             if should_commit:
                 session.register_history_item(f"item_{response_id}", committed_message)
@@ -1065,13 +1122,13 @@ class NativeRuntimeBridgeMixin:
 
     def _cleanup_duplex_session_state(self, session: DuplexSession) -> None:
         session_id = session.session_id
-        self._minicpmo_sessions.pop(session_id, None)
-        self._minicpmo_data_plane.close_session(
+        self._serving_runtime_adapter.remove_session_state(session_id)
+        self._serving_runtime_adapter.data_plane.close_session(
             session_id,
             active_request_id=session.active_request_id,
         )
 
-    def _encode_minicpmo_data_plane_audio(
+    def _encode_native_data_plane_audio(
         self,
         audio_data: object,
         sample_rate_hz: int,
@@ -1107,7 +1164,12 @@ class NativeRuntimeBridgeMixin:
             return None
 
     @staticmethod
-    def _attach_native_runtime_metadata(payload: dict[str, object], native_result: dict[str, object]) -> None:
+    def _attach_native_runtime_metadata(
+        payload: dict[str, object],
+        native_result: dict[str, object],
+        *,
+        stage_metrics: Mapping[str, object] | None = None,
+    ) -> None:
         metadata: dict[str, object] = {}
         runtime_impl = native_result.get("runtime_impl")
         if isinstance(runtime_impl, str) and runtime_impl:
@@ -1122,6 +1184,13 @@ class NativeRuntimeBridgeMixin:
             value = native_result.get(name)
             if isinstance(value, bool):
                 metadata[name] = value
+        effective_stage_metrics = stage_metrics if stage_metrics is not None else native_result.get("stage_metrics")
+        if isinstance(effective_stage_metrics, Mapping):
+            metadata["stage_metrics"] = {
+                str(stage_id): dict(values)
+                for stage_id, values in effective_stage_metrics.items()
+                if isinstance(values, Mapping)
+            }
         if metadata:
             payload["vllm_omni"] = metadata
 
@@ -1133,10 +1202,19 @@ class NativeRuntimeBridgeMixin:
         *,
         session: DuplexSession | None = None,
     ) -> None:
+        retryable = False
+        message = str(exc)
+        if isinstance(exc, DuplexControlRequestError):
+            code = exc.code
+            retryable = exc.retryable
+            error_data = exc.result.get("error")
+            if isinstance(error_data, dict) and isinstance(error_data.get("message"), str):
+                message = error_data["message"]
         payload: dict[str, object] = {
             "type": "error",
             "code": code,
-            "error": str(exc),
+            "error": message,
+            "retryable": retryable,
         }
         if session is not None:
             payload["session_id"] = session.session_id

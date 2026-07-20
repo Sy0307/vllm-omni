@@ -128,6 +128,14 @@ class MiniCPMO45DataPlaneSession:
         context: MiniCPMO45DataPlaneContext | None = None,
     ) -> Iterator[dict[str, object]]:
         context = context or MiniCPMO45DataPlaneContext()
+        stage_metrics = _output_stage_metrics(output)
+
+        def runtime_result(**values: object) -> dict[str, object]:
+            result = _runtime_result(**values)
+            if stage_metrics is not None:
+                result["stage_metrics"] = stage_metrics
+            return result
+
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str) or not request_id:
             request_id = None
@@ -186,7 +194,7 @@ class MiniCPMO45DataPlaneSession:
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
-            yield _runtime_result(
+            yield runtime_result(
                 stage_role="llm",
                 is_listen=True,
                 model_listen=True,
@@ -239,7 +247,7 @@ class MiniCPMO45DataPlaneSession:
             fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
             audio_results: list[dict[str, object]] = []
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
-                native_result = _runtime_result(
+                native_result = runtime_result(
                     stage_role="tts",
                     is_listen=False,
                     data_plane_request_id=request_id,
@@ -323,7 +331,7 @@ class MiniCPMO45DataPlaneSession:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
                 request_state.pending_audio_without_text[-1]["end_of_turn"] = True
                 request_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
-            terminal_result = _runtime_result(
+            terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
                 data_plane_request_id=request_id,
@@ -340,7 +348,7 @@ class MiniCPMO45DataPlaneSession:
             return
 
         if context.active_response_id is not None and unit_end_of_turn:
-            terminal_result = _runtime_result(
+            terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
                 data_plane_request_id=request_id,
@@ -360,7 +368,7 @@ class MiniCPMO45DataPlaneSession:
             # buffer here when no explicit model-turn key was present.
             if request_state is not None and output_turn_id is None:
                 request_state.pending_audio_without_text.clear()
-            terminal_result = _runtime_result(
+            terminal_result = runtime_result(
                 stage_role="tts",
                 is_listen=False,
                 data_plane_request_id=request_id,
@@ -383,7 +391,7 @@ class MiniCPMO45DataPlaneSession:
             and request_id is not None
             and not unit_end_of_turn
         ):
-            yield _runtime_result(
+            yield runtime_result(
                 stage_role="llm",
                 is_listen=True,
                 model_listen=False,
@@ -398,7 +406,7 @@ class MiniCPMO45DataPlaneSession:
             if context.auto_responds:
                 return
             if finished:
-                yield _runtime_result(
+                yield runtime_result(
                     stage_role="llm",
                     is_listen=True,
                     model_listen=False,
@@ -411,14 +419,14 @@ class MiniCPMO45DataPlaneSession:
         if context.auto_responds:
             return
         if "audio" in context.modalities:
-            yield _runtime_result(
+            yield runtime_result(
                 stage_role="tts",
                 error_code="runtime_data_plane_text_without_audio",
                 error="MiniCPM-o native duplex data-plane produced text without audio.",
                 data_plane_request_id=request_id,
             )
             return
-        yield _runtime_result(
+        yield runtime_result(
             stage_role="llm",
             is_listen=False,
             data_plane_request_id=request_id,
@@ -564,6 +572,19 @@ def _runtime_result(**values: object) -> dict[str, object]:
         "runtime_impl": "scheduler_data_plane",
         "owned_runtime": False,
     }
+
+
+def _output_stage_metrics(output: object) -> dict[str, dict[str, object]] | None:
+    metrics = getattr(output, "metrics", None)
+    if not isinstance(metrics, Mapping):
+        return None
+    stage_metrics = metrics.get("stage_metrics")
+    if not isinstance(stage_metrics, Mapping):
+        return None
+    snapshot = {
+        str(stage_id): dict(values) for stage_id, values in stage_metrics.items() if isinstance(values, Mapping)
+    }
+    return snapshot or None
 
 
 def _native_decision(

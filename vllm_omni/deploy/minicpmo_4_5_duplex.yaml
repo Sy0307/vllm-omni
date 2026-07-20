@@ -15,6 +15,9 @@ duplex_session:
   resume_replay_max_bytes_per_session: 8388608
   max_pending_input_bytes_per_session: 16777216
   max_pending_turns_per_session: 4
+  # Matches the configured Stage0/Stage1 sequence capacity below.
+  max_sessions: 2
+  completed_append_cache_size: 256
 
 stages:
   - stage_id: 0

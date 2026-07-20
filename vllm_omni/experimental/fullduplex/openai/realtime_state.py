@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 REALTIME_INPUT_AUDIO_FORMATS = {
     "pcm16",
@@ -41,6 +41,7 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "response_error": "server_error",
     "chat_error": "server_error",
     "duplex_session_busy": "rate_limit_error",
+    "resource_exhausted": "rate_limit_error",
     "response_already_active": "invalid_request_error",
     "response_not_active": "invalid_request_error",
     "response_create_without_input": "invalid_request_error",
@@ -141,19 +142,55 @@ class RealtimeSessionState:
         )
 
 
+_StateValue = TypeVar("_StateValue")
+
+
+class _RealtimeStateField(Generic[_StateValue]):
+    """Explicit descriptor binding one protocol attribute to session state."""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        del owner
+        self._name = name
+
+    def __get__(self, instance: Any, owner: type | None = None) -> _StateValue | _RealtimeStateField[_StateValue]:
+        del owner
+        if instance is None:
+            return self
+        return getattr(instance._state, self._name)
+
+    def __set__(self, instance: Any, value: _StateValue) -> None:
+        setattr(instance._state, self._name, value)
+
+
 class RealtimeStateOwner:
-    """Compatibility proxy exposing the historical private state attributes."""
+    """Declare the mutable state surface shared by input/output projectors."""
 
     _state: RealtimeSessionState
-    _state_fields = frozenset(RealtimeSessionState.__slots__)
-
-    def __getattr__(self, name: str) -> Any:
-        if name in self._state_fields:
-            return getattr(object.__getattribute__(self, "_state"), name)
-        raise AttributeError(name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name != "_state" and name in self._state_fields:
-            setattr(object.__getattribute__(self, "_state"), name, value)
-            return
-        object.__setattr__(self, name, value)
+    _opened: bool = _RealtimeStateField()
+    _autostarted_default_session: bool = _RealtimeStateField()
+    _resume_only: bool = _RealtimeStateField()
+    _pending_outbound: asyncio.Queue[dict[str, object]] = _RealtimeStateField()
+    _held_realtime_payloads: list[dict[str, object]] = _RealtimeStateField()
+    _hold_realtime_output_until_session_created: bool = _RealtimeStateField()
+    _default_model: object | None = _RealtimeStateField()
+    _default_session_id: object | None = _RealtimeStateField()
+    _default_extra_body: dict[str, object] = _RealtimeStateField()
+    _input_audio_format: str = _RealtimeStateField()
+    _input_sample_rate_hz: int = _RealtimeStateField()
+    _output_audio_format: str = _RealtimeStateField()
+    _overlap_silence_rms: float = _RealtimeStateField()
+    _send_realtime_json: Any = _RealtimeStateField()
+    _initial_session_update: bool = _RealtimeStateField()
+    _input_speech_started: bool = _RealtimeStateField()
+    _response_states: dict[str | int, _RealtimeResponseState] = _RealtimeStateField()
+    _item_truncation_cursors: dict[str, tuple[int, int]] = _RealtimeStateField()
+    _active_response_id: str | None = _RealtimeStateField()
+    _last_response_id: str | None = _RealtimeStateField()
+    _conversation_items: dict[str, dict[str, object]] = _RealtimeStateField()
+    _pending_commit_item_ids: asyncio.Queue[str] = _RealtimeStateField()
+    _last_conversation_item_id: str | None = _RealtimeStateField()
+    _output_sample_rate_hz: int | None = _RealtimeStateField()
+    _active_input_item_id: str | None = _RealtimeStateField()
+    _input_audio_buffer_has_audio: bool = _RealtimeStateField()
+    _input_audio_buffer_had_non_speech: bool = _RealtimeStateField()
+    _input_audio_buffer_transcript_parts: list[str] = _RealtimeStateField()

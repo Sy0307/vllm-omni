@@ -24,7 +24,8 @@ class MiniCPMO45ServingSessionState:
     auto_response_waiting_for_speech: bool = False
     auto_response_new_turn_prefix_variant: str | None = None
     data_plane_task: asyncio.Task[None] | None = None
-    continuation_response_id: str | None = None
+    data_plane_restart_requested: bool = False
+    continuation_owner_id: str | None = None
     continuation_units: int = 0
 
     def reserve_overlap_turn(
@@ -65,5 +66,5 @@ class MiniCPMO45ServingSessionState:
         return reserved_bytes
 
     def clear_continuation(self) -> None:
-        self.continuation_response_id = None
+        self.continuation_owner_id = None
         self.continuation_units = 0

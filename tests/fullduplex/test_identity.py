@@ -5,8 +5,10 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from vllm_omni.engine.duplex_types import DuplexFence as StableDuplexFence
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence as ExperimentalDuplexFence
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence as EngineDuplexFence
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_fence_is_frozen_and_slotted():
@@ -18,5 +20,5 @@ def test_fence_is_frozen_and_slotted():
     assert not hasattr(fence, "__dict__")
 
 
-def test_experimental_fence_reexports_stable_engine_type():
-    assert ExperimentalDuplexFence is StableDuplexFence
+def test_core_identity_reexports_engine_duplex_fence():
+    assert ExperimentalDuplexFence is EngineDuplexFence

@@ -4,19 +4,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
 class DuplexSamplingRow:
-    """Generic request context for an optional model-owned duplex sampler."""
+    """Request-local context for an optional model sampling hook.
+
+    The generic runner constructs rows only when the loaded model exposes
+    ``prepare_duplex_sampling``. Models without that hook do not allocate or
+    scan this metadata.
+    """
 
     row_idx: int
     request_id: str
     session_id: str | None
     incarnation: int
     seq: int | None
-    payload: dict[str, Any] | None
+    payload: dict[str, object] | None
     max_tokens: int | None
 
 

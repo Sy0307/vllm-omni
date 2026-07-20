@@ -19,6 +19,8 @@ from vllm_omni.experimental.fullduplex.openai.session_attachment import (
     ResumeToken,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class _Clock:
     def __init__(self) -> None:
@@ -146,8 +148,8 @@ async def test_registry_resume_rotates_token_replays_and_atomically_replaces_att
         closes_b.append(reason)
 
     created = await registry.create("sid", incarnation=2, send=send_a, close=close_a)
-    await registry.record_event("sid", {"type": "event-1"})
-    await registry.record_event("sid", {"type": "event-2"})
+    await registry.send_event("sid", {"type": "event-1"})
+    await registry.send_event("sid", {"type": "event-2"})
 
     resumed = await registry.resume(
         "sid",
@@ -163,9 +165,15 @@ async def test_registry_resume_rotates_token_replays_and_atomically_replaces_att
     assert [entry.sequence for entry in resumed.replay_entries] == [2]
     assert resumed.replaced_attachment is not None
     assert resumed.replaced_attachment.generation == 1
+    assert await registry.is_current_attachment("sid", created.attachment_generation) is False
+    assert await registry.is_current_attachment("sid", resumed.attachment_generation) is True
     assert await registry.detach("sid", attachment_generation=1) is False
     assert await registry.detach("sid", attachment_generation=2) is True
-    assert sends_a == [] and closes_a == [] and sends_b == [] and closes_b == []
+    assert [(payload["type"], payload["server_event_seq"]) for payload in sends_a] == [
+        ("event-1", 1),
+        ("event-2", 2),
+    ]
+    assert closes_a == [] and sends_b == [] and closes_b == []
 
 
 @pytest.mark.asyncio
@@ -191,8 +199,8 @@ async def test_registry_resume_sends_activation_then_replay_before_new_live_even
             await release_activation.wait()
 
     created = await registry.create("sid-order", incarnation=0, send=old_send, close=close)
-    await registry.record_event("sid-order", {"type": "replayed"})
     await registry.detach("sid-order", attachment_generation=1)
+    await registry.send_event("sid-order", {"type": "replayed"})
     resume_task = asyncio.create_task(
         registry.resume(
             "sid-order",
@@ -318,8 +326,10 @@ async def test_registry_keeps_sessions_journals_and_incarnations_isolated() -> N
 
     created_a = await registry.create("sid-a", incarnation=1, send=send, close=close)
     created_b = await registry.create("sid-b", incarnation=4, send=send, close=close)
-    await registry.record_event("sid-a", {"type": "a-only"})
-    await registry.record_event("sid-b", {"type": "b-only"})
+    await registry.detach("sid-a", attachment_generation=1)
+    await registry.detach("sid-b", attachment_generation=1)
+    await registry.send_event("sid-a", {"type": "a-only"})
+    await registry.send_event("sid-b", {"type": "b-only"})
 
     resumed_a = await registry.resume(
         "sid-a",
@@ -365,11 +375,13 @@ async def test_registry_repr_never_contains_plaintext_tokens() -> None:
         del reason
 
     created = await registry.create("sid-repr", incarnation=0, send=send, close=close)
-    entry = await registry.record_event(
+    await registry.detach("sid-repr", attachment_generation=1)
+    entry = await registry.send_event(
         "sid-repr",
         {"type": "session.resumed", "resume_token": created.resume_token.plaintext},
     )
 
+    assert entry is not None
     assert created.resume_token.plaintext not in repr(created)
     assert created.resume_token.plaintext not in repr(entry)
     assert created.resume_token.plaintext not in repr(registry)

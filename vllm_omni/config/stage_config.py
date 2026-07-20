@@ -272,6 +272,9 @@ class PipelineConfig:
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
     # Optional model-owned duplex planner loaded by the stable engine runtime.
     duplex_runtime_extension: str | None = None
+    # Optional model-owned Serving adapter loaded only when the Realtime duplex
+    # endpoint is enabled. Generic OpenAI modules must not select a model.
+    duplex_serving_adapter: str | None = None
     # Explicitly enable the stable duplex control mechanism. This is separate
     # from the optional model extension because turn-commit-only deployments
     # do not require a model planner.
@@ -420,6 +423,8 @@ class DuplexSessionRuntimeConfig:
     resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
+    max_sessions: int = 1
+    completed_append_cache_size: int = 256
 
     def __post_init__(self) -> None:
         positive = {
@@ -429,6 +434,8 @@ class DuplexSessionRuntimeConfig:
             "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
             "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
             "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_sessions": self.max_sessions,
+            "completed_append_cache_size": self.completed_append_cache_size,
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")

@@ -13,6 +13,8 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> None:
     deploy_path = tmp_path / "duplex.yaml"
@@ -28,6 +30,8 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.resume_replay_max_bytes_per_session == 8 * 1024 * 1024
     assert deploy.duplex_session.max_pending_input_bytes_per_session == 16 * 1024 * 1024
     assert deploy.duplex_session.max_pending_turns_per_session == 4
+    assert deploy.duplex_session.max_sessions == 1
+    assert deploy.duplex_session.completed_append_cache_size == 256
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -52,6 +56,8 @@ def test_duplex_session_runtime_accepts_disabled_idle_expiry(tmp_path) -> None:
         ("resume_replay_max_bytes_per_session", -1),
         ("max_pending_input_bytes_per_session", 0),
         ("max_pending_turns_per_session", -1),
+        ("max_sessions", 0),
+        ("completed_append_cache_size", 0),
     ],
 )
 def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str, value: int) -> None:

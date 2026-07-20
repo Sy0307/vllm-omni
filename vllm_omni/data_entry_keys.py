@@ -112,6 +112,7 @@ class _StructBase(msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unkno
 class HiddenStatesStruct(_StructBase):
     output: torch.Tensor | None = None
     output_shape: list[int] | None = None
+    # Generic AR-stage hidden-state handoff consumed by a downstream TTS stage.
     tts: torch.Tensor | None = None
     trailing_text: torch.Tensor | None = None
     last: torch.Tensor | None = None
@@ -181,6 +182,9 @@ class MetaStruct(_StructBase):
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
+    # Compatibility wire fields used by the MiniCPM streaming TTS handoff.
+    # Keep them in the strict msgspec schema until a versioned model metadata
+    # envelope can migrate existing chunk-transfer producers and consumers.
     unit_token_id: int | None = None
     unit_end_token_id: int | None = None
     listen_token_id: int | None = None
@@ -368,14 +372,6 @@ def deserialize_tensor_entry(entry: AdditionalInformationEntry) -> torch.Tensor:
     return torch.from_numpy(arr.copy())
 
 
-def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
-    return serialize_tensor_entry(t)
-
-
-def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    return deserialize_tensor_entry(entry)
-
-
 def serialize_payload(
     payload: OmniPayload,
 ) -> AdditionalInformationPayload | None:
@@ -394,7 +390,7 @@ def serialize_payload(
 
     for key, value in flat.items():
         if isinstance(value, torch.Tensor):
-            entries[key] = _serialize_tensor(value)
+            entries[key] = serialize_tensor_entry(value)
         elif isinstance(value, list):
             entries[key] = AdditionalInformationEntry(list_data=value)
         elif value is not None:
@@ -415,7 +411,7 @@ def deserialize_payload(
 
     for key, entry in wire.entries.items():
         if entry.tensor_data is not None:
-            flat[key] = _deserialize_tensor(entry)
+            flat[key] = deserialize_tensor_entry(entry)
         elif entry.list_data is not None:
             flat[key] = entry.list_data
         elif entry.scalar_data is not None:

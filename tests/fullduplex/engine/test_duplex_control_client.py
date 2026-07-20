@@ -3,14 +3,22 @@
 
 from __future__ import annotations
 
-from vllm_omni.engine.duplex_control_client import DuplexControlClient
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex_types import DuplexFence
+import pytest
+
 from vllm_omni.engine.messages import (
+    DuplexControlError,
     DuplexControlResultMessage,
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
+from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
+    DuplexControlClient,
+    DuplexControlRequestError,
+)
+from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Transport:
@@ -26,6 +34,23 @@ class _Transport:
             session_id=message.session_id,
             ok=True,
             stage_results=[],
+        )
+
+
+class _UnsupportedTransport:
+    def execute(self, key, message, **kwargs):
+        del key, kwargs
+        return DuplexControlResultMessage(
+            control_id=message.control_id,
+            fence=message.fence,
+            operation="touch",
+            session_id=message.session_id,
+            ok=False,
+            stage_results=[{"result": {"supported": False}}],
+            unsupported_count=1,
+            error=DuplexControlError(code="invalid_capability", message="unsupported", retryable=False),
+            accepted_fence=DuplexFence(message.session_id, epoch=2),
+            lease_generation=7,
         )
 
 
@@ -65,3 +90,21 @@ def test_control_client_routes_touch_and_resume_by_control_id() -> None:
     assert isinstance(resume_message, ResumeDuplexSessionMessage)
     assert resume_message.expected_lease_generation == 7
     assert resume_kwargs["timeout"] == 3.0
+
+
+def test_control_client_treats_ok_false_as_authoritative_failure() -> None:
+    client = DuplexControlClient(_UnsupportedTransport(), control_id_factory=lambda: "unsupported")
+    fence = DuplexFence("sid-unsupported")
+
+    with pytest.raises(DuplexControlRequestError, match="duplex touch failed") as exc_info:
+        client.touch(
+            fence.session_id,
+            fence=fence,
+            activity=DuplexLeaseActivity.HEARTBEAT,
+            timeout=1.0,
+        )
+
+    assert exc_info.value.code == "invalid_capability"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.accepted_fence == DuplexFence(fence.session_id, epoch=2)
+    assert exc_info.value.lease_generation == 7

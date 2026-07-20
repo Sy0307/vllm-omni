@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import TypedDict
 
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
@@ -19,14 +19,14 @@ class DuplexIntermediateBuffer(TypedDict, total=False):
     llm_output_text: list[str]
     stream_output: bool
     native_duplex: bool
-    ids: dict[str, Any]
-    hidden_states: dict[str, Any]
-    codes: dict[str, Any]
-    meta: dict[str, Any]
-    duplex: dict[str, Any]
-    omni_payload: Any
-    waveform: Any
-    mel_spec: Any
+    ids: dict[str, object]
+    hidden_states: dict[str, object]
+    codes: dict[str, object]
+    meta: dict[str, object]
+    duplex: dict[str, object]
+    omni_payload: object
+    waveform: object
+    mel_spec: object
 
 
 def build_duplex_intermediate_buffer(
@@ -59,19 +59,21 @@ def build_duplex_intermediate_buffer(
     return buffer
 
 
-def set_ref_audio(buffer: dict[str, Any], waveform: Any, sample_rate_hz: int) -> None:
+def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: int) -> None:
     buffer.setdefault("codes", {})["ref"] = waveform
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
-def set_tts_handoff(buffer: dict[str, Any], token_ids: Any | None, hidden_states: Any | None) -> None:
+def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
+    """Store the generic AR-stage token/hidden-state handoff consumed by TTS."""
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids
     if hidden_states is not None:
         buffer.setdefault("hidden_states", {})["tts"] = hidden_states
 
 
-def get_tts_handoff(info: dict[str, Any]) -> tuple[Any, Any]:
+def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
+    """Read the generic AR-stage to TTS handoff, including legacy flat keys."""
     ids_info = info.get("ids")
     hidden_info = info.get("hidden_states")
     tts_token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
@@ -83,7 +85,7 @@ def get_tts_handoff(info: dict[str, Any]) -> tuple[Any, Any]:
     return tts_token_ids, tts_hidden_states
 
 
-def get_stream_request_key(info: dict[str, Any]) -> str:
+def get_stream_request_key(info: dict[str, object]) -> str:
     key = info.get("global_request_id") or info.get("request_id") or info.get("_omni_req_id")
     if isinstance(key, (list, tuple)):
         key = key[0] if key else None
@@ -91,7 +93,7 @@ def get_stream_request_key(info: dict[str, Any]) -> str:
         key = key.decode("utf-8", errors="replace")
     if key is None:
         raise ValueError(
-            "MiniCPM-o duplex streaming handoff requires a stable request id; "
+            "Duplex streaming handoff requires a stable request id; "
             "expected global_request_id, request_id, or _omni_req_id."
         )
     return str(key)

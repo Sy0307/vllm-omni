@@ -9,15 +9,8 @@ from copy import deepcopy
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex_types import DuplexFence
-from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import payload_turn_id
-from vllm_omni.experimental.fullduplex.minicpmo45.input import (
-    MiniCPMO45PcmAppendReservation,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.session import (
-    MiniCPMO45ServingSessionState,
-)
+from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexPlaybackCommitPolicy,
@@ -29,12 +22,18 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
 )
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    PcmAppendReservation,
+    ServingRuntimeSessionState,
+    payload_turn_id,
+)
 from vllm_omni.experimental.fullduplex.openai.session_attachment import (
     DuplexJournalOverflowError,
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import (
     DuplexWebSocketActor,
     is_input_event,
+    normalize_duplex_input_event,
 )
 
 logger = init_logger(__name__)
@@ -65,9 +64,19 @@ class DuplexSessionRunnerMixin:
         attachment_generation: int | None = None
         resume_credential_delivered = False
         transport_detached = False
+        pending_turn_reservations = 0
 
         async def attachment_send(payload: dict[str, object]) -> None:
-            await websocket.send_json(payload)
+            nonlocal resume_credential_delivered
+            try:
+                await websocket.send_json(payload)
+            except RuntimeError as exc:
+                message = str(exc)
+                if "after sending 'websocket.close'" in message or "response already completed" in message:
+                    raise WebSocketDisconnect(code=1006) from exc
+                raise
+            if payload.get("type") == "session.created" and isinstance(payload.get("resume_token"), str):
+                resume_credential_delivered = True
 
         async def attachment_close(reason: str) -> None:
             close = getattr(websocket, "close", None)
@@ -120,7 +129,7 @@ class DuplexSessionRunnerMixin:
                 await actor.send_json(raw_payload)
 
             realtime_protocol.bind_sender(send_realtime_raw)
-        native = MiniCPMO45ServingSessionState()
+        native: ServingRuntimeSessionState = self._serving_runtime_adapter.create_session_state()
 
         def begin_close(reason: str) -> None:
             actor.closing = True
@@ -129,7 +138,6 @@ class DuplexSessionRunnerMixin:
                 session.mark_closing()
 
         event_emit_lock = asyncio.Lock()
-        native_append_tail: asyncio.Task[bool] | None = None
 
         async def send_outbound(payload: dict[str, object]) -> None:
             if not attachment_ready or session is None:
@@ -174,6 +182,7 @@ class DuplexSessionRunnerMixin:
         reader_task: asyncio.Task[None] | None = None
 
         async def read_event_loop() -> None:
+            nonlocal pending_turn_reservations
             assert session is not None
             try:
                 while not actor.closing:
@@ -204,6 +213,7 @@ class DuplexSessionRunnerMixin:
                             }
                         )
                         continue
+                    event = normalize_duplex_input_event(event)
                     event_type = event.get("type")
                     if not isinstance(event_type, str):
                         await emit_event(
@@ -223,6 +233,7 @@ class DuplexSessionRunnerMixin:
                             )
                             continue
                         event["_duplex_pending_turn_reserved"] = True
+                        pending_turn_reservations += 1
                     if is_input_event(event_type) and native_response_in_progress():
                         event["_duplex_overlap_candidate"] = True
                     await actor.enqueue_event(event)
@@ -230,34 +241,23 @@ class DuplexSessionRunnerMixin:
                 await actor.enqueue_event({"type": "__disconnect__"})
 
         async def next_actor_event() -> dict[str, object]:
+            nonlocal pending_turn_reservations, transport_detached
             event = await actor.next_event()
             if event.pop("_duplex_pending_turn_reserved", False) and session is not None:
                 session.release_pending_turn()
-            return event
-
-        async def flush_native_audio_buffer(*, emit_event) -> tuple[bool, bool]:
-            if session is None:
-                return True, False
-            # Drain in whole-chunk payloads: the buffer's first emission is
-            # capped at one chunk (worker first-unit window), so a long first
-            # commit may need several appends to reach the model.
-            result: tuple[bool, bool] | None = None
-            while True:
-                flushed = native.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
-                if flushed is None:
-                    break
-                append_epoch = session.epoch
-                result = await self._append_runtime_input(
-                    session,
-                    flushed,
-                    final=not native.audio_buffer.has_pending(),
-                    send_json=emit_event,
-                    mode="append_audio_chunk",
-                    expected_epoch=append_epoch,
+                pending_turn_reservations = max(0, pending_turn_reservations - 1)
+            if (
+                attachment_ready
+                and attachment_generation is not None
+                and session is not None
+                and not await self._attachment_registry.is_current_attachment(
+                    session.session_id,
+                    attachment_generation,
                 )
-                if result[0] is False:
-                    return result
-            return result if result is not None else (True, False)
+            ):
+                transport_detached = True
+                return {"type": "__replaced_attachment__"}
+            return event
 
         def native_response_in_progress() -> bool:
             if session is None:
@@ -280,11 +280,10 @@ class DuplexSessionRunnerMixin:
             *,
             final: bool,
             precreate_response: bool = False,
-            pcm_reservation: MiniCPMO45PcmAppendReservation | None = None,
+            pcm_reservation: PcmAppendReservation | None = None,
             operation_id: str | None = None,
             retained_committed_payload: dict[str, object] | None = None,
         ) -> asyncio.Task[bool] | None:
-            nonlocal native_append_tail
             if session is None:
                 return
             append_epoch = session.epoch
@@ -412,7 +411,7 @@ class DuplexSessionRunnerMixin:
                     return False
                 return await _run()
 
-            predecessor = native_append_tail
+            predecessor = actor.native_append_tail
             if predecessor is not None and predecessor.done():
                 try:
                     predecessor_ok = predecessor.result()
@@ -424,7 +423,7 @@ class DuplexSessionRunnerMixin:
                     # is an explicit retry and starts a new chain.
                     predecessor = None
             task = asyncio.create_task(_run_in_wire_order(predecessor))
-            native_append_tail = task
+            actor.native_append_tail = task
             actor.track_append_task(
                 task,
                 epoch=append_epoch,
@@ -438,7 +437,7 @@ class DuplexSessionRunnerMixin:
             return task
 
         async def wait_for_native_append_tail() -> bool:
-            predecessor = native_append_tail
+            predecessor = actor.native_append_tail
             if predecessor is None:
                 return True
             try:
@@ -461,7 +460,7 @@ class DuplexSessionRunnerMixin:
         ) -> None:
             """Schedule non-native runtime appends without blocking WS input.
 
-            Native MiniCPM-o appends use ``start_native_append`` because they can
+            Model-native appends use ``start_native_append`` because they can
             create data-plane response streams. Generic runtime appends still
             need the same control-plane isolation so cancel/close can preempt a
             slow engine append.
@@ -514,7 +513,7 @@ class DuplexSessionRunnerMixin:
                 return
             session = handshake.session
             if handshake.resumed:
-                native = self._minicpmo_sessions[session.session_id]
+                native = self._serving_runtime_adapter.session_states[session.session_id]
                 actor.tasks = self._session_tasks[session.session_id]
                 persisted_protocol = self._realtime_protocols.get(session.session_id)
                 if persisted_protocol is None:
@@ -528,7 +527,7 @@ class DuplexSessionRunnerMixin:
                 self._ensure_lifecycle_listener()
                 reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
             else:
-                self._minicpmo_sessions[session.session_id] = native
+                self._serving_runtime_adapter.session_states[session.session_id] = native
                 self._session_tasks[session.session_id] = actor.tasks
                 if realtime_protocol is not None:
                     self._realtime_protocols[session.session_id] = realtime_protocol
@@ -570,6 +569,9 @@ class DuplexSessionRunnerMixin:
             while True:
                 event = await next_actor_event()
                 event_type = event.get("type")
+
+                if event_type == "__replaced_attachment__":
+                    return
 
                 if event_type == "__timeout__":
                     begin_close("timeout")
@@ -675,7 +677,7 @@ class DuplexSessionRunnerMixin:
                         )
                     continue
 
-                if event_type in {"turn.signal", "signal_turn"} and event.get("event") in {
+                if event_type == "turn.signal" and event.get("event") in {
                     "input.cancel",
                     "response.cancel",
                     "barge_in",
@@ -687,7 +689,7 @@ class DuplexSessionRunnerMixin:
                     event = normalized_event
                     event_type = str(event["type"])
 
-                if event_type in {"session.close", "close_session"}:
+                if event_type == "session.close":
                     with suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(actor.output_queue.join(), timeout=1.0)
                     begin_close("session_close")
@@ -902,7 +904,7 @@ class DuplexSessionRunnerMixin:
                     actor.active_response_task = None
                     continue
 
-                if event_type in {"turn.signal", "signal_turn"}:
+                if event_type == "turn.signal":
                     turn_event = event.get("event")
                     if isinstance(turn_event, str):
                         if turn_event == "barge_in" and not session.capabilities.supports_barge_in:
@@ -1017,11 +1019,11 @@ class DuplexSessionRunnerMixin:
                         await emit_event({"type": "error", "error": "turn.signal requires event", "code": "bad_event"})
                     continue
 
-                if event_type in {"playback.ack", "audio.playback_ack"}:
+                if event_type == "playback.ack":
                     await self._handle_playback_ack(session, event, emit_event)
                     continue
 
-                if event_type in {"input.text.append", "input_text.append", "push_text"}:
+                if event_type == "input.text.append":
                     session.mark_user_input_activity()
                     text = event.get("text")
                     if not isinstance(text, str):
@@ -1037,7 +1039,7 @@ class DuplexSessionRunnerMixin:
                         await emit_event(
                             {
                                 "type": "error",
-                                "error": "MiniCPM-o native duplex currently accepts audio append only",
+                                "error": "The selected native duplex runtime accepts audio append only",
                                 "code": "native_text_append_unsupported",
                             }
                         )
@@ -1048,7 +1050,7 @@ class DuplexSessionRunnerMixin:
                         await start_runtime_append(text, final=False, mode="append_tokens")
                     continue
 
-                if event_type in {"input.audio.append", "input_audio_buffer.append", "push_chunk"}:
+                if event_type == "input_audio_buffer.append":
                     session.mark_user_input_activity()
                     audio = event.get("audio") or event.get("data")
                     if not isinstance(audio, str):
@@ -1072,19 +1074,19 @@ class DuplexSessionRunnerMixin:
                                 "cancel",
                             }:
                                 event.pop(key, None)
-                    if event_type == "input_audio_buffer.append":
-                        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
-                        default_sample_rate_hz = 16000
-                    else:
-                        fmt = event.get("format") if isinstance(event.get("format"), str) else "wav"
-                        default_sample_rate_hz = None
+                    fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
+                    default_sample_rate_hz = 16000
                     sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
-                    sample_rate_hz = int(sr_raw) if isinstance(sr_raw, int | float) else default_sample_rate_hz
-                    audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
-                        audio,
-                        fmt,
-                        sample_rate_hz=sample_rate_hz,
-                    )
+                    sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else default_sample_rate_hz
+                    try:
+                        audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+                            audio,
+                            fmt,
+                            sample_rate_hz=sample_rate_hz,
+                        )
+                    except ValueError as exc:
+                        await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
+                        continue
                     if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
                         await emit_event(
                             {
@@ -1389,7 +1391,7 @@ class DuplexSessionRunnerMixin:
                             response_options_error = self._apply_response_create_options(session, response_payload)
                             if response_options_error is not None:
                                 error_message = (
-                                    "MiniCPM-o native duplex response.create does not support generation "
+                                    "The selected native duplex runtime does not support generation "
                                     "overrides for instructions, voice, temperature, max tokens, tools, or "
                                     "tool_choice."
                                     if response_options_error == "unsupported_native_response_options"
@@ -1613,7 +1615,7 @@ class DuplexSessionRunnerMixin:
                                 "session_id": session.session_id,
                                 "epoch": session.epoch,
                                 "code": "response_create_without_input",
-                                "error": "MiniCPM-o native duplex response.create requires committed audio input.",
+                                "error": "Native duplex response.create requires committed audio input.",
                             }
                         )
                         session.discard_response_options()
@@ -1791,7 +1793,9 @@ class DuplexSessionRunnerMixin:
                     reader_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await reader_task
-                session.clear_pending_turn_reservations()
+                while pending_turn_reservations > 0:
+                    session.release_pending_turn()
+                    pending_turn_reservations -= 1
                 resumable_detach = (
                     transport_detached
                     and runtime_opened

@@ -97,7 +97,8 @@ class DuplexCapabilities:
     target_barge_in_latency_ms: int | None = 1000
 
     @classmethod
-    def minicpmo45_native(cls) -> DuplexCapabilities:
+    def minicpmo45_native(cls, *, max_sessions: int = 1) -> DuplexCapabilities:
+        supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
             supports_barge_in=False,
@@ -114,11 +115,11 @@ class DuplexCapabilities:
             supports_stage_connector_handoff=True,
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
-            supports_multi_session=True,
-            supports_multi_session_same_replica=True,
+            supports_multi_session=supports_multi_session,
+            supports_multi_session_same_replica=supports_multi_session,
             supports_session_lease=True,
             supports_session_resume=True,
-            session_admission_mode="scheduler_managed",
+            session_admission_mode="engine_managed",
             supports_audio_truncate=True,
             requires_model_runner_kv=True,
             requires_native_stage_role=True,
@@ -390,6 +391,9 @@ class ResponseState:
     pending_options: ResponseCreateOptions | None = None
     active_options: ResponseCreateOptions | None = None
     active_config: DuplexSessionConfig | None = None
+    stage_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
+    stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
+    stage_metric_tpot_weight: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -509,18 +513,8 @@ class DuplexSession:
         return MappingProxyType({key: dict(value) for key, value in self._conversation.item_ids.items()})
 
     @property
-    def history_item_audio_text_marks(self) -> Mapping[str, tuple[DuplexAssistantAudioTextMark, ...]]:
-        return MappingProxyType({key: tuple(value) for key, value in self._conversation.item_audio_text_marks.items()})
-
-    @property
     def pending_history_item_ids(self) -> Mapping[str, dict[str, object]]:
         return MappingProxyType({key: dict(value) for key, value in self._conversation.pending_item_ids.items()})
-
-    @property
-    def pending_history_item_audio_text_marks(self) -> Mapping[str, tuple[DuplexAssistantAudioTextMark, ...]]:
-        return MappingProxyType(
-            {key: tuple(value) for key, value in self._conversation.pending_item_audio_text_marks.items()}
-        )
 
     @property
     def pending_history_truncations_ms(self) -> Mapping[str, int]:
@@ -729,12 +723,99 @@ class DuplexSession:
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
+        self._clear_response_metrics()
         self._conversation.last_assistant_full_message = None
         self._conversation.last_assistant_audio_text_marks.clear()
         self._playback.current = DuplexPlaybackCursor()
         self._playback.by_response[response_id] = self._playback.current
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
         return response_id
+
+    def _clear_response_metrics(self) -> None:
+        self._response.stage_metrics.clear()
+        self._response.stage_metric_tpot_weighted_ms.clear()
+        self._response.stage_metric_tpot_weight.clear()
+
+    def accumulate_response_stage_metrics(
+        self,
+        stage_metrics: Mapping[object, object] | None,
+    ) -> dict[str, dict[str, object]]:
+        if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
+            return copy.deepcopy(self._response.stage_metrics)
+
+        additive_fields = (
+            "num_tokens_in",
+            "num_tokens_out",
+            "stage_gen_time_ms",
+            "postprocess_time_ms",
+            "audio_generated_frames",
+            "audio_duration_s",
+            "image_pixels",
+            "output_unit_count",
+        )
+        first_positive_fields = (
+            "serving_time_to_first_output_ms",
+            "vllm_ttft_ms",
+        )
+        interval_fields = (
+            ("inter_output_latencies_ms", "inter_output_latency_ms"),
+            ("vllm_itls_ms", "vllm_itl_ms"),
+        )
+        handled_fields = {
+            *additive_fields,
+            *first_positive_fields,
+            "vllm_tpot_ms",
+            *(name for pair in interval_fields for name in pair),
+        }
+
+        for raw_stage_id, raw_values in stage_metrics.items():
+            if not isinstance(raw_values, Mapping):
+                continue
+            stage_id = str(raw_stage_id)
+            current = self._response.stage_metrics.setdefault(stage_id, {})
+            for name in additive_fields:
+                value = raw_values.get(name)
+                if isinstance(value, int | float) and not isinstance(value, bool):
+                    current[name] = current.get(name, 0) + value
+            for name in first_positive_fields:
+                value = raw_values.get(name)
+                current_value = current.get(name)
+                if (
+                    isinstance(value, int | float)
+                    and not isinstance(value, bool)
+                    and value > 0
+                    and not (isinstance(current_value, int | float) and current_value > 0)
+                ):
+                    current[name] = value
+            for list_name, mean_name in interval_fields:
+                values = raw_values.get(list_name)
+                if isinstance(values, list):
+                    combined = list(current.get(list_name, []))
+                    combined.extend(
+                        value for value in values if isinstance(value, int | float) and not isinstance(value, bool)
+                    )
+                    current[list_name] = combined
+                    current[mean_name] = sum(combined) / len(combined) if combined else 0.0
+
+            tpot_ms = raw_values.get("vllm_tpot_ms")
+            token_count = raw_values.get("num_tokens_out")
+            if isinstance(tpot_ms, int | float) and tpot_ms > 0:
+                weight = max(int(token_count) - 1, 1) if isinstance(token_count, int | float) else 1
+                self._response.stage_metric_tpot_weighted_ms[stage_id] = (
+                    self._response.stage_metric_tpot_weighted_ms.get(stage_id, 0.0) + float(tpot_ms) * weight
+                )
+                self._response.stage_metric_tpot_weight[stage_id] = (
+                    self._response.stage_metric_tpot_weight.get(stage_id, 0) + weight
+                )
+                current["vllm_tpot_ms"] = self._response.stage_metric_tpot_weighted_ms[stage_id] / float(
+                    self._response.stage_metric_tpot_weight[stage_id]
+                )
+
+            for name, value in raw_values.items():
+                if name not in handled_fields:
+                    current[str(name)] = copy.deepcopy(value)
+
+        return copy.deepcopy(self._response.stage_metrics)
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
         self._input.overlap_speech_ms += max(0, int(duration_ms))
@@ -855,6 +936,7 @@ class DuplexSession:
             self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()
         return message
@@ -1111,6 +1193,7 @@ class DuplexSession:
         self._response.active_request_id = None
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
+        self._clear_response_metrics()
         self._restore_response_config()
         self.turn_state = DuplexTurnState.BARGE_IN
         return self.epoch
@@ -1123,6 +1206,7 @@ class DuplexSession:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
+        self._clear_response_metrics()
         self._restore_response_config()
 
     def as_public_dict(self) -> dict[str, object]:

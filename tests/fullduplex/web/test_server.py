@@ -1,8 +1,11 @@
 import hashlib
 
+import pytest
 from fastapi.testclient import TestClient
 
 from vllm_omni.experimental.fullduplex.web.server import STATIC_DIR, _join_ws_url, build_app
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_join_ws_url_preserves_realtime_query():

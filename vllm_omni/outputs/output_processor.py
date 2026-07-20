@@ -19,101 +19,14 @@ from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
-from vllm_omni.outputs.output_modality import (
-    DRAINABLE_MODALITIES,
-    OutputModality,
-    get_accumulation_strategy,
+from vllm_omni.outputs.multimodal_accumulation import (
+    drain_delta_payload,
+    is_non_final_delta_audio_chunk,
+    replace_snapshot_keys,
 )
+from vllm_omni.outputs.output_modality import OutputModality, get_accumulation_strategy
 
 logger = init_logger(__name__)
-
-_CHUNK_MM_METADATA_KEYS: frozenset[str] = frozenset(
-    {
-        "audio_text_total_chars",
-        "duplex_epoch",
-        "duplex_turn_id",
-        "llm_output_text",
-        "llm_output_text_utf8",
-        "sample_rate",
-        "sample_rate_hz",
-        "sr",
-        "text",
-        "tts_is_last_chunk",
-    }
-)
-
-
-def _is_chunk_mm_metadata_key(key: str) -> bool:
-    if key.startswith("meta."):
-        return key.split(".", 1)[1] in _CHUNK_MM_METADATA_KEYS
-    return key in _CHUNK_MM_METADATA_KEYS
-
-
-def _replace_snapshot_keys(
-    accumulated: MultimodalPayload,
-    incoming: MultimodalPayload,
-) -> None:
-    """Keep per-chunk metadata and prompt snapshots as latest-value state."""
-    for key in (*incoming.tensors, *incoming.metadata):
-        if key == "duplex_prompt_token_ids" or _is_chunk_mm_metadata_key(key):
-            accumulated.tensors.pop(key, None)
-            accumulated.metadata.pop(key, None)
-
-
-def _drain_delta_multimodal_payload(payload: MultimodalPayload) -> None:
-    for modality_key in DRAINABLE_MODALITIES:
-        key = str(modality_key)
-        payload.tensors.pop(key, None)
-        payload.metadata.pop(key, None)
-
-    for metadata_key in _CHUNK_MM_METADATA_KEYS:
-        flat_key = f"meta.{metadata_key}"
-        payload.tensors.pop(flat_key, None)
-        payload.metadata.pop(flat_key, None)
-
-    meta = payload.metadata.get("meta")
-    if isinstance(meta, dict):
-        filtered = {key: value for key, value in meta.items() if key not in _CHUNK_MM_METADATA_KEYS}
-        if filtered:
-            payload.metadata["meta"] = filtered
-        else:
-            payload.metadata.pop("meta", None)
-
-
-def _payload_meta_value(payload: MultimodalPayload, key: str) -> Any:
-    flat_key = f"meta.{key}"
-    if flat_key in payload.tensors:
-        return payload.tensors[flat_key]
-    if flat_key in payload.metadata:
-        return payload.metadata[flat_key]
-    meta = payload.metadata.get("meta")
-    if isinstance(meta, dict):
-        return meta.get(key)
-    return None
-
-
-def _last_scalar_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool | int):
-        return int(value)
-    if isinstance(value, list | tuple):
-        return _last_scalar_int(value[-1]) if value else None
-    if isinstance(value, torch.Tensor):
-        try:
-            if value.numel() == 0:
-                return None
-            return int(value.detach().cpu().reshape(-1)[-1].item())
-        except (RuntimeError, TypeError, ValueError):
-            return None
-    return None
-
-
-def _is_non_final_delta_audio_chunk(payload: MultimodalPayload, mm_type: str | None) -> bool:
-    if str(mm_type or "").lower() != "audio" and "audio" not in payload:
-        return False
-    return _last_scalar_int(_payload_meta_value(payload, "tts_is_last_chunk")) == 0
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -140,6 +53,14 @@ def _modality_to_type_string(modality: OutputModality) -> str:
         if "latent" in lowered:
             return "latent"
     return "text"
+
+
+def _mean_time_per_output_token_ms(stats: RequestStateStats) -> float:
+    output_intervals = stats.num_generation_tokens - 1
+    if output_intervals <= 0:
+        return 0.0
+    decode_time_s = max(stats.last_token_ts - stats.first_token_ts, 0.0)
+    return decode_time_s * 1000.0 / float(output_intervals)
 
 
 class OmniRequestState(RequestState):
@@ -172,7 +93,7 @@ class OmniRequestState(RequestState):
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
-        self.native_text_stats.arrival_time = update.arrival_time
+        self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         """Accumulate a multimodal tensor payload into the request state.
@@ -191,7 +112,7 @@ class OmniRequestState(RequestState):
 
             incoming = MultimodalPayload.from_raw(payload, modality_key)
             if incoming is not None:
-                _replace_snapshot_keys(self.mm_accumulated, incoming)
+                replace_snapshot_keys(self.mm_accumulated, incoming)
                 self.mm_accumulated = self.mm_accumulated.merged_with(incoming)
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
@@ -259,11 +180,7 @@ class OmniRequestState(RequestState):
             )
 
         is_delta = self.output_kind == RequestOutputKind.DELTA
-        if (
-            is_delta
-            and finish_reason is not None
-            and _is_non_final_delta_audio_chunk(self.mm_accumulated, self.mm_type)
-        ):
+        if is_delta and finish_reason is not None and is_non_final_delta_audio_chunk(self.mm_accumulated, self.mm_type):
             finish_reason = None
             stop_reason = None
 
@@ -379,7 +296,7 @@ class OmniRequestState(RequestState):
                 # step only sees freshly accumulated data for those keys and
                 # their client-facing per-chunk metadata.
                 if self.output_kind == RequestOutputKind.DELTA:
-                    _drain_delta_multimodal_payload(self.mm_accumulated)
+                    drain_delta_payload(self.mm_accumulated)
 
                 return output
         except (RuntimeError, TypeError, AttributeError):
@@ -487,6 +404,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         return self._native_text_metrics_by_request.setdefault(
             request_id,
             {
+                "num_generation_tokens": 0,
                 "vllm_ttft_ms": 0.0,
                 "vllm_tpot_ms": 0.0,
                 "vllm_itl_ms": 0.0,
@@ -688,6 +606,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state.lora_name,
         )
         record = self._native_text_metric_record(req_state.external_req_id)
+        record["num_generation_tokens"] = int(native_stats.num_generation_tokens)
         if was_prefilling:
             record["vllm_ttft_ms"] = max(float(native_stats.first_token_latency) * 1000.0, 0.0)
             return
@@ -697,6 +616,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             itls_ms = record.setdefault("vllm_itls_ms", [])
             itls_ms.append(itl_ms)
             record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
+        record["vllm_tpot_ms"] = _mean_time_per_output_token_ms(native_stats)
 
     def _update_stats_from_finished(
         self,

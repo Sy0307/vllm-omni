@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import importlib.util
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -8,9 +10,11 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-DEMO_PATH = Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/minicpmo_realtime_duplex_scenarios.py"
 MULTI_DEMO_PATH = (
-    Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_duplex_multi_session_e2e.py"
+    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py"
 )
 
 
@@ -30,6 +34,19 @@ def _load_multi_demo_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_realtime_duplex_multi_session_script_is_directly_executable():
+    result = subprocess.run(
+        [sys.executable, str(MULTI_DEMO_PATH), "--help"],
+        cwd=MULTI_DEMO_PATH.parents[3],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():
@@ -56,6 +73,16 @@ def test_realtime_duplex_multi_session_rejects_cross_session_response_identity()
             {"completed_response_ids": ["resp-shared"]},
             {"completed_response_ids": ["resp-shared"]},
         ]
+    )
+
+
+def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
+    demo = _load_multi_demo_module()
+
+    assert demo._event_session_id({"type": "session.heartbeat_ack", "session_id": "sid"}) == "sid"
+    assert (
+        demo._event_session_id({"type": "session.closed", "event": {"type": "session.closed", "session_id": "sid"}})
+        == "sid"
     )
 
 
@@ -116,6 +143,40 @@ def test_realtime_duplex_demo_session_update_uses_explicit_session_id():
     assert event["session"]["extra_body"]["minicpmo45_native_duplex"] is True
 
 
+def test_realtime_duplex_demo_response_required_uses_deterministic_sampling():
+    demo = _load_demo_module()
+
+    event = demo._session_update_event(
+        SimpleNamespace(
+            model="openbmb/MiniCPM-o-4_5",
+            output_audio_format="pcm16",
+            short_ack_ms=1200,
+            session_id=None,
+            validation_mode="response-required",
+            temperature=None,
+        )
+    )
+
+    assert event["session"]["temperature"] == 0.0
+
+
+def test_realtime_duplex_demo_model_policy_preserves_default_sampling():
+    demo = _load_demo_module()
+
+    event = demo._session_update_event(
+        SimpleNamespace(
+            model="openbmb/MiniCPM-o-4_5",
+            output_audio_format="pcm16",
+            short_ack_ms=1200,
+            session_id=None,
+            validation_mode="model-policy",
+            temperature=None,
+        )
+    )
+
+    assert "temperature" not in event["session"]
+
+
 def test_realtime_duplex_demo_resolves_explicit_turn_durations():
     demo = _load_demo_module()
 
@@ -156,6 +217,47 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
     assert state.response_playback_sent_ms("resp-1") == 27920
 
 
+def test_realtime_duplex_demo_partitions_timing_by_response_identity():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    for response_id, created_at_s, audio_at_s, token_count in (
+        ("resp-1", 10.0, 10.1, 3),
+        ("resp-2", 20.0, 20.2, 5),
+    ):
+        state.add(
+            {"type": "response.created", "response": {"id": response_id}},
+            received_at_s=created_at_s,
+        )
+        state.add(
+            {
+                "type": "response.audio.delta",
+                "response_id": response_id,
+                "delta": base64.b64encode(b"audio").decode("ascii"),
+                "metadata": {
+                    "audio_duration_ms": 80,
+                    "vllm_omni": {
+                        "stage_metrics": {
+                            "0": {
+                                "num_tokens_out": token_count,
+                                "vllm_itls_ms": [10.0],
+                            }
+                        }
+                    },
+                },
+            },
+            received_at_s=audio_at_s,
+        )
+
+    timings = state.response_timing_summaries()
+
+    assert timings["resp-1"]["stage0_tokens"]["output_token_count"] == 3
+    assert timings["resp-1"]["audio_output"]["response_created_to_first_audio_ms"] == 100.0
+    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-2"]["stage0_tokens"]["output_token_count"] == 5
+    assert timings["resp-2"]["audio_output"]["response_created_to_first_audio_ms"] == 200.0
+    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] is None
+
+
 def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():
     demo = _load_demo_module()
     state = demo.DemoState()
@@ -191,6 +293,28 @@ def test_realtime_duplex_demo_model_policy_accepts_continuous_input_without_comm
 
     assert not state.model_policy_event_order_ok(expected_turns=3)
     assert state.model_policy_event_order_ok(expected_turns=3, require_input_commit=False)
+
+
+def test_realtime_duplex_demo_accepts_overlap_unit_terminating_continuous_response():
+    demo = _load_demo_module()
+    state = demo.DemoState()
+    state.add({"type": "response.created", "response_id": "resp-1"})
+    state.add({"type": "response.done", "response_id": "resp-1"})
+
+    assert demo._continuous_overlap_terminal_is_outcome(
+        state,
+        validation_mode="model-policy",
+        model_unit_ready_while_active=True,
+        before_created=1,
+        before_model_listen=0,
+    )
+    assert not demo._continuous_overlap_terminal_is_outcome(
+        state,
+        validation_mode="response-required",
+        model_unit_ready_while_active=True,
+        before_created=1,
+        before_model_listen=0,
+    )
 
 
 def test_realtime_duplex_demo_full_turn_duration_does_not_slice_audio():
@@ -883,6 +1007,7 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
             send_transcript_hint=False,
             realtime_input=True,
             model_policy_settle_s=0.01,
+            validation_mode="response-required",
             silence_ms=1000,
         )
     )

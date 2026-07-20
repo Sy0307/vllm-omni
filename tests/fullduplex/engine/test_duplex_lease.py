@@ -7,12 +7,15 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from vllm_omni.engine.duplex_lease import (
+from vllm_omni.experimental.fullduplex.engine.duplex_lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
 )
-from vllm_omni.engine.duplex_session import DuplexSessionRuntimeManager
-from vllm_omni.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import DuplexInputMode
+from vllm_omni.experimental.fullduplex.engine.duplex_session import DuplexSessionRuntimeManager
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class FakeMonotonicClock:
@@ -51,7 +54,9 @@ def test_open_touch_detach_and_idle_expiry_use_monotonic_time() -> None:
     expired = manager.collect_expired()
 
     assert [item.session_id for item in expired] == ["sid-expiry"]
-    assert expired[0].reason == "idle_ttl_expired"
+    assert expired[0].reason == "disconnect_grace_expired"
+    assert manager.get("sid-expiry") is session
+    manager.finalize_close_session(session)
     assert manager.get("sid-expiry") is None
 
 
@@ -157,6 +162,49 @@ def test_disabled_idle_expiry_never_collects_session() -> None:
     clock.advance(1_000_000.0)
 
     assert manager.collect_expired() == []
+
+
+def test_detached_session_expires_at_disconnect_grace_when_idle_ttl_is_disabled() -> None:
+    clock = FakeMonotonicClock(0.0)
+    manager = DuplexSessionRuntimeManager(clock=clock)
+    fence = DuplexFence("sid-disconnect-grace")
+    session = manager.open_session(fence, lease_config=_lease_config(idle_ttl_s=None))
+
+    session.detach(fence)
+    clock.advance(29.0)
+    assert manager.collect_expired() == []
+
+    clock.advance(1.0)
+    expired = manager.collect_expired()
+
+    assert [item.session_id for item in expired] == [fence.session_id]
+    assert expired[0].reason == "disconnect_grace_expired"
+
+
+def test_runtime_manager_enforces_server_owned_session_admission() -> None:
+    manager = DuplexSessionRuntimeManager(max_sessions=2)
+    manager.open_session(DuplexFence("sid-admission-a"))
+    manager.open_session(DuplexFence("sid-admission-b"))
+
+    with pytest.raises(RuntimeError, match="duplex_session_capacity_exhausted"):
+        manager.open_session(DuplexFence("sid-admission-c"))
+
+
+def test_completed_append_cache_is_bounded() -> None:
+    manager = DuplexSessionRuntimeManager(completed_append_limit=2)
+    fence = DuplexFence("sid-completed-cache")
+    session = manager.open_session(fence)
+
+    for index in range(3):
+        session.record_completed_append(
+            f"operation-{index}",
+            fence=fence,
+            mode=DuplexInputMode.TURN_COMMIT_ONLY,
+            final=True,
+            stage_results=[{"index": index}],
+        )
+
+    assert list(session.completed_appends) == ["operation-1", "operation-2"]
 
 
 def test_lease_config_and_expiry_record_are_immutable() -> None:

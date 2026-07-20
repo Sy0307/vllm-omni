@@ -269,10 +269,6 @@ class DuplexSessionAttachmentRegistry:
                 resume_token=token,
             )
 
-    async def record_event(self, session_id: str, payload: Mapping[str, object]) -> JournalEntry:
-        async with self._lock:
-            return self._require(session_id).journal.record(payload)
-
     async def send_event(
         self,
         session_id: str,
@@ -329,6 +325,15 @@ class DuplexSessionAttachmentRegistry:
                 else None
             )
             return True
+
+    async def is_current_attachment(self, session_id: str, attachment_generation: int) -> bool:
+        async with self._lock:
+            state = self._sessions.get(session_id)
+            return (
+                state is not None
+                and state.attachment is not None
+                and state.attachment_generation == attachment_generation
+            )
 
     async def authenticate_resume(
         self,

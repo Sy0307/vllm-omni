@@ -95,10 +95,20 @@ or persistent KV lease. The browser continuously uploads PCM while unmuted,
 including during assistant playback; it does not run VAD or generate
 `input_audio_buffer.commit`. MiniCPM owns listen/speak progression at model-unit
 boundaries. This is not a deterministic VAD-triggered barge-in guarantee, and
-the checkpoint does not advertise production multi-session concurrency. See
+the checked-in duplex profile is validated only for its server-owned limit of
+two concurrent sessions, not production-scale fairness or arbitrary capacity.
+See
 [`docs/design/minicpmo45_duplex_runtime_architecture.md`](../../../docs/design/minicpmo45_duplex_runtime_architecture.md)
 for the active runtime path, lifecycle invariants, capability boundary, and
 validation scope.
+
+Fresh response-scoped H20 measurements put engine Stage0 TTFT at approximately
+31-310 ms, TPOT at 15-21 ms, ITL p95 at 16-33 ms, explicit input-commit to first
+audio at 387-1033 ms, and maximum client-observed audio chunk gaps at 388-1316
+ms. These small warm-state-sensitive samples are not SLOs, and the slowest
+first-audio result does not meet a 200 ms target. The demo reports
+`response_created_to_first_audio_ms` and `commit_to_first_audio_ms` separately;
+do not call the former end-to-end TTFP or infer TPOT from transcript deltas.
 
 ### Stage-based CLI (optional)
 
@@ -204,10 +214,10 @@ template appends `<|tts_bos|>`. For **curl**, put that field at the request
 root; nested `extra_body` is ignored. The OpenAI Python SDK may use
 `extra_body` because it merges those fields into the root.
 
-## 3. Run the Realtime duplex scenario demo
+## 3. Run the Realtime duplex demo
 
-After the server is running, use the scenario client to validate the native
-duplex semantics end to end:
+After the server is running, the user-facing demo streams one WAV, accepts the
+model-owned speak or listen decision, and writes the received events and audio:
 
 ```bash
 python examples/online_serving/minicpmo/realtime_duplex_demo.py \
@@ -217,13 +227,35 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 
-The script streams sequential clean speech turns and relies on `auto_response`;
-it never sends `response.create` or a serving-side barge-in signal. Pass a
-different `--turn-input-wav` for each later turn and use
-`--require-distinct-inputs` to reject repeated audio content and cross-turn
-transcript tail reuse. It fails on incomplete response/audio lifecycle events,
-stale output, cancellation, transcript delta/done mismatch, or missing audio
-when `--require-audio` is set.
+The demo relies on `auto_response`; it never sends `response.create` or a
+serving-side barge-in signal. Reusable WebSocket, PCM, and event collection
+helpers live in `vllm_omni.experimental.fullduplex.client`.
+
+Strict lifecycle and scenario validation is kept with the E2E suite:
+
+```bash
+python tests/e2e/online_serving/minicpmo_realtime_duplex_scenarios.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-wav /path/to/turn-1.wav \
+    --turn-input-wav /path/to/turn-2.wav \
+    --turn-input-wav /path/to/turn-3.wav \
+    --turns 3 --require-distinct-inputs --require-audio
+
+python tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-wav /path/to/fallback_16k_mono_pcm16.wav \
+    --session-input-wav /path/to/session-a.wav \
+    --session-input-wav /path/to/session-b.wav \
+    --session-expected-token expected-a \
+    --session-expected-token expected-b \
+    --sessions 2
+```
+
+The strict runner checks event ordering, transcript delta/done integrity,
+stale output, overlap, playback/history acknowledgement, response cardinality,
+session identity and semantic isolation, disconnect/resume, and expiry behavior.
 
 ## 4. Open the experimental browser client
 

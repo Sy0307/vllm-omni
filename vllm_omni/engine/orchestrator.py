@@ -15,7 +15,7 @@ import asyncio
 import time as _time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import janus
 import torch
@@ -31,29 +31,25 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.engine.duplex_control_plane import (
-    DuplexControlPlane,
+from vllm_omni.engine.duplex_contracts import (
+    DuplexControlPlanePort,
+    DuplexOutputAction,
     DuplexOutputContext,
+    DuplexOutputDecision,
     DuplexRequestIdentity,
+    DuplexRuntimeExtension,
     DuplexStageRequestContext,
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
 )
 from vllm_omni.engine.duplex_lease import DuplexLeaseConfig
-from vllm_omni.engine.duplex_runtime import (
-    DuplexOutputAction,
-    DuplexOutputDecision,
-    DuplexRuntimeExtension,
-    DuplexSessionRuntimeManager,
-    DuplexSessionRuntimeState,
-)
-from vllm_omni.engine.duplex_types import DuplexFence
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
+    DuplexFence,
     EngineQueueMessage,
     ErrorMessage,
     OutputMessage,
@@ -72,6 +68,12 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.experimental.fullduplex.engine.duplex_session import (
+        DuplexSessionRuntimeManager,
+        DuplexSessionRuntimeState,
+    )
 
 
 def _build_terminal_empty_output(
@@ -381,7 +383,7 @@ class Orchestrator:
             replica_sampler=self._sample_replica_metrics,
         )
         for stage_id, pool in enumerate(self.stage_pools):
-            for replica_id in pool.live_replica_ids():
+            for replica_id in pool.available_replica_ids():
                 self._orch_monitor.register_replica(stage_id, replica_id)
 
         # PD disaggregation state
@@ -399,10 +401,12 @@ class Orchestrator:
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
 
-        self.duplex_control_plane: DuplexControlPlane | None = None
+        self.duplex_control_plane: DuplexControlPlanePort | None = None
         runtime_session_config = duplex_session_config or DuplexSessionRuntimeConfig()
         self._duplex_reaper_interval_s = runtime_session_config.reaper_interval_s
         if enable_duplex_control:
+            from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
+
             self.duplex_control_plane = DuplexControlPlane(
                 extension=duplex_runtime_extension,
                 stage_port=_OrchestratorDuplexStagePort(
@@ -417,6 +421,8 @@ class Orchestrator:
                     idle_ttl_s=runtime_session_config.idle_ttl_s,
                     disconnect_grace_s=runtime_session_config.disconnect_grace_s,
                 ),
+                max_sessions=runtime_session_config.max_sessions,
+                completed_append_limit=runtime_session_config.completed_append_cache_size,
             )
 
         self._shutdown_event = asyncio.Event()
@@ -498,7 +504,7 @@ class Orchestrator:
             raise RuntimeError("duplex control plane is disabled")
         return self.duplex_control_plane.sessions
 
-    def _require_duplex_control_plane(self) -> DuplexControlPlane:
+    def _require_duplex_control_plane(self) -> DuplexControlPlanePort:
         if self.duplex_control_plane is None:
             raise RuntimeError("duplex control plane is disabled")
         return self.duplex_control_plane
@@ -560,6 +566,8 @@ class Orchestrator:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+            if self.duplex_control_plane is not None:
+                await self.duplex_control_plane.shutdown()
 
             if self._fatal_error is not None:
                 await self._drain_pending_requests_on_fatal()
@@ -593,7 +601,7 @@ class Orchestrator:
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif self.duplex_control_plane is not None and self.duplex_control_plane.accepts(msg):
-                await self.duplex_control_plane.handle(msg)
+                self.duplex_control_plane.dispatch(msg)
             elif msg_type == "abort":
                 await self._handle_abort(msg)
             elif msg_type == "collective_rpc":
@@ -793,6 +801,7 @@ class Orchestrator:
             return
         for pool in self.stage_pools:
             await pool.abort_requests(request_ids)
+            pool.release_bindings(request_ids)
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -865,7 +874,7 @@ class Orchestrator:
             idle = True
             for stage_id in range(self.num_stages):
                 pool = self.stage_pools[stage_id]
-                for replica_id in pool.live_replica_ids():
+                for replica_id in pool.available_replica_ids():
                     if self._shutdown_event.is_set():
                         return
 
@@ -936,7 +945,10 @@ class Orchestrator:
                             )
                             affected_request_ids = pool.mark_replica_unavailable(replica_id)
                             closed_sessions = (
-                                self.duplex_control_plane.close_sessions_for_request_ids(affected_request_ids)
+                                self.duplex_control_plane.close_sessions_for_request_ids(
+                                    affected_request_ids,
+                                    abort=False,
+                                )
                                 if self.duplex_control_plane is not None
                                 else {}
                             )
@@ -1022,7 +1034,8 @@ class Orchestrator:
                 continue
 
             stage_metrics = None
-            if output.finished:
+            segment_finished = req_state.streaming.enabled and req_state.streaming.segment_finished
+            if output.finished or segment_finished:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
@@ -1069,8 +1082,14 @@ class Orchestrator:
             return
 
         cleanup_ids = list(dict.fromkeys(request_ids))
+        closing_session_ids: list[str] = []
         if close_duplex_sessions and self.duplex_control_plane is not None:
-            closed_sessions = self.duplex_control_plane.close_sessions_for_request_ids(cleanup_ids)
+            closed_sessions = self.duplex_control_plane.close_sessions_for_request_ids(
+                cleanup_ids,
+                abort=abort,
+                cleanup_in_progress=True,
+            )
+            closing_session_ids.extend(closed_sessions)
             for session_id, stale_request_ids in closed_sessions.items():
                 logger.info(
                     "[Orchestrator] closed duplex session %s while cleaning failed request ids %s",
@@ -1080,15 +1099,22 @@ class Orchestrator:
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
 
-        if abort:
-            await self._abort_request_ids(cleanup_ids)
-        self._release_request_bindings(cleanup_ids)
-        for request_id in cleanup_ids:
-            self._pd_kv_params.pop(request_id, None)
-            req_state = self.request_states.pop(request_id, None)
-            if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
-                self._running_counter.decrement()
-                req_state.running_counter_registered = False
+        try:
+            if abort:
+                await self._abort_request_ids(cleanup_ids)
+            self._release_request_bindings(cleanup_ids)
+            for request_id in cleanup_ids:
+                self._pd_kv_params.pop(request_id, None)
+                req_state = self.request_states.pop(request_id, None)
+                if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
+                    self._running_counter.decrement()
+                    req_state.running_counter_registered = False
+        except BaseException:
+            if closing_session_ids and self.duplex_control_plane is not None:
+                self.duplex_control_plane.defer_request_cleanups(closing_session_ids)
+            raise
+        if closing_session_ids and self.duplex_control_plane is not None:
+            self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -1175,7 +1201,6 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""Generic engine lease primitives shared by optional session runtimes."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
 
-from vllm_omni.engine.duplex_types import DuplexFence
+from vllm_omni.engine.messages import DuplexFence
 
 
 class DuplexLeaseActivity(str, Enum):

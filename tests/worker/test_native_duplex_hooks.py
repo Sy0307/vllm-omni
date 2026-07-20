@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import os
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -303,6 +305,54 @@ def test_minicpmo_model_cleans_incarnation_state_when_request_finishes():
     }
 
 
+def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+    from vllm_omni.utils.mm_outputs import to_payload_element
+
+    class _Thinker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("device_anchor", torch.zeros(1))
+
+        def forward(self, *, input_ids, **kwargs):
+            del kwargs
+            return torch.arange(input_ids.numel() * 4, dtype=torch.float32).reshape(input_ids.numel(), 4)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model.thinker = _Thinker()
+    output = model.forward(
+        input_ids=torch.tensor([1, 2, 3, 4]),
+        positions=torch.arange(4),
+        runtime_additional_information=[
+            {
+                "global_request_id": ["req-a"],
+                "duplex": {
+                    "duplex_prompt_token_ids": [101, 102],
+                    "special_token_ids": {"listen_token_id": 701},
+                },
+            },
+            {
+                "global_request_id": ["req-b"],
+                "duplex": {
+                    "duplex_prompt_token_ids": [201, 202, 203],
+                    "special_token_ids": {"listen_token_id": 702},
+                },
+            },
+        ],
+    )
+
+    prompt_rows = output.multimodal_outputs["duplex_prompt_token_ids"]
+    listen_rows = output.multimodal_outputs["meta"]["listen_token_id"]
+    assert to_payload_element(prompt_rows, 0, 0, 2).reshape(-1).tolist() == [101, 102]
+    assert to_payload_element(prompt_rows, 1, 2, 4).reshape(-1).tolist() == [201, 202, 203]
+    assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
+    assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
+
+
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
@@ -384,6 +434,75 @@ def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
     )
 
     assert int(output.multimodal_outputs["meta.turn_end"].item()) == 1
+
+
+def test_minicpmo_tts_routes_batched_requests_and_terminal_flags_independently():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Talker:
+        def __init__(self):
+            self.calls = []
+            self._ar_last_chunk_flags = [True]
+            self._ar_turn_end_flags = [False]
+            self._ar_last_emitted_text = ""
+
+        def __call__(self, **kwargs):
+            info = kwargs["additional_information"]
+            request_id = info["global_request_id"][0]
+            self.calls.append(request_id)
+            is_last = request_id == "req-b"
+            self._ar_last_chunk_flags = [is_last]
+            self._ar_turn_end_flags = [is_last]
+            self._ar_last_emitted_text = request_id
+            value = 1.0 if request_id == "req-a" else 2.0
+            return None, torch.full((2,), value, dtype=torch.float32)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "tts"
+    model.config = SimpleNamespace(hidden_size=4)
+    model.talker = _Talker()
+
+    output = model.forward(
+        input_ids=torch.zeros(3, dtype=torch.long),
+        positions=torch.zeros(3, dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "global_request_id": ["req-a"],
+                "native_duplex": True,
+                "duplex": {"epoch": 3, "turn_id": 7},
+                "meta": {"native_duplex_segment_text": "first"},
+            },
+            {
+                "global_request_id": ["req-idle"],
+                "native_duplex": True,
+                "duplex": {"epoch": 3, "turn_id": 9},
+                "meta": {"native_duplex_segment_text": "idle"},
+            },
+            {
+                "global_request_id": ["req-b"],
+                "native_duplex": True,
+                "duplex": {"epoch": 4, "turn_id": 8},
+                "meta": {"native_duplex_segment_text": "second"},
+            },
+        ],
+        request_token_spans=[(0, 2), (2, 2), (2, 3)],
+    )
+
+    assert model.talker.calls == ["req-a", "req-b"]
+    assert model.talker._ar_last_chunk_flags == [False, False, True]
+    assert model.talker._ar_turn_end_flags == [False, False, True]
+    assert output.multimodal_outputs["meta.req_id"] == ["req-a", "req-b"]
+    assert output.multimodal_outputs["meta.sparse_audio"] == ["1"]
+    assert [waveform.tolist() for waveform in output.multimodal_outputs["model_outputs"]] == [
+        [1.0, 1.0],
+        [2.0, 2.0],
+    ]
+    assert [int(value.item()) for value in output.multimodal_outputs["meta.tts_is_last_chunk"]] == [0, 1]
+    assert [int(value.item()) for value in output.multimodal_outputs["meta.turn_end"]] == [0, 1]
+    assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_epoch"]] == [3, 4]
+    assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_turn_id"]] == [7, 8]
 
 
 def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
@@ -1690,3 +1809,50 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
+
+
+def test_minicpmo_tts_ref_audio_lru_evicts_matching_vocoder_base_cache(tmp_path):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+        MiniCPMO45TTSRuntimeConfig,
+    )
+
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    model._runtime_config = MiniCPMO45TTSRuntimeConfig(ref_audio_file_cache_size=1)
+    model._t2w_base_caches = {}
+    model._token2wav_state_lock = threading.RLock()
+    first_path = model._write_ref_audio_prompt_wav(np.array([0.1, -0.1], dtype=np.float32), 16_000)
+    assert first_path is not None
+    model._t2w_base_caches[first_path] = (torch.tensor([1]), {"cache": torch.tensor([2])})
+
+    second_path = model._write_ref_audio_prompt_wav(np.array([0.2, -0.2], dtype=np.float32), 16_000)
+
+    assert second_path is not None
+    assert second_path != first_path
+    assert first_path not in model._t2w_base_caches
+    assert not os.path.exists(first_path)
+
+
+def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+        _TalkerTurnState,
+    )
+
+    prompt_path = tmp_path / "session-ref.wav"
+    prompt_path.write_bytes(b"wav")
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    model._talker_turn_states = {
+        "request": _TalkerTurnState(str(prompt_path), str(prompt_path)),
+    }
+    model._talker_consumed_tokens = {"request": 1}
+    model._talker_request_keys = {}
+    model._t2w_base_caches = {
+        str(prompt_path): (torch.tensor([1]), {"cache": torch.tensor([2])}),
+    }
+    model._token2wav_state_lock = threading.RLock()
+    model.audio_tokenizer = None
+
+    assert model._close_turn_state("request") is True
+    assert str(prompt_path) not in model._t2w_base_caches
+    assert not prompt_path.exists()
