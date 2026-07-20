@@ -12,13 +12,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    get_ep_all2all_manager,
+)
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import (
     BatchDescriptor,
+    ExecuteModelState,
     IntermediateTensors,
     get_uniform_token_count,
 )
@@ -29,11 +34,9 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     _async_copy_mm,
     _ensure_tensor_values,
-    _uses_async_output,
 )
 from vllm_omni.worker_v2.omni_model_runner import (
     OmniGPUModelRunner,
-    _make_execute_model_state,
 )
 
 logger = init_logger(__name__)
@@ -51,11 +54,13 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
         finalize_output: Any | None = None,
+        check_ep_fault: bool = False,
     ) -> None:
         self.model_runner_output = model_runner_output
         self.num_reqs = num_reqs
         self.finalize_output = finalize_output
         self.copy_event = torch.cuda.Event(blocking=True)
+        self._has_fault: torch.Tensor | None = None
 
         with torch.cuda.stream(copy_stream):
             copy_stream.wait_stream(main_stream)
@@ -65,10 +70,19 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
                 copy_stream=copy_stream,
                 pin_memory=PIN_MEMORY,
             )
+            if check_ep_fault:
+                has_fault = get_ep_all2all_manager().query_fault()
+                self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> OmniModelRunnerOutput:
         self.copy_event.synchronize()
+        if self._has_fault is not None and self._has_fault.item():
+            mask = get_ep_all2all_manager().query_active_mask()
+            raise RuntimeError(
+                "Fault detected in EP all2all communication: one or more ranks "
+                f"timed out during dispatch/combine. Mask: {mask.cpu().tolist()}"
+            )
         payloads = OmniGenerationModelRunner._build_pooler_output_from_cpu(
             self.multimodal_outputs_cpu,
             self.num_reqs,
@@ -93,7 +107,6 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         super().__init__(*args, **kwargs)
         self._gen_model_output: Any = None
         self._gen_input_batch: Any = None
-        self._gen_kv_connector_output: Any = None
         # Placeholder for ExecuteModelState.hidden_states — allocated
         # once and reused every step to avoid per-forward allocation.
         self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
@@ -160,7 +173,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 )
                 continue
 
-            self.model_state.intermediate_buffer.remove_request(req_idx)
+            self.model_state.remove_request(req_idx)
 
             # In-place update token state — same slot, no remove/re-add.
             # .np[] = direct write (no GPU buffer); stage_write = GPU-synced.
@@ -280,9 +293,14 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         }
         self._add_legacy_forward_inputs(model_inputs, input_batch)
 
+        eplb = getattr(self, "eplb", None)
+        if eplb is not None:
+            eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+
         batch_descriptor = BatchDescriptor(
             num_tokens=input_batch.num_tokens_after_padding,
             has_lora=self.lora_config is not None,
+            num_active_loras=batch_desc.num_active_loras,
         )
         with set_forward_context(
             attn_metadata,
@@ -291,11 +309,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             cudagraph_runtime_mode=batch_desc.cg_mode,
             batch_descriptor=batch_descriptor,
             slot_mapping=slot_mappings_by_layer,
+            is_padding=input_batch.is_padding,
         ):
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.model(**model_inputs)
-
-        kv_connector_output = self.kv_connector.post_forward(scheduler_output.finished_req_ids)
+            if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                assert self.cudagraph_manager is not None
+                model_output = self.cudagraph_manager.run_pw_graph(
+                    self.model,
+                    model_inputs,
+                )
+            else:
+                model_output = self.model(**model_inputs)
 
         # Convert raw model output to OmniOutput.
         if not isinstance(model_output, OmniOutput):
@@ -307,20 +331,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         self._gen_model_output = model_output
         self._gen_input_batch = input_batch
-        self._gen_kv_connector_output = kv_connector_output
 
         # ExecuteModelState is required by the upstream engine loop
         # (EngineCore checks execute_model_state is not None before
         # calling sample_tokens).
-        self.execute_model_state = _make_execute_model_state(
+        self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=None,
             slot_mappings_by_layer=None,
             hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
             finished_req_ids=scheduler_output.finished_req_ids,
-            kv_connector_output=kv_connector_output,
-            num_tokens_across_dp=None,
         )
         return None
 
@@ -335,15 +356,15 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | None:
         model_output = self._gen_model_output
         input_batch = self._gen_input_batch
-        kv_connector_output = self._gen_kv_connector_output
+        execute_model_state = self.execute_model_state
         self._gen_model_output = None
         self._gen_input_batch = None
-        self._gen_kv_connector_output = None
         self.execute_model_state = None
 
-        if model_output is None or input_batch is None:
+        if model_output is None or input_batch is None or execute_model_state is None:
             return None
 
+        kv_connector_output = self.kv_connector.post_forward(execute_model_state.finished_req_ids)
         num_reqs = input_batch.num_reqs
 
         # Mark all scheduled tokens as computed so the scheduler does
@@ -382,10 +403,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         )
 
         raw_multimodal_outputs = model_output.multimodal_outputs
-        can_copy_async = (
-            getattr(getattr(self, "device", None), "type", "cpu") == "cuda"
-            and _uses_async_output(self)
-            and isinstance(raw_multimodal_outputs, (dict, type(None)))
+        can_copy_async = getattr(getattr(self, "device", None), "type", "cpu") == "cuda" and isinstance(
+            raw_multimodal_outputs, (dict, type(None))
         )
         if can_copy_async:
             async_output = OmniGenerationAsyncOutput(
@@ -395,14 +414,16 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 main_stream=self.main_stream,
                 copy_stream=self.output_copy_stream,
                 finalize_output=self._finalize_native_data_plane_output,
+                check_ep_fault=self.check_ep_fault,
             )
             self._reserve_native_data_plane_outputs(list(req_ids))
             self._release_generation_slots(input_batch)
             return async_output
 
-        # CPU and synchronous schedulers keep the established materialization
-        # path. Final generation stages publish audio only through
-        # multimodal_outputs, matching the V1 generation-runner contract.
+        # CPU execution keeps the synchronous materialization path. Final
+        # generation stages publish audio only through multimodal_outputs,
+        # matching the V1 generation-runner contract.
+        self._reserve_native_data_plane_outputs(list(req_ids))
         multimodal_outputs = self._build_pooler_output(model_output, num_reqs)
         output.multimodal_outputs = [
             _ensure_tensor_values(payload) if payload else {} for payload in multimodal_outputs

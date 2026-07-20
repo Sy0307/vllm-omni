@@ -12,7 +12,6 @@ import socket
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-import msgspec
 import vllm.v1.engine as _vllm_engine_module
 import vllm.v1.engine.core_client as _vllm_core_client_module
 from vllm.logger import init_logger
@@ -228,48 +227,7 @@ class StageEngineCoreClientBase(StageClientBase):
             raise EngineDeadError(f"Stage-{self.stage_id} engine core is dead")
 
     def _apply_ready_response(self, payload: bytes) -> None:
-        try:
-            MPClient._apply_ready_response(self, payload)
-            return
-        except msgspec.ValidationError as exc:
-            raw = msgspec.msgpack.decode(payload)
-            if not isinstance(raw, (dict, list, tuple)):
-                raise
-
-            if isinstance(raw, dict):
-                max_model_len = raw.get("max_model_len")
-                num_gpu_blocks = raw.get("num_gpu_blocks")
-                dp_stats_address = raw.get("dp_stats_address")
-            else:
-                max_model_len = raw[0] if len(raw) > 0 else None
-                num_gpu_blocks = raw[1] if len(raw) > 1 else None
-                dp_stats_address = raw[2] if len(raw) > 2 else None
-
-            if max_model_len is None and num_gpu_blocks is None and dp_stats_address is None:
-                raise
-
-            logger.warning(
-                "[StageEngineCoreClient] Falling back to schema-tolerant READY "
-                "response decode after vLLM decode failed: %s",
-                exc,
-            )
-
-            vllm_config = self.vllm_config
-            if max_model_len is not None:
-                vllm_config.model_config.max_model_len = min(
-                    vllm_config.model_config.max_model_len,
-                    int(max_model_len),
-                )
-
-            if num_gpu_blocks is not None:
-                current_blocks = vllm_config.cache_config.num_gpu_blocks or 0
-                vllm_config.cache_config.num_gpu_blocks = current_blocks + int(num_gpu_blocks)
-
-            if dp_stats_address is not None:
-                if self.stats_update_address is None:
-                    self.stats_update_address = dp_stats_address
-                else:
-                    assert dp_stats_address == self.stats_update_address
+        MPClient._apply_ready_response(self, payload)
 
     # ==================== Overrides ====================
 

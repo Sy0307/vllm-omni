@@ -230,6 +230,8 @@ correctness evidence and quality results are not performance evidence.
 
 ## Known limitations
 
+- Model Runner V2 rejects pipeline parallelism and prefill context parallelism
+  at runner startup. Use the v1 runner for those deployment shapes.
 - Direct readiness delivery requires a scheduler sink in the local engine
   process. Distributed layouts without that binding use the output-carried
   fallback and require separate TP/PP validation.

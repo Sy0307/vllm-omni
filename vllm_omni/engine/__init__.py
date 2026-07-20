@@ -130,7 +130,7 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # and retains its original vLLM semantics for pooling/embedding tasks.
     multimodal_output: dict[str, torch.Tensor] | None = None
     # Bytes-serialized carrier for a dict-shaped pooling_output (MR V2 cross-stage
-    # hidden/codec handoff). vLLM 0.23 strictly decodes ``pooling_output`` as a
+    # hidden/codec handoff). vLLM strictly decodes ``pooling_output`` as a
     # ``torch.Tensor``, so a per-request dict payload cannot ride that field. The
     # producer (OmniARScheduler) sets ``pooling_output=None`` and serializes the
     # dict here; the consumer (StagePool._poll_stage_raw) rehydrates it back into

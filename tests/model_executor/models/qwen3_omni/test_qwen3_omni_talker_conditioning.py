@@ -17,6 +17,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _IdentityTalker:
+    num_code_groups = 2
+
+    @staticmethod
+    def parameters():
+        return iter((torch.empty(0),))
+
     @staticmethod
     def text_projection(value: torch.Tensor) -> torch.Tensor:
         return value
@@ -45,6 +51,25 @@ def test_talker_postprocess_batch_gathers_each_request_tail():
 
     assert key == ("hidden_states", "last")
     assert torch.equal(values, torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
+
+
+def test_talker_prefill_marks_placeholder_codec_rows_invalid() -> None:
+    model = _model()
+    model.talker_preprocess_prefill = lambda input_ids, input_embeds, _payload: (
+        input_ids,
+        input_embeds,
+        {},
+    )
+
+    _, _, updates = model.talker_preprocess(
+        torch.tensor([1, 2], dtype=torch.long),
+        torch.ones(2, 2),
+        _omni_is_prefill=True,
+        meta={},
+    )
+
+    assert torch.equal(updates["codes"]["audio"], torch.zeros((2, 2), dtype=torch.long))
+    assert updates["meta"]["codec_frame_valid"].item() is False
 
 
 def test_talker_mtp_forwards_request_sampling_state_to_code_predictor() -> None:
@@ -393,6 +418,7 @@ def test_talker_decode_batch_matches_scalar_state_and_conditioning() -> None:
                 assert torch.equal(actual_value, expected_value)
             else:
                 assert actual_value == expected_value
+    assert all(update["meta"]["codec_frame_valid"].item() is False for update in updates)
 
 
 def test_talker_decode_batch_propagates_missing_conditioning_credit() -> None:

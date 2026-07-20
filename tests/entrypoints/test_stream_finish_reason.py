@@ -188,9 +188,19 @@ def _parse_sse_chunks(lines: list[str]) -> list[dict]:
     return chunks
 
 
-def test_streaming_audio_choice_skips_metadata_only_chunk() -> None:
+def test_streaming_audio_choice_emits_empty_delta_for_metadata_only_chunk() -> None:
     serving_chat = object.__new__(OmniOpenAIServingChat)
-    omni_output = SimpleNamespace(request_output=SimpleNamespace(outputs=[SimpleNamespace(multimodal_output={})]))
+    omni_output = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                stop_reason=None,
+                token_ids=[],
+                multimodal_output={},
+            )
+        ]
+    )
 
     choices = serving_chat._create_audio_choice(
         omni_output,
@@ -199,7 +209,10 @@ def test_streaming_audio_choice_skips_metadata_only_chunk() -> None:
         stream=True,
     )
 
-    assert choices == []
+    assert len(choices) == 1
+    assert choices[0].index == 0
+    assert choices[0].delta.content == ""
+    assert choices[0].finish_reason == "stop"
 
 
 async def _collect_stream(gen):

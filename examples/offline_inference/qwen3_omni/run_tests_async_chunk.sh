@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-MODEL_PATH="/models/Qwen3-Omni-30B-A3B-Instruct"
+MODEL_PATH="${MODEL_PATH:-/models/Qwen3-Omni-30B-A3B-Instruct}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 END2END="$SCRIPT_DIR/end2end_async_chunk.py"
 DEPLOY_CONFIG="$SCRIPT_DIR/../../../vllm_omni/deploy/qwen3_omni_moe_mrv2.yaml"

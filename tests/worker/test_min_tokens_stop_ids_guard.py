@@ -31,6 +31,12 @@ CODEC_EOS = 2150
 TEXT_EOS = 151645
 
 
+@pytest.fixture(autouse=True)
+def _disable_vllm_pin_memory_for_cpu(monkeypatch: pytest.MonkeyPatch):
+    """Keep the module-level H2D helper in CPU-only mode."""
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+
+
 def _make_min_tokens_proc(stop_token_ids: list[int], eos_token_id: int | None) -> MinTokensLogitsProcessor:
     """Build a MinTokensLogitsProcessor with one active request, mirroring
     the production path (engine folds the tokenizer EOS via

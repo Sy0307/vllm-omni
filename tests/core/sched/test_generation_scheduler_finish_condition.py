@@ -15,9 +15,12 @@ only the first chunk, producing truncated audio.
 import unittest
 from types import SimpleNamespace
 
+import pytest
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class FakeRequest:

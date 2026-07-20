@@ -385,6 +385,31 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     logger.info(f"Request ID: {request_id}, Saved audio to {out_wav}")
 
 
+class _StreamingAudioAccumulator:
+    """Collect DELTA-mode audio outputs before writing a complete WAV."""
+
+    def __init__(self) -> None:
+        self._chunks: list[torch.Tensor] = []
+        self._sample_rate: int | None = None
+
+    def add(self, mm: dict) -> None:
+        audio = mm.get("audio")
+        if audio is not None:
+            chunks = audio if isinstance(audio, list) else [audio]
+            self._chunks.extend(chunk.detach().cpu() for chunk in chunks)
+
+        sample_rate = mm.get("sr")
+        if isinstance(sample_rate, list) and sample_rate:
+            sample_rate = sample_rate[-1]
+        if sample_rate is not None:
+            self._sample_rate = int(sample_rate.item() if hasattr(sample_rate, "item") else sample_rate)
+
+    def as_multimodal_output(self) -> dict:
+        if not self._chunks or self._sample_rate is None:
+            raise RuntimeError("Streaming Qwen3-TTS request completed without audio output")
+        return {"audio": self._chunks, "sr": self._sample_rate}
+
+
 def main(args):
     """Run offline inference with Omni."""
     model_name, inputs = _build_inputs(args)
@@ -420,8 +445,10 @@ async def main_streaming(args):
         t_start = time.perf_counter()
         t_prev = t_start
         chunk_idx = 0
+        audio_accumulator = _StreamingAudioAccumulator()
         async for stage_output in omni.generate(prompt, request_id=request_id):
             mm = stage_output.outputs[0].multimodal_output
+            audio_accumulator.add(mm)
             if not stage_output.finished:
                 t_now = time.perf_counter()
                 audio = mm.get("audio")
@@ -438,7 +465,7 @@ async def main_streaming(args):
                 t_end = time.perf_counter()
                 total_ms = (t_end - t_start) * 1000
                 logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
-                _save_wav(output_dir, request_id, mm)
+                _save_wav(output_dir, request_id, audio_accumulator.as_multimodal_output())
 
 
 def parse_args():

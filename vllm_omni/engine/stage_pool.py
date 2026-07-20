@@ -1111,10 +1111,10 @@ class StagePool:
     def _rehydrate_pooling_output_payloads(outputs: EngineCoreOutputs) -> None:
         """Restore dict-shaped pooling_output from its bytes carrier (MR V2).
 
-        vLLM 0.23 decodes EngineCoreOutput.pooling_output as a torch.Tensor, so MR
+        vLLM decodes EngineCoreOutput.pooling_output as a torch.Tensor, so MR
         V2 runners ship the per-request dict handoff via ``pooling_output_payload``
         with ``pooling_output=None``. Decode it back here so downstream stage-input
-        processors see ``pooling_output`` exactly as on vLLM <= 0.22.
+        processors see the same ``pooling_output`` shape as the legacy runner.
         """
         for eco in outputs.outputs:
             payload = getattr(eco, "pooling_output_payload", None)

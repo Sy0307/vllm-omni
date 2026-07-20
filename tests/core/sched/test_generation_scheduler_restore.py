@@ -98,6 +98,7 @@ def _scheduler_with_parked_generation_request(
         prompt_is_token_ids=True,
         additional_information=None,
         external_req_id="waiting",
+        prefill_stats=None,
         record_event=lambda *args, **kwargs: None,
     )
     adapter = FakeAdapter()
@@ -148,10 +149,6 @@ def _scheduler_with_parked_generation_request(
         "vllm_omni.core.sched.omni_generation_scheduler.create_request_queue",
         lambda policy: _FakeQueue([]),
     )
-    monkeypatch.setattr(
-        "vllm_omni.core.sched.omni_generation_scheduler.OmniNewRequestData.from_request",
-        lambda *args, **kwargs: SimpleNamespace(req_id="waiting"),
-    )
     return scheduler, waiting
 
 
@@ -178,16 +175,18 @@ def test_mrv1_generation_scheduler_keeps_adapter_terminal_state() -> None:
     assert scheduler._is_done_receiving_chunks("done")
 
 
-def test_generation_scheduler_reserves_slots_for_parked_async_chunk_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mrv1_generation_scheduler_does_not_reserve_parked_async_chunk_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     scheduler, waiting = _scheduler_with_parked_generation_request(
         monkeypatch,
         use_v2_model_runner=False,
     )
 
-    OmniGenerationScheduler.schedule(scheduler)
+    output = OmniGenerationScheduler.schedule(scheduler)
 
-    assert waiting not in scheduler.running
-    assert scheduler.waiting.peek_request() is waiting
+    assert waiting in scheduler.running
+    assert output.num_scheduled_tokens == {"waiting": 1}
 
 
 def test_mrv2_generation_scheduler_does_not_reserve_released_runner_slots(
@@ -220,6 +219,7 @@ def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeyp
             {"codes": {"audio": torch.tensor([[1, 2, 3]], dtype=torch.long)}}
         ),
         external_req_id="terminal",
+        prefill_stats=None,
         record_event=lambda *args, **kwargs: None,
     )
     adapter = FakeAdapter()

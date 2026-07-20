@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.outputs import OmniConnectorOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Coordinator:

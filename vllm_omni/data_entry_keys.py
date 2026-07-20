@@ -90,6 +90,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
+    codec_frame_valid: bool | torch.Tensor
     ref_code_len: int
     ref_context_size: int
     ref_context_request_id: str
@@ -188,6 +189,7 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
+    codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None

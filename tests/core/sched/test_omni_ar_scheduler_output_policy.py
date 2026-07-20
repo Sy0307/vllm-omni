@@ -19,18 +19,20 @@ def test_final_output_is_propagated_to_engine_model_config() -> None:
 
 
 @pytest.mark.parametrize(
-    ("async_chunk", "final_output", "stopped", "has_control", "expected"),
+    ("async_chunk", "final_output", "use_v2", "stopped", "has_control", "expected"),
     [
-        (True, False, False, False, False),
-        (True, False, True, False, True),
-        (True, False, False, True, True),
-        (True, True, False, False, True),
-        (False, False, False, False, True),
+        (True, False, True, False, False, False),
+        (True, False, False, False, False, True),
+        (True, False, True, True, False, True),
+        (True, False, True, False, True, True),
+        (True, True, True, False, False, True),
+        (False, False, True, False, False, True),
     ],
 )
 def test_async_chunk_intermediate_stage_emits_only_control_outputs(
     async_chunk: bool,
     final_output: bool,
+    use_v2: bool,
     stopped: bool,
     has_control: bool,
     expected: bool,
@@ -38,6 +40,7 @@ def test_async_chunk_intermediate_stage_emits_only_control_outputs(
     model_config = SimpleNamespace(
         async_chunk=async_chunk,
         final_output=final_output,
+        use_v2_model_runner=use_v2,
     )
 
     assert (

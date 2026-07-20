@@ -169,9 +169,45 @@ def test_async_chunk_skips_stop_token_zero_frame_without_gpu_value_check():
     assert len(tm.code_prompt_token_ids[rid]) == 1
 
 
+def test_async_chunk_uses_authoritative_frame_validity_without_token_history():
+    tm = _tm()
+    rid = "r-native-validity"
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={
+            "codes": {"audio": torch.tensor([[1, 2, 3, 4]])},
+            "meta": {"codec_frame_valid": False},
+        },
+        request=_req(rid, finished=False, initial_codec_chunk_frames=1, output_token_ids=[]),
+        is_finished=False,
+    )
+
+    assert payload is None
+    assert tm.code_prompt_token_ids[rid] == []
+
+
+def test_async_chunk_keeps_final_real_frame_when_eos_was_just_sampled():
+    tm = _tm()
+    rid = "r-final-real-frame"
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={
+            "codes": {"audio": torch.tensor([[1, 2, 3, 4]])},
+            "meta": {"codec_frame_valid": True},
+        },
+        request=_req(rid, finished=True, initial_codec_chunk_frames=1, output_token_ids=[4198]),
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [1, 2, 3, 4]
+
+
 def test_async_chunk_keeps_cuda_frame_cache_on_device_when_available():
     if not torch.cuda.is_available():
-        return
+        pytest.skip("CUDA is required to verify GPU frame-cache residency")
     tm = _tm()
     rid = "r-cuda-cache"
 
@@ -232,6 +268,35 @@ def test_async_chunk_batch_matches_scalar_payloads_and_state():
             torch.stack(scalar_tm.code_prompt_token_ids[rid]),
         )
     torch.testing.assert_close(batch_tm.request_payload["r-batch-0"], scalar_tm.request_payload["r-batch-0"])
+
+
+def test_async_chunk_batch_uses_last_validity_for_multitoken_request_span():
+    tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=1)
+    request = _req("r-multitoken-span", finished=False, output_token_ids=[7])
+    outputs = [
+        {
+            "codes": {
+                "audio": torch.tensor(
+                    [
+                        [9, 9, 9, 9],
+                        [1, 2, 3, 4],
+                    ]
+                )
+            },
+            "meta": {"codec_frame_valid": torch.tensor([False, True])},
+        }
+    ]
+
+    payloads = qwen3_tts_processors.talker2code2wav_async_chunk_batch(
+        transfer_manager=tm,
+        pooling_outputs=outputs,
+        requests=[request],
+        is_finished=[False],
+    )
+
+    assert payloads[0] is not None
+    assert payloads[0].codes.audio.tolist() == [1, 2, 3, 4]
+    assert len(tm.code_prompt_token_ids[request.external_req_id]) == 1
 
 
 _CASES = [
@@ -731,21 +796,27 @@ class TestRampHelpers:
     def test_parse_ramp_mixed_list_returns_none(self):
         assert parse_chunk_ramp({"codec_chunk_ramp": [4, "x"]}) is None
 
-    def test_parse_ramp_warns_on_tail_mismatch(self, caplog):
-        import logging
+    def test_parse_ramp_warns_on_tail_mismatch(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(
+            "vllm_omni.model_executor.stage_input_processors.chunk_size_utils.logger.warning",
+            lambda message, *args: warnings.append(message % args),
+        )
 
-        with caplog.at_level(logging.WARNING):
-            result = parse_chunk_ramp({"codec_chunk_ramp": [4, 4, 8]}, steady=25)
+        result = parse_chunk_ramp({"codec_chunk_ramp": [4, 4, 8]}, steady=25)
         assert result == [4, 4, 8]
-        assert any("reintroduces" in r.message for r in caplog.records)
+        assert any("reintroduces" in message for message in warnings)
 
-    def test_parse_ramp_no_warn_on_tail_match(self, caplog):
-        import logging
+    def test_parse_ramp_no_warn_on_tail_match(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(
+            "vllm_omni.model_executor.stage_input_processors.chunk_size_utils.logger.warning",
+            lambda message, *args: warnings.append(message % args),
+        )
 
-        with caplog.at_level(logging.WARNING):
-            result = parse_chunk_ramp({"codec_chunk_ramp": [4, 4, 8, 16, 25]}, steady=25)
+        result = parse_chunk_ramp({"codec_chunk_ramp": [4, 4, 8, 16, 25]}, steady=25)
         assert result == [4, 4, 8, 16, 25]
-        assert not any("reintroduces" in r.message for r in caplog.records)
+        assert warnings == []
 
     @pytest.mark.parametrize(
         "index,ramp,steady,expected",

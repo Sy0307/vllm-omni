@@ -90,13 +90,34 @@ def test_talker_make_omni_output_keeps_codes_per_request() -> None:
     out = model.make_omni_output(
         hidden,
         model_intermediate_buffer=[
-            {"codes": {"audio": req0}},
-            {"codes": {"audio": req1}},
+            {
+                "codes": {"audio": req0},
+                "meta": {"codec_frame_valid": torch.tensor(False)},
+            },
+            {
+                "codes": {"audio": req1},
+                "meta": {"codec_frame_valid": torch.tensor(True)},
+            },
         ],
     )
 
     assert torch.equal(out.text_hidden_states, hidden)
     assert out.multimodal_outputs["codes"]["audio"] == [req0, req1]
+    validity = out.multimodal_outputs["meta"]["codec_frame_valid"]
+    assert len(validity) == 2
+    assert validity[0].item() is False
+    assert validity[1].item() is True
+
+
+def test_talker_make_omni_output_rejects_missing_validity_for_real_payload() -> None:
+    model = Qwen3OmniMoeForConditionalGeneration.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.model_stage = "talker"
+
+    with pytest.raises(RuntimeError, match="missing meta.codec_frame_valid"):
+        model.make_omni_output(
+            torch.zeros((1, 4)),
+            model_intermediate_buffer=[{"req_id": "real-request"}],
+        )
 
 
 class _FakeWrapper:
