@@ -784,12 +784,13 @@ async def test_run_abort(orchestrator_factory) -> None:
 def _duplex_open_message(
     session_id: str,
     *,
+    incarnation: int = 0,
     session_config: dict[str, object] | None = None,
     runtime_config: dict[str, object] | None = None,
 ) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
         control_id=f"open-{session_id}",
-        fence=DuplexFence(session_id),
+        fence=DuplexFence(session_id, incarnation=incarnation),
         session_id=session_id,
         capabilities={
             "input_modes": [DuplexInputMode.APPEND_AUDIO_CHUNK.value],
@@ -832,6 +833,7 @@ async def test_duplex_control_plane_keeps_public_and_runtime_config_separate() -
     )
     open_message = _duplex_open_message(
         "sid-config-channels",
+        incarnation=3,
         session_config={
             "instructions": "public instructions",
             "extra_body": {"duplex_stage_max_tokens": {"0": 99}},
@@ -850,6 +852,7 @@ async def test_duplex_control_plane_keeps_public_and_runtime_config_separate() -
     assert request_state.sampling_params_list[0].max_tokens == 3
     assert request_state.sampling_params_list[0].stop_token_ids == [151705]
     bridge = request_state.streaming.bridge_states["duplex"]
+    assert bridge["incarnation"] == open_message.fence.incarnation
     assert bridge["session_config"] == open_message.session_config
     assert bridge["runtime_config"] == open_message.runtime_config
 
