@@ -13,7 +13,7 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec
+from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
@@ -56,12 +56,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._active_window,
             )
         self.connector = self.create_connector(model_config)
-        connector_config = getattr(model_config, "stage_connector_config", {}) or {}
-        if isinstance(connector_config, dict):
-            connector_extra = connector_config.get("extra", {})
-        else:
-            connector_extra = getattr(connector_config, "extra", {})
-        self.receives_chunks = connector_extra.get("role") != "sender"
+        self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management

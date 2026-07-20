@@ -17,6 +17,24 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
 )
 
 
+def get_stage_connector_role(model_config: Any) -> str | None:
+    """Return the configured stage connector direction, if explicit."""
+    connector_config = getattr(model_config, "stage_connector_config", None)
+    if isinstance(connector_config, dict):
+        extra = connector_config.get("extra")
+    else:
+        extra = getattr(connector_config, "extra", None)
+    if isinstance(extra, dict):
+        role = extra.get("role")
+        return role if isinstance(role, str) else None
+    return None
+
+
+def stage_receives_chunks(model_config: Any) -> bool:
+    """Whether connector chunks, rather than the orchestrator, feed a stage."""
+    return get_stage_connector_role(model_config) != "sender"
+
+
 @dataclass
 class ConnectorSpec:
     """Specification for a connector instance."""

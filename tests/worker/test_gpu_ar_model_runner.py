@@ -7,7 +7,6 @@ import torch
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import (
-    _OMNI_CONNECTOR_INIT_ARCHS,
     ExecuteModelState,
     GPUARModelRunner,
     OmniAsyncGPUModelRunnerOutput,
@@ -15,10 +14,6 @@ from vllm_omni.worker.gpu_ar_model_runner import (
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_minicpmo_talker_initializes_omni_connectors():
-    assert "MiniCPMO45OmniForConditionalGeneration" in _OMNI_CONNECTOR_INIT_ARCHS
 
 
 @pytest.mark.parametrize(

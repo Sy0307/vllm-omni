@@ -47,9 +47,6 @@ class TestRegistryDeclaration:
         assert _PIPELINE_KEY in OMNI_PIPELINES
         assert "minicpmo_4_5_fused" not in OMNI_PIPELINES
 
-    def test_visible_in_central_registry(self) -> None:
-        assert _PIPELINE_KEY in OMNI_PIPELINES
-
     def test_lazy_load_returns_pipeline_config(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         assert isinstance(pipeline, PipelineConfig)
@@ -109,8 +106,7 @@ class TestPipelineTopology:
         assert talker.hf_config_name == "tts_config"
         assert talker.custom_process_next_stage_input_func is None
         assert talker.async_chunk_process_next_stage_input_func == (
-            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni."
-            "tts2code2wav_async_chunk"
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_async_chunk"
         )
 
     def test_talker_routes_through_llm2tts(self, pipeline: PipelineConfig) -> None:
@@ -169,9 +165,7 @@ class TestDeployTopology:
         assert len(stages) == 3
         assert [stage.stage_id for stage in stages] == [0, 1, 2]
         assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "1", "2"]
-        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(
-            "tts2code2wav_async_chunk"
-        )
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith("tts2code2wav_async_chunk")
         assert stages[2].custom_process_input_func is None
 
     def test_pipeline_exposes_no_full_payload_or_token_placeholder_hooks(self) -> None:

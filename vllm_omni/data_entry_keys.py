@@ -64,9 +64,6 @@ class OmniPayloadMeta(TypedDict, total=False):
     request_id: str
     chunk_seq: int
     cache_epoch: int
-    codec_start: int
-    codec_end: int
-    new_token_count: int
     codec_chunk_frames: int
     codec_left_context_frames: int
     code_flat_numel: int
@@ -164,9 +161,6 @@ class MetaStruct(_StructBase):
     request_id: str | None = None
     chunk_seq: int | None = None
     cache_epoch: int | None = None
-    codec_start: int | None = None
-    codec_end: int | None = None
-    new_token_count: int | None = None
     last_chunk: bool | None = None
     req_id: list[str] | None = None
     left_context_size: int | None = None

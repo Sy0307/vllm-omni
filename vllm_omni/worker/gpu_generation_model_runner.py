@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
@@ -43,19 +44,6 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
-
-_OMNI_CONNECTOR_INIT_ARCHS = {
-    "Qwen3OmniMoeForConditionalGeneration",
-    "Qwen2_5OmniForConditionalGeneration",
-    "CovoAudioForConditionalGeneration",
-    "MiMoAudioModel",
-    "Qwen3TTSTalkerForConditionalGeneration",
-    "Qwen3TTSCode2Wav",
-    "MiniCPMO45Code2Wav",
-    "CosyVoice3Model",
-    "DyninOmniForConditionalGeneration",
-    "IndexTTS2S2MelDecoder",
-}
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -70,7 +58,21 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
         # Mirrors the init allowlist in gpu_ar_model_runner.py.
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        _OMNI_CONNECTOR_INIT_ARCHS = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
+            "IndexTTS2S2MelDecoder",
+        }
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
@@ -319,9 +321,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             )
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
-            # Stateful generation stages must key caches by the same internal
-            # IDs reported in ``finished_req_ids`` during cleanup.
-            if getattr(self.model_config, "model_arch", None) == "MiniCPMO45Code2Wav":
+            if getattr(self.model, "requires_request_ids", False):
                 model_kwargs["request_ids"] = list(req_ids)
 
         # Set cudagraph mode to none if calc_kv_scales is true.

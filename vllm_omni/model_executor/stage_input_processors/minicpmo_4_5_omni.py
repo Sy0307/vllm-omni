@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stage input processor for MiniCPM-o 4.5: Thinker (LLM) -> Talker (TTS).
-
-This bridge converts thinker hidden states and token ids into the talker
-prompt payload. The talker runs Token2Wav internally; MiniCPM-o 4.5 does not
-have an independent code2wav pipeline stage.
-"""
+"""MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -21,6 +18,9 @@ from vllm_omni.experimental.fullduplex.engine.intermediate import (
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = logging.getLogger(__name__)
+_MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
+_MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
+_MINICPMO45_SILENCE_CODE = 4218
 
 
 def _extract_first_audio_ref(multi_modal_data):
@@ -110,6 +110,191 @@ def _coerce_int(value):
     except (TypeError, ValueError):
         return None
 
+
+def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    chunk_frames = int(config.get("codec_chunk_frames", 25))
+    left_context_frames = int(config.get("codec_left_context_frames", 3))
+    if chunk_frames <= 0 or left_context_frames < 0:
+        raise ValueError(
+            "Invalid MiniCPM-o codec chunk config: "
+            f"codec_chunk_frames={chunk_frames}, "
+            f"codec_left_context_frames={left_context_frames}"
+        )
+    return chunk_frames, left_context_frames
+
+
+def _codec_scalars(value: Any) -> list[int]:
+    """Normalize one request-routed codec delta to CPU scalar token IDs."""
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return []
+        return value.detach().to(device="cpu", dtype=torch.long).reshape(-1).tolist()
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        scalars: list[int] = []
+        for item in value:
+            scalars.extend(_codec_scalars(item))
+        return scalars
+    if isinstance(value, (int, bool)):
+        return [int(value)]
+    raise TypeError(f"Unsupported MiniCPM-o codec delta type: {type(value).__name__}")
+
+
+def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
+    if pooling_output is None:
+        return []
+    if isinstance(pooling_output, Mapping):
+        meta = pooling_output.get("meta")
+        routed_id = meta.get("request_id") if isinstance(meta, Mapping) else None
+        routed_id = routed_id or pooling_output.get("request_id")
+        if routed_id is not None and str(routed_id) != request_id:
+            return []
+        codes = pooling_output.get("codes")
+        audio = codes.get("audio") if isinstance(codes, Mapping) else None
+        return _codec_scalars(audio)
+    if isinstance(pooling_output, Sequence) and not isinstance(
+        pooling_output,
+        (str, bytes, bytearray),
+    ):
+        delta: list[int] = []
+        for item in pooling_output:
+            values = _extract_codec_delta(item, request_id) if isinstance(item, Mapping) else _codec_scalars(item)
+            delta.extend(values)
+        return delta
+    return _codec_scalars(pooling_output)
+
+
+def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if isinstance(request_payload, dict):
+        container = request_payload.get(request_id)
+        if isinstance(container, dict):
+            container.pop(_MINICPMO45_ASYNC_STATE, None)
+            if not container:
+                request_payload.pop(request_id, None)
+        else:
+            request_payload.pop(request_id, None)
+    code_accumulators = getattr(transfer_manager, "code_prompt_token_ids", None)
+    if hasattr(code_accumulators, "pop"):
+        code_accumulators.pop(request_id, None)
+
+
+def _is_aborted(request: Any) -> bool:
+    status_name = getattr(getattr(request, "status", None), "name", "")
+    return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
+
+
+def tts2code2wav_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: Any,
+    request: Any,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """Stream request-owned MiniCPM-o codec windows to Code2Wav."""
+    external_id = getattr(request, "external_req_id", None)
+    internal_id = getattr(request, "request_id", None)
+    request_id = str(external_id if external_id is not None else internal_id)
+    internal_id = str(internal_id if internal_id is not None else request_id)
+
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if request_payload is None:
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+    container = request_payload.get(request_id)
+    if not isinstance(container, dict):
+        container = {}
+        request_payload[request_id] = container
+
+    record = container.get(_MINICPMO45_STREAM_RECORD)
+    if not isinstance(record, dict):
+        record = {
+            "internal_id": internal_id,
+            "cache_epoch": 0,
+            "retired_internal_ids": set(),
+        }
+        container[_MINICPMO45_STREAM_RECORD] = record
+    elif internal_id in record["retired_internal_ids"]:
+        return None
+    elif record["internal_id"] != internal_id:
+        record["retired_internal_ids"].add(record["internal_id"])
+        record["internal_id"] = internal_id
+        record["cache_epoch"] = int(record["cache_epoch"]) + 1
+        _drop_codec_state(transfer_manager, request_id)
+
+    if _is_aborted(request):
+        record["retired_internal_ids"].add(internal_id)
+        _drop_codec_state(transfer_manager, request_id)
+        return None
+
+    state = container.get(_MINICPMO45_ASYNC_STATE)
+    if not isinstance(state, dict):
+        state = {
+            "internal_id": internal_id,
+            "pending": [],
+            "left_context": [],
+            "codec_end": 0,
+        }
+        container[_MINICPMO45_ASYNC_STATE] = state
+
+    pending = state["pending"]
+    pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    request_finished = getattr(request, "is_finished", None)
+    finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    if not finished and len(pending) < chunk_frames:
+        return None
+
+    new_token_count = len(pending) if finished else chunk_frames
+    new_codes = pending[:new_token_count]
+    del pending[:new_token_count]
+    codec_start = int(state["codec_end"])
+    codec_end = codec_start + new_token_count
+
+    if new_token_count:
+        if codec_start == 0:
+            context = [_MINICPMO45_SILENCE_CODE] * left_context_frames
+        else:
+            context = list(state["left_context"])
+        output_codes = [*context, *new_codes]
+        history = [*state["left_context"], *new_codes]
+        state["left_context"] = history[-left_context_frames:] if left_context_frames else []
+    elif finished and codec_start > 0 and state["left_context"]:
+        context = list(state["left_context"])
+        output_codes = context
+    else:
+        context = []
+        output_codes = []
+    state["codec_end"] = codec_end
+
+    last_chunk = bool(finished and not pending)
+    if last_chunk:
+        record["retired_internal_ids"].add(internal_id)
+        _drop_codec_state(transfer_manager, request_id)
+
+    chunk_seq = int(getattr(transfer_manager, "put_req_chunk", {}).get(request_id, 0))
+    finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor(output_codes, dtype=torch.long)),
+        meta=MetaStruct(
+            request_id=request_id,
+            chunk_seq=chunk_seq,
+            cache_epoch=int(record["cache_epoch"]),
+            code_flat_numel=len(output_codes),
+            codec_chunk_frames=new_token_count,
+            codec_left_context_frames=len(context),
+            left_context_size=len(context),
+            last_chunk=last_chunk,
+            stream_finished=finished_tensor,
+            finished=finished_tensor,
+            req_id=[request_id],
+        ),
+        request_id=request_id,
+    )
 
 def _special_token_ids_from_mm_output(mm_output):
     if not isinstance(mm_output, Mapping):
@@ -344,19 +529,7 @@ def llm2tts(
     requires_multimodal_data: bool = False,
     _streaming_context=None,
 ):
-    """Convert thinker stage output to talker stage input for MiniCPMO Omni.
-
-    Extracts from thinker output:
-      - Full hidden states (prompt + generated) for speaker embedding extraction
-      - Prompt token IDs (for finding spk_bos/spk_eos positions)
-      - Generated token IDs (for decoding TTS text)
-
-    The talker model will:
-      1. Find <|spk_bos|>/<|spk_eos|> positions in prompt_token_ids
-      2. Extract speaker embedding from hidden states at those positions
-      3. Decode generated text and extract TTS content
-      4. Run ConditionalChatTTS pipeline
-    """
+    """Build Talker conditioning for ordinary and full-duplex streaming."""
     if not source_outputs:
         raise ValueError("source_outputs cannot be empty")
 

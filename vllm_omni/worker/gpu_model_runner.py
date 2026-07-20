@@ -1361,13 +1361,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
-                model_kwargs_extra["request_sample_eligible"] = [
-                    bool(
-                        (req := self.requests.get(req_id)) is not None
-                        and int(req.num_computed_tokens) + int(nstp[req_index]) >= int(req.num_tokens)
-                    )
-                    for req_index, req_id in enumerate(self.input_batch.req_ids)
-                ]
+                if getattr(self.model, "requires_request_sample_eligibility", False):
+                    model_kwargs_extra["request_sample_eligible"] = [
+                        bool(
+                            (req := self.requests.get(req_id)) is not None
+                            and int(req.num_computed_tokens) + int(nstp[req_index]) >= int(req.num_tokens)
+                        )
+                        for req_index, req_id in enumerate(self.input_batch.req_ids)
+                    ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
                 # split, which can re-introduce the cross-request corruption this

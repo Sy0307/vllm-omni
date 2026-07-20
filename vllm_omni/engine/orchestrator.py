@@ -29,6 +29,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
@@ -1243,10 +1244,7 @@ class Orchestrator:
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and (
-                not self.async_chunk
-                or not self._stage_receives_async_chunks(stage_id + 1)
-            )
+            and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
@@ -1297,13 +1295,8 @@ class Orchestrator:
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""
         pool = self.stage_pools[stage_id]
-        connector_config = getattr(
-            getattr(pool.stage_vllm_config, "model_config", None),
-            "stage_connector_config",
-            {},
-        )
-        connector_extra = connector_config.get("extra", {}) if isinstance(connector_config, dict) else {}
-        return connector_extra.get("role") != "sender"
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        return stage_receives_chunks(model_config)
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)

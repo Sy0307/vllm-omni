@@ -28,10 +28,8 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
 @dataclass(frozen=True)
 class PromptFeatures:
     speech_tokens: torch.Tensor
-    speech_token_lens: torch.Tensor
     speaker_embedding: torch.Tensor
     mels: torch.Tensor
-    mel_lens: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -78,7 +76,11 @@ class BatchedToken2Wav(nn.Module):
                     values = self._token2wav._prepare_prompt(prompt_wav)
             finally:
                 torch.set_default_dtype(previous_dtype)
-            cached = PromptFeatures(*values)
+            cached = PromptFeatures(
+                speech_tokens=values[0],
+                speaker_embedding=values[2],
+                mels=values[3],
+            )
             self._prompt_features[cache_key] = cached
         return cached
 
@@ -240,18 +242,14 @@ class BatchedToken2Wav(nn.Module):
                             cache["estimator_cnn_cache"][:, :, batch_size + row : batch_size + row + 1],
                         ),
                         dim=2,
-                    )
-                    .detach()
-                    .clone(),
+                    ).detach(),
                     "estimator_att_cache": torch.cat(
                         (
                             cache["estimator_att_cache"][:, :, row : row + 1],
                             cache["estimator_att_cache"][:, :, batch_size + row : batch_size + row + 1],
                         ),
                         dim=2,
-                    )
-                    .detach()
-                    .clone(),
+                    ).detach(),
                 }
             )
         return result

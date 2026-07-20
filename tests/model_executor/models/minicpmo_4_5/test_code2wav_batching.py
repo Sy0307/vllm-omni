@@ -148,7 +148,9 @@ def _config(minimum: int = 1):
 def _model():
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
-    return MiniCPMO45Code2Wav(vllm_config=_config(), backend=backend), token2wav
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    model.backend = backend
+    return model, token2wav
 
 
 def _info(

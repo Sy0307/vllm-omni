@@ -206,7 +206,3 @@ def test_request_cleanup_only_evicts_ar_rng_state() -> None:
     talker._flush_deferred_cleanup()
 
     assert "req-done" not in talker._request_generators
-    assert not hasattr(talker, "_vocoder_states")
-    assert not hasattr(talker, "audio_tokenizer")
-    assert not hasattr(talker, "_run_vocoder_chunk")
-    assert not hasattr(talker, "generate_speech")

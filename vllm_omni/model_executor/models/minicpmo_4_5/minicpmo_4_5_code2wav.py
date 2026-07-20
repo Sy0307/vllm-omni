@@ -5,8 +5,6 @@
 from __future__ import annotations
 
 import json
-import os
-from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +13,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -24,8 +21,6 @@ from .batched_token2wav import (
     BatchedToken2WavState,
     state_shape_signature,
 )
-
-logger = init_logger(__name__)
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -79,6 +74,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     have_multimodal_outputs = True
     enable_update_additional_information = True
     requires_raw_input_tokens = True
+    requires_request_ids = True
     has_preprocess = False
     has_postprocess = False
 
@@ -87,29 +83,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        backend: BatchedToken2Wav | None = None,
     ):
         super().__init__()
         del prefix
         self.vllm_config = vllm_config
         self.model_path = str(vllm_config.model_config.model)
-        self.backend = backend
+        self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
-        self._stats_forwards = 0
-        self._stats_bucket_sizes: Counter[int] = Counter()
-        self._stats_reject_reasons: Counter[str] = Counter()
-        self._stats_batch_hits = 0
         extra = self._extra_config()
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
-        self._stats_log_every = int(
-            extra.get(
-                "code2wav_batch_stats_log_every",
-                os.environ.get("VLLM_OMNI_MINICPMO_CODE2WAV_STATS_LOG_EVERY", 0),
-            )
-            or 0
-        )
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._default_prompt_wav = str(
             extra.get(
@@ -149,16 +133,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 counts=normalized,
                 total=int(flat.numel()),
             )
-        segments: list[torch.Tensor] = []
-        offset = 0
-        for count in normalized:
-            segments.append(flat[offset : offset + count])
-            offset += count
-        return segments
-
-    def _reject(self, reason: str, **details: Any) -> RuntimeError:
-        self._stats_reject_reasons[reason] += 1
-        return _batch_error(reason, **details)
+        return list(torch.split(flat, normalized))
 
     def _parse_item(
         self,
@@ -172,11 +147,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             meta = info
         request_id = str(_scalar(meta.get("request_id"), _scalar(info.get("request_id"), "")))
         if not request_id:
-            raise self._reject("missing_request_id", output_index=index)
+            raise _batch_error("missing_request_id", output_index=index)
         cache_epoch = int(_scalar(meta.get("cache_epoch"), 0))
         chunk_seq = int(_scalar(meta.get("chunk_seq"), 0))
         if cache_epoch < 0 or chunk_seq < 0:
-            raise self._reject(
+            raise _batch_error(
                 "negative_stream_position",
                 request_id=request_id,
                 cache_epoch=cache_epoch,
@@ -196,14 +171,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         previous = self._states.get(state_id)
         if previous is None:
             if chunk_seq != 0:
-                raise self._reject(
+                raise _batch_error(
                     "missing_state_for_chunk",
                     request_id=request_id,
                     cache_epoch=cache_epoch,
                     chunk_seq=chunk_seq,
                 )
         elif cache_epoch < previous.cache_epoch:
-            raise self._reject(
+            raise _batch_error(
                 "stale_cache_epoch",
                 request_id=request_id,
                 expected=previous.cache_epoch,
@@ -211,7 +186,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         elif cache_epoch > previous.cache_epoch:
             if chunk_seq != 0:
-                raise self._reject(
+                raise _batch_error(
                     "new_epoch_requires_first_chunk",
                     request_id=request_id,
                     cache_epoch=cache_epoch,
@@ -219,21 +194,21 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             previous = None
         elif chunk_seq != previous.chunk_seq + 1:
-            raise self._reject(
+            raise _batch_error(
                 "stale_or_reordered_chunk",
                 request_id=request_id,
                 expected=previous.chunk_seq + 1,
                 actual=chunk_seq,
             )
         elif prompt_cache_id != previous.prompt_cache_id:
-            raise self._reject(
+            raise _batch_error(
                 "prompt_changed_midstream",
                 request_id=request_id,
                 expected=previous.prompt_cache_id,
                 actual=prompt_cache_id,
             )
         elif prompt_wav != previous.prompt_wav:
-            raise self._reject(
+            raise _batch_error(
                 "prompt_changed_midstream",
                 request_id=request_id,
                 expected=previous.prompt_wav,
@@ -268,17 +243,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             item.cache_epoch,
         )
 
-    def _log_stats_if_needed(self) -> None:
-        if not self._stats_log_every or self._stats_forwards % self._stats_log_every:
-            return
-        logger.info(
-            "MiniCPM-o Code2Wav batch stats: forwards=%d batch_hits=%d bucket_sizes=%s reject_reasons=%s",
-            self._stats_forwards,
-            self._stats_batch_hits,
-            dict(self._stats_bucket_sizes),
-            dict(self._stats_reject_reasons),
-        )
-
     @torch.inference_mode()
     def forward(
         self,
@@ -290,7 +254,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
-        self._stats_forwards += 1
         ids = input_ids if isinstance(input_ids, torch.Tensor) else torch.empty(0, dtype=torch.long)
         segments = self._split_segments(ids, kwargs.get("seq_token_counts"))
         empty = torch.empty(0, dtype=torch.float32, device=ids.device)
@@ -305,13 +268,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 },
             )
         if len(runtime_additional_information) != len(segments):
-            raise self._reject(
+            raise _batch_error(
                 "runtime_info_count_mismatch",
                 segments=len(segments),
                 runtime_infos=len(runtime_additional_information),
             )
         if self.backend is None:
-            raise self._reject("backend_not_loaded")
+            raise _batch_error("backend_not_loaded")
 
         state_ids = kwargs.get("request_ids")
         if state_ids is None:
@@ -324,7 +287,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 source = meta if isinstance(meta, Mapping) else info
                 state_ids.append(str(_scalar(source.get("request_id"), index)))
         if len(state_ids) != len(segments):
-            raise self._reject(
+            raise _batch_error(
                 "request_id_count_mismatch",
                 segments=len(segments),
                 request_ids=len(state_ids),
@@ -334,7 +297,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             zip(state_ids, segments, runtime_additional_information, strict=True)
         ):
             if not isinstance(info, Mapping):
-                raise self._reject(
+                raise _batch_error(
                     "invalid_runtime_info",
                     output_index=index,
                     value_type=type(info).__name__,
@@ -342,13 +305,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             items.append(self._parse_item(index, str(state_id), segment, info))
         state_ids = [item.state_id for item in items]
         if len(state_ids) != len(set(state_ids)):
-            raise self._reject("duplicate_request_in_forward", request_ids=state_ids)
+            raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         compute_items = [item for item in items if item.tokens.numel() > 0]
         invalid_empty = [item.request_id for item in items if not item.last_chunk and item.tokens.numel() == 0]
         if invalid_empty:
-            raise self._reject("empty_nonfinal_chunk", request_ids=invalid_empty)
+            raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
@@ -363,7 +326,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             if len(bucket) < self._min_batch_size
         ]
         if undersized:
-            raise self._reject(
+            raise _batch_error(
                 "exact_shape_bucket_below_minimum",
                 minimum=self._min_batch_size,
                 buckets=undersized,
@@ -372,8 +335,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         pending: dict[str, _RequestState | None] = {item.state_id: None for item in sentinels}
         for bucket in buckets.values():
             batch_size = len(bucket)
-            self._stats_bucket_sizes[batch_size] += 1
-            self._stats_batch_hits += batch_size
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
@@ -393,14 +354,14 @@ class MiniCPMO45Code2Wav(nn.Module):
             except Exception as exc:
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
-                raise self._reject(
+                raise _batch_error(
                     "backend_unsupported_or_failed",
                     request_ids=[item.request_id for item in bucket],
                     error_type=type(exc).__name__,
                     error=str(exc),
                 ) from exc
             if len(audios) != batch_size or len(next_states) != batch_size:
-                raise self._reject(
+                raise _batch_error(
                     "backend_result_size_mismatch",
                     expected=batch_size,
                     audios=len(audios),
@@ -425,7 +386,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._states.pop(request_id, None)
             else:
                 self._states[request_id] = state
-        self._log_stats_if_needed()
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={

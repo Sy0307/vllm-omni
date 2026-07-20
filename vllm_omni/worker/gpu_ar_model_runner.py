@@ -42,6 +42,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -50,19 +51,6 @@ from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentio
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
-
-_OMNI_CONNECTOR_INIT_ARCHS = {
-    "Qwen3OmniMoeForConditionalGeneration",
-    "Qwen2_5OmniForConditionalGeneration",
-    "CovoAudioForConditionalGeneration",
-    "MiMoAudioModel",
-    "Qwen3TTSTalkerForConditionalGeneration",
-    "Qwen3TTSCode2Wav",
-    "MiniCPMO45OmniForConditionalGeneration",
-    "CosyVoice3Model",
-    "DyninOmniForConditionalGeneration",
-    "IndexTTS2TalkerForConditionalGeneration",
-}
 
 
 def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -323,7 +311,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # separately as `(model_arch, model_stage)` tuples in
         # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
         # forgetting that produces a Stage-1 hang on the consumer.
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        _OMNI_CONNECTOR_INIT_ARCHS = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
+            "IndexTTS2TalkerForConditionalGeneration",
+        }
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
@@ -1532,9 +1534,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _uses_async_output_connector(self) -> bool:
         """Whether this stage streams its outputs through a connector."""
-        connector_config = getattr(self.model_config, "stage_connector_config", {})
-        connector_extra = connector_config.get("extra", {}) if isinstance(connector_config, dict) else {}
-        role = connector_extra.get("role")
+        role = get_stage_connector_role(self.model_config)
         if role is not None:
             return role == "sender"
         # Preserve the legacy partitioning default, except for a stage-0

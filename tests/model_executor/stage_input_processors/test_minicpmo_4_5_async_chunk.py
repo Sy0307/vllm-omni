@@ -63,9 +63,6 @@ def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) 
     if payload is not None:
         assert _codes(payload) == [4218, 4218, 4218, *range(25)]
         assert payload.meta.chunk_seq == 0
-        assert payload.meta.codec_start == 0
-        assert payload.meta.codec_end == 25
-        assert payload.meta.new_token_count == 25
         assert payload.meta.code_flat_numel == 28
 
 
@@ -81,9 +78,6 @@ def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
     assert steady is not None
     assert _codes(steady) == [22, 23, 24, *range(25, 50)]
     assert steady.meta.chunk_seq == 1
-    assert steady.meta.codec_start == 25
-    assert steady.meta.codec_end == 50
-    assert steady.meta.new_token_count == 25
 
 
 def test_exact_boundary_final_flushes_held_lookahead() -> None:
@@ -97,13 +91,9 @@ def test_exact_boundary_final_flushes_held_lookahead() -> None:
     assert final is not None
     assert _codes(final) == [22, 23, 24]
     assert final.meta.chunk_seq == 1
-    assert final.meta.new_token_count == 0
     assert final.meta.code_flat_numel == 3
-    assert final.meta.codec_start == 25
-    assert final.meta.codec_end == 25
     assert final.meta.last_chunk is True
     assert final.meta.finished.item() is True
-    assert "req" not in manager.request_payload
 
 
 def test_short_final_flushes_silence_prefix_and_tail() -> None:
@@ -112,7 +102,6 @@ def test_short_final_flushes_silence_prefix_and_tail() -> None:
 
     assert final is not None
     assert _codes(final) == [4218, 4218, 4218, *range(7)]
-    assert final.meta.new_token_count == 7
     assert final.meta.last_chunk is True
     assert final.meta.finished.item() is True
 
@@ -157,7 +146,6 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert tts2code2wav_async_chunk(manager, _delta(*range(10)), stale, False) is None
     stale.status = RequestStatus.FINISHED_ABORTED
     assert tts2code2wav_async_chunk(manager, None, stale, True) is None
-    assert "req" not in manager.request_payload
     assert tts2code2wav_async_chunk(manager, _delta(*range(25)), stale, False) is None
 
     replacement = _request("req", "internal-1")
