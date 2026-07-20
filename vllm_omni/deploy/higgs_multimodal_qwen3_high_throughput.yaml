@@ -48,7 +48,7 @@ stages:
       audio_state_step_mode: compile
       audio_sampler_mode: torch
     compilation_config:
-      # A100 c64 validation is faster with the compileable native ops exposed
+      # A100 c64 validation is faster with the compilable native ops exposed
       # to Inductor than with every custom op kept opaque.
       custom_ops: ["none"]
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
