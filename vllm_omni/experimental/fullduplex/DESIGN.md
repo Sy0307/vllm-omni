@@ -528,6 +528,52 @@ own response IDs, playback, overlap, Realtime events, or model policy.
 
 ## Serving and Compatibility Boundaries
 
+### Normative Realtime event contract
+
+The public contract in this section applies to `/v1/realtime?duplex=1`. Internal
+duplex event names such as `response.output_audio.delta` are projection inputs,
+not additional public aliases. Events for one attachment preserve mailbox
+order; replay after resume preserves the original event order and `event_id`.
+
+Accepted compatibility aliases are normalized before mailbox admission:
+
+| Canonical input event | Accepted aliases | Contract |
+| --- | --- | --- |
+| `input.text.append` | `input_text.append`, `push_text` | Appends text to the open input item. |
+| `input_audio_buffer.append` | `input.audio.append`, `push_chunk` | Appends audio; legacy aliases default to WAV when no format is supplied. |
+| `turn.signal` | `signal_turn` | Sends an explicit turn signal; it does not imply response creation. |
+| `playback.ack` | `audio.playback_ack` | Advances playback/history only for the identified response and attachment. |
+| `session.close` | `close_session`, `close` | Closes the session after previously admitted mailbox events. |
+
+The Realtime projector emits the following response lifecycle. Cardinality is
+scoped to one `response_id` unless stated otherwise.
+
+| Public event | Trigger and ordering | Cardinality |
+| --- | --- | --- |
+| `response.created` | First event for a visible assistant response; precedes its output-item, content-part, speak, text, and audio events. | Exactly once for every visible response. |
+| `response.speak` | The model selected speak; emitted after `response.created` and no later than the first `response.audio.delta`. It carries decision metadata, not transcript text. | At most once. |
+| `response.audio.delta` | Carries one ordered audio chunk. Every emitted audio delta is followed by a `response.audio_transcript.delta` for the same chunk. | Zero or more. |
+| `response.audio_transcript.delta` | Append-only transcript contribution paired with an audio delta; it may be empty for a text-less audio unit and must not repeat or overlap earlier text. | One per audio delta. |
+| `response.audio.done` | Closes the audio stream after its final delta and before response terminal events. It is omitted for a response with no audio or transcript. | At most once. |
+| `response.audio_transcript.done` | Contains the exact concatenation of all non-overlapping transcript deltas for the response. | At most once, and only for a non-empty transcript. |
+| `response.output_item.done` / `conversation.item.done` | Finalize the assistant item after content-part terminal events and before `response.done`. | At most once each. |
+| `response.done` | Terminal event for a created response; follows audio, transcript, content-part, and item terminal events. | Exactly once for every created response that reaches a terminal state. |
+| `rate_limits.updated` | Compatibility event emitted immediately after `response.done`; the current payload has an empty rate-limit list. | Once per emitted `response.done`. |
+| `response.listen` | The model selected listen at a model-unit boundary. It may be emitted without `response.created`; clients must not infer a missing or pending response from it. | Zero or more per session, at most once per model-unit decision. |
+
+Session lifecycle events (`session.created`, `session.updated`,
+`session.resumed`, `session.replaced`, `session.expired`, and
+`session.resync_required`) are session-scoped rather than response-scoped.
+`session.created` is emitted before held response output on a new attachment.
+Cancellation and truncation use terminal status/details on the affected
+response and never reuse that response ID for later model turns.
+
+Compatibility changes must update this table and its protocol contract tests in
+the same change. The golden transcript test requires joined
+`response.audio_transcript.delta` values to equal
+`response.audio_transcript.done.transcript`; response tests separately enforce
+at-most-once `response.speak` and terminal event cardinality.
+
 ### Session internal ledgers
 
 `DuplexSession` remains the serving aggregate root and now composes
