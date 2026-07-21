@@ -12,11 +12,11 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.messages import DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
-from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
@@ -1874,6 +1874,130 @@ async def test_realtime_committed_overlap_promotes_after_response_done():
     assert native.deferred_overlap_turn is False
 
 
+@pytest.mark.asyncio
+async def test_auto_response_committed_overlap_does_not_precreate_empty_response():
+    session_id = "sid-auto-overlap-no-empty-response"
+    request_id = f"duplex-{session_id}-e0-stage0"
+
+    def _stage_output(samples: int, *, turn_end: bool = False):
+        return SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[
+                SimpleNamespace(
+                    text="hello",
+                    multimodal_output={
+                        "audio": np.zeros(samples, dtype=np.float32),
+                        "sr": 24000,
+                        "meta": {
+                            "turn_end": turn_end,
+                            "duplex_turn_id": 0,
+                            "duplex_epoch": 0,
+                        },
+                    },
+                )
+            ],
+        )
+
+    first_append = {
+        "operation": "append",
+        "session_id": session_id,
+        "ok": True,
+        "unsupported_count": 0,
+        "error_count": 0,
+        "stage_results": [
+            {
+                "stage_id": 0,
+                "replica_id": 0,
+                "result": {
+                    "supported": True,
+                    "implementation_level": "model_native_duplex",
+                    "data_plane_append": True,
+                    "request_id": request_id,
+                    "response_stage_id": 1,
+                },
+            }
+        ],
+        "data_plane_outputs": [_stage_output(2400)],
+    }
+    promoted_append = {
+        "operation": "append",
+        "session_id": session_id,
+        "ok": True,
+        "unsupported_count": 0,
+        "error_count": 0,
+        "stage_results": [],
+        "data_plane_outputs": [],
+    }
+    engine = FakeEngineClient(
+        append_results=[first_append, promoted_append],
+        collect_outputs=[[_stage_output(4800, turn_end=True)]],
+        collect_delay_s=0.1,
+    )
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+
+    overlap_sent = False
+
+    def commit_overlap_after_first_response(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        nonlocal overlap_sent
+        if data.get("type") != "response.audio.delta" or overlap_sent:
+            return
+        overlap_sent = True
+        chunk = {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(3200, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 200,
+            "is_speech": True,
+        }
+        for _ in range(4):
+            ws.put(chunk)
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+
+    ws = TimedWebSocket(on_send=commit_overlap_after_first_response, receive_timeout_s=3)
+    create = _native_realtime_session_update(session_id)
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16000, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 1000,
+            "is_speech": True,
+        }
+    )
+    ws.put({"type": "input_audio_buffer.commit", "final": True})
+
+    handler_task = asyncio.create_task(handler.handle_realtime_session(ws))
+    try:
+        for _ in range(300):
+            if len(engine.appended) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail(
+                f"committed overlap was not promoted after response.done: "
+                f"appends={len(engine.appended)}, events={ws.sent_types()}"
+            )
+
+        assert overlap_sent is True
+        assert len(engine.appended) == 2
+        assert engine.appended[1][3] is True
+        assert ws.sent_types().count("response.created") == 1
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=3)
+
+    assert ws.sent_types().count("response.done") >= 1
+
+
 def test_auto_response_barge_in_marks_new_user_turn_payload_without_waiting_latch():
     handler, session = _auto_response_context("sid-auto-barge-new-turn", playback_active=True)
     payload = _native_audio_payload()
@@ -3047,6 +3171,49 @@ async def test_minicpmo_auto_response_turn_end_preserves_resumable_request():
     assert session.active_response_id is None
     assert session.active_request_id == request_id
     assert "response.done" in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_empty_turn_end_emits_model_listen():
+    request_id = "duplex-sid-empty-turn-end-e0-stage0"
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-empty-turn-end",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.bind_request(request_id)
+    ws = TimedWebSocket()
+
+    close_reason, emitted = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "tts",
+            "is_listen": False,
+            "data_plane_request_id": request_id,
+            "text": "",
+            "audio_data": "",
+            "audio_format": "pcm16",
+            "end_of_turn": True,
+            "abort_data_plane_request": True,
+            "model_turn_id": 0,
+            "uses_model_runner_scheduler": True,
+            "runner_kv_backed": True,
+            "runtime_impl": "scheduler_data_plane",
+        },
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert session.turn_id == 1
+    assert session.active_request_id == request_id
+    assert session.active_response_id is None
+    assert ws.sent_types() == ["response.listen"]
+    assert ws.sent[0]["model_listen"] is True
+    assert ws.sent[0]["reason"] == "model_turn_completed_without_output"
 
 
 @pytest.mark.asyncio

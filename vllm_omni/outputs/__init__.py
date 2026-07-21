@@ -9,7 +9,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 if TYPE_CHECKING:
-    from vllm_omni.engine.duplex_contracts import DuplexOutputDecision
+    from vllm_omni.experimental.fullduplex.engine.contracts import DuplexOutputDecision
 
 
 @dataclass

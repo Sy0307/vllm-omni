@@ -9,7 +9,7 @@ from typing import Any
 
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexAppendPlan,
     DuplexInputMode,

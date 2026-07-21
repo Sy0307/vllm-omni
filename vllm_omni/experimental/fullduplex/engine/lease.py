@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from vllm_omni.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 
 class DuplexLeaseActivity(str, Enum):

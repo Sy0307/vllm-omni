@@ -5,20 +5,18 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Literal, TypeAlias
+from typing import TypeAlias
 
 from vllm.logger import init_logger
 
 from vllm_omni.engine.messages import (
-    CollectiveRPCResultMessage,
-    DuplexControlResultMessage,
     EngineQueueMessage,
     ErrorMessage,
 )
 
 logger = init_logger(__name__)
 
-RpcCorrelationKey: TypeAlias = tuple[Literal["collective", "duplex"], str]
+RpcCorrelationKey: TypeAlias = tuple[str, str]
 RpcWaiter: TypeAlias = queue.Queue[EngineQueueMessage]
 
 
@@ -113,11 +111,10 @@ class RpcResultRouter:
 
     @staticmethod
     def _correlation_key(message: EngineQueueMessage) -> RpcCorrelationKey | None:
-        if isinstance(message, DuplexControlResultMessage):
-            return ("duplex", message.control_id)
-        if isinstance(message, CollectiveRPCResultMessage):
-            return ("collective", message.rpc_id)
-        return None
+        key = getattr(message, "rpc_correlation_key", None)
+        if not isinstance(key, tuple) or len(key) != 2 or not all(isinstance(part, str) and part for part in key):
+            return None
+        return key
 
 
 class CorrelatedRpcClient:

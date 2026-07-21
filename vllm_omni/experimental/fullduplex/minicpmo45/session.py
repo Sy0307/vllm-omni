@@ -21,6 +21,7 @@ class MiniCPMO45ServingSessionState:
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0
     deferred_response_create: bool = False
+    deferred_precreate_response: bool = False
     auto_response_waiting_for_speech: bool = False
     auto_response_new_turn_prefix_variant: str | None = None
     data_plane_task: asyncio.Task[None] | None = None
@@ -63,6 +64,7 @@ class MiniCPMO45ServingSessionState:
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
         self.deferred_response_create = False
+        self.deferred_precreate_response = False
         return reserved_bytes
 
     def clear_continuation(self) -> None:

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Model-neutral contracts for optional duplex engine integration.
+"""Model-neutral contracts for the experimental duplex engine plugin.
 
-This module contains only immutable data transfer objects and protocols used by
-the stable engine. Duplex control algorithms, session implementations, model
-policy, and Realtime serving remain under ``experimental.fullduplex``.
+This module contains only immutable data transfer objects and narrow protocols.
+Duplex control algorithms, session implementations, model policy, and Realtime
+serving remain in sibling experimental modules.
 """
 
 from __future__ import annotations
@@ -17,8 +17,9 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from vllm_omni.engine.messages import DuplexFence, EngineQueueMessage
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
+from vllm_omni.engine.messages import EngineQueueMessage
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 
 class SessionMode(str, Enum):

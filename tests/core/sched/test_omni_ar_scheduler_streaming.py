@@ -13,7 +13,7 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 
 # isort: on
 

@@ -9,17 +9,17 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from vllm_omni.engine.duplex_contracts import (
+from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexInputMode,
     DuplexRuntimeCapabilities,
 )
-from vllm_omni.engine.duplex_lease import (
+from vllm_omni.experimental.fullduplex.engine.lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
     DuplexLeaseState,
     DuplexSessionExpiry,
 )
-from vllm_omni.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 
 def _default_capabilities() -> DuplexRuntimeCapabilities:

@@ -27,6 +27,10 @@ stages:
   - stage_id: 1
     max_num_seqs: 2
     async_scheduling: false
+    # The streaming talker advances Python-owned per-request generators on
+    # every step, so only fixed-topology model regions are graph-capturable.
+    compilation_config:
+      cudagraph_mode: PIECEWISE
     default_sampling_params:
       max_tokens: 4096
       extra_args:

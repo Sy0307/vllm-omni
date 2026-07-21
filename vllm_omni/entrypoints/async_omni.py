@@ -27,8 +27,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.messages import DuplexFence, DuplexSessionLifecycleMessage, ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -45,6 +44,11 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
+    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+    from vllm_omni.experimental.fullduplex.engine.messages import (
+        DuplexFence,
+        DuplexSessionLifecycleMessage,
+    )
     from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
     from vllm_omni.inputs.data import OmniPromptType
 
@@ -884,7 +888,7 @@ class AsyncOmni(EngineClient, OmniBase):
                         await self.event_resolver.resolve(msg)
                         continue
 
-                    if isinstance(msg, DuplexSessionLifecycleMessage):
+                    if getattr(msg, "type", None) == "duplex_session_lifecycle":
                         await self.duplex_lifecycle_events.put(msg)
                         continue
 

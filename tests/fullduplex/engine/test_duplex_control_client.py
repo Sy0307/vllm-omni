@@ -5,18 +5,18 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.engine.messages import (
+from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
+    DuplexControlClient,
+    DuplexControlRequestError,
+)
+from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import (
     DuplexControlError,
     DuplexControlResultMessage,
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
-    DuplexControlClient,
-    DuplexControlRequestError,
-)
-from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -1,51 +1,57 @@
 import queue
+from typing import Literal
 
 import pytest
 
 from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
-    DuplexControlResultMessage,
+    EngineQueueMessage,
     ErrorMessage,
 )
 from vllm_omni.engine.rpc_result_router import RpcResultRouter
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _duplex_result(control_id: str) -> DuplexControlResultMessage:
-    return DuplexControlResultMessage(
-        control_id=control_id,
-        fence=DuplexFence("sid"),
-        operation="append",
-        session_id="sid",
-        ok=True,
-        stage_results=[],
+class GenericCorrelatedResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["generic_correlated_result"] = "generic_correlated_result"
+    namespace: str
+    correlation_id: str
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return (self.namespace, self.correlation_id)
+
+
+def _generic_result(correlation_id: str) -> GenericCorrelatedResultMessage:
+    return GenericCorrelatedResultMessage(
+        namespace="plugin",
+        correlation_id=correlation_id,
     )
 
 
 def test_rpc_result_router_routes_out_of_order_results_by_correlation_id():
     source: queue.Queue = queue.Queue()
     router = RpcResultRouter(source)
-    first = router.register(("duplex", "first"))
-    second = router.register(("duplex", "second"))
+    first = router.register(("plugin", "first"))
+    second = router.register(("plugin", "second"))
 
-    source.put(_duplex_result("second"))
-    source.put(_duplex_result("first"))
+    source.put(_generic_result("second"))
+    source.put(_generic_result("first"))
 
-    assert first.get(timeout=1).control_id == "first"
-    assert second.get(timeout=1).control_id == "second"
+    assert first.get(timeout=1).correlation_id == "first"
+    assert second.get(timeout=1).correlation_id == "second"
     router.close()
 
 
 def test_rpc_result_router_drops_only_the_late_result_after_unregister():
     source: queue.Queue = queue.Queue()
     router = RpcResultRouter(source)
-    expired = router.register(("duplex", "expired"))
+    expired = router.register(("plugin", "expired"))
     active = router.register(("collective", "active"))
-    router.unregister(("duplex", "expired"), expired)
+    router.unregister(("plugin", "expired"), expired)
 
-    source.put(_duplex_result("expired"))
+    source.put(_generic_result("expired"))
     source.put(
         CollectiveRPCResultMessage(
             rpc_id="active",
@@ -63,34 +69,34 @@ def test_rpc_result_router_drops_only_the_late_result_after_unregister():
 def test_rpc_result_router_broadcasts_fatal_errors_to_pending_waiters():
     source: queue.Queue = queue.Queue()
     router = RpcResultRouter(source)
-    duplex = router.register(("duplex", "one"))
+    plugin = router.register(("plugin", "one"))
     collective = router.register(("collective", "two"))
 
     source.put(ErrorMessage(error="orchestrator failed", fatal=True))
 
-    assert duplex.get(timeout=1).error == "orchestrator failed"
+    assert plugin.get(timeout=1).error == "orchestrator failed"
     assert collective.get(timeout=1).error == "orchestrator failed"
     with pytest.raises(RuntimeError, match="orchestrator failed"):
-        router.register(("duplex", "after-failure"))
+        router.register(("plugin", "after-failure"))
     router.close()
 
 
 def test_rpc_result_router_does_not_broadcast_uncorrelated_nonfatal_errors():
     source: queue.Queue = queue.Queue()
     router = RpcResultRouter(source)
-    waiter = router.register(("duplex", "active"))
+    waiter = router.register(("plugin", "active"))
 
     source.put(ErrorMessage(error="request failed", fatal=False, request_id="other"))
-    source.put(_duplex_result("active"))
+    source.put(_generic_result("active"))
 
-    assert waiter.get(timeout=1).control_id == "active"
+    assert waiter.get(timeout=1).correlation_id == "active"
     router.close()
 
 
 def test_rpc_result_router_close_unblocks_waiters_and_stops_consumer():
     source: queue.Queue = queue.Queue()
     router = RpcResultRouter(source)
-    waiter = router.register(("duplex", "pending"))
+    waiter = router.register(("plugin", "pending"))
 
     router.close()
 
@@ -100,4 +106,4 @@ def test_rpc_result_router_close_unblocks_waiters_and_stops_consumer():
     assert result.error == "RPC result router closed"
     assert not router._thread.is_alive()
     with pytest.raises(RuntimeError, match="router is closed"):
-        router.register(("duplex", "after-close"))
+        router.register(("plugin", "after-close"))

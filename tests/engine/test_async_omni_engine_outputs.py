@@ -16,18 +16,20 @@ from pytest_mock import MockerFixture
 from vllm_omni.engine.async_engine_utils import weak_shutdown_async_omni_engine
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
-    AppendDuplexInputMessage,
     CollectiveRPCResultMessage,
-    DuplexControlResultMessage,
     ErrorMessage,
     OutputMessage,
-    SignalDuplexTurnMessage,
 )
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
     DuplexControlClient,
     DuplexControlRequestError,
+)
+from vllm_omni.experimental.fullduplex.engine.messages import (
+    AppendDuplexInputMessage,
+    DuplexControlResultMessage,
+    SignalDuplexTurnMessage,
 )
 from vllm_omni.outputs import OmniRequestOutput
 

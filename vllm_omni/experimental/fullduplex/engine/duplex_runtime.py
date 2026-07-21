@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from vllm_omni.engine.duplex_contracts import (
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
+from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
     DuplexInputMode,
     DuplexOutputAction,
@@ -18,7 +19,6 @@ from vllm_omni.engine.duplex_contracts import (
     duplex_data_plane_request_info,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
 
 
 def load_duplex_runtime_extension(path: str | None) -> DuplexRuntimeExtension | None:
@@ -67,12 +67,6 @@ def validate_duplex_runtime_extension(
     return typed_extension
 
 
-from vllm_omni.experimental.fullduplex.engine.duplex_lease import (  # noqa: E402, F401
-    DuplexLeaseActivity,
-    DuplexLeaseConfig,
-    DuplexLeaseState,
-    DuplexSessionExpiry,
-)
 from vllm_omni.experimental.fullduplex.engine.duplex_session import (  # noqa: E402, F401
     DuplexAppendReservation,
     DuplexCompletedAppend,
@@ -82,6 +76,12 @@ from vllm_omni.experimental.fullduplex.engine.duplex_session import (  # noqa: E
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
     DuplexStageBinding,
+)
+from vllm_omni.experimental.fullduplex.engine.lease import (  # noqa: E402, F401
+    DuplexLeaseActivity,
+    DuplexLeaseConfig,
+    DuplexLeaseState,
+    DuplexSessionExpiry,
 )
 
 __all__ = [

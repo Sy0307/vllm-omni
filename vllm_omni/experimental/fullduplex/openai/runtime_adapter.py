@@ -64,6 +64,7 @@ class ServingRuntimeSessionState(Protocol):
     committed_audio_operation_id: str | None
     committed_audio_reserved_bytes: int
     deferred_response_create: bool
+    deferred_precreate_response: bool
     auto_response_waiting_for_speech: bool
     auto_response_new_turn_prefix_variant: str | None
     data_plane_task: asyncio.Task[None] | None

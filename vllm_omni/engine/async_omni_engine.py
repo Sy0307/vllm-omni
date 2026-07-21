@@ -48,13 +48,11 @@ from vllm_omni.engine.async_engine_utils import (
     upgrade_to_omni_request,
     weak_shutdown_async_omni_engine,
 )
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
-    DuplexFence,
     EngineQueueMessage,
     ErrorMessage,
     StageSubmissionMessage,
@@ -80,6 +78,8 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
+    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256

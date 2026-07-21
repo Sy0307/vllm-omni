@@ -16,18 +16,15 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
-    AppendDuplexInputMessage,
-    CloseDuplexSessionMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     ErrorMessage,
-    OpenDuplexSessionMessage,
     OutputMessage,
     ShutdownRequestMessage,
-    SignalDuplexTurnMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import (
@@ -36,7 +33,6 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
     _infer_stage_audio_sample_rate,
 )
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
@@ -45,6 +41,12 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeState,
     duplex_resource_request_id,
+)
+from vllm_omni.experimental.fullduplex.engine.messages import (
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
+    OpenDuplexSessionMessage,
+    SignalDuplexTurnMessage,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -830,6 +832,7 @@ async def test_duplex_control_plane_keeps_public_and_runtime_config_separate() -
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     open_message = _duplex_open_message(
         "sid-config-channels",
@@ -866,6 +869,7 @@ async def test_duplex_control_plane_preserves_turn_commit_without_model_extensio
         rpc_async_queue=rpc_q,
         stage_pools=[],
         duplex_runtime_extension=None,
+        enable_duplex_control=True,
     )
     assert isinstance(orchestrator.duplex_control_plane, DuplexControlPlane)
 
@@ -890,7 +894,6 @@ def test_ordinary_orchestrator_bypasses_duplex_control_plane() -> None:
         rpc_async_queue=asyncio.Queue(),
         stage_pools=[],
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
-        enable_duplex_control=False,
     )
 
     assert orchestrator.duplex_control_plane is None
@@ -907,6 +910,7 @@ async def test_duplex_close_cleans_preregistered_request_without_append() -> Non
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
         running_counter=running_counter,
     )
     open_message = _duplex_open_message("sid-preregister-close")
@@ -941,6 +945,7 @@ async def test_duplex_open_failure_rolls_back_session_and_reserved_request() -> 
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     open_message = _duplex_open_message(
         "sid-open-rollback",
@@ -969,6 +974,7 @@ async def test_duplex_running_counter_tracks_only_submitted_request() -> None:
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
         running_counter=running_counter,
     )
     open_message = _duplex_open_message("sid-duplex-counter")
@@ -1015,6 +1021,7 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=FailingPlanExtension(),
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-append-rollback", turn_id=1)
     session = orchestrator.duplex_sessions.open_session(
@@ -1053,6 +1060,7 @@ async def test_duplex_duplicate_append_operation_is_submitted_once() -> None:
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-idempotent-append")
     session = orchestrator.duplex_sessions.open_session(
@@ -1103,6 +1111,7 @@ async def test_duplex_barge_in_aborts_bound_stage_requests_before_releasing_fenc
         rpc_async_queue=rpc_q,
         stage_pools=stage_pools,
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     session = orchestrator.duplex_sessions.open_session(
         DuplexFence("sid-stage-signal"),
@@ -1157,6 +1166,7 @@ async def test_duplex_late_barge_in_releases_only_cancelled_fence_bindings() -> 
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_q,
         stage_pools=stage_pools,
+        enable_duplex_control=True,
     )
     cancelled_fence = DuplexFence("sid-late-stage-signal")
     session = orchestrator.duplex_sessions.open_session(
@@ -1205,6 +1215,7 @@ async def test_duplex_cancel_without_next_fence_is_rejected_without_releasing_bi
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_q,
         stage_pools=stage_pools,
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-cancel-contract")
     session = orchestrator.duplex_sessions.open_session(fence)
@@ -1237,6 +1248,7 @@ async def test_duplex_session_update_replaces_runtime_config() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_q,
         stage_pools=[],
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-update-config")
     session = orchestrator.duplex_sessions.open_session(
@@ -1275,6 +1287,7 @@ async def test_duplex_session_update_refreshes_next_append_sampling_policy() -> 
         rpc_async_queue=rpc_q,
         stage_pools=stage_pools,
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-update-policy")
     session = orchestrator.duplex_sessions.open_session(
@@ -1337,6 +1350,7 @@ async def test_duplex_invalid_session_update_preserves_previous_config() -> None
         rpc_async_queue=rpc_q,
         stage_pools=_build_stage_pools([[stage0]]),
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-invalid-update")
     original_runtime_config = {
@@ -1374,6 +1388,7 @@ async def test_duplex_arbitrary_non_cancel_signal_is_rejected() -> None:
         output_async_queue=asyncio.Queue(),
         rpc_async_queue=rpc_q,
         stage_pools=[],
+        enable_duplex_control=True,
     )
     fence = DuplexFence("sid-unsupported-signal")
     orchestrator.duplex_sessions.open_session(fence)
@@ -1408,6 +1423,7 @@ async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() ->
         rpc_async_queue=rpc_q,
         stage_pools=stage_pools,
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     cancelled_fence = DuplexFence("sid-cancel-late-append")
     next_fence = DuplexFence("sid-cancel-late-append", epoch=1)
@@ -1480,6 +1496,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         rpc_async_queue=asyncio.Queue(),
         stage_pools=stage_pools,
         duplex_runtime_extension=MiniCPMO45DuplexRuntimeExtension(),
+        enable_duplex_control=True,
     )
     session = orchestrator.duplex_sessions.open_session(
         DuplexFence("sid-bridge-turn"),

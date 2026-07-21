@@ -7,12 +7,12 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.duplex_request_client import DuplexRequestClient
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
     duplex_resource_request_id,
 )
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
 
