@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 
 class HiddenStates(TypedDict, total=False):
     output: torch.Tensor
-    tts: torch.Tensor
     trailing_text: torch.Tensor
     last: torch.Tensor
     layers: dict[int, torch.Tensor]
@@ -54,7 +53,6 @@ class Ids(TypedDict, total=False):
     all: list[int]
     prompt: list[int]
     output: list[int]
-    tts: list[int]
     speech_token: list[int]
     prior_image: list[int]
 
@@ -83,7 +81,6 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_size: int
     ref_context_request_id: str
     ref_context_included: bool
-    ref_audio_sr: int
     talker_prefill_offset: int
 
 
@@ -112,8 +109,6 @@ class _StructBase(msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unkno
 class HiddenStatesStruct(_StructBase):
     output: torch.Tensor | None = None
     output_shape: list[int] | None = None
-    # Generic AR-stage hidden-state handoff consumed by a downstream TTS stage.
-    tts: torch.Tensor | None = None
     trailing_text: torch.Tensor | None = None
     last: torch.Tensor | None = None
     layers: dict[int, torch.Tensor] | None = None
@@ -147,7 +142,6 @@ class IdsStruct(_StructBase):
     all: list[int] | None = None
     prompt: list[int] | None = None
     output: list[int] | None = None
-    tts: list[int] | None = None
     speech_token: list[int] | None = None
     prior_image: list[int] | None = None
 
@@ -176,25 +170,11 @@ class MetaStruct(_StructBase):
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
-    ref_audio_sr: int | None = None
     talker_prefill_offset: int | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
-    # Compatibility wire fields used by the MiniCPM streaming TTS handoff.
-    # Keep them in the strict msgspec schema until a versioned model metadata
-    # envelope can migrate existing chunk-transfer producers and consumers.
-    unit_token_id: int | None = None
-    unit_end_token_id: int | None = None
-    listen_token_id: int | None = None
-    speak_token_id: int | None = None
-    tts_bos_token_id: int | None = None
-    tts_eos_token_id: int | None = None
-    tts_pad_token_id: int | None = None
-    chunk_eos_token_id: int | None = None
-    chunk_tts_eos_token_id: int | None = None
-    turn_eos_token_id: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

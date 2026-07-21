@@ -1919,6 +1919,23 @@ def test_minicpmo_tts_ref_audio_lru_evicts_matching_vocoder_base_cache(tmp_path)
     assert not os.path.exists(first_path)
 
 
+def test_minicpmo_tts_prompt_wav_path_does_not_default_to_model_asset(tmp_path):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model_dir = tmp_path / "MiniCPM-o-4_5"
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    (assets_dir / "HT_ref_audio.wav").write_bytes(b"placeholder")
+
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model=str(model_dir)))
+    model._write_ref_audio_prompt_wav = lambda ref_audio, ref_audio_sr: None
+
+    assert model._resolve_prompt_wav_path(None, None) == (None, None)
+
+
 def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
