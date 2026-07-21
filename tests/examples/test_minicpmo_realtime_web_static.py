@@ -3,13 +3,15 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2] / "examples" / "online_serving" / "minicpmo" / "realtime_web" / "static"
+ROOT = Path(__file__).resolve().parents[2] / "examples" / "online_serving" / "minicpmo" / "realtime_web"
+APP_ROOT = ROOT / "app"
+STATIC_ROOT = APP_ROOT / "static"
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_page_exposes_focused_call_conversation_and_log_surfaces():
-    html = (ROOT / "index.html").read_text(encoding="utf-8")
+    html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
 
     assert 'id="callButton"' in html
     assert 'id="muteButton"' in html
@@ -23,7 +25,7 @@ def test_page_exposes_focused_call_conversation_and_log_surfaces():
 
 
 def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
-    source = (ROOT / "app.js").read_text(encoding="utf-8")
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "new URL(config.realtimePath, window.location.href)" in source
     assert "url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'" in source
@@ -43,7 +45,7 @@ def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
 
 
 def test_client_has_transactional_cleanup_and_visible_event_logging():
-    source = (ROOT / "app.js").read_text(encoding="utf-8")
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "async function stopSession" in source
     assert "track.stop()" in source
@@ -53,7 +55,7 @@ def test_client_has_transactional_cleanup_and_visible_event_logging():
 
 
 def test_client_keeps_microphone_upload_active_during_assistant_playback():
-    source = (ROOT / "app.js").read_text(encoding="utf-8")
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     upload_gate = re.search(r"function microphoneUploadEnabled\(\) \{(?P<body>.*?)\n  \}", source, re.DOTALL)
     begin_assistant = re.search(r"function beginAssistant\(responseId\) \{(?P<body>.*?)\n  \}", source, re.DOTALL)
 
@@ -65,8 +67,8 @@ def test_client_keeps_microphone_upload_active_during_assistant_playback():
 
 
 def test_audio_worklets_define_capture_and_playback_processors():
-    capture = (ROOT / "pcm_worklet.js").read_text(encoding="utf-8")
-    playback = (ROOT / "playback_worklet.js").read_text(encoding="utf-8")
+    capture = (STATIC_ROOT / "pcm_worklet.js").read_text(encoding="utf-8")
+    playback = (STATIC_ROOT / "playback_worklet.js").read_text(encoding="utf-8")
 
     assert "registerProcessor('fullduplex-pcm-capture'" in capture
     assert "Int16Array" in capture
@@ -76,8 +78,8 @@ def test_audio_worklets_define_capture_and_playback_processors():
 
 
 def test_playback_worklet_buffers_first_200ms_and_reports_underruns():
-    app = (ROOT / "app.js").read_text(encoding="utf-8")
-    playback = (ROOT / "playback_worklet.js").read_text(encoding="utf-8")
+    app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+    playback = (STATIC_ROOT / "playback_worklet.js").read_text(encoding="utf-8")
 
     assert "INITIAL_PLAYBACK_BUFFER_MS = 200" in app
     assert "initialBufferMs" in app

@@ -206,6 +206,9 @@ def test_completed_append_cache_is_bounded() -> None:
 
     assert list(session.completed_appends) == ["operation-1", "operation-2"]
 
+    session.accept_fence(DuplexFence(fence.session_id, epoch=1))
+    assert session.completed_appends == {}
+
 
 def test_lease_config_and_expiry_record_are_immutable() -> None:
     config = _lease_config()

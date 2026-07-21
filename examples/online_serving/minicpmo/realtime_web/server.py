@@ -19,7 +19,8 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
-STATIC_DIR = Path(__file__).parent / "static"
+APP_DIR = Path(__file__).parent / "app"
+STATIC_DIR = APP_DIR / "static"
 
 
 def _join_ws_url(base: str, path: str, query: str) -> str:
@@ -71,7 +72,7 @@ def build_app(
     ref_audio: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Experimental Full-Duplex Web Demo")
-    index_path = STATIC_DIR / "index.html"
+    index_path = APP_DIR / "index.html"
     app_version = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
 
     ref_audio_uri: str | None = None

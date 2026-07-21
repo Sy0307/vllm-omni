@@ -124,6 +124,7 @@ class DuplexSessionRuntimeState:
             self.input_seq = 0
             self.input_turn_seq = 0
             self._append_turn_key = None
+            self.completed_appends.clear()
         self.fence = fence
 
     def touch(self, fence: DuplexFence, activity: DuplexLeaseActivity) -> None:

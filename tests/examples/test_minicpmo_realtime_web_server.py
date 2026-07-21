@@ -3,7 +3,7 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from examples.online_serving.minicpmo.realtime_web.server import STATIC_DIR, _join_ws_url, build_app
+from examples.online_serving.minicpmo.realtime_web.server import APP_DIR, STATIC_DIR, _join_ws_url, build_app
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -54,6 +54,11 @@ def test_build_app_injects_public_realtime_url():
 def test_build_app_versions_client_bundle_and_disables_index_cache():
     client = TestClient(build_app())
     expected_version = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
+
+    assert (APP_DIR / "index.html").is_file()
+    assert (STATIC_DIR / "app.js").is_file()
+    assert not (APP_DIR.parent / "static").exists()
+    assert not (STATIC_DIR / "index.html").exists()
 
     index = client.get("/")
 

@@ -1240,9 +1240,20 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
             session_id=blocked.session_id,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
             payload={"audio": b"pcm"},
+            operation_id="blocked-operation",
         )
     )
     await asyncio.wait_for(stage_port.started.wait(), timeout=1)
+    plane.dispatch(
+        AppendDuplexInputMessage(
+            control_id="blocked-append-retry",
+            fence=blocked,
+            session_id=blocked.session_id,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+            payload={"audio": b"pcm"},
+            operation_id="blocked-operation",
+        )
+    )
     plane.dispatch(
         TouchDuplexSessionMessage(
             control_id="blocked-touch",
@@ -1265,4 +1276,13 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
 
     stage_port.release.set()
     await plane.drain()
-    assert [result_sink.get_nowait().control_id for _ in range(2)] == ["blocked-append", "blocked-touch"]
+    assert [result_sink.get_nowait().control_id for _ in range(3)] == [
+        "blocked-append",
+        "blocked-append-retry",
+        "blocked-touch",
+    ]
+    assert [
+        submission.context.session_id
+        for submission in stage_port.submit_calls
+        if submission.context.session_id == blocked.session_id
+    ] == [blocked.session_id]

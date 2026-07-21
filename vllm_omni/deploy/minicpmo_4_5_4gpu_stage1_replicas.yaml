@@ -1,4 +1,5 @@
-# MiniCPM-o 4.5 deploy: one thinker and three Stage1 replicas.
+# Experimental validation profile: one thinker and three Stage1 replicas.
+# This is not a recommended production entrypoint.
 #
 # Stage 0: GPU 0
 # Stage 1: replicas on GPU 1, 2, and 3

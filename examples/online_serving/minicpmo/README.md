@@ -26,9 +26,9 @@ Pick a deploy config that matches your GPU layout:
 | `minicpmo_4_5_2gpu.yaml` | 2 | 1 | Thinker on GPU0, talker+t2w on GPU1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | 2 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | 4 | Thinker 4-way TP on GPU0-3, talker+t2w on GPU4. |
-| `minicpmo_4_5_3gpu_stage1_replicas.yaml` | 3 | 1 | Thinker on GPU0, two talker+Token2wav replicas on GPU1/2. |
-| `minicpmo_4_5_4gpu_stage1_replicas.yaml` | 4 | 1 | Thinker on GPU0, three talker+Token2wav replicas on GPU1/2/3. |
-| `minicpmo_4_5_8x4090_stage1_replicas.yaml` | 8 | 4 | Thinker 4-way TP on GPU0-3, four talker+Token2wav replicas on GPU4-7. |
+| `minicpmo_4_5_3gpu_stage1_replicas.yaml` | 3 | 1 | Experimental validation profile: Thinker on GPU0, two talker+Token2wav replicas on GPU1/2. |
+| `minicpmo_4_5_4gpu_stage1_replicas.yaml` | 4 | 1 | Experimental validation profile: Thinker on GPU0, three talker+Token2wav replicas on GPU1/2/3. |
+| `minicpmo_4_5_8x4090_stage1_replicas.yaml` | 8 | 4 | Experimental validation profile: Thinker 4-way TP on GPU0-3, four talker+Token2wav replicas on GPU4-7. |
 | `minicpmo_4_5_duplex.yaml` | 2 | 1 | Experimental native duplex profile. |
 
 ```bash
@@ -42,6 +42,10 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
 checkpoint path. To start the experimental native duplex backend, use
 `vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
+
+The `*_stage1_replicas.yaml` files exercise composite Stage1 replica routing
+and failure recovery. They are validation profiles, not recommended production
+entrypoints.
 
 ## Send chat requests
 

@@ -449,6 +449,26 @@ the engine, and replaces the serving snapshots only after the engine ACK. A
 rejected candidate therefore leaves both the public configuration and runtime
 sampling generation unchanged.
 
+`DeployConfig.duplex_session` is an immutable, server-owned
+`DuplexSessionRuntimeConfig`. These limits are not read from client
+`extra_body` or session payloads:
+
+| Field | Default | Owner | Lifecycle or resource effect |
+|---|---:|---|---|
+| `idle_ttl_s` | `300.0` | Engine lease manager | Expires an attached or detached session after inactivity; `null` disables only idle expiry. |
+| `disconnect_grace_s` | `30.0` | Engine lease manager and API attachment registry | Bounds how long a detached session may retain engine resources before cleanup. |
+| `reaper_interval_s` | `5.0` | Orchestrator | Sets the cadence for lease expiry and pending cleanup retries. |
+| `resume_replay_ttl_s` | `60.0` | API attachment registry | Expires replay events retained for resume or takeover. |
+| `resume_replay_max_bytes_per_session` | `8388608` | API attachment registry | Bounds each session's replay buffer. |
+| `max_pending_input_bytes_per_session` | `16777216` | API session input ledger | Applies per-session byte backpressure before input is admitted. |
+| `max_pending_turns_per_session` | `4` | API session input ledger | Bounds queued turns that have not completed runtime processing. |
+| `max_sessions` | `1` | Engine session manager | Atomically enforces admission; closing sessions retain capacity until cleanup finalizes. |
+| `completed_append_cache_size` | `256` | Engine session manager | Bounds completed append idempotency records per session. |
+
+Deploy profiles may lower or raise these values to match scheduler capacity,
+but clients cannot override them. The engine remains authoritative for
+admission and cleanup ownership even when the API performs an early check.
+
 ## Generic-Path Cleanup
 
 Model-specific `MINICPMO45_PROFILE_LOGS` probes were removed from:
@@ -602,6 +622,24 @@ commit carrying `realtime_item_id`. Native auto-response may already have
 streamed those PCM samples into the runtime, so the runner accepts a validated
 commit even when no runtime-side chunk remains. A truly empty explicit buffer
 continues to return `input_audio_buffer_empty`.
+
+The commit-to-response contract is:
+
+| Session state at `input_audio_buffer.commit` | Runtime action | Required event outcome |
+|---|---|---|
+| Auto-response disabled, valid idle input | Commit and retain the input item. | Emit `input_audio_buffer.committed`; emit no response until an explicit `response.create`. |
+| Auto-response enabled, valid idle speech | Submit the final native append for the current model turn. | Emit `input_audio_buffer.committed` before model output. Create a response only on the first visible text/audio output; a model listen decision may end with `response.listen` and no response. |
+| Auto-response enabled, short overlap during an active response | Discard the short overlap as an acknowledgement. | Emit the committed/no-response acknowledgement; do not create or defer a response. |
+| Auto-response enabled, meaningful overlap during an active response | Retain one deferred payload and promote it after the active response terminates. | Emit `input_audio_buffer.committed` with deferred metadata. A later response follows the same visible-output rule and never reuses the prior response ID. |
+| Explicit silence/noise (`is_speech=false`) | Clear the physical input without a runtime append. | Emit the committed/no-response acknowledgement followed by `response.listen`. |
+| Empty or invalid input | Reject without changing response ownership. | Emit one typed `error`; do not emit `response.created`. |
+| Previous response cancelled or truncated and cleanup complete | Apply the corresponding idle rule above. | The prior response remains terminal; any later visible output receives a new response ID. |
+
+Append tasks, explicit commits, cancellation, and deferred promotion are
+serialized by the session actor. Tests cover post-response commits, active
+playback deferral, truncated-response ownership, and two-turn
+response-required execution; the H20 validation record below is the golden
+multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
