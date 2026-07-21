@@ -5,14 +5,15 @@ import pytest
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.duplex_request_client import DuplexRequestClient
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
     duplex_resource_request_id,
 )
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
+from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -311,12 +312,14 @@ async def test_async_omni_duplex_direct_output_keeps_stage_metrics():
             "duplex_native_decision": "speak",
         },
     )
-    direct_output = OmniRequestOutput(
-        request_id=request_id,
-        stage_id=0,
-        final_output_type="text",
-        finished=True,
-        duplex_output_decision=decision,
+    direct_output = attach_duplex_output_decision(
+        OmniRequestOutput(
+            request_id=request_id,
+            stage_id=0,
+            final_output_type="text",
+            finished=True,
+        ),
+        decision,
     )
     await req_state.queue.put(
         OutputMessage(
@@ -374,12 +377,14 @@ async def test_duplex_metrics_cursor_isolates_resumable_collect_windows():
             action=DuplexOutputAction.DIRECT_RESPONSE,
             metadata={"duplex_direct_response": True, "duplex_native_decision": "speak"},
         )
-        output = OmniRequestOutput(
-            request_id=request_id,
-            stage_id=0,
-            final_output_type="text",
-            finished=True,
-            duplex_output_decision=decision,
+        output = attach_duplex_output_decision(
+            OmniRequestOutput(
+                request_id=request_id,
+                stage_id=0,
+                final_output_type="text",
+                finished=True,
+            ),
+            decision,
         )
         return OutputMessage(
             request_id=request_id,
@@ -433,14 +438,17 @@ def test_async_omni_duplex_direct_output_prefers_outer_control_metadata():
             "duplex_native_decision": "listen",
         },
     )
-    output = OmniRequestOutput(
-        request_id="duplex-sid-e0-stage0",
-        stage_id=0,
-        request_output=SimpleNamespace(
-            outputs=[],
-            multimodal_output=SimpleNamespace(kind="processed-payload"),
+    output = attach_duplex_output_decision(
+        OmniRequestOutput(
+            request_id="duplex-sid-e0-stage0",
+            stage_id=0,
+            request_output=SimpleNamespace(
+                outputs=[],
+                multimodal_output=SimpleNamespace(kind="processed-payload"),
+                _custom_output={"inner": "completion"},
+            ),
         ),
-        duplex_output_decision=decision,
+        decision,
     )
 
     assert AsyncOmni._is_direct_duplex_data_plane_response(output)

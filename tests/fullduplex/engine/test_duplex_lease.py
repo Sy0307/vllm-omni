@@ -9,11 +9,11 @@ import pytest
 
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import DuplexInputMode
 from vllm_omni.experimental.fullduplex.engine.duplex_session import DuplexSessionRuntimeManager
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
 )
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

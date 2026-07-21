@@ -10,7 +10,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_plane_request_info
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,

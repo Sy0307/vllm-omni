@@ -34,7 +34,6 @@ from vllm_omni.engine.orchestrator import (
     _infer_stage_audio_sample_rate,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexInputMode,
@@ -45,6 +44,7 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
 from vllm_omni.experimental.fullduplex.engine.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
+    DuplexFence,
     OpenDuplexSessionMessage,
     SignalDuplexTurnMessage,
 )

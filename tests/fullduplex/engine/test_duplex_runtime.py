@@ -1,10 +1,14 @@
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine import duplex_runtime
+from vllm_omni.experimental.fullduplex.engine.contracts import (
+    duplex_data_plane_request_info,
+    duplex_resource_request_id,
+)
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexInputMode,
     DuplexOutputAction,
@@ -12,21 +16,27 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeManager,
 )
-from vllm_omni.experimental.fullduplex.engine.omni import (
-    build_duplex_data_plane_prompt,
-    duplex_data_plane_request_info,
-    duplex_new_user_turn_prefix_reserve,
-    duplex_resource_request_id,
-    duplex_scheduler_token_budget,
-)
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
+    build_duplex_data_plane_prompt,
+    duplex_new_user_turn_prefix_reserve,
+    duplex_scheduler_token_budget,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_duplex_fence_is_immutable():
+    fence = DuplexFence("session")
+
+    with pytest.raises(FrozenInstanceError):
+        fence.epoch = 1  # type: ignore[misc]
+
+    assert not hasattr(fence, "__dict__")
 
 
 def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
@@ -64,24 +74,6 @@ def test_duplex_runtime_tracks_same_request_id_for_each_pipeline_stage():
     assert session.stage_bindings[1].request_id == "req-shared"
     assert session.resource_request_ids() == ["req-shared"]
     assert session.input_seq == 0
-
-
-def test_experimental_runtime_types_are_compatibility_reexports():
-    from vllm_omni.experimental.fullduplex.engine import omni as compatibility
-
-    assert compatibility.DuplexInputMode is DuplexInputMode
-    assert compatibility.DuplexRuntimeCapabilities is DuplexRuntimeCapabilities
-    assert compatibility.DuplexSessionRuntimeManager is DuplexSessionRuntimeManager
-
-
-def test_duplex_session_state_has_a_dedicated_experimental_module():
-    from vllm_omni.experimental.fullduplex.engine import duplex_session
-    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseConfig
-
-    assert duplex_runtime.DuplexAppendReservation is duplex_session.DuplexAppendReservation
-    assert duplex_runtime.DuplexSessionRuntimeState is duplex_session.DuplexSessionRuntimeState
-    assert duplex_runtime.DuplexSessionRuntimeManager is duplex_session.DuplexSessionRuntimeManager
-    assert duplex_runtime.DuplexLeaseConfig is DuplexLeaseConfig
 
 
 def test_duplex_runtime_extension_validation_rejects_missing_methods():

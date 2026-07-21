@@ -24,11 +24,11 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexInputMode,
     DuplexRuntimeCapabilities,
 )
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.experimental.fullduplex.engine.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
+    DuplexFence,
     DuplexSessionLifecycleMessage,
     OpenDuplexSessionMessage,
     ResumeDuplexSessionMessage,

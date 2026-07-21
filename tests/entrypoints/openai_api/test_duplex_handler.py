@@ -12,11 +12,10 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexSessionLifecycleMessage
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
@@ -49,6 +48,7 @@ from vllm_omni.experimental.fullduplex.openai.serving import (
     should_enable_duplex_endpoint,
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import DuplexWebSocketActor
+from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -2176,23 +2176,25 @@ def test_direct_listen_decision_survives_inner_completion_metadata():
         output=inner_output,
     )
     assert decision is not None
-    output = OmniRequestOutput(
-        request_id="duplex-direct-listen",
-        finished=True,
-        stage_id=0,
-        final_output_type=decision.final_output_type,
-        request_output=inner_output,
-        duplex_output_decision=decision,
-        metrics={
-            "stage_metrics": {
-                "0": {
-                    "vllm_ttft_ms": 125.0,
-                    "vllm_tpot_ms": 18.0,
-                    "vllm_itl_ms": 17.5,
-                    "vllm_itls_ms": [17.0, 18.0],
+    output = attach_duplex_output_decision(
+        OmniRequestOutput(
+            request_id="duplex-direct-listen",
+            finished=True,
+            stage_id=0,
+            final_output_type=decision.final_output_type,
+            request_output=inner_output,
+            metrics={
+                "stage_metrics": {
+                    "0": {
+                        "vllm_ttft_ms": 125.0,
+                        "vllm_tpot_ms": 18.0,
+                        "vllm_itl_ms": 17.5,
+                        "vllm_itls_ms": [17.0, 18.0],
+                    }
                 }
-            }
-        },
+            },
+        ),
+        decision,
     )
 
     results = list(_test_data_plane().project_output(output))
@@ -2944,13 +2946,15 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
         output=inner_output,
     )
     assert decision is not None
-    listen_output = OmniRequestOutput(
-        request_id=request_id,
-        finished=True,
-        stage_id=0,
-        final_output_type=decision.final_output_type,
-        request_output=inner_output,
-        duplex_output_decision=decision,
+    listen_output = attach_duplex_output_decision(
+        OmniRequestOutput(
+            request_id=request_id,
+            finished=True,
+            stage_id=0,
+            final_output_type=decision.final_output_type,
+            request_output=inner_output,
+        ),
+        decision,
     )
     append_result = {
         "operation": "append",

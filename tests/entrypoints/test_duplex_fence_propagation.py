@@ -2,7 +2,7 @@ import pytest
 
 from tests.entrypoints.openai_api.test_duplex_handler import FakeChatService, TimedWebSocket
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSession, DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
 

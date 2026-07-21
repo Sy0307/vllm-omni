@@ -9,8 +9,8 @@ from copy import deepcopy
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexPlaybackCommitPolicy,

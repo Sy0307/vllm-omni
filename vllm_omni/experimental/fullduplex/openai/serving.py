@@ -19,8 +19,7 @@ from vllm_omni.entrypoints.openai.duplex_capability import (
     should_enable_duplex_endpoint,
 )
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexSessionLifecycleMessage
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.openai.chat_fallback import (
     ChatFallbackProjectorMixin,
 )
