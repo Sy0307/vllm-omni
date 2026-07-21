@@ -146,19 +146,23 @@ class RealtimeEventCollector:
         return None
 
     def add(self, event: dict[str, object], *, received_at_s: float | None = None) -> None:
-        self.events.append(event)
-        self.event_received_at_s.append(time.monotonic() if received_at_s is None else float(received_at_s))
-        response_id = self.response_id(event)
-        if event.get("type") == "response.created" and response_id and response_id not in self.response_ids:
+        received_at = time.monotonic() if received_at_s is None else float(received_at_s)
+        stored_event = dict(event)
+        stored_event.setdefault("_client_received_at_s", received_at)
+        self.events.append(stored_event)
+        self.event_received_at_s.append(received_at)
+        response_id = self.response_id(stored_event)
+        event_type = stored_event.get("type")
+        if event_type == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
-        if event.get("type") == "response.audio.delta":
-            delta = event.get("delta") or event.get("audio")
+        if event_type == "response.audio.delta":
+            delta = stored_event.get("delta") or stored_event.get("audio")
             if isinstance(delta, str) and response_id:
                 try:
                     self.response_audio.setdefault(response_id, []).append(base64.b64decode(delta))
                 except ValueError:
                     pass
-            sample_rate_hz = event.get("sample_rate_hz")
+            sample_rate_hz = stored_event.get("sample_rate_hz")
             if isinstance(sample_rate_hz, int) and sample_rate_hz > 0:
                 self.output_sample_rate_hz = sample_rate_hz
 

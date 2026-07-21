@@ -24,6 +24,7 @@
   const OUTPUT_RATE = 24000;
   const SEND_INTERVAL_MS = 200;
   const ECHO_GUARD_MS = 300;
+  const INITIAL_PLAYBACK_BUFFER_MS = 200;
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
   // (assets/presets/{omni,audio_duplex}/*.yaml).
@@ -282,13 +283,18 @@
     setModel('Speaking');
   }
 
-  function feedPlayback(decoded) {
+  function feedPlayback(decoded, responseId) {
     if (!decoded || !decoded.pcm || decoded.pcm.length === 0 || !playbackNode) return;
     const pcm = resampleInt16(decoded.pcm, decoded.sourceRate, playbackRate);
     responseHasAudio = true;
     assistantActive = true;
-    setPlayback('Playing');
-    playbackNode.port.postMessage({ type: 'audio', pcm }, [pcm.buffer]);
+    setPlayback('Buffering');
+    playbackNode.port.postMessage({
+      type: 'audio',
+      pcm,
+      responseId: responseId || currentResponseId,
+      initialBufferMs: INITIAL_PLAYBACK_BUFFER_MS,
+    }, [pcm.buffer]);
   }
 
   function requestPlaybackDrain(responseId) {
@@ -314,6 +320,9 @@
     const responseId = message.responseId || currentResponseId;
     sendPlaybackAck(responseId, Number(message.playedMs) || 0);
     setPlayback('Idle');
+    if (message.underrunMs > 0) {
+      appendLog(`playback underrun ${message.underrunMs} ms`);
+    }
     window.setTimeout(() => {
       assistantActive = false;
       currentResponseId = null;
@@ -344,7 +353,7 @@
         assistantActive = true;
         setModel('Speaking');
         decodeAudioDelta(event)
-          .then(feedPlayback)
+          .then((decoded) => feedPlayback(decoded, responseId))
           .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
         break;
       case 'response.audio.done':
@@ -389,6 +398,9 @@
     playbackNode.port.onmessage = (message) => {
       if (message.data.type === 'playback-started') setPlayback('Playing');
       else if (message.data.type === 'playback-drained') playbackDrained(message.data);
+      else if (message.data.type === 'playback-underrun') {
+        runtimeDetail.textContent = `Playback underrun ${message.data.underrunMs || 0} ms`;
+      }
     };
     playbackNode.connect(playbackContext.destination);
     await playbackContext.resume();
