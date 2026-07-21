@@ -1104,9 +1104,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ref_audio_sr = meta_info.get("ref_audio_sr", info.get("ref_audio_sr"))
             prompt_wav_path, temp_prompt_wav_path = self._resolve_prompt_wav_path(ref_audio, ref_audio_sr)
             if prompt_wav_path is None:
-                logger.warning(
-                    "4.5 Talker duplex streaming: no ref_audio prompt; skipping audio synthesis"
-                )
+                logger.warning("4.5 Talker duplex streaming: no ref_audio prompt; skipping audio synthesis")
                 yield self._empty_audio_chunk(), True
                 return
             state = _TalkerTurnState(

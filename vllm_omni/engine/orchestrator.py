@@ -29,7 +29,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
@@ -144,7 +143,6 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
-    resumable_segment_policy: ResumableSegmentPolicy | None = None,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -186,7 +184,6 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
-        resumable_segment_policy=resumable_segment_policy,
     )
 
 
@@ -324,7 +321,6 @@ class _OrchestratorDuplexStagePort:
             params=context.stage_sampling_params,
             model_config=self._stage_pools[context.stage_id].stage_vllm_config.model_config,
             resumable=True,
-            resumable_segment_policy=submission.segment_policy,
         )
         request.external_req_id = request.request_id
         pool = self._stage_pools[context.stage_id]
@@ -1369,7 +1365,6 @@ class Orchestrator:
         *,
         mm_features: list | None = None,
         resumable: bool = False,
-        resumable_segment_policy: ResumableSegmentPolicy | None = None,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -1380,7 +1375,6 @@ class Orchestrator:
                 model_config=next_pool.stage_vllm_config.model_config,
                 mm_features=mm_features,
                 resumable=resumable,
-                resumable_segment_policy=resumable_segment_policy,
             )
             request.external_req_id = request.request_id
             return request
@@ -1395,11 +1389,6 @@ class Orchestrator:
             resumable=resumable,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
-        if resumable_segment_policy is not None:
-            request = OmniEngineCoreRequest.from_request(
-                request,
-                resumable_segment_policy=resumable_segment_policy,
-            )
         request.external_req_id = req_id
         return request
 
@@ -1432,21 +1421,6 @@ class Orchestrator:
     @staticmethod
     def _is_duplex_session_request(req_state: OrchestratorRequestState) -> bool:
         return req_state.duplex_identity is not None
-
-    def _duplex_segment_policy(
-        self,
-        req_state: OrchestratorRequestState,
-        params: object,
-        *,
-        resumable: bool,
-    ) -> ResumableSegmentPolicy | None:
-        if self.duplex_control_plane is None:
-            return None
-        return self.duplex_control_plane.segment_policy(
-            self._duplex_output_context(req_state),
-            params,
-            resumable=resumable,
-        )
 
     @staticmethod
     def _duplex_fence_for_req_state(
@@ -1864,11 +1838,6 @@ class Orchestrator:
                     model_config=next_pool.stage_vllm_config.model_config,
                     mm_features=req_state.mm_features,
                     resumable=next_stage_resumable,
-                    resumable_segment_policy=self._duplex_segment_policy(
-                        req_state,
-                        params,
-                        resumable=next_stage_resumable,
-                    ),
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
@@ -1979,11 +1948,6 @@ class Orchestrator:
                 params=params,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
-                resumable_segment_policy=self._duplex_segment_policy(
-                    req_state,
-                    params,
-                    resumable=next_stage_resumable,
-                ),
             )
 
             if already_submitted:
@@ -2071,11 +2035,6 @@ class Orchestrator:
                     params=params,
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
-                    resumable_segment_policy=self._duplex_segment_policy(
-                        req_state,
-                        params,
-                        resumable=downstream_resumable,
-                    ),
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(

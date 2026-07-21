@@ -13,7 +13,6 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 
 # isort: on
 
@@ -91,37 +90,3 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
-
-
-def test_resumable_segment_boundary_uses_typed_policy_only() -> None:
-    sched = _make_scheduler(stage_id=1)
-    request = _make_request()
-    request.sampling_params = SamplingParams(max_tokens=8, stop_token_ids=[151645])
-    request.resumable = True
-    request.resumable_segment_policy = ResumableSegmentPolicy(
-        stop_token_ids=(151645,),
-        max_segment_tokens=8,
-    )
-    request.model_intermediate_buffer = {
-        "duplex": {
-            "data_plane": False,
-            "session_config": {
-                "duplex_stage_sampling_params": {
-                    "0": {"stop_token_ids": [111]},
-                    "1": {"stop_token_ids": [999]},
-                }
-            },
-        }
-    }
-
-    assert sched._is_resumable_segment_boundary(request, [151645]) is True
-
-
-def test_resumable_request_without_segment_policy_has_no_boundary() -> None:
-    sched = _make_scheduler(stage_id=1)
-    request = _make_request()
-    request.resumable = True
-    request.resumable_segment_policy = None
-    request.model_intermediate_buffer = {"duplex": {"data_plane": True}}
-
-    assert sched._is_resumable_segment_boundary(request, [151645]) is False

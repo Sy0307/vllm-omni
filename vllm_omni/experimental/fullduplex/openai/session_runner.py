@@ -12,6 +12,11 @@ from vllm.logger import init_logger
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
+from vllm_omni.experimental.fullduplex.openai.commit_policy import (
+    CommitAction,
+    CommitSnapshot,
+    decide_commit_action,
+)
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexPlaybackCommitPolicy,
     DuplexSession,
@@ -1434,17 +1439,18 @@ class DuplexSessionRunnerMixin:
                                 }
                             )
                             continue
-                        waiting_input_commit_after_response = (
-                            self._session_auto_responds(session)
-                            and native.auto_response_waiting_for_speech
-                            and native.speech_since_commit
-                            and session.active_response_id is None
+                        commit_action = decide_commit_action(
+                            CommitSnapshot(
+                                auto_responds=self._session_auto_responds(session),
+                                speech_since_commit=native.speech_since_commit,
+                                auto_response_waiting_for_speech=native.auto_response_waiting_for_speech,
+                                active_response_id=session.active_response_id,
+                                overlap_speech_ms=session.overlap_speech_ms,
+                                native_response_in_progress=native_response_in_progress(),
+                                playback_active=self._assistant_playback_active(session),
+                            )
                         )
-                        if (
-                            native_response_in_progress()
-                            and session.overlap_speech_ms > 0
-                            and not waiting_input_commit_after_response
-                        ):
+                        if commit_action is CommitAction.DEFER_ACTIVE_RESPONSE:
                             if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
                                 native.audio_buffer.clear()
                                 session.release_all_input_bytes()
@@ -1517,11 +1523,7 @@ class DuplexSessionRunnerMixin:
                                 committed_payload["response_create_deferred"] = should_create_response
                                 await emit_event(committed_payload)
                                 continue
-                        if (
-                            self._session_auto_responds(session)
-                            and native.speech_since_commit
-                            and session.active_response_id is None
-                        ):
+                        if commit_action is CommitAction.START_AUTO_RESPONSE:
                             commit_reservation = native.audio_buffer.prepare_commit(
                                 operation_id=uuid.uuid4().hex,
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,

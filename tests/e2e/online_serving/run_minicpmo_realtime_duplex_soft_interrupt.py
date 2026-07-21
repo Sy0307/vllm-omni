@@ -20,7 +20,6 @@ import uuid
 import wave
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
 AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
@@ -213,17 +212,10 @@ def summarize_artifacts(
     times = [_event_received_at_s(event) for event in events]
     clean_times = [received_at for received_at in times if received_at is not None]
     t0 = min(clean_times) if clean_times else None
-    response_summaries = [
-        _response_summary(events, response_id, t0=t0)
-        for response_id in response_ids
-    ]
+    response_summaries = [_response_summary(events, response_id, t0=t0) for response_id in response_ids]
     commit_index = _first_event_index(events, "input_audio_buffer.committed")
     first_created_index = next(
-        (
-            summary["created_index"]
-            for summary in response_summaries
-            if isinstance(summary.get("created_index"), int)
-        ),
+        (summary["created_index"] for summary in response_summaries if isinstance(summary.get("created_index"), int)),
         None,
     )
     first_done_index = (
@@ -237,18 +229,10 @@ def summarize_artifacts(
         else None
     )
     last_done_index = next(
-        (
-            summary["done_indices"][0]
-            for summary in reversed(response_summaries)
-            if summary.get("done_indices")
-        ),
+        (summary["done_indices"][0] for summary in reversed(response_summaries) if summary.get("done_indices")),
         None,
     )
-    listen_indices = [
-        index
-        for index, event in enumerate(events)
-        if event.get("type") == "response.listen"
-    ]
+    listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
     required_response_summaries = response_summaries[:min_responses]
     enough_responses = len(response_summaries) >= min_responses
     response_lifecycle_ok = enough_responses and all(
@@ -259,37 +243,26 @@ def summarize_artifacts(
         for summary in required_response_summaries
     )
     response_audio_contract_ok = enough_responses and all(
-        summary.get("audio_before_done_ok") is True
-        and int(summary.get("stale_audio_count", 0)) == 0
+        summary.get("audio_before_done_ok") is True and int(summary.get("stale_audio_count", 0)) == 0
         for summary in required_response_summaries
     )
     second_response_before_final_commit = (
-        second_created_index is not None
-        and commit_index is not None
-        and second_created_index < commit_index
+        second_created_index is not None and commit_index is not None and second_created_index < commit_index
     )
-    listen_before_first_response = (
-        first_created_index is not None
-        and any(index < first_created_index for index in listen_indices)
+    listen_before_first_response = first_created_index is not None and any(
+        index < first_created_index for index in listen_indices
     )
     listen_between_responses = (
         first_done_index is not None
         and second_created_index is not None
         and any(first_done_index < index < second_created_index for index in listen_indices)
     )
-    listen_after_last_done = (
-        last_done_index is not None
-        and any(index > last_done_index for index in listen_indices)
-    )
-    final_listen_after_commit = (
-        commit_index is not None
-        and any(index > commit_index for index in listen_indices)
-    )
+    listen_after_last_done = last_done_index is not None and any(index > last_done_index for index in listen_indices)
+    final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
-    transcript_expectation_ok = (
-        not expect_transcript_substring
-        or _normalize_text(expect_transcript_substring) in _normalize_text(transcript)
-    )
+    transcript_expectation_ok = not expect_transcript_substring or _normalize_text(
+        expect_transcript_substring
+    ) in _normalize_text(transcript)
     error_events = [
         event
         for event in events

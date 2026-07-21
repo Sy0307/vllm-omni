@@ -25,7 +25,6 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -136,38 +135,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return result
 
     def _should_defer_waiting_admission(self) -> bool:
-        return False
-
-    def _is_resumable_segment_boundary(
-        self,
-        request: Request,
-        new_token_ids: list[int],
-    ) -> bool:
-        if not getattr(request, "resumable", False):
-            return False
-        policy = getattr(request, "resumable_segment_policy", None)
-        if not isinstance(policy, ResumableSegmentPolicy):
-            return False
-        output_token_ids = getattr(request, "output_token_ids", None)
-        output_token_count = len(output_token_ids) if isinstance(output_token_ids, list) else 0
-        if not policy.reached_boundary(new_token_ids, output_token_count):
-            return False
-        if policy.stop_token_ids and any(int(token_id) in policy.stop_token_ids for token_id in new_token_ids):
-            logger.info(
-                "[OmniARScheduler] resumable segment boundary by stop token: req=%s tokens=%s stop_token_ids=%s",
-                request.request_id,
-                new_token_ids,
-                policy.stop_token_ids,
-            )
-            return True
-        if policy.max_segment_tokens is not None:
-            logger.info(
-                "[OmniARScheduler] resumable segment boundary by max tokens: req=%s output_len=%d max_tokens=%d",
-                request.request_id,
-                output_token_count,
-                policy.max_segment_tokens,
-            )
-            return True
         return False
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
@@ -453,10 +420,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # If criteria returns False, it might have triggered a background
             # transfer (e.g. prefill finished / special token) but continues decoding.
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
-                stopped = True
-
-            if not stopped and new_token_ids and self._is_resumable_segment_boundary(request, new_token_ids):
-                request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -751,8 +714,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []
-        if hasattr(update, "resumable_segment_policy"):
-            session.resumable_segment_policy = update.resumable_segment_policy
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if self.vllm_config.model_config.stage_id != 0:

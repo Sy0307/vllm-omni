@@ -10,7 +10,6 @@ from dataclasses import FrozenInstanceError
 import msgspec
 import pytest
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import (
     DuplexControlPlane,
     DuplexOutputContext,
@@ -60,20 +59,7 @@ class _Extension:
     ):
         del request_id, fence, session_config, runtime_config, seq, turn_seq, mode, payload, final
         assert sampling_params == "configured-0"
-        return DuplexAppendPlan(
-            prompt={"prompt_token_ids": [1, 2, 3]},
-            segment_policy=ResumableSegmentPolicy(
-                stop_token_ids=(99,),
-                max_segment_tokens=4,
-            ),
-        )
-
-    def segment_policy(self, sampling_params):
-        del sampling_params
-        return ResumableSegmentPolicy(
-            stop_token_ids=(99,),
-            max_segment_tokens=4,
-        )
+        return DuplexAppendPlan(prompt={"prompt_token_ids": [1, 2, 3]})
 
     def decide_output(self, **kwargs):
         del kwargs
@@ -171,10 +157,6 @@ async def test_control_plane_uses_frozen_typed_stage_context_without_request_sta
     submission = stage_port.submit_calls[-1]
     assert submission.context == stage_port.ensure_calls[-1]
     assert submission.prompt == {"prompt_token_ids": [1, 2, 3]}
-    assert submission.segment_policy == ResumableSegmentPolicy(
-        stop_token_ids=(99,),
-        max_segment_tokens=4,
-    )
     assert submission.already_submitted is False
     assert not hasattr(submission, "request_state")
 

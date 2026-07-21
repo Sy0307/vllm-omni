@@ -22,7 +22,6 @@ from typing import Any, Protocol
 
 from vllm.logger import init_logger
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
     DuplexInputMode,
@@ -240,10 +239,6 @@ class DuplexControlPlane:
             raise TypeError("duplex runtime extension must return sampling parameters as a tuple")
         if len(configured) != len(defaults):
             raise ValueError("duplex runtime extension must return one sampling parameter per stage")
-        for sampling_params in configured:
-            policy = self._extension.segment_policy(sampling_params)
-            if not isinstance(policy, ResumableSegmentPolicy):
-                raise TypeError("duplex runtime extension segment_policy() must return ResumableSegmentPolicy")
         return list(configured)
 
     @staticmethod
@@ -474,7 +469,6 @@ class DuplexControlPlane:
         submission = DuplexStageSubmission(
             context=request_context,
             prompt=append_plan.prompt,
-            segment_policy=append_plan.segment_policy,
             already_submitted=already_submitted,
         )
         submission_result = await self._stage_port.submit(submission)
@@ -975,19 +969,6 @@ class DuplexControlPlane:
             code = "failed_precondition"
             retryable = False
         return DuplexControlError(code=code, message=message, retryable=retryable)
-
-    def segment_policy(
-        self,
-        context: DuplexOutputContext | None,
-        params: object,
-        *,
-        resumable: bool,
-    ) -> ResumableSegmentPolicy | None:
-        if not resumable or context is None:
-            return None
-        if self._extension is None:
-            raise RuntimeError("duplex_runtime_extension_not_configured")
-        return self._extension.segment_policy(params)
 
     def decide_output(
         self,

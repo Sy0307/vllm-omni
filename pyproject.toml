@@ -300,7 +300,6 @@ extend-ignore-identifiers-re = [
     ".*[Nn][Dd]3.*",
     ".*updator.*",
     "byt5.*",
-    "afe93659",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",

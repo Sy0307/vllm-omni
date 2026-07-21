@@ -10,13 +10,9 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "audio_text_total_chars",
         "duplex_epoch",
         "duplex_turn_id",
-        "llm_output_text",
         "llm_output_text_utf8",
-        "sample_rate",
-        "sample_rate_hz",
-        "sr",
-        "text",
         "tts_is_last_chunk",
+        "turn_end",
     }
 )
 
@@ -31,9 +27,9 @@ def replace_snapshot_keys(
     accumulated: MultimodalPayload,
     incoming: MultimodalPayload,
 ) -> None:
-    """Replace per-chunk metadata and prompt snapshots with latest values."""
+    """Replace per-chunk metadata with the latest values."""
     for key in (*incoming.tensors, *incoming.metadata):
-        if key == "duplex_prompt_token_ids" or _is_chunk_metadata_key(key):
+        if _is_chunk_metadata_key(key):
             accumulated.tensors.pop(key, None)
             accumulated.metadata.pop(key, None)
 

@@ -113,19 +113,6 @@ def test_duplex_runtime_extension_validation_rejects_sampling_type_mismatch():
         )
 
 
-def test_duplex_runtime_extension_validation_rejects_segment_policy_type():
-    class WrongSegmentPolicyExtension(MiniCPMO45DuplexRuntimeExtension):
-        def segment_policy(self, sampling_params):
-            del sampling_params
-            return object()
-
-    with pytest.raises(TypeError, match="ResumableSegmentPolicy"):
-        duplex_runtime.validate_duplex_runtime_extension(
-            WrongSegmentPolicyExtension(),
-            sampling_defaults=(SamplingParams(),),
-        )
-
-
 def test_duplex_output_decision_metadata_is_immutable():
     decision = DuplexOutputDecision(
         action=DuplexOutputAction.DIRECT_RESPONSE,
@@ -508,9 +495,7 @@ def test_resource_request_id_session_membership_uses_encoded_identity():
 
     assert duplex_resource_request_belongs_to_session(request_id, "sid-with-dashes") is True
     assert duplex_resource_request_belongs_to_session(request_id, "sid") is False
-    assert (
-        duplex_resource_request_belongs_to_session("duplex-s.invalid.i.x.e.7.r.stage0", "sid") is False
-    )
+    assert duplex_resource_request_belongs_to_session("duplex-s.invalid.i.x.e.7.r.stage0", "sid") is False
 
 
 def test_placeholder_budget_is_planned_inside_omni_engine_boundary():

@@ -184,7 +184,6 @@ responsibility:
 | --- | --- |
 | `engine.messages` | ordinary engine queue messages and collective RPC envelopes |
 | `engine.rpc_result_router` | generic correlation routing through each result message's `rpc_correlation_key` |
-| `core.sched.segment_policy` | scheduler segment policy and resumable lifecycle contract |
 | `experimental.fullduplex.engine.contracts` | immutable duplex DTOs, extension/stage protocols, typed decisions, request-ID codec |
 | `experimental.fullduplex.engine.lease` | duplex lease activity, TTL/grace configuration, and expiry records |
 | `experimental.fullduplex.engine.messages` | identity fence and duplex control message/result envelopes |
@@ -240,13 +239,13 @@ Native append effects form a per-session tail. Each append awaits its
 predecessor before entering the engine, and `session.update` awaits that same
 tail before changing either the serving aggregate or engine configuration.
 Consequently, an append received before an update uses the old immutable
-sampling/policy snapshot, while the first accepted append after the update uses
+sampling snapshot, while the first accepted append after the update uses
 the new generation.
 
 The engine increments `config_generation` when it accepts the replacement
-configuration. At the next append boundary, the orchestrator rebuilds sampling
-parameters and `ResumableSegmentPolicy` from stage defaults through the model
-extension. It never mutates the snapshot of a segment already in progress.
+configuration. At the next append boundary, the control plane rebuilds sampling
+parameters from stage defaults through the model extension. It never mutates
+the snapshot of a segment already in progress.
 
 ### Irreversible cancellation fence
 
@@ -361,7 +360,6 @@ mechanisms:
 vllm_omni.engine.messages                  # ordinary queue and collective RPC envelopes
 vllm_omni.engine.rpc_result_router         # generic correlation routing
 vllm_omni.engine.async_engine_utils        # ordinary engine lifecycle helpers
-vllm_omni.core.sched.segment_policy        # scheduler segment policy
 ```
 
 The full-duplex implementation remains experimental:
@@ -397,16 +395,16 @@ exports remain lazy and are not part of ordinary startup.
 The MiniCPM pipeline opts into both and installs
 `MiniCPMO45DuplexRuntimeExtension`; ordinary pipelines construct neither a
 ControlPlane nor a ControlClient. The model-neutral protocol exposes
-sampling-parameter configuration, append planning, a typed
-`ResumableSegmentPolicy`, and a typed stage-output decision. MiniCPM owns
+sampling-parameter configuration, append planning, and a typed stage-output
+decision. MiniCPM owns
 stage-specific overrides, PCM-to-token budgeting, force-listen payload policy,
 special-token interpretation, and `listen` response metadata. The generic
 Orchestrator does not parse MiniCPM session keys, `listen_token_id`, or construct
 MiniCPM metadata, and it does not import the adapter.
 
-Extension loading is fail-fast. Startup validates every required callable,
-the number and type of returned stage sampling parameters, and the typed
-segment policy. Invalid custom extensions fail before a session can open.
+Extension loading is fail-fast. Startup validates every required callable and
+the number and type of returned stage sampling parameters. Invalid custom
+extensions fail before a session can open.
 
 Direct listen/speak outcomes use `DuplexOutputDecision` on
 `OmniRequestOutput`. That typed envelope is authoritative over inner completion
@@ -440,7 +438,7 @@ The MiniCPM serving adapter derives `runtime_config` from deploy/model defaults
 and validated public options. Clients cannot provide private runtime keys in
 `session.create` or `session.update`; response-scoped `extra_body` drops those
 keys rather than turning them into engine policy. The ControlPlane constructs
-sampling parameters and `ResumableSegmentPolicy` only from `runtime_config`,
+sampling parameters only from `runtime_config`,
 while append planning receives both snapshots explicitly. Raw Realtime
 `extra_body` is not used as the engine's sampling-policy channel.
 
@@ -487,13 +485,12 @@ policy behind that hook; the runner no longer reads `_minicpmo45_*` attributes
 or retries sampling after matching `TypeError` text.
 
 The scheduler no longer parses serving `session_config`, `extra_body`, or
-`duplex_stage_sampling_params`. Stage-specific overrides are materialized by
-the model runtime extension before scheduler admission. The orchestrator puts a
-typed `ResumableSegmentPolicy` on each resumable stage request, and streaming
-updates preserve that policy. The scheduler consumes only the policy and
-resumable-request state; it does not inspect a duplex dictionary, Realtime
-configuration, or MiniCPM sampling fields. A resumable request without a policy
-does not gain MiniCPM segment-stop behavior.
+`duplex_stage_sampling_params`. Stage-specific overrides are materialized as
+ordinary `SamplingParams` by the model runtime extension before scheduler
+admission. Existing vLLM stop-token, EOS, and max-token handling defines each
+segment boundary; `resumable=True` parks the request for the next streaming
+update. The scheduler does not inspect a duplex dictionary, Realtime
+configuration, or MiniCPM sampling fields.
 
 The generic runner's unused `_duplex_force_listen_applied_segments` cleanup and
 the obsolete `streaming_accumulated_keys` accumulation hook were removed. The
@@ -834,7 +831,7 @@ The current dirty tree was synchronized to the isolated H20 worktree at
   (`/tmp/remote_gpu_logs/e2146318.log`).
 - The pre-response continuation regression group passed 5 focused tests. The
   response-required two-turn scenario then passed 5/5 repeated runs in task
-  `afe93659`; two-session semantic isolation plus resume, takeover, and
+  two-session semantic isolation plus resume, takeover, and
   admission passed in task `49225794`; model-unit overlap passed in task
   `3888387d`. The final affected matrix above supersedes the earlier pending
   rerun requirement.

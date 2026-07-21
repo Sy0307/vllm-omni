@@ -31,12 +31,9 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
         "audio_text_total_chars",
         "duplex_epoch",
         "duplex_turn_id",
-        "llm_output_text",
         "llm_output_text_utf8",
-        "sample_rate",
-        "sample_rate_hz",
-        "sr",
         "tts_is_last_chunk",
+        "turn_end",
     }
 )
 

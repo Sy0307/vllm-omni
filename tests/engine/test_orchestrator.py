@@ -16,7 +16,6 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
@@ -1273,7 +1272,7 @@ async def test_duplex_session_update_replaces_runtime_config() -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplex_session_update_refreshes_next_append_sampling_policy() -> None:
+async def test_duplex_session_update_refreshes_next_append_sampling_params() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
@@ -1334,10 +1333,8 @@ async def test_duplex_session_update_refreshes_next_append_sampling_policy() -> 
     assert req_state.sampling_params_list[0].max_tokens == 7
     assert req_state.sampling_params_list[0].stop_token_ids == [151705]
     submitted_request = stage0.add_request_calls[0][0]
-    assert submitted_request.resumable_segment_policy == ResumableSegmentPolicy(
-        stop_token_ids=(151705,),
-        max_segment_tokens=7,
-    )
+    assert submitted_request.sampling_params.stop_token_ids == [151705]
+    assert submitted_request.sampling_params.max_tokens == 7
 
 
 @pytest.mark.asyncio
@@ -1532,10 +1529,8 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     assert duplex_state1["session_config"] == session.session_config
     assert req_state1.sampling_params_list[0].stop_token_ids == [151645]
     submitted_request = stage0.add_request_calls[0][0]
-    assert submitted_request.resumable_segment_policy == ResumableSegmentPolicy(
-        stop_token_ids=(151645,),
-        max_segment_tokens=1,
-    )
+    assert submitted_request.sampling_params.stop_token_ids == [151645]
+    assert submitted_request.sampling_params.max_tokens == 1
 
     await _handle_duplex(
         orchestrator,

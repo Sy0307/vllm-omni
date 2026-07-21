@@ -379,21 +379,6 @@ class TestSerializeDeserializePayload:
             restored = deserialize_payload(wire)
             assert restored["codes"]["audio"].dtype == dtype, f"dtype mismatch for {dtype}"
 
-    def test_tensor_entry_helpers_round_trip_tensor_wire_format(self):
-        from vllm_omni.data_entry_keys import (
-            deserialize_tensor_entry,
-            serialize_tensor_entry,
-        )
-
-        tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-
-        entry = serialize_tensor_entry(tensor)
-        restored = deserialize_tensor_entry(entry)
-
-        assert entry.tensor_dtype == "float32"
-        assert entry.tensor_shape == [2, 3]
-        assert torch.equal(restored, tensor)
-
     def test_tensor_shape_preserved(self):
         t = torch.randn(3, 4, 5)
         original: OmniPayload = {"hidden_states": {"output": t}}

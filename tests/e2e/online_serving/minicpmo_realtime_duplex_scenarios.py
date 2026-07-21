@@ -59,6 +59,13 @@ _url_with_model = build_realtime_url
 _read_wav_pcm16 = read_pcm16_wav
 
 
+def _ref_audio_data_url(path: str | None) -> str | None:
+    if path is None:
+        return None
+    ref_path = Path(path).expanduser()
+    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
+
+
 @dataclass
 class DemoState:
     events: list[dict[str, object]] = field(default_factory=list)
@@ -470,6 +477,9 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         temperature = 0.0
     if temperature is not None:
         session_payload["temperature"] = temperature
+    ref_audio = _ref_audio_data_url(getattr(args, "ref_audio", None))
+    if ref_audio is not None:
+        session_payload["ref_audio"] = ref_audio
     event: dict[str, object] = {
         "type": "session.update",
         "session": session_payload,
@@ -1269,7 +1279,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     distinct_turn_inputs = _turn_inputs_are_distinct(turn_input_paths, turn_pcm16)
     if getattr(args, "require_distinct_inputs", False) and not distinct_turn_inputs:
         raise ValueError("--require-distinct-inputs requires a different WAV path and audio payload for every turn")
-    url = _url_with_model(args.url, args.model, session_id=getattr(args, "session_id", None))
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+        session_id=getattr(args, "session_id", None),
+    )
     state = DemoState()
     stop = asyncio.Event()
     output_dir = Path(args.output_dir)
@@ -1555,6 +1570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--session-id", help="Use an explicit public session ID, including for close/reopen tests.")
     parser.add_argument("--input-wav", required=True)
+    parser.add_argument("--ref-audio", help="Optional WAV used as the MiniCPM-o voice prompt.")
     parser.add_argument(
         "--frame-image",
         default=None,

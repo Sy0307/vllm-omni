@@ -5461,7 +5461,9 @@ async def test_minicpmo_native_duplex_omits_ref_audio_when_client_does_not_provi
     def fail_if_default_ref_loaded(path):
         raise AssertionError(f"default ref audio should not be loaded: {path}")
 
-    monkeypatch.setattr(MiniCPMO45NativeDuplexServingAdapter, "_load_local_ref_audio", staticmethod(fail_if_default_ref_loaded))
+    monkeypatch.setattr(
+        MiniCPMO45NativeDuplexServingAdapter, "_load_local_ref_audio", staticmethod(fail_if_default_ref_loaded)
+    )
     monkeypatch.setattr(
         MiniCPMO45NativeDuplexServingAdapter,
         "_load_native_tokenizer",
@@ -6030,6 +6032,48 @@ async def test_minicpmo_native_auto_response_accepts_realtime_commit_after_strea
     committed = next(message for message in ws.sent if message.get("type") == "input.committed")
     assert committed["realtime_item_id"] == "item-consumed-stream"
     assert committed["native_audio"] is True
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_auto_response_post_response_commit_ignores_stale_progress_state():
+    session_id = "sid-native-auto-post-response"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+
+    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "session.created":
+            return
+        session = handler._registry.get(session_id)
+        assert session is not None
+        native = handler._minicpmo_session_state(session)
+        native.auto_response_waiting_for_speech = True
+        session.turn_state = DuplexTurnState.ASSISTANT_GENERATING
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(8000),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+            }
+        )
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+        ws.put({"type": "session.close"})
+
+    ws = TimedWebSocket(on_send=on_send)
+    create = _native_session_create(session_id)
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+
+    await handler.handle_session(ws)
+
+    assert len(engine.appended) == 1
+    assert engine.appended[0][3] is True
+    assert "input.committed" in ws.sent_types()
+    assert not any(message.get("code") == "response_already_active" for message in ws.sent)
 
 
 def test_realtime_overlap_commit_keeps_reserved_input_turn_after_model_advances():

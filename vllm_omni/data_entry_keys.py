@@ -334,7 +334,7 @@ def unflatten_payload(flat: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def serialize_tensor_entry(t: torch.Tensor) -> AdditionalInformationEntry:
+def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
@@ -345,7 +345,7 @@ def serialize_tensor_entry(t: torch.Tensor) -> AdditionalInformationEntry:
     )
 
 
-def deserialize_tensor_entry(entry: AdditionalInformationEntry) -> torch.Tensor:
+def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
     dt = np.dtype(entry.tensor_dtype or "float32")
     arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
     arr = arr.reshape(entry.tensor_shape)
@@ -370,7 +370,7 @@ def serialize_payload(
 
     for key, value in flat.items():
         if isinstance(value, torch.Tensor):
-            entries[key] = serialize_tensor_entry(value)
+            entries[key] = _serialize_tensor(value)
         elif isinstance(value, list):
             entries[key] = AdditionalInformationEntry(list_data=value)
         elif value is not None:
@@ -391,7 +391,7 @@ def deserialize_payload(
 
     for key, entry in wire.entries.items():
         if entry.tensor_data is not None:
-            flat[key] = deserialize_tensor_entry(entry)
+            flat[key] = _deserialize_tensor(entry)
         elif entry.list_data is not None:
             flat[key] = entry.list_data
         elif entry.scalar_data is not None:

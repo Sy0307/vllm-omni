@@ -17,7 +17,6 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine.messages import EngineQueueMessage
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
@@ -49,7 +48,6 @@ class DuplexRuntimeCapabilities:
 @dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, Any]
-    segment_policy: ResumableSegmentPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -86,8 +84,6 @@ class DuplexRuntimeExtension(Protocol):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan: ...
-
-    def segment_policy(self, sampling_params: object) -> ResumableSegmentPolicy: ...
 
     def decide_output(
         self,
@@ -133,7 +129,6 @@ class DuplexStageRequestContext:
 class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, Any]
-    segment_policy: ResumableSegmentPolicy | None
     already_submitted: bool
 
     def __post_init__(self) -> None:
@@ -193,14 +188,6 @@ class DuplexControlPlanePort(Protocol):
 
     def session_for_identity(self, identity: DuplexRequestIdentity | None) -> object | None: ...
 
-    def segment_policy(
-        self,
-        context: DuplexOutputContext | None,
-        sampling_params: object,
-        *,
-        resumable: bool,
-    ) -> ResumableSegmentPolicy | None: ...
-
     def decide_output(
         self,
         stage_id: int,
@@ -251,13 +238,7 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
 def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
     """Return whether a current-format resource request belongs to a session."""
     parts = request_id.split(".")
-    if (
-        len(parts) != 8
-        or parts[0] != "duplex-s"
-        or parts[2] != "i"
-        or parts[4] != "e"
-        or parts[6] != "r"
-    ):
+    if len(parts) != 8 or parts[0] != "duplex-s" or parts[2] != "i" or parts[4] != "e" or parts[6] != "r":
         return False
     try:
         int(parts[3])

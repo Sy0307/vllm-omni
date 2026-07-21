@@ -55,6 +55,7 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
         "meta.llm_output_text_utf8": torch.tensor([104, 105], dtype=torch.uint8),
         "meta.audio_text_total_chars": torch.tensor([2], dtype=torch.int32),
         "meta.tts_is_last_chunk": torch.tensor([1], dtype=torch.int32),
+        "meta.turn_end": torch.tensor([1], dtype=torch.int32),
         "meta.native_duplex_segment_text": "hi",
     }
 
@@ -65,5 +66,6 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     assert "meta.duplex_epoch" in client
     assert "meta.duplex_turn_id" in client
     assert "meta.tts_is_last_chunk" in client
+    assert "meta.turn_end" in client
     assert "meta.native_duplex_segment_text" not in client
     assert "meta.native_duplex_segment_text" in inter

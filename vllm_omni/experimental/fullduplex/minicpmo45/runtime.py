@@ -9,7 +9,6 @@ from typing import Any
 
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexAppendPlan,
     DuplexInputMode,
@@ -256,25 +255,6 @@ def _completion_token_ids(completion: object | None) -> list[int]:
     return []
 
 
-def _segment_policy(sampling_params: object) -> ResumableSegmentPolicy:
-    stop_token_ids: set[int] = set()
-    for source in (
-        getattr(sampling_params, "stop_token_ids", None),
-        getattr(sampling_params, "_all_stop_token_ids", None),
-    ):
-        if not isinstance(source, (list, tuple, set)):
-            continue
-        for token_id in source:
-            coerced = _coerce_int(token_id)
-            if coerced is not None and coerced >= 0:
-                stop_token_ids.add(coerced)
-    max_tokens = _coerce_int(getattr(sampling_params, "max_tokens", None))
-    return ResumableSegmentPolicy(
-        stop_token_ids=tuple(sorted(stop_token_ids)),
-        max_segment_tokens=max_tokens if max_tokens is not None and max_tokens > 0 else None,
-    )
-
-
 def _stage_config_value(runtime_config: dict[str, Any], key: str, stage_id: int) -> object | None:
     raw = runtime_config.get(key)
     if isinstance(raw, dict):
@@ -314,9 +294,6 @@ class MiniCPMO45DuplexRuntimeExtension:
             configured.append(params)
         return tuple(configured)
 
-    def segment_policy(self, sampling_params: object) -> ResumableSegmentPolicy:
-        return _segment_policy(sampling_params)
-
     def plan_append(
         self,
         *,
@@ -331,6 +308,7 @@ class MiniCPMO45DuplexRuntimeExtension:
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
+        del sampling_params
         return DuplexAppendPlan(
             prompt=build_duplex_data_plane_prompt(
                 request_id=request_id,
@@ -342,8 +320,7 @@ class MiniCPMO45DuplexRuntimeExtension:
                 mode=mode,
                 payload=payload,
                 final=final,
-            ),
-            segment_policy=self.segment_policy(sampling_params),
+            )
         )
 
     def decide_output(

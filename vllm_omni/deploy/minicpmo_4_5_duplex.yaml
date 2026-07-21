@@ -33,5 +33,4 @@ stages:
       cudagraph_mode: PIECEWISE
     default_sampling_params:
       max_tokens: 4096
-      extra_args:
-        stop_token_names: ["<|im_end|>"]
+      stop_token_ids: [151645]

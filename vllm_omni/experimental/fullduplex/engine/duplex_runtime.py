@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
     DuplexInputMode,
@@ -40,7 +39,6 @@ def validate_duplex_runtime_extension(
     required_methods = (
         "configure_sampling_params",
         "plan_append",
-        "segment_policy",
         "decide_output",
     )
     missing = [name for name in required_methods if not callable(getattr(extension, name, None))]
@@ -62,9 +60,6 @@ def validate_duplex_runtime_extension(
                     "Duplex runtime extension sampling parameter type mismatch "
                     f"for stage {stage_id}: expected {type(default).__name__}, got {type(value).__name__}"
                 )
-            policy = typed_extension.segment_policy(value)
-            if not isinstance(policy, ResumableSegmentPolicy):
-                raise TypeError("Duplex runtime extension segment_policy() must return ResumableSegmentPolicy")
     return typed_extension
 
 

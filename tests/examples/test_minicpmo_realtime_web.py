@@ -16,9 +16,7 @@ DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/minicpmo_r
 MULTI_DEMO_PATH = (
     Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py"
 )
-PAIR_DEMO_PATH = (
-    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_demo_pair.py"
-)
+PAIR_DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_demo_pair.py"
 SOFT_INTERRUPT_DEMO_PATH = (
     Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py"
 )

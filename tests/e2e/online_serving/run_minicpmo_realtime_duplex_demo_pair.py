@@ -18,7 +18,6 @@ import uuid
 import wave
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
 AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
@@ -171,18 +170,14 @@ def _summarize_session(
         for response_id in (_event_response_id(events[index]) for index in audio_delta_indices)
         if response_id is not None
     ]
-    first_audio_delta_before_done = (
-        bool(audio_delta_indices and done_indices)
-        and min(audio_delta_indices) < min(done_indices)
+    first_audio_delta_before_done = bool(audio_delta_indices and done_indices) and min(audio_delta_indices) < min(
+        done_indices
     )
     audio_delta_events = [events[index] for index in audio_delta_indices]
     first_received_at_s = next(
         (
             received_at
-            for received_at in (
-                _audio_delta_received_at_s(event)
-                for event in audio_delta_events
-            )
+            for received_at in (_audio_delta_received_at_s(event) for event in audio_delta_events)
             if received_at is not None
         ),
         None,
@@ -203,8 +198,7 @@ def _summarize_session(
             }
         )
     all_audio_deltas_same_response = (
-        len(delta_response_ids) == len(audio_delta_indices)
-        and len(set(delta_response_ids)) == 1
+        len(delta_response_ids) == len(audio_delta_indices) and len(set(delta_response_ids)) == 1
     )
     response_id_nonempty = bool(response_ids)
     response_audio_contract_ok = _session_audio_contract_ok(
@@ -238,11 +232,7 @@ def _summarize_session(
 def _identity_isolation_ok(sessions: list[dict[str, object]]) -> bool:
     seen: set[str] = set()
     for session in sessions:
-        ids = {
-            response_id
-            for response_id in session.get("response_ids", [])
-            if isinstance(response_id, str)
-        }
+        ids = {response_id for response_id in session.get("response_ids", []) if isinstance(response_id, str)}
         if not ids:
             return False
         if ids & seen:
@@ -337,8 +327,7 @@ async def run_pair(args: argparse.Namespace) -> dict[str, object]:
     )
     identity_isolation_ok = _identity_isolation_ok(sessions)
     min_audio_delta_ok = all(
-        int(session.get("audio_delta_count", 0)) >= args.min_audio_deltas_per_session
-        for session in sessions
+        int(session.get("audio_delta_count", 0)) >= args.min_audio_deltas_per_session for session in sessions
     )
     response_audio_contract_ok = all(session.get("response_audio_contract_ok") is True for session in sessions)
     result = {
@@ -363,9 +352,7 @@ async def run_pair(args: argparse.Namespace) -> dict[str, object]:
         "sessions": sessions,
     }
     summary_output = (
-        Path(args.summary_output)
-        if args.summary_output
-        else Path(validated["output_dir_a"]).parent / "summary.json"
+        Path(args.summary_output) if args.summary_output else Path(validated["output_dir_a"]).parent / "summary.json"
     )
     summary_output.parent.mkdir(parents=True, exist_ok=True)
     summary_output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

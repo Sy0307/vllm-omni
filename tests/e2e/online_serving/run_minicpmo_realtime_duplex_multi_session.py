@@ -410,6 +410,7 @@ def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
         model=args.model,
         session_id=f"multi-{index}-{uuid.uuid4().hex}",
         input_wav=input_wav,
+        ref_audio=args.ref_audio,
         turn_input_wav=list(args.turn_input_wav),
         output_dir=str(Path(args.output_dir) / f"session_{index:02d}"),
         output_audio_format="pcm16",
@@ -516,6 +517,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--sessions", type=int, default=2)
     parser.add_argument("--input-wav", required=True)
+    parser.add_argument("--ref-audio", help="Optional WAV used as the MiniCPM-o voice prompt for every session.")
     parser.add_argument("--session-input-wav", action="append", default=[])
     parser.add_argument("--session-expected-token", action="append", default=[])
     parser.add_argument("--turn-input-wav", action="append", default=[])

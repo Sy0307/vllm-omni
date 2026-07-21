@@ -1138,7 +1138,7 @@ class TestDeployConfigLoading:
         assert deploy.stages[1].enforce_eager is False
         assert deploy.stages[1].compilation_config == {"cudagraph_mode": "PIECEWISE"}
         assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
-        assert stages[1].yaml_extras["default_sampling_params"]["extra_args"]["stop_token_names"] == ["<|im_end|>"]
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [151645]
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage1_replicas"),

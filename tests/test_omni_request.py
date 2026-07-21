@@ -19,7 +19,6 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine import PromptEmbedsPayload
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
@@ -37,7 +36,7 @@ def test_omni_params_are_keyword_only():
         "prompt_embeds",
         "external_req_id",
         "additional_information",
-        "resumable_segment_policy",
+        "model_intermediate_buffer",
     ):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
 
@@ -95,19 +94,19 @@ def test_keyword_omni_params_round_trip():
     assert torch.equal(req.prompt_embeds, torch.from_numpy(arr))
 
 
-def test_resumable_segment_policy_round_trips_to_streaming_update():
-    policy = ResumableSegmentPolicy(stop_token_ids=(7,), max_segment_tokens=16)
+def test_model_intermediate_buffer_round_trips_to_streaming_update():
+    buffer = {"duplex": {"turn_id": 3}}
     request = OmniRequest(
-        request_id="req-policy",
+        request_id="req-model-buffer",
         prompt_token_ids=[1, 2],
         sampling_params=SamplingParams(max_tokens=16),
         pooling_params=None,
         resumable=True,
-        resumable_segment_policy=policy,
+        model_intermediate_buffer=buffer,
     )
 
     update = OmniStreamingUpdate.from_request(request)
 
     assert update is not None
-    assert request.resumable_segment_policy is policy
-    assert update.resumable_segment_policy is policy
+    assert request.model_intermediate_buffer is buffer
+    assert update.model_intermediate_buffer is buffer

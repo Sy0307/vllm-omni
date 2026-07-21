@@ -5,8 +5,8 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from vllm_omni.experimental.fullduplex.client import (
-    RealtimeEventCollector,
     RealtimeDuplexClient,
+    RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
     write_pcm16_wav,

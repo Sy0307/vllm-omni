@@ -11,7 +11,6 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
 
 
@@ -37,7 +36,6 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
-        resumable_segment_policy: ResumableSegmentPolicy | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -53,7 +51,6 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
-        self.resumable_segment_policy = resumable_segment_policy
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -101,7 +98,6 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
-            resumable_segment_policy=getattr(request, "resumable_segment_policy", None),
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
@@ -126,7 +122,6 @@ class OmniStreamingUpdate:
     sampling_params: SamplingParams | None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict | None = None
-    resumable_segment_policy: ResumableSegmentPolicy | None = None
 
     @classmethod
     def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
@@ -140,5 +135,4 @@ class OmniStreamingUpdate:
             sampling_params=request.sampling_params,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
-            resumable_segment_policy=getattr(request, "resumable_segment_policy", None),
         )
