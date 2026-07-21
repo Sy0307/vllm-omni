@@ -5432,18 +5432,17 @@ async def test_minicpmo_native_duplex_rejects_client_runtime_config():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_native_default_ref_audio_falls_back_to_loaded_model_path(monkeypatch, tmp_path):
+async def test_minicpmo_native_duplex_omits_ref_audio_when_client_does_not_provide_it(monkeypatch, tmp_path):
     model_dir = tmp_path / "MiniCPM-o-4_5"
     assets_dir = model_dir / "assets"
     assets_dir.mkdir(parents=True)
     default_ref = assets_dir / "HT_ref_audio.wav"
     default_ref.write_bytes(b"placeholder")
 
-    monkeypatch.setattr(
-        MiniCPMO45NativeDuplexServingAdapter,
-        "_load_local_ref_audio",
-        staticmethod(lambda path: (np.full(1600, 0.5, dtype=np.float32), 16000)),
-    )
+    def fail_if_default_ref_loaded(path):
+        raise AssertionError(f"default ref audio should not be loaded: {path}")
+
+    monkeypatch.setattr(MiniCPMO45NativeDuplexServingAdapter, "_load_local_ref_audio", staticmethod(fail_if_default_ref_loaded))
     monkeypatch.setattr(
         MiniCPMO45NativeDuplexServingAdapter,
         "_load_native_tokenizer",
@@ -5458,9 +5457,9 @@ async def test_minicpmo_native_default_ref_audio_falls_back_to_loaded_model_path
         model_config=SimpleNamespace(model=str(model_dir)),
     )
 
-    assert runtime_config["ref_audio_format"] == "pcm_f32le"
-    assert runtime_config["ref_audio_sample_rate_hz"] == 16000
-    assert base64.b64decode(runtime_config["ref_audio_data"]) == struct.pack("<1600f", *([0.5] * 1600))
+    assert "ref_audio_data" not in runtime_config
+    assert "ref_audio_format" not in runtime_config
+    assert "ref_audio_sample_rate_hz" not in runtime_config
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import os
 from copy import deepcopy
 from typing import Any
 
@@ -102,18 +101,15 @@ class MiniCPMO45NativeDuplexServingAdapter:
             ref_audio = extra_body.pop("tts_ref_audio")
 
         if ref_audio is None:
-            default_ref = cls._default_ref_audio_path(config, model_config=model_config)
-            if default_ref is None:
-                cls._apply_first_append_context_tokens(
-                    runtime_config,
-                    model_config=model_config,
-                    instructions=config.instructions,
-                    ref_sample_count=None,
-                )
-                cls._apply_new_user_turn_prefix_tokens(runtime_config, model_config=model_config)
-                config.extra_body = extra_body
-                return runtime_config
-            wav_np, sr = cls._load_local_ref_audio(default_ref)
+            cls._apply_first_append_context_tokens(
+                runtime_config,
+                model_config=model_config,
+                instructions=config.instructions,
+                ref_sample_count=None,
+            )
+            cls._apply_new_user_turn_prefix_tokens(runtime_config, model_config=model_config)
+            config.extra_body = extra_body
+            return runtime_config
         else:
             wav_np, sr = await cls.resolve_ref_audio(ref_audio, model_config=model_config)
 
@@ -318,17 +314,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
         )
         wav_np, sr = await connector.fetch_audio_async(ref_audio)
         return np.asarray(wav_np, dtype=np.float32), int(sr)
-
-    @staticmethod
-    def _default_ref_audio_path(config: DuplexSessionConfig, *, model_config: Any) -> str | None:
-        candidates = (config.model, getattr(model_config, "model", None))
-        for model in candidates:
-            if not isinstance(model, str) or not os.path.isdir(model):
-                continue
-            ref_path = os.path.join(model, "assets", "HT_ref_audio.wav")
-            if os.path.exists(ref_path):
-                return ref_path
-        return None
 
     @staticmethod
     def _load_local_ref_audio(path: str) -> tuple[np.ndarray, int]:

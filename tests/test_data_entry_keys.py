@@ -45,6 +45,16 @@ class TestOmniPayloadStruct:
         with pytest.raises(msgspec.ValidationError, match="unknown field"):
             to_struct({"meta": {"finisheed": True}})
 
+    def test_to_struct_rejects_minicpmo_duplex_runtime_handoff_fields(self):
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"hidden_states": {"tts": torch.zeros(1)}})
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"ids": {"tts": [1]}})
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"meta": {"ref_audio_sr": 16000}})
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"meta": {"listen_token_id": 151685}})
+
     def test_to_struct_rejects_wrong_type(self):
         with pytest.raises(msgspec.ValidationError, match="Expected"):
             to_struct({"meta": {"left_context_size": "not_an_int"}})
@@ -68,11 +78,11 @@ class TestOmniPayloadStruct:
 
     def test_struct_with_all_categories(self):
         d = {
-            "hidden_states": {"output": torch.zeros(1), "tts": torch.ones(2, 4)},
+            "hidden_states": {"output": torch.zeros(1), "last": torch.ones(2, 4)},
             "embed": {"prefill": torch.zeros(1), "tts_bos": torch.zeros(1)},
-            "ids": {"all": [1, 2], "prompt": [1], "tts": [3, 4]},
+            "ids": {"all": [1, 2], "prompt": [1], "speech_token": [3, 4]},
             "codes": {"audio": torch.zeros(1), "ref": torch.ones(4)},
-            "meta": {"left_context_size": 3, "num_processed_tokens": 7, "ref_audio_sr": 24000},
+            "meta": {"left_context_size": 3, "num_processed_tokens": 7},
         }
         s = to_struct(d)
         assert isinstance(s.hidden_states, HiddenStatesStruct)
@@ -81,11 +91,10 @@ class TestOmniPayloadStruct:
         assert isinstance(s.codes, CodesStruct)
         assert isinstance(s.meta, MetaStruct)
         assert s.ids.all == [1, 2]
-        assert s.ids.tts == [3, 4]
-        assert torch.equal(s.hidden_states.tts, torch.ones(2, 4))
+        assert s.ids.speech_token == [3, 4]
+        assert torch.equal(s.hidden_states.last, torch.ones(2, 4))
         assert s.meta.num_processed_tokens == 7
         assert torch.equal(s.codes.ref, torch.ones(4))
-        assert s.meta.ref_audio_sr == 24000
 
 
 class TestValidatePayload:
@@ -337,7 +346,7 @@ class TestSerializeDeserializePayload:
         original: OmniPayload = {
             "hidden_states": {"output": torch.tensor([1.0, 2.0])},
             "ids": {"all": [1, 2, 3]},
-            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "ar_width": 4, "ref_audio_sr": 16000},
+            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "ar_width": 4},
             "codes": {"audio": torch.tensor([3.0]), "ref": torch.tensor([0.1, 0.2])},
         }
         wire = serialize_payload(original)
@@ -346,7 +355,6 @@ class TestSerializeDeserializePayload:
         assert restored["ids"]["all"] == [1, 2, 3]
         assert restored["meta"]["finished"].item() is False
         assert restored["meta"]["ar_width"] == 4
-        assert restored["meta"]["ref_audio_sr"] == 16000
         assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
         assert torch.equal(restored["codes"]["ref"], original["codes"]["ref"])
 

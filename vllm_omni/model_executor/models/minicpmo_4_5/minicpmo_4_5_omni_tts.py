@@ -633,11 +633,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return token_ids.contiguous(), hidden_states.contiguous()
 
     def _resolve_prompt_wav_path(self, ref_audio, ref_audio_sr: int | None) -> tuple[str | None, str | None]:
-        model_path = self.vllm_config.model_config.model
-        default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
         temp_prompt_wav_path = self._write_ref_audio_prompt_wav(ref_audio, ref_audio_sr)
-        prompt_wav_path = temp_prompt_wav_path or (default_ref if os.path.exists(default_ref) else None)
-        return prompt_wav_path, temp_prompt_wav_path
+        return temp_prompt_wav_path, temp_prompt_wav_path
 
     def _max_tts_tokens_for_text(self, num_text: int) -> tuple[int, int]:
         cfg = self._tts_runtime_config()
@@ -1416,10 +1413,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             logger.warning("No audio_tokenizer")
             return None
 
-        model_path = self.vllm_config.model_config.model
-        default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
-        temp_prompt_wav_path = self._write_ref_audio_prompt_wav(ref_audio, ref_audio_sr)
-        prompt_wav_path = temp_prompt_wav_path or (default_ref if os.path.exists(default_ref) else None)
+        prompt_wav_path, temp_prompt_wav_path = self._resolve_prompt_wav_path(ref_audio, ref_audio_sr)
 
         try:
             outputs = tts.generate(**generate_kwargs)
