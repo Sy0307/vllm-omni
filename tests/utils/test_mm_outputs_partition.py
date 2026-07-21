@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_partition_thinker_latent_payload():
