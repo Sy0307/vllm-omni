@@ -19,6 +19,9 @@ MULTI_DEMO_PATH = (
 PAIR_DEMO_PATH = (
     Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_demo_pair.py"
 )
+SOFT_INTERRUPT_DEMO_PATH = (
+    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py"
+)
 
 
 def _load_demo_module():
@@ -48,6 +51,18 @@ def _load_pair_demo_module():
     return module
 
 
+def _load_soft_interrupt_demo_module():
+    spec = importlib.util.spec_from_file_location(
+        "minicpmo_realtime_duplex_soft_interrupt_test",
+        SOFT_INTERRUPT_DEMO_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_realtime_duplex_multi_session_script_is_directly_executable():
     result = subprocess.run(
         [sys.executable, str(MULTI_DEMO_PATH), "--help"],
@@ -65,6 +80,19 @@ def test_realtime_duplex_demo_pair_script_is_directly_executable():
     result = subprocess.run(
         [sys.executable, str(PAIR_DEMO_PATH), "--help"],
         cwd=PAIR_DEMO_PATH.parents[3],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_realtime_duplex_soft_interrupt_script_is_directly_executable():
+    result = subprocess.run(
+        [sys.executable, str(SOFT_INTERRUPT_DEMO_PATH), "--help"],
+        cwd=SOFT_INTERRUPT_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
         timeout=20,
@@ -245,6 +273,130 @@ def test_realtime_duplex_demo_pair_default_requires_multiple_audio_deltas(monkey
     args = demo.parse_args()
 
     assert args.min_audio_deltas_per_session == 2
+
+
+def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "soft_interrupt"
+    output.mkdir()
+    first_response_id = "resp-first"
+    second_response_id = "resp-second"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.speak", "response_id": first_response_id, "_client_received_at_s": 2.0},
+        {
+            "type": "response.audio.delta",
+            "response_id": first_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": first_response_id,
+            "delta": "中国古代四大发明",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.audio.delta",
+            "response_id": first_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.6,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": first_response_id,
+            "delta": "是造纸术。",
+            "_client_received_at_s": 2.6,
+        },
+        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
+        {"type": "response.listen", "_client_received_at_s": 3.2},
+        {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
+        {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 4.0},
+        {
+            "type": "response.audio.delta",
+            "response_id": second_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 4.1,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": second_response_id,
+            "delta": "一加一等于",
+            "_client_received_at_s": 4.1,
+        },
+        {
+            "type": "response.audio.delta",
+            "response_id": second_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 4.6,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": second_response_id,
+            "delta": "二。",
+            "_client_received_at_s": 4.6,
+        },
+        {"type": "response.done", "response_id": second_response_id, "_client_received_at_s": 5.0},
+        {"type": "response.listen", "_client_received_at_s": 5.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 6.0},
+        {"type": "response.listen", "_client_received_at_s": 6.1},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [first_response_id, second_response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        expect_transcript_substring="一加一等于二",
+    )
+
+    assert summary["ok"] is True
+    assert summary["second_response_before_final_commit"] is True
+    assert summary["final_listen_after_commit"] is True
+    assert summary["response_audio_contract_ok"] is True
+    assert summary["response_summaries"][0]["audio_delta_count"] == 2
+    assert summary["response_summaries"][1]["transcript"] == "一加一等于二。"
+
+
+def test_realtime_duplex_soft_interrupt_rejects_single_bulk_response(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "bulk_response"
+    output.mkdir()
+    response_id = "resp-only"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        expect_transcript_substring="一加一等于二",
+    )
+
+    assert summary["ok"] is False
+    assert summary["enough_responses"] is False
+    assert summary["multi_delta_ok"] is False
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():
