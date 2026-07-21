@@ -1485,18 +1485,23 @@ class Orchestrator:
         action = getattr(decision.action, "value", decision.action)
         if action != "direct_response":
             raise ValueError(f"Unsupported duplex output action: {action}")
+        from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
+
+        engine_output = attach_duplex_output_decision(
+            OmniRequestOutput(
+                request_id=req_id,
+                finished=True,
+                stage_id=stage_id,
+                final_output_type=decision.final_output_type,
+                request_output=output,
+            ),
+            decision,
+        )
         await self.output_async_queue.put(
             OutputMessage(
                 request_id=req_id,
                 stage_id=stage_id,
-                engine_outputs=OmniRequestOutput(
-                    request_id=req_id,
-                    finished=True,
-                    stage_id=stage_id,
-                    final_output_type=decision.final_output_type,
-                    request_output=output,
-                    duplex_output_decision=decision,
-                ),
+                engine_outputs=engine_output,
                 metrics=stage_metrics,
                 finished=True,
                 stage_submit_ts=submit_ts,

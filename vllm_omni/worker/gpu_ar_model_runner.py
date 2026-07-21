@@ -42,7 +42,6 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-from vllm_omni.model_executor.duplex import DuplexSamplingRow
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -331,7 +330,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._downstream_payload_cache: dict[str, bool] = {}
         self._duplex_sampling_hook = None
         self._duplex_sampling_hook_resolved = False
-        self._duplex_sampling_hook_active = False
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -343,8 +341,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         candidate = getattr(getattr(self, "model", None), "prepare_duplex_sampling", None)
         self._duplex_sampling_hook = candidate if callable(candidate) else None
         self._duplex_sampling_hook_resolved = True
-        if self._duplex_sampling_hook is not None and not hasattr(self, "_active_duplex_request_ids"):
-            self._active_duplex_request_ids: set[str] = set()
+        if self._duplex_sampling_hook is not None and not hasattr(self, "_duplex_sampling_helper"):
+            from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingHelper
+
+            self._duplex_sampling_helper = DuplexSamplingHelper()
         return self._duplex_sampling_hook
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -413,87 +413,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
 
-    @staticmethod
-    def _is_duplex_data_plane_info(info: object) -> bool:
-        duplex = info.get("duplex") if isinstance(info, dict) else None
-        return isinstance(duplex, dict) and duplex.get("data_plane") is True
-
-    def _refresh_active_duplex_request(self, req_id: str) -> None:
-        if self._resolve_duplex_sampling_hook() is None:
-            return
-        active_ids = getattr(self, "_active_duplex_request_ids", None)
-        if active_ids is None:
-            active_ids = set()
-            self._active_duplex_request_ids = active_ids
-        if self._is_duplex_data_plane_info(self._request_duplex_intermediate_info(req_id)):
-            active_ids.add(req_id)
-        else:
-            active_ids.discard(req_id)
-
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         if self._resolve_duplex_sampling_hook() is None:
             return deferred_state_corrections_fn
-        active_ids = self._active_duplex_request_ids
-        active_ids.difference_update(str(req_id) for req_id in scheduler_output.finished_req_ids)
-        for request in scheduler_output.scheduled_new_reqs:
-            self._refresh_active_duplex_request(str(request.req_id))
+        helper = getattr(self, "_duplex_sampling_helper", None)
+        if helper is not None:
+            helper.update_states(self, scheduler_output)
         return deferred_state_corrections_fn
-
-    def _duplex_sampling_rows(self) -> tuple[DuplexSamplingRow, ...]:
-        rows: list[DuplexSamplingRow] = []
-        active_ids = self._active_duplex_request_ids
-        req_ids = [str(req_id) for req_id in getattr(self.input_batch, "req_ids", [])]
-        requests = getattr(self, "requests", {})
-        for row_idx, req_id in enumerate(req_ids):
-            if req_id not in active_ids:
-                continue
-            info = self._request_duplex_intermediate_info(req_id)
-            duplex = info.get("duplex") if isinstance(info, dict) else None
-            if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
-                continue
-            session_id = duplex.get("session_id")
-            if not isinstance(session_id, str) or not session_id:
-                session_id = None
-            try:
-                incarnation = int(duplex.get("incarnation", 0))
-            except (TypeError, ValueError):
-                incarnation = 0
-            try:
-                seq = int(duplex.get("seq"))
-            except (TypeError, ValueError):
-                seq = None
-            payload = duplex.get("payload")
-            if not isinstance(payload, dict):
-                payload = None
-            request = requests.get(req_id) if isinstance(requests, dict) else None
-            sampling_params = getattr(request, "sampling_params", None)
-            try:
-                max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
-            except (TypeError, ValueError):
-                max_tokens = 0
-            rows.append(
-                DuplexSamplingRow(
-                    row_idx=row_idx,
-                    request_id=req_id,
-                    session_id=session_id,
-                    incarnation=incarnation,
-                    seq=seq,
-                    payload=payload,
-                    max_tokens=max_tokens if max_tokens > 0 else None,
-                )
-            )
-        return tuple(rows)
-
-    def _request_duplex_intermediate_info(self, req_id: str) -> dict[str, Any] | None:
-        model_intermediate_buffer = getattr(self, "model_intermediate_buffer", {})
-        info = model_intermediate_buffer.get(req_id) if isinstance(model_intermediate_buffer, dict) else None
-        if isinstance(info, dict):
-            return info
-        requests = getattr(self, "requests", {})
-        req_state = requests.get(req_id) if isinstance(requests, dict) else None
-        info = getattr(req_state, "additional_information_cpu", None)
-        return info if isinstance(info, dict) else None
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -620,9 +547,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._downstream_payload_cache.clear()
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.clear()
-        if hasattr(self, "_active_duplex_request_ids"):
-            self._active_duplex_request_ids.clear()
-        self._duplex_sampling_hook_active = False
+        duplex_helper = getattr(self, "_duplex_sampling_helper", None)
+        if duplex_helper is not None:
+            duplex_helper.clear()
 
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
@@ -1536,10 +1463,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
                 prepare_duplex_sampling = self._resolve_duplex_sampling_hook()
                 if prepare_duplex_sampling is not None:
-                    rows = self._duplex_sampling_rows() if getattr(self, "_active_duplex_request_ids", ()) else ()
-                    if rows or getattr(self, "_duplex_sampling_hook_active", False):
+                    helper = getattr(self, "_duplex_sampling_helper", None)
+                    rows = helper.rows(self) if helper is not None and helper.active_request_ids else ()
+                    if rows or (helper is not None and helper.hook_active):
                         prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
-                    self._duplex_sampling_hook_active = bool(rows)
+                    if helper is not None:
+                        helper.hook_active = bool(rows)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output

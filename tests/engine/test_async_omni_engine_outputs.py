@@ -21,7 +21,6 @@ from vllm_omni.engine.messages import (
     OutputMessage,
 )
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
-from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
     DuplexControlClient,
     DuplexControlRequestError,
@@ -29,6 +28,7 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
 from vllm_omni.experimental.fullduplex.engine.messages import (
     AppendDuplexInputMessage,
     DuplexControlResultMessage,
+    DuplexFence,
     SignalDuplexTurnMessage,
 )
 from vllm_omni.outputs import OmniRequestOutput

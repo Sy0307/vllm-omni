@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from PIL import Image
@@ -7,9 +7,6 @@ from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
-
-if TYPE_CHECKING:
-    from vllm_omni.experimental.fullduplex.engine.contracts import DuplexOutputDecision
 
 
 @dataclass
@@ -113,7 +110,6 @@ class OmniRequestOutput:
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
-    duplex_output_decision: "DuplexOutputDecision | None" = None
 
     # profiling data
     stage_durations: dict[str, float] = field(default_factory=dict)

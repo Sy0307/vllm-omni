@@ -16,6 +16,7 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 )
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -359,7 +360,7 @@ class DuplexRequestClient:
     @classmethod
     def multimodal_output(cls, output: object) -> dict[str, object]:
         if isinstance(output, OmniRequestOutput):
-            decision = output.duplex_output_decision
+            decision = get_duplex_output_decision(output)
             if decision is not None:
                 return dict(decision.metadata)
             private_output = getattr(output, "_multimodal_output", None)

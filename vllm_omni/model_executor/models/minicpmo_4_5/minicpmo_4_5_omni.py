@@ -31,7 +31,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.duplex import DuplexSamplingRow
+from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,

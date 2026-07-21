@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
+
 logger = init_logger(__name__)
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
@@ -144,7 +146,7 @@ class MiniCPMO45DataPlaneSession:
         outputs = getattr(output, "outputs", None)
         completion = outputs[0] if isinstance(outputs, list) and outputs else None
         text = getattr(completion, "text", "") if completion is not None else ""
-        direct_decision = getattr(output, "duplex_output_decision", None)
+        direct_decision = get_duplex_output_decision(output)
         direct_metadata = getattr(direct_decision, "metadata", None)
         if isinstance(direct_metadata, Mapping):
             mm_output = direct_metadata

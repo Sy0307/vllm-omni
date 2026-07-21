@@ -9,11 +9,11 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_client import (
     DuplexControlClient,
     DuplexControlRequestError,
 )
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import (
     DuplexControlError,
     DuplexControlResultMessage,
+    DuplexFence,
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )

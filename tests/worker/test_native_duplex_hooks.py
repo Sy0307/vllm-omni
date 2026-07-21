@@ -16,7 +16,7 @@ def _minicpmo_duplex_policy_case(
     state: SimpleNamespace,
     payload: dict[str, object],
 ):
-    from vllm_omni.model_executor.duplex import DuplexSamplingRow
+    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -43,7 +43,7 @@ def _minicpmo_duplex_policy_case(
 
 
 def test_minicpmo_model_hook_owns_duplex_sampling_rows_and_force_listen():
-    from vllm_omni.model_executor.duplex import DuplexSamplingRow
+    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -161,6 +161,7 @@ def test_minicpmo_model_hook_new_user_turn_opens_turn_without_forcing_speak():
 
 
 def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
+    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingHelper
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
@@ -181,9 +182,10 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
             sampling_params=SimpleNamespace(max_tokens=32),
         )
     }
-    runner._active_duplex_request_ids = {"req-duplex"}
+    helper = DuplexSamplingHelper()
+    helper.active_request_ids = {"req-duplex"}
 
-    rows = runner._duplex_sampling_rows()
+    rows = helper.rows(runner)
 
     assert len(rows) == 1
     assert rows[0].row_idx == 0
@@ -205,7 +207,10 @@ def test_generic_ar_runner_skips_duplex_rows_without_model_hook():
     )
     runner.model = SimpleNamespace(sample=lambda *_args, **_kwargs: None, prefer_model_sampler=False)
     runner.sampler = lambda **_kwargs: "standard-sampler"
-    runner._duplex_sampling_rows = lambda: pytest.fail("duplex rows built without a model hook")
+    runner._duplex_sampling_helper = SimpleNamespace(
+        active_request_ids={"req-duplex"},
+        rows=lambda *_args: pytest.fail("duplex rows built without a model hook"),
+    )
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "standard-sampler"
 
@@ -219,7 +224,7 @@ def test_plain_model_hook_resolution_does_not_allocate_duplex_tracking():
     runner._duplex_sampling_hook_resolved = False
 
     assert runner._resolve_duplex_sampling_hook() is None
-    assert not hasattr(runner, "_active_duplex_request_ids")
+    assert not hasattr(runner, "_duplex_sampling_helper")
 
 
 def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
@@ -238,8 +243,11 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
         prepare_duplex_sampling=lambda *_args: calls.append("prepare"),
     )
     runner.sampler = SimpleNamespace()
-    runner._active_duplex_request_ids = set()
-    runner._duplex_sampling_rows = lambda: pytest.fail("non-duplex MiniCPM scanned request rows")
+    runner._duplex_sampling_helper = SimpleNamespace(
+        active_request_ids=set(),
+        hook_active=False,
+        rows=lambda *_args: pytest.fail("non-duplex MiniCPM scanned request rows"),
+    )
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
     assert calls == []
@@ -261,9 +269,11 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
         prepare_duplex_sampling=lambda _logits, _metadata, rows: calls.append(rows),
     )
     runner.sampler = SimpleNamespace()
-    runner._active_duplex_request_ids = set()
-    runner._duplex_sampling_hook_active = True
-    runner._duplex_sampling_rows = lambda: pytest.fail("duplex cleanup scanned request rows")
+    runner._duplex_sampling_helper = SimpleNamespace(
+        active_request_ids=set(),
+        hook_active=True,
+        rows=lambda *_args: pytest.fail("duplex cleanup scanned request rows"),
+    )
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"

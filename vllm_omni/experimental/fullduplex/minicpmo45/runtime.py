@@ -16,7 +16,7 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexOutputAction,
     DuplexOutputDecision,
 )
-from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
