@@ -4,24 +4,18 @@ from vllm_omni.metrics import OrchestratorAggregator
 
 
 class ClientRequestState:
-    """Tracks one entrypoint request and its output queue.
-
-    ``resumable`` keeps the client state registered when a scheduler segment
-    finishes so a later append can continue the same logical request.
-    """
+    """Tracks one entrypoint request and its output queue."""
 
     def __init__(
         self,
         request_id: str,
         external_request_id: str | None = None,
         queue: asyncio.Queue | None = None,
-        resumable: bool = False,
     ):
         self.request_id = request_id
         self.external_request_id = external_request_id
         self.stage_id: int | None = None
         self.queue = queue if queue is not None else asyncio.Queue()
-        self.resumable = resumable
         self.metrics: OrchestratorAggregator | None = None
         # Wall-clock time at which the user's request arrived in the engine
         # entrypoint. Set in async_omni.generate() before the orchestrator

@@ -202,7 +202,6 @@ async def test_async_omni_duplex_append_can_defer_data_plane_output_collection()
         del session_id, kwargs
         request_state = app.request_states.get(request_id)
         assert request_state is not None
-        assert request_state.resumable is True
         assert request_state.metrics is not None
         return {
             "stage_results": [
@@ -299,12 +298,51 @@ async def test_async_omni_duplex_collect_waits_for_response_stage():
 
 
 @pytest.mark.asyncio
+async def test_duplex_request_client_retains_output_route_at_segment_terminal():
+    request_id = "duplex-sid-e0-stage0"
+    request_state = ClientRequestState(request_id)
+    request_states = {request_id: request_state}
+    output = OmniRequestOutput(
+        request_id=request_id,
+        stage_id=1,
+        final_output_type="audio",
+        finished=True,
+    )
+    await request_state.queue.put(
+        OutputMessage(
+            request_id=request_id,
+            stage_id=1,
+            engine_outputs=output,
+            finished=True,
+        )
+    )
+    client = DuplexRequestClient(
+        SimpleNamespace(),
+        SimpleNamespace(
+            request_states=request_states,
+            num_stages=2,
+            log_stats=False,
+        ),
+    )
+
+    outputs = await client.collect_outputs(
+        request_id,
+        request_state,
+        response_stage_id=1,
+        timeout=1.0,
+    )
+
+    assert outputs == [output]
+    assert request_states[request_id] is request_state
+
+
+@pytest.mark.asyncio
 async def test_async_omni_duplex_direct_output_keeps_stage_metrics():
     app = object.__new__(AsyncOmni)
     app._duplex_request_client = None
     app._final_output_handler = lambda: None
     request_id = "duplex-sid-e0-stage0"
-    req_state = ClientRequestState(request_id, resumable=True)
+    req_state = ClientRequestState(request_id)
     decision = DuplexOutputDecision(
         action=DuplexOutputAction.DIRECT_RESPONSE,
         metadata={
@@ -364,7 +402,7 @@ async def test_duplex_metrics_cursor_isolates_resumable_collect_windows():
     app._duplex_request_client = None
     app._final_output_handler = lambda: None
     request_id = "duplex-sid-e0-stage0"
-    req_state = ClientRequestState(request_id, resumable=True)
+    req_state = ClientRequestState(request_id)
     req_state.metrics = OrchestratorAggregator(
         num_stages=2,
         log_stats=False,
@@ -545,7 +583,7 @@ def test_async_omni_duplex_request_info_includes_response_stage():
 async def test_duplex_request_client_retains_output_route_when_close_fails():
     fence = DuplexFence("sid-close-route")
     request_id = duplex_resource_request_id(fence, "stage0")
-    request_states = {request_id: ClientRequestState(request_id, resumable=True)}
+    request_states = {request_id: ClientRequestState(request_id)}
 
     async def close_duplex_session_async(session_id, **kwargs):
         del session_id, kwargs

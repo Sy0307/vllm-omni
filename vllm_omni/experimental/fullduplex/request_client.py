@@ -131,10 +131,8 @@ class DuplexRequestClient:
         request_state = self.output_port.request_states.get(expected_request_id)
         created_request_state = request_state is None
         if request_state is None:
-            request_state = ClientRequestState(expected_request_id, resumable=True)
+            request_state = ClientRequestState(expected_request_id)
             self.output_port.request_states[expected_request_id] = request_state
-        else:
-            request_state.resumable = True
         if request_state.metrics is None:
             wall_start_ts = time.time()
             request_state.metrics = OrchestratorMetrics(
@@ -344,8 +342,6 @@ class DuplexRequestClient:
                 outputs.append(output_to_collect)
             if message.finished or outputs:
                 break
-        if outputs and outputs[-1].finished and not request_state.resumable:
-            self.output_port.request_states.pop(request_id, None)
         return outputs
 
     @classmethod
