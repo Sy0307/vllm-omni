@@ -2074,6 +2074,36 @@ def test_minicpmo_tts_no_ref_audio_initializes_empty_vocoder_cache():
     assert model._t2w_base_caches[""] == (None, {})
 
 
+def test_minicpmo_tts_native_duplex_merges_and_left_pads_nonfinal_unit_audio():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _native_duplex_unit_waveform,
+    )
+
+    waveform = _native_duplex_unit_waveform(
+        [torch.tensor([1.0, 2.0]), torch.tensor([3.0])],
+        turn_end=False,
+        target_samples=6,
+    )
+
+    assert waveform is not None
+    assert waveform.tolist() == [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
+
+
+def test_minicpmo_tts_native_duplex_does_not_pad_final_unit_audio():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _native_duplex_unit_waveform,
+    )
+
+    waveform = _native_duplex_unit_waveform(
+        [torch.tensor([1.0, 2.0]), torch.tensor([3.0])],
+        turn_end=True,
+        target_samples=6,
+    )
+
+    assert waveform is not None
+    assert waveform.tolist() == [1.0, 2.0, 3.0]
+
+
 def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,

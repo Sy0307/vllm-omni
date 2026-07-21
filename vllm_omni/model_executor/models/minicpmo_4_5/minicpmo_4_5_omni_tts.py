@@ -187,6 +187,23 @@ def _drain_native_duplex_emitted_text(state: _TalkerTurnState, *, has_audio: boo
 
 
 _T2W_SILENCE_TOKEN = 4218
+_NATIVE_DUPLEX_UNIT_AUDIO_SAMPLES = 24_000
+
+
+def _native_duplex_unit_waveform(
+    waveforms: Iterable[torch.Tensor],
+    *,
+    turn_end: bool,
+    target_samples: int = _NATIVE_DUPLEX_UNIT_AUDIO_SAMPLES,
+) -> torch.Tensor | None:
+    pieces = [torch.as_tensor(waveform).reshape(-1).cpu().contiguous() for waveform in waveforms]
+    pieces = [piece for piece in pieces if piece.numel() > 0]
+    if not pieces:
+        return None
+    waveform = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+    if not turn_end and waveform.numel() < target_samples:
+        waveform = F.pad(waveform, (target_samples - waveform.numel(), 0))
+    return waveform
 
 
 def _soundfile_patched_save(orig_save):
@@ -1167,12 +1184,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             chunk_size=chunk_size,
         )
         self._talker_consumed_tokens[key] = len(ids_list)
-        for waveform in waveforms:
+        unit_waveform = _native_duplex_unit_waveform(waveforms, turn_end=turn_end)
+        if unit_waveform is not None:
             self._ar_last_emitted_text = _drain_native_duplex_emitted_text(
                 state,
-                has_audio=bool(torch.as_tensor(waveform).numel()),
+                has_audio=True,
             )
-            yield waveform, False
+            yield unit_waveform, False
         if turn_end:
             self._close_turn_state(key)
             self._ar_last_emitted_text = ""

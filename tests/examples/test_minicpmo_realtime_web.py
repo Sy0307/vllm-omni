@@ -128,7 +128,10 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 "events = [",
                 "    {'type': 'session.created'},",
                 "    {'type': 'response.created', 'response': {'id': response_id}},",
-                "    {'type': 'response.audio.delta', 'response_id': response_id, 'delta': 'YQ=='},",
+                "    {'type': 'response.audio.delta', 'response_id': response_id, "
+                "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.1},",
+                "    {'type': 'response.audio.delta', 'response_id': response_id, "
+                "'delta': 'AAAA', 'sample_rate_hz': 24000, '_client_received_at_s': 10.6},",
                 "    {'type': 'response.done', 'response_id': response_id},",
                 "    {'type': 'session.closed'},",
                 "]",
@@ -166,7 +169,7 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
                 timeout_s=5.0,
                 no_realtime_pacing=False,
                 require_audio=True,
-                min_audio_deltas_per_session=1,
+                min_audio_deltas_per_session=2,
             )
         )
     )
@@ -178,7 +181,70 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
     assert result["input_wavs_distinct"] is True
     assert result["output_dirs_distinct"] is True
     assert result["identity_isolation_ok"] is True
-    assert {session["audio_delta_count"] for session in result["sessions"]} == {1}
+    assert result["response_audio_contract_ok"] is True
+    assert {session["audio_delta_count"] for session in result["sessions"]} == {2}
+    for session in result["sessions"]:
+        assert session["all_audio_deltas_same_response"] is True
+        assert session["response_id_nonempty"] is True
+        assert session["first_audio_delta_before_done"] is True
+        assert len(session["audio_delta_timings"]) == 2
+
+
+def test_realtime_duplex_demo_pair_rejects_false_green_audio_contract(tmp_path):
+    demo = _load_pair_demo_module()
+    output = tmp_path / "session"
+    output.mkdir()
+    response_id = "resp-a"
+    events = [
+        {"type": "response.created", "response": {"id": response_id}},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "sample_rate_hz": 24000},
+        {"type": "response.audio.delta", "response_id": "resp-other", "delta": "AAAA", "sample_rate_hz": 24000},
+        {"type": "response.done", "response_id": response_id},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id], "audio_bytes": 4}),
+        encoding="utf-8",
+    )
+
+    session = demo._summarize_session(
+        label="a",
+        input_wav="request.wav",
+        output_dir=str(output),
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    assert session["ok"] is False
+    assert session["all_audio_deltas_same_response"] is False
+    assert session["response_audio_contract_ok"] is False
+
+
+def test_realtime_duplex_demo_pair_default_requires_multiple_audio_deltas(monkeypatch):
+    demo = _load_pair_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "pair.py",
+            "--input-wav-a",
+            "a.wav",
+            "--input-wav-b",
+            "b.wav",
+            "--output-dir-a",
+            "a",
+            "--output-dir-b",
+            "b",
+        ],
+    )
+
+    args = demo.parse_args()
+
+    assert args.min_audio_deltas_per_session == 2
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():

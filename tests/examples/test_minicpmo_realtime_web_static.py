@@ -73,3 +73,18 @@ def test_audio_worklets_define_capture_and_playback_processors():
     assert "registerProcessor('fullduplex-pcm-playback'" in playback
     assert "playback-drained" in playback
     assert "clear" in playback
+
+
+def test_playback_worklet_buffers_first_200ms_and_reports_underruns():
+    app = (ROOT / "app.js").read_text(encoding="utf-8")
+    playback = (ROOT / "playback_worklet.js").read_text(encoding="utf-8")
+
+    assert "INITIAL_PLAYBACK_BUFFER_MS = 200" in app
+    assert "initialBufferMs" in app
+    assert "responseId" in app
+    assert "playback-underrun" in app
+    assert "underrunMs" in app
+    assert "initialBufferFrames" in playback
+    assert "playback-underrun" in playback
+    assert "underrunFrames" in playback
+    assert "underrunMs" in playback
