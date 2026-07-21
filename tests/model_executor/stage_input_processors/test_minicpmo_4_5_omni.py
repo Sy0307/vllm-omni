@@ -1,4 +1,6 @@
+import base64
 import os
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -1189,6 +1191,30 @@ def test_llm2tts_native_duplex_marks_talker_handoff_as_data_plane():
     assert duplex["epoch"] == 0
     assert duplex["turn_id"] == 7
     assert duplex["session_config"]["extra_body"]["duplex_stage_sampling_params"]["1"]["stop_token_ids"] == [151645]
+
+
+def test_llm2tts_native_duplex_carries_runtime_ref_audio_to_talker_payload():
+    ref_audio = base64.b64encode(struct.pack("<3f", 0.1, 0.2, 0.3)).decode("ascii")
+    streaming_context = SimpleNamespace(
+        bridge_states={
+            "duplex": {
+                "session_id": "sid-runtime-ref",
+                "runtime_config": {
+                    "ref_audio_data": ref_audio,
+                    "ref_audio_format": "pcm_f32le",
+                    "ref_audio_sample_rate_hz": 16000,
+                },
+            },
+        },
+    )
+    handoff = _native_duplex_handoff("duplex-runtime-ref", [101, 102], [9304, 21, 9308])
+
+    converted = llm2tts([handoff], prompt=[{}], _streaming_context=streaming_context)
+
+    info = converted[0]["model_intermediate_buffer"]
+    assert torch.allclose(torch.tensor(info["codes"]["ref"]), torch.tensor([0.1, 0.2, 0.3]))
+    assert info["meta"]["ref_audio_sr"] == 16000
+    assert info["duplex"]["runtime_config"]["ref_audio_data"] == ref_audio
 
 
 def test_llm2tts_native_duplex_advances_model_turn_only_after_turn_eos():

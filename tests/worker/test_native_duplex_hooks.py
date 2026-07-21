@@ -1529,6 +1529,57 @@ def test_minicpmo_stage0_native_sampler_preserves_early_model_turn_eos_decision(
     assert sampled.sampled_token_ids.tolist() == [[151717]]
 
 
+def test_minicpmo_stage0_native_sampler_char_cap_does_not_override_special_token():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Tokenizer:
+        eos_token_id = 151705
+        unk_token_id = -1
+        bad_token_ids = []
+        all_special_ids = [151706, 151717]
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<unit>": 151683,
+                "</unit>": 151684,
+                "<|listen|>": 151705,
+                "<|speak|>": 151706,
+                "<|tts_bos|>": 151703,
+                "<|tts_eos|>": 151704,
+                "<|tts_pad|>": 151722,
+                "<|chunk_eos|>": 151718,
+                "<|chunk_tts_eos|>": 151721,
+                "<|turn_eos|>": 151717,
+            }.get(token, -1)
+
+        def decode(self, ids, skip_special_tokens=True):
+            del skip_special_tokens
+            return "已经超过二十八个字符的当前语音分段文本"
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 151717] = 30.0
+    sampling_metadata = SimpleNamespace(
+        all_greedy=True,
+        all_random=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[[151706, 200, 201]],
+    )
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[151717]]
+
+
 def test_minicpmo_stage0_native_sampler_preserves_model_chunk_eos():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
@@ -1632,6 +1683,7 @@ def test_minicpmo_stage0_native_sampler_keeps_hard_chunk_cap():
 
     sampled = model.sample(logits, sampling_metadata)
 
+    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK == 20
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
@@ -1687,6 +1739,68 @@ def test_minicpmo_stage0_native_sampler_cuts_before_request_length_cap():
 
     sampled = model.sample(logits, sampling_metadata)
 
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[151718]]
+
+
+def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
+    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+        MiniCPMO45DuplexPolicy,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Tokenizer:
+        eos_token_id = 151705
+        unk_token_id = -1
+        bad_token_ids = []
+        all_special_ids = [151706, 151718, 151717, 151705]
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<unit>": 151683,
+                "</unit>": 151684,
+                "<|listen|>": 151705,
+                "<|speak|>": 151706,
+                "<|tts_bos|>": 151703,
+                "<|tts_eos|>": 151704,
+                "<|tts_pad|>": 151722,
+                "<|chunk_eos|>": 151718,
+                "<|chunk_tts_eos|>": 151721,
+                "<|turn_eos|>": 151717,
+            }.get(token, -1)
+
+        def decode(self, ids, skip_special_tokens=True):
+            token_text = {
+                200: "一二三四五六七八九十",
+                201: "十一十二十三十四十五",
+                202: "十六十七十八十九",
+            }
+            special = set(self.all_special_ids) if skip_special_tokens else set()
+            return "".join(token_text.get(int(token_id), "") for token_id in ids if int(token_id) not in special)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+    vocab_size = 151723
+    candidate = 202
+    logits = torch.full((1, vocab_size), -100.0)
+    logits[0, candidate] = 20.0
+    sampling_metadata = SimpleNamespace(
+        all_greedy=True,
+        all_random=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[[151706, 200, 201]],
+    )
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
@@ -1934,6 +2048,30 @@ def test_minicpmo_tts_prompt_wav_path_does_not_default_to_model_asset(tmp_path):
     model._write_ref_audio_prompt_wav = lambda ref_audio, ref_audio_sr: None
 
     assert model._resolve_prompt_wav_path(None, None) == (None, None)
+
+
+def test_minicpmo_tts_no_ref_audio_initializes_empty_vocoder_cache():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+        _TalkerTurnState,
+    )
+
+    class AudioTokenizer:
+        def set_stream_cache(self, prompt_wav_path):
+            raise AssertionError(f"unexpected reference-audio cache load: {prompt_wav_path!r}")
+
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    model._t2w_base_caches = {}
+    model._token2wav_state_lock = threading.RLock()
+    model.audio_tokenizer = AudioTokenizer()
+    state = _TalkerTurnState(None, None)
+
+    model._begin_turn_vocoder_cache(None, state=state)
+
+    assert state.stream_cache is None
+    assert state.hift_cache_dict == {}
+    assert state.vocoder_initialized is True
+    assert model._t2w_base_caches[""] == (None, {})
 
 
 def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):

@@ -16,6 +16,9 @@ DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/minicpmo_r
 MULTI_DEMO_PATH = (
     Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py"
 )
+PAIR_DEMO_PATH = (
+    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_demo_pair.py"
+)
 
 
 def _load_demo_module():
@@ -36,6 +39,15 @@ def _load_multi_demo_module():
     return module
 
 
+def _load_pair_demo_module():
+    spec = importlib.util.spec_from_file_location("minicpmo_realtime_duplex_demo_pair_test", PAIR_DEMO_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_realtime_duplex_multi_session_script_is_directly_executable():
     result = subprocess.run(
         [sys.executable, str(MULTI_DEMO_PATH), "--help"],
@@ -47,6 +59,126 @@ def test_realtime_duplex_multi_session_script_is_directly_executable():
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_realtime_duplex_demo_pair_script_is_directly_executable():
+    result = subprocess.run(
+        [sys.executable, str(PAIR_DEMO_PATH), "--help"],
+        cwd=PAIR_DEMO_PATH.parents[3],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_realtime_duplex_demo_pair_requires_distinct_inputs_and_outputs(tmp_path):
+    demo = _load_pair_demo_module()
+    wav_a = tmp_path / "request_a.wav"
+    wav_b = tmp_path / "request_b.wav"
+    wav_a.write_bytes(b"same")
+    wav_b.write_bytes(b"same")
+
+    args = SimpleNamespace(
+        input_wav_a=str(wav_a),
+        input_wav_b=str(wav_b),
+        output_dir_a=str(tmp_path / "session_a"),
+        output_dir_b=str(tmp_path / "session_a"),
+    )
+
+    with pytest.raises(ValueError, match="output directories must be different"):
+        demo._validate_pair_args(args)
+
+    args.output_dir_b = str(tmp_path / "session_b")
+    with pytest.raises(ValueError, match="input WAV files must have different content"):
+        demo._validate_pair_args(args)
+
+
+def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path, monkeypatch):
+    demo = _load_pair_demo_module()
+    fake_demo = tmp_path / "fake_realtime_duplex_demo.py"
+    start_log = tmp_path / "starts.log"
+    fake_demo.write_text(
+        "\n".join(
+            [
+                "import argparse, json, os, time",
+                "from pathlib import Path",
+                "parser = argparse.ArgumentParser()",
+                "parser.add_argument('--url')",
+                "parser.add_argument('--model')",
+                "parser.add_argument('--input-wav')",
+                "parser.add_argument('--output-dir')",
+                "parser.add_argument('--chunk-ms')",
+                "parser.add_argument('--timeout-s')",
+                "parser.add_argument('--session-id')",
+                "parser.add_argument('--ref-audio')",
+                "parser.add_argument('--require-audio', action='store_true')",
+                "parser.add_argument('--no-realtime-pacing', action='store_true')",
+                "args = parser.parse_args()",
+                "if args.ref_audio != os.environ.get('EXPECTED_REF_AUDIO'):",
+                "    raise SystemExit(f'unexpected ref audio: {args.ref_audio}')",
+                "output = Path(args.output_dir)",
+                "output.mkdir(parents=True, exist_ok=True)",
+                "response_id = 'resp-' + output.name",
+                "with open(os.environ['PAIR_START_LOG'], 'a', encoding='utf-8') as f:",
+                "    f.write(f'{output.name} {time.time()}\\n')",
+                "time.sleep(0.25)",
+                "events = [",
+                "    {'type': 'session.created'},",
+                "    {'type': 'response.created', 'response': {'id': response_id}},",
+                "    {'type': 'response.audio.delta', 'response_id': response_id, 'delta': 'YQ=='},",
+                "    {'type': 'response.done', 'response_id': response_id},",
+                "    {'type': 'session.closed'},",
+                "]",
+                "Path(output / 'events.jsonl').write_text(",
+                "    ''.join(json.dumps(event) + '\\n' for event in events),",
+                "    encoding='utf-8',",
+                ")",
+                "result = {'ok': True, 'response_ids': [response_id], 'audio_bytes': 1, 'output_dir': str(output)}",
+                "Path(output / 'result.json').write_text(json.dumps(result), encoding='utf-8')",
+                "print(json.dumps(result))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(demo, "DEMO_PATH", fake_demo)
+    monkeypatch.setenv("PAIR_START_LOG", str(start_log))
+    monkeypatch.setenv("EXPECTED_REF_AUDIO", str(tmp_path / "ref.wav"))
+    wav_a = tmp_path / "request_a.wav"
+    wav_b = tmp_path / "request_b.wav"
+    wav_a.write_bytes(b"request a")
+    wav_b.write_bytes(b"request b")
+
+    result = asyncio.run(
+        demo.run_pair(
+            SimpleNamespace(
+                url="ws://localhost:28889/v1/realtime?duplex=1",
+                model="/data/why/MiniCPM-o-4_5",
+                input_wav_a=str(wav_a),
+                input_wav_b=str(wav_b),
+                output_dir_a=str(tmp_path / "duplex_session_a"),
+                output_dir_b=str(tmp_path / "duplex_session_b"),
+                ref_audio=str(tmp_path / "ref.wav"),
+                summary_output=str(tmp_path / "summary.json"),
+                chunk_ms=200,
+                timeout_s=5.0,
+                no_realtime_pacing=False,
+                require_audio=True,
+                min_audio_deltas_per_session=1,
+            )
+        )
+    )
+
+    starts = [float(line.split()[1]) for line in start_log.read_text(encoding="utf-8").splitlines()]
+    assert len(starts) == 2
+    assert max(starts) - min(starts) < 0.2
+    assert result["ok"] is True
+    assert result["input_wavs_distinct"] is True
+    assert result["output_dirs_distinct"] is True
+    assert result["identity_isolation_ok"] is True
+    assert {session["audio_delta_count"] for session in result["sessions"]} == {1}
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():

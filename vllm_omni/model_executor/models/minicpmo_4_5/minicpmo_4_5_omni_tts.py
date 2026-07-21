@@ -763,19 +763,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             cache_key = prompt_wav_path or ""
             base = self._t2w_base_caches.get(cache_key)
             if base is None:
-                _orig_save = torchaudio.save
-                prev_dtype = torch.get_default_dtype()
-                torch.set_default_dtype(torch.float32)
-                try:
-                    torchaudio.save = _soundfile_patched_save(_orig_save)
-                    stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
-                finally:
-                    torch.set_default_dtype(prev_dtype)
-                    torchaudio.save = _orig_save
-                base = (
-                    _torch_clone_recursive(stream_cache),
-                    _torch_clone_recursive(hift_cache_dict),
-                )
+                if prompt_wav_path is None:
+                    base = (None, {})
+                else:
+                    _orig_save = torchaudio.save
+                    prev_dtype = torch.get_default_dtype()
+                    torch.set_default_dtype(torch.float32)
+                    try:
+                        torchaudio.save = _soundfile_patched_save(_orig_save)
+                        stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
+                    finally:
+                        torch.set_default_dtype(prev_dtype)
+                        torchaudio.save = _orig_save
+                    base = (
+                        _torch_clone_recursive(stream_cache),
+                        _torch_clone_recursive(hift_cache_dict),
+                    )
                 self._t2w_base_caches[cache_key] = base
             stream_cache = _torch_clone_recursive(base[0])
             hift_cache_dict = _torch_clone_recursive(base[1])
@@ -1083,6 +1086,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             ref_audio = codes_info.get("ref", info.get("ref_audio"))
             ref_audio_sr = meta_info.get("ref_audio_sr", info.get("ref_audio_sr"))
             prompt_wav_path, temp_prompt_wav_path = self._resolve_prompt_wav_path(ref_audio, ref_audio_sr)
+            if prompt_wav_path is None:
+                logger.warning(
+                    "4.5 Talker duplex streaming: no ref_audio prompt; skipping audio synthesis"
+                )
+                yield self._empty_audio_chunk(), True
+                return
             state = _TalkerTurnState(
                 prompt_wav_path,
                 temp_prompt_wav_path,

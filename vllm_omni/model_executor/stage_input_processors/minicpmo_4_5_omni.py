@@ -47,6 +47,21 @@ def _extract_first_audio_ref(multi_modal_data):
     return waveform.reshape(-1).cpu(), int(sample_rate)
 
 
+def _extract_native_runtime_ref_audio(data_plane_metadata):
+    if not isinstance(data_plane_metadata, dict):
+        return None
+    runtime_config = data_plane_metadata.get("runtime_config")
+    if not isinstance(runtime_config, dict):
+        return None
+    from vllm_omni.experimental.fullduplex.minicpmo45.input import decode_native_ref_audio_from_config
+
+    waveform = decode_native_ref_audio_from_config({"extra_body": runtime_config})
+    if waveform is None:
+        return None
+    sample_rate = runtime_config.get("ref_audio_sample_rate_hz") or 16000
+    return torch.as_tensor(waveform, dtype=torch.float32).reshape(-1).cpu(), int(sample_rate)
+
+
 def _coerce_token_id_list(value):
     if value is None:
         return None
@@ -266,6 +281,9 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     session_config = duplex_state.get("session_config")
     if isinstance(session_config, dict):
         metadata["session_config"] = dict(session_config)
+    runtime_config = duplex_state.get("runtime_config")
+    if isinstance(runtime_config, dict):
+        metadata["runtime_config"] = dict(runtime_config)
     return metadata
 
 
@@ -547,6 +565,10 @@ def llm2tts(
                 meta["segment_end"] = True
         req_mm_data = multi_modal_data.get(llm_output.request_id)
         ref_audio = _extract_first_audio_ref(req_mm_data)
+        if ref_audio is None:
+            ref_audio = _extract_native_runtime_ref_audio(
+                model_intermediate_buffer.get("duplex"),
+            )
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
