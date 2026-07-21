@@ -111,6 +111,15 @@ def test_latest_streaming_decision_is_used_at_exact_boundary():
     assert demo._latest_model_decision(events, after_index=0) == "listen"
 
 
+def test_ref_audio_data_url_encodes_explicit_wav(tmp_path):
+    demo = _load_demo_module()
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"RIFFfake")
+
+    assert demo._ref_audio_data_url(str(ref)) == "data:audio/wav;base64,UklGRmZha2U="
+    assert demo._ref_audio_data_url(None) is None
+
+
 def test_open_streaming_response_requires_post_commit_drain():
     demo = _load_demo_module()
 

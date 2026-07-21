@@ -69,6 +69,7 @@ def build_realtime_url(
     url: str,
     model: str,
     *,
+    autostart: bool | None = None,
     session_id: str | None = None,
 ) -> str:
     """Add the explicit native-duplex query parameters to a Realtime URL."""
@@ -77,6 +78,8 @@ def build_realtime_url(
     query.setdefault("duplex", "1")
     query.setdefault("model", model)
     query.setdefault("minicpmo45_native_duplex", "1")
+    if autostart is not None:
+        query.setdefault("autostart", "1" if autostart else "0")
     if session_id:
         query.setdefault("session_id", session_id)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
@@ -324,6 +327,7 @@ class RealtimeDuplexClient:
         model: str,
         *,
         output_audio_format: str = "pcm16",
+        ref_audio: str | None = None,
         session_id: str | None = None,
         timeout_s: float = 20.0,
     ) -> None:
@@ -341,6 +345,8 @@ class RealtimeDuplexClient:
                 "force_listen_count": 0,
             },
         }
+        if ref_audio is not None:
+            session["ref_audio"] = ref_audio
         if session_id:
             session["session_id"] = session_id
         await self.send({"type": "session.update", "session": session})

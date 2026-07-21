@@ -6,6 +6,7 @@ import pytest
 
 from vllm_omni.experimental.fullduplex.client import (
     RealtimeEventCollector,
+    RealtimeDuplexClient,
     build_realtime_url,
     read_pcm16_wav,
     write_pcm16_wav,
@@ -29,6 +30,60 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "minicpmo45_native_duplex": ["1"],
         "session_id": ["session-a"],
     }
+
+
+def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
+    url = build_realtime_url(
+        "ws://localhost:8099/v1/realtime?duplex=1",
+        "openbmb/MiniCPM-o-4_5",
+        autostart=False,
+    )
+
+    query = parse_qs(urlsplit(url).query)
+    assert query["autostart"] == ["0"]
+    assert query["minicpmo45_native_duplex"] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_configure_omits_ref_audio_by_default():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+
+    await client.configure("openbmb/MiniCPM-o-4_5", timeout_s=1)
+
+    session = client.sent[0]["session"]
+    assert "ref_audio" not in session
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_configure_sends_explicit_ref_audio():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        ref_audio="data:audio/wav;base64,AAAA",
+        timeout_s=1,
+    )
+
+    session = client.sent[0]["session"]
+    assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
 
 
 def test_realtime_event_collector_partitions_audio_by_response():

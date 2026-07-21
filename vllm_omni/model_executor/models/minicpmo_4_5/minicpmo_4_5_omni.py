@@ -1057,20 +1057,81 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
-            return self._finalize_minicpmo45_native_duplex_sample(
-                row_idx,
-                int(torch.argmax(logits, dim=-1).item()),
+            sampled = int(torch.argmax(logits, dim=-1).item())
+            sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
+                sampled,
+                recent_tokens,
                 token_ids,
             )
+            return self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
 
         logits = logits / temperature
         logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
-        return self._finalize_minicpmo45_native_duplex_sample(
-            row_idx,
-            int(torch.multinomial(probs, num_samples=1, generator=generator).item()),
+        sampled = int(torch.multinomial(probs, num_samples=1, generator=generator).item())
+        sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
+            sampled,
+            recent_tokens,
             token_ids,
         )
+        return self._finalize_minicpmo45_native_duplex_sample(
+            row_idx,
+            sampled,
+            token_ids,
+        )
+
+    def _maybe_cut_minicpmo45_native_duplex_text_chunk(
+        self,
+        sampled: int,
+        recent_tokens: list[int],
+        token_ids: dict[str, int],
+    ) -> int:
+        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
+        if chunk_eos_id < 0:
+            return int(sampled)
+        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
+        if sampled in special_ids:
+            return int(sampled)
+        max_chars = int(
+            getattr(
+                self,
+                "max_speak_chars_per_chunk",
+                MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK,
+            )
+            or MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
+        )
+        if max_chars <= 0:
+            return int(sampled)
+        tokenizer = self._minicpmo45_tokenizer()
+        decode = getattr(tokenizer, "decode", None)
+        if not callable(decode):
+            return int(sampled)
+        candidate_tokens = self._minicpmo45_current_chunk_tokens(recent_tokens, token_ids)
+        candidate_tokens.append(int(sampled))
+        try:
+            text = decode(candidate_tokens, skip_special_tokens=True)
+        except TypeError:
+            text = decode(candidate_tokens)
+        except Exception:
+            return int(sampled)
+        return int(chunk_eos_id) if isinstance(text, str) and len(text) >= max_chars else int(sampled)
+
+    @staticmethod
+    def _minicpmo45_current_chunk_tokens(
+        tokens: list[int],
+        token_ids: dict[str, int],
+    ) -> list[int]:
+        boundaries = {
+            token_ids.get("listen_token_id", -1),
+            token_ids.get("chunk_eos_token_id", -1),
+            token_ids.get("chunk_tts_eos_token_id", -1),
+            token_ids.get("turn_eos_token_id", -1),
+        }
+        start = 0
+        for idx, token_id in enumerate(tokens):
+            if token_id in boundaries:
+                start = idx + 1
+        return list(tokens[start:])
 
     def _minicpmo45_duplex_state_for_row(self, row_idx: int):
         row_sessions = getattr(self, "_minicpmo45_duplex_row_sessions", None)

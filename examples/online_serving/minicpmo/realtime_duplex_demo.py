@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import sys
 import time
@@ -106,6 +107,13 @@ def _event_count_after(
     return sum(event.get("type") == event_type for event in events[index + 1 :])
 
 
+def _ref_audio_data_url(path: str | None) -> str | None:
+    if path is None:
+        return None
+    ref_path = Path(path).expanduser()
+    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
+
+
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     input_pcm16 = read_pcm16_wav(Path(args.input_wav))
     if not input_pcm16:
@@ -114,11 +122,13 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     url = build_realtime_url(
         args.url,
         args.model,
+        autostart=False if args.ref_audio else None,
         session_id=args.session_id,
     )
     async with RealtimeDuplexClient(url) as client:
         await client.configure(
             args.model,
+            ref_audio=_ref_audio_data_url(args.ref_audio),
             session_id=args.session_id,
             timeout_s=args.timeout_s,
         )
@@ -296,6 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--session-id")
     parser.add_argument("--input-wav", required=True)
+    parser.add_argument("--ref-audio")
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=60.0)
