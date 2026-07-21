@@ -1135,6 +1135,8 @@ class TestDeployConfigLoading:
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex"]
         assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False]
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
+        assert deploy.stages[1].enforce_eager is False
+        assert deploy.stages[1].compilation_config == {"cudagraph_mode": "PIECEWISE"}
         assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
         assert stages[1].yaml_extras["default_sampling_params"]["extra_args"]["stop_token_names"] == ["<|im_end|>"]
 

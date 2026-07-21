@@ -12,7 +12,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 
 
 class PromptEmbedsPayload(msgspec.Struct):

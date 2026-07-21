@@ -915,7 +915,11 @@ class NativeRuntimeBridgeMixin:
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
             )
             model_turn_id = coerce_int(native_result.get("model_turn_id"))
-            if tts_segment_ended and self._session_auto_responds(session) and model_turn_id is not None:
+            if (
+                tts_segment_ended
+                and self._session_auto_responds(session)
+                and (model_turn_id is not None or session.active_response_id is not None)
+            ):
                 self._maybe_continue_native_response(
                     send_json,
                     session=session,
@@ -932,6 +936,19 @@ class NativeRuntimeBridgeMixin:
             model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
+            if self._session_auto_responds(session):
+                self._runtime_session_state(session).clear_continuation()
+                session.transition_turn(DuplexTurnState.IDLE)
+                emitted_response = True
+                payload = {
+                    "type": "response.listen",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "reason": "model_turn_completed_without_output",
+                    "model_listen": True,
+                }
+                self._attach_native_runtime_metadata(payload, native_result)
+                await send_json(payload)
             return close_reason, emitted_response
         model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:

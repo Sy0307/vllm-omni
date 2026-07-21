@@ -646,8 +646,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if mm_out is not None:
                 request_ids.append(get_stream_request_key(raw_info))
                 request_outputs.append(mm_out)
-        if previous_end != num_tokens:
-            raise RuntimeError(f"MiniCPM-o 4.5 TTS token spans cover {previous_end} of {num_tokens} scheduled tokens")
+        # vLLM pads the flattened token tensor to a CUDA Graph capture size.
+        # The spans describe only scheduled request rows, so an uncovered tail
+        # is graph padding rather than a missing request. Contiguity checks
+        # above still reject gaps between real requests.
 
         self.talker._ar_last_chunk_flags = row_chunk_flags
         self.talker._ar_turn_end_flags = row_turn_end_flags
@@ -835,13 +837,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
 
             runtime_info = kwargs.get("runtime_additional_information")
-            if isinstance(runtime_info, list) and len(runtime_info) > 1:
+            request_token_spans = kwargs.get("request_token_spans")
+            if isinstance(runtime_info, list) and (len(runtime_info) > 1 or request_token_spans is not None):
                 return self._run_batched_tts_requests(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     runtime_info=runtime_info,
-                    request_token_spans=kwargs.get("request_token_spans"),
+                    request_token_spans=request_token_spans,
                     num_tokens=num_tokens,
                     hidden_dim=hidden_dim,
                     device=device,

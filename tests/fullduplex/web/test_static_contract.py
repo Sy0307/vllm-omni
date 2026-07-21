@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[3] / "vllm_omni" / "experimental" / "fullduplex" / "web" / "static"
+ROOT = Path(__file__).resolve().parents[3] / "examples" / "online_serving" / "minicpmo" / "realtime_web" / "static"
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

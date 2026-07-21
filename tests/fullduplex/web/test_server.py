@@ -3,7 +3,7 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
-from vllm_omni.experimental.fullduplex.web.server import STATIC_DIR, _join_ws_url, build_app
+from examples.online_serving.minicpmo.realtime_web.server import STATIC_DIR, _join_ws_url, build_app
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

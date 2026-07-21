@@ -8,13 +8,14 @@ import time
 from collections.abc import Callable, MutableMapping
 from typing import Protocol
 
-from vllm_omni.engine.duplex_contracts import (
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_data_plane_request_info,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.messages import DuplexFence, ErrorMessage, OutputMessage
-from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 

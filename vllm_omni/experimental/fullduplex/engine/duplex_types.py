@@ -3,6 +3,6 @@
 
 from __future__ import annotations
 
-from vllm_omni.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 __all__ = ["DuplexFence"]

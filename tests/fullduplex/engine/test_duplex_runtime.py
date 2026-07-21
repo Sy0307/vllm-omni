@@ -3,13 +3,6 @@ from types import SimpleNamespace
 import pytest
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.duplex_contracts import (
-    DuplexInputMode as StableDuplexInputMode,
-)
-from vllm_omni.engine.duplex_contracts import (
-    DuplexOutputDecision as StableDuplexOutputDecision,
-)
-from vllm_omni.engine.duplex_lease import DuplexLeaseConfig as StableDuplexLeaseConfig
 from vllm_omni.experimental.fullduplex.core.identity import DuplexFence
 from vllm_omni.experimental.fullduplex.engine import duplex_runtime
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
@@ -73,11 +66,9 @@ def test_duplex_runtime_tracks_same_request_id_for_each_pipeline_stage():
     assert session.input_seq == 0
 
 
-def test_experimental_runtime_types_are_stable_engine_reexports():
+def test_experimental_runtime_types_are_compatibility_reexports():
     from vllm_omni.experimental.fullduplex.engine import omni as compatibility
 
-    assert DuplexInputMode is StableDuplexInputMode
-    assert DuplexOutputDecision is StableDuplexOutputDecision
     assert compatibility.DuplexInputMode is DuplexInputMode
     assert compatibility.DuplexRuntimeCapabilities is DuplexRuntimeCapabilities
     assert compatibility.DuplexSessionRuntimeManager is DuplexSessionRuntimeManager
@@ -85,13 +76,12 @@ def test_experimental_runtime_types_are_stable_engine_reexports():
 
 def test_duplex_session_state_has_a_dedicated_experimental_module():
     from vllm_omni.experimental.fullduplex.engine import duplex_session
-    from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseConfig
+    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseConfig
 
     assert duplex_runtime.DuplexAppendReservation is duplex_session.DuplexAppendReservation
     assert duplex_runtime.DuplexSessionRuntimeState is duplex_session.DuplexSessionRuntimeState
     assert duplex_runtime.DuplexSessionRuntimeManager is duplex_session.DuplexSessionRuntimeManager
     assert duplex_runtime.DuplexLeaseConfig is DuplexLeaseConfig
-    assert DuplexLeaseConfig is StableDuplexLeaseConfig
 
 
 def test_duplex_runtime_extension_validation_rejects_missing_methods():

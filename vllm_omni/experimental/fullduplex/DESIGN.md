@@ -24,10 +24,9 @@ not introduce another reducer, controller, worker provider, or shadow runtime.
   isolated H20 worktree on 2026-07-20
 
 The current tree has received fresh H20 focused and E2E validation against vLLM
-0.25.0. The latest broad affected matrix before the final pre-response
-continuation fix was green; that fix has separate focused and E2E evidence and
-still requires one final broad-matrix rerun. The checked-in MiniCPM
-profile admits two concurrent sessions through an engine-owned limit; a third
+0.25.0. The final affected matrix includes the pre-response continuation and
+Stage1 CUDA Graph padding regressions. The checked-in MiniCPM profile admits
+two concurrent sessions through an engine-owned limit; a third
 session was rejected and capacity returned after one session closed. The two
 accepted sessions independently completed their audio, transcript, response,
 playback, and close lifecycles. This is isolation and admission evidence for the
@@ -178,14 +177,17 @@ ordering guarantee.
 
 ### Extracted control ownership
 
-The model-neutral engine mechanism is split by responsibility:
+The generic engine mechanism and the experimental duplex plugin are split by
+responsibility:
 
 | Module | Responsibility |
 | --- | --- |
-| `engine.duplex_contracts` | model-neutral immutable DTOs, extension/stage protocols, typed decisions, request-ID codec |
-| `engine.duplex_lease` | generic resource lease activity, TTL/grace configuration, and expiry records |
-| `engine.messages` | identity fence and correlated control message/result envelopes |
-| `engine.resumable` | scheduler segment policy and resumable lifecycle contract |
+| `engine.messages` | ordinary engine queue messages and collective RPC envelopes |
+| `engine.rpc_result_router` | generic correlation routing through each result message's `rpc_correlation_key` |
+| `core.sched.segment_policy` | scheduler segment policy and resumable lifecycle contract |
+| `experimental.fullduplex.engine.contracts` | immutable duplex DTOs, extension/stage protocols, typed decisions, request-ID codec |
+| `experimental.fullduplex.engine.lease` | duplex lease activity, TTL/grace configuration, and expiry records |
+| `experimental.fullduplex.engine.messages` | identity fence and duplex control message/result envelopes |
 | `experimental.fullduplex.engine.duplex_runtime` | extension loading, validation, and compatibility exports |
 | `experimental.fullduplex.engine.duplex_session` | session resources, fences, append reservations, idempotency cache, binding cleanup |
 | `experimental.fullduplex.engine.duplex_control_plane` | control algorithms and the narrow `DuplexStagePort` used to submit and clean up stage requests |
@@ -352,13 +354,14 @@ which prevents queued old audio from leaking after a cancel or epoch bump.
 
 ## Runtime Type Boundary
 
-The stable model-neutral kernel is deliberately limited to:
+The stable kernel is deliberately limited to generic engine and scheduler
+mechanisms:
 
 ```text
-vllm_omni.engine.messages                  # identity fence and RPC envelopes
-vllm_omni.engine.duplex_contracts          # immutable DTOs and narrow protocols
-vllm_omni.engine.duplex_lease              # generic resource lease primitives
-vllm_omni.engine.resumable                 # scheduler segment policy
+vllm_omni.engine.messages                  # ordinary queue and collective RPC envelopes
+vllm_omni.engine.rpc_result_router         # generic correlation routing
+vllm_omni.engine.async_engine_utils        # ordinary engine lifecycle helpers
+vllm_omni.core.sched.segment_policy        # scheduler segment policy
 ```
 
 The full-duplex implementation remains experimental:
@@ -366,6 +369,12 @@ The full-duplex implementation remains experimental:
 ```text
 vllm_omni.experimental.fullduplex.engine.duplex_runtime
                                            # extension loading and validation
+vllm_omni.experimental.fullduplex.engine.contracts
+                                           # immutable DTOs and narrow protocols
+vllm_omni.experimental.fullduplex.engine.lease
+                                           # duplex lease primitives
+vllm_omni.experimental.fullduplex.engine.messages
+                                           # duplex identity and queue envelopes
 vllm_omni.experimental.fullduplex.engine.duplex_session
                                            # session transaction implementation
 vllm_omni.experimental.fullduplex.engine.duplex_control_plane
@@ -668,6 +677,17 @@ origin. Reports also include inter-chunk and chunk-duration
 count/mean/p50/p95/max plus maximum chunk gap. Engine and client measurements
 have different clock origins and must not be merged into one timeline.
 
+### Stage1 CUDA Graph boundary
+
+Native Stage1 streaming advances Python-owned request generators and turn
+state on every scheduler step. A full-model CUDA Graph would execute that
+Python control flow only while capturing and then replay stale chunk and turn
+metadata, even if its host-to-device tensor construction were made
+capture-safe. The duplex deploy profile therefore keeps `enforce_eager=false`
+but selects `cudagraph_mode=PIECEWISE` for Stage1. Python orchestration runs on
+every step while fixed-topology compiled regions remain eligible for CUDA
+Graph capture. This is a model execution constraint, not an E2E-only override.
+
 ### Resource capabilities
 
 The checked-in MiniCPM duplex deploy profile sets Stage0 and Stage1
@@ -693,8 +713,34 @@ All pytest and runtime evidence for this branch must run on the remote H20.
 ### Current synchronized tree
 
 The current dirty tree was synchronized to the isolated H20 worktree at
-`/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-control-plane-0719`.
+`/home/admin/workspace/aop_lab/model_runner_v2/vllm-omni-worktrees/pr3907-boundary-cg-0721`.
 
+- Final affected matrix: 661 passed, one network-dependent config test
+  deselected, 20 warnings. It includes the complete MiniCPM native-duplex hook
+  file and all control/session/handler/Orchestrator/import-boundary suites. The
+  run is task `be221f67` (`/tmp/remote_gpu_logs/be221f67.log`). The deselected
+  `test_resolve_when_autodetect_resolves_none` attempted a Hugging Face model
+  lookup and hung in the isolated environment; the duplex deploy-config test
+  passed independently.
+- Stage1 PIECEWISE CUDA Graph validation: the deploy-config assertion first
+  failed with no Stage1 compilation config, then passed in task `3ed6091d`.
+  Server task `95827027` started with `enforce_eager=False`, logged
+  `cudagraph_mode=PIECEWISE`, and captured batch sizes 1, 2, and 4 without the
+  CPU-to-CUDA capture error. The first concurrent E2E exposed graph padding as
+  `request_token_spans` covering three valid rows in a four-row capture. A
+  focused RED/GREEN now verifies both single-request and batched-request
+  padding, and the full MiniCPM hook file passed 47 tests in task `e89dba88`.
+  After the fix, two concurrent response-required sessions each completed two
+  spoken responses, playback acknowledgements, and history lifecycles with no
+  error or stale event. Artifacts are under
+  `/tmp/pr3907_piecewise_response_required_2x2_fixed_20260721`.
+- An exploratory two-session, two-turn model-policy run still left one session
+  waiting after its second input commit while the other session completed both
+  turns. The same liveness symptom was reproduced with Stage1 eager mode before
+  the padding fix, and no Stage1 fatal occurred after the fix. This run is not
+  counted as PIECEWISE acceptance evidence; the remaining Stage0 resumable
+  reactivation path requires separate diagnosis. Artifacts are under
+  `/tmp/pr3907_piecewise_model_policy_2x2_fixed_20260721`.
 - Latest broad affected matrix before the final pre-response continuation fix:
   608 passed, 19 warnings. This includes the
   Stage0 row-routing regression, cleanup-held admission regressions,
@@ -706,8 +752,8 @@ The current dirty tree was synchronized to the isolated H20 worktree at
   response-required two-turn scenario then passed 5/5 repeated runs in task
   `afe93659`; two-session semantic isolation plus resume, takeover, and
   admission passed in task `49225794`; model-unit overlap passed in task
-  `3888387d`. A final broad affected-matrix rerun remains required after this
-  lifecycle fix.
+  `3888387d`. The final affected matrix above supersedes the earlier pending
+  rerun requirement.
 - Serving plugin selection was first reproduced as three RED tests: the generic
   handler silently selected MiniCPM and the pipeline had no explicit Serving
   adapter field. The final pipeline/import/fail-fast group passed 9 tests in task

@@ -6,9 +6,9 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 
-from vllm_omni.engine.duplex_contracts import CorrelatedRpcTransport
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity
-from vllm_omni.engine.messages import (
+from vllm_omni.experimental.fullduplex.engine.contracts import CorrelatedRpcTransport
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,

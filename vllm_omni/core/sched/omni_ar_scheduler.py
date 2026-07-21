@@ -25,12 +25,12 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
 )
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 

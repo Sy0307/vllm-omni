@@ -505,6 +505,82 @@ def test_minicpmo_tts_routes_batched_requests_and_terminal_flags_independently()
     assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_turn_id"]] == [7, 8]
 
 
+@pytest.mark.parametrize(
+    ("runtime_info", "request_token_spans", "expected_rows", "expected_ids"),
+    [
+        (
+            [
+                {
+                    "global_request_id": ["req-a"],
+                    "native_duplex": True,
+                    "duplex": {"epoch": 3, "turn_id": 7},
+                    "meta": {"native_duplex_segment_text": "first"},
+                }
+            ],
+            [(0, 3)],
+            [3],
+            ["req-a"],
+        ),
+        (
+            [
+                {
+                    "global_request_id": ["req-a"],
+                    "native_duplex": True,
+                    "duplex": {"epoch": 3, "turn_id": 7},
+                    "meta": {"native_duplex_segment_text": "first"},
+                },
+                {
+                    "global_request_id": ["req-b"],
+                    "native_duplex": True,
+                    "duplex": {"epoch": 4, "turn_id": 8},
+                    "meta": {"native_duplex_segment_text": "second"},
+                },
+            ],
+            [(0, 2), (2, 3)],
+            [2, 1],
+            ["req-a", "req-b"],
+        ),
+    ],
+    ids=["single-request", "batched-requests"],
+)
+def test_minicpmo_tts_ignores_cuda_graph_padding_after_request_spans(
+    runtime_info,
+    request_token_spans,
+    expected_rows,
+    expected_ids,
+):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Talker:
+        def __init__(self):
+            self.input_rows = []
+            self._ar_last_chunk_flags = [True]
+            self._ar_turn_end_flags = [False]
+            self._ar_last_emitted_text = ""
+
+        def __call__(self, **kwargs):
+            self.input_rows.append(int(kwargs["input_ids"].shape[0]))
+            return None, torch.ones(2, dtype=torch.float32)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "tts"
+    model.config = SimpleNamespace(hidden_size=4)
+    model.talker = _Talker()
+
+    output = model.forward(
+        input_ids=torch.zeros(4, dtype=torch.long),
+        positions=torch.zeros(4, dtype=torch.long),
+        runtime_additional_information=runtime_info,
+        request_token_spans=request_token_spans,
+    )
+
+    assert model.talker.input_rows == expected_rows
+    assert output.text_hidden_states.shape == (4, 4)
+    assert output.multimodal_outputs["meta.req_id"] == expected_ids
+
+
 def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,

@@ -10,16 +10,7 @@ from dataclasses import FrozenInstanceError
 import msgspec
 import pytest
 
-from vllm_omni.engine.messages import (
-    AppendDuplexInputMessage,
-    CloseDuplexSessionMessage,
-    DuplexSessionLifecycleMessage,
-    OpenDuplexSessionMessage,
-    ResumeDuplexSessionMessage,
-    SignalDuplexTurnMessage,
-    TouchDuplexSessionMessage,
-)
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import (
     DuplexControlPlane,
     DuplexOutputContext,
@@ -28,13 +19,22 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import (
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
 )
-from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexAppendPlan,
     DuplexInputMode,
     DuplexRuntimeCapabilities,
 )
 from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity, DuplexLeaseConfig
+from vllm_omni.experimental.fullduplex.engine.messages import (
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
+    DuplexSessionLifecycleMessage,
+    OpenDuplexSessionMessage,
+    ResumeDuplexSessionMessage,
+    SignalDuplexTurnMessage,
+    TouchDuplexSessionMessage,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

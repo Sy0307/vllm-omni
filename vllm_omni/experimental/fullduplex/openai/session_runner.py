@@ -9,8 +9,8 @@ from copy import deepcopy
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
-from vllm_omni.experimental.fullduplex.engine.duplex_lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.openai.audio import convert_input_audio_with_rate
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexPlaybackCommitPolicy,
@@ -156,6 +156,7 @@ class DuplexSessionRunnerMixin:
                 )
 
         async def emit_event(payload: dict[str, object]) -> None:
+            deferred_precreate_response = False
             async with event_emit_lock:
                 accepted, deferred_overlap_payload = await self._apply_outbound_session_event(
                     payload,
@@ -167,11 +168,14 @@ class DuplexSessionRunnerMixin:
                 if not accepted:
                     return
                 await send_outbound(payload)
+                if deferred_overlap_payload is not None:
+                    deferred_precreate_response = native.deferred_precreate_response
+                    native.deferred_precreate_response = False
             if deferred_overlap_payload is not None and session is not None and not actor.closing:
                 await start_native_append(
                     deferred_overlap_payload,
                     final=True,
-                    precreate_response=True,
+                    precreate_response=deferred_precreate_response,
                     operation_id=native.committed_audio_operation_id,
                     retained_committed_payload=(
                         deferred_overlap_payload if native.committed_audio_payload is deferred_overlap_payload else None
@@ -1292,21 +1296,19 @@ class DuplexSessionRunnerMixin:
                                     }
                                 )
                                 continue
+                            allow_emit = not defer_native_append and (
+                                realtime_protocol is None
+                                or event_type != "input_audio_buffer.append"
+                                # Full-duplex: emit each ~chunk_period of audio so the model
+                                # runs per-chunk generation (speak/listen) without an explicit
+                                # response.create, matching the official duplex_generate loop.
+                                or self._session_auto_responds(session)
+                            )
                             pcm_reservation = native.audio_buffer.prepare_append(
                                 payload,
                                 operation_id=uuid.uuid4().hex,
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
-                                allow_emit=(
-                                    not defer_native_append
-                                    and (
-                                        realtime_protocol is None
-                                        or event_type != "input_audio_buffer.append"
-                                        # Full-duplex: emit each ~chunk_period of audio so the model
-                                        # runs per-chunk generation (speak/listen) without an explicit
-                                        # response.create, matching the official duplex_generate loop.
-                                        or self._session_auto_responds(session)
-                                    )
-                                ),
+                                allow_emit=allow_emit,
                             )
                         except ValueError as exc:
                             session.release_input_bytes(raw_audio_bytes)
@@ -1384,6 +1386,9 @@ class DuplexSessionRunnerMixin:
                         event_type == "response.create"
                         or bool(event.get("response_create", event_type == "input.commit"))
                         or (event_type == "input_audio_buffer.commit" and self._session_auto_responds(session))
+                    )
+                    precreate_response_requested = event_type == "response.create" or bool(
+                        event.get("response_create", event_type == "input.commit")
                     )
                     if event_type == "response.create":
                         response_payload = event.get("response")
@@ -1493,6 +1498,7 @@ class DuplexSessionRunnerMixin:
                                 )
                                 commit_reservation.commit()
                                 native.deferred_response_create = should_create_response
+                                native.deferred_precreate_response = precreate_response_requested
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
                                 committed = self._commit_native_audio_input(

@@ -22,7 +22,8 @@ from typing import Any, Protocol
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex_contracts import (
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
+from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
     DuplexInputMode,
     DuplexOutputContext,
@@ -37,8 +38,15 @@ from vllm_omni.engine.duplex_contracts import (
     SessionMode,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex_lease import DuplexLeaseActivity, DuplexLeaseConfig
-from vllm_omni.engine.messages import (
+from vllm_omni.experimental.fullduplex.engine.duplex_session import (
+    DuplexAppendReservation,
+    DuplexFenceMismatchError,
+    DuplexSessionExpiry,
+    DuplexSessionRuntimeManager,
+    DuplexSessionRuntimeState,
+)
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity, DuplexLeaseConfig
+from vllm_omni.experimental.fullduplex.engine.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
     DuplexControlError,
@@ -49,14 +57,6 @@ from vllm_omni.engine.messages import (
     ResumeDuplexSessionMessage,
     SignalDuplexTurnMessage,
     TouchDuplexSessionMessage,
-)
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
-from vllm_omni.experimental.fullduplex.engine.duplex_session import (
-    DuplexAppendReservation,
-    DuplexFenceMismatchError,
-    DuplexSessionExpiry,
-    DuplexSessionRuntimeManager,
-    DuplexSessionRuntimeState,
 )
 
 logger = init_logger(__name__)

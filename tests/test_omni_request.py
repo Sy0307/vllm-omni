@@ -19,8 +19,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine import PromptEmbedsPayload
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

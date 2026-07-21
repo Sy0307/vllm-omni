@@ -15,12 +15,12 @@ from fastapi import WebSocket
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.messages import DuplexSessionLifecycleMessage
 from vllm_omni.entrypoints.openai.duplex_capability import (
     should_enable_duplex_endpoint,
 )
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.duplex_types import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.openai.chat_fallback import (
     ChatFallbackProjectorMixin,
 )
@@ -371,6 +371,7 @@ class OmniDuplexSessionHandler(
                 native.input_since_commit = deferred_overlap_payload is not None
                 if realtime_protocol is not None:
                     native.deferred_response_create = True
+                    native.deferred_precreate_response = False
                     deferred_overlap_payload = None
             else:
                 had_pending_overlap_audio = native.audio_buffer.has_pending()

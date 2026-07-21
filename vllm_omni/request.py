@@ -11,8 +11,8 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
+from vllm_omni.core.sched.segment_policy import ResumableSegmentPolicy
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
-from vllm_omni.engine.resumable import ResumableSegmentPolicy
 
 
 class OmniRequest(Request):
