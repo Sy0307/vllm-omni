@@ -21,6 +21,8 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import AdditionalInformationPayload
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestOmniPayloadStruct:
     """Runtime-validated mirror of OmniPayload (msgspec.Struct)."""
