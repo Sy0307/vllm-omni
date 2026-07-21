@@ -18,12 +18,92 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+    PCM16_BYTES_PER_SAMPLE,
+    PCM16_SAMPLE_RATE,
     RealtimeDuplexClient,
     build_realtime_url,
     read_pcm16_wav,
     wait_for,
     write_pcm16_wav,
 )
+
+
+def _input_committed_index(
+    events: list[dict[str, object]],
+    after_index: int,
+) -> int | None:
+    for index, event in enumerate(events[max(after_index, 0) :], start=max(after_index, 0)):
+        if event.get("type") == "input_audio_buffer.committed":
+            return index
+    return None
+
+
+def _post_commit_model_decision(
+    events: list[dict[str, object]],
+    committed_index: int | None,
+) -> str | None:
+    if committed_index is None:
+        return None
+    for event in events[committed_index + 1 :]:
+        event_type = event.get("type")
+        if event_type == "response.listen":
+            return "listen"
+        if event_type == "response.done":
+            response = event.get("response")
+            if not isinstance(response, dict) or response.get("status") != "cancelled":
+                return "speak"
+    return None
+
+
+def _latest_model_decision(
+    events: list[dict[str, object]],
+    after_index: int,
+) -> str | None:
+    decision: str | None = None
+    for event in events[max(after_index, 0) :]:
+        event_type = event.get("type")
+        if event_type == "response.listen":
+            decision = "listen"
+        elif event_type == "response.done":
+            response = event.get("response")
+            if not isinstance(response, dict) or response.get("status") != "cancelled":
+                decision = "speak"
+    return decision
+
+
+def _chunk_period_ms(events: list[dict[str, object]]) -> int:
+    for event in reversed(events):
+        session = event.get("session")
+        if not isinstance(session, dict):
+            continue
+        capabilities = session.get("capabilities")
+        if not isinstance(capabilities, dict):
+            continue
+        chunk_period_ms = capabilities.get("chunk_period_ms")
+        if isinstance(chunk_period_ms, int) and chunk_period_ms > 0:
+            return chunk_period_ms
+    return 1000
+
+
+def _has_residual_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bool:
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
+    return bool(unit_bytes > 0 and len(pcm16) % unit_bytes)
+
+
+def _response_in_progress(events: list[dict[str, object]]) -> bool:
+    return sum(event.get("type") == "response.created" for event in events) > sum(
+        event.get("type") == "response.done" for event in events
+    )
+
+
+def _event_count_after(
+    events: list[dict[str, object]],
+    event_type: str,
+    index: int | None,
+) -> int:
+    if index is None:
+        return 0
+    return sum(event.get("type") == event_type for event in events[index + 1 :])
 
 
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
@@ -42,25 +122,50 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             session_id=args.session_id,
             timeout_s=args.timeout_s,
         )
-        before_done = client.events.count("response.done")
-        before_listen = client.events.count("response.listen")
+        stream_event_cursor = len(client.events.events)
         await client.stream_pcm16(
             input_pcm16,
             chunk_ms=args.chunk_ms,
             realtime=not args.no_realtime_pacing,
         )
+        commit_event_cursor = len(client.events.events)
+        stream_decision = _latest_model_decision(client.events.events, stream_event_cursor)
+        input_has_residual_model_unit = _has_residual_model_unit(
+            input_pcm16,
+            chunk_period_ms=_chunk_period_ms(client.events.events),
+        )
+        wait_for_post_commit_decision = False
         commit_sent_at_s = time.monotonic()
         await client.commit()
-        await wait_for(
-            lambda: (
-                client.events.count("response.done") > before_done
-                or client.events.count("response.listen") > before_listen
-            ),
-            timeout_s=args.timeout_s,
-            label="model speak/listen decision",
-        )
+        wait_error: str | None = None
+        committed_index: int | None = None
+        post_commit_decision: str | None = None
+        try:
+            await wait_for(
+                lambda: _input_committed_index(client.events.events, commit_event_cursor) is not None,
+                timeout_s=args.timeout_s,
+                label="input_audio_buffer.committed",
+            )
+            committed_index = _input_committed_index(client.events.events, commit_event_cursor)
+            stream_decision = _latest_model_decision(client.events.events[: committed_index + 1], stream_event_cursor)
+            wait_for_post_commit_decision = input_has_residual_model_unit or _response_in_progress(
+                client.events.events[: committed_index + 1]
+            )
+            if wait_for_post_commit_decision:
+                await wait_for(
+                    lambda: _post_commit_model_decision(client.events.events, committed_index) is not None,
+                    timeout_s=args.timeout_s,
+                    label="post-commit model decision or response drain",
+                )
+                post_commit_decision = _post_commit_model_decision(client.events.events, committed_index)
+        except TimeoutError as exc:
+            wait_error = str(exc)
         await client.acknowledge_playback()
-        await client.close_session(timeout_s=args.timeout_s)
+        close_error: str | None = None
+        try:
+            await client.close_session(timeout_s=args.timeout_s)
+        except TimeoutError as exc:
+            close_error = str(exc)
 
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +183,10 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "response.created",
             after_s=commit_sent_at_s,
         )
-        response_done_at_s = client.events.last_received_at("response.done")
+        response_done_at_s = client.events.first_received_at(
+            "response.done",
+            after_s=commit_sent_at_s,
+        )
         audio_duration_s = len(audio) / (client.events.output_sample_rate_hz * 2)
         response_generation_s = (
             response_done_at_s - response_created_at_s
@@ -100,6 +208,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             input_committed_at_s=commit_sent_at_s,
             response_id=response_id,
         )
+        errors = client.events.errors()
+        if wait_error:
+            errors.append({"type": "client.timeout", "message": wait_error})
+        if close_error:
+            errors.append({"type": "client.timeout", "message": close_error})
+        model_decision = post_commit_decision or stream_decision
         (output_dir / "events.jsonl").write_text(
             "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
             encoding="utf-8",
@@ -116,10 +230,27 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "ok": (
                 client.events.count("session.created") > 0
                 and client.events.count("session.closed") > 0
-                and not client.events.errors()
+                and not errors
+                and model_decision is not None
                 and (bool(audio) or not args.require_audio)
             ),
-            "model_decision": "speak" if audio else "listen",
+            "model_decision": model_decision,
+            "post_commit": {
+                "input_committed_event_index": committed_index,
+                "decision": post_commit_decision,
+                "decision_required": wait_for_post_commit_decision,
+                "input_had_residual_model_unit": input_has_residual_model_unit,
+                "response_listen_count": _event_count_after(
+                    client.events.events,
+                    "response.listen",
+                    committed_index,
+                ),
+                "response_done_count": _event_count_after(
+                    client.events.events,
+                    "response.done",
+                    committed_index,
+                ),
+            },
             "audio_bytes": len(audio),
             "output_sample_rate_hz": client.events.output_sample_rate_hz,
             "latency": {
@@ -149,7 +280,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "timing": timing,
             "response_ids": client.events.response_ids,
             "transcript": "".join(transcript_deltas),
-            "errors": client.events.errors(),
+            "errors": errors,
             "output_dir": str(output_dir),
         }
         (output_dir / "result.json").write_text(
