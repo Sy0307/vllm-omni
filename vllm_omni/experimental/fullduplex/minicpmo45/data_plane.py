@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 import numpy as np
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.fullduplex.engine.contracts import (
+    duplex_resource_request_belongs_to_session,
+)
 from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -510,7 +513,11 @@ class MiniCPMO45DataPlaneSession:
 
     @staticmethod
     def request_belongs_to_session(request_id: str, session_id: str) -> bool:
-        return request_id.startswith(f"duplex-{session_id}-") or request_id.startswith(f"chatcmpl-duplex-{session_id}-")
+        return (
+            duplex_resource_request_belongs_to_session(request_id, session_id)
+            or request_id.startswith(f"duplex-{session_id}-")
+            or request_id.startswith(f"chatcmpl-duplex-{session_id}-")
+        )
 
 
 def coerce_int(value: object) -> int | None:

@@ -3317,6 +3317,25 @@ def test_duplex_data_plane_text_delta_appends_distinct_non_prefix_segments():
     assert "".join(deltas) == "It's Canberra. Next question."
 
 
+def test_duplex_data_plane_close_session_removes_encoded_request_state():
+    data_plane = _test_data_plane()
+    target_request_id = duplex_resource_request_id(
+        DuplexFence("sid-to-close", incarnation=1, epoch=2),
+        "stage0",
+    )
+    other_request_id = duplex_resource_request_id(
+        DuplexFence("sid-to-keep", incarnation=1, epoch=2),
+        "stage0",
+    )
+    data_plane.begin_request(target_request_id)
+    data_plane.begin_request(other_request_id)
+
+    data_plane.close_session("sid-to-close")
+
+    assert data_plane.has_request(target_request_id) is False
+    assert data_plane.has_request(other_request_id) is True
+
+
 def test_duplex_auto_response_segment_complete_keeps_data_plane_request_open():
     import numpy as np
 

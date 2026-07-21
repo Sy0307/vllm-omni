@@ -248,6 +248,31 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     return f"duplex-s.{encoded_session_id}.i.{fence.incarnation}.e.{fence.epoch}.r.{role}"
 
 
+def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
+    """Return whether a current-format resource request belongs to a session."""
+    parts = request_id.split(".")
+    if (
+        len(parts) != 8
+        or parts[0] != "duplex-s"
+        or parts[2] != "i"
+        or parts[4] != "e"
+        or parts[6] != "r"
+    ):
+        return False
+    try:
+        int(parts[3])
+        int(parts[5])
+    except ValueError:
+        return False
+    role = parts[7]
+    if not role or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
+    ):
+        return False
+    encoded_session_id = base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return parts[1] == encoded_session_id
+
+
 __all__ = [
     "CorrelatedRpcTransport",
     "DuplexAppendPlan",
@@ -265,5 +290,6 @@ __all__ = [
     "DuplexStageSubmissionResult",
     "SessionMode",
     "duplex_data_plane_request_info",
+    "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
 ]

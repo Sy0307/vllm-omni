@@ -7,6 +7,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.experimental.fullduplex.engine import duplex_runtime
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_data_plane_request_info,
+    duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
@@ -497,6 +498,19 @@ def test_resource_request_id_codec_separates_session_id_from_incarnation():
     )
 
     assert embedded_incarnation != actual_incarnation
+
+
+def test_resource_request_id_session_membership_uses_encoded_identity():
+    request_id = duplex_resource_request_id(
+        DuplexFence("sid-with-dashes", incarnation=2, epoch=7),
+        "stage0",
+    )
+
+    assert duplex_resource_request_belongs_to_session(request_id, "sid-with-dashes") is True
+    assert duplex_resource_request_belongs_to_session(request_id, "sid") is False
+    assert (
+        duplex_resource_request_belongs_to_session("duplex-s.invalid.i.x.e.7.r.stage0", "sid") is False
+    )
 
 
 def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
