@@ -22,11 +22,72 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
     RealtimeDuplexClient,
+    RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
     wait_for,
     write_pcm16_wav,
 )
+
+
+class _StreamingOutputWriter:
+    """Persist and report output deltas as the client receives them."""
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self.audio_chunk_dir = output_dir / "audio_chunks"
+        self.audio_chunk_paths: list[Path] = []
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_chunk_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "output.pcm").write_bytes(b"")
+
+    def handle(self, event: dict[str, object]) -> None:
+        event_type = event.get("type")
+        if event_type in {
+            "response.audio_transcript.delta",
+            "response.output_text.delta",
+        }:
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                print(delta, end="", file=sys.stderr, flush=True)
+            return
+        if event_type != "response.audio.delta":
+            return
+
+        delta = event.get("delta") or event.get("audio")
+        if not isinstance(delta, str) or not delta:
+            return
+        try:
+            pcm16 = base64.b64decode(delta)
+        except ValueError:
+            return
+        if not pcm16:
+            return
+
+        chunk_index = len(self.audio_chunk_paths) + 1
+        chunk_path = self.audio_chunk_dir / f"chunk_{chunk_index:04d}.wav"
+        sample_rate_hz = event.get("sample_rate_hz")
+        if not isinstance(sample_rate_hz, int) or sample_rate_hz <= 0:
+            sample_rate_hz = 24_000
+        with (self.output_dir / "output.pcm").open("ab") as output_pcm:
+            output_pcm.write(pcm16)
+        write_pcm16_wav(chunk_path, pcm16, sample_rate_hz=sample_rate_hz)
+        self.audio_chunk_paths.append(chunk_path)
+        print(
+            f"\n[audio chunk {chunk_index}: {len(pcm16)} bytes -> {chunk_path}]",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+class _StreamingEventCollector(RealtimeEventCollector):
+    def __init__(self, writer: _StreamingOutputWriter) -> None:
+        super().__init__()
+        self._writer = writer
+
+    def add(self, event: dict[str, object], *, received_at_s: float | None = None) -> None:
+        super().add(event, received_at_s=received_at_s)
+        self._writer.handle(self.events[-1])
 
 
 def _input_committed_index(
@@ -119,13 +180,18 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     if not input_pcm16:
         raise ValueError("input WAV has no audio")
 
+    output_dir = Path(args.output_dir)
+    stream_writer = _StreamingOutputWriter(output_dir)
+
     url = build_realtime_url(
         args.url,
         args.model,
         autostart=False if args.ref_audio else None,
         session_id=args.session_id,
     )
-    async with RealtimeDuplexClient(url) as client:
+    client = RealtimeDuplexClient(url)
+    client.events = _StreamingEventCollector(stream_writer)
+    async with client:
         await client.configure(
             args.model,
             ref_audio=_ref_audio_data_url(args.ref_audio),
@@ -177,8 +243,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         except TimeoutError as exc:
             close_error = str(exc)
 
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
         audio = client.events.audio_bytes()
         first_text_at_s = client.events.first_received_at(
             "response.audio_transcript.delta",
@@ -262,6 +326,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 ),
             },
             "audio_bytes": len(audio),
+            "audio_chunk_count": len(stream_writer.audio_chunk_paths),
+            "audio_chunk_files": [str(path) for path in stream_writer.audio_chunk_paths],
             "output_sample_rate_hz": client.events.output_sample_rate_hz,
             "latency": {
                 "ttft_ms": (

@@ -760,15 +760,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 prompt_rows = []
                 for duplex_info in duplex_rows:
                     prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
-                    prompt_rows.append(
-                        torch.tensor(
-                            [prompt_token_ids],
-                            dtype=torch.long,
-                            device=text_hidden_states.device,
-                        )
-                        if isinstance(prompt_token_ids, list)
-                        else None
-                    )
+                    # This is a complete per-handoff snapshot, not a generated
+                    # tensor delta. Keep it as row-local metadata so output
+                    # accumulation replaces the previous value instead of
+                    # attempting to concatenate variable-length prompts.
+                    prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
                 if any(row is not None for row in prompt_rows):
                     multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
 

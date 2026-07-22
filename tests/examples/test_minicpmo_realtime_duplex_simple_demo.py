@@ -1,5 +1,7 @@
+import base64
 import importlib.util
 import sys
+import wave
 from pathlib import Path
 
 import pytest
@@ -165,3 +167,45 @@ def test_open_streaming_response_requires_post_commit_drain():
             {"type": "response.done"},
         ]
     )
+
+
+def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, capsys):
+    demo = _load_demo_module()
+    writer = demo._StreamingOutputWriter(tmp_path)
+    first_pcm = b"\x01\x00\x02\x00"
+    second_pcm = b"\x03\x00"
+
+    writer.handle(
+        {
+            "type": "response.audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(first_pcm).decode("ascii"),
+            "sample_rate_hz": 24_000,
+        }
+    )
+    writer.handle(
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "resp-a",
+            "delta": "你好",
+        }
+    )
+    writer.handle(
+        {
+            "type": "response.audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(second_pcm).decode("ascii"),
+            "sample_rate_hz": 24_000,
+        }
+    )
+
+    assert (tmp_path / "output.pcm").read_bytes() == first_pcm + second_pcm
+    chunk_paths = sorted((tmp_path / "audio_chunks").glob("*.wav"))
+    assert [path.name for path in chunk_paths] == ["chunk_0001.wav", "chunk_0002.wav"]
+    with wave.open(str(chunk_paths[0]), "rb") as chunk_wav:
+        assert chunk_wav.getframerate() == 24_000
+        assert chunk_wav.readframes(chunk_wav.getnframes()) == first_pcm
+    assert writer.audio_chunk_paths == chunk_paths
+    stderr = capsys.readouterr().err
+    assert "audio chunk 1" in stderr
+    assert "你好" in stderr
