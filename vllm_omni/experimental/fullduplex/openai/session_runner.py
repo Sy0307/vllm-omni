@@ -22,7 +22,6 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
     DuplexTurnEventType,
-    DuplexTurnState,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
@@ -282,7 +281,33 @@ class DuplexSessionRunnerMixin:
                 return True
             if actor.has_response_bound_append_tasks():
                 return True
-            return session.turn_state == DuplexTurnState.ASSISTANT_GENERATING
+            return False
+
+        def clear_completed_pending_silence() -> None:
+            task = native.pending_silence_task
+            if task is not None and task.done():
+                native.pending_silence_task = None
+                native.pending_silence_owner_id = None
+
+        def mark_pending_silence_superseded() -> None:
+            task = native.pending_silence_task
+            if task is None:
+                return
+            if task.done():
+                native.pending_silence_task = None
+            # Do not cancel the task or clear native_append_tail here. A
+            # silence append may already have reached the Engine, and local
+            # cancellation cannot retract that RPC. The sequencer preserves
+            # wire order; before_append will skip silence that has not started.
+            native.pending_silence_owner_id = None
+
+        def real_native_input_waiting() -> bool:
+            clear_completed_pending_silence()
+            return (
+                native.audio_buffer.has_pending()
+                or native.audio_buffer.has_reserved()
+                or actor.has_queued_input_events()
+            )
 
         async def start_native_append(
             payload: object,
@@ -292,9 +317,13 @@ class DuplexSessionRunnerMixin:
             pcm_reservation: PcmAppendReservation | None = None,
             operation_id: str | None = None,
             retained_committed_payload: dict[str, object] | None = None,
+            silence_continuation: bool = False,
+            before_append=None,
         ) -> asyncio.Task[bool] | None:
             if session is None:
                 return
+            if not silence_continuation:
+                mark_pending_silence_superseded()
             append_epoch = session.epoch
             append_turn_id = payload_turn_id(payload)
             if append_turn_id is None:
@@ -304,8 +333,6 @@ class DuplexSessionRunnerMixin:
                 session.bind_request(request_id)
             if precreate_response:
                 session.bind_response_turn(append_turn_id)
-            if final:
-                session.mark_assistant_generating()
             if precreate_response and session.active_response_id is None:
                 response_id = session.begin_response(turn_id=append_turn_id)
                 await emit_event(
@@ -416,6 +443,10 @@ class DuplexSessionRunnerMixin:
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
                     return False
+                if before_append is not None and not before_append():
+                    if pcm_reservation is not None:
+                        pcm_reservation.rollback()
+                    return True
                 if pcm_reservation is not None and not pcm_reservation.active:
                     return False
                 return await _run()
@@ -440,10 +471,66 @@ class DuplexSessionRunnerMixin:
                 final=final,
                 response_bound=final or precreate_response,
             )
+            if silence_continuation:
+                native.pending_silence_task = task
+
+                def _clear_done_pending_silence(done: asyncio.Task[bool]) -> None:
+                    if native.pending_silence_task is done:
+                        native.pending_silence_task = None
+                        native.pending_silence_owner_id = None
+
+                task.add_done_callback(_clear_done_pending_silence)
             # Let this wire-order effect start before the next mailbox event can
             # cancel it. Later native appends still serialize on predecessor.
             await asyncio.sleep(0)
             return task
+
+        async def schedule_native_silence_continuation(
+            payload: object,
+            *,
+            request_id: str,
+            owner_id: str,
+            response_id: str | None,
+            response_owned: bool,
+            expected_epoch: int | None,
+            expected_incarnation: int,
+            expected_model_turn_id: int | None,
+            send_json,
+        ) -> bool:
+            del send_json
+            if session is None:
+                return False
+            clear_completed_pending_silence()
+            pending_silence = native.pending_silence_task
+            if pending_silence is not None and not pending_silence.done():
+                return False
+            if actor.native_append_tail is not None and not actor.native_append_tail.done():
+                return False
+            if real_native_input_waiting():
+                return False
+
+            def _still_valid() -> bool:
+                return not real_native_input_waiting() and not self._native_silence_continuation_is_stale(
+                    session,
+                    request_id=request_id,
+                    response_id=response_id,
+                    response_owned=response_owned,
+                    expected_epoch=expected_epoch,
+                    expected_incarnation=expected_incarnation,
+                    expected_model_turn_id=expected_model_turn_id,
+                )
+
+            native.pending_silence_owner_id = owner_id
+            task = await start_native_append(
+                payload,
+                final=False,
+                silence_continuation=True,
+                before_append=_still_valid,
+            )
+            if task is None:
+                native.pending_silence_owner_id = None
+                return False
+            return True
 
         async def wait_for_native_append_tail() -> bool:
             predecessor = actor.native_append_tail
@@ -540,6 +627,7 @@ class DuplexSessionRunnerMixin:
                 self._session_tasks[session.session_id] = actor.tasks
                 if realtime_protocol is not None:
                     self._realtime_protocols[session.session_id] = realtime_protocol
+            native.silence_continuation_scheduler = schedule_native_silence_continuation
             if realtime_protocol is not None:
                 session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
             if not handshake.resumed:
@@ -588,7 +676,6 @@ class DuplexSessionRunnerMixin:
                     session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
-                    native.clear_overlap_turn()
                     native.clear_committed_audio()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
@@ -709,7 +796,6 @@ class DuplexSessionRunnerMixin:
                     session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
-                    native.clear_overlap_turn()
                     native.clear_committed_audio()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
@@ -736,7 +822,6 @@ class DuplexSessionRunnerMixin:
                     session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
-                    native.clear_overlap_turn()
                     native.clear_committed_audio()
                     cancelled = session.cancel_pending_input()
                     await emit_event(
@@ -804,7 +889,6 @@ class DuplexSessionRunnerMixin:
                         session.release_all_input_bytes()
                         native.input_since_commit = False
                         native.speech_since_commit = False
-                        native.clear_overlap_turn()
                         native.clear_committed_audio()
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
@@ -946,6 +1030,13 @@ class DuplexSessionRunnerMixin:
                                 session.replace_config(previous_config)
                             if update_error is not None:
                                 await emit_event(update_error)
+                                continue
+                            runtime_update_error = self._runtime_session_candidate_update_error(
+                                session,
+                                candidate_config,
+                            )
+                            if runtime_update_error is not None:
+                                await emit_event(runtime_update_error)
                                 continue
                             candidate_runtime_config = self._runtime_config_for_session_update(
                                 session,
@@ -1123,21 +1214,8 @@ class DuplexSessionRunnerMixin:
                     defer_native_append = False
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
-                        if not native.input_since_commit:
-                            native.deferred_overlap_turn = self._should_start_deferred_native_auto_response_overlap(
-                                session,
-                                event,
-                            )
-                            if native.deferred_overlap_turn:
-                                native.reserve_overlap_turn(
-                                    session_turn_id=session.turn_id,
-                                    active_response_turn_id=session.active_response_turn_id,
-                                )
-                            else:
-                                native.clear_overlap_turn()
-                        overlap_active = native.deferred_overlap_turn or (
-                            not self._session_auto_responds(session) and native_response_in_progress()
-                        )
+                        mark_pending_silence_superseded()
+                        overlap_active = not self._session_auto_responds(session) and native_response_in_progress()
                         if overlap_active:
                             decision = self._overlap_decision(session, event, payload)
                             await self._emit_overlap_decision(emit_event, session, decision)
@@ -1147,7 +1225,6 @@ class DuplexSessionRunnerMixin:
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=self._input_audio_duration_ms(event, payload)
                                     )
-                                session.mark_assistant_generating()
                                 continue
                             if action == "listen":
                                 buffer_overlap_audio = bool(decision.get("buffer_audio", True))
@@ -1162,10 +1239,8 @@ class DuplexSessionRunnerMixin:
                                     )
                                 if decision.get("force_listen", True) is True:
                                     payload["force_listen"] = True
-                                session.mark_assistant_generating()
                             else:
                                 event["force_barge_in"] = True
-                                self._mark_barge_in_new_user_turn_payload(payload)
                                 cancelled_fence = DuplexFence(
                                     session.session_id,
                                     epoch=session.epoch,
@@ -1179,7 +1254,6 @@ class DuplexSessionRunnerMixin:
                                 session.reset_overlap_speech()
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
-                                native.clear_overlap_turn()
                                 await actor.cancel_append_tasks()
                                 had_native_stream = native.data_plane_task is not None
                                 cancelled = await self._cancel_active_response(
@@ -1262,16 +1336,7 @@ class DuplexSessionRunnerMixin:
                                 }
                             )
                             continue
-                        new_user_turn_payload = self._mark_auto_response_new_user_turn_payload(
-                            session,
-                            event,
-                            payload,
-                        )
-                        if new_user_turn_payload:
-                            native.audio_buffer.clear_force_listen()
-                        if self._should_skip_auto_response_waiting_silence(session, event, payload):
-                            continue
-                        if not new_user_turn_payload and self._should_force_listen_for_auto_response_overlap(
+                        if self._should_force_listen_for_auto_response_overlap(
                             session, event, payload
                         ):
                             # Auto-response keeps a long-lived native Stage0 stream.
@@ -1339,11 +1404,6 @@ class DuplexSessionRunnerMixin:
 
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
                     realtime_item_id = event.get("realtime_item_id")
-                    committing_overlap_turn_id = (
-                        native.deferred_overlap_turn_id
-                        if event_type in {"input.commit", "input_audio_buffer.commit"}
-                        else None
-                    )
                     realtime_validated_audio_commit = (
                         event_type == "input_audio_buffer.commit"
                         and isinstance(realtime_item_id, str)
@@ -1355,8 +1415,6 @@ class DuplexSessionRunnerMixin:
                         and not await wait_for_native_append_tail()
                     ):
                         continue
-                    if event_type in {"input.commit", "input_audio_buffer.commit"}:
-                        native.clear_overlap_turn()
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
                         native.input_since_commit = False
                         native.speech_since_commit = False
@@ -1367,11 +1425,7 @@ class DuplexSessionRunnerMixin:
                             {
                                 "type": "input.committed",
                                 "session_id": session.session_id,
-                                "turn_id": (
-                                    committing_overlap_turn_id
-                                    if committing_overlap_turn_id is not None
-                                    else session.turn_id
-                                ),
+                                "turn_id": session.turn_id,
                                 "epoch": session.epoch,
                                 "empty": True,
                                 "is_speech": False,
@@ -1443,7 +1497,6 @@ class DuplexSessionRunnerMixin:
                             CommitSnapshot(
                                 auto_responds=self._session_auto_responds(session),
                                 speech_since_commit=native.speech_since_commit,
-                                auto_response_waiting_for_speech=native.auto_response_waiting_for_speech,
                                 active_response_id=session.active_response_id,
                                 overlap_speech_ms=session.overlap_speech_ms,
                                 native_response_in_progress=native_response_in_progress(),
@@ -1465,11 +1518,7 @@ class DuplexSessionRunnerMixin:
                                     {
                                         "type": "input.committed",
                                         "session_id": session.session_id,
-                                        "turn_id": (
-                                            committing_overlap_turn_id
-                                            if committing_overlap_turn_id is not None
-                                            else session.turn_id
-                                        ),
+                                        "turn_id": session.turn_id,
                                         "epoch": session.epoch,
                                         "empty": True,
                                         "is_speech": False,
@@ -1494,9 +1543,6 @@ class DuplexSessionRunnerMixin:
                                         native.committed_audio_payload,
                                         deferred_payload,
                                     )
-                                if committing_overlap_turn_id is not None:
-                                    deferred_payload = dict(deferred_payload)
-                                    deferred_payload["duplex_turn_id"] = committing_overlap_turn_id
                                 native.retain_committed_audio(
                                     deferred_payload,
                                     operation_id=commit_reservation.operation_id,
@@ -1511,7 +1557,6 @@ class DuplexSessionRunnerMixin:
                                     session,
                                     realtime_item_id=event.get("realtime_item_id"),
                                     transcript=event.get("transcript"),
-                                    turn_id=committing_overlap_turn_id,
                                 )
                                 committed_payload = self._native_audio_committed_payload(
                                     session,
@@ -1548,11 +1593,7 @@ class DuplexSessionRunnerMixin:
                             native.deferred_response_create = False
                             native.input_since_commit = False
                             native.speech_since_commit = False
-                            data_plane_turn_id = (
-                                committing_overlap_turn_id
-                                if committing_overlap_turn_id is not None
-                                else session.turn_id
-                            )
+                            data_plane_turn_id = session.turn_id
                             committed = self._commit_native_audio_input(
                                 session,
                                 realtime_item_id=event.get("realtime_item_id"),
@@ -1568,7 +1609,6 @@ class DuplexSessionRunnerMixin:
                                 )
                             )
                             if final_payload is not None:
-                                self._consume_auto_response_waiting_turn_payload(session, final_payload)
                                 await start_native_append(
                                     {
                                         **final_payload,
@@ -1656,9 +1696,6 @@ class DuplexSessionRunnerMixin:
                         if commit_reservation is not None:
                             commit_reservation.commit()
                         if flushed is not None:
-                            if committing_overlap_turn_id is not None:
-                                flushed = dict(flushed)
-                                flushed["duplex_turn_id"] = committing_overlap_turn_id
                             if self._should_force_listen_for_short_commit(session, event, flushed):
                                 flushed = dict(flushed)
                                 flushed["force_listen"] = True
@@ -1667,7 +1704,6 @@ class DuplexSessionRunnerMixin:
                                 session,
                                 realtime_item_id=event.get("realtime_item_id"),
                                 transcript=event.get("transcript"),
-                                turn_id=committing_overlap_turn_id,
                             )
                             await emit_event(
                                 self._native_audio_committed_payload(
@@ -1734,7 +1770,6 @@ class DuplexSessionRunnerMixin:
                                     session,
                                     realtime_item_id=event.get("realtime_item_id"),
                                     transcript=event.get("transcript"),
-                                    turn_id=committing_overlap_turn_id,
                                 )
                                 if native_had_uncommitted_audio
                                 else None
@@ -1774,10 +1809,9 @@ class DuplexSessionRunnerMixin:
                             session,
                             actor.active_response_task,
                             emit_event,
-                            reason="new_user_turn",
+                            reason="new_response",
                         )
                     actor.active_response_task = asyncio.create_task(self._run_response(session, emit_event))
-                    session.mark_assistant_generating()
                     continue
 
                 await emit_event(

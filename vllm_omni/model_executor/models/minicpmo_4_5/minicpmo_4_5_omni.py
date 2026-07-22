@@ -193,11 +193,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not isinstance(force_listen_segments, set):
             force_listen_segments = set()
             self._minicpmo45_force_listen_applied_segments = force_listen_segments
-        turn_ended_sessions = getattr(self, "_minicpmo45_turn_ended_sessions", None)
-        if not isinstance(turn_ended_sessions, set):
-            turn_ended_sessions = set()
-            self._minicpmo45_turn_ended_sessions = turn_ended_sessions
-
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
         for row in rows:
@@ -209,35 +204,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 continue
             force_listen = payload.get("force_listen") is True
             is_speech = payload.get("is_speech")
-            new_user_turn = payload.get("new_user_turn") is True
             redirect_listen = False
+            segment_key = (row.request_id, row.seq if row.seq is not None else -1)
             session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
             if turn_eos_id >= 0 and session_key is not None:
                 state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
+                pending_speech_context = (
+                    bool(getattr(state, "pending_speech_context", False)) if state is not None else False
+                )
                 if is_speech is True:
-                    turn_ended_sessions.discard(session_key)
                     if state is not None:
-                        if new_user_turn:
-                            with suppress(Exception):
-                                state.current_turn_ended = True
                         if not getattr(state, "current_turn_ended", True):
                             redirect_listen = True
                         with suppress(Exception):
                             state.last_terminator_token = None
                 else:
-                    prev_term = None
-                    if state is not None:
-                        prev_term = getattr(state, "last_terminator_token", None)
-                        if prev_term is None:
-                            prev_term = getattr(state, "pending_terminator_token", None)
-                    if prev_term == turn_eos_id:
-                        turn_ended_sessions.add(session_key)
-                if session_key in turn_ended_sessions and is_speech is not True:
-                    force_listen = True
+                    turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
+                    if turn_ended and not pending_speech_context:
+                        force_listen = True
 
             if not force_listen and not redirect_listen:
                 continue
-            segment_key = (row.request_id, row.seq if row.seq is not None else -1)
             if force_listen and segment_key in force_listen_segments:
                 continue
             if force_listen:
@@ -401,14 +388,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             seq = int(seq) if seq is not None else None
         except (TypeError, ValueError):
             seq = None
+        epoch = duplex.get("epoch")
+        try:
+            epoch = int(epoch) if epoch is not None else None
+        except (TypeError, ValueError):
+            epoch = None
         result = helper._stage_prefill_embeddings_only(
             state,
             audio_waveform,
             video_frames=video_frames,
+            epoch=epoch,
             seq=seq,
+            is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
-            new_user_turn=payload.get("new_user_turn") is True,
-            new_user_turn_prefix_variant=payload.get("new_user_turn_prefix_variant"),
         )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
@@ -1191,6 +1183,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)
+        tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         chunk_tts_eos_id = token_ids.get("chunk_tts_eos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
@@ -1200,7 +1193,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             state.last_terminator_token = int(sampled)
             if sampled == turn_eos_id or (sampled == listen_id and force_listen):
                 state.current_turn_ended = True
+                with suppress(Exception):
+                    state.pending_speech_response_open = False
             return
+        if (
+            sampled == tts_bos_id
+            and getattr(state, "current_turn_ended", True)
+            and getattr(state, "pending_speech_context", False)
+        ):
+            with suppress(Exception):
+                state.pending_speech_response_open = True
+        elif getattr(state, "pending_speech_response_open", False):
+            with suppress(Exception):
+                state.pending_speech_context = False
+                state.pending_speech_response_open = False
+        elif getattr(state, "current_turn_ended", True):
+            with suppress(Exception):
+                state.pending_speech_context = False
         state.pending_terminator_token = None
         state.last_terminator_token = None
         state.current_turn_ended = False

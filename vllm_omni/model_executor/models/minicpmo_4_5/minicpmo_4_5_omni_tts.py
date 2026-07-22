@@ -700,6 +700,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _stream_turn_id(self, info: dict[str, Any]) -> int | None:
         duplex = info.get("duplex")
         if isinstance(duplex, dict):
+            turn_id = self._coerce_turn_id(duplex.get("model_turn_id"))
+            if turn_id is not None:
+                return turn_id
             turn_id = self._coerce_turn_id(duplex.get("turn_id"))
             if turn_id is not None:
                 return turn_id

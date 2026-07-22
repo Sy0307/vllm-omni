@@ -30,10 +30,6 @@ class MiniCPMO45DuplexPolicy:
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
     DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
-    NEW_USER_TURN_PREFIX_INTERRUPTED_TTS = "interrupted_tts"
-    NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE = "clean_response_done"
-    NEW_USER_TURN_PREFIX_LISTEN_ONLY = "listen_only"
-    NEW_USER_TURN_PREFIX = ""
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:
@@ -57,25 +53,6 @@ class MiniCPMO45DuplexPolicy:
             prefix += "\n<|audio_start|>"
             suffix = "<|audio_end|>" + suffix
         return prefix, suffix
-
-    @classmethod
-    def new_user_turn_prefix_text(cls, variant: object = None) -> str:
-        """Text prefix before the first audio unit of a new user turn.
-
-        Native full-duplex uses the released ``MiniCPMODuplex`` path, whose
-        ``streaming_prefill`` feeds only ``<unit>`` plus media per append.
-        Chat-role prefixes belong to the simplex streaming path and poison the
-        long-lived duplex KV if inserted mid-session.
-        """
-        return cls.NEW_USER_TURN_PREFIX
-
-    @classmethod
-    def new_user_turn_prefix_variants(cls) -> tuple[str, ...]:
-        return (
-            cls.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS,
-            cls.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
-            cls.NEW_USER_TURN_PREFIX_LISTEN_ONLY,
-        )
 
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {
         "unit_token_id": "<unit>",

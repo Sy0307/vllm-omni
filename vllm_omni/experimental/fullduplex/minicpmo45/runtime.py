@@ -88,19 +88,6 @@ def duplex_first_append_context_reserve(runtime_config: object) -> int:
     return reserve
 
 
-def duplex_new_user_turn_prefix_reserve(runtime_config: object, *, variant: object = None) -> int:
-    if not isinstance(runtime_config, dict):
-        return 0
-    if isinstance(variant, str) and variant:
-        by_variant = runtime_config.get("duplex_new_user_turn_prefix_tokens_by_variant")
-        if isinstance(by_variant, dict) and isinstance(by_variant.get(variant), int):
-            return max(0, by_variant[variant])
-    exact = runtime_config.get("duplex_new_user_turn_prefix_tokens")
-    if isinstance(exact, int) and exact >= 0:
-        return exact
-    return 0
-
-
 def _duplex_force_listen_count(extra_body: object) -> int:
     raw = extra_body.get("force_listen_count") if isinstance(extra_body, dict) else None
     try:
@@ -130,17 +117,8 @@ def build_duplex_data_plane_prompt(
             token_budget = (
                 context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
             )
-    if (
-        seq > 1
-        and duplex_payload_is_exact_chunks(payload)
-        and not (isinstance(payload, dict) and payload.get("new_user_turn") is True)
-    ):
+    if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-    if isinstance(payload, dict) and payload.get("new_user_turn") is True:
-        token_budget += duplex_new_user_turn_prefix_reserve(
-            runtime_config,
-            variant=payload.get("new_user_turn_prefix_variant"),
-        )
     if final and duplex_payload_is_exact_chunks(payload):
         token_budget += 12
     extra_body = session_config.get("extra_body")
@@ -371,7 +349,6 @@ __all__ = [
     "build_duplex_data_plane_prompt",
     "duplex_first_append_context_reserve",
     "duplex_first_append_unit_count",
-    "duplex_new_user_turn_prefix_reserve",
     "duplex_payload_is_exact_chunks",
     "duplex_scheduler_token_budget",
 ]

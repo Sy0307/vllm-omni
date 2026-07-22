@@ -44,14 +44,31 @@ def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
     assert 'type: "response.create"' not in source
 
 
+def test_web_server_requires_ref_audio_for_audio_output_session():
+    source = (ROOT / "server.py").read_text(encoding="utf-8")
+
+    ref_audio_arg = re.search(
+        r"parser\.add_argument\(\s*\"--ref-audio\",(?P<body>.*?)\n\s*\)",
+        source,
+        re.DOTALL,
+    )
+    assert ref_audio_arg is not None
+    assert "required=True" in ref_audio_arg.group("body")
+    assert "Optional reference voice" not in ref_audio_arg.group("body")
+
+
 def test_client_has_transactional_cleanup_and_visible_event_logging():
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "async function stopSession" in source
+    assert "type: 'session.close'" in source
+    assert "waitForSessionClosed" in source
+    assert "SESSION_CLOSE_TIMEOUT_MS" in source
+    assert "case 'session.closed':" in source
     assert "track.stop()" in source
     assert "clearInterval(sendTimer)" in source
     assert "appendEventLog(event)" in source
-    assert "addEventListener('beforeunload'" in source
+    assert "stopSession({ terminal: false })" in source
 
 
 def test_client_keeps_microphone_upload_active_during_assistant_playback():

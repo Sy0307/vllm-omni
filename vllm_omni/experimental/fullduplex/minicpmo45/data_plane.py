@@ -179,7 +179,11 @@ class MiniCPMO45DataPlaneSession:
         output_turn_id = output_turn_id_from_metadata(mm_output)
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
-        stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id != expected_turn_id
+        stale_turn = (
+            expected_turn_id is not None
+            and output_turn_id is not None
+            and output_turn_id < expected_turn_id
+        )
         if expected_turn_id is None and output_turn_id is not None:
             stale_turn = output_turn_id < context.turn_id
         stale_epoch = output_epoch is not None and output_epoch != context.epoch
@@ -199,7 +203,7 @@ class MiniCPMO45DataPlaneSession:
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
-            yield runtime_result(
+            listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
                 model_listen=True,
@@ -207,6 +211,9 @@ class MiniCPMO45DataPlaneSession:
                 data_plane_request_id=request_id,
                 end_of_turn=False,
             )
+            if output_turn_id is not None:
+                listen_result["model_turn_id"] = output_turn_id
+            yield listen_result
             return
 
         raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
@@ -278,13 +285,18 @@ class MiniCPMO45DataPlaneSession:
             if context.auto_responds:
                 if delta_text and text_turn_state is not None:
                     text_turn_state.has_text = True
+                future_model_turn = (
+                    context.active_response_turn_id is not None
+                    and output_turn_id is not None
+                    and output_turn_id > context.active_response_turn_id
+                )
                 response_turn_bound = context.active_response_id is not None and (
                     output_turn_id is None
                     or context.active_response_turn_id is None
                     or context.active_response_turn_id == output_turn_id
                 )
                 turn_has_text = text_turn_state is not None and text_turn_state.has_text
-                if not response_turn_bound and not turn_has_text:
+                if not future_model_turn and not response_turn_bound and not turn_has_text:
                     if request_state is not None:
                         if tts_segment_end:
                             request_state.pending_audio_without_text.clear()
@@ -396,7 +408,7 @@ class MiniCPMO45DataPlaneSession:
             and request_id is not None
             and not unit_end_of_turn
         ):
-            yield runtime_result(
+            listen_result = runtime_result(
                 stage_role="llm",
                 is_listen=True,
                 model_listen=False,
@@ -405,13 +417,16 @@ class MiniCPMO45DataPlaneSession:
                 data_plane_request_id=request_id,
                 end_of_turn=False,
             )
+            if output_turn_id is not None:
+                listen_result["model_turn_id"] = output_turn_id
+            yield listen_result
             return
 
         if not text:
             if context.auto_responds:
                 return
             if finished:
-                yield runtime_result(
+                listen_result = runtime_result(
                     stage_role="llm",
                     is_listen=True,
                     model_listen=False,
@@ -420,6 +435,9 @@ class MiniCPMO45DataPlaneSession:
                     data_plane_request_id=request_id,
                     end_of_turn=False,
                 )
+                if output_turn_id is not None:
+                    listen_result["model_turn_id"] = output_turn_id
+                yield listen_result
             return
         if context.auto_responds:
             return

@@ -18,13 +18,9 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
     DuplexSessionRuntimeManager,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
     build_duplex_data_plane_prompt,
-    duplex_new_user_turn_prefix_reserve,
     duplex_scheduler_token_budget,
 )
 
@@ -399,44 +395,6 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
             }
         )
         == 16
-    )
-
-
-def test_duplex_new_user_turn_prefix_reserve_uses_precomputed_count():
-    assert duplex_new_user_turn_prefix_reserve({"duplex_new_user_turn_prefix_tokens": 7}) == 7
-
-
-def test_duplex_new_user_turn_prefix_reserve_uses_variant_count():
-    assert (
-        duplex_new_user_turn_prefix_reserve(
-            {
-                "duplex_new_user_turn_prefix_tokens": 99,
-                "duplex_new_user_turn_prefix_tokens_by_variant": {
-                    MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE: 5,
-                },
-            },
-            variant=MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE,
-        )
-        == 5
-    )
-
-
-def test_minicpmo_new_user_turn_prefix_variants_match_hf_duplex_streaming_prefill():
-    # MiniCPMODuplex.streaming_prefill feeds only <unit> plus media per
-    # append. Chat-role prefixes are used by the simplex streaming path and
-    # must not be injected into native full-duplex KV mid-session.
-    assert (
-        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(
-            MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_CLEAN_RESPONSE_DONE
-        )
-        == ""
-    )
-    assert (
-        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_INTERRUPTED_TTS)
-        == ""
-    )
-    assert (
-        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(MiniCPMO45DuplexPolicy.NEW_USER_TURN_PREFIX_LISTEN_ONLY) == ""
     )
 
 

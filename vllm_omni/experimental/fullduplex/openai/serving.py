@@ -33,7 +33,6 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSessionRegistry,
     DuplexSessionState,
     DuplexTurnController,
-    DuplexTurnState,
     ResponseCreateOptions,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import (
@@ -283,9 +282,6 @@ class OmniDuplexSessionHandler(
             if session is not None:
                 session.mark_closing()
 
-        if payload_type == "response.listen" and session is not None:
-            session.transition_turn(DuplexTurnState.IDLE)
-
         if not is_terminal or session is None:
             return True, None
 
@@ -309,10 +305,9 @@ class OmniDuplexSessionHandler(
             # Auto-response is a model-owned continuous stream. A response
             # terminal advances the model turn without requiring the browser
             # to close its Realtime input item. Keep any partial model unit so
-            # later PCM can complete it, but remove the commit-gated overlap
-            # latch left by the previous response.
-            native.deferred_overlap_turn = False
-            native.clear_overlap_turn()
+            # later PCM can complete it. Serving does not create or promote a
+            # new model generation here; Stage0 advances generation identity
+            # only after the model's terminal token.
             session.reset_overlap_speech()
             return True, None
         realtime_input_still_open = (
@@ -323,10 +318,8 @@ class OmniDuplexSessionHandler(
         )
         if realtime_input_still_open:
             # response.done only closes the assistant response. It does not
-            # close the current Realtime input item. Latch its identity even
-            # when no later chunk has arrived yet, then buffer the remainder
-            # until input_audio_buffer.commit closes the complete item.
-            native.deferred_overlap_turn = True
+            # close the current Realtime input item, and it does not reserve
+            # or advance a model generation.
             session.reset_overlap_speech()
             return True, None
         if can_promote_overlap and session.overlap_speech_ms > 0:
@@ -353,14 +346,6 @@ class OmniDuplexSessionHandler(
                 if self._session_auto_responds(session) and deferred_overlap_payload is not None:
                     deferred_overlap_payload = dict(deferred_overlap_payload)
                     deferred_overlap_payload["force_listen"] = False
-                    deferred_overlap_payload["new_user_turn"] = True
-                    deferred_overlap_payload.setdefault(
-                        "new_user_turn_prefix_variant",
-                        native.auto_response_new_turn_prefix_variant
-                        or self._serving_runtime_adapter.clean_response_done_prefix,
-                    )
-                    native.auto_response_new_turn_prefix_variant = None
-                    native.auto_response_waiting_for_speech = False
                 if deferred_overlap_payload is not None:
                     native.retain_committed_audio(
                         deferred_overlap_payload,
@@ -377,7 +362,6 @@ class OmniDuplexSessionHandler(
                 native.audio_buffer.clear()
                 native.input_since_commit = False
                 native.speech_since_commit = False
-                native.clear_overlap_turn()
                 if had_pending_overlap_audio and realtime_protocol is not None:
                     await realtime_protocol.discard_pending_input_audio(audio_end_ms=session.overlap_speech_ms)
                 if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
@@ -389,7 +373,6 @@ class OmniDuplexSessionHandler(
             native.deferred_response_create = False
             native.input_since_commit = False
             native.speech_since_commit = False
-            native.clear_overlap_turn()
         return True, deferred_overlap_payload
 
     @staticmethod
@@ -740,11 +723,6 @@ class OmniDuplexSessionHandler(
         merged["force_listen"] = bool(first.get("force_listen", False)) or bool(second.get("force_listen", False))
         merged.pop("force_speak", None)
         merged["is_speech"] = bool(first.get("is_speech", False)) or bool(second.get("is_speech", False))
-        if bool(first.get("new_user_turn", False)) or bool(second.get("new_user_turn", False)):
-            merged["new_user_turn"] = True
-            prefix_variant = first.get("new_user_turn_prefix_variant") or second.get("new_user_turn_prefix_variant")
-            if isinstance(prefix_variant, str):
-                merged["new_user_turn_prefix_variant"] = prefix_variant
         return merged
 
     @classmethod
@@ -796,109 +774,6 @@ class OmniDuplexSessionHandler(
         if event.get("force_barge_in") is True:
             return False
         return event.get("force_listen") is True or payload.get("force_listen") is True
-
-    def _should_start_deferred_native_auto_response_overlap(
-        self,
-        session: DuplexSession,
-        event: Mapping[str, object],
-    ) -> bool:
-        """Latch overlap identity from the first chunk's receive-time state."""
-        return (
-            self._session_auto_responds(session)
-            and event.get("_duplex_overlap_candidate") is True
-            and self._assistant_playback_active(session)
-        )
-
-    def _should_skip_auto_response_waiting_silence(
-        self,
-        session: DuplexSession,
-        event: dict[str, object],
-        payload: dict[str, object],
-    ) -> bool:
-        if not self._session_auto_responds(session):
-            return False
-        native = self._runtime_session_state(session)
-        if not native.auto_response_waiting_for_speech:
-            return False
-        if native.deferred_overlap_turn and native.input_since_commit:
-            # This chunk still belongs to the open Realtime input item that
-            # overlapped the previous response.  Preserve its silence as part
-            # of that item; only input_audio_buffer.commit may close it.
-            return False
-        if event.get("force_barge_in") is True:
-            return False
-        if event.get("force_listen") is True:
-            return False
-        return not self._input_looks_like_speech(event, payload, session=session)
-
-    def _mark_auto_response_waiting_for_speech(
-        self,
-        session: DuplexSession,
-        *,
-        prefix_variant: str,
-    ) -> None:
-        if not self._session_auto_responds(session):
-            return
-        native = self._runtime_session_state(session)
-        native.auto_response_waiting_for_speech = True
-        native.auto_response_new_turn_prefix_variant = prefix_variant
-
-    def _mark_barge_in_new_user_turn_payload(self, payload: dict[str, object]) -> None:
-        payload["new_user_turn"] = True
-        payload.setdefault(
-            "new_user_turn_prefix_variant",
-            self._serving_runtime_adapter.interrupted_tts_prefix,
-        )
-
-    def _consume_auto_response_waiting_turn_payload(
-        self,
-        session: DuplexSession,
-        payload: dict[str, object],
-    ) -> bool:
-        """Attach the saved turn boundary to one complete input payload."""
-        if not self._session_auto_responds(session):
-            return False
-        native = self._runtime_session_state(session)
-        if not native.auto_response_waiting_for_speech:
-            return False
-        prefix_variant = native.auto_response_new_turn_prefix_variant
-        native.auto_response_waiting_for_speech = False
-        native.auto_response_new_turn_prefix_variant = None
-        payload["force_listen"] = False
-        if prefix_variant:
-            payload.setdefault("new_user_turn_prefix_variant", prefix_variant)
-        payload["new_user_turn"] = True
-        return True
-
-    def _mark_auto_response_new_user_turn_payload(
-        self,
-        session: DuplexSession,
-        event: dict[str, object],
-        payload: dict[str, object],
-    ) -> bool:
-        if not self._session_auto_responds(session):
-            return False
-        if event.get("force_listen") is True:
-            return False
-        force_barge_in = event.get("force_barge_in") is True
-        native = self._runtime_session_state(session)
-        if force_barge_in:
-            prefix_variant = (
-                native.auto_response_new_turn_prefix_variant or self._serving_runtime_adapter.interrupted_tts_prefix
-            )
-            native.auto_response_new_turn_prefix_variant = None
-        else:
-            if not native.auto_response_waiting_for_speech:
-                return False
-            if not self._input_looks_like_speech(event, payload, session=session):
-                return False
-            return self._consume_auto_response_waiting_turn_payload(session, payload)
-        native.auto_response_waiting_for_speech = False
-        payload["force_listen"] = False
-        if prefix_variant:
-            payload.setdefault("new_user_turn_prefix_variant", prefix_variant)
-        payload["new_user_turn"] = True
-        return True
 
     @staticmethod
     def _assistant_playback_active(session: DuplexSession) -> bool:
@@ -1028,7 +903,7 @@ class OmniDuplexSessionHandler(
                     model_config=getattr(self._chat_service, "model_config", None),
                 )
             except ServingRuntimeConfigError as exc:
-                await send_json({"type": "error", "error": str(exc), "code": "invalid_duplex_runtime_config"})
+                await send_json({"type": "error", "error": str(exc), "code": exc.code})
                 return None
             except ValueError as exc:
                 await send_json({"type": "error", "error": str(exc), "code": "unsupported_ref_audio_path"})
@@ -1257,7 +1132,7 @@ class OmniDuplexSessionHandler(
             return {
                 "type": "error",
                 "session_id": session.session_id,
-                "code": "invalid_duplex_runtime_config",
+                "code": exc.code,
                 "error": str(exc),
             }
         return None
@@ -1274,12 +1149,34 @@ class OmniDuplexSessionHandler(
             dict(session.runtime_config),
         )
 
+    def _runtime_session_candidate_update_error(
+        self,
+        session: DuplexSession,
+        candidate_config: DuplexSessionConfig,
+    ) -> dict[str, object] | None:
+        if not self._uses_native_input_append(session):
+            return None
+        if not self._config_requests_audio_output(candidate_config):
+            return None
+        if "ref_audio_data" in session.runtime_config:
+            return None
+        return {
+            "type": "error",
+            "session_id": session.session_id,
+            "code": "ref_audio_required",
+            "error": "MiniCPM-o native duplex audio output requires ref_audio",
+        }
+
     @staticmethod
     def _uses_native_input_append(session: DuplexSession) -> bool:
         return (
             session.capabilities.implementation_level == "model_native_duplex"
             and session.capabilities.supports_input_append
         )
+
+    @staticmethod
+    def _config_requests_audio_output(config: DuplexSessionConfig) -> bool:
+        return any(str(modality).lower() == "audio" for modality in config.modalities)
 
     @staticmethod
     def _native_stage0_request_id(session: DuplexSession, epoch: int) -> str:

@@ -34,8 +34,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "duplex_stage0_max_tokens",
             "duplex_scheduler_token_id",
             "duplex_first_append_context_tokens",
-            "duplex_new_user_turn_prefix_tokens",
-            "duplex_new_user_turn_prefix_tokens_by_variant",
             "ref_audio_data",
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
@@ -101,13 +99,17 @@ class MiniCPMO45NativeDuplexServingAdapter:
             ref_audio = extra_body.pop("tts_ref_audio")
 
         if ref_audio is None:
+            if any(str(modality).lower() == "audio" for modality in config.modalities):
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "MiniCPM-o native duplex audio output requires ref_audio",
+                    code="ref_audio_required",
+                )
             cls._apply_first_append_context_tokens(
                 runtime_config,
                 model_config=model_config,
                 instructions=config.instructions,
                 ref_sample_count=None,
             )
-            cls._apply_new_user_turn_prefix_tokens(runtime_config, model_config=model_config)
             config.extra_body = extra_body
             return runtime_config
         else:
@@ -130,7 +132,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
             instructions=config.instructions,
             ref_sample_count=len(wav_np),
         )
-        cls._apply_new_user_turn_prefix_tokens(runtime_config, model_config=model_config)
         config.extra_body = extra_body
         config.ref_audio = None
         return runtime_config
@@ -148,7 +149,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stage0_params: dict[str, object] = {
             "temperature": config.temperature if config.temperature is not None else 0.7,
             "top_p": 0.8,
-            "top_k": 100,
+            "top_k": 20,
             "repetition_penalty": 1.05,
         }
         stop_token_ids = cls._native_stage0_stop_token_ids(model_config)
@@ -193,34 +194,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
             return
         ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
         runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
-
-    @classmethod
-    def _apply_new_user_turn_prefix_tokens(
-        cls,
-        runtime_config: dict[str, object],
-        *,
-        model_config: Any,
-    ) -> None:
-        if "duplex_new_user_turn_prefix_tokens" in runtime_config:
-            return
-        tokenizer = cls._load_native_tokenizer(model_config)
-        if tokenizer is None:
-            return
-        try:
-            prefix_ids = tokenizer.encode(MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(), add_special_tokens=False)
-            variant_counts = {
-                variant: len(
-                    tokenizer.encode(
-                        MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(variant),
-                        add_special_tokens=False,
-                    )
-                )
-                for variant in MiniCPMO45DuplexPolicy.new_user_turn_prefix_variants()
-            }
-        except Exception:
-            return
-        runtime_config["duplex_new_user_turn_prefix_tokens"] = len(prefix_ids)
-        runtime_config["duplex_new_user_turn_prefix_tokens_by_variant"] = variant_counts
 
     @staticmethod
     def _native_stage0_stop_token_ids(model_config: Any) -> list[int]:

@@ -80,8 +80,8 @@ DOMAIN_TERMINAL_EVENTS = frozenset(
 )
 
 
-def is_input_event(event_type: str) -> bool:
-    return event_type in INPUT_EVENTS
+def is_input_event(event_type: object) -> bool:
+    return isinstance(event_type, str) and event_type in INPUT_EVENTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +144,7 @@ class DuplexWebSocketActor:
     closing: bool = False
     close_reason: str | None = None
     stale_output_dropped: int = 0
+    _queued_input_events: int = 0
 
     @property
     def native_append_tasks(self) -> dict[asyncio.Task[bool], DuplexAppendTaskMeta]:
@@ -166,12 +167,19 @@ class DuplexWebSocketActor:
         self.tasks.native_append_tail = task
 
     async def enqueue_event(self, event: dict[str, object]) -> None:
+        if is_input_event(event.get("type")):
+            self._queued_input_events += 1
         await self.mailbox.put(event)
 
     async def next_event(self) -> dict[str, object]:
         event = await self.mailbox.get()
+        if is_input_event(event.get("type")):
+            self._queued_input_events = max(0, self._queued_input_events - 1)
         self.mailbox.task_done()
         return event
+
+    def has_queued_input_events(self) -> bool:
+        return self._queued_input_events > 0
 
     async def send_json(self, payload: dict[str, object]) -> None:
         await self.output_queue.put(payload)

@@ -152,9 +152,9 @@ def main() -> None:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument(
         "--ref-audio",
-        default=None,
+        required=True,
         help=(
-            "Optional reference voice wav for TTS voice cloning, e.g. the "
+            "Reference voice wav for TTS voice cloning, e.g. the "
             "official MiniCPM-o-Demo assets/ref_audio/ref_minicpm_signature.wav"
         ),
     )

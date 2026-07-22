@@ -14,7 +14,6 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
-    DuplexTurnState,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     coerce_int,
@@ -308,7 +307,7 @@ class NativeRuntimeBridgeMixin:
                     expected_epoch=expected_epoch,
                 )
             elif close_reason is None:
-                self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
+                await self._maybe_continue_native_response(send_json, session=session, expected_epoch=expected_epoch)
 
         task = asyncio.create_task(_run())
         native.data_plane_task = task
@@ -336,7 +335,31 @@ class NativeRuntimeBridgeMixin:
         count = native.continuation_units if native.continuation_owner_id == owner_id else 0
         return count < self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
 
-    def _maybe_continue_native_response(
+    def _native_silence_continuation_is_stale(
+        self,
+        session: DuplexSession,
+        *,
+        request_id: str,
+        response_id: str | None,
+        response_owned: bool,
+        expected_epoch: int | None,
+        expected_incarnation: int,
+        expected_model_turn_id: int | None,
+    ) -> bool:
+        stale_common_owner = (
+            session.state == DuplexSessionState.CLOSED
+            or session.incarnation != expected_incarnation
+            or session.active_request_id != request_id
+            or (expected_epoch is not None and session.epoch != expected_epoch)
+        )
+        stale_response_owner = response_owned and session.active_response_id != response_id
+        stale_model_turn_owner = not response_owned and (
+            session.active_response_id is not None
+            or session.turn_id != expected_model_turn_id
+        )
+        return stale_common_owner or stale_response_owner or stale_model_turn_owner
+
+    async def _maybe_continue_native_response(
         self,
         send_json,
         *,
@@ -373,7 +396,6 @@ class NativeRuntimeBridgeMixin:
             if (
                 not auto_response
                 or expected_model_turn_id is None
-                or session.turn_state != DuplexTurnState.ASSISTANT_GENERATING
                 or session.turn_id != expected_model_turn_id
             ):
                 native.clear_continuation()
@@ -383,38 +405,30 @@ class NativeRuntimeBridgeMixin:
         count = native.continuation_units if native.continuation_owner_id == owner_id else 0
         if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
-        native.continuation_owner_id = owner_id
-        native.continuation_units = count + 1
         payload = self._native_silence_unit_payload()
         payload["duplex_turn_id"] = payload_turn_id
 
-        async def _continue() -> None:
-            try:
-                stale_common_owner = (
-                    session.state == DuplexSessionState.CLOSED
-                    or session.active_request_id != request_id
-                    or (expected_epoch is not None and session.epoch != expected_epoch)
-                )
-                stale_response_owner = response_owned and session.active_response_id != response_id
-                stale_model_turn_owner = not response_owned and (
-                    session.active_response_id is not None
-                    or session.turn_state != DuplexTurnState.ASSISTANT_GENERATING
-                    or session.turn_id != expected_model_turn_id
-                )
-                if stale_common_owner or stale_response_owner or stale_model_turn_owner:
-                    return
-                await self._append_runtime_input(
-                    session,
-                    payload,
-                    final=False,
-                    send_json=send_json,
-                    mode="append_audio_chunk",
-                    expected_epoch=expected_epoch,
-                )
-            except Exception as exc:
-                logger.exception("Failed to continue duplex native response: %s", exc)
-
-        asyncio.create_task(_continue())
+        scheduler = native.silence_continuation_scheduler
+        if scheduler is None:
+            return
+        try:
+            scheduled = await scheduler(
+                payload,
+                request_id=request_id,
+                owner_id=owner_id,
+                response_id=response_id,
+                response_owned=response_owned,
+                expected_epoch=expected_epoch,
+                expected_incarnation=session.incarnation,
+                expected_model_turn_id=expected_model_turn_id,
+                send_json=send_json,
+            )
+        except Exception as exc:
+            logger.exception("Failed to schedule duplex native response continuation: %s", exc)
+            scheduled = False
+        if scheduled:
+            native.continuation_owner_id = owner_id
+            native.continuation_units = count + 1
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
         native = self._runtime_session_state(session)
@@ -812,6 +826,7 @@ class NativeRuntimeBridgeMixin:
             # model turns cannot create empty responses or steal later audio.
             return close_reason, False
         is_listen = native_result.get("is_listen")
+        model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if native_result.get("is_buffering") is True or native_result.get("prefill_success") is False:
             if native_result.get("data_plane_request_id") == session.active_request_id:
                 session.clear_request()
@@ -827,7 +842,11 @@ class NativeRuntimeBridgeMixin:
             await send_json(payload)
             return close_reason, emitted_response
         if is_listen is True:
-            model_turn_id = coerce_int(native_result.get("model_turn_id"))
+            await self._end_active_response_before_future_model_turn(
+                send_json,
+                session=session,
+                model_turn_id=model_turn_id,
+            )
             if (
                 session.active_response_id is not None
                 and model_turn_id is not None
@@ -841,13 +860,12 @@ class NativeRuntimeBridgeMixin:
                 and native_result.get("end_of_turn") is not True
             )
             if non_terminal_auto_listen:
-                self._maybe_continue_native_response(
+                await self._maybe_continue_native_response(
                     send_json,
                     session=session,
                     expected_epoch=expected_epoch,
                 )
                 return close_reason, emitted_response
-            session.transition_turn(DuplexTurnState.IDLE)
             auto_response = self._session_auto_responds(session)
             if not auto_response and data_plane_request_id == session.active_request_id:
                 session.clear_request()
@@ -881,18 +899,13 @@ class NativeRuntimeBridgeMixin:
                     # The official model often listens for a silence beat or
                     # two before answering; keep the response open and give it
                     # the next silence unit as a decision point.
-                    self._maybe_continue_native_response(
+                    await self._maybe_continue_native_response(
                         send_json,
                         session=session,
                         expected_epoch=expected_epoch,
                     )
                     return close_reason, emitted_response
                 session.end_response(commit_text=False, preserve_request=auto_response)
-                if auto_response:
-                    self._mark_auto_response_waiting_for_speech(
-                        session,
-                        prefix_variant=self._serving_runtime_adapter.clean_response_done_prefix,
-                    )
                 await send_json(
                     {
                         "type": "response.done",
@@ -914,13 +927,12 @@ class NativeRuntimeBridgeMixin:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
             )
-            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if (
                 tts_segment_ended
                 and self._session_auto_responds(session)
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
-                self._maybe_continue_native_response(
+                await self._maybe_continue_native_response(
                     send_json,
                     session=session,
                     expected_epoch=expected_epoch,
@@ -933,12 +945,10 @@ class NativeRuntimeBridgeMixin:
                     session.clear_request()
                 if not self._session_auto_responds(session):
                     self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
-            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
             if self._session_auto_responds(session):
                 self._runtime_session_state(session).clear_continuation()
-                session.transition_turn(DuplexTurnState.IDLE)
                 emitted_response = True
                 payload = {
                     "type": "response.listen",
@@ -950,13 +960,17 @@ class NativeRuntimeBridgeMixin:
                 self._attach_native_runtime_metadata(payload, native_result)
                 await send_json(payload)
             return close_reason, emitted_response
-        model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
             # A continuation append can already be in flight when the prior
             # response reaches turn EOS.  Its late audio still carries the
             # completed model turn, so it must not reserve a second Realtime
             # response for that turn.
             return close_reason, emitted_response
+        await self._end_active_response_before_future_model_turn(
+            send_json,
+            session=session,
+            model_turn_id=model_turn_id,
+        )
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -1069,7 +1083,7 @@ class NativeRuntimeBridgeMixin:
             and native_result.get("abort_data_plane_request") is True
             and self._session_auto_responds(session)
         ):
-            self._maybe_continue_native_response(
+            await self._maybe_continue_native_response(
                 send_json,
                 session=session,
                 expected_epoch=expected_epoch,
@@ -1091,11 +1105,6 @@ class NativeRuntimeBridgeMixin:
             model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
-            if self._session_auto_responds(session):
-                self._mark_auto_response_waiting_for_speech(
-                    session,
-                    prefix_variant=self._serving_runtime_adapter.clean_response_done_prefix,
-                )
             if should_commit:
                 session.register_history_item(f"item_{response_id}", committed_message)
             await send_json(
@@ -1108,9 +1117,41 @@ class NativeRuntimeBridgeMixin:
                     "playback": session.playback.as_dict(),
                 }
             )
-        elif response_created:
-            session.transition_turn(DuplexTurnState.ASSISTANT_PLAYING)
         return close_reason, emitted_response
+
+    async def _end_active_response_before_future_model_turn(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        model_turn_id: int | None,
+    ) -> None:
+        if not self._session_auto_responds(session):
+            return
+        response_id = session.active_response_id
+        active_turn_id = session.active_response_turn_id
+        if response_id is None or model_turn_id is None or active_turn_id is None:
+            return
+        if int(model_turn_id) <= int(active_turn_id):
+            return
+        session.complete_model_turn(int(model_turn_id) - 1)
+        should_commit = self._should_commit_response_to_history(session, response_id)
+        committed_message = session.end_response(
+            commit_text=should_commit,
+            preserve_request=True,
+        )
+        if should_commit:
+            session.register_history_item(f"item_{response_id}", committed_message)
+        await send_json(
+            {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": committed_message is not None,
+                "playback": session.playback.as_dict(),
+            }
+        )
 
     @staticmethod
     def _normalize_native_audio_text_marks(
@@ -1194,6 +1235,9 @@ class NativeRuntimeBridgeMixin:
         owned_runtime = native_result.get("owned_runtime")
         if isinstance(owned_runtime, bool):
             metadata["owned_runtime"] = owned_runtime
+        model_turn_id = coerce_int(native_result.get("model_turn_id"))
+        if model_turn_id is not None:
+            metadata["model_turn_id"] = model_turn_id
         for name in (
             "uses_model_runner_scheduler",
             "runner_kv_backed",

@@ -16,7 +16,6 @@ class CommitAction(str, Enum):
 class CommitSnapshot:
     auto_responds: bool
     speech_since_commit: bool
-    auto_response_waiting_for_speech: bool
     active_response_id: str | None
     overlap_speech_ms: int
     native_response_in_progress: bool
@@ -25,14 +24,13 @@ class CommitSnapshot:
 
 def decide_commit_action(snapshot: CommitSnapshot) -> CommitAction:
     """Choose response scheduling from an immutable session snapshot."""
-    if snapshot.playback_active and snapshot.overlap_speech_ms > 0:
-        return CommitAction.DEFER_ACTIVE_RESPONSE
-    can_start_response = snapshot.active_response_id is None and (
-        snapshot.auto_response_waiting_for_speech or not snapshot.native_response_in_progress
-    )
-    if snapshot.auto_responds and snapshot.speech_since_commit and can_start_response:
-        return CommitAction.START_AUTO_RESPONSE
+    if snapshot.auto_responds:
+        if snapshot.speech_since_commit:
+            return CommitAction.START_AUTO_RESPONSE
+        return CommitAction.COMMIT_ONLY
     if snapshot.native_response_in_progress and snapshot.overlap_speech_ms > 0:
+        return CommitAction.DEFER_ACTIVE_RESPONSE
+    if snapshot.playback_active and snapshot.overlap_speech_ms > 0:
         return CommitAction.DEFER_ACTIVE_RESPONSE
     return CommitAction.COMMIT_ONLY
 

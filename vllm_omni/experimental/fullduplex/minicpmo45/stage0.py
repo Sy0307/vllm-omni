@@ -25,13 +25,16 @@ class _MiniCPMO45Stage0SessionState:
     context_embeds: list[Any] = field(default_factory=list)
     context_token_ids: list[int] = field(default_factory=list)
     current_turn_ended: bool = True
-    prepared_seq: int | None = None
+    prepared_append_identity: tuple[int | None, int] | None = None
     prepared_inputs_embeds: Any | None = None
     prepared_input_token_ids: list[int] = field(default_factory=list)
     prepared_result: dict[str, Any] = field(default_factory=dict)
     audio_past_key_values: Any | None = None
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
+    pending_speech_context: bool = False
+    pending_speech_append_identity: tuple[int | None, int] | None = None
+    pending_speech_response_open: bool = False
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -141,10 +144,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         audio_waveform: Any,
         *,
         video_frames: list[Any] | None = None,
+        epoch: int | None = None,
         seq: int | None = None,
+        is_speech: bool = False,
         final: bool = False,
-        new_user_turn: bool = False,
-        new_user_turn_prefix_variant: object = None,
     ) -> dict[str, Any]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
@@ -154,7 +157,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         """
         start_time = time.time()
         processor = self._configure_streaming_processor(state)
-        if seq is not None and state.prepared_seq == seq and state.prepared_inputs_embeds is not None:
+        append_identity = (epoch, seq) if seq is not None else None
+        if (
+            append_identity is not None
+            and state.prepared_append_identity == append_identity
+            and state.prepared_inputs_embeds is not None
+        ):
             result = dict(state.prepared_result)
             result["inputs_embeds"] = state.prepared_inputs_embeds
             result["input_token_ids"] = list(state.prepared_input_token_ids)
@@ -171,9 +179,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             frame_blocks = self._stage_vision_embeddings(video_frames)
             if frame_blocks is None or len(frame_blocks) != len(video_frames):
                 return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
-        prefix_new_user_turn = bool(new_user_turn)
-        if prefix_new_user_turn:
-            state.current_turn_ended = True
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size(processor)
         self._pad_first_audio_chunk_if_needed(state, processor)
@@ -186,11 +191,6 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         embed_parts: list[Any] = []
         token_ids: list[int] = []
-        new_user_turn_prefix_ids = (
-            list(self._encode_text(MiniCPMO45DuplexPolicy.new_user_turn_prefix_text(new_user_turn_prefix_variant)))
-            if prefix_new_user_turn
-            else []
-        )
         if state.audio_chunk_idx == 0 and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
@@ -237,10 +237,6 @@ class MiniCPMO45Stage0DuplexRuntime:
                     token_ids.append(int(pending_terminator))
                 embed_parts.append(self._embed_token(self.unit_end_token_id))
                 token_ids.append(self.unit_end_token_id)
-            if prefix_new_user_turn and units_built == 0:
-                for token_id in new_user_turn_prefix_ids:
-                    embed_parts.append(self._embed_token(token_id))
-                    token_ids.append(int(token_id))
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
@@ -294,8 +290,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "runtime_impl": "scheduler_data_plane",
             }
         )
-        if seq is not None:
-            state.prepared_seq = seq
+        if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
+            state.pending_speech_context = True
+            state.pending_speech_append_identity = append_identity
+        if append_identity is not None:
+            state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
             state.prepared_input_token_ids = list(token_ids)
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}

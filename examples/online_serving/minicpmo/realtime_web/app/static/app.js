@@ -25,6 +25,7 @@
   const SEND_INTERVAL_MS = 200;
   const ECHO_GUARD_MS = 300;
   const INITIAL_PLAYBACK_BUFFER_MS = 200;
+  const SESSION_CLOSE_TIMEOUT_MS = 1000;
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
   // (assets/presets/{omni,audio_duplex}/*.yaml).
@@ -63,6 +64,7 @@
   let logCount = 0;
   let liveUserTurn = null;
   let liveAssistantTurn = null;
+  let sessionCloseResolver = null;
 
   if (promptPreset && systemPromptInput) {
     promptPreset.addEventListener('change', () => {
@@ -381,6 +383,10 @@
           runtimeDetail.textContent = `Playback committed ${acknowledgement.committed_ms || 0} ms`;
         }
         break;
+      case 'session.closed':
+        if (sessionCloseResolver) sessionCloseResolver();
+        sessionCloseResolver = null;
+        break;
       case 'error':
         setConnection('Error', 'error');
         runtimeDetail.textContent = String(event.error || event.code || 'Server error');
@@ -573,7 +579,22 @@
     startCamera().catch((error) => appendLog(`camera failed: ${error.message || error}`, true));
   });
 
-  async function stopSession() {
+  function waitForSessionClosed(targetSocket, timeoutMs) {
+    if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) return Promise.resolve();
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (sessionCloseResolver === finish) sessionCloseResolver = null;
+        resolve();
+      };
+      sessionCloseResolver = finish;
+      window.setTimeout(finish, timeoutMs);
+    });
+  }
+
+  async function stopSession({ terminal = true } = {}) {
     running = false;
     assistantActive = false;
     pendingCapture = [];
@@ -585,6 +606,11 @@
       const closingSocket = socket;
       socket = null;
       closingSocket.onclose = null;
+      if (terminal && closingSocket.readyState === WebSocket.OPEN) {
+        const closed = waitForSessionClosed(closingSocket, SESSION_CLOSE_TIMEOUT_MS);
+        closingSocket.send(JSON.stringify({ type: 'session.close' }));
+        await closed;
+      }
       closingSocket.close(1000, 'client stop');
     }
     if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
@@ -635,5 +661,5 @@
     logCount = 0;
     eventCount.textContent = '0 events';
   });
-  window.addEventListener('beforeunload', () => { stopSession(); });
+  window.addEventListener('beforeunload', () => { stopSession({ terminal: false }); });
 })();

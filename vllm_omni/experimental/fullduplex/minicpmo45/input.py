@@ -12,7 +12,6 @@ class MiniCPMO45PcmAppendReservation:
         "_active",
         "_force_listen",
         "_is_speech",
-        "_new_user_turn",
         "_owner",
         "_raw",
         "_sample_rate_hz",
@@ -32,7 +31,6 @@ class MiniCPMO45PcmAppendReservation:
         sample_rate_hz: int,
         force_listen: bool,
         is_speech: bool,
-        new_user_turn: bool,
         turn_had_speech: bool = False,
         video_frames: list[str] | None = None,
     ) -> None:
@@ -43,7 +41,6 @@ class MiniCPMO45PcmAppendReservation:
         self._sample_rate_hz = sample_rate_hz
         self._force_listen = force_listen
         self._is_speech = is_speech
-        self._new_user_turn = new_user_turn
         self._turn_had_speech = turn_had_speech
         self._video_frames = list(video_frames or [])
         self._active = True
@@ -103,7 +100,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._sample_rate_hz: int | None = None
         self._force_listen = False
         self._is_speech = False
-        self._new_user_turn = False
         self._turn_had_speech = False
         self._reservation_seq = 0
         self._reservations: list[MiniCPMO45PcmAppendReservation] = []
@@ -120,7 +116,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._sample_rate_hz = None
         self._force_listen = False
         self._is_speech = False
-        self._new_user_turn = False
         self._turn_had_speech = False
 
     def clear_force_listen(self) -> None:
@@ -128,6 +123,9 @@ class MiniCPMO45PcmAppendBuffer:
 
     def has_pending(self) -> bool:
         return bool(self._buffer)
+
+    def has_reserved(self) -> bool:
+        return bool(self._reservations)
 
     @property
     def pending_byte_count(self) -> int:
@@ -152,7 +150,6 @@ class MiniCPMO45PcmAppendBuffer:
             sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else 0,
             force_listen=bool(payload.get("force_listen", False)),
             is_speech=bool(payload.get("is_speech", False)),
-            new_user_turn=bool(payload.get("new_user_turn", False)),
             turn_had_speech=bool(payload.get("is_speech", False)),
         )
         self._reservations.append(reservation)
@@ -189,7 +186,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         self._force_listen = self._force_listen or bool(payload.get("force_listen", False))
         self._is_speech = self._is_speech or bool(payload.get("is_speech", False))
-        self._new_user_turn = self._new_user_turn or bool(payload.get("new_user_turn", False))
         if not allow_emit:
             return None
 
@@ -208,7 +204,7 @@ class MiniCPMO45PcmAppendBuffer:
             remainder = emit_samples % min_samples
             pad_samples = (min_samples - remainder) if remainder else 0
         else:
-            emit_samples = buffered_samples - (buffered_samples % min_samples)
+            emit_samples = min_samples
             pad_samples = 0
         emit_bytes = emit_samples * 4
         reserved_raw = bytes(self._buffer[:emit_bytes])
@@ -233,12 +229,9 @@ class MiniCPMO45PcmAppendBuffer:
             out["video_frames"] = attached_frames
         out["force_listen"] = self._force_listen
         out["is_speech"] = self._is_speech
-        if self._new_user_turn:
-            out["new_user_turn"] = True
         if not self._buffer:
             self._force_listen = False
             self._is_speech = False
-            self._new_user_turn = False
         reservation = MiniCPMO45PcmAppendReservation(
             owner=self,
             operation_id=operation_id,
@@ -247,7 +240,6 @@ class MiniCPMO45PcmAppendBuffer:
             sample_rate_hz=sample_rate_hz,
             force_listen=bool(out.get("force_listen", False)),
             is_speech=bool(out.get("is_speech", False)),
-            new_user_turn=bool(out.get("new_user_turn", False)),
             turn_had_speech=self._turn_had_speech,
             video_frames=attached_frames,
         )
@@ -272,8 +264,6 @@ class MiniCPMO45PcmAppendBuffer:
                 "force_listen": self._force_listen,
                 "is_speech": self._is_speech,
             }
-            if self._new_user_turn:
-                payload["new_user_turn"] = True
             reservation = self.prepare_append(
                 payload,
                 operation_id=operation_id,
@@ -292,7 +282,6 @@ class MiniCPMO45PcmAppendBuffer:
                 sample_rate_hz=self._sample_rate_hz or 0,
                 force_listen=self._force_listen,
                 is_speech=self._is_speech,
-                new_user_turn=self._new_user_turn,
                 turn_had_speech=had_speech,
             )
             self._reservations.append(reservation)
@@ -302,7 +291,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._sample_rate_hz = None
         self._force_listen = False
         self._is_speech = False
-        self._new_user_turn = False
         self._turn_had_speech = False
         return reservation
 
@@ -353,7 +341,6 @@ class MiniCPMO45PcmAppendBuffer:
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._force_listen = self._force_listen or any(item._force_listen for item in rolled_back)
         self._is_speech = self._is_speech or any(item._is_speech for item in rolled_back)
-        self._new_user_turn = self._new_user_turn or any(item._new_user_turn for item in rolled_back)
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
         for item in rolled_back:
             item._active = False
@@ -370,8 +357,6 @@ class MiniCPMO45PcmAppendBuffer:
             "force_listen": self._force_listen,
             "is_speech": self._is_speech,
         }
-        if self._new_user_turn:
-            payload["new_user_turn"] = True
         return self.append(payload, chunk_period_ms=chunk_period_ms, flush=True)
 
     def commit(self, *, chunk_period_ms: int) -> dict[str, object] | None:

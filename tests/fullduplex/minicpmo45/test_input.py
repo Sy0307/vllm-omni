@@ -33,6 +33,16 @@ def test_commit_does_not_add_silence_after_incremental_audio_was_drained():
     assert committed is None
 
 
+def test_append_emits_one_model_unit_when_multiple_units_are_buffered():
+    buffer = MiniCPMO45PcmAppendBuffer()
+
+    emitted = buffer.append(pcm_payload(32_000), chunk_period_ms=1_000)
+
+    assert emitted is not None
+    assert len(base64.b64decode(emitted["audio"])) == 16_000 * 4
+    assert buffer.pending_byte_count == 16_000 * 4
+
+
 def test_commit_without_speech_does_not_synthesize_terminal_audio():
     buffer = MiniCPMO45PcmAppendBuffer()
     buffer.append(pcm_payload(8_000, speech=False), chunk_period_ms=1_000)
