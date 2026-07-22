@@ -82,6 +82,7 @@
     url.searchParams.set('duplex', '1');
     url.searchParams.set('model', config.model || 'openbmb/MiniCPM-o-4_5');
     url.searchParams.set('minicpmo45_native_duplex', '1');
+    url.searchParams.set('autostart', '0');
     return url.toString();
   }
 
