@@ -1,3 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Stage input processor for MiniCPM-o 4.5: Thinker (LLM) -> Talker (TTS).
+
+This bridge converts thinker hidden states and token ids into the talker
+prompt payload. The talker runs Token2Wav internally; MiniCPM-o 4.5 does not
+have an independent code2wav pipeline stage.
+"""
+
 import logging
 from collections.abc import Callable, Mapping
 
@@ -421,15 +430,10 @@ def llm2tts(
         tts_end_ids = _native_tts_boundary_token_ids(special_token_ids)
 
         # Plain-chat (use_tts_template) fallback: non-duplex requests do not
-        # surface special_token_ids. Preserve the pre-duplex marker-pair
-        # detection so both MiniCPM-o 4.5 and 2.6 stop before their TTS EOS.
+        # surface special_token_ids, so use MiniCPM-o 4.5's fixed boundaries.
         if tts_bos_id is None and not is_native_duplex_handoff:
-            if 151703 in full_token_ids or 151704 in full_token_ids:
-                tts_bos_id = 151703
-                tts_end_ids = set(tts_end_ids) | {151704, 151645}
-            else:
-                tts_bos_id = 151691
-                tts_end_ids = set(tts_end_ids) | {151692, 151645}
+            tts_bos_id = 151703
+            tts_end_ids = set(tts_end_ids) | {151704, 151645}
 
         tts_bos_idx = None
         # For native duplex the resumable prompt folds every earlier unit, so
@@ -615,115 +619,3 @@ def llm2tts(
                     duplex_state["model_turn_id"] = current_model_turn_id + 1
 
     return tts_inputs
-
-
-def tts2t2w(
-    source_outputs,
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    requires_multimodal_data: bool = False,
-    _streaming_context=None,
-):
-    """Convert talker stage output to code2wav stage input for MiniCPMO Omni.
-
-    Extracts mel_spec from talker's multimodal output and passes it to
-    the code2wav stage for Vocos vocoder (mel → waveform) conversion.
-    """
-    tts_outputs = source_outputs
-    t2w_inputs = []
-
-    if not isinstance(prompt, list):
-        prompt = [prompt]
-
-    multi_modal_data = {}
-    for tts_output, p in zip(tts_outputs, prompt):
-        if isinstance(p, dict):
-            multi_modal_data[tts_output.request_id] = p.get("multi_modal_data", None)
-        else:
-            multi_modal_data[tts_output.request_id] = getattr(p, "multi_modal_data", None)
-
-    for i, tts_output in enumerate(tts_outputs):
-        output = tts_output.outputs[0]
-
-        mel_spec = None
-        waveform = None
-        if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, Mapping):
-            import torch as _torch
-
-            mel_spec = output.multimodal_output.get("mel_spec")
-            waveform = output.multimodal_output.get("model_outputs")
-            if waveform is None:
-                waveform = output.multimodal_output.get("audio")
-            # The 4.5 talker already runs DVAE+Vocos internally and produces a
-            # 1-D waveform tensor; it is stored under `model_outputs` which the
-            # output_processor renames to the stage's `engine_output_type`
-            # (e.g. "latent"). Recover it here.
-            latent = output.multimodal_output.get("latent")
-            import logging as _logging
-
-            _log = _logging.getLogger(__name__)
-            if latent is not None:
-                if isinstance(latent, _torch.Tensor):
-                    _log.info(
-                        "tts2t2w: latent tensor shape=%s dtype=%s numel=%d",
-                        tuple(latent.shape),
-                        latent.dtype,
-                        latent.numel(),
-                    )
-                elif isinstance(latent, list):
-                    _log.info(
-                        "tts2t2w: latent is list len=%d type0=%s shape0=%s",
-                        len(latent),
-                        type(latent[0]).__name__ if latent else None,
-                        tuple(latent[0].shape) if latent and isinstance(latent[0], _torch.Tensor) else None,
-                    )
-                else:
-                    _log.info("tts2t2w: latent type=%s", type(latent).__name__)
-            if isinstance(latent, list) and latent:
-                cand = latent[0]
-                if isinstance(cand, _torch.Tensor):
-                    latent = cand
-            if isinstance(latent, _torch.Tensor):
-                if latent.dim() == 1 and latent.numel() > 1000:
-                    if waveform is None:
-                        waveform = latent
-                elif latent.dim() == 2 and 1 in latent.shape and latent.numel() > 1000:
-                    if waveform is None:
-                        waveform = latent.reshape(-1)
-                elif latent.dim() >= 2 and 100 in latent.shape and mel_spec is None:
-                    mel_spec = latent
-
-        if mel_spec is None and waveform is None:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "tts2t2w: no mel_spec/waveform found in talker output (multimodal_output keys: %s)",
-                list(output.multimodal_output.keys())
-                if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, Mapping)
-                else "N/A",
-            )
-
-        model_intermediate_buffer = {}
-        if waveform is not None:
-            model_intermediate_buffer["waveform"] = _to_transport_list(waveform)
-        elif mel_spec is not None:
-            model_intermediate_buffer["mel_spec"] = _to_transport_list(mel_spec)
-
-        t2w_prompt_token_ids = _coerce_token_id_list(getattr(output, "token_ids", None))
-        if not t2w_prompt_token_ids:
-            t2w_prompt_token_ids = list(getattr(tts_output, "prompt_token_ids", []) or [])
-        if not t2w_prompt_token_ids:
-            raise ValueError("MiniCPM-o token2wav stage requires at least one scheduler prompt token")
-        t2w_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=t2w_prompt_token_ids,
-                model_intermediate_buffer=model_intermediate_buffer,
-                multi_modal_data=(
-                    multi_modal_data[tts_output.request_id]
-                    if requires_multimodal_data and multi_modal_data.get(tts_output.request_id) is not None
-                    else None
-                ),
-                mm_processor_kwargs=None,
-            )
-        )
-
-    return t2w_inputs

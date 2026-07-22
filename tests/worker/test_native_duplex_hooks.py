@@ -1502,6 +1502,163 @@ def test_minicpmo_stage0_native_sampler_penalizes_repeated_text_token():
     assert sampled.sampled_token_ids.tolist() == [[alternative]]
 
 
+def test_minicpmo_stage0_native_sampler_penalizes_text_from_prior_chunk():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Tokenizer:
+        eos_token_id = 151705
+        unk_token_id = -1
+        bad_token_ids = []
+        all_special_ids = []
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<unit>": 151683,
+                "</unit>": 151684,
+                "<|listen|>": 151705,
+                "<|speak|>": 151706,
+                "<|tts_bos|>": 151703,
+                "<|tts_eos|>": 151704,
+                "<|tts_pad|>": 151722,
+                "<|chunk_eos|>": 151718,
+                "<|chunk_tts_eos|>": 151721,
+                "<|turn_eos|>": 151717,
+            }.get(token, -1)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+    session_key = ("sid-cross-chunk-repetition", 0)
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
+    state.generated_text_tokens = [198] * 8
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+
+    vocab_size = 151723
+    repeated = 198
+    alternative = 1234
+    logits = torch.full((1, vocab_size), -100.0)
+    logits[0, repeated] = 20.0
+    logits[0, alternative] = 19.5
+    sampling_metadata = SimpleNamespace(
+        all_greedy=False,
+        all_random=True,
+        temperature=torch.tensor([1.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[[]],
+    )
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[alternative]]
+
+
+def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    class _Tokenizer:
+        eos_token_id = 151705
+        unk_token_id = -1
+        bad_token_ids = []
+        all_special_ids = []
+
+        def convert_tokens_to_ids(self, token):
+            return {
+                "<unit>": 151683,
+                "</unit>": 151684,
+                "<|listen|>": 151705,
+                "<|speak|>": 151706,
+                "<|tts_bos|>": 151703,
+                "<|tts_eos|>": 151704,
+                "<|tts_pad|>": 151722,
+                "<|chunk_eos|>": 151718,
+                "<|chunk_tts_eos|>": 151721,
+                "<|turn_eos|>": 151717,
+            }.get(token, -1)
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+    session_key = ("sid-negative-logit-repetition", 0)
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
+    repeated = 198
+    alternative = 1234
+    state.generated_text_tokens = [repeated]
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, repeated] = -1.0
+    logits[0, alternative] = -0.97
+    sampling_metadata = SimpleNamespace(
+        all_greedy=False,
+        all_random=True,
+        temperature=torch.tensor([1.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[[]],
+    )
+
+    sampled = model.sample(logits, sampling_metadata)
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[repeated]]
+
+
+def test_minicpmo_stage0_records_only_bounded_text_repetition_history():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = ("sid-text-history", 0)
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    token_ids = {
+        "unit_token_id": 1,
+        "unit_end_token_id": 2,
+        "listen_token_id": 3,
+        "speak_token_id": 4,
+        "tts_bos_token_id": 5,
+        "tts_eos_token_id": 6,
+        "tts_pad_token_id": 7,
+        "chunk_eos_token_id": 8,
+        "chunk_tts_eos_token_id": 9,
+        "turn_eos_token_id": 10,
+    }
+
+    for sampled in range(1000, 1520):
+        model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+
+    expected_history = list(range(1008, 1520))
+    assert state.generated_text_tokens == expected_history
+
+    for sampled in token_ids.values():
+        model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+
+    assert state.generated_text_tokens == expected_history
+
+
 def test_minicpmo_stage0_native_sampler_does_not_override_model_at_punctuation():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,

@@ -5545,19 +5545,7 @@ async def test_minicpmo_native_duplex_open_session_maps_missing_ref_audio_to_typ
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_native_duplex_text_only_omits_ref_audio_when_client_does_not_provide_it(monkeypatch, tmp_path):
-    model_dir = tmp_path / "MiniCPM-o-4_5"
-    assets_dir = model_dir / "assets"
-    assets_dir.mkdir(parents=True)
-    default_ref = assets_dir / "HT_ref_audio.wav"
-    default_ref.write_bytes(b"placeholder")
-
-    def fail_if_default_ref_loaded(path):
-        raise AssertionError(f"default ref audio should not be loaded: {path}")
-
-    monkeypatch.setattr(
-        MiniCPMO45NativeDuplexServingAdapter, "_load_local_ref_audio", staticmethod(fail_if_default_ref_loaded)
-    )
+async def test_minicpmo_native_duplex_text_only_omits_ref_audio_when_client_does_not_provide_it(monkeypatch):
     monkeypatch.setattr(
         MiniCPMO45NativeDuplexServingAdapter,
         "_load_native_tokenizer",
@@ -5569,7 +5557,7 @@ async def test_minicpmo_native_duplex_text_only_omits_ref_audio_when_client_does
 
     runtime_config = await MiniCPMO45NativeDuplexServingAdapter.prepare_runtime_config(
         config,
-        model_config=SimpleNamespace(model=str(model_dir)),
+        model_config=SimpleNamespace(model="openbmb/MiniCPM-o-4_5"),
     )
 
     assert "ref_audio_data" not in runtime_config

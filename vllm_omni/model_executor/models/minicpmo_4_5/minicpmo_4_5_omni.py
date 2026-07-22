@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from:
+# https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
+#
 # Copyright 2025 The OpenBMB Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,12 +56,11 @@ logger = init_logger(__name__)
     dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
 class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
-    """MiniCPM-o 2.6 Omni model for conditional generation.
+    """MiniCPM-o 4.5 Omni model for conditional generation.
 
-    This model supports multi-stage processing:
-    - thinker: Image preprocessing + Vision encoder + 3D resampler
-    - talker: LLM generation
-    - code2wav: Speech output
+    This model has two pipeline stages:
+    - llm: multimodal thinker and text generation
+    - tts: talker generation followed by its built-in Token2Wav vocoder
     """
 
     @classmethod
@@ -99,7 +103,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
             self.model = self.thinker
             self.talker = None
-            self.code2wav = None
 
         elif self.model_stage == "tts":
             self.thinker = None
@@ -115,23 +118,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if hasattr(self.talker, "init_multi_modal"):
                 self.talker.init_multi_modal(config)
             self.model = self.talker
-            self.code2wav = None
-
-        elif self.model_stage == "t2w":
-            self.thinker = None
-            self.talker = None
-            # Code2wav only runs Vocos (mel → waveform);
-            # use tts_config if available, otherwise use the main config.
-            self.code2wav_config = getattr(config, "tts_config", None) or config
-            self.code2wav = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "code2wav"),
-                hf_config=self.code2wav_config,
-                architectures=["MiniCPMO45OmniT2WModel"],
-            )
-            self.model = self.code2wav
         else:
-            raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts', 't2w'")
+            raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts'")
 
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
@@ -252,38 +240,25 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         *,
         thinker_device: str | torch.device | None = None,
         talker_device: str | torch.device | None = None,
-        code2wav_device: str | torch.device | None = None,
     ) -> None:
-        """Optionally move thinker/talker/code2wav to different devices.
+        """Optionally move the thinker and talker to different devices.
 
         Example:
             model.move_submodules_to_devices(
                 thinker_device='cuda:0',
                 talker_device='cuda:1',
-                code2wav_device='cpu',
             )
         """
         if thinker_device is not None and self.thinker is not None:
             self.thinker.to(thinker_device)
         if talker_device is not None and self.talker is not None:
             self.talker.to(talker_device)
-        if code2wav_device is not None and self.code2wav is not None:
-            self.code2wav.to(code2wav_device)
 
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
     ) -> torch.Tensor:
-        if self.model_stage == "t2w":
-            tts_cfg = getattr(self.config, "tts_config", None)
-            hs = getattr(tts_cfg, "hidden_size", 768) if tts_cfg else 768
-            return torch.zeros(
-                input_ids.shape[0],
-                hs,
-                device=input_ids.device,
-                dtype=torch.bfloat16,
-            )
         embed_fn = getattr(self.model, "get_input_embeddings", None)
         if callable(embed_fn):
             try:
@@ -308,7 +283,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         *,
         is_multimodal=None,
     ) -> torch.Tensor:
-        if self.model_stage in ("talker", "code2wav"):
+        if self.model_stage == "tts":
             return self.get_input_embeddings(input_ids)
         return super().embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
 
@@ -683,9 +658,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         Forward pass for MiniCPM-o Omni model.
 
         Workflow:
-        1) Thinker: Image preprocessing + Vision encoder + 3D resampler → hidden states
-        2) Talker: LLM generation from hidden states → text tokens
-        3) Code2Wav: Text tokens → speech waveform
+        1) LLM: multimodal thinker → hidden states and text tokens
+        2) TTS: talker + Token2Wav → speech waveform
         """
         if self.model_stage == "llm":
             # Normalize to batched inputs if caller provides 1D/2D unbatched tensors
@@ -804,7 +778,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 multimodal_outputs=multimodal_outputs,
             )
 
-        # Talker stage: runs ConditionalChatTTS + DVAE → mel_spec (+ optional Vocos → waveform)
+        # Talker stage: runs TTS generation and its built-in Token2Wav vocoder.
         if self.model_stage == "tts":
             if input_ids is not None:
                 num_tokens = input_ids.shape[0]
@@ -852,54 +826,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=mm_out)
 
             return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
-
-        # Code2Wav stage: Vocos mel → waveform
-        if self.model_stage == "t2w":
-            if input_ids is not None:
-                n_tokens = input_ids.shape[0]
-                device = input_ids.device
-            elif inputs_embeds is not None:
-                n_tokens = inputs_embeds.shape[0]
-                device = inputs_embeds.device
-            else:
-                n_tokens = 1
-                device = torch.device("cuda")
-            hidden_dim = self.config.hidden_size if hasattr(self.config, "hidden_size") else 2560
-
-            # Profile/dummy run: both input_ids and inputs_embeds are None.
-            if input_ids is None and inputs_embeds is None:
-                dummy_hidden = torch.zeros(n_tokens, hidden_dim, device=device)
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs=None)
-
-            runtime_info = kwargs.get("runtime_additional_information")
-            code2wav_info = {}
-            if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                code2wav_info = runtime_info[0] if isinstance(runtime_info[0], dict) else {}
-
-            waveform_passthrough = code2wav_info.get("waveform")
-            mel_spec = code2wav_info.get("mel_spec")
-            dummy_hidden = torch.zeros(n_tokens, hidden_dim, device=device)
-
-            if waveform_passthrough is not None:
-                return OmniOutput(
-                    text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [waveform_passthrough]}
-                )
-
-            if mel_spec is not None and isinstance(mel_spec, torch.Tensor) and mel_spec.dim() == 1:
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [mel_spec]})
-
-            if mel_spec is not None and self.code2wav is not None:
-                with torch.inference_mode():
-                    waveform = self.code2wav(
-                        input_ids=input_ids,
-                        positions=positions,
-                        inputs_embeds=mel_spec if isinstance(mel_spec, torch.Tensor) else None,
-                        additional_information=code2wav_info,
-                    )
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [waveform]})
-
-            logger.warning("Code2Wav: no mel_spec or code2wav model, returning empty")
-            return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [torch.zeros(0)]})
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 
@@ -1031,15 +957,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 logits[:, valid_forbidden] = float("-inf")
 
         special_ids = self._minicpmo45_native_special_token_ids(token_ids)
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        generated_text_tokens = getattr(state, "generated_text_tokens", None)
+        repetition_tokens = generated_text_tokens if generated_text_tokens else recent_tokens
         repetition_penalty = 1.05
-        if repetition_penalty != 1.0 and recent_tokens:
-            for token_id in set(recent_tokens[-512:]):
+        if repetition_penalty != 1.0 and repetition_tokens:
+            history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
+            for token_id in set(repetition_tokens[-history_size:]):
                 if token_id in special_ids or token_id < 0 or token_id >= logits.shape[-1]:
                     continue
-                if logits[0, token_id] > 0:
-                    logits[0, token_id] /= repetition_penalty
-                else:
-                    logits[0, token_id] *= repetition_penalty
+                logits[0, token_id] /= repetition_penalty
 
         temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
@@ -1192,6 +1119,15 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 with suppress(Exception):
                     state.pending_speech_response_open = False
             return
+        special_ids = self._minicpmo45_native_special_token_ids(token_ids)
+        if sampled not in special_ids:
+            generated_text_tokens = getattr(state, "generated_text_tokens", None)
+            if not isinstance(generated_text_tokens, list):
+                generated_text_tokens = []
+                state.generated_text_tokens = generated_text_tokens
+            generated_text_tokens.append(int(sampled))
+            history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
+            del generated_text_tokens[:-history_size]
         if (
             sampled == tts_bos_id
             and getattr(state, "current_turn_ended", True)
@@ -1322,12 +1258,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         loaded_weights = set()
         thinker_weights = []
         talker_weights = []
-        code2wav_weights = []
 
         # MiniCPM-o checkpoint prefixes → stage mapping:
         #   thinker: vpm, resampler, llm, apm, audio_projection_layer
         #   talker:  tts (ConditionalChatTTS)
-        #   code2wav: (vocos loaded separately, not from main checkpoint)
         for k, v in weights:
             if k.startswith(("vpm.", "resampler.", "llm.", "apm.", "audio_projection_layer.")):
                 thinker_weights.append((k, v))
@@ -1347,11 +1281,5 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             talker_loaded = self.talker.load_weights(talker_weights)
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)
-
-        # Load code2wav weights
-        if self.code2wav is not None and code2wav_weights:
-            code2wav_loaded = self.code2wav.load_weights(code2wav_weights)
-            code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
-            loaded_weights.update(code2wav_loaded)
 
         return loaded_weights

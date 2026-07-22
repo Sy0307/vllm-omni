@@ -289,13 +289,6 @@ class MiniCPMO45NativeDuplexServingAdapter:
         return np.asarray(wav_np, dtype=np.float32), int(sr)
 
     @staticmethod
-    def _load_local_ref_audio(path: str) -> tuple[np.ndarray, int]:
-        import soundfile as sf
-
-        wav_np, sr = sf.read(path, dtype="float32", always_2d=True)
-        return wav_np, int(sr)
-
-    @staticmethod
     def normalize_ref_audio(wav_np: np.ndarray, sample_rate: int, *, target_sr: int) -> np.ndarray:
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:

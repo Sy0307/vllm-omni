@@ -30,6 +30,7 @@ class MiniCPMO45DuplexPolicy:
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
     DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
+    REPETITION_HISTORY_SIZE = 512
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:

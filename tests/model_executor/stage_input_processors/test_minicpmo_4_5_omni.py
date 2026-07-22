@@ -16,7 +16,6 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     _native_duplex_segment_output_ids,
     llm2tts,
-    tts2t2w,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -400,43 +399,6 @@ def test_llm2tts_rejects_native_duplex_output_without_special_token_metadata():
 
     with pytest.raises(ValueError, match=r"<\|tts_bos\|>"):
         llm2tts([llm_output], prompt=[{}])
-
-
-def test_llm2tts_scheduler_prompt_uses_real_output_tokens_without_tts_slice():
-    latent = torch.arange(16, dtype=torch.float16).reshape(4, 4)
-    output = SimpleNamespace(
-        token_ids=[31, 32],
-        text="hello",
-        multimodal_output={"latent": latent},
-    )
-    llm_output = SimpleNamespace(
-        request_id="plain-req",
-        prompt_token_ids=[21, 22],
-        outputs=[output],
-    )
-
-    converted = llm2tts([llm_output], prompt=[{}])
-
-    assert converted[0]["prompt_token_ids"] == [31, 32]
-    assert "stream_output" not in converted[0]["model_intermediate_buffer"]
-
-
-def test_tts2t2w_scheduler_prompt_uses_real_talker_tokens():
-    output = SimpleNamespace(
-        token_ids=[41],
-        multimodal_output={"audio": torch.tensor([0.1, -0.1], dtype=torch.float32)},
-    )
-    tts_output = SimpleNamespace(
-        request_id="tts-req",
-        prompt_token_ids=[21, 22],
-        outputs=[output],
-    )
-
-    converted = tts2t2w([tts_output], prompt=[{}])
-
-    assert converted[0]["prompt_token_ids"] == [41]
-    assert "additional_information" not in converted[0]
-    assert converted[0]["model_intermediate_buffer"]["waveform"] == output.multimodal_output["audio"].tolist()
 
 
 def test_minicpmo_talker_normalizes_list_handoff_payload(monkeypatch):

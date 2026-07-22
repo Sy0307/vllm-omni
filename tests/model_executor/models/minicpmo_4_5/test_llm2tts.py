@@ -10,7 +10,6 @@ Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2t
   - structured model_intermediate_buffer carries the thinker ids and text
   - scheduler prompt tokens follow the selected TTS region or output tokens
   - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 tokens
-  - MiniCPM-o 2.6 fallback detection on 151691 / 151692 when no 4.5 markers
   - No TTS markers present -> no ``tts_token_ids`` / ``tts_hidden_states`` keys
   - prompt arg is normalized to a list and ``multi_modal_data`` is gated by
     ``requires_multimodal_data``
@@ -64,6 +63,23 @@ def test_native_duplex_talker_emits_empty_text_metadata_to_clear_previous_segmen
     assert output.multimodal_outputs is not None
     assert output.multimodal_outputs["meta.llm_output_text_utf8"].numel() == 0
     assert output.multimodal_outputs["meta.audio_text_total_chars"].tolist() == [0]
+
+
+def test_tts_embed_input_ids_uses_active_talker_embedding(monkeypatch) -> None:
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "tts"
+    expected = torch.ones((2, _HIDDEN_DIM))
+
+    monkeypatch.setattr(
+        model,
+        "get_input_embeddings",
+        lambda input_ids: expected,
+    )
+
+    actual = model.embed_input_ids(torch.tensor([11, 12]))
+
+    assert actual is expected
 
 
 def _make_thinker_output(
@@ -135,6 +151,7 @@ class TestBasicShape:
             prompt=None,
         )
         assert out[0]["prompt_token_ids"] == [20]
+        assert "stream_output" not in out[0]["model_intermediate_buffer"]
 
     def test_model_intermediate_buffer_carries_thinker_outputs(self) -> None:
         prompt_ids = [10, 11, 12]
@@ -183,13 +200,11 @@ class TestBasicShape:
 
 
 class TestTtsRegionDetection:
-    """The bridge auto-detects which MiniCPM-o generation produced the output
-    by sniffing for 4.5-specific BOS/EOS token ids (151703 / 151704); when
-    those are absent it falls back to the 2.6 ids (151691 / 151692).
+    """The bridge detects MiniCPM-o 4.5 BOS/EOS ids (151703 / 151704).
 
     This is a regression guard: a single off-by-one or wrong branch
-    precedence here causes the talker to receive an empty / wrong-region
-    slice and emit silent audio.
+    causes the talker to receive an empty / wrong-region slice and emit
+    silent audio.
     """
 
     def _run(self, prompt_token_ids, output_token_ids):
@@ -217,24 +232,6 @@ class TestTtsRegionDetection:
         assert buffer["ids"]["tts"] == [30, 31]
         assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 
-    def test_4_5_takes_precedence_when_both_markers_present(self) -> None:
-        # If both 2.6 and 4.5 markers appear (shouldn't really happen on a
-        # real checkpoint, but exercises the loop's break), the 4.5 markers
-        # win because the source loop pins on the first 4.5 id seen.
-        # sequence index: 0   1   2     3   4     5    6   7    8
-        buffer, hidden = self._run([10], [151691, 70, 151692, 151703, 30, 151704, 40])
-        assert buffer["ids"]["tts"] == [30]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[5:6])
-
-    def test_2_6_fallback(self) -> None:
-        # No 4.5 markers anywhere -> use 2.6 BOS/EOS pair.
-        # full sequence: [10, 151691, 30, 31, 151692, 40]
-        #                  0     1    2   3     4     5
-        # BOS at idx 1 -> slice starts at 2; EOS at idx 4 -> slice ends at 4.
-        buffer, hidden = self._run([10], [151691, 30, 31, 151692, 40])
-        assert buffer["ids"]["tts"] == [30, 31]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[2:4])
-
     def test_bos_without_eos_runs_to_end(self) -> None:
         # When BOS is found but EOS is missing (typical for an in-flight or
         # truncated decode), the slice should extend to the end of the
@@ -251,62 +248,6 @@ class TestTtsRegionDetection:
         buffer, _ = self._run([10, 11], [20, 21, 22])
         assert "tts" not in buffer["ids"]
         assert "tts" not in buffer.get("hidden_states", {})
-
-
-class TestNativeDuplexHandoff:
-    @staticmethod
-    def _special() -> dict[str, int]:
-        return {
-            "unit_token_id": 151683,
-            "unit_end_token_id": 151684,
-            "listen_token_id": 151705,
-            "speak_token_id": 151706,
-            "tts_bos_token_id": 151703,
-            "tts_eos_token_id": 151704,
-            "tts_pad_token_id": 151722,
-            "chunk_eos_token_id": 151718,
-            "chunk_tts_eos_token_id": 151721,
-            "turn_eos_token_id": 151717,
-        }
-
-    def _run_native(self, output_token_ids: list[int]):
-        prompt_ids = [151684, 151684, 151683] + [151698] * 10
-        total = len(prompt_ids) + len(output_token_ids)
-        hidden = torch.arange(total * _HIDDEN_DIM, dtype=torch.float32).reshape(total, _HIDDEN_DIM)
-        mm_output = {
-            "duplex_prompt_token_ids": prompt_ids,
-            "meta": self._special(),
-        }
-        return llm2tts(
-            [
-                _make_thinker_output(
-                    prompt_token_ids=prompt_ids,
-                    output_token_ids=output_token_ids,
-                    text="native",
-                    hidden_states=hidden,
-                    multimodal_output=mm_output,
-                )
-            ],
-            prompt=None,
-        )
-
-    def test_native_duplex_valid_speak_handoff_is_forwarded(self) -> None:
-        out = self._run_native([151705, 151706, 108386, 104256, 151718])
-
-        assert len(out) == 1
-        assert out[0]["model_intermediate_buffer"]["ids"]["tts"] == [108386, 104256]
-
-    def test_native_duplex_direct_text_handoff_is_forwarded(self) -> None:
-        out = self._run_native([57960, 3, 854, 58736, 854, 58736])
-
-        assert len(out) == 1
-        assert out[0]["model_intermediate_buffer"]["ids"]["tts"] == [3, 854, 58736, 854, 58736]
-
-    def test_native_duplex_turn_eos_stops_handoff_after_inclusive_boundary(self) -> None:
-        out = self._run_native([151705, 151706, 108386, 151717, 84921, 279, 151718])
-
-        assert len(out) == 1
-        assert out[0]["model_intermediate_buffer"]["ids"]["tts"] == [108386, 151717]
 
 
 class TestPromptAndMultiModal:
