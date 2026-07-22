@@ -454,14 +454,14 @@
           auto_response: true,
           minicpmo45_native_duplex: true,
         };
-        // Reference voice for TTS cloning, provided by the server via
-        // --ref-audio (mirrors the official demo's default ref audio).
-        if (config.refAudio) extraBody.ref_audio = config.refAudio;
         const session = {
           modalities: ['audio', 'text'],
           voice: 'default',
           extra_body: extraBody,
         };
+        // Reference voice for TTS cloning, provided by the server via
+        // --ref-audio (mirrors the official demo's default ref audio).
+        if (config.refAudio) session.ref_audio = config.refAudio;
         const instructions = systemPromptInput ? systemPromptInput.value.trim() : '';
         if (instructions) session.instructions = instructions;
         socket.send(JSON.stringify({ type: 'session.update', session }));

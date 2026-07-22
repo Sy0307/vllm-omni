@@ -57,6 +57,13 @@ def test_web_server_requires_ref_audio_for_audio_output_session():
     assert "Optional reference voice" not in ref_audio_arg.group("body")
 
 
+def test_client_sends_ref_audio_in_realtime_session_contract():
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "if (config.refAudio) session.ref_audio = config.refAudio;" in source
+    assert "extraBody.ref_audio" not in source
+
+
 def test_client_has_transactional_cleanup_and_visible_event_logging():
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
