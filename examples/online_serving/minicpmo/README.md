@@ -14,7 +14,13 @@ Install vLLM-Omni with the MiniCPM-o talker dependencies:
 
 ```bash
 pip install 'vllm-omni[minicpmo]'
+
+# From a source checkout:
+pip install -e '.[minicpmo]'
 ```
+
+The `minicpmo` extra installs `stepaudio2-minicpmo` and its audio dependencies,
+including `librosa`.
 
 ## Start the backend server
 
@@ -118,6 +124,14 @@ python -m examples.online_serving.minicpmo.realtime_web \
     --ws-backend ws://127.0.0.1:8099 \
     --public-realtime-url wss://public.example/v1/realtime
 ```
+
+## Validate soft-interrupt behavior
+
+The soft-interrupt E2E driver defaults to `--validation-mode model-policy`,
+which checks lifecycle and streaming invariants for arbitrary input audio. The
+stronger `response-required` mode is diagnostic: it requires a purpose-built
+two-response WAV, its `--input-sha256`, and an
+`--expect-second-response-substring` value.
 
 ## Related examples
 

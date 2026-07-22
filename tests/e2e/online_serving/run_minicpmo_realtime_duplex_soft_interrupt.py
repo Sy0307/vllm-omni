@@ -1,11 +1,9 @@
 """Validate MiniCPM-o Realtime duplex soft-interrupt delta streaming.
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
-duplex backend, then checks the emitted Realtime events for the user-visible
-shape that mirrors the reference MiniCPM-o demo:
-
-listen -> response 1 speak/deltas -> done -> listen -> response 2 speak/deltas
--> done -> listen/commit.
+duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
+The stronger response-required mode binds the two-response contract to a known
+input checksum and expected second response.
 """
 
 from __future__ import annotations
@@ -13,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import sys
@@ -31,6 +30,13 @@ TRANSCRIPT_DELTA_EVENTS = {
 
 def _canonical_path(path: str) -> Path:
     return Path(path).expanduser().resolve(strict=False)
+
+
+def _validate_input_sha256(path: Path, expected: str) -> str:
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != expected.lower():
+        raise ValueError(f"input WAV SHA256 mismatch: expected {expected.lower()}, got {actual}")
+    return actual
 
 
 def _read_json(path: Path) -> dict[str, object]:
@@ -202,10 +208,13 @@ def _response_summary(
 def summarize_artifacts(
     *,
     output_dir: Path,
+    validation_mode: str,
     min_responses: int,
     min_audio_deltas_per_response: int,
-    expect_transcript_substring: str | None,
+    expect_second_response_substring: str | None,
 ) -> dict[str, object]:
+    if validation_mode not in {"model-policy", "response-required"}:
+        raise ValueError(f"unsupported validation mode: {validation_mode}")
     result = _read_json(output_dir / "result.json")
     events = _read_events(output_dir / "events.jsonl")
     response_ids = _response_created_ids(events)
@@ -233,18 +242,18 @@ def summarize_artifacts(
         None,
     )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
-    required_response_summaries = response_summaries[:min_responses]
-    enough_responses = len(response_summaries) >= min_responses
-    response_lifecycle_ok = enough_responses and all(
-        bool(summary.get("one_done")) for summary in required_response_summaries
-    )
+    effective_min_responses = min_responses if validation_mode == "response-required" else 1
+    enough_responses = len(response_summaries) >= effective_min_responses
+    response_lifecycle_ok = enough_responses and all(bool(summary.get("one_done")) for summary in response_summaries)
     multi_delta_ok = enough_responses and all(
-        int(summary.get("audio_delta_count", 0)) >= min_audio_deltas_per_response
-        for summary in required_response_summaries
+        int(summary.get("audio_delta_count", 0)) >= min_audio_deltas_per_response for summary in response_summaries
     )
     response_audio_contract_ok = enough_responses and all(
         summary.get("audio_before_done_ok") is True and int(summary.get("stale_audio_count", 0)) == 0
-        for summary in required_response_summaries
+        for summary in response_summaries
+    )
+    response_before_final_commit = (
+        first_created_index is not None and commit_index is not None and first_created_index < commit_index
     )
     second_response_before_final_commit = (
         second_created_index is not None and commit_index is not None and second_created_index < commit_index
@@ -258,11 +267,19 @@ def summarize_artifacts(
         and any(first_done_index < index < second_created_index for index in listen_indices)
     )
     listen_after_last_done = last_done_index is not None and any(index > last_done_index for index in listen_indices)
+    listen_after_response_before_commit = (
+        last_done_index is not None
+        and commit_index is not None
+        and any(last_done_index < index < commit_index for index in listen_indices)
+    )
     final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
-    transcript_expectation_ok = not expect_transcript_substring or _normalize_text(
-        expect_transcript_substring
-    ) in _normalize_text(transcript)
+    second_response_transcript = (
+        str(response_summaries[1].get("transcript") or "") if len(response_summaries) >= 2 else ""
+    )
+    second_response_transcript_expectation_ok = not expect_second_response_substring or _normalize_text(
+        expect_second_response_substring
+    ) in _normalize_text(second_response_transcript)
     error_events = [
         event
         for event in events
@@ -278,7 +295,7 @@ def summarize_artifacts(
         and event["response"].get("status") == "cancelled"
     )
     result_ok = result.get("ok") is True
-    ok = bool(
+    common_contract_ok = bool(
         result_ok
         and not error_events
         and cancelled_count == 0
@@ -286,33 +303,43 @@ def summarize_artifacts(
         and response_lifecycle_ok
         and multi_delta_ok
         and response_audio_contract_ok
-        and second_response_before_final_commit
+        and response_before_final_commit
+        and listen_after_response_before_commit
+        and final_listen_after_commit
+    )
+    mode_contract_ok = validation_mode == "model-policy" or (
+        second_response_before_final_commit
         and listen_before_first_response
         and listen_between_responses
         and listen_after_last_done
-        and final_listen_after_commit
-        and transcript_expectation_ok
+        and second_response_transcript_expectation_ok
     )
+    ok = common_contract_ok and mode_contract_ok
     return {
         "ok": ok,
         "result_ok": result_ok,
+        "validation_mode": validation_mode,
         "event_counts": _event_counts(events),
         "response_ids": response_ids,
         "response_summaries": response_summaries,
         "min_responses": min_responses,
+        "effective_min_responses": effective_min_responses,
         "min_audio_deltas_per_response": min_audio_deltas_per_response,
         "enough_responses": enough_responses,
         "response_lifecycle_ok": response_lifecycle_ok,
         "multi_delta_ok": multi_delta_ok,
         "response_audio_contract_ok": response_audio_contract_ok,
+        "response_before_final_commit": response_before_final_commit,
         "second_response_before_final_commit": second_response_before_final_commit,
         "listen_before_first_response": listen_before_first_response,
         "listen_between_responses": listen_between_responses,
         "listen_after_last_done": listen_after_last_done,
+        "listen_after_response_before_commit": listen_after_response_before_commit,
         "final_listen_after_commit": final_listen_after_commit,
         "transcript": transcript,
-        "expect_transcript_substring": expect_transcript_substring,
-        "transcript_expectation_ok": transcript_expectation_ok,
+        "second_response_transcript": second_response_transcript,
+        "expect_second_response_substring": expect_second_response_substring,
+        "second_response_transcript_expectation_ok": second_response_transcript_expectation_ok,
         "error_count": len(error_events),
         "cancelled_count": cancelled_count,
         "compact_sequence": _compact_sequence(events),
@@ -325,6 +352,9 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
     output_dir = _canonical_path(args.output_dir)
     if not input_wav.is_file():
         raise ValueError(f"input WAV does not exist: {input_wav}")
+    input_sha256 = hashlib.sha256(input_wav.read_bytes()).hexdigest()
+    if args.input_sha256:
+        input_sha256 = _validate_input_sha256(input_wav, args.input_sha256)
     command = [
         sys.executable,
         str(DEMO_PATH),
@@ -373,14 +403,16 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
 
     summary = summarize_artifacts(
         output_dir=output_dir,
+        validation_mode=args.validation_mode,
         min_responses=args.min_responses,
         min_audio_deltas_per_response=args.min_audio_deltas_per_response,
-        expect_transcript_substring=args.expect_transcript_substring,
+        expect_second_response_substring=args.expect_second_response_substring,
     )
     summary.update(
         {
             "returncode": process.returncode if process.returncode is not None else -1,
             "input_wav": str(input_wav),
+            "input_sha256": input_sha256,
             "stdout_tail": stdout_bytes.decode(errors="replace")[-4000:],
             "stderr_tail": stderr_bytes.decode(errors="replace")[-4000:],
         }
@@ -404,12 +436,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--require-audio", action="store_true")
     parser.add_argument("--no-realtime-pacing", action="store_true")
+    parser.add_argument(
+        "--validation-mode",
+        choices=("model-policy", "response-required"),
+        default="model-policy",
+    )
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
-    parser.add_argument("--expect-transcript-substring")
+    parser.add_argument("--input-sha256")
+    parser.add_argument("--expect-second-response-substring")
     args = parser.parse_args()
-    if args.min_responses < 2:
+    if args.validation_mode == "response-required" and args.min_responses < 2:
         parser.error("--min-responses must be at least 2")
+    if args.validation_mode == "response-required" and not args.input_sha256:
+        parser.error("--input-sha256 is required in response-required mode")
+    if args.validation_mode == "response-required" and not args.expect_second_response_substring:
+        parser.error("--expect-second-response-substring is required in response-required mode")
     if args.min_audio_deltas_per_response < 1:
         parser.error("--min-audio-deltas-per-response must be positive")
     return args

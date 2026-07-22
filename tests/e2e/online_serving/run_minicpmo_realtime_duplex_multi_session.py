@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,15 +15,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-try:
-    from tests.e2e.online_serving.minicpmo_realtime_duplex_scenarios import (
-        _url_with_model,
-        run_demo,
-    )
-except ModuleNotFoundError as exc:
-    if exc.name not in {"tests.e2e", "tests.e2e.online_serving"}:
-        raise
-    from minicpmo_realtime_duplex_scenarios import _url_with_model, run_demo
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from minicpmo_realtime_duplex_scenarios import _url_with_model, run_demo  # noqa: E402
 
 
 def _with_resume_mode(url: str) -> str:

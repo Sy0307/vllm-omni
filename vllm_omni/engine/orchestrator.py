@@ -351,6 +351,7 @@ class Orchestrator:
     _running_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    duplex_control_plane: DuplexControlPlanePort | None = None
 
     def __init__(
         self,
