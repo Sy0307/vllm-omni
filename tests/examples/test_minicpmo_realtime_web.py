@@ -265,12 +265,76 @@ def test_realtime_duplex_demo_pair_default_requires_multiple_audio_deltas(monkey
             "a",
             "--output-dir-b",
             "b",
+            "--ref-audio",
+            "ref.wav",
         ],
     )
 
     args = demo.parse_args()
 
+    assert args.ref_audio == "ref.wav"
     assert args.min_audio_deltas_per_session == 2
+
+
+def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
+    demo = _load_pair_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "pair.py",
+            "--input-wav-a",
+            "a.wav",
+            "--input-wav-b",
+            "b.wav",
+            "--output-dir-a",
+            "a",
+            "--output-dir-b",
+            "b",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+
+def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
+    demo = _load_soft_interrupt_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "soft.py",
+            "--input-wav",
+            "input.wav",
+            "--output-dir",
+            "out",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+
+def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
+    demo = _load_soft_interrupt_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "soft.py",
+            "--input-wav",
+            "input.wav",
+            "--output-dir",
+            "out",
+            "--ref-audio",
+            "ref.wav",
+        ],
+    )
+
+    args = demo.parse_args()
+
+    assert args.ref_audio == "ref.wav"
 
 
 def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp_path):

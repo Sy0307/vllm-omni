@@ -90,6 +90,7 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --url ws://localhost:8099/v1/realtime?duplex=1 \
     --model openbmb/MiniCPM-o-4_5 \
     --input-wav /path/to/input_16k_mono_pcm16.wav \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 

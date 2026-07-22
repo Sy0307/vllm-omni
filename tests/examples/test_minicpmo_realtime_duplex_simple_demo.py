@@ -120,6 +120,41 @@ def test_ref_audio_data_url_encodes_explicit_wav(tmp_path):
     assert demo._ref_audio_data_url(None) is None
 
 
+def test_realtime_duplex_demo_requires_ref_audio(monkeypatch):
+    demo = _load_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "realtime_duplex_demo.py",
+            "--input-wav",
+            "input.wav",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+
+def test_realtime_duplex_demo_accepts_explicit_ref_audio(monkeypatch):
+    demo = _load_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "realtime_duplex_demo.py",
+            "--input-wav",
+            "input.wav",
+            "--ref-audio",
+            "ref.wav",
+        ],
+    )
+
+    args = demo.parse_args()
+
+    assert args.ref_audio == "ref.wav"
+
+
 def test_open_streaming_response_requires_post_commit_drain():
     demo = _load_demo_module()
 

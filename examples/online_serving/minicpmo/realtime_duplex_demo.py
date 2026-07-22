@@ -306,7 +306,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--session-id")
     parser.add_argument("--input-wav", required=True)
-    parser.add_argument("--ref-audio")
+    parser.add_argument(
+        "--ref-audio",
+        required=True,
+        help=(
+            "Reference WAV for the MiniCPM-o duplex assistant voice. "
+            "This demo matches the official flow by always providing a reference audio clip."
+        ),
+    )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=60.0)
