@@ -1336,9 +1336,7 @@ class DuplexSessionRunnerMixin:
                                 }
                             )
                             continue
-                        if self._should_force_listen_for_auto_response_overlap(
-                            session, event, payload
-                        ):
+                        if self._should_force_listen_for_auto_response_overlap(session, event, payload):
                             # Auto-response keeps a long-lived native Stage0 stream.
                             # While assistant audio is still active, silence from the
                             # browser should advance the model in listen mode rather

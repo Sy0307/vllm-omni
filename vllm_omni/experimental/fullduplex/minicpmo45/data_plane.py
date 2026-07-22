@@ -179,11 +179,7 @@ class MiniCPMO45DataPlaneSession:
         output_turn_id = output_turn_id_from_metadata(mm_output)
         output_epoch = output_epoch_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
-        stale_turn = (
-            expected_turn_id is not None
-            and output_turn_id is not None
-            and output_turn_id < expected_turn_id
-        )
+        stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id < expected_turn_id
         if expected_turn_id is None and output_turn_id is not None:
             stale_turn = output_turn_id < context.turn_id
         stale_epoch = output_epoch is not None and output_epoch != context.epoch

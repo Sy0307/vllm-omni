@@ -354,8 +354,7 @@ class NativeRuntimeBridgeMixin:
         )
         stale_response_owner = response_owned and session.active_response_id != response_id
         stale_model_turn_owner = not response_owned and (
-            session.active_response_id is not None
-            or session.turn_id != expected_model_turn_id
+            session.active_response_id is not None or session.turn_id != expected_model_turn_id
         )
         return stale_common_owner or stale_response_owner or stale_model_turn_owner
 
@@ -393,11 +392,7 @@ class NativeRuntimeBridgeMixin:
                 session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
             )
         else:
-            if (
-                not auto_response
-                or expected_model_turn_id is None
-                or session.turn_id != expected_model_turn_id
-            ):
+            if not auto_response or expected_model_turn_id is None or session.turn_id != expected_model_turn_id:
                 native.clear_continuation()
                 return
             owner_id = f"model-turn:{expected_model_turn_id}"
