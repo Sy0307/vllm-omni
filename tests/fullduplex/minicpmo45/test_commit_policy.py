@@ -19,7 +19,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
             CommitSnapshot(
                 auto_responds=True,
                 speech_since_commit=True,
-                auto_response_waiting_for_speech=False,
                 active_response_id=None,
                 overlap_speech_ms=0,
                 native_response_in_progress=False,
@@ -28,43 +27,64 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
             CommitAction.START_AUTO_RESPONSE,
         ),
         (
-            "post-response idle commit with stale runtime work",
+            "native auto-response remains model-owned during playback",
             CommitSnapshot(
                 auto_responds=True,
                 speech_since_commit=True,
-                auto_response_waiting_for_speech=True,
-                active_response_id=None,
-                overlap_speech_ms=0,
-                native_response_in_progress=True,
-                playback_active=False,
-            ),
-            CommitAction.START_AUTO_RESPONSE,
-        ),
-        (
-            "commit during post-response playback",
-            CommitSnapshot(
-                auto_responds=True,
-                speech_since_commit=True,
-                auto_response_waiting_for_speech=True,
                 active_response_id=None,
                 overlap_speech_ms=800,
                 native_response_in_progress=True,
                 playback_active=True,
             ),
+            CommitAction.START_AUTO_RESPONSE,
+        ),
+        (
+            "native auto-response commit without speech",
+            CommitSnapshot(
+                auto_responds=True,
+                speech_since_commit=False,
+                active_response_id=None,
+                overlap_speech_ms=0,
+                native_response_in_progress=True,
+                playback_active=False,
+            ),
+            CommitAction.COMMIT_ONLY,
+        ),
+        (
+            "non-auto response overlap",
+            CommitSnapshot(
+                auto_responds=False,
+                speech_since_commit=True,
+                active_response_id=None,
+                overlap_speech_ms=800,
+                native_response_in_progress=True,
+                playback_active=False,
+            ),
             CommitAction.DEFER_ACTIVE_RESPONSE,
         ),
         (
-            "commit after truncated response",
+            "non-auto playback overlap",
             CommitSnapshot(
-                auto_responds=True,
+                auto_responds=False,
                 speech_since_commit=True,
-                auto_response_waiting_for_speech=False,
+                active_response_id=None,
+                overlap_speech_ms=800,
+                native_response_in_progress=False,
+                playback_active=True,
+            ),
+            CommitAction.DEFER_ACTIVE_RESPONSE,
+        ),
+        (
+            "non-auto commit without overlap",
+            CommitSnapshot(
+                auto_responds=False,
+                speech_since_commit=True,
                 active_response_id=None,
                 overlap_speech_ms=0,
                 native_response_in_progress=False,
                 playback_active=False,
             ),
-            CommitAction.START_AUTO_RESPONSE,
+            CommitAction.COMMIT_ONLY,
         ),
     ],
     ids=lambda value: value if isinstance(value, str) else None,
@@ -77,17 +97,3 @@ def test_decide_commit_action_covers_realtime_lifecycle_sequences(
     del case
 
     assert decide_commit_action(snapshot) is expected
-
-
-def test_decide_commit_action_keeps_non_auto_response_commit_transport_only() -> None:
-    snapshot = CommitSnapshot(
-        auto_responds=False,
-        speech_since_commit=True,
-        auto_response_waiting_for_speech=False,
-        active_response_id=None,
-        overlap_speech_ms=0,
-        native_response_in_progress=False,
-        playback_active=False,
-    )
-
-    assert decide_commit_action(snapshot) is CommitAction.COMMIT_ONLY
