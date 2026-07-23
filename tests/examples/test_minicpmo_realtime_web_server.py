@@ -53,7 +53,10 @@ def test_build_app_injects_public_realtime_url():
 
 def test_build_app_versions_client_bundle_and_disables_index_cache():
     client = TestClient(build_app())
-    expected_version = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
+    expected_version_hash = hashlib.sha256()
+    for asset_name in ("app.js", "pcm_worklet.js", "playback_worklet.js"):
+        expected_version_hash.update((STATIC_DIR / asset_name).read_bytes())
+    expected_version = expected_version_hash.hexdigest()[:12]
 
     assert (APP_DIR / "index.html").is_file()
     assert (STATIC_DIR / "app.js").is_file()
