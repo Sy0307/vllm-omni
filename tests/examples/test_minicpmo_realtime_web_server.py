@@ -1,9 +1,25 @@
 import hashlib
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from examples.online_serving.minicpmo.realtime_web.server import APP_DIR, STATIC_DIR, _join_ws_url, build_app
+SERVER_PATH = Path(__file__).resolve().parents[2] / "examples/online_serving/minicpmo/realtime_web/server.py"
+spec = importlib.util.spec_from_file_location(
+    "minicpmo_realtime_web_server_test",
+    SERVER_PATH,
+)
+assert spec is not None and spec.loader is not None
+server = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = server
+spec.loader.exec_module(server)
+
+APP_DIR = server.APP_DIR
+STATIC_DIR = server.STATIC_DIR
+_join_ws_url = server._join_ws_url
+build_app = server.build_app
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
