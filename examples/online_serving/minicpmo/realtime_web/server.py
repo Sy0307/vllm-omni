@@ -73,7 +73,14 @@ def build_app(
 ) -> FastAPI:
     app = FastAPI(title="Experimental Full-Duplex Web Demo")
     index_path = APP_DIR / "index.html"
-    app_version = hashlib.sha256((STATIC_DIR / "app.js").read_bytes()).hexdigest()[:12]
+    app_version_hash = hashlib.sha256()
+    for asset_path in (
+        STATIC_DIR / "app.js",
+        STATIC_DIR / "pcm_worklet.js",
+        STATIC_DIR / "playback_worklet.js",
+    ):
+        app_version_hash.update(asset_path.read_bytes())
+    app_version = app_version_hash.hexdigest()[:12]
 
     ref_audio_uri: str | None = None
     if ref_audio:
@@ -90,6 +97,7 @@ def build_app(
                 "model": model,
                 "realtimePath": public_realtime_url or "v1/realtime",
                 "refAudio": ref_audio_uri,
+                "appVersion": app_version,
             },
             ensure_ascii=True,
         )

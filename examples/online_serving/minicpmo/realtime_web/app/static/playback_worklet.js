@@ -9,11 +9,16 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.started = false;
     this.activeResponseId = null;
     this.initialBufferFrames = Math.round(sampleRate * 0.2);
+    this.bufferWaitFrames = this.initialBufferFrames;
+    this.rebuffering = false;
+    this.fadeFrames = Math.max(1, Math.round(sampleRate * 0.005));
+    this.fadeInFrames = 0;
     this.port.onmessage = (event) => this.handleMessage(event.data || {});
   }
 
   handleMessage(message) {
     if (message.type === 'audio' && message.pcm) {
+      const wasEmpty = this.queue.length === 0;
       if (!this.started && !this.activeResponseId) {
         this.activeResponseId = message.responseId || null;
       }
@@ -21,10 +26,15 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
         this.initialBufferFrames = Math.max(0, Math.round((sampleRate * message.initialBufferMs) / 1000));
       }
       this.queue.push(message.pcm);
-      this.startIfBuffered();
+      if (!this.started && wasEmpty && !this.rebuffering) {
+        this.bufferWaitFrames = this.initialBufferFrames;
+      }
     } else if (message.type === 'drain') {
       this.drain = { responseId: message.responseId || null };
-      if (!this.started && this.bufferedFrames() > 0) this.startPlayback();
+      if (!this.started && this.bufferedFrames() > 0) {
+        this.bufferWaitFrames = 0;
+        this.startPlayback();
+      }
       this.notifyIfDrained();
     } else if (message.type === 'clear') {
       this.queue = [];
@@ -34,6 +44,9 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       this.drain = null;
       this.started = false;
       this.activeResponseId = null;
+      this.bufferWaitFrames = this.initialBufferFrames;
+      this.rebuffering = false;
+      this.fadeInFrames = 0;
     }
   }
 
@@ -46,11 +59,10 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
   startPlayback() {
     if (this.started) return;
     this.started = true;
-    this.port.postMessage({ type: 'playback-started', responseId: this.activeResponseId });
-  }
-
-  startIfBuffered() {
-    if (!this.started && this.bufferedFrames() >= this.initialBufferFrames) this.startPlayback();
+    this.fadeInFrames = this.fadeFrames;
+    if (this.playedFrames === 0) {
+      this.port.postMessage({ type: 'playback-started', responseId: this.activeResponseId });
+    }
   }
 
   notifyIfDrained() {
@@ -66,11 +78,36 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.drain = null;
     this.started = false;
     this.activeResponseId = null;
+    this.bufferWaitFrames = this.initialBufferFrames;
+    this.rebuffering = false;
+    this.fadeInFrames = 0;
+  }
+
+  reportUnderrun() {
+    this.port.postMessage({
+      type: 'playback-underrun',
+      responseId: this.activeResponseId,
+      underrunMs: Math.round((this.underrunFrames * 1000) / sampleRate),
+    });
   }
 
   process(_inputs, outputs) {
     const output = outputs[0][0];
     output.fill(0);
+    if (!this.started) {
+      if (this.rebuffering && !this.drain) {
+        this.underrunFrames += output.length;
+        this.reportUnderrun();
+      }
+      if (this.queue.length > 0 && this.bufferWaitFrames > 0) {
+        this.bufferWaitFrames = Math.max(0, this.bufferWaitFrames - output.length);
+        return true;
+      }
+      if (this.queue.length > 0) {
+        this.startPlayback();
+        this.rebuffering = false;
+      }
+    }
     if (!this.started) {
       this.notifyIfDrained();
       return true;
@@ -80,7 +117,13 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       const pcm = this.queue[0];
       const count = Math.min(output.length - target, pcm.length - this.offset);
       for (let index = 0; index < count; index += 1) {
-        output[target + index] = pcm[this.offset + index] / 32768;
+        let sample = pcm[this.offset + index] / 32768;
+        if (this.fadeInFrames > 0) {
+          const elapsed = this.fadeFrames - this.fadeInFrames;
+          sample *= elapsed / this.fadeFrames;
+          this.fadeInFrames -= 1;
+        }
+        output[target + index] = sample;
       }
       target += count;
       this.offset += count;
@@ -91,12 +134,16 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       }
     }
     if (target < output.length && !this.drain) {
+      const fadeCount = Math.min(target, this.fadeFrames);
+      for (let index = 0; index < fadeCount; index += 1) {
+        output[target - fadeCount + index] *= (fadeCount - index - 1) / fadeCount;
+      }
       this.underrunFrames += output.length - target;
-      this.port.postMessage({
-        type: 'playback-underrun',
-        responseId: this.activeResponseId,
-        underrunMs: Math.round((this.underrunFrames * 1000) / sampleRate),
-      });
+      this.reportUnderrun();
+      this.started = false;
+      this.rebuffering = true;
+      this.bufferWaitFrames = this.initialBufferFrames;
+      this.fadeInFrames = 0;
     }
     this.notifyIfDrained();
     return true;

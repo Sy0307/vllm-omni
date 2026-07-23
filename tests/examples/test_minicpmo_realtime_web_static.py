@@ -1,4 +1,7 @@
 import re
+import shutil
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -102,11 +105,22 @@ def test_audio_worklets_define_capture_and_playback_processors():
     assert "clear" in playback
 
 
-def test_playback_worklet_buffers_first_200ms_and_reports_underruns():
+def test_audio_worklet_urls_use_the_static_asset_version():
+    server = (ROOT / "server.py").read_text(encoding="utf-8")
+    app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert '"appVersion": app_version' in server
+    assert 'STATIC_DIR / "playback_worklet.js"' in server
+    assert 'STATIC_DIR / "pcm_worklet.js"' in server
+    assert "staticAssetUrl('static/playback_worklet.js')" in app
+    assert "staticAssetUrl('static/pcm_worklet.js')" in app
+
+
+def test_playback_worklet_buffers_first_400ms_and_reports_underruns():
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     playback = (STATIC_ROOT / "playback_worklet.js").read_text(encoding="utf-8")
 
-    assert "INITIAL_PLAYBACK_BUFFER_MS = 200" in app
+    assert "INITIAL_PLAYBACK_BUFFER_MS = 400" in app
     assert "initialBufferMs" in app
     assert "responseId" in app
     assert "playback-underrun" in app
@@ -115,3 +129,81 @@ def test_playback_worklet_buffers_first_200ms_and_reports_underruns():
     assert "playback-underrun" in playback
     assert "underrunFrames" in playback
     assert "underrunMs" in playback
+
+
+def test_playback_worklet_waits_before_playing_and_rebuffers_after_underrun():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the AudioWorklet regression test")
+
+    script = textwrap.dedent(
+        """
+        const fs = require('fs');
+        const vm = require('vm');
+
+        global.sampleRate = 1000;
+        global.AudioWorkletProcessor = class {
+          constructor() {
+            this.port = { onmessage: null, postMessage: () => {} };
+          }
+        };
+        let Processor = null;
+        global.registerProcessor = (_name, processor) => { Processor = processor; };
+        vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+
+        const processor = new Processor();
+        const render = () => {
+          const output = new Float32Array(100);
+          processor.process([], [[output]]);
+          return output;
+        };
+        const assert = (condition, message) => {
+          if (!condition) throw new Error(message);
+        };
+
+        const first = new Int16Array(150);
+        first.fill(16384);
+        processor.handleMessage({
+          type: 'audio',
+          pcm: first,
+          responseId: 'response-1',
+          initialBufferMs: 400,
+        });
+        assert(!processor.started, 'large first delta must not bypass wall-clock prebuffer');
+        assert(render().every((sample) => sample === 0), 'first prebuffer render must be silent');
+        assert(render().every((sample) => sample === 0), 'second prebuffer render must be silent');
+        assert(render().every((sample) => sample === 0), 'third prebuffer render must be silent');
+        assert(render().every((sample) => sample === 0), 'fourth prebuffer render must be silent');
+        const firstPlayback = render();
+        assert(firstPlayback.some((sample) => sample !== 0), 'playback must start after prebuffer');
+
+        const underrun = render();
+        assert(!processor.started, 'an empty queue must return to buffering');
+        assert(underrun[underrun.length - 1] === 0, 'underrun boundary must fade to zero');
+
+        const resumed = new Int16Array(300);
+        resumed.fill(8192);
+        processor.handleMessage({
+          type: 'audio',
+          pcm: resumed,
+          responseId: 'response-1',
+          initialBufferMs: 400,
+        });
+        assert(render().every((sample) => sample === 0), 'resume must rebuild jitter buffer');
+        assert(render().every((sample) => sample === 0), 'resume must keep rebuilding jitter buffer');
+        assert(render().every((sample) => sample === 0), 'resume must keep waiting');
+        assert(render().every((sample) => sample === 0), 'resume must wait the full buffer interval');
+        const resumedPlayback = render();
+        assert(resumedPlayback.some((sample) => sample !== 0), 'playback must resume after rebuffer');
+        assert(
+          Math.abs(resumedPlayback[0]) < Math.abs(resumedPlayback[50]),
+          'resumed playback must fade in instead of jumping from silence',
+        );
+        """
+    )
+    subprocess.run(
+        [node, "-e", script, str(STATIC_ROOT / "playback_worklet.js")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

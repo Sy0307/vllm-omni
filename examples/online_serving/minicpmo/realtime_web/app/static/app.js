@@ -24,7 +24,7 @@
   const OUTPUT_RATE = 24000;
   const SEND_INTERVAL_MS = 200;
   const ECHO_GUARD_MS = 300;
-  const INITIAL_PLAYBACK_BUFFER_MS = 200;
+  const INITIAL_PLAYBACK_BUFFER_MS = 400;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
@@ -65,6 +65,11 @@
   let liveUserTurn = null;
   let liveAssistantTurn = null;
   let sessionCloseResolver = null;
+
+  function staticAssetUrl(path) {
+    const version = String(config.appVersion || '').trim();
+    return version ? `${path}?v=${encodeURIComponent(version)}` : path;
+  }
 
   if (promptPreset && systemPromptInput) {
     promptPreset.addEventListener('change', () => {
@@ -400,7 +405,7 @@
   async function openPlayback() {
     playbackContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: OUTPUT_RATE });
     playbackRate = playbackContext.sampleRate;
-    await playbackContext.audioWorklet.addModule('static/playback_worklet.js');
+    await playbackContext.audioWorklet.addModule(staticAssetUrl('static/playback_worklet.js'));
     playbackNode = new AudioWorkletNode(playbackContext, 'fullduplex-pcm-playback');
     playbackNode.port.onmessage = (message) => {
       if (message.data.type === 'playback-started') setPlayback('Playing');
@@ -429,7 +434,7 @@
       captureContext = new (window.AudioContext || window.webkitAudioContext)();
     }
     captureRate = captureContext.sampleRate;
-    await captureContext.audioWorklet.addModule('static/pcm_worklet.js');
+    await captureContext.audioWorklet.addModule(staticAssetUrl('static/pcm_worklet.js'));
     const source = captureContext.createMediaStreamSource(mediaStream);
     captureNode = new AudioWorkletNode(captureContext, 'fullduplex-pcm-capture');
     captureNode.port.onmessage = (message) => {
