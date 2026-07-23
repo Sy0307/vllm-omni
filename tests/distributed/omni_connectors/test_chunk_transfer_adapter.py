@@ -13,6 +13,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
+from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -41,6 +42,33 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         additional_information=None,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
+
+
+def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(
+        _all_token_ids=[0, 0, 7, 8],
+        _output_token_ids=[7, 8],
+        prompt_token_ids=[0, 0],
+        num_computed_tokens=4,
+        num_prompt_tokens=2,
+        update_block_hashes=mocker.Mock(),
+    )
+    payload = {
+        "ids": {"prompt": [1, 2, 3]},
+        "meta": {
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 7,
+        },
+    }
+
+    construct_next_stage_streaming_input_prompt(payload, request)
+
+    assert request.prompt_token_ids == [0] * 7
+    assert request._all_token_ids == [0] * 7
+    assert request._output_token_ids == []
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 7
+    request.update_block_hashes.assert_called_once_with()
 
 
 @pytest.fixture

@@ -20,9 +20,8 @@ Use this recipe as a known-good starting point for serving
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
 MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
 `/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The default deploy co-locates the strict three-stage pipeline on one
-large-memory GPU; the 8x4090 scale-out layout remains available via
-`--deploy-config`.
+shot. The opt-in batching deploy co-locates the strict three-stage pipeline
+on one large-memory GPU; 2-GPU, 3-GPU, and 8x4090 layouts are also provided.
 
 ## References
 
@@ -30,6 +29,11 @@ large-memory GPU; the 8x4090 scale-out layout remains available via
   `hf_config.version="4.5"`):
   - Single-GPU strict three-stage layout (default):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
+  - Explicit continuous-batching alias:
+    [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
+  - 2-GPU and 3-GPU layouts:
+    [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
+    [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
 - Online example + Gradio demo:
@@ -47,13 +51,15 @@ large-memory GPU; the 8x4090 scale-out layout remains available via
 
 ## Hardware Support
 
-Two hardware layouts ship with deploy configs. Every layout uses the
+Four hardware layouts ship with deploy configs. Every layout uses the
 same strict three-stage topology. The Talker emits codec chunks only;
 Code2Wav consumes them through a shared-memory async connector.
 
 | Layout | Thinker | Talker | Code2Wav | Typical hardware |
 | --- | --- | --- | --- | --- |
 | 1-GPU (default) | GPU 0 | GPU 0 | GPU 0 | 1x large-memory GPU |
+| 2-GPU | GPU 0 | GPU 1 | GPU 1 | 2x large-memory GPU |
+| 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
 ## GPU
@@ -86,6 +92,21 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 The deploy config is auto-loaded by the model registry — no
 `--deploy-config` flag needed for this default single-GPU layout.
 
+#### Performance comparison
+
+Compare text-only and text+audio separately. Text-only isolates Thinker
+generation, while text+audio also schedules codec decoding and waveform
+generation in two colocated processes. On the single-GPU, `max_num_seqs=4`,
+concurrency-10 Daily-Omni audio run, all 1197 requests completed at 1.31
+req/s; mean serving TTFT was 3.59 s, Stage 0 TPOT was 396.78 ms, and audio
+TTFP was 5.99 s.
+
+The previously reported roughly +15% TTFT and 3x text TPOT/ITL versus
+#5233 are not conclusive without the same commit, hardware, modalities, and
+concurrency. Three-stage queueing explains the larger text+audio latency, but
+not a text-only TPOT regression by itself. A same-config text-only A/B is
+required before attributing that difference to the Talker rewrite.
+
 #### Verification
 
 **Quick smoke test (text-only output)**:
@@ -100,10 +121,10 @@ curl http://localhost:8099/v1/chat/completions \
     }'
 ```
 
-**Text + speech in one response** (the headline 4.5 feature). The TTS
-path is gated by a Jinja flag on the chat template. Pass
-`use_tts_template=true` via the **top-level** `chat_template_kwargs`
-field (curl does not flatten nested `extra_body`):
+**Text + speech in one response** (the headline 4.5 feature). The model
+bridge conditions the Talker from the generated assistant span, so the
+generic serving layer does not inject MiniCPM-specific template defaults.
+`use_tts_template=true` remains supported when explicitly requested:
 
 ```bash
 curl http://localhost:8099/v1/chat/completions \

@@ -24,36 +24,9 @@ from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
-
-# Preserve the established external vocoder on CUDA. Ascend uses the in-tree
-# adapter because ``stepaudio2-minicpmo`` hard-codes CUDA device placement.
-if current_omni_platform.is_npu():
-    try:
-        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
-            MiniCPMO45Token2wav as _Token2wav,
-        )
-
-        _token2wav_backend = "step_audio2_core"
-    except ImportError:
-        try:
-            from stepaudio2 import Token2wav as _Token2wav
-
-            _token2wav_backend = "stepaudio2_pkg"
-        except ImportError:
-            _Token2wav = None
-            _token2wav_backend = None
-else:
-    try:
-        from stepaudio2 import Token2wav as _Token2wav
-
-        _token2wav_backend = "stepaudio2_pkg"
-    except ImportError:
-        _Token2wav = None
-        _token2wav_backend = None
-
-_stepaudio2_available = _Token2wav is not None
 
 _REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
@@ -154,6 +127,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
         self._request_generators: dict[str, torch.Generator] = {}
+        self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
 
         tts_config = getattr(config, "tts_config", None)
@@ -250,8 +224,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         first_call = not isinstance(state, dict)
 
         if is_prefill or first_call:
-            token_ids = info_dict.get("tts_token_ids")
-            hidden_states = info_dict.get("tts_hidden_states")
+            token_ids, hidden_states = get_tts_handoff(info_dict)
+            # Cross-process stage transport serializes CPU tensors as lists.
+            # Normalize both local tensor handoffs and transported payloads
+            # before validating/building the Talker condition.
+            if isinstance(token_ids, (list, tuple)):
+                token_ids = torch.as_tensor(token_ids, dtype=torch.long)
+            if isinstance(hidden_states, (list, tuple)):
+                hidden_states = torch.as_tensor(hidden_states, dtype=torch.float32)
             if not isinstance(token_ids, torch.Tensor) or not isinstance(hidden_states, torch.Tensor):
                 available = sorted(key for key in info_dict if not key.startswith("_"))
                 raise ValueError(
@@ -265,11 +245,30 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 raise ValueError("MiniCPM-o Talker conditioning must not be empty")
             full_embeds = self._build_condition_embeddings(token_ids, hidden_states)
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
+            if offset == 0 and span_len > full_embeds.shape[0]:
+                # Async-chunk prewarms Stage 1 with placeholder token IDs. Two
+                # Thinker handoffs can arrive before the first one executes,
+                # so the scheduler prompt may already include the newer
+                # placeholder prefix while additional_information still
+                # carries the preceding condition. Materialize that prefix as
+                # the embeddings of its actual zero token IDs and keep the
+                # complete Talker condition tail-aligned (audio BOS remains
+                # the final prefill token).
+                prefix_len = span_len - full_embeds.shape[0]
+                placeholder_ids = torch.zeros(
+                    prefix_len,
+                    dtype=torch.long,
+                    device=self.emb_text.weight.device,
+                )
+                full_embeds = torch.cat([self.emb_text(placeholder_ids), full_embeds], dim=0)
             embeds = full_embeds[offset : offset + span_len]
             if embeds.shape[0] != span_len:
                 raise ValueError(
                     "MiniCPM-o Talker prefill span exceeds condition: "
-                    f"offset={offset} span={span_len} condition={full_embeds.shape[0]}"
+                    f"request_id={info_dict.get('request_id')} offset={offset} "
+                    f"span={span_len} condition={full_embeds.shape[0]} "
+                    f"tts_ids={token_ids.shape[0]} tts_hidden={hidden_states.shape[0]} "
+                    f"prompt_len={info_dict.get('_omni_prompt_len')}"
                 )
             max_tokens = _max_audio_tokens(int(token_ids.numel()))
             state = {
@@ -277,6 +276,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "max_tokens": max_tokens,
                 "finished": False,
             }
+            request_id = str(info_dict.get("request_id", "0"))
+            request_states = getattr(self, "_request_audio_states", None)
+            if request_states is None:
+                request_states = {}
+                self._request_audio_states = request_states
+            request_states[request_id] = state
             empty_codes = torch.empty(0, dtype=torch.long, device=embeds.device)
             return (
                 input_ids,
@@ -372,7 +377,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
-            state = dict(info.get("audio_state", {}) or {})
+            request_id = str(info.get("request_id", index))
+            request_states = getattr(self, "_request_audio_states", None)
+            if request_states is None:
+                request_states = {}
+                self._request_audio_states = request_states
+            state = request_states.get(request_id)
+            if not isinstance(state, dict):
+                state = dict(info.get("audio_state", {}) or {})
+                request_states[request_id] = state
             if state.get("finished"):
                 stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
                 codec_deltas.append(empty_delta)
@@ -386,12 +399,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
-            codes = (info.get("audio_codes", {}) or {}).get("accumulated")
+            codes = state.get("codes")
+            if not isinstance(codes, torch.Tensor):
+                codes = (info.get("audio_codes", {}) or {}).get("accumulated")
             if not isinstance(codes, torch.Tensor):
                 codes = torch.empty(0, dtype=torch.long, device=hidden.device)
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
-            request_id = str(info.get("request_id", index))
             step = int(state.get("step", 0))
             sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
             is_eos = int(sampled.item()) == self._num_audio_tokens - 1
@@ -404,6 +418,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 delta = sampled.reshape(1, 1)
             else:
                 delta = empty_delta
+            state["codes"] = codes
             info["audio_state"] = state
             info["audio_codes"] = {
                 "current": sampled.reshape(1),
@@ -429,8 +444,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
 
     def _flush_deferred_cleanup(self) -> None:
+        request_audio_states = getattr(self, "_request_audio_states", {})
         for request_id in self._deferred_cleanup_ids:
             self._request_generators.pop(request_id, None)
+            request_audio_states.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(

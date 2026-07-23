@@ -1489,17 +1489,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_buffer = getattr(new_req, "model_intermediate_buffer", None)
             if isinstance(model_buffer, dict) and model_buffer:
                 self._update_intermediate_buffer(new_req.req_id, model_buffer)
-            payload = getattr(new_req, "additional_information", None)
-            payload_info = deserialize_additional_information(payload)
-            if payload_info:
+            payload_info = getattr(new_req, "additional_information", None)
+            if isinstance(payload_info, dict):
                 self._update_intermediate_buffer(new_req.req_id, payload_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
             if isinstance(cached_infos, dict):
-                for req_id, payload in cached_infos.items():
-                    req_infos = deserialize_additional_information(payload)
-                    if req_infos:
+                for req_id, req_infos in cached_infos.items():
+                    if isinstance(req_infos, dict):
                         self._update_intermediate_buffer(req_id, req_infos)
 
     def _maybe_attach_mimo_audio_req_infos(

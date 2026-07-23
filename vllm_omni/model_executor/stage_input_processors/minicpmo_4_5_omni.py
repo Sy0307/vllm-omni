@@ -296,6 +296,7 @@ def tts2code2wav_async_chunk(
         request_id=request_id,
     )
 
+
 def _special_token_ids_from_mm_output(mm_output):
     if not isinstance(mm_output, Mapping):
         return {}
@@ -618,6 +619,11 @@ def llm2tts(
         for idx_t in range(search_start, len(full_token_ids)):
             if full_token_ids[idx_t] == tts_bos_id:
                 tts_bos_idx = idx_t + 1
+        if tts_bos_idx is None and not is_native_duplex_handoff and llm_output_ids:
+            # Audio routing is a model-stage concern, not an OpenAI serving
+            # default. Plain chat templates do not include <|tts_bos|>; in
+            # that case condition the Talker on the generated assistant span.
+            tts_bos_idx = prompt_token_ids_len
 
         tts_eos_idx = None
         if tts_bos_idx is not None:
@@ -778,6 +784,9 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + 2
             scheduler_prompt_token_ids = [0] * condition_length
+            handoff_meta = model_intermediate_buffer.setdefault("meta", {})
+            handoff_meta["replace_streaming_prompt"] = True
+            handoff_meta["next_stage_prompt_len"] = condition_length
         else:
             scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
                 tts_token_ids_slice,

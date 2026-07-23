@@ -10,6 +10,10 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+_FUSED_TALKER_REMOVED_REASON = (
+    "MiniCPM-o now uses separate request-owned Talker and Code2Wav stages; "
+    "legacy fused Talker+Token2Wav assertions are not applicable."
+)
 
 
 def _minicpmo_duplex_policy_case(
@@ -544,6 +548,7 @@ def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
         )
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_condition_text():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
@@ -581,6 +586,7 @@ def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_conditi
     assert int(output.multimodal_outputs["meta.audio_text_total_chars"].item()) == len("你好，你有什莫想聊的吗？")
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
@@ -613,6 +619,7 @@ def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
     assert int(output.multimodal_outputs["meta.turn_end"].item()) == 1
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_routes_batched_requests_and_terminal_flags_independently():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
@@ -720,6 +727,7 @@ def test_minicpmo_tts_routes_batched_requests_and_terminal_flags_independently()
     ],
     ids=["single-request", "batched-requests"],
 )
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_ignores_cuda_graph_padding_after_request_spans(
     runtime_info,
     request_token_spans,
@@ -2429,6 +2437,7 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     assert len(state.context_embeds) == 6
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_ref_audio_lru_evicts_matching_vocoder_base_cache(tmp_path):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
@@ -2451,6 +2460,7 @@ def test_minicpmo_tts_ref_audio_lru_evicts_matching_vocoder_base_cache(tmp_path)
     assert not os.path.exists(first_path)
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_prompt_wav_path_does_not_default_to_model_asset(tmp_path):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
@@ -2468,6 +2478,7 @@ def test_minicpmo_tts_prompt_wav_path_does_not_default_to_model_asset(tmp_path):
     assert model._resolve_prompt_wav_path(None, None) == (None, None)
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_stream_turn_id_prefers_duplex_identity():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
@@ -2497,6 +2508,7 @@ def test_minicpmo_tts_stream_turn_id_prefers_duplex_identity():
     assert model._stream_turn_id({"turn_id": 2}) == 2
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_no_ref_audio_initializes_empty_vocoder_cache():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
@@ -2521,6 +2533,7 @@ def test_minicpmo_tts_no_ref_audio_initializes_empty_vocoder_cache():
     assert model._t2w_base_caches[""] == (None, {})
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_native_duplex_merges_and_left_pads_nonfinal_unit_audio():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         _native_duplex_unit_waveform,
@@ -2536,6 +2549,7 @@ def test_minicpmo_tts_native_duplex_merges_and_left_pads_nonfinal_unit_audio():
     assert waveform.tolist() == [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_native_duplex_does_not_pad_final_unit_audio():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         _native_duplex_unit_waveform,
@@ -2551,6 +2565,7 @@ def test_minicpmo_tts_native_duplex_does_not_pad_final_unit_audio():
     assert waveform.tolist() == [1.0, 2.0, 3.0]
 
 
+@pytest.mark.skip(reason=_FUSED_TALKER_REMOVED_REASON)
 def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,

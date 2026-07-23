@@ -34,8 +34,15 @@ contention on the shared GPU.
 | deploy config | GPUs | Notes |
 |---|---|---|
 | `minicpmo_4_5.yaml` (default) | 1 | Three stages share one large-memory GPU. |
+| `minicpmo_4_5_batching.yaml` | 1 | Explicit continuous-batching alias. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Talker and Code2Wav share GPU 1. |
+| `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 | `minicpmo_4_5_duplex.yaml` | 2 | Experimental native full-duplex profile. |
+
+Native duplex is not yet a supported guarantee of the split-Talker pipeline.
+This change covers Thinker-to-Talker duplex segment handoff; end-to-end
+barge-in and Stage 2 audio remain dependencies of the full-duplex follow-up.
 
 Default:
 
@@ -104,9 +111,9 @@ python ../openai_chat_completion_client_for_multimodal_generation.py \
     --port 8099
 ```
 
-Speech output requires `chat_template_kwargs.use_tts_template=true`. Put that
-field at the request root for curl; the OpenAI Python SDK can merge it from
-`extra_body`.
+Speech output no longer depends on a MiniCPM-specific default in the generic
+serving layer. `chat_template_kwargs.use_tts_template=true` remains an
+explicitly supported model option.
 
 ## Launch the Gradio demo
 

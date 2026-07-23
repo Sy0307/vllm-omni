@@ -10,7 +10,7 @@ Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2t
   - structured model_intermediate_buffer carries the thinker ids and text
   - scheduler prompt tokens follow the selected TTS region or output tokens
   - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 tokens
-  - No TTS markers present -> no ``tts_token_ids`` / ``tts_hidden_states`` keys
+  - plain chat without TTS markers conditions on the generated assistant span
   - prompt arg is normalized to a list and ``multi_modal_data`` is gated by
     ``requires_multimodal_data``
 """
@@ -33,6 +33,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _HIDDEN_DIM = 4
 
 
+@pytest.mark.skip(reason="Legacy fused Talker metadata is replaced by separate Talker and Code2Wav stage payloads.")
 def test_native_duplex_talker_emits_empty_text_metadata_to_clear_previous_segment() -> None:
     class _Talker:
         _ar_last_chunk_flags = [True]
@@ -144,13 +145,13 @@ class TestBasicShape:
         )
         assert len(out) == 2
 
-    def test_talker_scheduler_prompt_uses_output_tokens(self) -> None:
+    def test_talker_scheduler_prompt_matches_condition_length(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))
         out = llm2tts(
             [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden)],
             prompt=None,
         )
-        assert out[0]["prompt_token_ids"] == [20]
+        assert out[0]["prompt_token_ids"] == [0, 0, 0]
         assert "stream_output" not in out[0]["model_intermediate_buffer"]
 
     def test_model_intermediate_buffer_carries_thinker_outputs(self) -> None:
@@ -173,6 +174,24 @@ class TestBasicShape:
         assert buffer["ids"]["prompt"] == prompt_ids
         assert buffer["ids"]["output"] == out_ids
         assert buffer["llm_output_text"] == ["hello"]
+
+    def test_strict_talker_receives_flat_tensor_handoff(self) -> None:
+        hidden = torch.arange(5 * _HIDDEN_DIM, dtype=torch.float32).reshape(5, _HIDDEN_DIM)
+        result = llm2tts(
+            [
+                _make_thinker_output(
+                    prompt_token_ids=[10],
+                    output_token_ids=[151703, 20, 21, 151704],
+                    hidden_states=hidden,
+                )
+            ],
+            prompt=None,
+        )[0]
+
+        buffer = result["model_intermediate_buffer"]
+        assert result["prompt_token_ids"] == [0, 0, 0, 0]
+        assert torch.equal(buffer["tts_token_ids"], torch.tensor([20, 21]))
+        assert torch.equal(buffer["tts_hidden_states"], hidden[2:4])
 
     def test_latent_in_multimodal_output_takes_precedence(self) -> None:
         # When both ``multimodal_output["latent"]`` and ``hidden_states`` are
@@ -241,13 +260,10 @@ class TestTtsRegionDetection:
         assert buffer["ids"]["tts"] == [30, 31]
         assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 
-    def test_no_tts_markers_omits_slice_keys(self) -> None:
-        # If neither marker pair is present, the bridge should NOT populate
-        # ``tts_token_ids`` / ``tts_hidden_states`` — the talker should fall
-        # through to the dummy path.
-        buffer, _ = self._run([10, 11], [20, 21, 22])
-        assert "tts" not in buffer["ids"]
-        assert "tts" not in buffer.get("hidden_states", {})
+    def test_plain_chat_without_tts_markers_uses_assistant_span(self) -> None:
+        buffer, hidden = self._run([10, 11], [20, 21, 22])
+        assert buffer["ids"]["tts"] == [20, 21, 22]
+        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[2:5])
 
 
 class TestPromptAndMultiModal:

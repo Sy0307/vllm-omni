@@ -54,6 +54,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._num_audio_tokens = 8
     talker._batch_stop_logits = None
     talker._request_generators = {}
+    talker._request_audio_states = {}
     talker._deferred_cleanup_ids = set()
     return talker
 
@@ -199,6 +200,30 @@ def test_max_token_terminal_includes_only_new_codec_delta(mocker) -> None:
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [1]
 
 
+def test_request_local_state_survives_missing_runner_buffer_update(mocker) -> None:
+    talker = _make_talker()
+    mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(3))
+    first_info = {
+        "request_id": "req-local-state",
+        "audio_state": {"step": 1, "max_tokens": 3},
+        "audio_codes": {"accumulated": torch.tensor([4])},
+    }
+
+    talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[first_info],
+        request_token_spans=[(0, 1)],
+    )
+    second = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-local-state"}],
+        request_token_spans=[(0, 1)],
+    )
+
+    assert second.multimodal_outputs["meta"]["finished"][0].item() is True
+    assert talker._request_audio_states["req-local-state"]["step"] == 3
+
+
 def test_missing_conditioning_fails_clearly() -> None:
     talker = _make_talker()
 
@@ -211,11 +236,13 @@ def test_missing_conditioning_fails_clearly() -> None:
         )
 
 
-def test_request_cleanup_only_evicts_ar_rng_state() -> None:
+def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:
     talker = _make_talker()
     talker._request_generators["req-done"] = torch.Generator()
+    talker._request_audio_states["req-done"] = {"step": 1}
 
     talker.on_requests_finished(["req-done"])
     talker._flush_deferred_cleanup()
 
     assert "req-done" not in talker._request_generators
+    assert "req-done" not in talker._request_audio_states
