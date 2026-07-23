@@ -35,10 +35,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _PIPELINE_KEY = "minicpmo_4_5"
 _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
-    "minicpmo_4_5.yaml": ["0", "1", "1"],
-    "minicpmo_4_5_3gpu.yaml": ["0,1", "2", "2"],
+    "minicpmo_4_5.yaml": ["0", "0", "0"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
-    "minicpmo_4_5_batching.yaml": ["0", "1", "2"],
 }
 
 
@@ -155,18 +153,13 @@ class TestDeployTopology:
         assert connector["extra"]["codec_left_context_frames"] == 3
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert connector["extra"]["connector_get_max_wait"] == 300
-
-    def test_batching_deploy_resolves_three_gpu_async_pipeline(self) -> None:
-        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_batching.yaml")
-        pipeline = OMNI_PIPELINES[deploy.pipeline]
-        stages = merge_pipeline_deploy(pipeline, deploy)
-
-        assert deploy.async_chunk is True
-        assert len(stages) == 3
-        assert [stage.stage_id for stage in stages] == [0, 1, 2]
-        assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "1", "2"]
-        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith("tts2code2wav_async_chunk")
-        assert stages[2].custom_process_input_func is None
+        if filename == "minicpmo_4_5.yaml":
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
+                0.65,
+                0.15,
+                0.15,
+            ]
 
     def test_pipeline_exposes_no_full_payload_or_token_placeholder_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]

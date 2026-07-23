@@ -26,11 +26,14 @@ including `librosa`.
 
 The deploy config auto-loads via `--omni`. The default
 `vllm_omni/deploy/minicpmo_4_5.yaml` uses the strict three-stage pipeline
-on two GPUs: Thinker on GPU 0 and Talker + Code2Wav on GPU 1.
+on one large-memory GPU. Thinker, Talker, and Code2Wav all use logical
+device 0 with memory budgets of 65%, 15%, and 15%, respectively. Each
+stage admits at most four concurrent sequences to limit cross-process
+contention on the shared GPU.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
-| `minicpmo_4_5.yaml` (default) | 2 | Thinker on GPU 0; Talker and Code2Wav on GPU 1. |
+| `minicpmo_4_5.yaml` (default) | 1 | Three stages share one large-memory GPU. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 | `minicpmo_4_5_duplex.yaml` | 2 | Experimental native full-duplex profile. |
 
@@ -127,6 +130,11 @@ letter; leaving MiniCPM-o 4.5 reasoning enabled can exhaust the 256-token
 answer budget inside `<think>` and make first-letter extraction score the
 reasoning text instead of the final answer.
 
+For accuracy comparisons with the established text benchmark, send
+`--extra_body '{"modalities":["text"]}'`. Requesting audio also benchmarks
+Talker and Code2Wav and changes the assistant template, so it is not an
+apples-to-apples accuracy run.
+
 ## Run the Realtime duplex CLI demo
 
 After the duplex backend is running, stream one WAV through the Realtime
@@ -183,9 +191,14 @@ two-response WAV, its `--input-sha256`, and an
 
 - Stage 1 performs request-owned AR continuous batching. Stage 2 keeps
   request-owned Flow/HiFT caches and batches exact-shape-compatible chunks.
+- `StageRequestStats.batch_size` is request-scoped and does not report the
+  scheduler's execution batch.
 - Stage 0 and Stage 1 use vLLM CUDA Graph capture. Stage 2 remains eager until
   a dedicated exact-shape graph wrapper owns static I/O buffers and copies
   request cache state outside capture.
+- Co-locating all three stages minimizes hardware requirements but makes their
+  CUDA contexts contend for one GPU. Use the 8x4090 layout or a custom
+  multi-GPU deploy config when throughput is the primary goal.
 - Output audio is base64 WAV in `message.audio.data` (24 kHz mono).
 - Offline counterpart:
   [`examples/offline_inference/minicpmo/`](../../offline_inference/minicpmo/)

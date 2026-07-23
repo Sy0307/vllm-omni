@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -173,3 +175,42 @@ class TestResolveAudioFormat:
             request = self._make_request({"format": fmt, "voice": "alloy"})
             result = serving_chat._resolve_audio_format(request)
             assert not isinstance(result, ErrorResponse), f"Format {fmt} should be accepted"
+
+
+class TestPrepareOutputModalities:
+    @pytest.fixture
+    def serving_chat(self):
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        serving = object.__new__(OmniOpenAIServingChat)
+        serving.engine_client = SimpleNamespace(output_modalities=["text", "audio"])
+        serving.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="minicpmo", architectures=["MiniCPMO"])
+        )
+        return serving
+
+    @staticmethod
+    def _make_request(modalities=None, chat_template_kwargs=None):
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+
+        return ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            modalities=modalities,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+
+    def test_minicpmo_audio_default_enables_tts_template(self, serving_chat):
+        request = self._make_request()
+
+        output_modalities = serving_chat._prepare_output_modalities(request)
+
+        assert output_modalities == ["text", "audio"]
+        assert request.chat_template_kwargs == {"use_tts_template": True}
+
+    def test_explicit_template_value_is_preserved(self, serving_chat):
+        request = self._make_request(["text", "audio"], {"use_tts_template": False})
+
+        serving_chat._prepare_output_modalities(request)
+
+        assert request.chat_template_kwargs == {"use_tts_template": False}

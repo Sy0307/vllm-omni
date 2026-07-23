@@ -405,6 +405,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        output_modalities = self._prepare_output_modalities(request)
+
         try:
             lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
@@ -3843,6 +3845,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_format == "pcm16":
             audio_format = "pcm"
         return audio_format
+
+    def _prepare_output_modalities(self, request: ChatCompletionRequest) -> list[str]:
+        """Resolve output defaults before rendering model chat templates."""
+        engine_modalities = [x for x in self.engine_client.output_modalities if x is not None]
+        output_modalities = request.modalities if request.modalities is not None else engine_modalities
+        request.modalities = output_modalities
+        if output_modalities and "audio" in output_modalities:
+            hf_config = getattr(self.model_config, "hf_config", None)
+            architectures = getattr(hf_config, "architectures", None) or ()
+            is_minicpmo = str(getattr(hf_config, "model_type", "")).lower() == "minicpmo" or any(
+                str(arch).startswith("MiniCPMO") for arch in architectures
+            )
+            if is_minicpmo:
+                # MiniCPM-o emits the text/hidden-state span consumed by its
+                # Talker only when the assistant prefix contains <|tts_bos|>.
+                template_kwargs = dict(request.chat_template_kwargs or {})
+                template_kwargs.setdefault("use_tts_template", True)
+                request.chat_template_kwargs = template_kwargs
+        return output_modalities
 
     def _create_error_response(
         self,

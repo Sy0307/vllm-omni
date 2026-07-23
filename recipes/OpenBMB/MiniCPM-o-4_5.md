@@ -20,14 +20,15 @@ Use this recipe as a known-good starting point for serving
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
 MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
 `/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The default deploy uses two GPUs for the strict three-stage pipeline;
-the 8x4090 scale-out layout remains available via `--deploy-config`.
+shot. The default deploy co-locates the strict three-stage pipeline on one
+large-memory GPU; the 8x4090 scale-out layout remains available via
+`--deploy-config`.
 
 ## References
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
-  - 2-GPU strict three-stage layout (default):
+  - Single-GPU strict three-stage layout (default):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
@@ -46,26 +47,25 @@ the 8x4090 scale-out layout remains available via `--deploy-config`.
 
 ## Hardware Support
 
-Two GPU layouts ship with deploy configs. Every layout uses the
+Two hardware layouts ship with deploy configs. Every layout uses the
 same strict three-stage topology. The Talker emits codec chunks only;
 Code2Wav consumes them through a shared-memory async connector.
 
 | Layout | Thinker | Talker | Code2Wav | Typical hardware |
 | --- | --- | --- | --- | --- |
-| 2-GPU (default) | GPU 0 | GPU 1 | GPU 1 | 2x A100/H100/H200 80GB |
+| 1-GPU (default) | GPU 0 | GPU 0 | GPU 0 | 1x large-memory GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
 ## GPU
 
-### 2 x GPU (default — single command)
+### 1 x GPU (default — single command)
 
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-puts the thinker on GPU 0 (`~90 %` memory) and
-co-locates the codec-only Talker and Code2Wav stages on GPU 1. This is
-the recommended starting layout — works on
-any pair of 80GB-class GPUs (A100, H100, H200) and on most 40GB+
-pairs as long as the thinker model weights fit.
+co-locates Thinker, codec-only Talker, and Code2Wav on GPU 0. Their
+`gpu_memory_utilization` budgets are 0.65, 0.15, and 0.15. This layout
+minimizes the GPU count; use a large-memory accelerator and leave the
+remaining 5% for runtime overhead.
 
 #### Environment
 
@@ -152,16 +152,24 @@ speech output (TTS)"** checkbox on / off.
 
 #### Notes
 
-- Memory budget: thinker uses `gpu_memory_utilization: 0.7`; Talker and
-  Code2Wav use separate 0.45 and 0.30 stage budgets on GPU 1.
+- Memory budget: Thinker, Talker, and Code2Wav reserve 0.65, 0.15, and
+  0.15 of GPU 0. The larger Thinker share protects its multimodal KV cache;
+  all three model processes still share one CUDA device.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
 - Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains
   eager because its request-owned Flow/HiFT caches and variable chunk/cache
   shapes are not yet exposed through a static exact-shape graph wrapper.
-- The default and batching configs support `max_num_seqs: 4`. Talker AR
+- All default stages use `max_num_seqs: 4` to reduce cross-process GPU
+  contention. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
   exact-shape-compatible chunks and does not fall back to serial decode.
+- `StageRequestStats.batch_size` is a request-scoped placeholder, not the
+  scheduler's execution batch.
+- Single-GPU co-location trades throughput for hardware density: Stage 0/1
+  CUDA Graph replay and eager Stage 2 vocoder kernels compete across three
+  CUDA contexts. Use the 8x4090 config or a custom multi-GPU mapping for
+  throughput-sensitive serving.
 
 ### 8 x RTX 4090 24GB (consumer-GPU layout)
 

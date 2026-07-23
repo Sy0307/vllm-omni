@@ -11,9 +11,6 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
-import logging
-import os
-import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -58,8 +55,24 @@ else:
 
 _stepaudio2_available = _Token2wav is not None
 
-logger = logging.getLogger(__name__)
 _REPETITION_WINDOW = 16
+_MIN_AUDIO_TOKENS = 64
+_MAX_AUDIO_TOKENS = 2048
+_AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+
+
+def _max_audio_tokens(condition_tokens: int) -> int:
+    """Bound codec generation with a conservative text-length estimate.
+
+    EOS is masked for the first 50 steps, so a direct ``text_tokens * 10``
+    limit can terminate short responses before EOS is eligible. The 2048
+    ceiling matches the checkpoint's native generation default and keeps the
+    sequence within the Talker's 4096-position context.
+    """
+    return max(
+        _MIN_AUDIO_TOKENS,
+        min(_MAX_AUDIO_TOKENS, condition_tokens * _AUDIO_TOKENS_PER_TEXT_TOKEN),
+    )
 
 
 def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) -> torch.Tensor:
@@ -258,7 +271,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "MiniCPM-o Talker prefill span exceeds condition: "
                     f"offset={offset} span={span_len} condition={full_embeds.shape[0]}"
                 )
-            max_tokens = max(2048, min(16384, int(token_ids.numel()) * 10))
+            max_tokens = _max_audio_tokens(int(token_ids.numel()))
             state = {
                 "step": 0,
                 "max_tokens": max_tokens,

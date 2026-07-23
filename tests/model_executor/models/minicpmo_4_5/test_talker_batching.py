@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _max_audio_tokens,
 )
 from vllm_omni.utils.mm_outputs import to_payload_element
 
@@ -66,6 +67,17 @@ def _routed(output, index: int):
         seq_len=2,
         scheduled_seq_len=2,
     )
+
+
+@pytest.mark.parametrize(
+    ("condition_tokens", "expected"),
+    [(3, 64), (100, 1000), (1000, 2048)],
+)
+def test_audio_token_limit_scales_with_condition_length(
+    condition_tokens: int,
+    expected: int,
+) -> None:
+    assert _max_audio_tokens(condition_tokens) == expected
 
 
 def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> None:
