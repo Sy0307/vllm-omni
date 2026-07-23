@@ -72,7 +72,8 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     talker = _make_talker()
     seen: list[tuple[str, list[float], list[int]]] = []
 
-    def sample(hidden, history, request_id):
+    def sample(hidden, history, request_id, step):
+        assert step == 0
         seen.append((request_id, hidden.reshape(-1).tolist(), history.tolist()))
         return torch.tensor(2 if request_id == "req-a" else 3)
 

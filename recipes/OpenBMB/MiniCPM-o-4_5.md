@@ -20,20 +20,15 @@ Use this recipe as a known-good starting point for serving
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
 MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
 `/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The recipe covers the shipped GPU layouts (single / 2 / 3 / 8 GPUs):
-  the default co-locates both stages on one GPU, and the larger scale-out
-  layouts (2 / 3 / 8 GPUs) are selected via `--deploy-config`.
+shot. The default deploy uses two GPUs for the strict three-stage pipeline;
+the 8x4090 scale-out layout remains available via `--deploy-config`.
 
 ## References
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
-  - Single-GPU layout (default):
+  - 2-GPU strict three-stage layout (default):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - 2-GPU layout (thinker on GPU 0, talker on GPU 1):
-    [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
-  - 3-GPU layout (thinker TP=2):
-    [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
 - Online example + Gradio demo:
@@ -51,23 +46,22 @@ shot. The recipe covers the shipped GPU layouts (single / 2 / 3 / 8 GPUs):
 
 ## Hardware Support
 
-Three GPU layouts ship with default deploy configs. Every layout uses the
+Two GPU layouts ship with deploy configs. Every layout uses the
 same strict three-stage topology. The Talker emits codec chunks only;
 Code2Wav consumes them through a shared-memory async connector.
 
 | Layout | Thinker | Talker | Code2Wav | Typical hardware |
 | --- | --- | --- | --- | --- |
 | 2-GPU (default) | GPU 0 | GPU 1 | GPU 1 | 2x A100/H100/H200 80GB |
-| 3-GPU (thinker TP=2) | GPU 0,1 (TP=2) | GPU 2 | GPU 2 | 3x large-memory GPUs |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
 ## GPU
 
-### 1 x GPU (default — single command)
+### 2 x GPU (default — single command)
 
 The default
 [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-puts the thinker on GPU 0 (`~70 %` memory, `enforce_eager: true`) and
+puts the thinker on GPU 0 (`~90 %` memory) and
 co-locates the codec-only Talker and Code2Wav stages on GPU 1. This is
 the recommended starting layout — works on
 any pair of 80GB-class GPUs (A100, H100, H200) and on most 40GB+
@@ -131,6 +125,17 @@ in another choice's `message.audio.data` (24 kHz mono, see Notes). With
 `modalities: ["text", "audio"]` you typically get two `choices` entries
 (one text, one audio).
 
+**Streaming text + speech**:
+
+```bash
+python examples/online_serving/minicpmo/streaming_chat_completion.py \
+    --base-url http://localhost:8099/v1 \
+    --output minicpmo_stream.wav
+```
+
+The client prints text deltas as they arrive and reconstructs one valid WAV
+from the independently encoded audio deltas.
+
 **Gradio demo (text + image + audio + video UI)**:
 
 ```bash
@@ -151,55 +156,12 @@ speech output (TTS)"** checkbox on / off.
   Code2Wav use separate 0.45 and 0.30 stage budgets on GPU 1.
 - `--trust-remote-code` is required — the HF repo ships a custom
   `MiniCPMO` config / model class.
-- Pin: `enforce_eager: true` on all stages. CUDA graph capture remains
-  outside the currently validated configuration.
+- Stage 0 Thinker and Stage 1 Talker enable vLLM CUDA Graphs. Stage 2 remains
+  eager because its request-owned Flow/HiFT caches and variable chunk/cache
+  shapes are not yet exposed through a static exact-shape graph wrapper.
 - The default and batching configs support `max_num_seqs: 4`. Talker AR
   state and Code2Wav caches are request-owned; Code2Wav batches only
   exact-shape-compatible chunks and does not fall back to serial decode.
-
-### 2 x GPU (talker on its own GPU)
-
-Use
-[`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml)
-when you have two GPUs and want to give the talker + Token2Wav vocoder a
-dedicated card instead of sharing GPU 0 with the thinker. The thinker
-runs on GPU 0 (`~90 %` mem, TP=1) and the talker on GPU 1 (`~75 %` mem,
-`max_num_seqs: 1`). This relieves the memory pressure of the default
-single-GPU co-located layout and is the recommended step up when a
-second 80GB-class card is available but full 3-way TP scale-out is not
-needed.
-
-#### Command
-
-```bash
-vllm serve openbmb/MiniCPM-o-4_5 --omni \
-    --deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml \
-    --trust-remote-code \
-    --host 0.0.0.0 --port 8099
-```
-
-Verification and Notes mirror the single-GPU section; the only
-difference is that the talker no longer competes with the thinker for
-GPU 0 memory.
-
-### 3 x GPU (thinker TP=2)
-
-Use
-[`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
-when you have a third GPU available and want the thinker on 2-way tensor
-parallel. Talker and Code2Wav share GPU 2 in this conservative layout.
-
-#### Command
-
-```bash
-vllm serve openbmb/MiniCPM-o-4_5 --omni \
-    --deploy-config vllm_omni/deploy/minicpmo_4_5_3gpu.yaml \
-    --trust-remote-code \
-    --host 0.0.0.0 --port 8099
-```
-
-Verification and Notes mirror the single-GPU section; thinker latency
-roughly halves under load thanks to TP=2.
 
 ### 8 x RTX 4090 24GB (consumer-GPU layout)
 

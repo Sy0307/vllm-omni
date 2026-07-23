@@ -1,11 +1,8 @@
-# MiniCPM-o 4.5 default deploy: 3 stages on 2 GPUs.
+# MiniCPM-o 4.5 deploy: strict three-stage layout on 2 GPUs.
 #
-# Stage 0 (thinker): GPU 0 — multimodal understanding, ~70% mem.
-# Stage 1 (talker) : GPU 1 — MiniCPMTTS codec generation, ~45% mem.
-# Stage 2 (code2wav): GPU 1 — codec-to-waveform generation, ~30% mem.
-#
-# Other GPU layouts: minicpmo_4_5_3gpu.yaml, minicpmo_4_5_8x4090.yaml.
-# Opt-in request batching: minicpmo_4_5_batching.yaml.
+# Stage 0 (thinker): GPU 0 — multimodal understanding.
+# Stage 1 (talker) : GPU 1 — MiniCPMTTS codec generation.
+# Stage 2 (code2wav): GPU 1 — batched codec-to-waveform generation.
 pipeline: minicpmo_4_5
 async_chunk: true
 
@@ -25,7 +22,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 16
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.9
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -44,7 +41,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 4
     gpu_memory_utilization: 0.45
-    enforce_eager: true
+    enforce_eager: false
     max_num_batched_tokens: 8192
     devices: "1"
     output_connectors:
@@ -61,7 +58,7 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 4
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.45
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
@@ -76,6 +73,14 @@ stages:
       max_tokens: 65536
       detokenize: true
 
-# MiniCPM-o 4.5 has only been verified on CUDA devices.  Add per-platform
-# overrides here when other backends (ROCm/XPU/NPU) are verified end-to-end.
-platforms: {}
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
