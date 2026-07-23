@@ -36,6 +36,9 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_stream_request_key, get_tts_handoff
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.platforms import current_omni_platform
 
 # The external vocoder hard-codes CUDA placement. Ascend uses the in-tree
@@ -252,6 +255,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.tts = None
         self.audio_tokenizer = None
         self._assets_loaded = False
+        self._model_path: str | None = None
         self._stream_gens: dict[str, Any] = {}
         self._talker_turn_states: dict[str, _TalkerTurnState] = {}
         # Consumed-cursor into the accumulated handoff condition for the
@@ -343,7 +347,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return
         self._assets_loaded = True
         try:
-            model_path = self.vllm_config.model_config.model
+            model_path = download_weights_from_hf_specific(self.vllm_config.model_config.model, None, ["*"])
+            self._model_path = model_path
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
             from transformers import AutoImageProcessor
@@ -655,7 +660,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def _resolve_prompt_wav_path(self, ref_audio, ref_audio_sr: int | None) -> tuple[str | None, str | None]:
         temp_prompt_wav_path = self._write_ref_audio_prompt_wav(ref_audio, ref_audio_sr)
-        return temp_prompt_wav_path, temp_prompt_wav_path
+        if temp_prompt_wav_path is not None:
+            return temp_prompt_wav_path, temp_prompt_wav_path
+        if (model_path := getattr(self, "_model_path", None)) is not None:
+            default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
+            if os.path.exists(default_ref):
+                return default_ref, None
+        return None, None
 
     def _max_tts_tokens_for_text(self, num_text: int) -> tuple[int, int]:
         cfg = self._tts_runtime_config()
