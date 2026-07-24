@@ -80,6 +80,10 @@ from transformers.utils import (
     replace_return_docstrings,
     requires_backends,
 )
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.config import VllmConfig
 from vllm.config.multimodal import (
     AudioDummyOptions,
@@ -1358,6 +1362,11 @@ class SiglipMLP(nn.Module):
 
 
 # Copied from transformers.models.clip.modeling_clip.CLIPEncoderLayer with CLIP->Siglip
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": [0, 1]},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class SiglipEncoderLayer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()

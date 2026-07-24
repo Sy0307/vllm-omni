@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     SiglipEncoderLayer,
@@ -34,6 +35,10 @@ def _vision_config(attention_implementation: str) -> SimpleNamespace:
 
 def test_siglip_declares_sdpa_support() -> None:
     assert SiglipVisionTransformer._supports_sdpa is True
+
+
+def test_siglip_encoder_layer_supports_regional_compile() -> None:
+    assert TorchCompileWithNoGuardsWrapper in SiglipEncoderLayer.__bases__
 
 
 def test_siglip_encoder_selects_sdpa_attention() -> None:

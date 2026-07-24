@@ -24,6 +24,7 @@ from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
+    _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -166,12 +167,20 @@ class TestDeployTopology:
                 0.15,
                 0.15,
             ]
+            assert stages[0].yaml_engine_args["compilation_config"]["compile_mm_encoder"] is True
         elif filename in {"minicpmo_4_5_batching.yaml", "minicpmo_4_5_2gpu.yaml"}:
             assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
                 0.9,
                 0.55,
                 0.35,
             ]
+
+    def test_npu_override_does_not_inherit_cuda_encoder_compile(self) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        deploy = _apply_platform_overrides(deploy, platform="npu")
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+
+        assert stages[0].yaml_engine_args["compilation_config"] == {"cudagraph_mode": "PIECEWISE"}
 
     def test_pipeline_exposes_no_full_payload_or_token_placeholder_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
