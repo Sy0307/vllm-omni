@@ -85,7 +85,7 @@ class BatchedToken2Wav(nn.Module):
         return cached
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
-        """Release cached features for a request-owned runtime prompt."""
+        """Release request-owned prompt features after stream completion."""
         self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
 
     @staticmethod
