@@ -236,8 +236,8 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
     @pytest.mark.skip(
         reason=(
-            "/v1/realtime rejects async_chunk since #3907 (server closes with 1000 after "
-            "unsupported error); tracked in #5363"
+            "The API-level async_chunk guard is removed, but Qwen3-Omni realtime "
+            "still hits the independent Stage-1 scheduler assertion also reported in #4271"
         )
     )
     def test_streaming_audio_input_pcm_output_async_chunk(self, omni_server) -> None:
