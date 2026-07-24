@@ -99,7 +99,7 @@ class BatchedToken2Wav(nn.Module):
         return cached
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
-        """Release request-owned prompt features after stream completion."""
+        """Release cached features for a request-owned runtime prompt."""
         self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
 
     @staticmethod
@@ -360,6 +360,7 @@ class BatchedToken2Wav(nn.Module):
         states: list[BatchedToken2WavState],
         *,
         last_chunk: bool,
+        flush_encoder: bool = False,
     ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
         batch_size = int(tokens.shape[0])
         if batch_size != len(states):
@@ -382,7 +383,7 @@ class BatchedToken2Wav(nn.Module):
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
-                last_chunk=last_chunk,
+                last_chunk=last_chunk or flush_encoder,
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )

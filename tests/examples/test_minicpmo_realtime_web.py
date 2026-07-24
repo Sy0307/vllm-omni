@@ -1523,7 +1523,7 @@ def test_realtime_duplex_demo_waits_at_each_model_unit_and_stops_after_speak():
     assert len(ws.messages) == 10
 
 
-def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_done(monkeypatch):
+def test_realtime_duplex_demo_listen_only_overlap_accepts_silence_unit_before_first_done(monkeypatch):
     demo = _load_demo_module()
     state = demo.DemoState()
     send_calls = 0
@@ -1548,7 +1548,6 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
         del args
         assert not state.response_done("resp-first")
         kwargs["on_model_unit_ready"]()
-        state.add({"type": "input_audio_buffer.speech_started", "turn": 2})
         _add_response_transcript(state, "resp-first", transcript="第一轮完成", audio=False)
         state.add({"type": "response.created", "response": {"id": "resp-second"}})
         _add_response_transcript(state, "resp-second", transcript="第二轮完成", audio=True)
@@ -1568,7 +1567,7 @@ def test_realtime_duplex_demo_listen_only_overlap_sends_next_turn_before_first_d
             ws,
             state,
             b"\x00\x00",
-            b"\x01\x00",
+            b"\x00\x00",
             transcripts=("first", "second"),
             durations_ms=(None, None),
             chunk_ms=200,

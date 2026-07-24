@@ -19,10 +19,12 @@ class _FakeEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls: list[int] = []
+        self.last_chunk_calls: list[bool] = []
 
     def forward_chunk(self, xs, last_chunk=False, cnn_cache=None, att_cache=None):
         batch, length, _ = xs.shape
         self.calls.append(batch)
+        self.last_chunk_calls.append(last_chunk)
         old_length = 0 if att_cache is None else att_cache.shape[3]
         output = xs[:, : max(1, length - 1)]
         cnn = xs[:, :1, :].transpose(1, 2).contiguous()
@@ -114,10 +116,13 @@ class _FakeToken2Wav:
         self.source_cache_len = 2
         self.speech_window = torch.hamming_window(4, periodic=False)
         self.prompt_calls = 0
+        self.prompt_paths: list[str] = []
+        self.prompt_path_exists: list[bool] = []
 
     def _prepare_prompt(self, prompt_wav):
-        del prompt_wav
         self.prompt_calls += 1
+        self.prompt_paths.append(str(prompt_wav))
+        self.prompt_path_exists.append(Path(prompt_wav).is_file())
         return (
             torch.tensor([[5, 6]], dtype=torch.long),
             torch.tensor([2], dtype=torch.int32),
@@ -257,6 +262,67 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     torch.testing.assert_close(audios[0][0], torch.tensor(1.7 * 10))
     torch.testing.assert_close(audios[1][0], torch.tensor(1.7 * 20))
     assert token2wav.flow.encoder.calls[-1] == 2
+
+
+def test_code2wav_projects_duplex_metadata_to_final_audio_output():
+    model, token2wav = _model()
+    segment = _info("duplex", 0, [10, 11])
+    segment["meta"].update(
+        {
+            "native_duplex": True,
+            "duplex_epoch": 3,
+            "duplex_turn_id": 7,
+            "native_duplex_segment_text": "hello",
+            "tts_is_last_chunk": True,
+            "turn_end": False,
+        }
+    )
+
+    segment_output = _forward(model, [segment])
+
+    assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
+    assert token2wav.flow.encoder.last_chunk_calls[-1] is True
+    assert "duplex" in model._states
+
+    final = _info("duplex", 1, [12, 13], last_chunk=True)
+    final["meta"].update(segment["meta"])
+    final["meta"]["chunk_seq"] = 1
+    final["meta"]["last_chunk"] = True
+    final["meta"]["turn_end"] = True
+    output = _forward(model, [final])
+
+    payload = output.multimodal_outputs
+    assert "meta" not in payload
+    assert payload["meta.native_duplex"][0].item() is True
+    assert payload["meta.duplex_epoch"][0].item() == 3
+    assert payload["meta.duplex_turn_id"][0].item() == 7
+    assert bytes(payload["meta.llm_output_text_utf8"][0].tolist()).decode("utf-8") == "hello"
+    assert payload["meta.tts_is_last_chunk"][0].item() is True
+    assert payload["meta.turn_end"][0].item() is True
+    assert "duplex" not in model._states
+
+
+def test_runtime_ref_audio_is_materialized_reused_and_released(tmp_path, monkeypatch):
+    model, token2wav = _model()
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    first = _info("duplex", 0, [10, 11])
+    first["codes"]["ref"] = torch.tensor([0.0, 0.25, -0.25, 0.0])
+    first["meta"]["ref_audio_sr"] = 16000
+
+    _forward(model, [first], request_ids=["internal-duplex"])
+    second = _info("duplex", 1, [12, 13], last_chunk=True)
+    _forward(model, [second], request_ids=["internal-duplex"])
+
+    assert token2wav.prompt_calls == 1
+    assert token2wav.prompt_path_exists == [True]
+    prompt_path = Path(token2wav.prompt_paths[0])
+    assert prompt_path.parent == tmp_path
+    assert prompt_path.name.startswith("minicpmo45_ref_")
+    assert prompt_path.is_file()
+
+    model.on_requests_finished(["internal-duplex"])
+
+    assert not prompt_path.exists()
 
 
 def test_mixed_final_exact_buckets_keep_order_and_release_only_final_states():
@@ -494,8 +560,10 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     first["meta"].pop("prompt_cache_id")
 
     output = _forward(model, [first])
-    prompt_cache_id, prompt_wav = model._owned_prompt_wavs["voice-a"]
-    assert prompt_cache_id.startswith("voice-a:")
+    prompt_key = model._request_prompt_keys["voice-a"]
+    prompt = model._runtime_prompts[prompt_key]
+    prompt_cache_id, prompt_wav = prompt.cache_id, prompt.path
+    assert prompt_cache_id.startswith("runtime-ref-")
     assert Path(prompt_wav).is_file()
     assert bytes(output.multimodal_outputs["meta.llm_output_text_utf8"][0].tolist()).decode() == "hello"
     assert output.multimodal_outputs["meta.duplex_turn_id"][0].item() == 7
@@ -503,9 +571,13 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
 
     final = _info("voice-a", 1, [3, 4], last_chunk=True)
     final["meta"].pop("prompt_cache_id")
+    final["meta"]["tts_is_last_chunk"] = True
     output = _forward(model, [final])
 
     assert output.multimodal_outputs["meta.tts_is_last_chunk"][0].item() is True
-    assert "voice-a" not in model._owned_prompt_wavs
+    assert model._request_prompt_keys["voice-a"] == prompt_key
+    model.on_requests_finished(["voice-a"])
+    assert "voice-a" not in model._request_prompt_keys
+    assert prompt_key not in model._runtime_prompts
     assert not Path(prompt_wav).exists()
     assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features
