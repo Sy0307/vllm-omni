@@ -14,7 +14,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 
 from vllm_omni.outputs import output_processor
-from vllm_omni.outputs.output_modality import OutputModalityNames
+from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -450,6 +450,46 @@ def test_no_detokenizer_make_request_output():
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypatch):
+    """Generation-stage MM-only chunks must reach the orchestrator.
+
+    StagePool registers generation requests without a per-request collector,
+    so the processor return value is the only path from Stage2 to
+    Orchestrator._handle_processed_outputs().
+    """
+    state = _make_no_detok_state(RequestOutputKind.DELTA)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.AUDIO
+    processor.request_states = {"r": state}
+    upstream_result = SimpleNamespace(request_outputs=[], reqs_to_abort=[])
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: upstream_result,
+    )
+    engine_output = SimpleNamespace(
+        request_id="r",
+        multimodal_output={
+            "model_outputs": torch.arange(8, dtype=torch.float32),
+            "sr": torch.tensor(24000, dtype=torch.int32),
+        },
+        output_type="audio",
+        pooling_output=None,
+        new_token_ids=[],
+        finish_reason=None,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+    )
+
+    result = processor.process_outputs([engine_output])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].request_id == "r"
+    assert AUDIO in result.request_outputs[0].outputs[0].multimodal_output
 
 
 def test_no_detokenizer_make_request_output_with_routed_experts():
