@@ -26,7 +26,6 @@ _MINICPMO45_SILENCE_CODE = 4218
 class _MiniCPMO45MetaStruct(MetaStruct):
     """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
 
-    native_duplex: bool | None = None
     ref_audio_sr: int | None = None
     llm_output_text_utf8: torch.Tensor | None = None
     duplex_turn_id: int | None = None
@@ -362,7 +361,6 @@ def tts2code2wav_async_chunk(
             finished=finished_tensor,
             is_segment_finished=finished_tensor,
             req_id=[request_id],
-            native_duplex=native_duplex,
             duplex_epoch=duplex_epoch,
             duplex_turn_id=duplex_turn_id,
             llm_output_text_utf8=segment_text_utf8,

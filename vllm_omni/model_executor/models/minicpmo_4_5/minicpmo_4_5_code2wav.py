@@ -76,7 +76,6 @@ class _WorkItem:
     tokens: torch.Tensor
     previous: _RequestState | None
     runtime_prompt_key: str | None
-    native_duplex: bool
     duplex_epoch: int
     duplex_turn_id: int
     segment_text_utf8: torch.Tensor
@@ -349,7 +348,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             tokens=tokens,
             previous=previous,
             runtime_prompt_key=runtime_prompt_key,
-            native_duplex=bool(_scalar(meta.get("native_duplex"), False)),
             duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
             duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
             segment_text_utf8=segment_text_utf8,
@@ -562,7 +560,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # Generation runner wire payloads are flat and tensor-only.
                 # Dotted metadata keys are unflattened again by the output
                 # processor before the full-duplex data plane consumes them.
-                "meta.native_duplex": [torch.tensor(item.native_duplex, dtype=torch.bool) for item in items],
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],

@@ -145,7 +145,6 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     assert payload is not None
     assert payload.codes.ref.tolist() == pytest.approx([0.1, -0.1])
     assert payload.meta.ref_audio_sr == 16000
-    assert payload.meta.native_duplex is True
     torch.testing.assert_close(
         payload.meta.llm_output_text_utf8,
         torch.tensor(list(b"hello"), dtype=torch.uint8),
