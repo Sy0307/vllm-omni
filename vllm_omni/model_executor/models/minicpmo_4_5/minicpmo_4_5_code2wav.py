@@ -195,11 +195,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         path = str(Path(tempfile.gettempdir()) / f"minicpmo45_ref_{cache_key[:24]}_{sample_rate_hz}.wav")
         entry = self._runtime_prompts.get(cache_key)
         if entry is None:
-            prompt_path = Path(path)
-            if not prompt_path.is_file():
-                sf.write(prompt_path, waveform.numpy(), sample_rate_hz)
             entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
             self._runtime_prompts[cache_key] = entry
+        prompt_path = Path(entry.path)
+        if not prompt_path.is_file():
+            sf.write(prompt_path, waveform.numpy(), sample_rate_hz)
         return cache_key, entry.cache_id, entry.path
 
     def _resolve_prompt(
