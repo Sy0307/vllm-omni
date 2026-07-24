@@ -131,6 +131,9 @@ class TestPipelineTopology:
         assert code2wav.engine_output_type == "audio"
         assert code2wav.model_arch == "MiniCPMO45Code2Wav"
         assert code2wav.sync_process_input_func is None
+        assert code2wav.scheduler_cls == (
+            "vllm_omni.model_executor.models.minicpmo_4_5.scheduler.MiniCPMO45Code2WavScheduler"
+        )
 
 
 class TestDeployTopology:
