@@ -114,6 +114,7 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     assert _routed(output, 0)["codes"]["audio"].tolist() == [[2]]
     assert _routed(output, 1)["codes"]["audio"].tolist() == [[3]]
     assert _routed(output, 0)["meta"]["finished"].item() is False
+    assert set(output.multimodal_outputs["meta"]) == {"finished"}
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
 
 
@@ -161,6 +162,23 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
         "second",
     ]
     assert [value.item() for value in meta["turn_end"]] == [False, True]
+
+
+def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:
+    talker = _make_talker()
+    mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(2))
+    info = {
+        "request_id": "req-missing-fence",
+        "native_duplex": True,
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    with pytest.raises(RuntimeError, match="requires non-negative integer epoch and turn_id"):
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
 
 
 def test_incomplete_prefill_emits_no_code_and_does_not_advance_state(mocker) -> None:
