@@ -223,7 +223,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             meta = payload_data.get("meta", {})
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
-            payload_tts_finished = self._is_truthy_scalar(meta.get("tts_is_last_chunk"))
             if self.model_mode == "ar":
                 request.additional_information = payload_data
                 replace_prompt = meta.get("replace_streaming_prompt") is True
@@ -280,20 +279,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 # Empty chunk with more data expected: keep polling.
                 has_new_ids = bool(new_ids.numel()) if use_tensor_codes else bool(new_ids)
-                if not has_new_ids and (payload_segment_finished or payload_tts_finished):
-                    # Preserve an explicit scheduler or TTS boundary even
-                    # when it contains no new codec frames. Native duplex TTS
-                    # boundaries deliberately keep is_segment_finished=False
-                    # so the resumable turn stays open. The placeholder makes
-                    # the generation stage execute once; code_flat_numel=0
-                    # keeps the model from decoding it as a real codec token.
+                if not has_new_ids and payload_segment_finished:
+                    # Preserve an explicit scheduler boundary even when it
+                    # contains no new codec frames.
                     request.prompt_token_ids = [0]
-                if (
-                    not has_new_ids
-                    and not payload_finished
-                    and not payload_segment_finished
-                    and not payload_tts_finished
-                ):
+                if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
                     # requeues the request. Do not mark an empty non-terminal
                     # chunk as ready, otherwise Stage1 can consume before the

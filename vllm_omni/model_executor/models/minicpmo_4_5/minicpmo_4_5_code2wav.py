@@ -79,7 +79,7 @@ class _WorkItem:
     native_duplex: bool
     duplex_epoch: int
     duplex_turn_id: int
-    segment_text: str
+    segment_text_utf8: torch.Tensor
     tts_is_last_chunk: bool
     segment_end: bool
     turn_end: bool
@@ -334,9 +334,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 expected=previous.prompt_wav,
                 actual=prompt_wav,
             )
-        segment_text = _scalar(meta.get("native_duplex_segment_text"), "")
-        if not isinstance(segment_text, str):
-            segment_text = ""
+        segment_text_utf8 = meta.get("llm_output_text_utf8")
+        if not isinstance(segment_text_utf8, torch.Tensor):
+            segment_text_utf8 = torch.empty(0, dtype=torch.uint8)
         return _WorkItem(
             output_index=index,
             state_id=state_id,
@@ -352,7 +352,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             native_duplex=bool(_scalar(meta.get("native_duplex"), False)),
             duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
             duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
-            segment_text=segment_text,
+            segment_text_utf8=segment_text_utf8,
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
@@ -565,9 +565,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.native_duplex": [torch.tensor(item.native_duplex, dtype=torch.bool) for item in items],
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
-                "meta.llm_output_text_utf8": [
-                    torch.tensor(list(item.segment_text.encode("utf-8")), dtype=torch.uint8) for item in items
-                ],
+                "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
