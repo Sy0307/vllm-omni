@@ -50,6 +50,7 @@ def _duplex_delta(
     text: str = "segment",
     turn_end: bool = False,
 ):
+    text_utf8 = torch.tensor(list(text.encode("utf-8")), dtype=torch.uint8)
     return {
         "codes": {"audio": torch.tensor(codes, dtype=torch.long).reshape(-1, 1)},
         "meta": {
@@ -57,7 +58,7 @@ def _duplex_delta(
             "native_duplex": torch.tensor(True),
             "duplex_epoch": torch.tensor(epoch),
             "duplex_turn_id": torch.tensor(turn_id),
-            "native_duplex_segment_text": text,
+            "llm_output_text_utf8": text_utf8,
             "turn_end": torch.tensor(turn_end),
         },
     }
@@ -147,7 +148,10 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     assert payload.codes.ref.tolist() == pytest.approx([0.1, -0.1])
     assert payload.meta.ref_audio_sr == 16000
     assert payload.meta.native_duplex is True
-    assert payload.meta.native_duplex_segment_text == "hello"
+    torch.testing.assert_close(
+        payload.meta.llm_output_text_utf8,
+        torch.tensor(list(b"hello"), dtype=torch.uint8),
+    )
     assert payload.meta.duplex_epoch == 3
     assert payload.meta.duplex_turn_id == 7
     assert payload.meta.tts_is_last_chunk is True
@@ -231,6 +235,27 @@ def test_empty_final_releases_wait_gate_once() -> None:
     assert duplicate is None
 
 
+def test_empty_duplex_boundary_uses_zero_length_transport_placeholder() -> None:
+    manager = _manager()
+
+    boundary = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(text="boundary"),
+        _request("req-duplex"),
+        True,
+    )
+
+    assert boundary is not None
+    assert _codes(boundary) == [0]
+    assert boundary.meta.code_flat_numel == 0
+    assert boundary.meta.last_chunk is False
+    assert boundary.meta.is_segment_finished.item() is False
+    torch.testing.assert_close(
+        boundary.meta.llm_output_text_utf8,
+        torch.tensor(list(b"boundary"), dtype=torch.uint8),
+    )
+
+
 def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     manager = _manager()
     request = _request("req-duplex")
@@ -245,15 +270,9 @@ def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
         request,
         True,
     )
-    second_delta = _duplex_delta(12, 13, text="")
-    second_delta["meta"].pop("native_duplex_segment_text")
-    second_delta["meta"]["llm_output_text_utf8"] = torch.tensor(
-        list(b"second"),
-        dtype=torch.uint8,
-    )
     second = tts2code2wav_async_chunk(
         manager,
-        second_delta,
+        _duplex_delta(12, 13, text="second"),
         request,
         True,
     )
@@ -271,7 +290,10 @@ def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     assert second.meta.chunk_seq == first.meta.chunk_seq + 1
     assert second.meta.duplex_epoch == 3
     assert second.meta.duplex_turn_id == 7
-    assert second.meta.native_duplex_segment_text == "second"
+    torch.testing.assert_close(
+        second.meta.llm_output_text_utf8,
+        torch.tensor(list(b"second"), dtype=torch.uint8),
+    )
     assert second.meta.tts_is_last_chunk is True
     assert second.meta.turn_end is False
     assert first.meta.is_segment_finished.item() is False
