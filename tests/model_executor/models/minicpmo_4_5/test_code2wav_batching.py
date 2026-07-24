@@ -417,15 +417,15 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     prompt_cache_id, prompt_wav = model._owned_prompt_wavs["voice-a"]
     assert prompt_cache_id.startswith("voice-a:")
     assert Path(prompt_wav).is_file()
-    assert output.multimodal_outputs["llm_output_text"] == ["hello"]
-    assert output.multimodal_outputs["duplex_turn_id"] == [7]
-    assert output.multimodal_outputs["duplex_epoch"] == [3]
+    assert bytes(output.multimodal_outputs["meta.llm_output_text_utf8"][0].tolist()).decode() == "hello"
+    assert output.multimodal_outputs["meta.duplex_turn_id"][0].item() == 7
+    assert output.multimodal_outputs["meta.duplex_epoch"][0].item() == 3
 
     final = _info("voice-a", 1, [3, 4], last_chunk=True)
     final["meta"].pop("prompt_cache_id")
     output = _forward(model, [final])
 
-    assert output.multimodal_outputs["tts_is_last_chunk"] == [True]
+    assert output.multimodal_outputs["meta.tts_is_last_chunk"][0].item() is True
     assert "voice-a" not in model._owned_prompt_wavs
     assert not Path(prompt_wav).exists()
     assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features

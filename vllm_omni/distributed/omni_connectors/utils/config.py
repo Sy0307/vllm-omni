@@ -35,6 +35,16 @@ def stage_receives_chunks(model_config: Any) -> bool:
     return get_stage_connector_role(model_config) != "sender"
 
 
+def stage_sends_async_output(model_config: Any) -> bool:
+    """Whether async output should be partitioned for connector transport."""
+    role = get_stage_connector_role(model_config)
+    if role is not None:
+        return role == "sender"
+    # Preserve legacy partitioning while keeping stage-0 orchestrator bridges
+    # on the normal RequestOutput path.
+    return getattr(model_config, "stage_id", None) != 0
+
+
 @dataclass
 class ConnectorSpec:
     """Specification for a connector instance."""

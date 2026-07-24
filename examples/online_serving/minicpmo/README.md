@@ -25,16 +25,17 @@ including `librosa`.
 ## Start the backend server
 
 The deploy config auto-loads via `--omni`.
-`vllm_omni/deploy/minicpmo_4_5.yaml` is a stable compatibility entry point
-that delegates to the canonical `minicpmo_4_5_batching.yaml`. Thinker,
-Talker, and Code2Wav use logical device 0 with memory budgets of 65%, 15%,
-and 15%; each admits at most four concurrent sequences.
+The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
+logical device 0 with memory budgets of 65%, 15%, and 15%. For throughput,
+`minicpmo_4_5_batching.yaml` gives the Thinker GPU 0 (90%) and colocates the
+Talker (55%) and Code2Wav (35%) on GPU 1. Each stage admits at most four
+concurrent sequences.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
-| `minicpmo_4_5.yaml` (default) | 1 | Compatibility alias for the canonical layout. |
-| `minicpmo_4_5_batching.yaml` | 1 | Canonical three-stage continuous-batching layout. |
-| `minicpmo_4_5_2gpu.yaml` | 2 | Talker and Code2Wav share GPU 1. |
+| `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
+| `minicpmo_4_5_batching.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Backward-compatible alias for `minicpmo_4_5_batching.yaml`. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 | `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |

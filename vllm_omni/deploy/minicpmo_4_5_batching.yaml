@@ -1,7 +1,7 @@
-# Opt-in MiniCPM-o 4.5 strict three-stage continuous-batching layout.
+# MiniCPM-o 4.5 two-GPU continuous-batching layout.
 #
-# Thinker, Talker, and Code2Wav share one large-memory GPU. The default
-# minicpmo_4_5.yaml remains the compatible fused two-stage deployment.
+# Thinker owns GPU 0. Talker and Code2Wav share GPU 1, keeping text decoding
+# isolated from codec/vocoder contention while preserving stage-2 batching.
 pipeline: minicpmo_4_5
 async_chunk: true
 
@@ -21,7 +21,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
-    gpu_memory_utilization: 0.65
+    gpu_memory_utilization: 0.9
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -39,10 +39,10 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
-    gpu_memory_utilization: 0.15
+    gpu_memory_utilization: 0.55
     enforce_eager: false
     max_num_batched_tokens: 8192
-    devices: "0"
+    devices: "1"
     output_connectors:
       to_stage_2: connector_of_shared_memory
     # Codec sampling is model-owned by the checkpoint's tts_config (defaults:
@@ -60,12 +60,12 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 4
-    gpu_memory_utilization: 0.15
+    gpu_memory_utilization: 0.35
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "0"
+    devices: "1"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:

@@ -9,10 +9,11 @@ from typing import Any
 import torch
 from vllm.inputs import TextPrompt
 
-from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct, set_tts_handoff
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
+    set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -580,7 +581,14 @@ def llm2tts(
 
     for llm_output in llm_outputs:
         output = llm_output.outputs[0]
-        mm_output = output.multimodal_output if isinstance(output.multimodal_output, Mapping) else {}
+        request_mm_output = getattr(llm_output, "multimodal_output", None)
+        completion_mm_output = getattr(output, "multimodal_output", None)
+        if isinstance(request_mm_output, Mapping):
+            mm_output = request_mm_output
+        elif isinstance(completion_mm_output, Mapping):
+            mm_output = completion_mm_output
+        else:
+            mm_output = {}
         special_token_ids = _special_token_ids_from_mm_output(mm_output)
         prompt_token_ids = (
             _coerce_token_id_list(mm_output.get("duplex_prompt_token_ids"))

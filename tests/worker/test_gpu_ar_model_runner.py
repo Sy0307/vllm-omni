@@ -16,21 +16,6 @@ from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentio
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize(
-    ("role", "stage_id", "expected"),
-    [("sender", 0, True), ("receiver", 1, False), (None, 0, False), (None, None, True)],
-)
-def test_async_output_connector_respects_role_and_stage_zero_bridge(role, stage_id, expected):
-    runner = object.__new__(GPUARModelRunner)
-    extra = {} if role is None else {"role": role}
-    runner.model_config = SimpleNamespace(
-        stage_id=stage_id,
-        stage_connector_config={"extra": extra},
-    )
-
-    assert runner._uses_async_output_connector() is expected
-
-
 def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -> GPUARModelRunner:
     runner = object.__new__(GPUARModelRunner)
     runner.vllm_config = SimpleNamespace(
@@ -678,6 +663,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     # inter_stage_outputs mirrors multimodal_outputs (PR #4792).
     assert output.inter_stage_outputs is not None
     assert output.multimodal_outputs is not None
+    assert output.inter_stage_outputs is output.multimodal_outputs
     assert torch.equal(output.inter_stage_outputs[0]["hidden"], output.multimodal_outputs[0]["hidden"])
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], output.multimodal_outputs[1]["hidden"])
     assert torch.equal(output.multimodal_outputs[0]["hidden"], torch.tensor([[1.0, 10.0]]))

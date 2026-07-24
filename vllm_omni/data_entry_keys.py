@@ -115,26 +115,6 @@ class OmniPayload(TypedDict, total=False):
     request_id: str
 
 
-def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
-    """Store the production AR-to-TTS token and hidden-state contract."""
-    if token_ids is not None:
-        buffer.setdefault("ids", {})["tts"] = token_ids
-    if hidden_states is not None:
-        buffer.setdefault("hidden_states", {})["tts"] = hidden_states
-
-
-def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
-    """Read the AR-to-TTS handoff, including legacy flat aliases."""
-    ids_info = info.get("ids")
-    hidden_info = info.get("hidden_states")
-    token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
-    hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
-    return (
-        info.get("tts_token_ids") if token_ids is None else token_ids,
-        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
-    )
-
-
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
 
 

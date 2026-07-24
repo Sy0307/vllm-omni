@@ -20,16 +20,17 @@ Use this recipe as a known-good starting point for serving
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
 MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
 `/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The canonical batching deploy co-locates the strict three-stage pipeline
-on one large-memory GPU; 2-GPU, 3-GPU, and 8x4090 layouts are also provided.
+shot. The recommended batching deploy isolates the Thinker on GPU 0 and
+co-locates Talker and Code2Wav on GPU 1; 1-GPU, 3-GPU, and 8x4090 layouts are
+also provided.
 
 ## References
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
-  - Compatibility entry point (auto-loaded; delegates to the canonical file):
+  - Default single-GPU compatibility layout (auto-loaded):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - Canonical single-GPU continuous-batching layout:
+  - Recommended 2-GPU continuous-batching layout:
     [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
   - 2-GPU and 3-GPU layouts:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
@@ -66,12 +67,10 @@ Code2Wav consumes them through a shared-memory async connector.
 
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
 request-local codec generation and Code2Wav owns waveform state and
-reference-voice prompt features. `minicpmo_4_5.yaml` remains a stable config
-entry point but delegates to `minicpmo_4_5_batching.yaml`; it is not a fused
-two-stage fallback. Keeping the removed fused vocoder in parallel would
-duplicate state machines and leave continuous batching untested on one path.
-Use the 2-GPU or 3-GPU profile when three colocated CUDA contexts are not
-acceptable.
+reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
+single-GPU entry point; `minicpmo_4_5_batching.yaml` is the recommended
+two-GPU profile. The removed fused two-stage implementation is not retained as
+a fallback because it would duplicate state machines and correctness paths.
 
 ## GPU
 
@@ -103,32 +102,39 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 The deploy config is auto-loaded by the model registry — no
 `--deploy-config` flag needed for this default single-GPU layout.
 
+For the recommended two-GPU layout, add:
+
+```bash
+--deploy-config vllm_omni/deploy/minicpmo_4_5_batching.yaml
+```
+
 #### Performance comparison
 
 Compare text-only and text+audio separately. Text-only isolates Thinker
-generation; text+audio also schedules Talker and Code2Wav on the same GPU.
-The following full Daily-Omni runs used one GPU, 1197 samples, concurrency 10,
-and identical `enable_thinking=false` / `use_tts_template=true` request
-settings. The `origin/main` baseline required `--enforce-eager` because its
-default Talker CUDA Graph capture copied an unpinned CPU tensor.
+generation; text+audio also schedules Talker and Code2Wav. The following full
+Daily-Omni runs used the same two GPUs, 1197 samples, concurrency 10, and
+identical `enable_thinking=false` / `use_tts_template=true` request settings.
+The `origin/main` fused Talker ran eager because its graph capture copied an
+unpinned CPU metadata tensor.
 
-| Metric | `origin/main` eager | Three-stage branch |
+| Metric | `origin/main` two-stage | Three-stage batching |
 | --- | ---: | ---: |
-| Accuracy | 65.16% | 64.83% |
-| Throughput | 0.96 req/s | 1.32 req/s |
-| Mean E2EL | 10.35 s | 7.58 s |
-| Mean serving TTFT | 1.20 s | 3.60 s |
-| Mean audio TTFP | 10.35 s | 6.01 s |
-| Mean audio RTF | 3.78 | 3.12 |
-| Stage 0 TPOT / ITL | 26.81 / 26.82 ms | 402.83 / 402.59 ms |
+| Accuracy | 64.83% | 64.83% |
+| Throughput | 0.62 req/s | 1.97 req/s |
+| Mean E2EL | 16.17 s | 5.07 s |
+| Mean serving TTFT | 0.92 s | 1.28 s |
+| Mean audio TTFP | 16.17 s | 3.24 s |
+| Mean audio RTF | 5.97 | 2.11 |
+| Stage 0 mean TPOT / ITL | 8.27 / 8.27 ms | 40.08 / 40.11 ms |
+| Stage 0 median TPOT / ITL | 7.23 / 7.24 ms | 7.43 / 7.53 ms |
 
-The audio path improves throughput, E2EL, TTFP, and RTF because Code2Wav runs
-incrementally instead of waiting for the fused Talker. The Thinker TTFT and
-TPOT/ITL regress because three independent processes contend on one GPU and
-the Thinker budget drops to 65%; this is queueing/resource contention, not
-Talker token sampling in the Thinker forward pass. Global TPOT/ITL is not
-meaningful when text is emitted as one aggregated chunk, so the table reports
-Stage 0 token metrics.
+The split pipeline improves throughput 3.19x and lowers audio TTFP by 80%.
+Isolating the Thinker on GPU 0 also removes the prior single-GPU TPOT
+regression: 40.08 ms is slightly better than the pre-rebase report (~44 ms).
+Its median TPOT is effectively the same as main; the higher mean is queueing
+tail latency because this profile bounds each stage to four sequences while
+main's Thinker admits 16. Global TPOT/ITL remains zero when serving emits text
+as one aggregated chunk, so the table reports Stage 0 metrics.
 
 #### Verification
 

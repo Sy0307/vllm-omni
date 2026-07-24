@@ -92,13 +92,15 @@ def _make_thinker_output(
     latent: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
     multimodal_output: dict[str, object] | None = None,
+    request_multimodal_output: dict[str, object] | None = None,
 ):
     """Construct a minimal mock of a thinker engine output entry.
 
     The real ``llm2tts`` only reads a tight slice of fields:
-      - top-level: ``request_id``, ``prompt_token_ids``, ``outputs[0]``
-      - per-output: ``multimodal_output`` (dict), ``hidden_states`` (opt),
-        ``text``, ``token_ids``
+      - top-level: ``request_id``, ``prompt_token_ids``, optional
+        ``multimodal_output``, and ``outputs[0]``
+      - per-output: fallback ``multimodal_output``, ``hidden_states`` (opt),
+        ``text``, and ``token_ids``
     """
     mm_output = dict(multimodal_output or {})
     if latent is not None:
@@ -110,11 +112,14 @@ def _make_thinker_output(
     )
     if hidden_states is not None:
         output.hidden_states = hidden_states
-    return SimpleNamespace(
+    request_output = SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         outputs=[output],
     )
+    if request_multimodal_output is not None:
+        request_output.multimodal_output = request_multimodal_output
+    return request_output
 
 
 class TestInputValidation:
@@ -132,6 +137,19 @@ class TestInputValidation:
 
 
 class TestBasicShape:
+    def test_request_level_multimodal_output_feeds_orchestrator_bridge(self) -> None:
+        hidden = torch.zeros((2, _HIDDEN_DIM))
+        thinker_output = _make_thinker_output(
+            prompt_token_ids=[10],
+            output_token_ids=[20],
+            request_multimodal_output={"latent": hidden},
+        )
+
+        out = llm2tts([thinker_output], prompt=None)
+
+        assert out[0]["prompt_token_ids"] == [0, 0, 0]
+        assert torch.equal(torch.tensor(out[0]["model_intermediate_buffer"]["hidden_states"]["tts"]), hidden[1:])
+
     def test_returns_one_entry_per_input(self) -> None:
         hidden = torch.zeros((3, _HIDDEN_DIM))
         out = llm2tts(

@@ -471,17 +471,30 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._release_prompt(request_id)
             else:
                 self._states[request_id] = state
+        sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
                 "model_outputs": outputs,
-                "sr": [sample_rate for _ in outputs],
-                "llm_output_text": [item.segment_text for item in items],
-                "tts_is_last_chunk": [item.last_chunk for item in items],
-                "segment_end": [item.segment_end for item in items],
-                "turn_end": [item.turn_end for item in items],
-                "duplex_turn_id": [item.duplex_turn_id for item in items],
-                "duplex_epoch": [item.duplex_epoch for item in items],
+                "sr": [sample_rate_tensor.clone() for _ in outputs],
+                "meta.llm_output_text_utf8": [
+                    torch.tensor(list(item.segment_text.encode("utf-8")), dtype=torch.uint8) for item in items
+                ],
+                "meta.tts_is_last_chunk": [torch.tensor(item.last_chunk, dtype=torch.bool) for item in items],
+                "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
+                "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
+                "meta.duplex_turn_id": [
+                    torch.tensor(item.duplex_turn_id, dtype=torch.int64)
+                    if item.duplex_turn_id is not None
+                    else torch.empty(0, dtype=torch.int64)
+                    for item in items
+                ],
+                "meta.duplex_epoch": [
+                    torch.tensor(item.duplex_epoch, dtype=torch.int64)
+                    if item.duplex_epoch is not None
+                    else torch.empty(0, dtype=torch.int64)
+                    for item in items
+                ],
             },
         )
 

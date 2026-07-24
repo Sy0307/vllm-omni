@@ -42,7 +42,10 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    get_stage_connector_role,
+    stage_sends_async_output,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -1532,15 +1535,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return None
         return wire_payloads
 
-    def _uses_async_output_connector(self) -> bool:
-        """Whether this stage streams its outputs through a connector."""
-        role = get_stage_connector_role(self.model_config)
-        if role is not None:
-            return role == "sender"
-        # Preserve the legacy partitioning default, except for a stage-0
-        # orchestrator bridge that has no configured outgoing connector.
-        return getattr(self.model_config, "stage_id", None) != 0
-
     def _snapshot_query_start_loc_cpu(self) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu
         if callable(query_start_loc_cpu):
@@ -1854,11 +1848,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        if self._async_chunk and self._uses_async_output_connector():
+        if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            # Stages without an outgoing async connector still need their
-            # inter-stage payload on the normal RequestOutput bridge.
+            # Connector-less stages expose the same payload through the
+            # orchestrator bridge; non-async stages preserve legacy behavior.
             pooler_inter, pooler_client = pooler_output, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
@@ -1870,7 +1864,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-            multimodal_outputs = self._build_multimodal_outputs(pooler_client)
+            multimodal_outputs = (
+                inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None

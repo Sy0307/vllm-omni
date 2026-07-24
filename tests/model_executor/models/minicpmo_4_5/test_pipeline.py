@@ -36,7 +36,7 @@ _PIPELINE_KEY = "minicpmo_4_5"
 _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
-    "minicpmo_4_5_batching.yaml": ["0", "0", "0"],
+    "minicpmo_4_5_batching.yaml": ["0", "1", "1"],
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
@@ -162,6 +162,12 @@ class TestDeployTopology:
                 0.65,
                 0.15,
                 0.15,
+            ]
+        elif filename in {"minicpmo_4_5_batching.yaml", "minicpmo_4_5_2gpu.yaml"}:
+            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
+                0.9,
+                0.55,
+                0.35,
             ]
 
     def test_pipeline_exposes_no_full_payload_or_token_placeholder_hooks(self) -> None:

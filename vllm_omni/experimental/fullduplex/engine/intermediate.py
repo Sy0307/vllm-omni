@@ -64,6 +64,26 @@ def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: i
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
+def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
+    """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
+    if token_ids is not None:
+        buffer.setdefault("ids", {})["tts"] = token_ids
+    if hidden_states is not None:
+        buffer.setdefault("hidden_states", {})["tts"] = hidden_states
+
+
+def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
+    """Read the canonical handoff, including the legacy flat aliases."""
+    ids_info = info.get("ids")
+    hidden_info = info.get("hidden_states")
+    token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
+    hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
+    return (
+        info.get("tts_token_ids") if token_ids is None else token_ids,
+        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+    )
+
+
 def get_stream_request_key(info: dict[str, object]) -> str:
     key = info.get("global_request_id") or info.get("request_id") or info.get("_omni_req_id")
     if isinstance(key, (list, tuple)):
