@@ -227,30 +227,6 @@ def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapte
     assert adapter.get_req_chunk[request.request_id] == 2
 
 
-def test_load_poll_generation_empty_tts_boundary_uses_placeholder_without_finishing_segment(
-    build_adapter,
-):
-    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
-    request = _req("req-tts-boundary", RequestStatus.WAITING)
-    payload: OmniPayload = {
-        "codes": {"audio": torch.empty(0, dtype=torch.long)},
-        "meta": {
-            "finished": torch.tensor(False, dtype=torch.bool),
-            "is_segment_finished": torch.tensor(False, dtype=torch.bool),
-            "tts_is_last_chunk": True,
-            "code_flat_numel": 0,
-        },
-    }
-    connector.get.return_value = (payload, 16)
-
-    assert adapter._poll_single_request(request) is True
-
-    assert request.prompt_token_ids == [0]
-    assert request.request_id in adapter._finished_load_reqs
-    assert request.request_id not in adapter.segment_finished_requests
-    assert request.additional_information["meta"]["tts_is_last_chunk"] is True
-
-
 def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")

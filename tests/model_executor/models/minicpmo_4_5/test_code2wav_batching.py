@@ -267,12 +267,13 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
 def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     model, token2wav = _model()
     segment = _info("duplex", 0, [10, 11])
+    segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
     segment["meta"].update(
         {
             "native_duplex": True,
             "duplex_epoch": 3,
             "duplex_turn_id": 7,
-            "native_duplex_segment_text": "hello",
+            "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
             "turn_end": False,
         }
@@ -296,7 +297,10 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert payload["meta.native_duplex"][0].item() is True
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
-    assert bytes(payload["meta.llm_output_text_utf8"][0].tolist()).decode("utf-8") == "hello"
+    torch.testing.assert_close(
+        payload["meta.llm_output_text_utf8"][0],
+        segment_text_utf8,
+    )
     assert payload["meta.tts_is_last_chunk"][0].item() is True
     assert payload["meta.turn_end"][0].item() is True
     assert "duplex" not in model._states
@@ -551,9 +555,10 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     model, _ = _model()
     first = _info("voice-a", 0, [1, 2])
     first["codes"]["ref"] = torch.linspace(-0.1, 0.1, 160)
+    segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
     first["meta"].update(
         ref_audio_sr=16000,
-        native_duplex_segment_text="hello",
+        llm_output_text_utf8=segment_text_utf8,
         duplex_turn_id=7,
         duplex_epoch=3,
     )
@@ -565,7 +570,10 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     prompt_cache_id, prompt_wav = prompt.cache_id, prompt.path
     assert prompt_cache_id.startswith("runtime-ref-")
     assert Path(prompt_wav).is_file()
-    assert bytes(output.multimodal_outputs["meta.llm_output_text_utf8"][0].tolist()).decode() == "hello"
+    torch.testing.assert_close(
+        output.multimodal_outputs["meta.llm_output_text_utf8"][0],
+        segment_text_utf8,
+    )
     assert output.multimodal_outputs["meta.duplex_turn_id"][0].item() == 7
     assert output.multimodal_outputs["meta.duplex_epoch"][0].item() == 3
 
