@@ -28,7 +28,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
 
     native_duplex: bool | None = None
     ref_audio_sr: int | None = None
-    native_duplex_segment_text: str | None = None
+    llm_output_text_utf8: torch.Tensor | None = None
     duplex_turn_id: int | None = None
     duplex_epoch: int | None = None
     segment_end: bool | None = None
@@ -199,45 +199,6 @@ def _metadata_value(multimodal_output: Any, key: str, default: Any = None) -> An
     return value
 
 
-def _decode_utf8_metadata(multimodal_output: Any, key: str) -> str:
-    if not isinstance(multimodal_output, Mapping):
-        return ""
-    meta = multimodal_output.get("meta")
-    if not isinstance(meta, Mapping):
-        return ""
-    value = meta.get(key)
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().reshape(-1).tolist()
-    elif isinstance(value, (bytes, bytearray)):
-        value = bytes(value)
-    elif isinstance(value, Sequence) and not isinstance(value, str):
-        if len(value) == 1 and isinstance(value[0], torch.Tensor):
-            value = value[0].detach().cpu().reshape(-1).tolist()
-    else:
-        return ""
-    try:
-        return bytes(value).decode("utf-8")
-    except (TypeError, ValueError, UnicodeDecodeError):
-        return ""
-
-
-def _request_additional_information(request: Any) -> dict[str, Any]:
-    info = getattr(request, "additional_information", None)
-    return info if isinstance(info, dict) else {}
-
-
-def _request_ref_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
-    info = _request_additional_information(request)
-    codes = info.get("codes")
-    meta = info.get("meta")
-    ref_audio = codes.get("ref") if isinstance(codes, Mapping) else None
-    ref_audio_sr = meta.get("ref_audio_sr") if isinstance(meta, Mapping) else None
-    if ref_audio is None:
-        return None, _coerce_int(ref_audio_sr)
-    waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu()
-    return waveform, _coerce_int(ref_audio_sr)
-
-
 def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
     request_payload = getattr(transfer_manager, "request_payload", None)
     if isinstance(request_payload, dict):
@@ -272,11 +233,10 @@ def tts2code2wav_async_chunk(
     native_duplex = bool(_metadata_value(multimodal_output, "native_duplex", False))
     duplex_epoch = _coerce_int(_metadata_value(multimodal_output, "duplex_epoch"))
     duplex_turn_id = _coerce_int(_metadata_value(multimodal_output, "duplex_turn_id"))
-    segment_text = _metadata_value(multimodal_output, "native_duplex_segment_text", "")
-    if not isinstance(segment_text, str):
-        segment_text = ""
-    if not segment_text:
-        segment_text = _decode_utf8_metadata(multimodal_output, "llm_output_text_utf8")
+    output_meta = multimodal_output.get("meta") if isinstance(multimodal_output, Mapping) else None
+    segment_text_utf8 = output_meta.get("llm_output_text_utf8") if isinstance(output_meta, Mapping) else None
+    if not isinstance(segment_text_utf8, torch.Tensor):
+        segment_text_utf8 = None
     turn_end = bool(_metadata_value(multimodal_output, "turn_end", False))
     duplex_turn_key = (duplex_epoch, duplex_turn_id)
 
@@ -358,6 +318,12 @@ def tts2code2wav_async_chunk(
         context = []
         output_codes = []
     state["codec_end"] = codec_end
+    code_flat_numel = len(output_codes)
+    if flush_pending and not last_chunk and code_flat_numel == 0:
+        # Keep the generic generation connector model-agnostic: a real token
+        # makes this control-only TTS boundary schedulable, while the explicit
+        # zero length tells Code2Wav to discard the placeholder.
+        output_codes = [0]
 
     if last_chunk and not native_duplex:
         record["retired_internal_ids"].add(internal_id)
@@ -368,7 +334,15 @@ def tts2code2wav_async_chunk(
     ref_audio = None
     ref_audio_sr = None
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
-        ref_audio, ref_audio_sr = _request_ref_audio(request)
+        request_info = getattr(request, "additional_information", None)
+        if isinstance(request_info, Mapping):
+            codes_info = request_info.get("codes")
+            meta_info = request_info.get("meta")
+            raw_ref_audio = codes_info.get("ref") if isinstance(codes_info, Mapping) else None
+            raw_ref_audio_sr = meta_info.get("ref_audio_sr") if isinstance(meta_info, Mapping) else None
+            ref_audio_sr = _coerce_int(raw_ref_audio_sr)
+            if raw_ref_audio is not None:
+                ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -379,7 +353,7 @@ def tts2code2wav_async_chunk(
             request_id=request_id,
             chunk_seq=chunk_seq,
             cache_epoch=int(record["cache_epoch"]),
-            code_flat_numel=len(output_codes),
+            code_flat_numel=code_flat_numel,
             codec_chunk_frames=new_token_count,
             codec_left_context_frames=len(context),
             left_context_size=len(context),
@@ -391,7 +365,7 @@ def tts2code2wav_async_chunk(
             native_duplex=native_duplex,
             duplex_epoch=duplex_epoch,
             duplex_turn_id=duplex_turn_id,
-            native_duplex_segment_text=segment_text,
+            llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end,
             ref_audio_sr=ref_audio_sr,
