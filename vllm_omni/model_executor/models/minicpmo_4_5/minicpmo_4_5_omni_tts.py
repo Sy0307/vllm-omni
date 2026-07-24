@@ -24,7 +24,7 @@ from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.data_entry_keys import get_tts_handoff
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -32,6 +32,14 @@ _REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
 _MAX_AUDIO_TOKENS = 2048
 _AUDIO_TOKENS_PER_TEXT_TOKEN = 10
+# Codec-token sampling happens inside the model; vLLM sampling parameters
+# only choose the Talker's binary continue/stop row.
+_CODEC_SEED = 42
+_CODEC_TEMPERATURE = 0.8
+_CODEC_TOP_K = 25
+_CODEC_TOP_P = 0.85
+_CODEC_REPETITION_PENALTY = 1.05
+_CODEC_MIN_TOKENS = 50
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -140,6 +148,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._num_audio_tokens = getattr(tts_config, "num_audio_tokens", 6562)
             self._hidden_size = getattr(tts_config, "hidden_size", 768)
             self._normalize = getattr(tts_config, "normalize_projected_hidden", True)
+            self._codec_seed = int(getattr(tts_config, "seed", _CODEC_SEED))
+            self._codec_temperature = float(getattr(tts_config, "temperature", _CODEC_TEMPERATURE))
+            self._codec_top_k = int(getattr(tts_config, "top_k", _CODEC_TOP_K))
+            self._codec_top_p = float(getattr(tts_config, "top_p", _CODEC_TOP_P))
+            self._codec_repetition_penalty = float(getattr(tts_config, "repetition_penalty", _CODEC_REPETITION_PENALTY))
+            self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
         else:
             self._tts_config = None
 
@@ -306,7 +320,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         generator = self._request_generators.get(request_id)
         if generator is None:
             generator = torch.Generator(device=device)
-            generator.manual_seed(42)
+            generator.manual_seed(self._codec_seed)
             self._request_generators[request_id] = generator
         return generator
 
@@ -317,20 +331,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / 0.8
+        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
         logits = _apply_repetition_penalty(
             logits,
             history,
-            penalty=1.05,
+            penalty=self._codec_repetition_penalty,
             window_size=_REPETITION_WINDOW,
         )
-        if step < 50:
+        if step < self._codec_min_tokens:
             logits[..., eos_id] = float("-inf")
         logits = _apply_top_k_top_p(
             logits,
-            top_k=25,
-            top_p=0.85,
+            top_k=self._codec_top_k,
+            top_p=self._codec_top_p,
             min_tokens_to_keep=3,
         )
         probabilities = torch.softmax(logits, dim=-1)

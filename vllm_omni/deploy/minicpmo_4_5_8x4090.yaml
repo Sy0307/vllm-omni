@@ -50,8 +50,6 @@ stages:
       repetition_penalty: 1.1
 
   - stage_id: 1
-    # Talker only consumes runtime_additional_information[0]; any value > 1
-    # makes concurrent requests share request-0's audio (mm_outputs fallback).
     max_num_seqs: 1
     gpu_memory_utilization: 0.9
     enforce_eager: true
@@ -59,6 +57,8 @@ stages:
     devices: "4"
     output_connectors:
       to_stage_2: connector_of_shared_memory
+    # vLLM samples the binary continue/stop row; codec sampling comes from
+    # the checkpoint's tts_config and currently uses a deterministic seed.
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

@@ -721,7 +721,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
-        if stage_id != 0:
+        update_info = getattr(update, "additional_information", None)
+        update_meta = update_info.get("meta") if isinstance(update_info, dict) else None
+        if isinstance(update_meta, dict) and update_meta.get("replace_streaming_prompt") is True:
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)

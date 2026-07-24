@@ -61,8 +61,7 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
 
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == output_ids
-    assert torch.equal(info["tts_token_ids"], torch.tensor(output_ids))
-    assert torch.equal(info["tts_hidden_states"], latent[2:4])
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[2:4])
     assert converted["prompt_token_ids"] == [0, 0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 4
@@ -115,16 +114,25 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
             },
         },
     )
-    context = SimpleNamespace(bridge_states={})
+    context = SimpleNamespace(
+        bridge_states={
+            "duplex": {
+                "epoch": 3,
+                "model_turn_id": 7,
+            }
+        }
+    )
 
     converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
 
     info = converted["model_intermediate_buffer"]
     assert info["native_duplex"] is True
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(info["tts_token_ids"], torch.tensor([21, 22]))
     assert converted["prompt_token_ids"] == [0, 0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
+    assert info["meta"]["segment_end"] is True
+    assert info["duplex"]["epoch"] == 3
+    assert info["duplex"]["turn_id"] == 7
 
 
 def test_native_duplex_requires_tokenizer_boundary_metadata() -> None:

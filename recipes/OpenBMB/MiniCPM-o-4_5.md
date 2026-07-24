@@ -20,16 +20,16 @@ Use this recipe as a known-good starting point for serving
 of the MiniCPM-o family — it runs a multimodal thinker, a streaming
 MiniCPMTTS codec talker, and a separate batched Code2Wav stage so a single
 `/v1/chat/completions` call can return text and 24 kHz speech in one
-shot. The opt-in batching deploy co-locates the strict three-stage pipeline
+shot. The canonical batching deploy co-locates the strict three-stage pipeline
 on one large-memory GPU; 2-GPU, 3-GPU, and 8x4090 layouts are also provided.
 
 ## References
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +
   `hf_config.version="4.5"`):
-  - Single-GPU strict three-stage layout (default):
+  - Compatibility entry point (auto-loaded; delegates to the canonical file):
     [`vllm_omni/deploy/minicpmo_4_5.yaml`](../../vllm_omni/deploy/minicpmo_4_5.yaml)
-  - Explicit continuous-batching alias:
+  - Canonical single-GPU continuous-batching layout:
     [`vllm_omni/deploy/minicpmo_4_5_batching.yaml`](../../vllm_omni/deploy/minicpmo_4_5_batching.yaml)
   - 2-GPU and 3-GPU layouts:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
@@ -61,6 +61,17 @@ Code2Wav consumes them through a shared-memory async connector.
 | 2-GPU | GPU 0 | GPU 1 | GPU 1 | 2x large-memory GPU |
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
+
+### Migration from the fused deployment
+
+MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns
+request-local codec generation and Code2Wav owns waveform state and
+reference-voice prompt features. `minicpmo_4_5.yaml` remains a stable config
+entry point but delegates to `minicpmo_4_5_batching.yaml`; it is not a fused
+two-stage fallback. Keeping the removed fused vocoder in parallel would
+duplicate state machines and leave continuous batching untested on one path.
+Use the 2-GPU or 3-GPU profile when three colocated CUDA contexts are not
+acceptable.
 
 ## GPU
 
@@ -95,17 +106,29 @@ The deploy config is auto-loaded by the model registry — no
 #### Performance comparison
 
 Compare text-only and text+audio separately. Text-only isolates Thinker
-generation, while text+audio also schedules codec decoding and waveform
-generation in two colocated processes. On the single-GPU, `max_num_seqs=4`,
-concurrency-10 Daily-Omni audio run, all 1197 requests completed at 1.31
-req/s; mean serving TTFT was 3.59 s, Stage 0 TPOT was 396.78 ms, and audio
-TTFP was 5.99 s.
+generation; text+audio also schedules Talker and Code2Wav on the same GPU.
+The following full Daily-Omni runs used one GPU, 1197 samples, concurrency 10,
+and identical `enable_thinking=false` / `use_tts_template=true` request
+settings. The `origin/main` baseline required `--enforce-eager` because its
+default Talker CUDA Graph capture copied an unpinned CPU tensor.
 
-The previously reported roughly +15% TTFT and 3x text TPOT/ITL versus
-#5233 are not conclusive without the same commit, hardware, modalities, and
-concurrency. Three-stage queueing explains the larger text+audio latency, but
-not a text-only TPOT regression by itself. A same-config text-only A/B is
-required before attributing that difference to the Talker rewrite.
+| Metric | `origin/main` eager | Three-stage branch |
+| --- | ---: | ---: |
+| Accuracy | 65.16% | 64.83% |
+| Throughput | 0.96 req/s | 1.32 req/s |
+| Mean E2EL | 10.35 s | 7.58 s |
+| Mean serving TTFT | 1.20 s | 3.60 s |
+| Mean audio TTFP | 10.35 s | 6.01 s |
+| Mean audio RTF | 3.78 | 3.12 |
+| Stage 0 TPOT / ITL | 26.81 / 26.82 ms | 402.83 / 402.59 ms |
+
+The audio path improves throughput, E2EL, TTFP, and RTF because Code2Wav runs
+incrementally instead of waiting for the fused Talker. The Thinker TTFT and
+TPOT/ITL regress because three independent processes contend on one GPU and
+the Thinker budget drops to 65%; this is queueing/resource contention, not
+Talker token sampling in the Thinker forward pass. Global TPOT/ITL is not
+meaningful when text is emitted as one aggregated chunk, so the table reports
+Stage 0 token metrics.
 
 #### Verification
 
@@ -234,13 +257,20 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   missing dep raises `ImportError` at first request with the same
   install hint instead of silently emitting empty audio.
 
-- **TTS trigger**: speech output requires
-  `chat_template_kwargs.use_tts_template=true` so the chat template
-  appends `<|tts_bos|>` before generation. Without it, Stage-1 talker
-  receives no TTS token span and returns silent audio (not text-only).
-  For **curl**, put `chat_template_kwargs` at the request root; nested
-  `extra_body.chat_template_kwargs` is ignored. The OpenAI Python SDK
-  may use `extra_body` because it flattens those fields into the root.
+- **TTS conditioning**: the MiniCPM stage bridge can condition speech from
+  the generated assistant span without changing shared serving code.
+  `chat_template_kwargs.use_tts_template=true` remains supported when an
+  explicit `<|tts_bos|>` boundary is desired. For **curl**, put
+  `chat_template_kwargs` at the request root; the OpenAI Python SDK may use
+  `extra_body` because it flattens those fields into the root.
+
+- **Reference voice**: request audio is carried on the first codec chunk.
+  Code2Wav owns the temporary prompt WAV and prompt-feature cache, and removes
+  both when the stream ends.
+
+- **Talker sampling**: codec-token sampling reads the checkpoint `tts_config`
+  and defaults to deterministic seed 42. Stage-1 deploy sampling parameters
+  control only vLLM's binary continue/stop token.
 
 - **Output audio**: 24 kHz mono WAV inside the OpenAI-style
   `message.audio.data` (base64). The Gradio demo's WAV player decodes

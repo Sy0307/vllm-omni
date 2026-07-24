@@ -9,11 +9,10 @@ from typing import Any
 import torch
 from vllm.inputs import TextPrompt
 
-from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct, set_tts_handoff
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
-    set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -233,11 +232,30 @@ def tts2code2wav_async_chunk(
 
     state = container.get(_MINICPMO45_ASYNC_STATE)
     if not isinstance(state, dict):
+        request_info = getattr(request, "additional_information", None)
+        if not isinstance(request_info, Mapping):
+            request_info = {}
+        codes_info = request_info.get("codes")
+        if not isinstance(codes_info, Mapping):
+            codes_info = {}
+        meta_info = request_info.get("meta")
+        if not isinstance(meta_info, Mapping):
+            meta_info = {}
+        duplex_info = request_info.get("duplex")
+        if not isinstance(duplex_info, Mapping):
+            duplex_info = {}
         state = {
             "internal_id": internal_id,
             "pending": [],
             "left_context": [],
             "codec_end": 0,
+            "ref_audio": codes_info.get("ref"),
+            "ref_audio_sr": meta_info.get("ref_audio_sr"),
+            "segment_text": meta_info.get("native_duplex_segment_text"),
+            "segment_end": bool(meta_info.get("segment_end", False)),
+            "turn_end": bool(meta_info.get("turn_end", False)),
+            "duplex_turn_id": duplex_info.get("model_turn_id", duplex_info.get("turn_id")),
+            "duplex_epoch": duplex_info.get("epoch"),
         }
         container[_MINICPMO45_ASYNC_STATE] = state
 
@@ -278,8 +296,12 @@ def tts2code2wav_async_chunk(
 
     chunk_seq = int(getattr(transfer_manager, "put_req_chunk", {}).get(request_id, 0))
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
+    ref_audio = state.get("ref_audio") if codec_start == 0 else None
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=torch.tensor(output_codes, dtype=torch.long)),
+        codes=CodesStruct(
+            audio=torch.tensor(output_codes, dtype=torch.long),
+            ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
+        ),
         meta=MetaStruct(
             request_id=request_id,
             chunk_seq=chunk_seq,
@@ -292,6 +314,15 @@ def tts2code2wav_async_chunk(
             stream_finished=finished_tensor,
             finished=finished_tensor,
             req_id=[request_id],
+            ref_audio_sr=_coerce_int(state.get("ref_audio_sr")),
+            native_duplex_segment_text=(
+                str(state["segment_text"]) if isinstance(state.get("segment_text"), str) else None
+            ),
+            duplex_turn_id=_coerce_int(state.get("duplex_turn_id")),
+            duplex_epoch=_coerce_int(state.get("duplex_epoch")),
+            segment_end=bool(state.get("segment_end", False)),
+            turn_end=bool(state.get("turn_end", False)),
+            tts_is_last_chunk=last_chunk,
         ),
         request_id=request_id,
     )
@@ -769,16 +800,8 @@ def llm2tts(
             if not handoff_ids:
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
-        if handoff_ids is not None and handoff_hidden is not None:
-            # The strict three-stage Talker consumes flat tensor aliases while
-            # the full-duplex transport keeps the canonical nested handoff.
-            # Carry both representations so ordinary streaming and native
-            # full-duplex requests use the same stage bridge.
-            tts_ids_tensor = torch.as_tensor(handoff_ids, dtype=torch.long)
-            tts_hidden_tensor = torch.as_tensor(handoff_hidden, dtype=torch.float32)
-            model_intermediate_buffer["tts_token_ids"] = tts_ids_tensor
-            model_intermediate_buffer["tts_hidden_states"] = tts_hidden_tensor
         if native_turn_end_handoff:
+            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
             _reset_native_tts_handoff(_streaming_context)
 
         if handoff_ids is not None and handoff_hidden is not None:

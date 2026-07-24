@@ -64,27 +64,6 @@ def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: i
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
-def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
-    """Store the generic AR-stage token/hidden-state handoff consumed by TTS."""
-    if token_ids is not None:
-        buffer.setdefault("ids", {})["tts"] = token_ids
-    if hidden_states is not None:
-        buffer.setdefault("hidden_states", {})["tts"] = hidden_states
-
-
-def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
-    """Read the generic AR-stage to TTS handoff, including legacy flat keys."""
-    ids_info = info.get("ids")
-    hidden_info = info.get("hidden_states")
-    tts_token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
-    tts_hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
-    if tts_token_ids is None:
-        tts_token_ids = info.get("tts_token_ids")
-    if tts_hidden_states is None:
-        tts_hidden_states = info.get("tts_hidden_states")
-    return tts_token_ids, tts_hidden_states
-
-
 def get_stream_request_key(info: dict[str, object]) -> str:
     key = info.get("global_request_id") or info.get("request_id") or info.get("_omni_req_id")
     if isinstance(key, (list, tuple)):

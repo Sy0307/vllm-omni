@@ -4,12 +4,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import soundfile as sf
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -65,6 +69,11 @@ class _WorkItem:
     last_chunk: bool
     tokens: torch.Tensor
     previous: _RequestState | None
+    segment_text: str
+    duplex_turn_id: int | None
+    duplex_epoch: int | None
+    segment_end: bool
+    turn_end: bool
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -90,6 +99,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
+        self._owned_prompt_wavs: dict[str, tuple[str, str]] = {}
         extra = self._extra_config()
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
@@ -110,6 +120,57 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
+
+    def _release_prompt(self, state_id: str) -> None:
+        owned = self._owned_prompt_wavs.pop(state_id, None)
+        if owned is None:
+            return
+        prompt_cache_id, prompt_wav = owned
+        if self.backend is not None:
+            self.backend.evict_prompt(prompt_cache_id, prompt_wav)
+        try:
+            os.unlink(prompt_wav)
+        except FileNotFoundError:
+            pass
+
+    def _write_reference_prompt(
+        self,
+        state_id: str,
+        reference: object,
+        sample_rate: object,
+    ) -> tuple[str, str]:
+        waveform = torch.as_tensor(reference, dtype=torch.float32).reshape(-1).cpu()
+        if waveform.numel() == 0:
+            return self._default_prompt_id, self._default_prompt_wav
+        sample_rate_hz = int(_scalar(sample_rate, 24000))
+        if sample_rate_hz <= 0:
+            raise _batch_error(
+                "invalid_ref_audio_sample_rate",
+                request_id=state_id,
+                sample_rate=sample_rate_hz,
+            )
+        digest = hashlib.sha256()
+        digest.update(str(sample_rate_hz).encode("ascii"))
+        digest.update(waveform.numpy().tobytes())
+        prompt_cache_id = f"{state_id}:{digest.hexdigest()}"
+        current = self._owned_prompt_wavs.get(state_id)
+        if current is not None and current[0] == prompt_cache_id and os.path.exists(current[1]):
+            return current
+
+        self._release_prompt(state_id)
+        handle = tempfile.NamedTemporaryFile(prefix="minicpmo45-ref-", suffix=".wav", delete=False)
+        prompt_wav = handle.name
+        handle.close()
+        try:
+            sf.write(prompt_wav, waveform.numpy(), sample_rate_hz, format="WAV")
+        except Exception:
+            try:
+                os.unlink(prompt_wav)
+            except FileNotFoundError:
+                pass
+            raise
+        self._owned_prompt_wavs[state_id] = (prompt_cache_id, prompt_wav)
+        return prompt_cache_id, prompt_wav
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -158,10 +219,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 chunk_seq=chunk_seq,
             )
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
-        prompt_cache_id = str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id))
-        prompt_wav = str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
+        reference = codes.get("ref") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
         if last_chunk and int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
             # The generation scheduler reserves one placeholder token for an
@@ -192,6 +252,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     cache_epoch=cache_epoch,
                     chunk_seq=chunk_seq,
                 )
+            self._release_prompt(state_id)
             previous = None
         elif chunk_seq != previous.chunk_seq + 1:
             raise _batch_error(
@@ -200,20 +261,38 @@ class MiniCPMO45Code2Wav(nn.Module):
                 expected=previous.chunk_seq + 1,
                 actual=chunk_seq,
             )
-        elif prompt_cache_id != previous.prompt_cache_id:
+
+        explicit_prompt_id = _scalar(meta.get("prompt_cache_id"))
+        explicit_prompt_wav = _scalar(meta.get("prompt_wav"))
+        if previous is not None and explicit_prompt_id is None and explicit_prompt_wav is None:
+            prompt_cache_id = previous.prompt_cache_id
+            prompt_wav = previous.prompt_wav
+        elif reference is not None:
+            prompt_cache_id, prompt_wav = self._write_reference_prompt(
+                state_id,
+                reference,
+                meta.get("ref_audio_sr"),
+            )
+        else:
+            prompt_cache_id = str(explicit_prompt_id or self._default_prompt_id)
+            prompt_wav = str(explicit_prompt_wav or self._default_prompt_wav)
+
+        if previous is not None and prompt_cache_id != previous.prompt_cache_id:
             raise _batch_error(
                 "prompt_changed_midstream",
                 request_id=request_id,
                 expected=previous.prompt_cache_id,
                 actual=prompt_cache_id,
             )
-        elif prompt_wav != previous.prompt_wav:
+        if previous is not None and prompt_wav != previous.prompt_wav:
             raise _batch_error(
                 "prompt_changed_midstream",
                 request_id=request_id,
                 expected=previous.prompt_wav,
                 actual=prompt_wav,
             )
+        duplex_turn_id = _scalar(meta.get("duplex_turn_id"))
+        duplex_epoch = _scalar(meta.get("duplex_epoch"))
         return _WorkItem(
             output_index=index,
             state_id=state_id,
@@ -225,6 +304,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             last_chunk=last_chunk,
             tokens=tokens,
             previous=previous,
+            segment_text=str(_scalar(meta.get("native_duplex_segment_text"), "")),
+            duplex_turn_id=int(duplex_turn_id) if duplex_turn_id is not None else None,
+            duplex_epoch=int(duplex_epoch) if duplex_epoch is not None else None,
+            segment_end=bool(_scalar(meta.get("segment_end"), False)),
+            turn_end=bool(_scalar(meta.get("turn_end"), False)),
         )
 
     @staticmethod
@@ -384,6 +468,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         for request_id, state in pending.items():
             if state is None:
                 self._states.pop(request_id, None)
+                self._release_prompt(request_id)
             else:
                 self._states[request_id] = state
         return OmniOutput(
@@ -391,12 +476,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             multimodal_outputs={
                 "model_outputs": outputs,
                 "sr": [sample_rate for _ in outputs],
+                "llm_output_text": [item.segment_text for item in items],
+                "tts_is_last_chunk": [item.last_chunk for item in items],
+                "segment_end": [item.segment_end for item in items],
+                "turn_end": [item.turn_end for item in items],
+                "duplex_turn_id": [item.duplex_turn_id for item in items],
+                "duplex_epoch": [item.duplex_epoch for item in items],
             },
         )
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
-            self._states.pop(str(request_id), None)
+            state_id = str(request_id)
+            self._states.pop(state_id, None)
+            self._release_prompt(state_id)
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

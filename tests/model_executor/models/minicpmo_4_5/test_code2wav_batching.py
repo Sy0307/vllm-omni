@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeEncoder(nn.Module):
@@ -396,3 +399,33 @@ def test_cleanup_uses_generation_runner_internal_request_ids():
     model.on_requests_finished(["internal-a"])
 
     assert set(model._states) == {"internal-b"}
+
+
+def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
+    model, _ = _model()
+    first = _info("voice-a", 0, [1, 2])
+    first["codes"]["ref"] = torch.linspace(-0.1, 0.1, 160)
+    first["meta"].update(
+        ref_audio_sr=16000,
+        native_duplex_segment_text="hello",
+        duplex_turn_id=7,
+        duplex_epoch=3,
+    )
+    first["meta"].pop("prompt_cache_id")
+
+    output = _forward(model, [first])
+    prompt_cache_id, prompt_wav = model._owned_prompt_wavs["voice-a"]
+    assert prompt_cache_id.startswith("voice-a:")
+    assert Path(prompt_wav).is_file()
+    assert output.multimodal_outputs["llm_output_text"] == ["hello"]
+    assert output.multimodal_outputs["duplex_turn_id"] == [7]
+    assert output.multimodal_outputs["duplex_epoch"] == [3]
+
+    final = _info("voice-a", 1, [3, 4], last_chunk=True)
+    final["meta"].pop("prompt_cache_id")
+    output = _forward(model, [final])
+
+    assert output.multimodal_outputs["tts_is_last_chunk"] == [True]
+    assert "voice-a" not in model._owned_prompt_wavs
+    assert not Path(prompt_wav).exists()
+    assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features

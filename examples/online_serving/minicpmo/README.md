@@ -24,25 +24,25 @@ including `librosa`.
 
 ## Start the backend server
 
-The deploy config auto-loads via `--omni`. The default
-`vllm_omni/deploy/minicpmo_4_5.yaml` uses the strict three-stage pipeline
-on one large-memory GPU. Thinker, Talker, and Code2Wav all use logical
-device 0 with memory budgets of 65%, 15%, and 15%, respectively. Each
-stage admits at most four concurrent sequences to limit cross-process
-contention on the shared GPU.
+The deploy config auto-loads via `--omni`.
+`vllm_omni/deploy/minicpmo_4_5.yaml` is a stable compatibility entry point
+that delegates to the canonical `minicpmo_4_5_batching.yaml`. Thinker,
+Talker, and Code2Wav use logical device 0 with memory budgets of 65%, 15%,
+and 15%; each admits at most four concurrent sequences.
 
 | deploy config | GPUs | Notes |
 |---|---|---|
-| `minicpmo_4_5.yaml` (default) | 1 | Three stages share one large-memory GPU. |
-| `minicpmo_4_5_batching.yaml` | 1 | Explicit continuous-batching alias. |
+| `minicpmo_4_5.yaml` (default) | 1 | Compatibility alias for the canonical layout. |
+| `minicpmo_4_5_batching.yaml` | 1 | Canonical three-stage continuous-batching layout. |
 | `minicpmo_4_5_2gpu.yaml` | 2 | Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
-| `minicpmo_4_5_duplex.yaml` | 2 | Experimental native full-duplex profile. |
+| `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
 
-Native duplex is not yet a supported guarantee of the split-Talker pipeline.
-This change covers Thinker-to-Talker duplex segment handoff; end-to-end
-barge-in and Stage 2 audio remain dependencies of the full-duplex follow-up.
+The split pipeline preserves native-duplex epoch/turn identity, segment text,
+turn completion, reference voice, and terminal-audio metadata through
+Code2Wav. Focused CPU regressions cover this envelope; run the Realtime
+scenario below for live barge-in validation on the target GPU.
 
 Default:
 
@@ -131,16 +131,16 @@ Open `http://<host>:7862` in a browser.
 
 ## Daily-Omni accuracy
 
-`vllm bench serve --omni --dataset-name daily-omni` automatically sends
-`chat_template_kwargs.enable_thinking=false`. Daily-Omni requires one A–D
-letter; leaving MiniCPM-o 4.5 reasoning enabled can exhaust the 256-token
-answer budget inside `<think>` and make first-letter extraction score the
-reasoning text instead of the final answer.
+Daily-Omni requires one A–D letter. Set
+`chat_template_kwargs.enable_thinking=false` explicitly in `--extra-body`;
+the generic benchmark CLI does not inject a MiniCPM-specific default.
+Leaving reasoning enabled can exhaust the 256-token answer budget inside
+`<think>` and make first-letter extraction score reasoning text.
 
-For accuracy comparisons with the established text benchmark, send
-`--extra_body '{"modalities":["text"]}'`. Requesting audio also benchmarks
-Talker and Code2Wav and changes the assistant template, so it is not an
-apples-to-apples accuracy run.
+For the established text benchmark, send
+`--extra_body '{"modalities":["text"],"chat_template_kwargs":{"enable_thinking":false}}'`.
+Requesting audio also benchmarks Talker and Code2Wav and changes the
+assistant template, so it is not an apples-to-apples accuracy run.
 
 ## Run the Realtime duplex CLI demo
 
@@ -198,6 +198,11 @@ two-response WAV, its `--input-sha256`, and an
 
 - Stage 1 performs request-owned AR continuous batching. Stage 2 keeps
   request-owned Flow/HiFT caches and batches exact-shape-compatible chunks.
+- Reference audio travels with the first codec chunk; Stage 2 owns its
+  temporary prompt WAV and evicts prompt features when the request finishes.
+- Codec sampling reads the checkpoint `tts_config` (default deterministic
+  seed 42). Stage-1 YAML sampling parameters govern only the binary
+  continue/stop token exposed to vLLM.
 - `StageRequestStats.batch_size` is request-scoped and does not report the
   scheduler's execution batch.
 - Stage 0 and Stage 1 use vLLM CUDA Graph capture. Stage 2 remains eager until

@@ -106,6 +106,32 @@ def test_short_final_flushes_silence_prefix_and_tail() -> None:
     assert final.meta.finished.item() is True
 
 
+def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
+    manager = _manager()
+    request = _request("req")
+    request.additional_information = {
+        "codes": {"ref": [0.1, -0.1]},
+        "meta": {
+            "ref_audio_sr": 16000,
+            "native_duplex_segment_text": "hello",
+            "segment_end": True,
+            "turn_end": True,
+        },
+        "duplex": {"epoch": 3, "model_turn_id": 7},
+    }
+
+    payload = tts2code2wav_async_chunk(manager, _delta(*range(7)), request, True)
+
+    assert payload is not None
+    assert payload.codes.ref.tolist() == pytest.approx([0.1, -0.1])
+    assert payload.meta.ref_audio_sr == 16000
+    assert payload.meta.native_duplex_segment_text == "hello"
+    assert payload.meta.duplex_epoch == 3
+    assert payload.meta.duplex_turn_id == 7
+    assert payload.meta.segment_end is True
+    assert payload.meta.turn_end is True
+
+
 def test_empty_final_releases_wait_gate_once() -> None:
     manager = _manager()
     request = _request("req")

@@ -89,6 +89,13 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_size: int
     ref_context_request_id: str
     ref_context_included: bool
+    ref_audio_sr: int
+    native_duplex_segment_text: str
+    duplex_turn_id: int
+    duplex_epoch: int
+    segment_end: bool
+    turn_end: bool
+    tts_is_last_chunk: bool
     talker_prefill_offset: int
     omni_final_stage_id: int
 
@@ -106,6 +113,26 @@ class OmniPayload(TypedDict, total=False):
     speaker: Any
     language: Any
     request_id: str
+
+
+def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
+    """Store the production AR-to-TTS token and hidden-state contract."""
+    if token_ids is not None:
+        buffer.setdefault("ids", {})["tts"] = token_ids
+    if hidden_states is not None:
+        buffer.setdefault("hidden_states", {})["tts"] = hidden_states
+
+
+def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
+    """Read the AR-to-TTS handoff, including legacy flat aliases."""
+    ids_info = info.get("ids")
+    hidden_info = info.get("hidden_states")
+    token_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
+    hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
+    return (
+        info.get("tts_token_ids") if token_ids is None else token_ids,
+        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+    )
 
 
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
@@ -184,6 +211,13 @@ class MetaStruct(_StructBase):
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
+    ref_audio_sr: int | None = None
+    native_duplex_segment_text: str | None = None
+    duplex_turn_id: int | None = None
+    duplex_epoch: int | None = None
+    segment_end: bool | None = None
+    turn_end: bool | None = None
+    tts_is_last_chunk: bool | None = None
     talker_prefill_offset: int | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None

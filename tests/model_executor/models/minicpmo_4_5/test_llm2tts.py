@@ -175,7 +175,7 @@ class TestBasicShape:
         assert buffer["ids"]["output"] == out_ids
         assert buffer["llm_output_text"] == ["hello"]
 
-    def test_strict_talker_receives_flat_tensor_handoff(self) -> None:
+    def test_strict_talker_receives_canonical_nested_handoff(self) -> None:
         hidden = torch.arange(5 * _HIDDEN_DIM, dtype=torch.float32).reshape(5, _HIDDEN_DIM)
         result = llm2tts(
             [
@@ -190,8 +190,8 @@ class TestBasicShape:
 
         buffer = result["model_intermediate_buffer"]
         assert result["prompt_token_ids"] == [0, 0, 0, 0]
-        assert torch.equal(buffer["tts_token_ids"], torch.tensor([20, 21]))
-        assert torch.equal(buffer["tts_hidden_states"], hidden[2:4])
+        assert buffer["ids"]["tts"] == [20, 21]
+        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[2:4])
 
     def test_latent_in_multimodal_output_takes_precedence(self) -> None:
         # When both ``multimodal_output["latent"]`` and ``hidden_states`` are

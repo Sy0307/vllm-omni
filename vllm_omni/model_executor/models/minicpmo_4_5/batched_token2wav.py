@@ -84,6 +84,10 @@ class BatchedToken2Wav(nn.Module):
             self._prompt_features[cache_key] = cached
         return cached
 
+    def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
+        """Release request-owned prompt features after stream completion."""
+        self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
+
     @staticmethod
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
         return (
