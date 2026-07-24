@@ -26,6 +26,7 @@ _MINICPMO45_SILENCE_CODE = 4218
 class _MiniCPMO45MetaStruct(MetaStruct):
     """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
 
+    native_duplex: bool | None = None
     ref_audio_sr: int | None = None
     native_duplex_segment_text: str | None = None
     duplex_turn_id: int | None = None
@@ -181,6 +182,62 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
     return _codec_scalars(pooling_output)
 
 
+def _metadata_value(multimodal_output: Any, key: str, default: Any = None) -> Any:
+    if not isinstance(multimodal_output, Mapping):
+        return default
+    meta = multimodal_output.get("meta")
+    if not isinstance(meta, Mapping):
+        return default
+    value = meta.get(key, default)
+    if isinstance(value, torch.Tensor):
+        flat = value.detach().cpu().reshape(-1)
+        return flat[0].item() if flat.numel() else default
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if not value:
+            return default
+        return _metadata_value({"meta": {key: value[0]}}, key, default)
+    return value
+
+
+def _decode_utf8_metadata(multimodal_output: Any, key: str) -> str:
+    if not isinstance(multimodal_output, Mapping):
+        return ""
+    meta = multimodal_output.get("meta")
+    if not isinstance(meta, Mapping):
+        return ""
+    value = meta.get(key)
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, (bytes, bytearray)):
+        value = bytes(value)
+    elif isinstance(value, Sequence) and not isinstance(value, str):
+        if len(value) == 1 and isinstance(value[0], torch.Tensor):
+            value = value[0].detach().cpu().reshape(-1).tolist()
+    else:
+        return ""
+    try:
+        return bytes(value).decode("utf-8")
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return ""
+
+
+def _request_additional_information(request: Any) -> dict[str, Any]:
+    info = getattr(request, "additional_information", None)
+    return info if isinstance(info, dict) else {}
+
+
+def _request_ref_audio(request: Any) -> tuple[torch.Tensor | None, int | None]:
+    info = _request_additional_information(request)
+    codes = info.get("codes")
+    meta = info.get("meta")
+    ref_audio = codes.get("ref") if isinstance(codes, Mapping) else None
+    ref_audio_sr = meta.get("ref_audio_sr") if isinstance(meta, Mapping) else None
+    if ref_audio is None:
+        return None, _coerce_int(ref_audio_sr)
+    waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu()
+    return waveform, _coerce_int(ref_audio_sr)
+
+
 def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
     request_payload = getattr(transfer_manager, "request_payload", None)
     if isinstance(request_payload, dict):
@@ -212,6 +269,16 @@ def tts2code2wav_async_chunk(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     internal_id = str(internal_id if internal_id is not None else request_id)
+    native_duplex = bool(_metadata_value(multimodal_output, "native_duplex", False))
+    duplex_epoch = _coerce_int(_metadata_value(multimodal_output, "duplex_epoch"))
+    duplex_turn_id = _coerce_int(_metadata_value(multimodal_output, "duplex_turn_id"))
+    segment_text = _metadata_value(multimodal_output, "native_duplex_segment_text", "")
+    if not isinstance(segment_text, str):
+        segment_text = ""
+    if not segment_text:
+        segment_text = _decode_utf8_metadata(multimodal_output, "llm_output_text_utf8")
+    turn_end = bool(_metadata_value(multimodal_output, "turn_end", False))
+    duplex_turn_key = (duplex_epoch, duplex_turn_id)
 
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
@@ -227,7 +294,9 @@ def tts2code2wav_async_chunk(
         record = {
             "internal_id": internal_id,
             "cache_epoch": 0,
+            "chunk_seq": 0,
             "retired_internal_ids": set(),
+            "last_terminal_turn": None,
         }
         container[_MINICPMO45_STREAM_RECORD] = record
     elif internal_id in record["retired_internal_ids"]:
@@ -236,6 +305,8 @@ def tts2code2wav_async_chunk(
         record["retired_internal_ids"].add(record["internal_id"])
         record["internal_id"] = internal_id
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
+        record["chunk_seq"] = 0
+        record["last_terminal_turn"] = None
         _drop_codec_state(transfer_manager, request_id)
 
     if _is_aborted(request):
@@ -243,32 +314,16 @@ def tts2code2wav_async_chunk(
         _drop_codec_state(transfer_manager, request_id)
         return None
 
+    if native_duplex and turn_end and record.get("last_terminal_turn") == duplex_turn_key:
+        return None
+
     state = container.get(_MINICPMO45_ASYNC_STATE)
     if not isinstance(state, dict):
-        request_info = getattr(request, "additional_information", None)
-        if not isinstance(request_info, Mapping):
-            request_info = {}
-        codes_info = request_info.get("codes")
-        if not isinstance(codes_info, Mapping):
-            codes_info = {}
-        meta_info = request_info.get("meta")
-        if not isinstance(meta_info, Mapping):
-            meta_info = {}
-        duplex_info = request_info.get("duplex")
-        if not isinstance(duplex_info, Mapping):
-            duplex_info = {}
         state = {
             "internal_id": internal_id,
             "pending": [],
             "left_context": [],
             "codec_end": 0,
-            "ref_audio": codes_info.get("ref"),
-            "ref_audio_sr": meta_info.get("ref_audio_sr"),
-            "segment_text": meta_info.get("native_duplex_segment_text"),
-            "segment_end": bool(meta_info.get("segment_end", False)),
-            "turn_end": bool(meta_info.get("turn_end", False)),
-            "duplex_turn_id": duplex_info.get("model_turn_id", duplex_info.get("turn_id")),
-            "duplex_epoch": duplex_info.get("epoch"),
         }
         container[_MINICPMO45_ASYNC_STATE] = state
 
@@ -277,10 +332,12 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    if not finished and len(pending) < chunk_frames:
+    flush_pending = finished
+    last_chunk = bool(flush_pending and (not native_duplex or turn_end))
+    if not flush_pending and len(pending) < chunk_frames:
         return None
 
-    new_token_count = len(pending) if finished else chunk_frames
+    new_token_count = len(pending) if flush_pending else chunk_frames
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -292,9 +349,9 @@ def tts2code2wav_async_chunk(
         else:
             context = list(state["left_context"])
         output_codes = [*context, *new_codes]
-        history = [*state["left_context"], *new_codes]
+        history = output_codes
         state["left_context"] = history[-left_context_frames:] if left_context_frames else []
-    elif finished and codec_start > 0 and state["left_context"]:
+    elif last_chunk and codec_start > 0 and state["left_context"]:
         context = list(state["left_context"])
         output_codes = context
     else:
@@ -302,18 +359,21 @@ def tts2code2wav_async_chunk(
         output_codes = []
     state["codec_end"] = codec_end
 
-    last_chunk = bool(finished and not pending)
-    if last_chunk:
+    if last_chunk and not native_duplex:
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
 
-    chunk_seq = int(getattr(transfer_manager, "put_req_chunk", {}).get(request_id, 0))
+    chunk_seq = int(record["chunk_seq"])
+    record["chunk_seq"] = chunk_seq + 1
+    ref_audio = None
+    ref_audio_sr = None
+    if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
+        ref_audio, ref_audio_sr = _request_ref_audio(request)
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
-    ref_audio = state.get("ref_audio") if codec_start == 0 else None
-    return OmniPayloadStruct(
+    payload = OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(output_codes, dtype=torch.long),
-            ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
+            ref=ref_audio,
         ),
         meta=_MiniCPMO45MetaStruct(
             request_id=request_id,
@@ -326,19 +386,24 @@ def tts2code2wav_async_chunk(
             last_chunk=last_chunk,
             stream_finished=finished_tensor,
             finished=finished_tensor,
+            is_segment_finished=finished_tensor,
             req_id=[request_id],
-            ref_audio_sr=_coerce_int(state.get("ref_audio_sr")),
-            native_duplex_segment_text=(
-                str(state["segment_text"]) if isinstance(state.get("segment_text"), str) else None
-            ),
-            duplex_turn_id=_coerce_int(state.get("duplex_turn_id")),
-            duplex_epoch=_coerce_int(state.get("duplex_epoch")),
-            segment_end=bool(state.get("segment_end", False)),
-            turn_end=bool(state.get("turn_end", False)),
-            tts_is_last_chunk=last_chunk,
+            native_duplex=native_duplex,
+            duplex_epoch=duplex_epoch,
+            duplex_turn_id=duplex_turn_id,
+            native_duplex_segment_text=segment_text,
+            tts_is_last_chunk=flush_pending,
+            turn_end=turn_end,
+            ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
     )
+    if last_chunk and native_duplex:
+        record["last_terminal_turn"] = duplex_turn_key
+        record["cache_epoch"] = int(record["cache_epoch"]) + 1
+        record["chunk_seq"] = 0
+        _drop_codec_state(transfer_manager, request_id)
+    return payload
 
 
 def _special_token_ids_from_mm_output(mm_output):

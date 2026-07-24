@@ -19,7 +19,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from minicpmo_realtime_duplex_scenarios import _url_with_model, run_demo  # noqa: E402
+from minicpmo_realtime_duplex_scenarios import (  # noqa: E402
+    _ref_audio_data_url,
+    _url_with_model,
+    run_demo,
+)
 
 
 def _with_resume_mode(url: str) -> str:
@@ -27,6 +31,33 @@ def _with_resume_mode(url: str) -> str:
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["resume"] = "1"
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _probe_session_url(args: argparse.Namespace, *, session_id: str) -> str:
+    return _url_with_model(
+        args.url,
+        args.model,
+        autostart=False,
+        session_id=session_id,
+    )
+
+
+def _probe_session_update_event(
+    args: argparse.Namespace,
+    *,
+    session_id: str | None = None,
+) -> dict[str, object]:
+    session: dict[str, object] = {
+        "model": args.model,
+        "modalities": ["audio", "text"],
+        "extra_body": {"minicpmo45_native_duplex": True},
+    }
+    if session_id is not None:
+        session["session_id"] = session_id
+    ref_audio = _ref_audio_data_url(getattr(args, "ref_audio", None))
+    if ref_audio is not None:
+        session["ref_audio"] = ref_audio
+    return {"type": "session.update", "session": session}
 
 
 def _response_ids(result: dict[str, object]) -> set[str]:
@@ -114,21 +145,9 @@ async def _open_admission_session(
     args: argparse.Namespace,
     session_id: str,
 ) -> tuple[object, dict[str, object]]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _probe_session_url(args, session_id=session_id)
     ws = await websockets.connect(url, max_size=64 * 1024 * 1024)
-    await ws.send(
-        json.dumps(
-            {
-                "type": "session.update",
-                "session": {
-                    "session_id": session_id,
-                    "model": args.model,
-                    "modalities": ["audio", "text"],
-                    "extra_body": {"minicpmo45_native_duplex": True},
-                },
-            }
-        )
-    )
+    await ws.send(json.dumps(_probe_session_update_event(args, session_id=session_id)))
     created, _ = await _receive_until(ws, "session.created", timeout_s=args.timeout_s)
     return ws, created
 
@@ -151,21 +170,9 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
             accepted.append(await _open_admission_session(args, f"{prefix}-accepted-{index}"))
 
         overflow_id = f"{prefix}-overflow"
-        overflow_url = _url_with_model(args.url, args.model, session_id=overflow_id)
+        overflow_url = _probe_session_url(args, session_id=overflow_id)
         async with websockets.connect(overflow_url, max_size=64 * 1024 * 1024) as overflow:
-            await overflow.send(
-                json.dumps(
-                    {
-                        "type": "session.update",
-                        "session": {
-                            "session_id": overflow_id,
-                            "model": args.model,
-                            "modalities": ["audio", "text"],
-                            "extra_body": {"minicpmo45_native_duplex": True},
-                        },
-                    }
-                )
-            )
+            await overflow.send(json.dumps(_probe_session_update_event(args, session_id=overflow_id)))
             error, _ = await _receive_until(overflow, "error", timeout_s=args.timeout_s)
             overflow_code = _error_code(error)
 
@@ -207,20 +214,9 @@ async def _resume_probe(
     session_id: str,
     expect_expired: bool = False,
 ) -> dict[str, object]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _probe_session_url(args, session_id=session_id)
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as first:
-        await first.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "model": args.model,
-                        "modalities": ["audio", "text"],
-                        "extra_body": {"minicpmo45_native_duplex": True},
-                    },
-                }
-            )
-        )
+        await first.send(json.dumps(_probe_session_update_event(args, session_id=session_id)))
         created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
         token = created.get("resume_token")
         incarnation = created.get("incarnation")
@@ -306,22 +302,11 @@ async def _takeover_probe(
     *,
     session_id: str,
 ) -> dict[str, object]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _probe_session_url(args, session_id=session_id)
     first = await websockets.connect(url, max_size=64 * 1024 * 1024)
     second = None
     try:
-        await first.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "model": args.model,
-                        "modalities": ["audio", "text"],
-                        "extra_body": {"minicpmo45_native_duplex": True},
-                    },
-                }
-            )
-        )
+        await first.send(json.dumps(_probe_session_update_event(args, session_id=session_id)))
         created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
         token = created.get("resume_token")
         incarnation = created.get("incarnation")

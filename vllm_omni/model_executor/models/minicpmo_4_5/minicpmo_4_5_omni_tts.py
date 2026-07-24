@@ -377,8 +377,48 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
+        native_duplex_flags: list[torch.Tensor] = []
+        duplex_epochs: list[torch.Tensor] = []
+        duplex_turn_ids: list[torch.Tensor] = []
+        segment_texts_utf8: list[torch.Tensor] = []
+        turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
         for index, info in enumerate(infos):
+            info_dict = info if isinstance(info, dict) else {}
+            duplex_info = info_dict.get("duplex")
+            if not isinstance(duplex_info, dict):
+                duplex_info = {}
+            meta_info = info_dict.get("meta")
+            if not isinstance(meta_info, dict):
+                meta_info = {}
+            native_duplex = info_dict.get("native_duplex") is True
+            epoch = duplex_info.get("epoch", -1)
+            turn_id = duplex_info.get("turn_id", -1)
+            segment_text = meta_info.get("native_duplex_segment_text", "")
+            if not isinstance(segment_text, str):
+                segment_text = ""
+            turn_eos_id = meta_info.get("turn_eos_token_id")
+            ids_info = info_dict.get("ids")
+            tts_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
+            if isinstance(tts_ids, torch.Tensor):
+                contains_turn_eos = isinstance(turn_eos_id, int) and bool(
+                    torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
+                )
+            elif isinstance(tts_ids, (list, tuple)):
+                contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+            else:
+                contains_turn_eos = False
+            native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
+            duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
+            duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+            segment_texts_utf8.append(
+                torch.tensor(
+                    list(segment_text.encode("utf-8")),
+                    dtype=torch.uint8,
+                )
+            )
+            turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+
             if not isinstance(info, dict):
                 stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
@@ -447,7 +487,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # preserving compaction alignment while emitting only this step's code.
         multimodal_outputs: dict[str, Any] = {
             "codes": {"audio": codec_deltas},
-            "meta": {"finished": terminal_flags},
+            "meta": {
+                "finished": terminal_flags,
+                "native_duplex": native_duplex_flags,
+                "duplex_epoch": duplex_epochs,
+                "duplex_turn_id": duplex_turn_ids,
+                "llm_output_text_utf8": segment_texts_utf8,
+                "turn_end": turn_end_flags,
+            },
         }
         return OmniOutput(
             text_hidden_states=hidden,
