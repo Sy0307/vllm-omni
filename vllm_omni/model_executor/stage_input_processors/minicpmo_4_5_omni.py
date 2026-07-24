@@ -23,6 +23,18 @@ _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 
 
+class _MiniCPMO45MetaStruct(MetaStruct):
+    """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
+
+    ref_audio_sr: int | None = None
+    native_duplex_segment_text: str | None = None
+    duplex_turn_id: int | None = None
+    duplex_epoch: int | None = None
+    segment_end: bool | None = None
+    turn_end: bool | None = None
+    tts_is_last_chunk: bool | None = None
+
+
 def _extract_first_audio_ref(multi_modal_data):
     if not isinstance(multi_modal_data, dict):
         return None
@@ -303,7 +315,7 @@ def tts2code2wav_async_chunk(
             audio=torch.tensor(output_codes, dtype=torch.long),
             ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
         ),
-        meta=MetaStruct(
+        meta=_MiniCPMO45MetaStruct(
             request_id=request_id,
             chunk_seq=chunk_seq,
             cache_epoch=int(record["cache_epoch"]),

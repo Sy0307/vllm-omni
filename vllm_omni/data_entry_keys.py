@@ -89,13 +89,6 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_size: int
     ref_context_request_id: str
     ref_context_included: bool
-    ref_audio_sr: int
-    native_duplex_segment_text: str
-    duplex_turn_id: int
-    duplex_epoch: int
-    segment_end: bool
-    turn_end: bool
-    tts_is_last_chunk: bool
     talker_prefill_offset: int
     omni_final_stage_id: int
 
@@ -191,13 +184,6 @@ class MetaStruct(_StructBase):
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
-    ref_audio_sr: int | None = None
-    native_duplex_segment_text: str | None = None
-    duplex_turn_id: int | None = None
-    duplex_epoch: int | None = None
-    segment_end: bool | None = None
-    turn_end: bool | None = None
-    tts_is_last_chunk: bool | None = None
     talker_prefill_offset: int | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
