@@ -301,6 +301,39 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert "duplex" not in model._states
 
 
+def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
+    model, _ = _model()
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    first = _info("voice-a", 0, [10, 11])
+    first["codes"]["ref"] = reference
+    first["meta"]["ref_audio_sr"] = 16000
+    first["meta"].pop("prompt_cache_id")
+    _forward(model, [first], request_ids=["internal-a"])
+
+    prompt_key = model._request_prompt_keys["internal-a"]
+    prompt_path = Path(model._runtime_prompts[prompt_key].path)
+    prompt_path.unlink()
+
+    second = _info("voice-b", 0, [12, 13])
+    second["codes"]["ref"] = reference
+    second["meta"]["ref_audio_sr"] = 16000
+    second["meta"].pop("prompt_cache_id")
+    _forward(model, [second], request_ids=["internal-b"])
+
+    assert prompt_path.is_file()
+    assert model._runtime_prompts[prompt_key].owners == {"internal-a", "internal-b"}
+
+    model.on_requests_finished(["internal-a"])
+    assert prompt_path.is_file()
+    assert model._runtime_prompts[prompt_key].owners == {"internal-b"}
+
+    model.on_requests_finished(["internal-b"])
+    assert not prompt_path.exists()
+    assert prompt_key not in model._runtime_prompts
+
+
 def test_mixed_final_exact_buckets_keep_order_and_release_only_final_states():
     model, _ = _model()
     _forward(
