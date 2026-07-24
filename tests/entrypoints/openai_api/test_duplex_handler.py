@@ -2520,6 +2520,52 @@ def test_duplex_auto_response_tts_scheduler_eos_fallback():
     assert results[0]["abort_data_plane_request"] is True
 
 
+def test_duplex_auto_response_rearms_tts_boundary_for_next_segment_in_same_turn():
+    data_plane = _test_data_plane()
+    request_id = "duplex-sid-next-segment-same-turn-e0-stage0"
+    session = DuplexSession(
+        session_id="sid-next-segment-same-turn",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.bind_response_turn(0)
+    data_plane.begin_request(request_id)
+
+    first_segment = _duplex_tts_output(
+        request_id=request_id,
+        samples=24000,
+        finished=False,
+        tts_is_last_chunk=True,
+        turn_id=0,
+    )
+    first_results = _project_data_plane(
+        data_plane,
+        {"data_plane_outputs": [first_segment]},
+        session=session,
+    )
+
+    assert len(first_results) == 1
+    assert first_results[0]["abort_data_plane_request"] is True
+
+    data_plane.begin_request(request_id)
+    second_segment = _duplex_tts_output(
+        request_id=request_id,
+        samples=48000,
+        finished=False,
+        text="hello again",
+        tts_is_last_chunk=True,
+        turn_id=0,
+    )
+    second_results = _project_data_plane(
+        data_plane,
+        {"data_plane_outputs": [second_segment]},
+        session=session,
+    )
+
+    assert len(second_results) == 1
+    assert second_results[0]["audio_data"] == "wav-24000"
+    assert second_results[0]["abort_data_plane_request"] is True
+
+
 def test_duplex_turn_end_is_not_swallowed_by_finished_segment_fallback():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-turn-end-after-segment-e0-stage0"

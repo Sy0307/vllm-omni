@@ -4,12 +4,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +76,13 @@ class _RequestState:
     token2wav: BatchedToken2WavState
 
 
+@dataclass
+class _RuntimePrompt:
+    cache_id: str
+    path: str
+    owners: set[str]
+
+
 @dataclass(frozen=True)
 class _WorkItem:
     output_index: int
@@ -89,9 +95,12 @@ class _WorkItem:
     last_chunk: bool
     tokens: torch.Tensor
     previous: _RequestState | None
+    runtime_prompt_key: str | None
+    native_duplex: bool
+    duplex_epoch: int
+    duplex_turn_id: int
     segment_text: str
-    duplex_turn_id: int | None
-    duplex_epoch: int | None
+    tts_is_last_chunk: bool
     segment_end: bool
     turn_end: bool
     has_payload: bool = True
@@ -120,7 +129,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
-        self._owned_prompt_wavs: dict[str, tuple[str, str]] = {}
+        self._runtime_prompts: dict[str, _RuntimePrompt] = {}
+        self._request_prompt_keys: dict[str, str] = {}
         extra = self._extra_config()
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
@@ -142,62 +152,105 @@ class MiniCPMO45Code2Wav(nn.Module):
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
 
-    def _release_prompt(self, state_id: str) -> None:
-        owned = self._owned_prompt_wavs.pop(state_id, None)
-        if owned is None:
-            return
-        prompt_cache_id, prompt_wav = owned
-        if self.backend is not None:
-            self.backend.evict_prompt(prompt_cache_id, prompt_wav)
-        try:
-            os.unlink(prompt_wav)
-        except FileNotFoundError:
-            pass
-
-    def _write_reference_prompt(
-        self,
-        state_id: str,
-        reference: object,
-        sample_rate: object,
-    ) -> tuple[str, str]:
-        waveform = torch.as_tensor(reference, dtype=torch.float32).reshape(-1).cpu()
-        if waveform.numel() == 0:
-            return self._default_prompt_id, self._default_prompt_wav
-        sample_rate_hz = int(_scalar(sample_rate, 24000))
-        if sample_rate_hz <= 0:
-            raise _batch_error(
-                "invalid_ref_audio_sample_rate",
-                request_id=state_id,
-                sample_rate=sample_rate_hz,
-            )
-        digest = hashlib.sha256()
-        digest.update(str(sample_rate_hz).encode("ascii"))
-        digest.update(waveform.numpy().tobytes())
-        prompt_cache_id = f"{state_id}:{digest.hexdigest()}"
-        current = self._owned_prompt_wavs.get(state_id)
-        if current is not None and current[0] == prompt_cache_id and os.path.exists(current[1]):
-            return current
-
-        self._release_prompt(state_id)
-        handle = tempfile.NamedTemporaryFile(prefix="minicpmo45-ref-", suffix=".wav", delete=False)
-        prompt_wav = handle.name
-        handle.close()
-        try:
-            sf.write(prompt_wav, waveform.numpy(), sample_rate_hz, format="WAV")
-        except Exception:
-            try:
-                os.unlink(prompt_wav)
-            except FileNotFoundError:
-                pass
-            raise
-        self._owned_prompt_wavs[state_id] = (prompt_cache_id, prompt_wav)
-        return prompt_cache_id, prompt_wav
-
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
 
     def compute_logits(self, hidden_states: Any, sampling_metadata: Any = None) -> None:
         return None
+
+    def _materialize_runtime_prompt(
+        self,
+        ref_audio: Any,
+        sample_rate: Any,
+    ) -> tuple[str, str, str]:
+        sample_rate_hz = int(_scalar(sample_rate, 0))
+        waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
+        if sample_rate_hz <= 0:
+            raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
+        if waveform.numel() == 0:
+            raise _batch_error("empty_ref_audio")
+        if not bool(torch.isfinite(waveform).all().item()):
+            raise _batch_error("non_finite_ref_audio")
+
+        digest = sha256()
+        digest.update(waveform.numpy().tobytes())
+        digest.update(str(sample_rate_hz).encode())
+        cache_key = digest.hexdigest()
+        cache_id = f"runtime-ref-{cache_key[:24]}-{sample_rate_hz}"
+        path = str(Path(tempfile.gettempdir()) / f"minicpmo45_ref_{cache_key[:24]}_{sample_rate_hz}.wav")
+        entry = self._runtime_prompts.get(cache_key)
+        if entry is None:
+            prompt_path = Path(path)
+            if not prompt_path.is_file():
+                sf.write(prompt_path, waveform.numpy(), sample_rate_hz)
+            entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
+            self._runtime_prompts[cache_key] = entry
+        return cache_key, entry.cache_id, entry.path
+
+    def _resolve_prompt(
+        self,
+        state_id: str,
+        info: Mapping[str, Any],
+        meta: Mapping[str, Any],
+        previous: _RequestState | None,
+    ) -> tuple[str, str, str | None]:
+        codes = info.get("codes")
+        ref_audio = codes.get("ref") if isinstance(codes, Mapping) else None
+        if ref_audio is not None:
+            cache_key, cache_id, path = self._materialize_runtime_prompt(
+                ref_audio,
+                meta.get("ref_audio_sr"),
+            )
+            return cache_id, path, cache_key
+
+        if previous is not None:
+            return previous.prompt_cache_id, previous.prompt_wav, self._request_prompt_keys.get(state_id)
+
+        cache_key = self._request_prompt_keys.get(state_id)
+        entry = self._runtime_prompts.get(cache_key) if cache_key is not None else None
+        if entry is not None:
+            return entry.cache_id, entry.path, cache_key
+
+        return (
+            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
+            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
+            None,
+        )
+
+    def _release_request_prompt(self, state_id: str) -> None:
+        cache_key = self._request_prompt_keys.pop(state_id, None)
+        entry = self._runtime_prompts.get(cache_key) if cache_key is not None else None
+        if entry is None:
+            return
+        entry.owners.discard(state_id)
+        if entry.owners:
+            return
+        if self.backend is not None:
+            self.backend.evict_prompt(entry.cache_id, entry.path)
+        Path(entry.path).unlink(missing_ok=True)
+        self._runtime_prompts.pop(cache_key, None)
+
+    def _commit_runtime_prompt_owners(self, items: list[_WorkItem]) -> None:
+        for item in items:
+            cache_key = item.runtime_prompt_key
+            if cache_key is None:
+                continue
+            previous_key = self._request_prompt_keys.get(item.state_id)
+            if previous_key != cache_key:
+                self._release_request_prompt(item.state_id)
+            entry = self._runtime_prompts.get(cache_key)
+            if entry is not None:
+                entry.owners.add(item.state_id)
+                self._request_prompt_keys[item.state_id] = cache_key
+
+    def _prune_unowned_runtime_prompts(self) -> None:
+        for cache_key, entry in list(self._runtime_prompts.items()):
+            if entry.owners:
+                continue
+            if self.backend is not None:
+                self.backend.evict_prompt(entry.cache_id, entry.path)
+            Path(entry.path).unlink(missing_ok=True)
+            self._runtime_prompts.pop(cache_key, None)
 
     @staticmethod
     def _split_segments(input_ids: torch.Tensor, counts: Any) -> list[torch.Tensor]:
@@ -266,14 +319,15 @@ class MiniCPMO45Code2Wav(nn.Module):
                 chunk_seq=chunk_seq,
             )
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
+        tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
-        reference = codes.get("ref") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
-        if last_chunk and int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
+        if int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
             # The generation scheduler reserves one placeholder token for an
-            # empty terminal chunk. The producer's explicit length is the
-            # authority, so do not decode that placeholder as codec data.
+            # empty terminal or segment-boundary chunk. The producer's
+            # explicit length is the authority, so do not decode that
+            # placeholder as codec data.
             tokens = segment.new_empty(0, dtype=torch.long)
         previous = self._states.get(state_id)
         if previous is None:
@@ -299,7 +353,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                     cache_epoch=cache_epoch,
                     chunk_seq=chunk_seq,
                 )
-            self._release_prompt(state_id)
             previous = None
         elif chunk_seq != previous.chunk_seq + 1:
             raise _batch_error(
@@ -308,22 +361,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                 expected=previous.chunk_seq + 1,
                 actual=chunk_seq,
             )
-
-        explicit_prompt_id = _scalar(meta.get("prompt_cache_id"))
-        explicit_prompt_wav = _scalar(meta.get("prompt_wav"))
-        if previous is not None and explicit_prompt_id is None and explicit_prompt_wav is None:
-            prompt_cache_id = previous.prompt_cache_id
-            prompt_wav = previous.prompt_wav
-        elif reference is not None:
-            prompt_cache_id, prompt_wav = self._write_reference_prompt(
-                state_id,
-                reference,
-                meta.get("ref_audio_sr"),
-            )
-        else:
-            prompt_cache_id = str(explicit_prompt_id or self._default_prompt_id)
-            prompt_wav = str(explicit_prompt_wav or self._default_prompt_wav)
-
+        prompt_cache_id, prompt_wav, runtime_prompt_key = self._resolve_prompt(
+            state_id,
+            info,
+            meta,
+            previous,
+        )
         if previous is not None and prompt_cache_id != previous.prompt_cache_id:
             raise _batch_error(
                 "prompt_changed_midstream",
@@ -338,8 +381,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 expected=previous.prompt_wav,
                 actual=prompt_wav,
             )
-        duplex_turn_id = _scalar(meta.get("duplex_turn_id"))
-        duplex_epoch = _scalar(meta.get("duplex_epoch"))
+        segment_text = _scalar(meta.get("native_duplex_segment_text"), "")
+        if not isinstance(segment_text, str):
+            segment_text = ""
         return _WorkItem(
             output_index=index,
             state_id=state_id,
@@ -351,9 +395,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             last_chunk=last_chunk,
             tokens=tokens,
             previous=previous,
-            segment_text=str(_scalar(meta.get("native_duplex_segment_text"), "")),
-            duplex_turn_id=int(duplex_turn_id) if duplex_turn_id is not None else None,
-            duplex_epoch=int(duplex_epoch) if duplex_epoch is not None else None,
+            runtime_prompt_key=runtime_prompt_key,
+            native_duplex=bool(_scalar(meta.get("native_duplex"), False)),
+            duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
+            duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
+            segment_text=segment_text,
+            tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
         )
@@ -371,6 +418,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             int(item.tokens.numel()),
             cache_signature,
             item.last_chunk,
+            item.tts_is_last_chunk,
             item.cache_epoch,
         )
 
@@ -435,27 +483,45 @@ class MiniCPMO45Code2Wav(nn.Module):
                 request_ids=len(state_ids),
             )
         items: list[_WorkItem] = []
-        for index, (state_id, segment, info) in enumerate(
-            zip(state_ids, segments, runtime_additional_information, strict=True)
-        ):
-            if not isinstance(info, Mapping):
-                raise _batch_error(
-                    "invalid_runtime_info",
-                    output_index=index,
-                    value_type=type(info).__name__,
-                )
-            items.append(self._parse_item(index, str(state_id), segment, info))
+        try:
+            for index, (state_id, segment, info) in enumerate(
+                zip(state_ids, segments, runtime_additional_information, strict=True)
+            ):
+                if not isinstance(info, Mapping):
+                    raise _batch_error(
+                        "invalid_runtime_info",
+                        output_index=index,
+                        value_type=type(info).__name__,
+                    )
+                items.append(self._parse_item(index, str(state_id), segment, info))
+        except Exception:
+            self._prune_unowned_runtime_prompts()
+            raise
         state_ids = [item.state_id for item in items]
         if len(state_ids) != len(set(state_ids)):
+            self._prune_unowned_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
+        segment_markers = [
+            item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
+        ]
         compute_items = [item for item in items if item.tokens.numel() > 0]
         invalid_empty = [
-            item.request_id for item in items if item.has_payload and not item.last_chunk and item.tokens.numel() == 0
+            item.request_id
+            for item in items
+            if item.has_payload
+            and not item.last_chunk
+            and not item.tts_is_last_chunk
+            and item.tokens.numel() == 0
         ]
         if invalid_empty:
+            self._prune_unowned_runtime_prompts()
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
+        missing_marker_state = [item.request_id for item in segment_markers if item.previous is None]
+        if missing_marker_state:
+            self._prune_unowned_runtime_prompts()
+            raise _batch_error("empty_segment_without_state", request_ids=missing_marker_state)
 
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
@@ -470,6 +536,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             if len(bucket) < self._min_batch_size
         ]
         if undersized:
+            self._prune_unowned_runtime_prompts()
             raise _batch_error(
                 "exact_shape_bucket_below_minimum",
                 minimum=self._min_batch_size,
@@ -477,6 +544,19 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
 
         pending: dict[str, _RequestState | None] = {item.state_id: None for item in sentinels}
+        pending.update(
+            {
+                item.state_id: _RequestState(
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=item.chunk_seq,
+                    prompt_cache_id=item.prompt_cache_id,
+                    prompt_wav=item.prompt_wav,
+                    token2wav=item.previous.token2wav,
+                )
+                for item in segment_markers
+                if item.previous is not None
+            }
+        )
         for bucket in buckets.values():
             batch_size = len(bucket)
             try:
@@ -494,8 +574,10 @@ class MiniCPMO45Code2Wav(nn.Module):
                     features,
                     states,
                     last_chunk=bucket[0].last_chunk,
+                    flush_encoder=bucket[0].tts_is_last_chunk,
                 )
             except Exception as exc:
+                self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
                 raise _batch_error(
@@ -505,6 +587,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     error=str(exc),
                 ) from exc
             if len(audios) != batch_size or len(next_states) != batch_size:
+                self._prune_unowned_runtime_prompts()
                 raise _batch_error(
                     "backend_result_size_mismatch",
                     expected=batch_size,
@@ -525,10 +608,10 @@ class MiniCPMO45Code2Wav(nn.Module):
                     )
                 )
 
+        self._commit_runtime_prompt_owners(items)
         for request_id, state in pending.items():
             if state is None:
                 self._states.pop(request_id, None)
-                self._release_prompt(request_id)
             else:
                 self._states[request_id] = state
         sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
@@ -537,24 +620,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             multimodal_outputs={
                 "model_outputs": outputs,
                 "sr": [sample_rate_tensor.clone() for _ in outputs],
+                # Generation runner wire payloads are flat and tensor-only.
+                # Dotted metadata keys are unflattened again by the output
+                # processor before the full-duplex data plane consumes them.
+                "meta.native_duplex": [torch.tensor(item.native_duplex, dtype=torch.bool) for item in items],
+                "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
+                "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [
                     torch.tensor(list(item.segment_text.encode("utf-8")), dtype=torch.uint8) for item in items
                 ],
-                "meta.tts_is_last_chunk": [torch.tensor(item.last_chunk, dtype=torch.bool) for item in items],
+                "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
-                "meta.duplex_turn_id": [
-                    torch.tensor(item.duplex_turn_id, dtype=torch.int64)
-                    if item.duplex_turn_id is not None
-                    else torch.empty(0, dtype=torch.int64)
-                    for item in items
-                ],
-                "meta.duplex_epoch": [
-                    torch.tensor(item.duplex_epoch, dtype=torch.int64)
-                    if item.duplex_epoch is not None
-                    else torch.empty(0, dtype=torch.int64)
-                    for item in items
-                ],
             },
         )
 
@@ -562,7 +639,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._states.pop(state_id, None)
-            self._release_prompt(state_id)
+            self._release_request_prompt(state_id)
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
