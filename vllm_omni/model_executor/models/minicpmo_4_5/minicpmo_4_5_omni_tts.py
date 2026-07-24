@@ -373,6 +373,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise RuntimeError(
                 f"MiniCPM-o continuous Talker received {len(sample_eligible)} sampling flags for {len(infos)} requests"
             )
+        emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
 
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
@@ -385,39 +386,47 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
-            duplex_info = info_dict.get("duplex")
-            if not isinstance(duplex_info, dict):
-                duplex_info = {}
-            meta_info = info_dict.get("meta")
-            if not isinstance(meta_info, dict):
-                meta_info = {}
             native_duplex = info_dict.get("native_duplex") is True
-            epoch = duplex_info.get("epoch", -1)
-            turn_id = duplex_info.get("turn_id", -1)
-            segment_text = meta_info.get("native_duplex_segment_text", "")
-            if not isinstance(segment_text, str):
-                segment_text = ""
-            turn_eos_id = meta_info.get("turn_eos_token_id")
-            ids_info = info_dict.get("ids")
-            tts_ids = ids_info.get("tts") if isinstance(ids_info, dict) else None
-            if isinstance(tts_ids, torch.Tensor):
-                contains_turn_eos = isinstance(turn_eos_id, int) and bool(
-                    torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
+            if emit_duplex_metadata:
+                duplex_info = info_dict.get("duplex")
+                if not isinstance(duplex_info, dict):
+                    duplex_info = {}
+                epoch = duplex_info.get("epoch", -1)
+                turn_id = duplex_info.get("turn_id", -1)
+                if native_duplex and not all(
+                    isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
+                ):
+                    raise RuntimeError(
+                        "MiniCPM-o native duplex Talker requires non-negative integer "
+                        f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
+                    )
+                meta_info = info_dict.get("meta")
+                if not isinstance(meta_info, dict):
+                    meta_info = {}
+                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
+                if not isinstance(segment_text, str):
+                    segment_text = ""
+                turn_eos_id = meta_info.get("turn_eos_token_id")
+                ids_info = info_dict.get("ids")
+                tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
+                if isinstance(tts_ids, torch.Tensor):
+                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
+                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
+                    )
+                elif isinstance(tts_ids, (list, tuple)):
+                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+                else:
+                    contains_turn_eos = False
+                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
+                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
+                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                segment_texts_utf8.append(
+                    torch.tensor(
+                        list(segment_text.encode("utf-8")),
+                        dtype=torch.uint8,
+                    )
                 )
-            elif isinstance(tts_ids, (list, tuple)):
-                contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
-            else:
-                contains_turn_eos = False
-            native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-            duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
-            duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
-            segment_texts_utf8.append(
-                torch.tensor(
-                    list(segment_text.encode("utf-8")),
-                    dtype=torch.uint8,
-                )
-            )
-            turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
                 stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
@@ -485,16 +494,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
+        meta_outputs = {"finished": terminal_flags}
+        if emit_duplex_metadata:
+            meta_outputs.update(
+                {
+                    "native_duplex": native_duplex_flags,
+                    "duplex_epoch": duplex_epochs,
+                    "duplex_turn_id": duplex_turn_ids,
+                    "llm_output_text_utf8": segment_texts_utf8,
+                    "turn_end": turn_end_flags,
+                }
+            )
         multimodal_outputs: dict[str, Any] = {
             "codes": {"audio": codec_deltas},
-            "meta": {
-                "finished": terminal_flags,
-                "native_duplex": native_duplex_flags,
-                "duplex_epoch": duplex_epochs,
-                "duplex_turn_id": duplex_turn_ids,
-                "llm_output_text_utf8": segment_texts_utf8,
-                "turn_end": turn_end_flags,
-            },
+            "meta": meta_outputs,
         }
         return OmniOutput(
             text_hidden_states=hidden,

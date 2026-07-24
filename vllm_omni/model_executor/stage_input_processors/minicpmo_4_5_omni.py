@@ -181,23 +181,6 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
     return _codec_scalars(pooling_output)
 
 
-def _metadata_value(multimodal_output: Any, key: str, default: Any = None) -> Any:
-    if not isinstance(multimodal_output, Mapping):
-        return default
-    meta = multimodal_output.get("meta")
-    if not isinstance(meta, Mapping):
-        return default
-    value = meta.get(key, default)
-    if isinstance(value, torch.Tensor):
-        flat = value.detach().cpu().reshape(-1)
-        return flat[0].item() if flat.numel() else default
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        if not value:
-            return default
-        return _metadata_value({"meta": {key: value[0]}}, key, default)
-    return value
-
-
 def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
     request_payload = getattr(transfer_manager, "request_payload", None)
     if isinstance(request_payload, dict):
@@ -229,14 +212,15 @@ def tts2code2wav_async_chunk(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     internal_id = str(internal_id if internal_id is not None else request_id)
-    native_duplex = bool(_metadata_value(multimodal_output, "native_duplex", False))
-    duplex_epoch = _coerce_int(_metadata_value(multimodal_output, "duplex_epoch"))
-    duplex_turn_id = _coerce_int(_metadata_value(multimodal_output, "duplex_turn_id"))
     output_meta = multimodal_output.get("meta") if isinstance(multimodal_output, Mapping) else None
-    segment_text_utf8 = output_meta.get("llm_output_text_utf8") if isinstance(output_meta, Mapping) else None
+    output_meta = output_meta if isinstance(output_meta, Mapping) else {}
+    native_duplex = bool(_coerce_int(output_meta.get("native_duplex")))
+    duplex_epoch = _coerce_int(output_meta.get("duplex_epoch"))
+    duplex_turn_id = _coerce_int(output_meta.get("duplex_turn_id"))
+    segment_text_utf8 = output_meta.get("llm_output_text_utf8")
     if not isinstance(segment_text_utf8, torch.Tensor):
         segment_text_utf8 = None
-    turn_end = bool(_metadata_value(multimodal_output, "turn_end", False))
+    turn_end = bool(_coerce_int(output_meta.get("turn_end")))
     duplex_turn_key = (duplex_epoch, duplex_turn_id)
 
     request_payload = getattr(transfer_manager, "request_payload", None)

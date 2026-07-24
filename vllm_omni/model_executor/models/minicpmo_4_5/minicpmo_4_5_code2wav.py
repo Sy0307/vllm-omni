@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -109,6 +110,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._states: dict[str, _RequestState] = {}
         self._runtime_prompts: dict[str, _RuntimePrompt] = {}
         self._request_prompt_keys: dict[str, str] = {}
+        self._runtime_prompt_dir = tempfile.TemporaryDirectory(
+            prefix="minicpmo45-runtime-prompts-",
+        )
         extra = self._extra_config()
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
@@ -140,7 +144,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self,
         ref_audio: Any,
         sample_rate: Any,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
         waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
@@ -155,15 +159,31 @@ class MiniCPMO45Code2Wav(nn.Module):
         digest.update(str(sample_rate_hz).encode())
         cache_key = digest.hexdigest()
         cache_id = f"runtime-ref-{cache_key[:24]}-{sample_rate_hz}"
-        path = str(Path(tempfile.gettempdir()) / f"minicpmo45_ref_{cache_key[:24]}_{sample_rate_hz}.wav")
+        path = str(Path(self._runtime_prompt_dir.name) / f"minicpmo45_ref_{cache_key[:24]}_{sample_rate_hz}.wav")
         entry = self._runtime_prompts.get(cache_key)
         if entry is None:
             entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
             self._runtime_prompts[cache_key] = entry
         prompt_path = Path(entry.path)
         if not prompt_path.is_file():
-            sf.write(prompt_path, waveform.numpy(), sample_rate_hz)
-        return cache_key, entry.cache_id, entry.path
+            with tempfile.NamedTemporaryFile(
+                dir=prompt_path.parent,
+                prefix=f".{prompt_path.stem}-",
+                suffix=".wav",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+            try:
+                sf.write(
+                    temporary_path,
+                    waveform.numpy(),
+                    sample_rate_hz,
+                    format="WAV",
+                )
+                os.replace(temporary_path, prompt_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        return cache_key, entry
 
     def _resolve_prompt(
         self,
@@ -175,11 +195,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         codes = info.get("codes")
         ref_audio = codes.get("ref") if isinstance(codes, Mapping) else None
         if ref_audio is not None:
-            cache_key, cache_id, path = self._materialize_runtime_prompt(
+            cache_key, entry = self._materialize_runtime_prompt(
                 ref_audio,
                 meta.get("ref_audio_sr"),
             )
-            return cache_id, path, cache_key
+            return entry.cache_id, entry.path, cache_key
 
         if previous is not None:
             return previous.prompt_cache_id, previous.prompt_wav, self._request_prompt_keys.get(state_id)

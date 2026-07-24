@@ -302,8 +302,8 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
 
 
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
-    model, _ = _model()
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model()
     reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
 
     first = _info("voice-a", 0, [10, 11])
@@ -332,6 +332,62 @@ def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_pa
     model.on_requests_finished(["internal-b"])
     assert not prompt_path.exists()
     assert prompt_key not in model._runtime_prompts
+
+
+def test_runtime_prompt_write_failure_does_not_publish_partial_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model()
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    def fail_after_partial_write(path, *_args, **_kwargs):
+        Path(path).write_bytes(b"partial")
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav.sf.write",
+        fail_after_partial_write,
+    )
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        model._materialize_runtime_prompt(reference, 16000)
+
+    assert len(model._runtime_prompts) == 1
+    entry = next(iter(model._runtime_prompts.values()))
+    assert not Path(entry.path).exists()
+    assert list(Path(entry.path).parent.iterdir()) == []
+
+
+def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    first_model, _ = _model()
+    second_model, _ = _model()
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    def runtime_ref_info(request_id: str):
+        info = _info(request_id, 0, [10, 11])
+        info["codes"]["ref"] = reference
+        info["meta"]["ref_audio_sr"] = 16000
+        info["meta"].pop("prompt_cache_id")
+        return info
+
+    _forward(first_model, [runtime_ref_info("voice-a")], request_ids=["internal-a"])
+    _forward(second_model, [runtime_ref_info("voice-b")], request_ids=["internal-b"])
+
+    first_key = first_model._request_prompt_keys["internal-a"]
+    second_key = second_model._request_prompt_keys["internal-b"]
+    first_path = Path(first_model._runtime_prompts[first_key].path)
+    second_path = Path(second_model._runtime_prompts[second_key].path)
+    assert first_key == second_key
+    assert first_path != second_path
+    assert first_path.is_file()
+    assert second_path.is_file()
+
+    first_model.on_requests_finished(["internal-a"])
+    assert not first_path.exists()
+    assert second_path.is_file()
+
+    second_model.on_requests_finished(["internal-b"])
+    assert not second_path.exists()
 
 
 def test_mixed_final_exact_buckets_keep_order_and_release_only_final_states():
