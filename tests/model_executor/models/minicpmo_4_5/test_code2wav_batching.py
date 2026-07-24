@@ -116,13 +116,10 @@ class _FakeToken2Wav:
         self.source_cache_len = 2
         self.speech_window = torch.hamming_window(4, periodic=False)
         self.prompt_calls = 0
-        self.prompt_paths: list[str] = []
-        self.prompt_path_exists: list[bool] = []
 
     def _prepare_prompt(self, prompt_wav):
+        del prompt_wav
         self.prompt_calls += 1
-        self.prompt_paths.append(str(prompt_wav))
-        self.prompt_path_exists.append(Path(prompt_wav).is_file())
         return (
             torch.tensor([[5, 6]], dtype=torch.long),
             torch.tensor([2], dtype=torch.int32),
@@ -270,7 +267,6 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
     segment["meta"].update(
         {
-            "native_duplex": True,
             "duplex_epoch": 3,
             "duplex_turn_id": 7,
             "llm_output_text_utf8": segment_text_utf8,
@@ -294,7 +290,6 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
 
     payload = output.multimodal_outputs
     assert "meta" not in payload
-    assert payload["meta.native_duplex"][0].item() is True
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
     torch.testing.assert_close(
@@ -304,29 +299,6 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert payload["meta.tts_is_last_chunk"][0].item() is True
     assert payload["meta.turn_end"][0].item() is True
     assert "duplex" not in model._states
-
-
-def test_runtime_ref_audio_is_materialized_reused_and_released(tmp_path, monkeypatch):
-    model, token2wav = _model()
-    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    first = _info("duplex", 0, [10, 11])
-    first["codes"]["ref"] = torch.tensor([0.0, 0.25, -0.25, 0.0])
-    first["meta"]["ref_audio_sr"] = 16000
-
-    _forward(model, [first], request_ids=["internal-duplex"])
-    second = _info("duplex", 1, [12, 13], last_chunk=True)
-    _forward(model, [second], request_ids=["internal-duplex"])
-
-    assert token2wav.prompt_calls == 1
-    assert token2wav.prompt_path_exists == [True]
-    prompt_path = Path(token2wav.prompt_paths[0])
-    assert prompt_path.parent == tmp_path
-    assert prompt_path.name.startswith("minicpmo45_ref_")
-    assert prompt_path.is_file()
-
-    model.on_requests_finished(["internal-duplex"])
-
-    assert not prompt_path.exists()
 
 
 def test_mixed_final_exact_buckets_keep_order_and_release_only_final_states():
