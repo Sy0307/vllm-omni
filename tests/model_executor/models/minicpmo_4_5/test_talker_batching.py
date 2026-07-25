@@ -332,6 +332,26 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
     assert decode_embeds.shape == (1, 4)
 
 
+def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    condition = torch.arange(18, dtype=torch.float32).reshape(9, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=condition)
+
+    _, embeds, _ = talker.preprocess(
+        torch.zeros(9, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=59,
+        _omni_prompt_len=68,
+        request_id="req-chunked-prefill",
+        tts_token_ids=torch.tensor([1]),
+        tts_hidden_states=torch.ones(1, 2),
+    )
+
+    assert torch.equal(embeds, condition)
+
+
 def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:
     talker = _make_talker()
     talker._request_generators["req-done"] = torch.Generator()

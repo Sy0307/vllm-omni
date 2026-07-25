@@ -283,16 +283,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
             full_embeds = self._build_condition_embeddings(token_ids, hidden_states)
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
-            if offset == 0 and span_len > full_embeds.shape[0]:
-                # Async-chunk prewarms Stage 1 with placeholder token IDs. Two
-                # Thinker handoffs can arrive before the first one executes,
-                # so the scheduler prompt may already include the newer
-                # placeholder prefix while additional_information still
-                # carries the preceding condition. Materialize that prefix as
-                # the embeddings of its actual zero token IDs and keep the
-                # complete Talker condition tail-aligned (audio BOS remains
-                # the final prefill token).
-                prefix_len = span_len - full_embeds.shape[0]
+            # The handoff rebuilds only the tail-aligned Talker condition.
+            # Materialize zero-token embeddings for any scheduler prompt
+            # prefix so chunked prefill can slice from a non-zero offset.
+            prompt_len = info_dict.get("_omni_prompt_len")
+            target_len = int(prompt_len) if prompt_len is not None else offset + span_len
+            prefix_len = target_len - full_embeds.shape[0]
+            if prefix_len > 0:
                 placeholder_ids = torch.zeros(
                     prefix_len,
                     dtype=torch.long,
