@@ -503,10 +503,24 @@ class DuplexSessionRunnerMixin:
             clear_completed_pending_silence()
             pending_silence = native.pending_silence_task
             if pending_silence is not None and not pending_silence.done():
-                return False
-            if actor.native_append_tail is not None and not actor.native_append_tail.done():
-                return False
-            if real_native_input_waiting():
+                if pending_silence is asyncio.current_task():
+                    return False
+                try:
+                    if not await pending_silence:
+                        return False
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    return False
+                except Exception:
+                    return False
+                clear_completed_pending_silence()
+                pending_silence = native.pending_silence_task
+                if pending_silence is not None and not pending_silence.done():
+                    return False
+            append_tail = actor.native_append_tail
+            if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
 
             def _still_valid() -> bool:
