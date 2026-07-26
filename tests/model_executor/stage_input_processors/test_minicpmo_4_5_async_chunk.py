@@ -129,6 +129,32 @@ def test_short_final_flushes_silence_prefix_and_tail() -> None:
     assert final.meta.finished.item() is True
 
 
+def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+
+    body = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(25), turn_end=True),
+        request,
+        False,
+    )
+    final = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(turn_end=True),
+        request,
+        True,
+    )
+
+    assert body is not None
+    assert body.meta.last_chunk is False
+    assert body.meta.turn_end is False
+    assert final is not None
+    assert _codes(final) == [22, 23, 24]
+    assert final.meta.last_chunk is True
+    assert final.meta.turn_end is True
+
+
 def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     manager = _manager()
     request = _request("req")

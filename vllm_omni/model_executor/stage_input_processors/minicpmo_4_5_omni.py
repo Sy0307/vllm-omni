@@ -349,7 +349,7 @@ def tts2code2wav_async_chunk(
             duplex_turn_id=duplex_turn_id,
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
-            turn_end=turn_end,
+            turn_end=turn_end and last_chunk,
             ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
@@ -523,7 +523,7 @@ def _native_duplex_segment_output_ids(
     streaming_context,
     *,
     request_id: str,
-) -> tuple[list[int], str]:
+) -> tuple[list[int], str, bool]:
     """Slice the cumulative thinker output down to the current segment.
 
     Tracks how many output tokens were already handed to the talker in the
@@ -532,7 +532,7 @@ def _native_duplex_segment_output_ids(
     """
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
-        return output_ids, output_text
+        return output_ids, output_text, True
     state = bridge_states.setdefault("minicpmo45_tts_handoff", {})
     duplex_state = bridge_states.get("duplex")
     turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id")) if isinstance(duplex_state, dict) else None
@@ -542,17 +542,12 @@ def _native_duplex_segment_output_ids(
         state["request_id"] = request_id
         state["sent_output_len"] = 0
         state["sent_output_ids"] = []
-        state["acc_tts_ids"] = []
-        state["acc_tts_hidden"] = []
+    previous_turn_id = state.get("turn_id")
     sent_len = state.get("sent_output_len", 0)
     prev_output_ids = state.get("sent_output_ids", [])
-    prev_turn_id = state.get("turn_id")
     if not isinstance(sent_len, int) or sent_len < 0 or sent_len > len(output_ids):
-        # Shrunken cumulative output = epoch reset after barge-in: the talker
-        # condition history is stale too.
+        # Shrunken cumulative output = epoch reset after barge-in.
         sent_len = 0
-        state["acc_tts_ids"] = []
-        state["acc_tts_hidden"] = []
     elif sent_len and isinstance(prev_output_ids, list):
         prev_prefix = prev_output_ids[:sent_len]
         current_prefix = output_ids[:sent_len]
@@ -561,15 +556,7 @@ def _native_duplex_segment_output_ids(
             # others keep returning cumulative ids. Detect restart from the
             # token prefix instead of clearing the cursor at turn_eos.
             sent_len = 0
-            state["acc_tts_ids"] = []
-            state["acc_tts_hidden"] = []
-    if isinstance(prev_turn_id, int) and isinstance(turn_id, int) and prev_turn_id != turn_id:
-        # The thinker output list is cumulative across clean turns, so the
-        # output cursor must stay put. The talker condition is per assistant
-        # turn, though; carrying it across turn_id boundaries makes stage 1
-        # replay the previous turn after its consumed cursor has been reset.
-        state["acc_tts_ids"] = []
-        state["acc_tts_hidden"] = []
+    turn_start = sent_len == 0 or previous_turn_id != turn_id
     segment_ids = output_ids[sent_len:]
     decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
     if isinstance(decode_token_ids, Callable):
@@ -596,22 +583,7 @@ def _native_duplex_segment_output_ids(
     state["sent_output_len"] = len(output_ids)
     state["sent_output_ids"] = list(output_ids)
     state["turn_id"] = turn_id
-    return segment_ids, segment_text
-
-
-def _reset_native_tts_handoff(streaming_context) -> None:
-    bridge_states = getattr(streaming_context, "bridge_states", None)
-    if not isinstance(bridge_states, dict):
-        return
-    state = bridge_states.get("minicpmo45_tts_handoff")
-    if not isinstance(state, dict):
-        return
-    # Keep the output cursor: the thinker can keep reporting cumulative
-    # output after turn_eos on the same resumable request. If a runtime really
-    # restarts token ids, _native_duplex_segment_output_ids detects the prefix
-    # mismatch and resets the slice cursor there.
-    state["acc_tts_ids"] = []
-    state["acc_tts_hidden"] = []
+    return segment_ids, segment_text, turn_start
 
 
 def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
@@ -642,32 +614,6 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     if isinstance(runtime_config, dict):
         metadata["runtime_config"] = dict(runtime_config)
     return metadata
-
-
-def _accumulate_native_tts_handoff(streaming_context, new_ids, new_hidden):
-    """Hand the talker the FULL accumulated condition on every handoff.
-
-    The runner's streaming buffer update is not merge-safe for a resumable
-    stage-1 request: in-place updates merge sub-keys, but a resume prefill
-    REPLACES the buffer, silently dropping every earlier segment's tts
-    tokens/hiddens (observed losing alternating reply segments — the talker
-    vocalized text it never saw between islands it did). Accumulate here so
-    the latest handoff always carries the complete history and downstream
-    replace semantics are lossless; the talker consumes by cursor.
-    """
-    bridge_states = getattr(streaming_context, "bridge_states", None)
-    if not isinstance(bridge_states, dict):
-        return new_ids, new_hidden
-    state = bridge_states.setdefault("minicpmo45_tts_handoff", {})
-    acc_ids = state.setdefault("acc_tts_ids", [])
-    acc_hidden = state.setdefault("acc_tts_hidden", [])
-    if new_ids:
-        acc_ids.extend(int(t) for t in new_ids)
-        if new_hidden:
-            acc_hidden.extend(new_hidden)
-    if not acc_ids:
-        return None, None
-    return list(acc_ids), list(acc_hidden)
 
 
 def _build_tts_scheduler_prompt_token_ids(
@@ -744,6 +690,7 @@ def llm2tts(
         # buffer overflows.
         llm_output_ids = list(llm_output_ids)
         thinker_text = getattr(output, "text", "") or ""
+        native_turn_start = False
         if _has_native_duplex_prompt_metadata(mm_output):
             # The thinker's resumable duplex request reports cumulative
             # output ids/text, but earlier segments are already folded into
@@ -753,7 +700,7 @@ def llm2tts(
             # alignment holds, the talker prompt grows linearly with new
             # tokens instead of quadratically, and downstream transcripts
             # carry per-unit deltas instead of re-sending the whole reply.
-            llm_output_ids, thinker_text = _native_duplex_segment_output_ids(
+            llm_output_ids, thinker_text, native_turn_start = _native_duplex_segment_output_ids(
                 llm_output_ids,
                 thinker_text,
                 _streaming_context,
@@ -921,6 +868,7 @@ def llm2tts(
                 # The talker detects turn end from <|turn_eos|> inside the
                 # handed condition (official conditions on its embedding).
                 meta["turn_eos_token_id"] = int(turn_eos_id)
+            meta["turn_start"] = native_turn_start
             if native_segment_end:
                 meta["segment_end"] = True
         req_mm_data = multi_modal_data.get(llm_output.request_id)
@@ -938,24 +886,22 @@ def llm2tts(
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
-            handoff_ids, handoff_hidden = _accumulate_native_tts_handoff(
-                _streaming_context,
-                handoff_ids,
-                handoff_hidden,
-            )
             if not handoff_ids:
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
-            _reset_native_tts_handoff(_streaming_context)
 
         if handoff_ids is not None and handoff_hidden is not None:
-            condition_length = max(len(handoff_ids), len(handoff_hidden)) + 2
+            condition_suffix_length = 1 if is_native_duplex_handoff else 2
+            condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
-            handoff_meta["replace_streaming_prompt"] = True
             handoff_meta["next_stage_prompt_len"] = condition_length
+            # Native duplex resumes one Talker request within a turn, but a new
+            # assistant turn must discard the previous turn's prompt and KV.
+            if not is_native_duplex_handoff or native_turn_start:
+                handoff_meta["replace_streaming_prompt"] = True
         else:
             scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(
                 tts_token_ids_slice,

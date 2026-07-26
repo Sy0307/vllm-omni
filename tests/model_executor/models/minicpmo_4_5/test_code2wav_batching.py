@@ -214,6 +214,18 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache1[0, 0, 0, 0, 0].item() == 20
 
 
+def test_fade_in_out_limits_overlap_to_available_previous_audio():
+    speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
+    previous = torch.full((1, 3), 2.0)
+    window = torch.hamming_window(8, periodic=False)
+
+    actual = BatchedToken2Wav._fade_in_out(speech, previous, window)
+
+    expected = speech.clone()
+    expected[..., :3] = speech[..., :3] * window[:3] + previous * window[-3:]
+    torch.testing.assert_close(actual, expected)
+
+
 def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav)
@@ -278,7 +290,9 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     segment_output = _forward(model, [segment])
 
     assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
-    assert token2wav.flow.encoder.last_chunk_calls[-1] is True
+    # A Talker unit boundary only drains pending codec tokens. The official
+    # streaming path keeps Token2wav open until the assistant turn ends.
+    assert token2wav.flow.encoder.last_chunk_calls[-1] is False
     assert "duplex" in model._states
 
     final = _info("duplex", 1, [12, 13], last_chunk=True)
@@ -298,6 +312,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     )
     assert payload["meta.tts_is_last_chunk"][0].item() is True
     assert payload["meta.turn_end"][0].item() is True
+    assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
 
 
