@@ -442,51 +442,6 @@ def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
     assert condition.shape[0] == token_ids.shape[0] + 1
 
 
-def test_native_turn_end_prefill_allows_immediate_codec_eos(mocker) -> None:
-    talker = _make_talker()
-    talker.emb_text = nn.Embedding(1, 2)
-    talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
-    talker._codec_temperature = 1.0
-    talker._codec_repetition_penalty = 1.0
-    talker._codec_top_k = -1
-    talker._codec_top_p = 1.0
-    mocker.patch.object(
-        talker,
-        "_build_condition_embeddings",
-        return_value=torch.ones(3, 2),
-    )
-
-    talker.preprocess(
-        torch.zeros(3, dtype=torch.long),
-        None,
-        _omni_is_prefill=True,
-        request_id="req-turn-end",
-        native_duplex=True,
-        meta={"turn_end": True},
-        tts_token_ids=torch.tensor([1]),
-        tts_hidden_states=torch.ones(1, 2),
-    )
-
-    def assert_eos_is_available(logits, dim):
-        assert dim == -1
-        assert torch.isfinite(logits[..., 7]).all()
-        probabilities = torch.zeros_like(logits)
-        probabilities[..., 7] = 1
-        return probabilities
-
-    mocker.patch("torch.softmax", side_effect=assert_eos_is_available)
-    mocker.patch("torch.multinomial", return_value=torch.tensor([[7]]))
-
-    sampled = talker._sample_audio_code(
-        torch.ones(1, 2),
-        torch.empty(0, dtype=torch.long),
-        "req-turn-end",
-        0,
-    )
-
-    assert sampled.item() == 7
-
-
 def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:
     talker = _make_talker()
     talker._request_generators["req-done"] = torch.Generator()

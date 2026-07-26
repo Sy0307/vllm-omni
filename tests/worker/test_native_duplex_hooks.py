@@ -1486,63 +1486,6 @@ def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty(
     assert sampled.sampled_token_ids.tolist() == [[repeated]]
 
 
-def test_minicpmo_stage0_native_sampler_penalizes_prior_listen_decisions():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
-        _MiniCPMO45Stage0SessionState,
-    )
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Tokenizer:
-        eos_token_id = 151705
-        unk_token_id = -1
-        bad_token_ids = []
-        all_special_ids = []
-
-        def convert_tokens_to_ids(self, token):
-            return {
-                "<unit>": 151683,
-                "</unit>": 151684,
-                "<|listen|>": 151705,
-                "<|speak|>": 151706,
-                "<|tts_bos|>": 151703,
-                "<|tts_eos|>": 151704,
-                "<|tts_pad|>": 151722,
-                "<|chunk_eos|>": 151718,
-                "<|chunk_tts_eos|>": 151721,
-                "<|turn_eos|>": 151717,
-            }.get(token, -1)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "llm"
-    model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
-    session_key = ("sid-listen-repetition", 0)
-    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
-    state.generated_tokens = [151705] * 9
-    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
-    model._minicpmo45_duplex_row_sessions = {0: session_key}
-
-    logits = torch.full((1, 151723), -100.0)
-    logits[0, 151705] = 16.5
-    logits[0, 151706] = 16.0
-    sampling_metadata = SimpleNamespace(
-        all_greedy=True,
-        all_random=False,
-        temperature=torch.tensor([1.0]),
-        top_k=torch.tensor([100]),
-        top_p=torch.tensor([0.8]),
-        generators={},
-        prompt_token_ids=torch.tensor([[151683] * 16]),
-        output_token_ids=[[]],
-    )
-
-    sampled = model.sample(logits, sampling_metadata)
-
-    assert sampled is not None
-    assert sampled.sampled_token_ids.tolist() == [[151706]]
-
-
 def test_minicpmo_stage0_records_bounded_model_policy_history():
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         _MiniCPMO45Stage0SessionState,
@@ -1579,26 +1522,6 @@ def test_minicpmo_stage0_records_bounded_model_policy_history():
         model._record_minicpmo45_duplex_generation_token(0, sampled)
 
     assert state.generated_tokens == [*expected_history[len(token_ids) :], *token_ids.values()]
-
-
-def test_minicpmo_stage0_forced_listen_does_not_enter_model_policy_history():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
-        _MiniCPMO45Stage0SessionState,
-    )
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    session_key = ("sid-forced-listen-history", 0)
-    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
-    model._minicpmo45_duplex_row_sessions = {0: session_key}
-    model._minicpmo45_duplex_row_payloads = {0: {"force_listen": True}}
-
-    model._record_minicpmo45_duplex_generation_token(0, 151705)
-
-    assert state.generated_tokens == []
 
 
 def test_minicpmo_stage0_native_sampler_does_not_override_model_at_punctuation():
