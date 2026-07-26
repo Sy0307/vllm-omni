@@ -325,6 +325,70 @@ def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     assert second.meta.is_segment_finished.item() is False
 
 
+def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+
+    first = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(10, 11, 12, text="first"),
+        request,
+        True,
+    )
+    second = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(13, 14, text="first"),
+        request,
+        True,
+    )
+
+    assert first is not None
+    assert _codes(first) == [0]
+    assert first.meta.code_flat_numel == 0
+    assert first.meta.last_chunk is False
+    assert first.meta.tts_is_last_chunk is True
+    assert second is not None
+    assert _codes(second) == [4218, 4218, 4218, 10, 11, 12, 13, 14]
+    assert second.meta.code_flat_numel == 8
+    torch.testing.assert_close(
+        second.meta.llm_output_text_utf8,
+        torch.tensor(list(b"firstfirst"), dtype=torch.uint8),
+    )
+
+
+def test_duplex_empty_finish_callback_does_not_replay_previous_text() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+
+    first = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(25), text="first"),
+        request,
+        False,
+    )
+    boundary = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(text="first"),
+        request,
+        True,
+    )
+    second = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(25, 50), text="second"),
+        request,
+        False,
+    )
+
+    assert first is not None
+    assert boundary is not None
+    assert boundary.meta.code_flat_numel == 0
+    assert second is not None
+    torch.testing.assert_close(
+        second.meta.llm_output_text_utf8,
+        torch.tensor(list(b"second"), dtype=torch.uint8),
+    )
+
+
 def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     manager = _manager()
     request = _request("req-duplex")

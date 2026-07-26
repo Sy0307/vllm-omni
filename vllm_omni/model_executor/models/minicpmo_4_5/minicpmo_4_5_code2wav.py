@@ -536,10 +536,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
-        missing_marker_state = [item.request_id for item in segment_markers if item.previous is None]
-        if missing_marker_state:
-            self._prune_unowned_runtime_prompts()
-            raise _batch_error("empty_segment_without_state", request_ids=missing_marker_state)
 
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
@@ -575,6 +571,45 @@ class MiniCPMO45Code2Wav(nn.Module):
                 if item.previous is not None
             }
         )
+        initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
+        for item in segment_markers:
+            if item.previous is None:
+                initial_marker_buckets.setdefault(
+                    (item.prompt_cache_id, item.prompt_wav),
+                    [],
+                ).append(item)
+        for bucket in initial_marker_buckets.values():
+            try:
+                features = self.backend.prepare_prompt(
+                    bucket[0].prompt_cache_id,
+                    bucket[0].prompt_wav,
+                )
+                states = self.backend.setup_batch(features, len(bucket))
+            except Exception as exc:
+                self._prune_unowned_runtime_prompts()
+                if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
+                    raise
+                raise _batch_error(
+                    "backend_unsupported_or_failed",
+                    request_ids=[item.request_id for item in bucket],
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                ) from exc
+            if len(states) != len(bucket):
+                self._prune_unowned_runtime_prompts()
+                raise _batch_error(
+                    "backend_result_size_mismatch",
+                    expected=len(bucket),
+                    states=len(states),
+                )
+            for item, state in zip(bucket, states, strict=True):
+                pending[item.state_id] = _RequestState(
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=item.chunk_seq,
+                    prompt_cache_id=item.prompt_cache_id,
+                    prompt_wav=item.prompt_wav,
+                    token2wav=state,
+                )
         for bucket in buckets.values():
             batch_size = len(bucket)
             try:
