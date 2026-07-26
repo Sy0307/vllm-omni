@@ -71,6 +71,30 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
     request.update_block_hashes.assert_called_once_with()
 
 
+def test_streaming_payload_can_append_exact_prompt_length(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(
+        _all_token_ids=[0, 0, 7, 8],
+        _output_token_ids=[7, 8],
+        prompt_token_ids=[0, 0],
+        num_computed_tokens=4,
+        num_prompt_tokens=2,
+        update_block_hashes=mocker.Mock(),
+    )
+    payload = {
+        "ids": {"prompt": [1, 2, 3]},
+        "meta": {"next_stage_prompt_len": 3},
+    }
+
+    construct_next_stage_streaming_input_prompt(payload, request)
+
+    assert request.prompt_token_ids == [0, 0, 7, 8, 0, 0, 0]
+    assert request._all_token_ids == [0, 0, 7, 8, 0, 0, 0]
+    assert request._output_token_ids == []
+    assert request.num_computed_tokens == 4
+    assert request.num_prompt_tokens == 7
+    request.update_block_hashes.assert_called_once_with()
+
+
 @pytest.fixture
 def build_adapter(monkeypatch, mocker: MockerFixture):
     def _build(

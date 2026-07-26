@@ -35,7 +35,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
-    generated_text_tokens: list[int] = field(default_factory=list)
+    generated_tokens: list[int] = field(default_factory=list)
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -196,19 +196,15 @@ class MiniCPMO45Stage0DuplexRuntime:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 
-        # Consume every complete chunk in the buffer so the appended span and
-        # the scheduler's slot reservation for this append agree exactly. A
-        # final append may zero-pad a real residual chunk, but it must not add
-        # a whole silence unit after all input was already consumed: official
-        # duplex generation runs once per microphone unit and client commit is
-        # not an additional model decision.
+        # Consume every complete processor chunk in the buffer so the appended
+        # span and the scheduler's slot reservation agree exactly. The serving
+        # PCM buffer pads a final real residual before it reaches Stage0. Do not
+        # pad again here: the first processor chunk is hop-aligned below 1035ms
+        # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
         while True:
             if len(state.audio_buffer) < chunk_size:
-                if not final or len(state.audio_buffer) == 0:
-                    break
-                pad = np.zeros(chunk_size - len(state.audio_buffer), dtype=np.float32)
-                state.audio_buffer = np.concatenate([state.audio_buffer, pad])
+                break
             audio_chunk = state.audio_buffer[:chunk_size]
             batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx, processor=processor)
             for name, value in (
@@ -224,6 +220,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                 if units_built == 0:
                     return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
                 break
+            consumed_samples = self._consumed_audio_samples(
+                state.audio_chunk_idx,
+                chunk_size,
+                processor=processor,
+            )
             if state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
@@ -255,9 +256,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
             )
-            state.audio_buffer = state.audio_buffer[
-                self._consumed_audio_samples(state.audio_chunk_idx, chunk_size, processor=processor) :
-            ]
+            state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
             chunk_size = self._streaming_chunk_size(processor)

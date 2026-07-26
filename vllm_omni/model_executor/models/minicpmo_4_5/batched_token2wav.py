@@ -348,9 +348,16 @@ class BatchedToken2Wav(nn.Module):
         previous: torch.Tensor,
         window: torch.Tensor,
     ) -> torch.Tensor:
-        overlap = int(window.shape[0] // 2)
+        overlap = min(
+            int(window.shape[0] // 2),
+            int(speech.shape[-1]),
+            int(previous.shape[-1]),
+        )
         result = speech.clone()
-        result[..., :overlap] = result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[overlap:]
+        if overlap > 0:
+            result[..., :overlap] = (
+                result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
+            )
         return result
 
     def decode_batch(

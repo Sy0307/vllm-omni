@@ -592,7 +592,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                     features,
                     states,
                     last_chunk=bucket[0].last_chunk,
-                    flush_encoder=bucket[0].tts_is_last_chunk,
                 )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
