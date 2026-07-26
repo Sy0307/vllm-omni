@@ -206,6 +206,47 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     assert second_input["prompt_token_ids"] == [0, 0, 0]
 
 
+def test_native_duplex_transcript_decodes_the_talker_condition_slice() -> None:
+    prompt_ids = [101, 102]
+    metadata = {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    token_text = {21: "杭州", 22: "和", 23: "州和", 24: "上海之间", 25: "大"}
+
+    def output(token_ids: list[int]):
+        return _output(
+            prompt_ids=prompt_ids,
+            output_ids=token_ids,
+            latent=torch.zeros((len(prompt_ids) + len(token_ids), 1)),
+            multimodal_output={
+                "duplex_prompt_token_ids": prompt_ids,
+                "meta": metadata,
+            },
+        )
+
+    context = SimpleNamespace(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: "".join(token_text.get(int(token_id), "") for token_id in ids),
+    )
+    first_ids = [9304, 21, 22, 9308]
+    first_info = llm2tts([output(first_ids)], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    second_info = llm2tts(
+        [output([*first_ids, 23, 24, 25, 9308])],
+        prompt=[{}],
+        _streaming_context=context,
+    )[0]["model_intermediate_buffer"]
+
+    assert first_info["meta"]["native_duplex_segment_text"] == "杭州和"
+    assert second_info["ids"]["tts"] == [24, 25]
+    assert second_info["meta"]["native_duplex_segment_text"] == "上海之间大"
+
+
 def test_native_duplex_requires_tokenizer_boundary_metadata() -> None:
     latent = torch.zeros((3, 4))
     source = _output(

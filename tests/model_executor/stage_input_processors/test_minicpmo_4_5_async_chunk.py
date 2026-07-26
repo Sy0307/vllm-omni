@@ -389,6 +389,30 @@ def test_duplex_empty_finish_callback_does_not_replay_previous_text() -> None:
     )
 
 
+def test_duplex_short_tail_does_not_replay_previous_segment_text() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+
+    def chunk(codes, text: str, finished: bool):
+        return tts2code2wav_async_chunk(
+            manager,
+            _duplex_delta(*codes, text=text),
+            request,
+            finished,
+        )
+
+    first = chunk(range(25), "和上海之间", False)
+    first_tail = chunk([25, 26], "和上海之间", True)
+    assert first is not None
+    assert first.meta.llm_output_text_utf8.tolist() == list("和上海之间".encode())
+    assert first_tail is not None
+    assert first_tail.meta.code_flat_numel == 0
+    assert chunk([27, 28, 29], "的距离大约是", False) is None
+    next_flush = chunk([], "的距离大约是", True)
+    assert next_flush is not None
+    assert next_flush.meta.llm_output_text_utf8.tolist() == list("的距离大约是".encode())
+
+
 def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     manager = _manager()
     request = _request("req-duplex")
