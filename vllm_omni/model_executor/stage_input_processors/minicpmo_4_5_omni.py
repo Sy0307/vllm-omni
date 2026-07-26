@@ -267,6 +267,7 @@ def tts2code2wav_async_chunk(
             "internal_id": internal_id,
             "pending": [],
             "pending_text_utf8": [],
+            "segment_text_recorded": False,
             "left_context": [],
             "codec_end": 0,
         }
@@ -274,6 +275,17 @@ def tts2code2wav_async_chunk(
 
     pending = state["pending"]
     pending.extend(_extract_codec_delta(multimodal_output, request_id))
+    pending_text_utf8 = state.setdefault("pending_text_utf8", [])
+    current_text_utf8 = (
+        segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
+        if isinstance(segment_text_utf8, torch.Tensor)
+        else []
+    )
+    if native_duplex and current_text_utf8 and not state.get("segment_text_recorded", False):
+        # Talker repeats the unit text on every codec step. Queue it once for
+        # the first Code2Wav payload that can carry audio for this unit.
+        pending_text_utf8.extend(current_text_utf8)
+        state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
@@ -288,20 +300,6 @@ def tts2code2wav_async_chunk(
     new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
-    pending_text_utf8 = state.setdefault("pending_text_utf8", [])
-    current_text_utf8 = (
-        segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
-        if isinstance(segment_text_utf8, torch.Tensor)
-        else []
-    )
-    if hold_short_unit:
-        pending_text_utf8.extend(current_text_utf8)
-    elif pending_text_utf8:
-        segment_text_utf8 = torch.tensor(
-            [*pending_text_utf8, *current_text_utf8],
-            dtype=torch.uint8,
-        )
-        pending_text_utf8.clear()
     codec_start = int(state["codec_end"])
     codec_end = codec_start + new_token_count
 
@@ -321,6 +319,11 @@ def tts2code2wav_async_chunk(
         output_codes = []
     state["codec_end"] = codec_end
     code_flat_numel = len(output_codes)
+    if native_duplex and code_flat_numel > 0:
+        segment_text_utf8 = torch.tensor(pending_text_utf8, dtype=torch.uint8)
+        pending_text_utf8.clear()
+    if native_duplex and finished:
+        state["segment_text_recorded"] = False
     if flush_pending and not last_chunk and code_flat_numel == 0:
         # Keep the generic generation connector model-agnostic: a real token
         # makes this control-only TTS boundary schedulable, while the explicit
@@ -536,6 +539,26 @@ def _native_tts_boundary_token_ids(special_token_ids):
     }
 
 
+def _decode_native_duplex_token_ids(
+    token_ids: list[int],
+    streaming_context,
+    *,
+    request_id: str,
+) -> str | None:
+    decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
+    if not isinstance(decode_token_ids, Callable):
+        return None
+    decode_ids = [int(token_id) for token_id in token_ids]
+    try:
+        try:
+            return str(decode_token_ids(decode_ids, skip_special_tokens=True))
+        except TypeError:
+            return str(decode_token_ids(decode_ids))
+    except Exception:
+        logger.exception("Failed to decode MiniCPM-o duplex token delta for request_id=%s", request_id)
+        return ""
+
+
 def _native_duplex_segment_output_ids(
     output_ids: list[int],
     output_text: str,
@@ -577,17 +600,13 @@ def _native_duplex_segment_output_ids(
             sent_len = 0
     turn_start = sent_len == 0 or previous_turn_id != turn_id
     segment_ids = output_ids[sent_len:]
-    decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
-    if isinstance(decode_token_ids, Callable):
-        decode_ids = [int(token_id) for token_id in segment_ids]
-        try:
-            try:
-                segment_text = str(decode_token_ids(decode_ids, skip_special_tokens=True))
-            except TypeError:
-                segment_text = str(decode_token_ids(decode_ids))
-        except Exception:
-            logger.exception("Failed to decode MiniCPM-o duplex token delta for request_id=%s", request_id)
-            segment_text = ""
+    decoded_segment_text = _decode_native_duplex_token_ids(
+        segment_ids,
+        streaming_context,
+        request_id=request_id,
+    )
+    if decoded_segment_text is not None:
+        segment_text = decoded_segment_text
     elif sent_len == 0:
         # Non-orchestrator unit tests and legacy callers may not install a
         # decoder. Never slice cumulative text with a stale character cursor.
@@ -862,6 +881,18 @@ def llm2tts(
                         .to(torch.float32)
                         .contiguous()
                     )
+        handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        if is_native_duplex_handoff and handoff_ids:
+            handoff_text = _decode_native_duplex_token_ids(
+                handoff_ids,
+                _streaming_context,
+                request_id=str(llm_output.request_id),
+            )
+            if handoff_text is not None:
+                # Match the released streaming_generate contract: transcript
+                # text comes from total_ids_in_unit, the same slice that
+                # conditions the Talker.
+                thinker_text = handoff_text
         model_intermediate_buffer = build_duplex_intermediate_buffer(
             request_id=str(llm_output.request_id),
             prompt_token_ids=prompt_token_ids,
@@ -899,7 +930,6 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
