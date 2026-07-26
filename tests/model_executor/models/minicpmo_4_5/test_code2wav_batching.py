@@ -316,6 +316,34 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert "duplex" not in model._states
 
 
+def test_initial_empty_segment_marker_initializes_stream_without_audio():
+    model, token2wav = _model()
+    boundary = _info("duplex", 0, [])
+    boundary["meta"].update(
+        {
+            "code_flat_numel": 0,
+            "tts_is_last_chunk": True,
+            "turn_end": False,
+        }
+    )
+
+    output = _forward(model, [boundary])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert "duplex" in model._states
+    assert token2wav.hift.calls == []
+
+    resumed = _info(
+        "duplex",
+        1,
+        [4218, 4218, 4218, 10, 11, 12, 13, 14],
+    )
+    output = _forward(model, [resumed])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert "duplex" in model._states
+
+
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
     model, _ = _model()

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
+_MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -265,6 +266,7 @@ def tts2code2wav_async_chunk(
         state = {
             "internal_id": internal_id,
             "pending": [],
+            "pending_text_utf8": [],
             "left_context": [],
             "codec_end": 0,
         }
@@ -280,9 +282,26 @@ def tts2code2wav_async_chunk(
     if not flush_pending and len(pending) < chunk_frames:
         return None
 
-    new_token_count = len(pending) if flush_pending else chunk_frames
+    hold_short_unit = (
+        native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
+    )
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
+    pending_text_utf8 = state.setdefault("pending_text_utf8", [])
+    current_text_utf8 = (
+        segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
+        if isinstance(segment_text_utf8, torch.Tensor)
+        else []
+    )
+    if hold_short_unit:
+        pending_text_utf8.extend(current_text_utf8)
+    elif pending_text_utf8:
+        segment_text_utf8 = torch.tensor(
+            [*pending_text_utf8, *current_text_utf8],
+            dtype=torch.uint8,
+        )
+        pending_text_utf8.clear()
     codec_start = int(state["codec_end"])
     codec_end = codec_start + new_token_count
 
