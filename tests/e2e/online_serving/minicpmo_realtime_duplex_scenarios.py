@@ -1382,6 +1382,17 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             await ws.send(json.dumps({"type": "session.close"}))
             await _wait_for(state, lambda: state.count("session.closed") > 0, timeout_s=20, label="session.closed")
         finally:
+            if state.count("session.created") > 0 and state.count("session.closed") == 0:
+                try:
+                    await ws.send(json.dumps({"type": "session.close"}))
+                    await _wait_for(
+                        state,
+                        lambda: state.count("session.closed") > 0,
+                        timeout_s=min(args.timeout_s, 5),
+                        label="session.closed during cleanup",
+                    )
+                except (ConnectionClosed, TimeoutError):
+                    pass
             stop.set()
             reader.cancel()
             try:
