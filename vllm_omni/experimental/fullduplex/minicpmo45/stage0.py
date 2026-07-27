@@ -5,6 +5,7 @@ import copy
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45Duplex
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
+_MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 
 
 @dataclass
@@ -611,12 +613,27 @@ class MiniCPMO45Stage0DuplexRuntime:
         if not model_path:
             return None
         try:
-            from transformers import AutoProcessor
+            from transformers import AutoImageProcessor, AutoProcessor
 
-            processor = AutoProcessor.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-            )
+            original_register = AutoImageProcessor.register
+
+            def register_image_processor(config_class, *args, **kwargs):
+                # The checkpoint's auto_map already loads this class. Its
+                # legacy string registration is incompatible with some
+                # Transformers versions and is otherwise redundant.
+                if config_class == "MiniCPMVImageProcessor":
+                    return None
+                return original_register(config_class, *args, **kwargs)
+
+            with _MINICPMO45_PROCESSOR_LOAD_LOCK:
+                AutoImageProcessor.register = staticmethod(register_image_processor)
+                try:
+                    processor = AutoProcessor.from_pretrained(
+                        model_path,
+                        trust_remote_code=True,
+                    )
+                finally:
+                    AutoImageProcessor.register = staticmethod(original_register)
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:

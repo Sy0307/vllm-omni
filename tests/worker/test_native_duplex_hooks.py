@@ -640,6 +640,18 @@ def _minicpmo45_tokenizer_stub():
     )
 
 
+def _transformers_processor_stub(auto_processor):
+    class _AutoImageProcessor:
+        @staticmethod
+        def register(*_args, **_kwargs):
+            return None
+
+    return SimpleNamespace(
+        AutoImageProcessor=_AutoImageProcessor,
+        AutoProcessor=auto_processor,
+    )
+
+
 def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
     import sys
 
@@ -651,22 +663,35 @@ def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
     processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
     load_calls = []
 
+    class _AutoImageProcessor:
+        @staticmethod
+        def register(config_class, image_processor_class):
+            del image_processor_class
+            if isinstance(config_class, str):
+                raise AttributeError("'str' object has no attribute '__module__'")
+
     class _AutoProcessor:
         @classmethod
         def from_pretrained(cls, model_path, *, trust_remote_code):
             load_calls.append((model_path, trust_remote_code))
+            _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
             return processor
 
     monkeypatch.setitem(
         sys.modules,
         "transformers",
-        SimpleNamespace(AutoProcessor=_AutoProcessor),
+        SimpleNamespace(
+            AutoImageProcessor=_AutoImageProcessor,
+            AutoProcessor=_AutoProcessor,
+        ),
     )
 
     loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
 
     assert loaded is processor
     assert load_calls == [(model_id, True)]
+    with pytest.raises(AttributeError, match="__module__"):
+        _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
 
 
 def test_minicpmo_stage0_processor_load_preserves_original_exception(monkeypatch):
@@ -687,7 +712,7 @@ def test_minicpmo_stage0_processor_load_preserves_original_exception(monkeypatch
     monkeypatch.setitem(
         sys.modules,
         "transformers",
-        SimpleNamespace(AutoProcessor=_AutoProcessor),
+        _transformers_processor_stub(_AutoProcessor),
     )
 
     with pytest.raises(RuntimeError, match="Failed to load MiniCPM-o duplex processor") as exc_info:
@@ -712,7 +737,7 @@ def test_minicpmo_stage0_processor_requires_tokenizer(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "transformers",
-        SimpleNamespace(AutoProcessor=_AutoProcessor),
+        _transformers_processor_stub(_AutoProcessor),
     )
 
     with pytest.raises(RuntimeError, match="does not expose a tokenizer"):
@@ -737,7 +762,7 @@ def test_minicpmo_stage0_loaded_processor_validates_special_tokens(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "transformers",
-        SimpleNamespace(AutoProcessor=_AutoProcessor),
+        _transformers_processor_stub(_AutoProcessor),
     )
 
     runtime = MiniCPMO45Stage0DuplexRuntime(
