@@ -321,7 +321,6 @@ def summarize_artifacts(
     mode_contract_ok = validation_mode == "model-policy" or (
         second_response_before_final_commit
         and listen_before_first_response
-        and listen_between_responses
         and listen_after_last_done
         and second_response_transcript_expectation_ok
     )

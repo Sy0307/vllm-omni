@@ -522,6 +522,26 @@ class DuplexSessionRunnerMixin:
             append_tail = actor.native_append_tail
             if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
+            continuation_delay_s = max(
+                0.0,
+                float(session.capabilities.chunk_period_ms or 1000) / 1000.0,
+            )
+            if continuation_delay_s > 0:
+                await asyncio.sleep(continuation_delay_s)
+                if (
+                    actor.native_append_tail is not append_tail
+                    or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
+                    or self._native_silence_continuation_is_stale(
+                        session,
+                        request_id=request_id,
+                        response_id=response_id,
+                        response_owned=response_owned,
+                        expected_epoch=expected_epoch,
+                        expected_incarnation=expected_incarnation,
+                        expected_model_turn_id=expected_model_turn_id,
+                    )
+                ):
+                    return False
 
             def _still_valid() -> bool:
                 return not real_native_input_waiting() and not self._native_silence_continuation_is_stale(
