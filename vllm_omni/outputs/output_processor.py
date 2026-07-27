@@ -557,6 +557,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state.num_cached_tokens = eco.num_cached_tokens
             req_state.is_prefilling = False
 
+            is_non_final_audio_chunk = (
+                finish_reason is not None
+                and req_state.output_kind == RequestOutputKind.DELTA
+                and is_non_final_delta_audio_chunk(req_state.mm_accumulated, req_state.mm_type)
+            )
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 None,  # pooling_output
@@ -571,7 +576,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     request_outputs.append(request_output)
 
             is_segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            if finish_reason is not None and not is_segment_finished:
+            if finish_reason is not None and not is_segment_finished and not is_non_final_audio_chunk:
                 self._finish_request(req_state)
         return request_outputs
 
