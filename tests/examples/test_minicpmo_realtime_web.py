@@ -412,7 +412,6 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
             "_client_received_at_s": 2.6,
         },
         {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
-        {"type": "response.listen", "_client_received_at_s": 3.2},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
         {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 4.0},
         {
@@ -462,6 +461,7 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     )
 
     assert summary["ok"] is True
+    assert summary["listen_between_responses"] is False
     assert summary["second_response_before_final_commit"] is True
     assert summary["final_listen_after_commit"] is True
     assert summary["response_audio_contract_ok"] is True
