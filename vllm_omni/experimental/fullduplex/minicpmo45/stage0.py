@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import base64
 import copy
-import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -59,6 +57,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             else getattr(stage_model, "tokenizer", None)
         )
         self._init_token_ids()
+        if self.tokenizer is not None:
+            self._require_special_token_ids()
 
     def _stage_runtime_ready(self) -> bool:
         return self.processor is not None and self.tokenizer is not None and self.thinker is not None
@@ -610,28 +610,18 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _load_processor_from_path(model_path: str | None) -> Any | None:
         if not model_path:
             return None
-        processor_path = model_path
-        if not Path(processor_path).is_dir():
-            try:
-                from huggingface_hub import snapshot_download
-
-                processor_path = snapshot_download(
-                    model_path,
-                    local_files_only=True,
-                )
-            except Exception:
-                return None
-        if processor_path not in sys.path:
-            sys.path.insert(0, processor_path)
         try:
-            from processing_minicpmo import MiniCPMOProcessor
+            from transformers import AutoProcessor
 
-            return MiniCPMOProcessor.from_pretrained(
-                processor_path,
+            processor = AutoProcessor.from_pretrained(
+                model_path,
                 trust_remote_code=True,
             )
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
+        if getattr(processor, "tokenizer", None) is None:
+            raise RuntimeError(f"MiniCPM-o duplex processor loaded from {model_path!r} does not expose a tokenizer")
+        return processor
 
     def _init_token_ids(self) -> None:
         if self.tokenizer is None:
