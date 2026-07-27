@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,7 +46,7 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     args.verify_admission_limit = 2
     result = asyncio.run(run_lifecycle_probes(args))
 
-    assert result["ok"] is True
+    assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["expiry"]["ok"] is True
     assert result["expiry"]["error_code"] == "session_resume_expired"
     assert result["admission"]["ok"] is True
