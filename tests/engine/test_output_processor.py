@@ -547,6 +547,22 @@ def test_mm_only_segment_finish_retains_request_state_for_next_audio_chunk(monke
     assert "r" not in processor.request_states
 
 
+def test_mm_only_nonfinal_audio_retains_state_without_segment_marker(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    first = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=False)])
+
+    assert "r" in processor.request_states
+    assert len(first.request_outputs) == 1
+    assert first.request_outputs[0].finished is False
+
+    second = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=True)])
+
+    assert len(second.request_outputs) == 1
+    assert second.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
 def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
     processor = _make_mm_only_output_processor(monkeypatch)
 
