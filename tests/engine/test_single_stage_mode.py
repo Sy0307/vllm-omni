@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -189,6 +190,34 @@ class TestOmniMasterServerAllocation:
         input_port = int(alloc.input_bind_address.split(":")[-1])
         output_port = int(alloc.output_bind_address.split(":")[-1])
         assert len({handshake_port, input_port, output_port}) == 3
+
+    def test_route_ports_remain_os_reserved_until_master_releases_them(self):
+        server = OmniMasterServer(master_address="127.0.0.1", master_port=15005, stage_ids=[0])
+        alloc = server.get_allocation(0)
+        ports = [
+            int(alloc.handshake_bind_address.rsplit(":", 1)[-1]),
+            int(alloc.input_bind_address.rsplit(":", 1)[-1]),
+            int(alloc.output_bind_address.rsplit(":", 1)[-1]),
+        ]
+
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                with pytest.raises(OSError):
+                    probe.bind(("127.0.0.1", port))
+
+        server.release_route_port_reservations(0, handshake=True, data=False)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", ports[0]))
+        for port in ports[1:]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                with pytest.raises(OSError):
+                    probe.bind(("127.0.0.1", port))
+
+        server.stop()
+
+        for port in ports[1:]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
 
     def test_get_zmq_addresses_returns_bind_addresses(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15002, stage_ids=[0])
