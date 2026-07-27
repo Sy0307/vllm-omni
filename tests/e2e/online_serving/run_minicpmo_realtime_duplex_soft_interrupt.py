@@ -39,6 +39,17 @@ def _validate_input_sha256(path: Path, expected: str) -> str:
     return actual
 
 
+def _input_duration_s(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav_file:
+        return wav_file.getnframes() / wav_file.getframerate()
+
+
+def _client_process_timeout_s(input_wav: Path, protocol_timeout_s: float) -> float:
+    # The child first streams the WAV in real time, then can independently
+    # exhaust its post-commit and session-close protocol waits.
+    return _input_duration_s(input_wav) + 2 * protocol_timeout_s + 30.0
+
+
 def _read_json(path: Path) -> dict[str, object]:
     if not path.is_file():
         return {}
@@ -388,7 +399,7 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(),
-            timeout=args.timeout_s + 30.0,
+            timeout=_client_process_timeout_s(input_wav, args.timeout_s),
         )
     except TimeoutError:
         process.kill()
