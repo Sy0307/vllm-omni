@@ -15,27 +15,27 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import (
     run_soft_interrupt,
 )
-from tests.e2e.online_serving.test_minicpmo_4_5_duplex import (
-    _SERVER_PARAMS,
-    _SOFT_INTERRUPT_SHA256,
-    _multi_session_args,
-    _realtime_url,
-    _resolve_ref_audio,
-    _validated_input_wav,
-    _validated_soft_interrupt_wav,
-)
 from tests.helpers.mark import hardware_test
+from tests.helpers.minicpmo_4_5_duplex import (
+    SERVER_PARAMS,
+    SOFT_INTERRUPT_SHA256,
+    multi_session_args,
+    realtime_url,
+    resolve_ref_audio,
+    validated_input_wav,
+    validated_soft_interrupt_wav,
+)
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_path: Path) -> None:
-    args = _multi_session_args(
+    args = multi_session_args(
         omni_server=omni_server,
-        input_wav=_validated_input_wav(),
-        ref_audio=_resolve_ref_audio(model_prefix),
+        input_wav=validated_input_wav(),
+        ref_audio=resolve_ref_audio(model_prefix),
         output_dir=tmp_path / "admission_expiry",
         response_required=False,
     )
@@ -54,16 +54,16 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
-    input_wav = _validated_soft_interrupt_wav()
+    input_wav = validated_soft_interrupt_wav()
     result = asyncio.run(
         run_soft_interrupt(
             SimpleNamespace(
-                url=_realtime_url(omni_server),
+                url=realtime_url(omni_server),
                 model=omni_server.model,
                 input_wav=str(input_wav),
-                ref_audio=str(_resolve_ref_audio(model_prefix)),
+                ref_audio=str(resolve_ref_audio(model_prefix)),
                 output_dir=str(tmp_path / "soft_interrupt"),
                 summary_output=None,
                 chunk_ms=200,
@@ -73,7 +73,7 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
                 validation_mode="response-required",
                 min_responses=2,
                 min_audio_deltas_per_response=2,
-                input_sha256=_SOFT_INTERRUPT_SHA256,
+                input_sha256=SOFT_INTERRUPT_SHA256,
                 expect_second_response_substring="一加一等于二",
             )
         )

@@ -12,14 +12,11 @@ import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/minicpmo_realtime_duplex_scenarios.py"
-MULTI_DEMO_PATH = (
-    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py"
-)
-PAIR_DEMO_PATH = Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_demo_pair.py"
-SOFT_INTERRUPT_DEMO_PATH = (
-    Path(__file__).resolve().parents[1] / "e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py"
-)
+DRIVER_DIR = Path(__file__).resolve().parent
+DEMO_PATH = DRIVER_DIR / "minicpmo_realtime_duplex_scenarios.py"
+MULTI_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_multi_session.py"
+PAIR_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_demo_pair.py"
+SOFT_INTERRUPT_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_soft_interrupt.py"
 
 
 def _load_demo_module():
