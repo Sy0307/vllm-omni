@@ -224,7 +224,10 @@ steps:
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
           - vllm_omni/core/sched/
+          - vllm_omni/outputs/multimodal_accumulation.py
+          - vllm_omni/engine/stage_init_utils.py
           - vllm_omni/engine/async_omni_engine.py
+          - vllm_omni/entrypoints/cli/serve.py
         commands:
           - |
             timeout 20m bash -c "
