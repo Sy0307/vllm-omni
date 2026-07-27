@@ -6,6 +6,7 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -609,12 +610,26 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _load_processor_from_path(model_path: str | None) -> Any | None:
         if not model_path:
             return None
-        if model_path not in sys.path:
-            sys.path.insert(0, model_path)
+        processor_path = model_path
+        if not Path(processor_path).is_dir():
+            try:
+                from huggingface_hub import snapshot_download
+
+                processor_path = snapshot_download(
+                    model_path,
+                    local_files_only=True,
+                )
+            except Exception:
+                return None
+        if processor_path not in sys.path:
+            sys.path.insert(0, processor_path)
         try:
             from processing_minicpmo import MiniCPMOProcessor
 
-            return MiniCPMOProcessor.from_pretrained(model_path, trust_remote_code=True)
+            return MiniCPMOProcessor.from_pretrained(
+                processor_path,
+                trust_remote_code=True,
+            )
         except Exception:
             return None
 
