@@ -612,7 +612,35 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
         runtime._require_special_token_ids()
 
 
-def test_minicpmo_stage0_loads_processor_from_cached_hf_snapshot(monkeypatch, tmp_path):
+def _minicpmo45_tokenizer_stub():
+    token_ids = {
+        token: index
+        for index, token in enumerate(
+            (
+                "<unit>",
+                "</unit>",
+                "<|listen|>",
+                "<|speak|>",
+                "<|tts_bos|>",
+                "<|tts_eos|>",
+                "<|tts_pad|>",
+                "<|chunk_eos|>",
+                "<|chunk_tts_eos|>",
+                "<|turn_eos|>",
+            ),
+            start=101,
+        )
+    }
+    return SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: token_ids.get(token, 0),
+        encode=lambda token, add_special_tokens=False: (
+            [token_ids[token]] if not add_special_tokens and token in token_ids else [0]
+        ),
+    )
+
+
+def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
     import sys
 
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
@@ -620,37 +648,117 @@ def test_minicpmo_stage0_loads_processor_from_cached_hf_snapshot(monkeypatch, tm
     )
 
     model_id = "openbmb/MiniCPM-o-4_5"
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    processor = object()
-    snapshot_calls = []
+    processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
+    load_calls = []
 
-    class _MiniCPMOProcessor:
+    class _AutoProcessor:
         @classmethod
         def from_pretrained(cls, model_path, *, trust_remote_code):
-            assert model_path == str(snapshot)
-            assert trust_remote_code is True
+            load_calls.append((model_path, trust_remote_code))
             return processor
 
-    monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.setitem(
         sys.modules,
-        "processing_minicpmo",
-        SimpleNamespace(MiniCPMOProcessor=_MiniCPMOProcessor),
+        "transformers",
+        SimpleNamespace(AutoProcessor=_AutoProcessor),
     )
-
-    def _snapshot_download(repo_id, *, local_files_only):
-        snapshot_calls.append((repo_id, local_files_only))
-        return str(snapshot)
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
 
     loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
 
     assert loaded is processor
-    assert snapshot_calls == [(model_id, True)]
-    assert str(snapshot) in sys.path
-    assert model_id not in sys.path
+    assert load_calls == [(model_id, True)]
+
+
+def test_minicpmo_stage0_processor_load_preserves_original_exception(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    original = ValueError("invalid processor config")
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            raise original
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoProcessor=_AutoProcessor),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to load MiniCPM-o duplex processor") as exc_info:
+        MiniCPMO45Stage0DuplexRuntime._load_processor_from_path("openbmb/MiniCPM-o-4_5")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_minicpmo_stage0_processor_requires_tokenizer(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            return object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoProcessor=_AutoProcessor),
+    )
+
+    with pytest.raises(RuntimeError, match="does not expose a tokenizer"):
+        MiniCPMO45Stage0DuplexRuntime._load_processor_from_path("openbmb/MiniCPM-o-4_5")
+
+
+def test_minicpmo_stage0_loaded_processor_validates_special_tokens(monkeypatch):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            return processor
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoProcessor=_AutoProcessor),
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime(
+        SimpleNamespace(),
+        model_path="openbmb/MiniCPM-o-4_5",
+        device="cpu",
+    )
+
+    assert runtime.processor is processor
+    assert set(runtime._special_token_ids()) == {
+        "unit_token_id",
+        "unit_end_token_id",
+        "listen_token_id",
+        "speak_token_id",
+        "tts_bos_token_id",
+        "tts_eos_token_id",
+        "tts_pad_token_id",
+        "chunk_eos_token_id",
+        "chunk_tts_eos_token_id",
+        "turn_eos_token_id",
+    }
 
 
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
