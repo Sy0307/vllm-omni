@@ -28,6 +28,7 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
 
     ref_audio_sr: int | None = None
+    native_duplex_segment_text: str | None = None
     llm_output_text_utf8: torch.Tensor | None = None
     duplex_turn_id: int | None = None
     duplex_epoch: int | None = None

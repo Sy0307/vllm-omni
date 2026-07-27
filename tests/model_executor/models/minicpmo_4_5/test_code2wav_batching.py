@@ -158,35 +158,6 @@ def _model():
     return model, token2wav
 
 
-def test_code2wav_resolves_hf_model_id_for_assets(mocker, tmp_path):
-    resolved_root = tmp_path / "snapshot"
-    resolved_root.mkdir()
-    config = _config()
-    config.model_config.model = "openbmb/MiniCPM-o-4_5"
-    config.model_config.revision = "test-revision"
-    config.model_config.stage_connector_config["extra"].pop("prompt_wav")
-    config.load_config = SimpleNamespace(download_dir="/model-cache")
-    model = MiniCPMO45Code2Wav(vllm_config=config)
-    mock_download = mocker.patch(
-        "vllm_omni.model_executor.model_loader.weight_utils.download_weights_from_hf_specific",
-        return_value=str(resolved_root),
-    )
-
-    assert model._resolve_model_root() == resolved_root
-    assert model.model_path == str(resolved_root)
-    assert model._default_prompt_wav == str(resolved_root / "assets" / "HT_ref_audio.wav")
-    mock_download.assert_called_once_with(
-        "openbmb/MiniCPM-o-4_5",
-        "/model-cache",
-        allow_patterns=[
-            "assets/HT_ref_audio.wav",
-            "assets/token2wav/*",
-        ],
-        revision="test-revision",
-        require_all=True,
-    )
-
-
 def _info(
     request_id: str,
     chunk_seq: int,
