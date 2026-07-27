@@ -139,12 +139,41 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
+        self._prompt_wav_explicit = "prompt_wav" in extra
         self._default_prompt_wav = str(
             extra.get(
                 "prompt_wav",
                 Path(self.model_path) / "assets" / "HT_ref_audio.wav",
             )
         )
+
+    def _resolve_model_root(self) -> Path:
+        model_root = Path(self.model_path)
+        if model_root.is_dir():
+            return model_root
+
+        from vllm_omni.model_executor.model_loader.weight_utils import (
+            download_weights_from_hf_specific,
+        )
+
+        model_config = self.vllm_config.model_config
+        load_config = getattr(self.vllm_config, "load_config", None)
+        model_root = Path(
+            download_weights_from_hf_specific(
+                self.model_path,
+                getattr(load_config, "download_dir", None),
+                allow_patterns=[
+                    "assets/HT_ref_audio.wav",
+                    "assets/token2wav/*",
+                ],
+                revision=getattr(model_config, "revision", None),
+                require_all=True,
+            )
+        )
+        self.model_path = str(model_root)
+        if not self._prompt_wav_explicit:
+            self._default_prompt_wav = str(model_root / "assets" / "HT_ref_audio.wav")
+        return model_root
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -726,10 +755,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             from stepaudio2.token2wav import Token2wav
 
         extra = self._extra_config()
+        model_root = self._resolve_model_root()
         prompt_path = Path(self._default_prompt_wav)
         if not prompt_path.is_file():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav prompt audio not found: {prompt_path}")
-        token2wav_path = Path(self.model_path) / "assets" / "token2wav"
+        token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         use_float16 = bool(extra.get("token2wav_float16", False))
