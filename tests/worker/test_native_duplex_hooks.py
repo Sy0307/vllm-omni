@@ -612,6 +612,47 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
         runtime._require_special_token_ids()
 
 
+def test_minicpmo_stage0_loads_processor_from_cached_hf_snapshot(monkeypatch, tmp_path):
+    import sys
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    model_id = "openbmb/MiniCPM-o-4_5"
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    processor = object()
+    snapshot_calls = []
+
+    class _MiniCPMOProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            assert model_path == str(snapshot)
+            assert trust_remote_code is True
+            return processor
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(
+        sys.modules,
+        "processing_minicpmo",
+        SimpleNamespace(MiniCPMOProcessor=_MiniCPMOProcessor),
+    )
+
+    def _snapshot_download(repo_id, *, local_files_only):
+        snapshot_calls.append((repo_id, local_files_only))
+        return str(snapshot)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
+
+    loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
+
+    assert loaded is processor
+    assert snapshot_calls == [(model_id, True)]
+    assert str(snapshot) in sys.path
+    assert model_id not in sys.path
+
+
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     import torch
 
