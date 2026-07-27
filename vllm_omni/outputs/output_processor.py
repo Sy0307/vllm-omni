@@ -570,7 +570,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 else:
                     request_outputs.append(request_output)
 
-            if finish_reason is not None:
+            is_segment_finished = bool(getattr(eco, "is_segment_finished", False))
+            if finish_reason is not None and not is_segment_finished:
                 self._finish_request(req_state)
         return request_outputs
 

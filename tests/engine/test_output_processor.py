@@ -492,6 +492,71 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
     assert AUDIO in result.request_outputs[0].outputs[0].multimodal_output
 
 
+def _make_mm_only_output_processor(monkeypatch):
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.AUDIO
+    processor.request_states = {"r": _make_no_detok_state(RequestOutputKind.DELTA)}
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            request_outputs=[],
+            reqs_to_abort=[],
+        ),
+    )
+
+    def finish_request(req_state):
+        processor.request_states.pop(req_state.request_id, None)
+
+    processor._finish_request = finish_request
+    return processor
+
+
+def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
+    return SimpleNamespace(
+        request_id="r",
+        multimodal_output={
+            "model_outputs": torch.arange(8, dtype=torch.float32),
+            "meta.tts_is_last_chunk": torch.tensor([int(is_last_chunk)]),
+        },
+        output_type="audio",
+        pooling_output=None,
+        new_token_ids=[],
+        finish_reason=FinishReason.STOP,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+        is_segment_finished=is_segment_finished,
+    )
+
+
+def test_mm_only_segment_finish_retains_request_state_for_next_audio_chunk(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    first = processor.process_outputs([_audio_engine_output(is_segment_finished=True, is_last_chunk=False)])
+
+    assert "r" in processor.request_states
+    assert len(first.request_outputs) == 1
+    assert first.request_outputs[0].finished is False
+
+    second = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=True)])
+
+    assert len(second.request_outputs) == 1
+    assert second.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
+def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
+    processor = _make_mm_only_output_processor(monkeypatch)
+
+    result = processor.process_outputs([_audio_engine_output(is_segment_finished=False, is_last_chunk=True)])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
 def test_no_detokenizer_make_request_output_with_routed_experts():
     """make_request_output accepts the routed_experts arg that the multimodal
     output channel (_process_mm_only_outputs) passes positionally, and attaches
