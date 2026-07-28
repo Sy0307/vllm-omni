@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import CompilationMode
 
 from vllm_omni.model_executor.models.indextts2.indextts2_talker import (
     IndexTTS2TalkerForConditionalGeneration,
@@ -168,6 +169,7 @@ def test_mel_head_preserves_official_checkpoint_bias(monkeypatch):
         model_config=SimpleNamespace(model="/model", hf_config=config),
         cache_config=None,
         quant_config=None,
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
     )
 
     talker = IndexTTS2TalkerForConditionalGeneration(vllm_config=vllm_config)
