@@ -26,21 +26,21 @@ def _cpu_view(tensor: torch.Tensor) -> torch.Tensor:
 
 def _strip_stop_token(
     codes: torch.Tensor,
-    latent: torch.Tensor,
+    latent: torch.Tensor | None,
     stop_mel_token: int = STOP_MEL_TOKEN,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Strip at the first stop token, matching official IndexTTS2 v2.
 
-    Returns: (codes [B, T'], latent [B, T', D], code_lens [B]).
+    Returns codes, optional aligned latent, and code lengths.
     """
     if codes.ndim == 1:
         codes = codes.unsqueeze(0)
-    if latent.ndim == 2:
+    if latent is not None and latent.ndim == 2:
         latent = latent.unsqueeze(0)
 
     if codes.device.type != "cpu":
         codes = codes.detach().cpu()
-    if latent.device.type != "cpu":
+    if latent is not None and latent.device.type != "cpu":
         latent = latent.detach().cpu()
 
     device = codes.device
@@ -50,8 +50,6 @@ def _strip_stop_token(
 
     for i in range(codes.shape[0]):
         code = codes[i]
-        lat = latent[i]
-
         stop_mask = (code == stop_mel_token).nonzero(as_tuple=False)
         if stop_mask.numel() > 0:
             valid_len = int(stop_mask[0].item())
@@ -59,27 +57,50 @@ def _strip_stop_token(
             valid_len = int(code.shape[0])
         code_lens.append(valid_len)
         codes_out.append(code[:valid_len])
-        latent_out.append(lat[:valid_len])
+        if latent is not None:
+            latent_out.append(latent[i, :valid_len])
 
     max_len = max(code_lens) if code_lens else 0
     if max_len == 0:
+        empty_codes = torch.zeros(codes.shape[0], 0, dtype=torch.long, device=device)
+        empty_latent = (
+            torch.zeros(
+                codes.shape[0],
+                0,
+                latent.shape[-1],
+                device=device,
+                dtype=latent.dtype,
+            )
+            if latent is not None
+            else None
+        )
         return (
-            torch.zeros(codes.shape[0], 0, dtype=torch.long, device=device),
-            torch.zeros(codes.shape[0], 0, latent.shape[-1], device=device, dtype=latent.dtype),
-            torch.zeros(codes.shape[0], dtype=torch.long, device=device),
+            empty_codes,
+            empty_latent,
+            torch.zeros(
+                codes.shape[0],
+                dtype=torch.long,
+                device=device,
+            ),
         )
 
     padded_codes = torch.zeros((len(codes_out), max_len), dtype=torch.long, device=device)
-    padded_latent = torch.zeros(
-        len(latent_out),
-        max_len,
-        latent_out[0].shape[-1],
-        device=device,
-        dtype=latent_out[0].dtype,
+    padded_latent = (
+        torch.zeros(
+            len(latent_out),
+            max_len,
+            latent_out[0].shape[-1],
+            device=device,
+            dtype=latent_out[0].dtype,
+        )
+        if latent_out
+        else None
     )
-    for i, (c, lat) in enumerate(zip(codes_out, latent_out)):
+    for i, c in enumerate(codes_out):
         padded_codes[i, : c.shape[0]] = c
-        padded_latent[i, : lat.shape[0]] = lat
+        if padded_latent is not None:
+            lat = latent_out[i]
+            padded_latent[i, : lat.shape[0]] = lat
 
     return padded_codes, padded_latent, torch.tensor(code_lens, dtype=torch.long, device=device)
 
@@ -105,19 +126,24 @@ def _normalize_latent_sequence(latent: torch.Tensor) -> torch.Tensor:
 
 def _build_s2mel_additional_information(
     mel_codes: torch.Tensor,
-    latent: torch.Tensor,
+    latent: torch.Tensor | None,
     meta: dict[str, Any],
     *,
+    use_gpt_latent: bool,
     context: str,
 ) -> dict[str, Any]:
     """Build the Stage-1 S2Mel tensor contract shared by legacy and connector paths."""
     mel_codes_clean, latent_clean, code_lens = _strip_stop_token(mel_codes, latent)
 
     additional_information = {
-        "latent": _cpu_view(latent_clean),
         "mel_codes": _cpu_view(mel_codes_clean),
         "code_lens": _cpu_view(code_lens),
+        "use_gpt_latent": use_gpt_latent,
     }
+    if use_gpt_latent:
+        if latent_clean is None:
+            raise ValueError(f"{context} requires GPT latent but none was provided")
+        additional_information["latent"] = _cpu_view(latent_clean)
 
     for key in ("S_ref", "ref_mel", "style"):
         val = meta.get(key)
@@ -141,6 +167,12 @@ def _get_payload_value(pooling_output: dict[str, Any], dotted_key: str, nested_p
 
 def _request_id(request: Any) -> str:
     return str(getattr(request, "external_req_id", None) or getattr(request, "request_id", "?"))
+
+
+def _request_seed(request: Any) -> int | None:
+    sampling_params = getattr(request, "sampling_params", None)
+    seed = getattr(sampling_params, "seed", None)
+    return int(seed) if seed is not None else None
 
 
 def talker2s2mel_token_only(
@@ -186,27 +218,49 @@ def talker2s2mel_full_payload(
         return None
 
     latent = _get_payload_value(pooling_output, "hidden_states.latent", "hidden_states", "latent")
-    if not isinstance(latent, torch.Tensor) or latent.numel() == 0:
-        logger.warning("talker2s2mel_full_payload: missing hidden_states.latent for req=%s", rid)
-        return None
 
     mel_seq = _normalize_mel_sequence(mel_codes)
-    latent_seq = _normalize_latent_sequence(latent)
-    if mel_seq.numel() == 0 or latent_seq.numel() == 0:
-        logger.warning("talker2s2mel_full_payload: empty normalized mel/latent for req=%s", rid)
+    use_gpt_latent_value = _get_payload_value(
+        pooling_output,
+        "meta.use_gpt_latent",
+        "meta",
+        "use_gpt_latent",
+    )
+    # Missing policy metadata identifies the legacy IndexTTS 2 producer.
+    use_gpt_latent = True if use_gpt_latent_value is None else bool(use_gpt_latent_value)
+    if mel_seq.numel() == 0:
+        logger.warning("talker2s2mel_full_payload: empty normalized mel for req=%s", rid)
         return None
 
-    common_len = min(int(mel_seq.shape[0]), int(latent_seq.shape[0]))
-    if common_len <= 0:
-        logger.warning("talker2s2mel_full_payload: no common mel/latent length for req=%s", rid)
-        return None
-
-    mel_seq = mel_seq[:common_len]
-    latent_seq = latent_seq[:common_len]
+    latent_seq: torch.Tensor | None = None
+    if use_gpt_latent:
+        if not isinstance(latent, torch.Tensor) or latent.numel() == 0:
+            logger.warning("talker2s2mel_full_payload: missing hidden_states.latent for req=%s", rid)
+            return None
+        latent_seq = _normalize_latent_sequence(latent)
+        if latent_seq.numel() == 0:
+            logger.warning("talker2s2mel_full_payload: empty normalized latent for req=%s", rid)
+            return None
+        common_len = min(int(mel_seq.shape[0]), int(latent_seq.shape[0]))
+        if common_len <= 0:
+            logger.warning("talker2s2mel_full_payload: no common mel/latent length for req=%s", rid)
+            return None
+        mel_seq = mel_seq[:common_len]
+        latent_seq = latent_seq[:common_len]
 
     meta = {
         "S_ref": _get_payload_value(pooling_output, "meta.S_ref", "meta", "S_ref"),
         "ref_mel": _get_payload_value(pooling_output, "meta.ref_mel", "meta", "ref_mel"),
         "style": _get_payload_value(pooling_output, "meta.style", "meta", "style"),
     }
-    return _build_s2mel_additional_information(mel_seq, latent_seq, meta, context="full_payload")
+    additional_information = _build_s2mel_additional_information(
+        mel_seq,
+        latent_seq,
+        meta,
+        use_gpt_latent=use_gpt_latent,
+        context="full_payload",
+    )
+    seed = _request_seed(request)
+    if seed is not None:
+        additional_information["seed"] = seed
+    return additional_information

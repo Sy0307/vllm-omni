@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Offline inference example for IndexTTS2 via vLLM-Omni.
+"""Offline inference example for IndexTTS 2.0 and 2.5 via vLLM-Omni.
 
-Two-stage pipeline: GPT AR (Stage 0) → S2Mel + BigVGAN (Stage 1).
+Two-stage pipeline: GPT AR (Stage 0) → semantic codec + S2Mel + BigVGAN
+(Stage 1).
 Output is 22050 Hz mono WAV.
 
 Usage:
   python end2end.py \
-    --model /path/to/IndexTeam/IndexTTS-2 \
+    --model /path/to/indextts-2.5 \
+    --model-version 2.5 \
+    --lang zh \
     --text "你好，这是一个语音合成测试。" \
     --ref-audio /path/to/ref.wav
 
@@ -47,6 +50,9 @@ def build_request(
     emo_alpha: float | None = None,
     use_emo_text: bool = False,
     use_random: bool = False,
+    model_type: str = "indextts2",
+    lang: str = "zh",
+    text_normalization: bool = True,
 ) -> dict:
     additional: dict = {"text": [text]}
     if ref_audio_path:
@@ -63,8 +69,17 @@ def build_request(
         additional["use_emo_text"] = [True]
     if use_random:
         additional["use_random"] = [True]
+    if model_type == "indextts2_5":
+        additional["lang"] = [lang]
+        additional["text_normalization"] = [text_normalization]
     return {
-        "prompt_token_ids": build_indextts2_prefill_prompt_ids(model, text),
+        "prompt_token_ids": build_indextts2_prefill_prompt_ids(
+            model,
+            text,
+            model_type=model_type,
+            lang=lang,
+            text_normalization=text_normalization,
+        ),
         "additional_information": additional,
     }
 
@@ -95,9 +110,22 @@ def extract_audio(mm: dict) -> tuple[torch.Tensor | None, int]:
 
 
 def main(args) -> None:
+    model_type = "indextts2_5" if args.model_version == "2.5" else "indextts2"
+    deploy_config = args.deploy_config
+    if deploy_config is None and args.model_version == "2.5":
+        repo_root = Path(__file__).resolve().parents[4]
+        deploy_name = "indextts2_5_latent.yaml" if args.use_gpt_latent else "indextts2_5.yaml"
+        deploy_config = str(repo_root / "vllm_omni" / "deploy" / deploy_name)
+    elif args.use_gpt_latent and args.model_version != "2.5":
+        raise ValueError("--use-gpt-latent is only valid for --model-version 2.5")
+    elif args.use_gpt_latent and args.deploy_config is not None:
+        raise ValueError(
+            "--use-gpt-latent selects the bundled compatibility deploy config; do not combine it with --deploy-config"
+        )
+
     omni = Omni(
         model=args.model,
-        deploy_config=args.deploy_config,
+        deploy_config=deploy_config,
         stage_init_timeout=args.stage_init_timeout,
     )
 
@@ -136,6 +164,9 @@ def main(args) -> None:
         emo_alpha=args.emo_alpha,
         use_emo_text=args.use_emo_text,
         use_random=args.use_random,
+        model_type=model_type,
+        lang=args.lang,
+        text_normalization=args.text_normalization,
     )
 
     for i, omni_out in enumerate(omni.generate(inputs, sampling_params_list=sampling_params)):
@@ -154,8 +185,33 @@ def main(args) -> None:
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="IndexTTS2 offline inference")
-    parser.add_argument("--model", required=True, help="HF model path for IndexTTS2.")
+    parser = FlexibleArgumentParser(description="IndexTTS 2.0/2.5 offline inference")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="HF model path or native bundle containing checkpoints/.",
+    )
+    parser.add_argument(
+        "--model-version",
+        choices=("2.0", "2.5"),
+        default="2.0",
+    )
+    parser.add_argument(
+        "--lang",
+        default="zh",
+        help="IndexTTS 2.5 language code, for example zh/en/ja/yue.",
+    )
+    parser.add_argument(
+        "--no-text-normalization",
+        action="store_false",
+        dest="text_normalization",
+        help="Disable IndexTTS 2.5 text normalization.",
+    )
+    parser.add_argument(
+        "--use-gpt-latent",
+        action="store_true",
+        help="Use the experimental IndexTTS 2.5 GPT-latent compatibility path.",
+    )
     parser.add_argument("--text", default="你好，这是IndexTTS2语音合成测试。")
     parser.add_argument("--ref-audio", required=True, help="Reference audio for voice cloning.")
     parser.add_argument("--emo-audio", default=None, help="Emotion reference audio.")

@@ -154,6 +154,26 @@ def test_talker2s2mel_full_payload_flat_keys_builds_s2mel_contract():
     assert result["S_ref"].data_ptr() != cond["S_ref"].data_ptr()
 
 
+def test_talker2s2mel_full_payload_preserves_explicit_request_seed():
+    cond = _conditioning_tensors()
+    payload = {
+        "codes.mel": torch.tensor([[10], [20]]),
+        "hidden_states.latent": torch.randn(2, LATENT_DIM),
+        "meta.S_ref": cond["S_ref"],
+        "meta.ref_mel": cond["ref_mel"],
+        "meta.style": cond["style"],
+    }
+    request = SimpleNamespace(
+        request_id="r-seeded",
+        sampling_params=SimpleNamespace(seed=0),
+    )
+
+    result = talker2s2mel_full_payload(None, payload, request)
+
+    assert result is not None
+    assert result["seed"] == 0
+
+
 def test_talker2s2mel_full_payload_nested_fallback_input():
     cond = _conditioning_tensors()
     payload = {
@@ -216,6 +236,36 @@ def test_talker2s2mel_full_payload_crops_mel_latent_to_common_length():
     assert result["mel_codes"].tolist() == [[1, 2]]
     assert result["latent"].shape == (1, 2, LATENT_DIM)
     assert result["code_lens"].tolist() == [2]
+
+
+def test_talker2s2mel_full_payload_v25_code_only_does_not_invent_latent():
+    cond = _conditioning_tensors()
+    payload = {
+        "codes.mel": torch.tensor([[3], [4], [STOP_MEL_TOKEN]]),
+        "meta.use_gpt_latent": False,
+        "meta.S_ref": cond["S_ref"],
+        "meta.ref_mel": cond["ref_mel"],
+        "meta.style": cond["style"],
+    }
+
+    result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-v25"))
+
+    assert result is not None
+    assert result["mel_codes"].tolist() == [[3, 4]]
+    assert result["code_lens"].tolist() == [2]
+    assert result["use_gpt_latent"] is False
+    assert "latent" not in result
+
+
+def test_talker2s2mel_full_payload_latent_mode_rejects_missing_latent():
+    payload = {
+        "codes.mel": torch.tensor([[3], [4], [STOP_MEL_TOKEN]]),
+        "meta.use_gpt_latent": True,
+    }
+
+    result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-latent"))
+
+    assert result is None
 
 
 def test_talker2s2mel_full_payload_missing_required_fields_returns_none():

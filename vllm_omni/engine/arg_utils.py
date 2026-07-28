@@ -22,6 +22,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
+    "IndexTTS25S2MelDecoder": "indextts2_5",
+    "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
@@ -39,6 +41,7 @@ def _register_omni_hf_configs() -> None:
 
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
+            IndexTTS25Config,
         )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
@@ -71,6 +74,7 @@ def _register_omni_hf_configs() -> None:
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
+        ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
@@ -230,7 +234,12 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            return  # can't load config, let vLLM handle the error
+            # Native IndexTTS/CosyVoice-style local bundles can be valid model
+            # directories without any HuggingFace config.json. The registered
+            # omni config class supplies defaults once model_type is injected.
+            if not os.path.isdir(self.model):
+                return
+            config_dict = {}
 
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")

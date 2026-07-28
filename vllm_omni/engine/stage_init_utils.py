@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
+from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
@@ -948,11 +949,36 @@ def build_llm_stage_output_processor(
     )
 
 
+class _TokenOnlyRenderer(BaseRenderer):
+    """Renderer for stages that accept pre-tokenized prompts only.
+
+    vLLM's default renderer factory still resolves a tokenizer repository
+    when ``skip_tokenizer_init`` is true. Omni stages such as IndexTTS build
+    their own token IDs and do not need that repository or a tokenizer
+    object.
+    """
+
+    def render_messages(self, messages, params):
+        raise ValueError(
+            "Chat messages are unavailable when skip_tokenizer_init=True; submit prompt_token_ids or prompt_embeds"
+        )
+
+
+def _build_token_only_renderer(stage_vllm_config: Any) -> BaseRenderer:
+    return _TokenOnlyRenderer(stage_vllm_config, tokenizer=None)
+
+
 def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     """Build the shared stage-0 input processor."""
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
-    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    if bool(getattr(stage_vllm_config.model_config, "skip_tokenizer_init", False)):
+        input_processor = InputProcessor(
+            vllm_config=stage_vllm_config,
+            renderer=_build_token_only_renderer(stage_vllm_config),
+        )
+    else:
+        input_processor = InputProcessor(vllm_config=stage_vllm_config)
     input_processor.input_preprocessor = OmniInputPreprocessor(
         vllm_config=stage_vllm_config,
         renderer=input_processor.renderer,

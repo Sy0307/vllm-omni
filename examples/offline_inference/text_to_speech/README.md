@@ -24,6 +24,7 @@ list of supported architectures across all modalities, see
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
+| IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
 ## Common Quick Start
@@ -437,15 +438,38 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 
 ---
 
-## IndexTTS-2
+## IndexTTS-2 and IndexTTS-2.5
 
-2-stage TTS pipeline (GPT AR talker + S2Mel CFM DiT + BigVGAN vocoder) at 22.05 kHz. Every request requires reference audio for zero-shot voice cloning. Supports emotion conditioning via audio, text, or 8-dim vector.
+Both versions use a 2-stage TTS pipeline and produce 22.05 kHz mono audio. Stage 0 is a GPT AR talker. IndexTTS-2 Stage 1 uses RepCodec semantic embeddings, GPT latent, S2Mel CFM/DiT, and BigVGAN. IndexTTS-2.5 replaces RepCodec with EnhancedCodec and defaults to the official code-only path (`use_gpt_latent=false`); its GPT-latent route is retained as an explicit experimental compatibility mode. Every request requires reference audio for zero-shot voice cloning.
 
 ### Quick start
+
+IndexTTS-2:
+
 ```bash
 python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --model IndexTeam/IndexTTS-2 \
     --text "你好，这是一个语音合成测试。" \
+    --ref-audio /path/to/reference.wav
+```
+
+IndexTTS-2.5 with a native repository/lab bundle whose model root contains `checkpoints/`:
+
+```bash
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model /path/to/indextts-2.5 \
+    --model-version 2.5 \
+    --lang ja \
+    --text "こんにちは、音声合成のテストです。" \
+    --ref-audio /path/to/reference.wav
+
+# Explicit experimental GPT-latent compatibility mode:
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model /path/to/indextts-2.5 \
+    --model-version 2.5 \
+    --use-gpt-latent \
+    --lang en \
+    --text "This is the latent compatibility path." \
     --ref-audio /path/to/reference.wav
 ```
 
@@ -474,10 +498,12 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
 ```
 
 ### Notes
-- `--ref-audio` is **required** — IndexTTS-2 does not support text-only synthesis.
+- `--ref-audio` is **required** — neither version provides text-only synthesis.
 - Stage 0 (AR Talker): GPT-2 generates mel codes from text + reference audio.
-- Stage 1 (S2Mel + BigVGAN): CFM DiT converts mel codes to waveform at 22.05 kHz.
-- Deploy config: `vllm_omni/deploy/indextts2.yaml`. Stage 1 runs with `enforce_eager: true` (DiT has dynamic shapes).
+- IndexTTS-2.5 accepts explicit language codes such as `zh`, `en`, `ja`, and `yue`; use `--no-text-normalization` only when the input is already normalized.
+- Stage 1 (semantic codec + S2Mel + BigVGAN): CFM/DiT converts the complete semantic-code sequence to waveform.
+- Deploy configs: `vllm_omni/deploy/indextts2.yaml`, `indextts2_5.yaml`, and the explicit `indextts2_5_latent.yaml` compatibility config.
+- `async_chunk=false` is intentional for IndexTTS-2.5 correctness: S2Mel consumes the completed semantic sequence.
 
 ---
 

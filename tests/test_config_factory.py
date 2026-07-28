@@ -14,7 +14,10 @@ import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import (
+    StageConfigFactory,
+    _infer_native_indextts_model_type,
+)
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
@@ -625,6 +628,31 @@ class TestPipelineDiscovery:
         assert "definitely_not_a_real_model" not in OMNI_PIPELINES
         assert OMNI_PIPELINES.get("definitely_not_a_real_model") is None
         assert resolve_pipeline_config("definitely_not_a_real_model") is None
+
+    def test_native_indextts25_structure_overrides_stale_version_field(
+        self,
+        tmp_path,
+    ):
+        checkpoint_dir = tmp_path / "checkpoints"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "gpt.pth").touch()
+        (checkpoint_dir / "codec.pth").touch()
+        (checkpoint_dir / "multilingual_zh_ja_yue_char_del.tiktoken").touch()
+        (checkpoint_dir / "config.yaml").write_text(
+            "gpt:\n  number_text_tokens: 60509\nversion: 2.0\n",
+            encoding="utf-8",
+        )
+        assert _infer_native_indextts_model_type(str(tmp_path)) == "indextts2_5"
+
+    def test_native_indextts2_structure_remains_detectable(self, tmp_path):
+        checkpoint_dir = tmp_path / "checkpoints"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "gpt.pth").touch()
+        (checkpoint_dir / "s2mel.pth").touch()
+        (checkpoint_dir / "bpe.model").touch()
+        (checkpoint_dir / "semantic_codec.pth").touch()
+
+        assert _infer_native_indextts_model_type(str(tmp_path)) == "indextts2"
 
     def test_pipeline_config_supports_hf_architectures(self):
         """PipelineConfig accepts hf_architectures for HF-arch fallback

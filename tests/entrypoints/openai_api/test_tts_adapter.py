@@ -13,6 +13,10 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     all_tts_model_types,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
+    IndexTTS2Adapter,
+    IndexTTS25Adapter,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
@@ -32,6 +36,8 @@ EXPECTED_MODEL_TYPES = {
     "higgs_audio_v3",
     "glm_tts",
     "step_audio2",
+    "indextts2",
+    "indextts2_5",
 }
 
 
@@ -85,6 +91,19 @@ def test_all_adapters_are_ar_or_diffusion():
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
+
+
+def test_indextts_adapters_are_versioned():
+    assert resolve_adapter("indextts2") is IndexTTS2Adapter
+    assert resolve_adapter("indextts2_5") is IndexTTS25Adapter
+    assert IndexTTS25Adapter.stage_keys == frozenset({"indextts2_5_talker"})
+
+
+def test_indextts25_validates_explicit_language():
+    adapter = IndexTTS25Adapter(type("Context", (), {"server": object()})())
+
+    assert adapter._validate_extra_params({"lang": "ja"}) is None
+    assert "Unsupported IndexTTS 2.5 language" in adapter._validate_extra_params({"lang": "xx-invalid"})
 
 
 def test_diffusion_adapter_extra_body_params_fallback():

@@ -325,6 +325,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "NemotronHForCausalLM",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
+            "IndexTTS25TalkerForConditionalGeneration",
         }
         # The stage-level ``model_arch`` override may be blank so the class
         # resolves from the checkpoint's own ``architectures`` (e.g. the Audex

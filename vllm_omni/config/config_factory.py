@@ -65,6 +65,42 @@ def with_trust_remote_code_override(
     return merged
 
 
+def _infer_native_indextts_model_type(model: str) -> str | None:
+    """Detect official IndexTTS bundles from their checkpoint ABI.
+
+    Native releases may have no ``config.json`` and their ``config.yaml``
+    version can be stale. Prefer the tokenizer/codec layout, which is the
+    runtime-relevant distinction between 2.0 and 2.5.
+    """
+    model_path = Path(model).expanduser()
+    if not model_path.is_dir():
+        return None
+
+    roots = [model_path]
+    checkpoints = model_path / "checkpoints"
+    if checkpoints.is_dir():
+        roots.append(checkpoints)
+
+    for root in roots:
+        if (
+            (root / "gpt.pth").is_file()
+            and (root / "codec.pth").is_file()
+            and (root / "multilingual_zh_ja_yue_char_del.tiktoken").is_file()
+        ):
+            return "indextts2_5"
+
+    for root in roots:
+        if (
+            (root / "gpt.pth").is_file()
+            and (root / "s2mel.pth").is_file()
+            and (root / "bpe.model").is_file()
+            and (root / "semantic_codec.pth").is_file()
+        ):
+            return "indextts2"
+
+    return None
+
+
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
@@ -156,6 +192,10 @@ class StageConfigFactory:
         Returns:
             model_type as a string; may be None on failure.
         """
+        native_indextts_type = _infer_native_indextts_model_type(model)
+        if native_indextts_type is not None:
+            return native_indextts_type
+
         hf_config = cls.get_hf_config(
             model=model,
             trust_remote_code=trust_remote_code,

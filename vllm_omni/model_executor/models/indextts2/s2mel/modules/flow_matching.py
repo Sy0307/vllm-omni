@@ -26,7 +26,18 @@ class BASECFM(torch.nn.Module, ABC):
             self.zero_prompt_speech_token = False
 
     @torch.inference_mode()
-    def inference(self, mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5):
+    def inference(
+        self,
+        mu,
+        x_lens,
+        prompt,
+        style,
+        f0,
+        n_timesteps,
+        temperature=1.0,
+        inference_cfg_rate=0.5,
+        initial_noise=None,
+    ):
         """Forward diffusion
 
         Args:
@@ -47,7 +58,21 @@ class BASECFM(torch.nn.Module, ABC):
                 shape: (batch_size, 80, mel_timesteps)
         """
         B, T = mu.size(0), mu.size(1)
-        z = torch.randn([B, self.in_channels, T], device=mu.device, dtype=mu.dtype) * temperature
+        expected_noise_shape = (B, self.in_channels, T)
+        if initial_noise is None:
+            z = torch.randn(
+                expected_noise_shape,
+                device=mu.device,
+                dtype=mu.dtype,
+            )
+        else:
+            if tuple(initial_noise.shape) != expected_noise_shape:
+                raise ValueError(
+                    "CFM initial noise shape mismatch: "
+                    f"expected={expected_noise_shape}, got={tuple(initial_noise.shape)}"
+                )
+            z = initial_noise.to(device=mu.device, dtype=mu.dtype)
+        z = z * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate)
 

@@ -100,6 +100,7 @@ _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
 _INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
+_INDEXTTS25_TTS_MODEL_STAGES = {"indextts2_5_talker"}
 # audex_omni covers the audex_s2s S2S deployment, whose
 # TTS pass uses the same /v1/audio/speech surface.
 _AUDEX_TTS_MODEL_STAGES = {"audex_thinker", "audex_omni"}
@@ -121,6 +122,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _GLM_TTS_MODEL_STAGES
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
+    | _INDEXTTS25_TTS_MODEL_STAGES
     | _AUDEX_TTS_MODEL_STAGES
     | _AUDEX_TTA_MODEL_STAGES
 )
@@ -133,6 +135,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "indextts2",
+    "indextts2_5",
     "audex",
     "audex_tta",
 }
@@ -750,6 +753,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "step_audio2"
         if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
             return "indextts2"
+        if model_stage in _INDEXTTS25_TTS_MODEL_STAGES:
+            return "indextts2_5"
         if model_stage in _AUDEX_TTS_MODEL_STAGES:
             return "audex"
         if model_stage in _AUDEX_TTA_MODEL_STAGES:

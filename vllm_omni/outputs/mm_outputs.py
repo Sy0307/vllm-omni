@@ -23,7 +23,14 @@ logger = init_logger(__name__)
 # arrive as 0-d torch.Tensors — from_dict routes all tensors into .tensors,
 # so we relocate them to .metadata before consolidation to avoid a bogus
 # torch.cat attempt and its warn-and-keep-last fallback.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset(
+    {
+        "sr",
+        "sample_rate",
+        "audio_sample_rate",
+        "meta.use_gpt_latent",
+    }
+)
 
 
 def _cat_tensors(

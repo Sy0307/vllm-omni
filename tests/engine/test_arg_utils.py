@@ -6,6 +6,7 @@ explicitly patch values that differ from vLLM.
 
 import argparse
 import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -173,6 +174,26 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
         "talker_config": {
             "max_position_embeddings": 65536,
         },
+    }
+
+
+def test_patch_missing_local_hf_config(tmp_path):
+    """Native model bundles may only contain a checkpoints/ directory."""
+    (tmp_path / "checkpoints").mkdir()
+    args = object.__new__(OmniEngineArgs)
+    args.model = str(tmp_path)
+    args.model_arch = "IndexTTS25TalkerForConditionalGeneration"
+    args.hf_config_path = None
+
+    args._patch_empty_hf_config("indextts2_5")
+
+    assert args.hf_config_path is not None
+    config_path = args.hf_config_path + "/config.json"
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    assert config == {
+        "model_type": "indextts2_5",
+        "architectures": ["IndexTTS25TalkerForConditionalGeneration"],
     }
 
 

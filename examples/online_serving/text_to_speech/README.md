@@ -17,6 +17,7 @@ For the full list of supported architectures across all modalities, see
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | compat only, non-chunk | uploaded audio voice only; no presets | — |
+| IndexTTS-2.5 | native `checkpoints/` bundle | ✓ (`ref_audio` or uploaded `voice`) | compat only, non-chunk | uploaded audio voice only; no presets | — |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
@@ -138,14 +139,25 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 
 ---
 
-## IndexTTS-2
+## IndexTTS-2 and IndexTTS-2.5
 
-2-stage TTS (GPT AR + S2Mel CFM DiT + BigVGAN) at 22.05 kHz. Requests use `ref_audio` for voice cloning, or an uploaded audio `voice` from `/v1/audio/voices`. Supports emotion conditioning via `emo_audio`, `emo_text`, or `emo_vector` passed in `extra_params`.
+2-stage TTS at 22.05 kHz. Requests use `ref_audio` for voice cloning, or an uploaded audio `voice` from `/v1/audio/voices`. IndexTTS-2.5 uses a multilingual tokenizer, CAMPPlus speaker projection, EnhancedCodec, and code-only Stage 0→1 transfer by default. Both versions support emotion conditioning via `emo_audio`, `emo_text`, or `emo_vector` passed in `extra_params`.
 
 ### Launch
 ```bash
 vllm serve IndexTeam/IndexTTS-2 --omni --trust-remote-code --port 8092
 # or, to pass the bundled deploy config explicitly:
+bash examples/online_serving/text_to_speech/indextts2/run_server.sh
+
+# IndexTTS-2.5 default: use_gpt_latent=false
+MODEL_VERSION=2.5 \
+MODEL=/path/to/indextts-2.5 \
+bash examples/online_serving/text_to_speech/indextts2/run_server.sh
+
+# Experimental compatibility path: both stages use GPT latent
+MODEL_VERSION=2.5 \
+USE_GPT_LATENT=1 \
+MODEL=/path/to/indextts-2.5 \
 bash examples/online_serving/text_to_speech/indextts2/run_server.sh
 ```
 
@@ -161,14 +173,24 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
     --text "今天心情很好！" \
     --ref-audio /path/to/ref.wav \
     --emo-audio /path/to/happy.wav
+
+# IndexTTS-2.5 Japanese request
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --model-version 2.5 \
+    --model /path/to/indextts-2.5 \
+    --lang ja \
+    --text "こんにちは、音声合成のテストです。" \
+    --ref-audio /path/to/ref.wav
 ```
 
 ### Notes
 - Output: 22.05 kHz mono WAV.
-- Provide `ref_audio` on the documented raw request path, or pass `voice` only when it names an uploaded audio voice; IndexTTS-2 does not provide a built-in text-only preset voice.
+- Provide `ref_audio` on the documented raw request path, or pass `voice` only when it names an uploaded audio voice; neither version provides a built-in text-only preset voice.
+- IndexTTS-2.5 request controls `lang` and `text_normalization` are carried in `extra_params`; the client does this for `--model-version 2.5`.
 - Emotion params (`emo_audio`, `emo_text`, `emo_vector`, `emo_alpha`, `use_emo_text`, `use_random`) are passed via the `extra_params` field. Official precedence is `use_emo_text` > `emo_vector` > `emo_audio` > same emotion as the speaker reference.
-- `stream=true` is accepted as an OpenAI-compatible response path, but IndexTTS-2 is not async-chunk streaming; audio is produced after S2Mel receives the full mel-code sequence.
-- Deploy config: `vllm_omni/deploy/indextts2.yaml` (auto-loaded).
+- `stream=true` is accepted as an OpenAI-compatible response path, but these pipelines are not async-chunk streaming; audio is produced after S2Mel receives the full semantic-code sequence.
+- IndexTTS-2.5 deploy configs are `vllm_omni/deploy/indextts2_5.yaml` (official no-latent default) and `indextts2_5_latent.yaml` (experimental compatibility).
+- On the internal H20 bundle, use `/home/admin/workspace/aop_lab/app_data/.cache/models--test-shimei--test-tts/snapshots/20260728043522/` as `MODEL`; asset discovery accepts its nested `checkpoints/` layout.
 
 ---
 
