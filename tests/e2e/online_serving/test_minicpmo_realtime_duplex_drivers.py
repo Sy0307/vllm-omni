@@ -338,7 +338,7 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
 @pytest.mark.parametrize(
     "extra_args",
     [
-        ["--expect-second-response-substring", "一加一等于二"],
+        ["--expect-followup-response-substring", "一加一等于二"],
         ["--input-sha256", "a" * 64],
     ],
 )
@@ -454,7 +454,7 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
         validation_mode="response-required",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring="一加一等于二",
+        expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is True
@@ -495,7 +495,7 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
         validation_mode="model-policy",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring=None,
+        expect_followup_response_substring=None,
     )
 
     assert summary["ok"] is True
@@ -534,14 +534,14 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
         validation_mode="response-required",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring="一加一等于二",
+        expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is False
     assert summary["enough_responses"] is False
 
 
-def test_realtime_duplex_soft_interrupt_checks_expected_text_in_second_response(tmp_path):
+def test_realtime_duplex_soft_interrupt_rejects_expected_text_only_in_first_response(tmp_path):
     demo = _load_soft_interrupt_demo_module()
     output = tmp_path / "second_response_text"
     output.mkdir()
@@ -608,11 +608,81 @@ def test_realtime_duplex_soft_interrupt_checks_expected_text_in_second_response(
         validation_mode="response-required",
         min_responses=2,
         min_audio_deltas_per_response=2,
-        expect_second_response_substring="一加一等于二",
+        expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is False
-    assert summary["second_response_transcript_expectation_ok"] is False
+    assert summary["followup_response_transcript_expectation_ok"] is False
+
+
+def test_realtime_duplex_soft_interrupt_accepts_expected_text_in_later_followup_response(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "later_followup_response_text"
+    output.mkdir()
+    response_ids = ["resp-first", "resp-ack", "resp-target"]
+    transcripts = ["中国古代四大发明", "没问题。", "一加一等于二。"]
+    events = [{"type": "response.listen", "_client_received_at_s": 1.0}]
+    received_at_s = 2.0
+    for response_id, transcript in zip(response_ids, transcripts, strict=True):
+        events.extend(
+            [
+                {
+                    "type": "response.created",
+                    "response": {"id": response_id},
+                    "_client_received_at_s": received_at_s,
+                },
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": "AAAA",
+                    "_client_received_at_s": received_at_s + 0.1,
+                },
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": "AAAA",
+                    "_client_received_at_s": received_at_s + 0.2,
+                },
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": response_id,
+                    "delta": transcript,
+                    "_client_received_at_s": received_at_s + 0.2,
+                },
+                {
+                    "type": "response.done",
+                    "response_id": response_id,
+                    "_client_received_at_s": received_at_s + 0.3,
+                },
+            ]
+        )
+        received_at_s += 1.0
+    events.extend(
+        [
+            {"type": "response.listen", "_client_received_at_s": received_at_s},
+            {"type": "input_audio_buffer.committed", "_client_received_at_s": received_at_s + 0.5},
+            {"type": "response.listen", "_client_received_at_s": received_at_s + 0.6},
+        ]
+    )
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": response_ids}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="response-required",
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring="一加一等于二",
+    )
+
+    assert summary["ok"] is True
+    assert summary["followup_response_transcript_expectation_ok"] is True
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():
