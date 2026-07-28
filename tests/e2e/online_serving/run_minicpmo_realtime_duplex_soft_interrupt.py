@@ -2,8 +2,8 @@
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
 duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
-The stronger response-required mode binds the two-response contract to a known
-input checksum and expected second response.
+The stronger response-required mode binds the multi-response contract to a
+known input checksum and expected follow-up response.
 """
 
 from __future__ import annotations
@@ -222,7 +222,7 @@ def summarize_artifacts(
     validation_mode: str,
     min_responses: int,
     min_audio_deltas_per_response: int,
-    expect_second_response_substring: str | None,
+    expect_followup_response_substring: str | None,
 ) -> dict[str, object]:
     if validation_mode not in {"model-policy", "response-required"}:
         raise ValueError(f"unsupported validation mode: {validation_mode}")
@@ -285,12 +285,17 @@ def summarize_artifacts(
     )
     final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
-    second_response_transcript = (
-        str(response_summaries[1].get("transcript") or "") if len(response_summaries) >= 2 else ""
+    followup_response_transcripts = [
+        str(summary.get("transcript") or "")
+        for summary in response_summaries[1:]
+        if commit_index is not None
+        and isinstance(summary.get("created_index"), int)
+        and summary["created_index"] < commit_index
+    ]
+    followup_response_transcript_expectation_ok = not expect_followup_response_substring or any(
+        _normalize_text(expect_followup_response_substring) in _normalize_text(transcript)
+        for transcript in followup_response_transcripts
     )
-    second_response_transcript_expectation_ok = not expect_second_response_substring or _normalize_text(
-        expect_second_response_substring
-    ) in _normalize_text(second_response_transcript)
     error_events = [
         event
         for event in events
@@ -322,7 +327,7 @@ def summarize_artifacts(
         second_response_before_final_commit
         and listen_before_first_response
         and listen_after_last_done
-        and second_response_transcript_expectation_ok
+        and followup_response_transcript_expectation_ok
     )
     ok = common_contract_ok and mode_contract_ok
     return {
@@ -347,9 +352,9 @@ def summarize_artifacts(
         "listen_after_response_before_commit": listen_after_response_before_commit,
         "final_listen_after_commit": final_listen_after_commit,
         "transcript": transcript,
-        "second_response_transcript": second_response_transcript,
-        "expect_second_response_substring": expect_second_response_substring,
-        "second_response_transcript_expectation_ok": second_response_transcript_expectation_ok,
+        "followup_response_transcripts": followup_response_transcripts,
+        "expect_followup_response_substring": expect_followup_response_substring,
+        "followup_response_transcript_expectation_ok": followup_response_transcript_expectation_ok,
         "error_count": len(error_events),
         "cancelled_count": cancelled_count,
         "compact_sequence": _compact_sequence(events),
@@ -416,7 +421,7 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         validation_mode=args.validation_mode,
         min_responses=args.min_responses,
         min_audio_deltas_per_response=args.min_audio_deltas_per_response,
-        expect_second_response_substring=args.expect_second_response_substring,
+        expect_followup_response_substring=args.expect_followup_response_substring,
     )
     summary.update(
         {
@@ -454,14 +459,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
     parser.add_argument("--input-sha256")
-    parser.add_argument("--expect-second-response-substring")
+    parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()
     if args.validation_mode == "response-required" and args.min_responses < 2:
         parser.error("--min-responses must be at least 2")
     if args.validation_mode == "response-required" and not args.input_sha256:
         parser.error("--input-sha256 is required in response-required mode")
-    if args.validation_mode == "response-required" and not args.expect_second_response_substring:
-        parser.error("--expect-second-response-substring is required in response-required mode")
+    if args.validation_mode == "response-required" and not args.expect_followup_response_substring:
+        parser.error("--expect-followup-response-substring is required in response-required mode")
     if args.min_audio_deltas_per_response < 1:
         parser.error("--min-audio-deltas-per-response must be positive")
     return args
