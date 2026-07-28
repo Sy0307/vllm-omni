@@ -445,8 +445,8 @@ class TestSingleStageModeDetection:
 
         get_pipeline_config.assert_called_once_with(
             model="fake-model",
-            trust_remote_code=None,
-            deploy_config_path=None,
+            trust_remote_code=False,
+            deploy_config_path="/fake/duplex.yaml",
         )
         load_deploy_config.assert_called_once_with("/fake/duplex.yaml")
         assert engine.duplex_session_config is duplex_session

@@ -209,14 +209,13 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so resolve the model pipeline
-        # beforehand. stage_configs_path may point at a generated/legacy stage
-        # config and must not override model-based pipeline resolution.
-        deploy_config_path = kwargs.get("deploy_config")
-        runtime_config_path = deploy_config_path or kwargs.get("stage_configs_path")
+        # Stage resolution pops deploy_config, so get pipeline-wide settings
+        # beforehand. The stage CLI exposes the same deploy YAML through
+        # stage_configs_path.
+        deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
@@ -228,8 +227,8 @@ class AsyncOmniEngine:
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
-        if runtime_config_path is not None:
-            self.duplex_session_config = load_deploy_config(runtime_config_path).duplex_session
+        if deploy_config_path is not None:
+            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a
