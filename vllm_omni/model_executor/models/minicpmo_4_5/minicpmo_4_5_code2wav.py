@@ -557,10 +557,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         invalid_empty = [
             item.request_id
             for item in items
-            if item.has_payload
-            and not item.last_chunk
-            and not item.tts_is_last_chunk
-            and item.tokens.numel() == 0
+            if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
