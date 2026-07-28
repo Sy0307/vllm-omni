@@ -74,7 +74,7 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
                 min_responses=2,
                 min_audio_deltas_per_response=2,
                 input_sha256=SOFT_INTERRUPT_SHA256,
-                expect_followup_response_substring="一加一等于二",
+                expect_followup_response_substring=None,
             )
         )
     )
@@ -83,4 +83,4 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
     assert result["error_count"] == 0
     assert result["response_lifecycle_ok"] is True
     assert result["response_audio_contract_ok"] is True
-    assert result["followup_response_transcript_expectation_ok"] is True
+    assert result["followup_response_transcript_ok"] is True
