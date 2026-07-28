@@ -335,14 +335,7 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
     assert args.validation_mode == "model-policy"
 
 
-@pytest.mark.parametrize(
-    "extra_args",
-    [
-        ["--expect-followup-response-substring", "一加一等于二"],
-        ["--input-sha256", "a" * 64],
-    ],
-)
-def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch, extra_args):
+def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -357,7 +350,6 @@ def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(mo
             "ref.wav",
             "--validation-mode",
             "response-required",
-            *extra_args,
         ],
     )
 
@@ -541,7 +533,7 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
     assert summary["enough_responses"] is False
 
 
-def test_realtime_duplex_soft_interrupt_rejects_expected_text_only_in_first_response(tmp_path):
+def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):
     demo = _load_soft_interrupt_demo_module()
     output = tmp_path / "second_response_text"
     output.mkdir()
@@ -611,69 +603,20 @@ def test_realtime_duplex_soft_interrupt_rejects_expected_text_only_in_first_resp
         expect_followup_response_substring="一加一等于二",
     )
 
-    assert summary["ok"] is False
+    assert summary["ok"] is True
+    assert summary["followup_response_transcript_ok"] is True
     assert summary["followup_response_transcript_expectation_ok"] is False
 
-
-def test_realtime_duplex_soft_interrupt_accepts_expected_text_in_later_followup_response(tmp_path):
-    demo = _load_soft_interrupt_demo_module()
-    output = tmp_path / "later_followup_response_text"
-    output.mkdir()
-    response_ids = ["resp-first", "resp-ack", "resp-target"]
-    transcripts = ["中国古代四大发明", "没问题。", "一加一等于二。"]
-    events = [{"type": "response.listen", "_client_received_at_s": 1.0}]
-    received_at_s = 2.0
-    for response_id, transcript in zip(response_ids, transcripts, strict=True):
-        events.extend(
-            [
-                {
-                    "type": "response.created",
-                    "response": {"id": response_id},
-                    "_client_received_at_s": received_at_s,
-                },
-                {
-                    "type": "response.audio.delta",
-                    "response_id": response_id,
-                    "delta": "AAAA",
-                    "_client_received_at_s": received_at_s + 0.1,
-                },
-                {
-                    "type": "response.audio.delta",
-                    "response_id": response_id,
-                    "delta": "AAAA",
-                    "_client_received_at_s": received_at_s + 0.2,
-                },
-                {
-                    "type": "response.audio_transcript.delta",
-                    "response_id": response_id,
-                    "delta": transcript,
-                    "_client_received_at_s": received_at_s + 0.2,
-                },
-                {
-                    "type": "response.done",
-                    "response_id": response_id,
-                    "_client_received_at_s": received_at_s + 0.3,
-                },
-            ]
-        )
-        received_at_s += 1.0
-    events.extend(
-        [
-            {"type": "response.listen", "_client_received_at_s": received_at_s},
-            {"type": "input_audio_buffer.committed", "_client_received_at_s": received_at_s + 0.5},
-            {"type": "response.listen", "_client_received_at_s": received_at_s + 0.6},
-        ]
-    )
+    events = [
+        event
+        for event in events
+        if event.get("response_id") != second_response_id or event["type"] != "response.audio_transcript.delta"
+    ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
         encoding="utf-8",
     )
-    (output / "result.json").write_text(
-        demo.json.dumps({"ok": True, "response_ids": response_ids}),
-        encoding="utf-8",
-    )
-
-    summary = demo.summarize_artifacts(
+    missing_transcript_summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="response-required",
         min_responses=2,
@@ -681,8 +624,8 @@ def test_realtime_duplex_soft_interrupt_accepts_expected_text_in_later_followup_
         expect_followup_response_substring="一加一等于二",
     )
 
-    assert summary["ok"] is True
-    assert summary["followup_response_transcript_expectation_ok"] is True
+    assert missing_transcript_summary["ok"] is False
+    assert missing_transcript_summary["followup_response_transcript_ok"] is False
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():

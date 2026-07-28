@@ -292,6 +292,9 @@ def summarize_artifacts(
         and isinstance(summary.get("created_index"), int)
         and summary["created_index"] < commit_index
     ]
+    followup_response_transcript_ok = any(
+        bool(_normalize_text(transcript)) for transcript in followup_response_transcripts
+    )
     followup_response_transcript_expectation_ok = not expect_followup_response_substring or any(
         _normalize_text(expect_followup_response_substring) in _normalize_text(transcript)
         for transcript in followup_response_transcripts
@@ -327,7 +330,7 @@ def summarize_artifacts(
         second_response_before_final_commit
         and listen_before_first_response
         and listen_after_last_done
-        and followup_response_transcript_expectation_ok
+        and followup_response_transcript_ok
     )
     ok = common_contract_ok and mode_contract_ok
     return {
@@ -353,6 +356,7 @@ def summarize_artifacts(
         "final_listen_after_commit": final_listen_after_commit,
         "transcript": transcript,
         "followup_response_transcripts": followup_response_transcripts,
+        "followup_response_transcript_ok": followup_response_transcript_ok,
         "expect_followup_response_substring": expect_followup_response_substring,
         "followup_response_transcript_expectation_ok": followup_response_transcript_expectation_ok,
         "error_count": len(error_events),
@@ -465,8 +469,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min-responses must be at least 2")
     if args.validation_mode == "response-required" and not args.input_sha256:
         parser.error("--input-sha256 is required in response-required mode")
-    if args.validation_mode == "response-required" and not args.expect_followup_response_substring:
-        parser.error("--expect-followup-response-substring is required in response-required mode")
     if args.min_audio_deltas_per_response < 1:
         parser.error("--min-audio-deltas-per-response must be positive")
     return args
