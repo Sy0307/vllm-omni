@@ -40,17 +40,36 @@
           </label>
         </section>
 
-        <div class="runtime-row">
-          <div class="meter" aria-label="Microphone level">
-            <span>Mic</span>
-            <div class="meter-track"><div id="meterFill" class="meter-fill"></div></div>
+        <section
+          id="microphoneRail"
+          class="duplex-rail"
+          aria-label="Microphone and duplex status"
+        >
+          <div class="mic-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect x="8" y="3" width="8" height="12" rx="4"></rect>
+              <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7"></path>
+            </svg>
           </div>
-          <dl class="runtime-status">
-            <div><dt>Model</dt><dd id="modelState">Idle</dd></div>
-            <div><dt>Playback</dt><dd id="playbackState">Idle</dd></div>
-            <div><dt>Session</dt><dd id="sessionTimer">00:00</dd></div>
-          </dl>
-        </div>
+          <div class="mic-signal">
+            <div class="mic-signal-heading">
+              <strong>Your microphone</strong>
+              <span><span id="captureRate">16 kHz</span> · <span id="sessionTimer">00:00</span></span>
+            </div>
+            <div id="micBars" class="mic-bars" aria-hidden="true">
+              <i class="mic-bar"></i><i class="mic-bar"></i><i class="mic-bar"></i>
+              <i class="mic-bar"></i><i class="mic-bar"></i><i class="mic-bar"></i>
+              <i class="mic-bar"></i><i class="mic-bar"></i><i class="mic-bar"></i>
+              <i class="mic-bar"></i><i class="mic-bar"></i><i class="mic-bar"></i>
+              <i class="mic-bar"></i><i class="mic-bar"></i><i class="mic-bar"></i>
+              <i class="mic-bar"></i><i class="mic-bar"></i><i class="mic-bar"></i>
+            </div>
+          </div>
+          <div class="duplex-state">
+            <strong id="modelState">Idle</strong>
+            <span id="playbackState">Mic closed</span>
+          </div>
+        </section>
 
         <section class="conversation-section" aria-labelledby="conversationTitle">
           <div class="section-heading">
