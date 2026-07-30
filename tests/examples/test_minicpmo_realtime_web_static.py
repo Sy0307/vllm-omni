@@ -86,6 +86,15 @@ def test_client_tracks_pcm_bars_and_per_response_generation_duration():
     assert "sendBeacon" not in source
 
 
+def test_duplex_rail_preserves_active_playback_when_mute_state_changes():
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "let playbackStatus = 'Idle';" in source
+    assert "playbackStatus = label;" in source
+    assert "if (playbackStatus !== 'Idle')" in source
+    assert "setMicDetail(playbackStatus);" in source
+
+
 def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 

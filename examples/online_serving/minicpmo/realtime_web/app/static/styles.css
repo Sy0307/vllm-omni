@@ -350,6 +350,14 @@ main {
   font-size: 7px;
 }
 
+.duplex-rail[data-state="speaking"] .mic-glyph {
+  background: var(--ash-primary);
+}
+
+.duplex-rail[data-state="idle"] .mic-glyph {
+  opacity: .58;
+}
+
 .conversation-section {
   padding: 22px 24px 0;
 }
@@ -406,11 +414,39 @@ main {
 .turn-user .turn-role { color: var(--ash-title-accent); }
 .turn-assistant .turn-role { color: #776e82; }
 
+.turn-body,
 .turn-text {
   min-width: 0;
+}
+
+.turn-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.55;
+}
+
+.turn-response-meta {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ash-muted);
+  font: 750 8px/1 var(--font-data);
+  text-transform: uppercase;
+}
+
+.turn-response-meta::before {
+  content: "";
+  width: 14px;
+  height: 1px;
+  background: color-mix(in srgb, var(--ash-line) 58%, var(--ash-surface));
+}
+
+.turn-live .turn-response-meta::before {
+  height: 5px;
+  border: 1px solid var(--ash-line);
+  background: var(--ash-primary);
+  animation: response-pulse 900ms ease-in-out infinite;
 }
 
 .turn-live .turn-text::after {
@@ -443,6 +479,14 @@ main {
   from {
     opacity: 0;
     transform: translateY(8px);
+  }
+}
+
+@keyframes response-pulse {
+  50% {
+    opacity: .42;
+    transform: scaleX(.65);
+    transform-origin: left;
   }
 }
 
@@ -641,7 +685,8 @@ main {
 @media (prefers-reduced-motion: reduce) {
   .app-shell,
   .status-online::before,
-  .turn {
+  .turn,
+  .turn-live .turn-response-meta::before {
     animation: none;
   }
 

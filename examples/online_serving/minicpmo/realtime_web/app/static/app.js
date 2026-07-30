@@ -13,7 +13,9 @@
   const modelState = document.getElementById('modelState');
   const playbackState = document.getElementById('playbackState');
   const sessionTimer = document.getElementById('sessionTimer');
-  const meterFill = document.getElementById('meterFill');
+  const microphoneRail = document.getElementById('microphoneRail');
+  const captureRateLabel = document.getElementById('captureRate');
+  const micBars = Array.from(document.querySelectorAll('#micBars .mic-bar'));
   const conversation = document.getElementById('conversation');
   const emptyConversation = document.getElementById('emptyConversation');
   const eventLog = document.getElementById('eventLog');
@@ -29,6 +31,8 @@
   const ECHO_GUARD_MS = 300;
   const INITIAL_PLAYBACK_BUFFER_MS = 1000;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
+  const RESPONSE_TIMER_INTERVAL_MS = 100;
+  const MIC_BAR_HEIGHTS = [5, 9, 14, 8, 17, 11, 6, 13, 18, 10, 5, 12, 16, 8, 4, 10, 14, 7];
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
   // (assets/presets/{omni,audio_duplex}/*.yaml).
@@ -72,6 +76,7 @@
   let cameraPendingFrame = null;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
+  let playbackStatus = 'Idle';
   let pendingCapture = [];
   let currentResponseId = null;
   let responseHasAudio = false;
@@ -79,6 +84,9 @@
   let liveUserTurn = null;
   let liveAssistantTurn = null;
   let sessionCloseResolver = null;
+  let responseTimer = null;
+  let smoothedMicLevel = 0;
+  const responseTimings = new Map();
 
   function staticAssetUrl(path) {
     const version = String(config.appVersion || '').trim();
@@ -115,10 +123,24 @@
 
   function setModel(label) {
     modelState.textContent = label;
+    if (microphoneRail) microphoneRail.dataset.state = label.toLowerCase();
+  }
+
+  function setMicDetail(label) {
+    playbackState.textContent = label;
+  }
+
+  function syncMicDetail() {
+    if (playbackStatus !== 'Idle') setMicDetail(playbackStatus);
+    else if (!running) setMicDetail('Mic closed');
+    else if (muted) setMicDetail('Mic muted');
+    else setMicDetail('Mic open');
   }
 
   function setPlayback(label) {
-    playbackState.textContent = label;
+    playbackStatus = label;
+    if (label === 'Idle') syncMicDetail();
+    else setMicDetail(label);
   }
 
   function compactEvent(event) {
@@ -164,12 +186,22 @@
     const label = document.createElement('div');
     label.className = 'turn-role';
     label.textContent = role === 'user' ? 'You' : 'Assistant';
+    const body = document.createElement('div');
+    body.className = 'turn-body';
     const text = document.createElement('div');
     text.className = 'turn-text';
-    row.append(label, text);
+    body.appendChild(text);
+    row.append(label, body);
     conversation.appendChild(row);
     conversation.scrollTop = conversation.scrollHeight;
-    const turn = { row, text, value: '' };
+    const turn = {
+      row,
+      body,
+      text,
+      value: '',
+      responseMeta: null,
+      responseId: null,
+    };
     if (role === 'user') liveUserTurn = turn;
     else liveAssistantTurn = turn;
     return turn;
@@ -194,6 +226,74 @@
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
     else liveAssistantTurn = null;
+  }
+
+  function formatResponseDuration(durationMs) {
+    return `${(Math.max(0, durationMs) / 1000).toFixed(1)}s`;
+  }
+
+  function ensureResponseMeta(turn) {
+    if (turn.responseMeta) return turn.responseMeta;
+    const meta = document.createElement('div');
+    meta.className = 'turn-response-meta';
+    meta.setAttribute('aria-hidden', 'true');
+    turn.body.appendChild(meta);
+    turn.responseMeta = meta;
+    return meta;
+  }
+
+  function updateResponseTimers() {
+    const now = performance.now();
+    for (const timing of responseTimings.values()) {
+      if (timing.finishedAt !== null) continue;
+      ensureResponseMeta(timing.turn).textContent =
+        `Responding · ${formatResponseDuration(now - timing.startedAt)}`;
+    }
+  }
+
+  function startResponseTiming(responseId) {
+    if (!responseId || responseTimings.has(responseId)) return;
+    const turn = ensureTurn('assistant');
+    const timing = {
+      responseId,
+      startedAt: performance.now(),
+      finishedAt: null,
+      turn,
+    };
+    turn.responseId = responseId;
+    responseTimings.set(responseId, timing);
+    ensureResponseMeta(turn).textContent = 'Responding · 0.0s';
+    if (responseTimer === null) {
+      responseTimer = window.setInterval(updateResponseTimers, RESPONSE_TIMER_INTERVAL_MS);
+    }
+  }
+
+  function finishResponseTiming(responseId, status) {
+    const timing = responseTimings.get(responseId);
+    if (!timing || timing.finishedAt !== null) return;
+    timing.finishedAt = performance.now();
+    const duration = formatResponseDuration(timing.finishedAt - timing.startedAt);
+    const finalStatus = status || 'completed';
+    const label = finalStatus === 'cancelled'
+      ? 'Interrupted ·'
+      : finalStatus === 'failed' ? 'Failed ·' : 'Completed ·';
+    const accessibleLabel = finalStatus === 'cancelled'
+      ? 'interrupted'
+      : finalStatus === 'failed' ? 'failed' : 'completed';
+    const meta = ensureResponseMeta(timing.turn);
+    meta.textContent = `${label} ${duration}`;
+    meta.removeAttribute('aria-hidden');
+    meta.setAttribute('aria-label', `Response ${accessibleLabel} in ${duration}`);
+    if ([...responseTimings.values()].every((entry) => entry.finishedAt !== null)) {
+      window.clearInterval(responseTimer);
+      responseTimer = null;
+    }
+  }
+
+  function clearResponseTimers() {
+    if (responseTimer !== null) window.clearInterval(responseTimer);
+    responseTimer = null;
+    responseTimings.clear();
   }
 
   function bytesToBase64(bytes) {
@@ -261,10 +361,24 @@
     };
   }
 
+  function renderMicLevel(level) {
+    const activeCount = Math.round(Math.max(0, Math.min(1, level)) * micBars.length);
+    micBars.forEach((bar, index) => {
+      bar.classList.toggle('is-active', index < activeCount);
+      bar.style.height = `${MIC_BAR_HEIGHTS[index] || 4}px`;
+    });
+  }
+
   function updateMeter(pcm) {
     let peak = 0;
-    for (let index = 0; index < pcm.length; index += 8) peak = Math.max(peak, Math.abs(pcm[index]));
-    meterFill.style.width = `${Math.min(100, (peak / 32768) * 150).toFixed(0)}%`;
+    for (let index = 0; index < pcm.length; index += 8) {
+      peak = Math.max(peak, Math.abs(pcm[index]));
+    }
+    const nextLevel = Math.min(1, (peak / 32768) * 1.5);
+    smoothedMicLevel = nextLevel > smoothedMicLevel
+      ? nextLevel
+      : Math.max(0, smoothedMicLevel * .82);
+    renderMicLevel(muted ? 0 : smoothedMicLevel);
   }
 
   function microphoneUploadEnabled() {
@@ -372,8 +486,10 @@
       case 'response.created':
       case 'response.speak':
         beginAssistant(responseId);
+        startResponseTiming(responseId);
         break;
       case 'response.audio.delta':
+        startResponseTiming(responseId);
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');
@@ -396,10 +512,15 @@
       case 'conversation.item.input_audio_transcription.completed':
         finishTranscript('user', event.transcript || '');
         break;
-      case 'response.done':
+      case 'response.done': {
+        const status = event.response && event.response.status
+          ? event.response.status
+          : 'completed';
         finishTranscript('assistant');
+        finishResponseTiming(responseId, status);
         if (!responseHasAudio) requestPlaybackDrain(responseId);
         break;
+      }
       case 'playback.acknowledged':
         {
           const acknowledgement = event.event || event;
@@ -451,6 +572,7 @@
       captureContext = new (window.AudioContext || window.webkitAudioContext)();
     }
     captureRate = captureContext.sampleRate;
+    captureRateLabel.textContent = `${Math.round(captureRate / 1000)} kHz`;
     await captureContext.audioWorklet.addModule(staticAssetUrl('static/pcm_worklet.js'));
     const source = captureContext.createMediaStreamSource(mediaStream);
     captureNode = new AudioWorkletNode(captureContext, 'fullduplex-pcm-capture');
@@ -548,6 +670,7 @@
       cameraButton.disabled = false;
       setConnection('Connected', 'online');
       setModel('Listening');
+      syncMicDetail();
       appendLog('session started');
     } catch (error) {
       appendLog(`start failed: ${error.message || error}`, true);
@@ -651,7 +774,9 @@
     playbackNode = null;
     currentResponseId = null;
     responseHasAudio = false;
-    meterFill.style.width = '0%';
+    smoothedMicLevel = 0;
+    renderMicLevel(0);
+    clearResponseTimers();
     sessionTimer.textContent = '00:00';
     callButton.textContent = 'Start session';
     callButton.classList.remove('is-active');
@@ -671,6 +796,11 @@
     pendingCapture = [];
     muteButton.textContent = muted ? 'Unmute' : 'Mute';
     muteButton.classList.toggle('is-active', muted);
+    if (muted) {
+      smoothedMicLevel = 0;
+      renderMicLevel(0);
+    }
+    syncMicDetail();
     appendLog(muted ? 'microphone muted' : 'microphone unmuted');
   }
 
@@ -682,6 +812,8 @@
   toggleLogButton.addEventListener('click', () => {
     setLogExpanded(eventLogPanel.hidden);
   });
+  renderMicLevel(0);
+  syncMicDetail();
   setLogExpanded(false);
   clearLogButton.addEventListener('click', () => {
     eventLog.textContent = '';
