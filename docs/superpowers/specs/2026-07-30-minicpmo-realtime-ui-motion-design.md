@@ -153,30 +153,33 @@ Under `prefers-reduced-motion: reduce`:
 - retain instantaneous microphone level changes because they are functional
   feedback, not decorative motion.
 
-## Per-response Generation Timing
+## Per-response Latency Timing
 
 ### Definition
 
-The displayed value is the client-observed streaming generation duration:
+The UI displays two browser-observed latency milestones from the same input
+boundary:
 
 ```text
-start = browser receives response.created
-end   = browser receives response.done
-duration = performance.now(end) - performance.now(start)
+start          = browser receives input_audio_buffer.committed
+first audio    = browser receives the first response.audio.delta
+fully complete = browser receives response.done
 ```
 
-The UI must call this a completion or response duration, not TTFP or
-user-perceived latency.
+If a response begins without a preceding committed event, the browser uses the
+first response event as a defensive fallback start. These values are client
+observations rather than server-only model-generation metrics.
 
 ### Display states
 
-- Active: `Responding · 3.8s`
-- Completed: `Completed · 8.2s`
-- Cancelled/interrupted: `Interrupted · 2.6s`
-- Failed: `Failed · 1.4s`
+- Waiting for audio: `First audio · waiting / Responding · 0.8s`
+- Streaming: `First audio · 0.4s / Responding · 3.8s`
+- Completed: `First audio · 0.4s / Fully completed · 8.2s`
+- Cancelled/interrupted: `First audio · 0.4s / Interrupted · 2.6s`
+- Failed: `First audio · not received / Failed · 1.4s`
 
-The metadata appears below the assistant text in small data typography. It does
-not create a separate dashboard row.
+The metadata appears below the assistant text in enlarged data typography. It
+does not create a separate dashboard row.
 
 ### State ownership
 

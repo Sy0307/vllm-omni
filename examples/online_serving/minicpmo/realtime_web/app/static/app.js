@@ -85,6 +85,7 @@
   let liveAssistantTurn = null;
   let sessionCloseResolver = null;
   let responseTimer = null;
+  let latestInputCommittedAt = null;
   let smoothedMicLevel = 0;
   const responseTimings = new Map();
 
@@ -246,26 +247,43 @@
     const now = performance.now();
     for (const timing of responseTimings.values()) {
       if (timing.finishedAt !== null) continue;
+      const firstAudio = timing.firstAudioAt === null
+        ? 'waiting'
+        : formatResponseDuration(timing.firstAudioAt - timing.startedAt);
       ensureResponseMeta(timing.turn).textContent =
-        `Responding · ${formatResponseDuration(now - timing.startedAt)}`;
+        `First audio · ${firstAudio} / Responding · `
+        + formatResponseDuration(now - timing.startedAt);
     }
   }
 
   function startResponseTiming(responseId) {
     if (!responseId || responseTimings.has(responseId)) return;
     const turn = ensureTurn('assistant');
+    const startedAt = latestInputCommittedAt || performance.now();
+    latestInputCommittedAt = null;
     const timing = {
       responseId,
-      startedAt: performance.now(),
+      startedAt,
+      firstAudioAt: null,
       finishedAt: null,
       turn,
     };
     turn.responseId = responseId;
     responseTimings.set(responseId, timing);
-    ensureResponseMeta(turn).textContent = 'Responding · 0.0s';
+    ensureResponseMeta(turn).textContent =
+      'First audio · waiting / Responding · 0.0s';
     if (responseTimer === null) {
       responseTimer = window.setInterval(updateResponseTimers, RESPONSE_TIMER_INTERVAL_MS);
     }
+  }
+
+  function markFirstResponseTiming(responseId) {
+    const timing = responseTimings.get(responseId);
+    if (!timing || timing.firstAudioAt !== null) return;
+    timing.firstAudioAt = performance.now();
+    ensureResponseMeta(timing.turn).textContent =
+      `First audio · ${formatResponseDuration(timing.firstAudioAt - timing.startedAt)}`
+      + ` / Responding · ${formatResponseDuration(timing.firstAudioAt - timing.startedAt)}`;
   }
 
   function finishResponseTiming(responseId, status) {
@@ -273,17 +291,23 @@
     if (!timing || timing.finishedAt !== null) return;
     timing.finishedAt = performance.now();
     const duration = formatResponseDuration(timing.finishedAt - timing.startedAt);
+    const firstAudio = timing.firstAudioAt === null
+      ? 'not received'
+      : formatResponseDuration(timing.firstAudioAt - timing.startedAt);
     const finalStatus = status || 'completed';
     const label = finalStatus === 'cancelled'
       ? 'Interrupted ·'
-      : finalStatus === 'failed' ? 'Failed ·' : 'Completed ·';
+      : finalStatus === 'failed' ? 'Failed ·' : 'Fully completed ·';
     const accessibleLabel = finalStatus === 'cancelled'
       ? 'interrupted'
       : finalStatus === 'failed' ? 'failed' : 'completed';
     const meta = ensureResponseMeta(timing.turn);
-    meta.textContent = `${label} ${duration}`;
+    meta.textContent = `First audio · ${firstAudio} / ${label} ${duration}`;
     meta.removeAttribute('aria-hidden');
-    meta.setAttribute('aria-label', `Response ${accessibleLabel} in ${duration}`);
+    meta.setAttribute(
+      'aria-label',
+      `First audio in ${firstAudio}; response ${accessibleLabel} in ${duration}`,
+    );
     if ([...responseTimings.values()].every((entry) => entry.finishedAt !== null)) {
       window.clearInterval(responseTimer);
       responseTimer = null;
@@ -294,6 +318,7 @@
     if (responseTimer !== null) window.clearInterval(responseTimer);
     responseTimer = null;
     responseTimings.clear();
+    latestInputCommittedAt = null;
   }
 
   function bytesToBase64(bytes) {
@@ -488,8 +513,12 @@
         beginAssistant(responseId);
         startResponseTiming(responseId);
         break;
+      case 'input_audio_buffer.committed':
+        latestInputCommittedAt = performance.now();
+        break;
       case 'response.audio.delta':
         startResponseTiming(responseId);
+        markFirstResponseTiming(responseId);
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');

@@ -326,9 +326,12 @@ main {
 }
 
 .duplex-state {
-  min-width: 92px;
+  min-width: 136px;
   padding-left: 14px;
   border-left: 1px solid color-mix(in srgb, var(--ash-line) 45%, var(--ash-surface));
+  display: flex;
+  align-items: flex-end;
+  flex-direction: column;
   text-align: right;
 }
 
@@ -340,14 +343,56 @@ main {
 }
 
 .duplex-state strong {
+  min-width: 112px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--ash-line) 75%, var(--ash-surface));
+  background: color-mix(in srgb, var(--ash-control) 42%, var(--ash-surface));
   color: var(--ash-title-accent);
-  font-size: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  letter-spacing: .08em;
+}
+
+.duplex-state strong::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border: 1px solid var(--ash-line);
+  border-radius: 50%;
+  background: var(--ash-muted);
+}
+
+.duplex-rail[data-state="listening"] .duplex-state strong {
+  border-color: var(--ash-title-accent);
+  background: color-mix(in srgb, var(--ash-primary) 32%, var(--ash-surface));
+  color: var(--ash-ink);
+  animation: listening-focus 1.8s ease-in-out infinite;
+}
+
+.duplex-rail[data-state="listening"] .duplex-state strong::before {
+  background: var(--ash-title-accent);
+}
+
+.duplex-rail[data-state="speaking"] .duplex-state strong {
+  background: color-mix(in srgb, var(--ash-wave) 25%, var(--ash-surface));
+}
+
+.duplex-rail[data-state="speaking"] .duplex-state strong::before {
+  background: var(--ash-wave);
+}
+
+.duplex-rail[data-state="idle"] .duplex-state strong {
+  opacity: .64;
 }
 
 .duplex-state span {
   margin-top: 6px;
   color: var(--ash-muted);
-  font-size: 7px;
+  font-size: 8px;
 }
 
 .duplex-rail[data-state="speaking"] .mic-glyph {
@@ -426,20 +471,26 @@ main {
 }
 
 .turn-response-meta {
-  margin-top: 8px;
+  width: fit-content;
+  margin-top: 10px;
+  padding: 7px 9px;
+  border-left: 3px solid color-mix(in srgb, var(--ash-title-accent) 62%, var(--ash-line));
+  background: color-mix(in srgb, var(--ash-control) 28%, transparent);
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--ash-muted);
-  font: 750 8px/1 var(--font-data);
+  color: color-mix(in srgb, var(--ash-ink) 76%, var(--ash-muted));
+  font: 800 11px/1.2 var(--font-data);
+  letter-spacing: .025em;
   text-transform: uppercase;
 }
 
 .turn-response-meta::before {
   content: "";
-  width: 14px;
-  height: 1px;
-  background: color-mix(in srgb, var(--ash-line) 58%, var(--ash-surface));
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ash-title-accent) 68%, var(--ash-surface));
 }
 
 .turn-live .turn-response-meta::before {
@@ -472,6 +523,12 @@ main {
   50% {
     opacity: .42;
     transform: scale(.82);
+  }
+}
+
+@keyframes listening-focus {
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--ash-primary) 24%, transparent);
   }
 }
 
@@ -638,6 +695,7 @@ main {
     padding: 10px 0 0;
     border-top: 1px solid color-mix(in srgb, var(--ash-line) 45%, var(--ash-surface));
     border-left: 0;
+    align-items: flex-start;
     text-align: left;
   }
 
@@ -686,7 +744,8 @@ main {
   .app-shell,
   .status-online::before,
   .turn,
-  .turn-live .turn-response-meta::before {
+  .turn-live .turn-response-meta::before,
+  .duplex-rail[data-state="listening"] .duplex-state strong {
     animation: none;
   }
 

@@ -59,6 +59,8 @@ def test_stylesheet_uses_ash_indigo_typography_motion_and_responsive_shell():
     assert "--font-data:" in source
     assert ".duplex-rail" in source
     assert ".mic-bar.is-active" in source
+    assert '.duplex-rail[data-state="listening"] .duplex-state strong' in source
+    assert "@keyframes listening-focus" in source
     assert ".turn-response-meta" in source
     assert "@keyframes page-arrive" in source
     assert "@keyframes status-breathe" in source
@@ -68,7 +70,7 @@ def test_stylesheet_uses_ash_indigo_typography_motion_and_responsive_shell():
     assert "[hidden]" in source
 
 
-def test_client_tracks_pcm_bars_and_per_response_generation_duration():
+def test_client_tracks_pcm_bars_first_audio_and_full_response_duration():
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "const micBars = Array.from" in source
@@ -76,10 +78,13 @@ def test_client_tracks_pcm_bars_and_per_response_generation_duration():
     assert "classList.toggle('is-active'" in source
     assert "const responseTimings = new Map();" in source
     assert "function startResponseTiming(responseId)" in source
+    assert "function markFirstResponseTiming(responseId)" in source
     assert "function finishResponseTiming(responseId, status)" in source
+    assert "input_audio_buffer.committed" in source
     assert "performance.now()" in source
+    assert "First audio ·" in source
     assert "Responding ·" in source
-    assert "Completed ·" in source
+    assert "Fully completed ·" in source
     assert "Interrupted ·" in source
     assert "aria-hidden" in source
     assert "localStorage" not in source
@@ -104,7 +109,7 @@ def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
     assert "url.searchParams.set('minicpmo45_native_duplex', '1')" in source
     assert "auto_response: true" in source
     assert "input_audio_buffer.append" in source
-    assert "input_audio_buffer.commit" not in source
+    assert "type: 'input_audio_buffer.commit'" not in source
     assert "playback.ack" in source
     assert "event.event || event" in source
     assert "response.audio.delta" in source
