@@ -13,14 +13,18 @@ STATIC_ROOT = APP_ROOT / "static"
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_page_exposes_simplified_fog_blue_layout_and_collapsed_log():
+def test_page_exposes_ash_indigo_duplex_rail_and_collapsed_log():
     html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
 
     assert 'class="app-shell"' in html
     assert 'id="callButton"' in html
     assert 'id="muteButton"' in html
     assert 'id="connectionState"' in html
+    assert 'id="microphoneRail"' in html
+    assert 'id="micBars"' in html
     assert 'id="modelState"' in html
+    assert 'id="playbackState"' in html
+    assert 'id="sessionTimer"' in html
     assert 'id="conversation"' in html
     assert 'id="promptEditor"' in html
     assert 'id="toggleLogButton"' in html
@@ -44,16 +48,42 @@ def test_client_toggles_event_log_and_custom_prompt_visibility():
     assert "promptEditor.hidden = promptPreset.value !== 'custom';" in source
 
 
-def test_stylesheet_uses_fog_blue_tokens_and_responsive_shell():
+def test_stylesheet_uses_ash_indigo_typography_motion_and_responsive_shell():
     source = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
 
-    assert "--fog-page: #e7e9e9;" in source
-    assert "--fog-control: #c4cbd0;" in source
-    assert "--fog-primary: #9eafba;" in source
-    assert ".app-shell" in source
-    assert ".log-summary" in source
+    assert "--ash-page: #e4e6ea;" in source
+    assert "--ash-control: #c4c8d0;" in source
+    assert "--ash-primary: #939faf;" in source
+    assert '--font-display: "Avenir Next"' in source
+    assert "--font-interface:" in source
+    assert "--font-data:" in source
+    assert ".duplex-rail" in source
+    assert ".mic-bar.is-active" in source
+    assert ".turn-response-meta" in source
+    assert "@keyframes page-arrive" in source
+    assert "@keyframes status-breathe" in source
+    assert "@keyframes turn-arrive" in source
+    assert "@media (prefers-reduced-motion: reduce)" in source
     assert "@media (max-width: 760px)" in source
     assert "[hidden]" in source
+
+
+def test_client_tracks_pcm_bars_and_per_response_generation_duration():
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "const micBars = Array.from" in source
+    assert "function updateMeter(pcm)" in source
+    assert "classList.toggle('is-active'" in source
+    assert "const responseTimings = new Map();" in source
+    assert "function startResponseTiming(responseId)" in source
+    assert "function finishResponseTiming(responseId, status)" in source
+    assert "performance.now()" in source
+    assert "Responding ·" in source
+    assert "Completed ·" in source
+    assert "Interrupted ·" in source
+    assert "aria-hidden" in source
+    assert "localStorage" not in source
+    assert "sendBeacon" not in source
 
 
 def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
