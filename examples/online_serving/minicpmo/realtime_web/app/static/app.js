@@ -32,6 +32,11 @@
   const INITIAL_PLAYBACK_BUFFER_MS = 1000;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
   const RESPONSE_TIMER_INTERVAL_MS = 100;
+  const VAD_START_RMS = 0.018;
+  const VAD_END_RMS = 0.012;
+  const VAD_MIN_SPEECH_MS = 160;
+  const VAD_END_SILENCE_MS = 420;
+  const VAD_ENDPOINT_MAX_AGE_MS = 12000;
   const MIC_BAR_HEIGHTS = [5, 9, 14, 8, 17, 11, 6, 13, 18, 10, 5, 12, 16, 8, 4, 10, 14, 7];
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
@@ -86,6 +91,10 @@
   let sessionCloseResolver = null;
   let responseTimer = null;
   let latestInputCommittedAt = null;
+  let latestVadEndAt = null;
+  let vadSpeechActive = false;
+  let vadSpeechMs = 0;
+  let vadSilenceMs = 0;
   let smoothedMicLevel = 0;
   const responseTimings = new Map();
 
@@ -247,13 +256,16 @@
     const now = performance.now();
     for (const timing of responseTimings.values()) {
       if (timing.finishedAt !== null) continue;
-      const firstAudio = timing.firstAudioAt === null
-        ? 'waiting'
-        : formatResponseDuration(timing.firstAudioAt - timing.startedAt);
       ensureResponseMeta(timing.turn).textContent =
-        `First audio · ${firstAudio} / Responding · `
+        `VAD end → Speaking · ${formatVadToSpeaking(timing)} / Responding · `
         + formatResponseDuration(now - timing.startedAt);
     }
+  }
+
+  function formatVadToSpeaking(timing) {
+    if (timing.speakingAt === null) return 'waiting';
+    if (timing.vadEndedAt === null) return 'unavailable';
+    return formatResponseDuration(timing.speakingAt - timing.vadEndedAt);
   }
 
   function startResponseTiming(responseId) {
@@ -264,26 +276,33 @@
     const timing = {
       responseId,
       startedAt,
-      firstAudioAt: null,
+      vadEndedAt: null,
+      speakingAt: null,
       finishedAt: null,
       turn,
     };
     turn.responseId = responseId;
     responseTimings.set(responseId, timing);
     ensureResponseMeta(turn).textContent =
-      'First audio · waiting / Responding · 0.0s';
+      'VAD end → Speaking · waiting / Responding · 0.0s';
     if (responseTimer === null) {
       responseTimer = window.setInterval(updateResponseTimers, RESPONSE_TIMER_INTERVAL_MS);
     }
   }
 
-  function markFirstResponseTiming(responseId) {
+  function markSpeakingTiming(responseId) {
     const timing = responseTimings.get(responseId);
-    if (!timing || timing.firstAudioAt !== null) return;
-    timing.firstAudioAt = performance.now();
+    if (!timing || timing.speakingAt !== null) return;
+    const speakingAt = performance.now();
+    timing.vadEndedAt = latestVadEndAt !== null
+      && speakingAt - latestVadEndAt <= VAD_ENDPOINT_MAX_AGE_MS
+      ? latestVadEndAt
+      : null;
+    timing.speakingAt = speakingAt;
+    latestVadEndAt = null;
     ensureResponseMeta(timing.turn).textContent =
-      `First audio · ${formatResponseDuration(timing.firstAudioAt - timing.startedAt)}`
-      + ` / Responding · ${formatResponseDuration(timing.firstAudioAt - timing.startedAt)}`;
+      `VAD end → Speaking · ${formatVadToSpeaking(timing)}`
+      + ` / Responding · ${formatResponseDuration(timing.speakingAt - timing.startedAt)}`;
   }
 
   function finishResponseTiming(responseId, status) {
@@ -291,9 +310,6 @@
     if (!timing || timing.finishedAt !== null) return;
     timing.finishedAt = performance.now();
     const duration = formatResponseDuration(timing.finishedAt - timing.startedAt);
-    const firstAudio = timing.firstAudioAt === null
-      ? 'not received'
-      : formatResponseDuration(timing.firstAudioAt - timing.startedAt);
     const finalStatus = status || 'completed';
     const label = finalStatus === 'cancelled'
       ? 'Interrupted ·'
@@ -302,11 +318,12 @@
       ? 'interrupted'
       : finalStatus === 'failed' ? 'failed' : 'completed';
     const meta = ensureResponseMeta(timing.turn);
-    meta.textContent = `First audio · ${firstAudio} / ${label} ${duration}`;
+    const vadToSpeaking = formatVadToSpeaking(timing);
+    meta.textContent = `VAD end → Speaking · ${vadToSpeaking} / ${label} ${duration}`;
     meta.removeAttribute('aria-hidden');
     meta.setAttribute(
       'aria-label',
-      `First audio in ${firstAudio}; response ${accessibleLabel} in ${duration}`,
+      `VAD end to speaking in ${vadToSpeaking}; response ${accessibleLabel} in ${duration}`,
     );
     if ([...responseTimings.values()].every((entry) => entry.finishedAt !== null)) {
       window.clearInterval(responseTimer);
@@ -319,6 +336,7 @@
     responseTimer = null;
     responseTimings.clear();
     latestInputCommittedAt = null;
+    latestVadEndAt = null;
   }
 
   function bytesToBase64(bytes) {
@@ -406,6 +424,38 @@
     renderMicLevel(muted ? 0 : smoothedMicLevel);
   }
 
+  function updateClientVad(pcm) {
+    if (!running || muted || pcm.length === 0) return;
+    let energy = 0;
+    let samples = 0;
+    for (let index = 0; index < pcm.length; index += 4) {
+      const normalized = pcm[index] / 32768;
+      energy += normalized * normalized;
+      samples += 1;
+    }
+    const rms = Math.sqrt(energy / Math.max(1, samples));
+    const chunkMs = (pcm.length / captureRate) * 1000;
+    const speechThreshold = vadSpeechActive ? VAD_END_RMS : VAD_START_RMS;
+    if (rms >= speechThreshold) {
+      vadSpeechMs += chunkMs;
+      vadSilenceMs = 0;
+      if (!vadSpeechActive && vadSpeechMs >= VAD_MIN_SPEECH_MS) {
+        vadSpeechActive = true;
+      }
+      return;
+    }
+    if (!vadSpeechActive) {
+      vadSpeechMs = 0;
+      return;
+    }
+    vadSilenceMs += chunkMs;
+    if (vadSilenceMs < VAD_END_SILENCE_MS) return;
+    vadSpeechActive = false;
+    vadSpeechMs = 0;
+    vadSilenceMs = 0;
+    latestVadEndAt = performance.now();
+  }
+
   function microphoneUploadEnabled() {
     return running && !muted;
   }
@@ -445,6 +495,7 @@
     responseHasAudio = false;
     assistantActive = true;
     setModel('Speaking');
+    markSpeakingTiming(responseId);
   }
 
   function feedPlayback(decoded, responseId) {
@@ -510,18 +561,18 @@
         break;
       case 'response.created':
       case 'response.speak':
-        beginAssistant(responseId);
         startResponseTiming(responseId);
+        beginAssistant(responseId);
         break;
       case 'input_audio_buffer.committed':
         latestInputCommittedAt = performance.now();
         break;
       case 'response.audio.delta':
         startResponseTiming(responseId);
-        markFirstResponseTiming(responseId);
         currentResponseId = responseId || currentResponseId;
         assistantActive = true;
         setModel('Speaking');
+        markSpeakingTiming(responseId);
         decodeAudioDelta(event)
           .then((decoded) => feedPlayback(decoded, responseId))
           .catch((error) => appendLog(`audio decode failed: ${error.message || error}`, true));
@@ -608,6 +659,7 @@
     captureNode.port.onmessage = (message) => {
       const pcm = new Int16Array(message.data);
       updateMeter(pcm);
+      updateClientVad(pcm);
       if (microphoneUploadEnabled()) pendingCapture.push(pcm);
     };
     const silentSink = captureContext.createGain();
@@ -803,6 +855,9 @@
     playbackNode = null;
     currentResponseId = null;
     responseHasAudio = false;
+    vadSpeechActive = false;
+    vadSpeechMs = 0;
+    vadSilenceMs = 0;
     smoothedMicLevel = 0;
     renderMicLevel(0);
     clearResponseTimers();
@@ -826,6 +881,9 @@
     muteButton.textContent = muted ? 'Unmute' : 'Mute';
     muteButton.classList.toggle('is-active', muted);
     if (muted) {
+      vadSpeechActive = false;
+      vadSpeechMs = 0;
+      vadSilenceMs = 0;
       smoothedMicLevel = 0;
       renderMicLevel(0);
     }

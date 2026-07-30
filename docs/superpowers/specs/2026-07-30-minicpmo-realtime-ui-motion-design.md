@@ -157,26 +157,35 @@ Under `prefers-reduced-motion: reduce`:
 
 ### Definition
 
-The UI displays two browser-observed latency milestones from the same input
-boundary:
+The UI displays a browser-side turn-transition measurement together with the
+full response duration:
 
 ```text
-start          = browser receives input_audio_buffer.committed
-first audio    = browser receives the first response.audio.delta
-fully complete = browser receives response.done
+VAD end             = client PCM energy stays below the end threshold for 420 ms
+Speaking            = the UI switches its duplex state to Speaking
+full-response start = browser receives input_audio_buffer.committed
+fully complete      = browser receives response.done
 ```
 
-If a response begins without a preceding committed event, the browser uses the
-first response event as a defensive fallback start. These values are client
-observations rather than server-only model-generation metrics.
+The VAD arms only after at least 160 ms of speech. It uses RMS hysteresis with a
+higher speech-start threshold and a lower speech-end threshold. The timestamp
+starts when the 420 ms silence decision is confirmed, not at the first quiet
+sample. If no valid local VAD end precedes Speaking, the metric says
+`unavailable` instead of presenting a misleading zero.
+An unconsumed endpoint expires after 12 seconds, preventing a later response
+from reusing stale speech timing.
+
+If a response begins without a preceding committed event, full-response timing
+uses the first response event as a defensive fallback start. These values are
+client observations rather than server-only model-generation metrics.
 
 ### Display states
 
-- Waiting for audio: `First audio · waiting / Responding · 0.8s`
-- Streaming: `First audio · 0.4s / Responding · 3.8s`
-- Completed: `First audio · 0.4s / Fully completed · 8.2s`
-- Cancelled/interrupted: `First audio · 0.4s / Interrupted · 2.6s`
-- Failed: `First audio · not received / Failed · 1.4s`
+- Waiting for state change: `VAD end → Speaking · waiting / Responding · 0.8s`
+- Speaking: `VAD end → Speaking · 0.6s / Responding · 3.8s`
+- Completed: `VAD end → Speaking · 0.6s / Fully completed · 8.2s`
+- Cancelled/interrupted: `VAD end → Speaking · 0.6s / Interrupted · 2.6s`
+- No valid VAD endpoint: `VAD end → Speaking · unavailable / Failed · 1.4s`
 
 The metadata appears below the assistant text in enlarged data typography. It
 does not create a separate dashboard row.
@@ -185,6 +194,9 @@ does not create a separate dashboard row.
 
 - Track timing state by `response_id`.
 - Start timing on `response.created`.
+- Track local VAD continuously from real microphone PCM without changing or
+  gating the uploaded audio.
+- Consume the latest valid VAD-end timestamp when the UI enters Speaking.
 - If an implementation receives a response-associated visible output before
   `response.created`, create a fallback timer at that first visible event and
   replace its ownership when the response ID becomes available.

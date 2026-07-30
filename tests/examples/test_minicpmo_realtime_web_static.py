@@ -70,19 +70,23 @@ def test_stylesheet_uses_ash_indigo_typography_motion_and_responsive_shell():
     assert "[hidden]" in source
 
 
-def test_client_tracks_pcm_bars_first_audio_and_full_response_duration():
+def test_client_tracks_pcm_bars_vad_end_to_speaking_and_full_response_duration():
     source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
 
     assert "const micBars = Array.from" in source
     assert "function updateMeter(pcm)" in source
     assert "classList.toggle('is-active'" in source
+    assert "const VAD_END_SILENCE_MS" in source
+    assert "function updateClientVad(pcm)" in source
+    assert "updateClientVad(pcm);" in source
     assert "const responseTimings = new Map();" in source
     assert "function startResponseTiming(responseId)" in source
-    assert "function markFirstResponseTiming(responseId)" in source
+    assert "function markSpeakingTiming(responseId)" in source
     assert "function finishResponseTiming(responseId, status)" in source
     assert "input_audio_buffer.committed" in source
     assert "performance.now()" in source
-    assert "First audio ·" in source
+    assert "VAD end → Speaking ·" in source
+    assert "First audio ·" not in source
     assert "Responding ·" in source
     assert "Fully completed ·" in source
     assert "Interrupted ·" in source
