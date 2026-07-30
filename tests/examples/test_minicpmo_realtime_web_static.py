@@ -13,18 +13,47 @@ STATIC_ROOT = APP_ROOT / "static"
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_page_exposes_focused_call_conversation_and_log_surfaces():
+def test_page_exposes_simplified_fog_blue_layout_and_collapsed_log():
     html = (APP_ROOT / "index.html").read_text(encoding="utf-8")
 
+    assert 'class="app-shell"' in html
     assert 'id="callButton"' in html
     assert 'id="muteButton"' in html
     assert 'id="connectionState"' in html
     assert 'id="modelState"' in html
     assert 'id="conversation"' in html
+    assert 'id="promptEditor"' in html
+    assert 'id="toggleLogButton"' in html
+    assert 'aria-controls="eventLogPanel"' in html
+    assert 'aria-expanded="false"' in html
+    assert re.search(r'id="eventLogPanel"[^>]*\bhidden\b', html)
     assert 'id="eventLog"' in html
-    assert "<details" in html
+    assert "<details" not in html
     assert "Automatic barge-in" not in html
     assert "Server VAD" not in html
+
+
+def test_client_toggles_event_log_and_custom_prompt_visibility():
+    source = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+
+    assert "function setLogExpanded(expanded)" in source
+    assert "eventLogPanel.hidden = !expanded;" in source
+    assert "toggleLogButton.setAttribute('aria-expanded', String(expanded));" in source
+    assert "expanded ? 'Hide event log' : 'Show event log'" in source
+    assert "function syncPromptEditorVisibility()" in source
+    assert "promptEditor.hidden = promptPreset.value !== 'custom';" in source
+
+
+def test_stylesheet_uses_fog_blue_tokens_and_responsive_shell():
+    source = (STATIC_ROOT / "styles.css").read_text(encoding="utf-8")
+
+    assert "--fog-page: #e7e9e9;" in source
+    assert "--fog-control: #c4cbd0;" in source
+    assert "--fog-primary: #9eafba;" in source
+    assert ".app-shell" in source
+    assert ".log-summary" in source
+    assert "@media (max-width: 760px)" in source
+    assert "[hidden]" in source
 
 
 def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
@@ -116,15 +145,16 @@ def test_audio_worklet_urls_use_the_static_asset_version():
     assert "staticAssetUrl('static/pcm_worklet.js')" in app
 
 
-def test_playback_worklet_buffers_first_400ms_and_reports_underruns():
+def test_playback_worklet_buffers_first_one_second_and_reports_underruns():
     app = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
     playback = (STATIC_ROOT / "playback_worklet.js").read_text(encoding="utf-8")
 
-    assert "INITIAL_PLAYBACK_BUFFER_MS = 400" in app
+    assert "INITIAL_PLAYBACK_BUFFER_MS = 1000" in app
     assert "initialBufferMs" in app
     assert "responseId" in app
     assert "playback-underrun" in app
     assert "underrunMs" in app
+    assert "sampleRate * 1.0" in playback
     assert "initialBufferFrames" in playback
     assert "playback-underrun" in playback
     assert "underrunFrames" in playback
@@ -161,43 +191,83 @@ def test_playback_worklet_waits_before_playing_and_rebuffers_after_underrun():
           if (!condition) throw new Error(message);
         };
 
-        const first = new Int16Array(150);
+        const first = new Int16Array(999);
         first.fill(16384);
         processor.handleMessage({
           type: 'audio',
           pcm: first,
           responseId: 'response-1',
-          initialBufferMs: 400,
+          initialBufferMs: 1000,
         });
-        assert(!processor.started, 'large first delta must not bypass wall-clock prebuffer');
-        assert(render().every((sample) => sample === 0), 'first prebuffer render must be silent');
-        assert(render().every((sample) => sample === 0), 'second prebuffer render must be silent');
-        assert(render().every((sample) => sample === 0), 'third prebuffer render must be silent');
-        assert(render().every((sample) => sample === 0), 'fourth prebuffer render must be silent');
-        const firstPlayback = render();
-        assert(firstPlayback.some((sample) => sample !== 0), 'playback must start after prebuffer');
+        assert(!processor.started, 'sub-second first delta must remain buffered');
+        assert(render().every((sample) => sample === 0), 'sub-second first delta must stay silent');
 
+        const firstRemainder = new Int16Array(1);
+        firstRemainder.fill(16384);
+        processor.handleMessage({
+          type: 'audio',
+          pcm: firstRemainder,
+          responseId: 'response-1',
+          initialBufferMs: 1000,
+        });
+        const firstPlayback = render();
+        assert(
+          firstPlayback.some((sample) => sample !== 0),
+          'playback must start as soon as one second is buffered',
+        );
+
+        for (let index = 0; index < 9; index += 1) render();
         const underrun = render();
         assert(!processor.started, 'an empty queue must return to buffering');
         assert(underrun[underrun.length - 1] === 0, 'underrun boundary must fade to zero');
 
-        const resumed = new Int16Array(300);
+        const resumed = new Int16Array(999);
         resumed.fill(8192);
         processor.handleMessage({
           type: 'audio',
           pcm: resumed,
           responseId: 'response-1',
-          initialBufferMs: 400,
+          initialBufferMs: 1000,
         });
-        assert(render().every((sample) => sample === 0), 'resume must rebuild jitter buffer');
-        assert(render().every((sample) => sample === 0), 'resume must keep rebuilding jitter buffer');
-        assert(render().every((sample) => sample === 0), 'resume must keep waiting');
-        assert(render().every((sample) => sample === 0), 'resume must wait the full buffer interval');
+        assert(render().every((sample) => sample === 0), 'sub-second resume must stay buffered');
+
+        const resumedRemainder = new Int16Array(1);
+        resumedRemainder.fill(8192);
+        processor.handleMessage({
+          type: 'audio',
+          pcm: resumedRemainder,
+          responseId: 'response-1',
+          initialBufferMs: 1000,
+        });
         const resumedPlayback = render();
-        assert(resumedPlayback.some((sample) => sample !== 0), 'playback must resume after rebuffer');
+        assert(
+          resumedPlayback.some((sample) => sample !== 0),
+          'playback must resume as soon as one second is rebuffered',
+        );
         assert(
           Math.abs(resumedPlayback[0]) < Math.abs(resumedPlayback[50]),
           'resumed playback must fade in instead of jumping from silence',
+        );
+
+        const tailProcessor = new Processor();
+        const tail = new Int16Array(300);
+        tail.fill(4096);
+        tailProcessor.handleMessage({
+          type: 'audio',
+          pcm: tail,
+          responseId: 'response-tail',
+          initialBufferMs: 1000,
+        });
+        const renderTail = () => {
+          const output = new Float32Array(100);
+          tailProcessor.process([], [[output]]);
+          return output;
+        };
+        assert(renderTail().every((sample) => sample === 0), 'short final tail must wait before drain');
+        tailProcessor.handleMessage({ type: 'drain', responseId: 'response-tail' });
+        assert(
+          renderTail().some((sample) => sample !== 0),
+          'drain must immediately release a final tail shorter than one second',
         );
         """
     )

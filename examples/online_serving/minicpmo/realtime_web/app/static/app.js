@@ -7,6 +7,7 @@
   const cameraButton = document.getElementById('cameraButton');
   const cameraPreview = document.getElementById('cameraPreview');
   const promptPreset = document.getElementById('promptPreset');
+  const promptEditor = document.getElementById('promptEditor');
   const systemPromptInput = document.getElementById('systemPrompt');
   const connectionState = document.getElementById('connectionState');
   const modelState = document.getElementById('modelState');
@@ -18,13 +19,15 @@
   const eventLog = document.getElementById('eventLog');
   const eventCount = document.getElementById('eventCount');
   const runtimeDetail = document.getElementById('runtimeDetail');
+  const eventLogPanel = document.getElementById('eventLogPanel');
+  const toggleLogButton = document.getElementById('toggleLogButton');
   const clearLogButton = document.getElementById('clearLogButton');
 
   const INPUT_RATE = 16000;
   const OUTPUT_RATE = 24000;
   const SEND_INTERVAL_MS = 200;
   const ECHO_GUARD_MS = 300;
-  const INITIAL_PLAYBACK_BUFFER_MS = 400;
+  const INITIAL_PLAYBACK_BUFFER_MS = 1000;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
 
   // Default prompts mirroring the official MiniCPM-o-Demo presets
@@ -39,6 +42,17 @@
       + 'seriously and in a high quality. Please chat with the user in a high naturalness '
       + 'style. You are in duplex mode, where you can listen and speak at the same time.',
   };
+
+  function setLogExpanded(expanded) {
+    eventLogPanel.hidden = !expanded;
+    toggleLogButton.setAttribute('aria-expanded', String(expanded));
+    toggleLogButton.textContent = expanded ? 'Hide event log' : 'Show event log';
+  }
+
+  function syncPromptEditorVisibility() {
+    if (!promptEditor || !promptPreset) return;
+    promptEditor.hidden = promptPreset.value !== 'custom';
+  }
 
   let socket = null;
   let mediaStream = null;
@@ -75,10 +89,13 @@
     promptPreset.addEventListener('change', () => {
       const preset = PROMPT_PRESETS[promptPreset.value];
       if (preset !== undefined) systemPromptInput.value = preset;
+      syncPromptEditorVisibility();
     });
     systemPromptInput.addEventListener('input', () => {
       promptPreset.value = 'custom';
+      syncPromptEditorVisibility();
     });
+    syncPromptEditorVisibility();
   }
 
   function realtimeUrl() {
@@ -662,6 +679,10 @@
     else startSession();
   });
   muteButton.addEventListener('click', toggleMute);
+  toggleLogButton.addEventListener('click', () => {
+    setLogExpanded(eventLogPanel.hidden);
+  });
+  setLogExpanded(false);
   clearLogButton.addEventListener('click', () => {
     eventLog.textContent = '';
     logCount = 0;

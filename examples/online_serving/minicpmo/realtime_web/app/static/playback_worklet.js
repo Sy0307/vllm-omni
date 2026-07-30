@@ -9,8 +9,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.terminalFadeFrames = 0;
     this.started = false;
     this.activeResponseId = null;
-    this.initialBufferFrames = Math.round(sampleRate * 0.2);
-    this.bufferWaitFrames = this.initialBufferFrames;
+    this.initialBufferFrames = Math.round(sampleRate * 1.0);
     this.rebuffering = false;
     this.fadeFrames = Math.max(1, Math.round(sampleRate * 0.005));
     this.fadeInFrames = 0;
@@ -19,7 +18,6 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
 
   handleMessage(message) {
     if (message.type === 'audio' && message.pcm) {
-      const wasEmpty = this.queue.length === 0;
       if (!this.started && !this.activeResponseId) {
         this.activeResponseId = message.responseId || null;
       }
@@ -27,14 +25,10 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
         this.initialBufferFrames = Math.max(0, Math.round((sampleRate * message.initialBufferMs) / 1000));
       }
       this.queue.push(message.pcm);
-      if (!this.started && wasEmpty && !this.rebuffering) {
-        this.bufferWaitFrames = this.initialBufferFrames;
-      }
     } else if (message.type === 'drain') {
       this.drain = { responseId: message.responseId || null };
       this.terminalFadeFrames = Math.min(this.fadeFrames, this.bufferedFrames());
       if (!this.started && this.bufferedFrames() > 0) {
-        this.bufferWaitFrames = 0;
         this.startPlayback();
       }
       this.notifyIfDrained();
@@ -47,7 +41,6 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       this.terminalFadeFrames = 0;
       this.started = false;
       this.activeResponseId = null;
-      this.bufferWaitFrames = this.initialBufferFrames;
       this.rebuffering = false;
       this.fadeInFrames = 0;
     }
@@ -82,7 +75,6 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.terminalFadeFrames = 0;
     this.started = false;
     this.activeResponseId = null;
-    this.bufferWaitFrames = this.initialBufferFrames;
     this.rebuffering = false;
     this.fadeInFrames = 0;
   }
@@ -103,11 +95,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
         this.underrunFrames += output.length;
         this.reportUnderrun();
       }
-      if (this.queue.length > 0 && this.bufferWaitFrames > 0) {
-        this.bufferWaitFrames = Math.max(0, this.bufferWaitFrames - output.length);
-        return true;
-      }
-      if (this.queue.length > 0) {
+      if (this.bufferedFrames() >= this.initialBufferFrames) {
         this.startPlayback();
         this.rebuffering = false;
       }
@@ -157,7 +145,6 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       this.reportUnderrun();
       this.started = false;
       this.rebuffering = true;
-      this.bufferWaitFrames = this.initialBufferFrames;
       this.fadeInFrames = 0;
     }
     this.notifyIfDrained();
