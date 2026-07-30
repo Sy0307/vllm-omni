@@ -318,7 +318,7 @@ def test_playback_worklet_waits_before_playing_and_rebuffers_after_underrun():
     )
 
 
-def test_playback_worklet_fades_terminal_drain_to_zero():
+def test_playback_worklet_uses_30ms_terminal_release_and_20ms_post_roll():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for the AudioWorklet regression test")
@@ -364,14 +364,41 @@ def test_playback_worklet_fades_terminal_drain_to_zero():
 
         assert(output.some((sample) => sample !== 0), 'terminal audio must still play');
         assert(output[output.length - 1] === 0, 'terminal drain must fade the final sample to zero');
-        const tail = Array.from(output.slice(-5), Math.abs);
+        assert(
+          output[75] < output[70],
+          'terminal drain must begin fading across the final 30 ms',
+        );
+        const tail = Array.from(output.slice(-30), Math.abs);
         assert(
           tail.every((sample, index) => index === 0 || sample <= tail[index - 1]),
           'terminal drain fade must decrease monotonically',
         );
         assert(
-          messages.filter((message) => message.type === 'playback-drained').length === 1,
-          'terminal drain must be reported exactly once after playback',
+          messages.filter((message) => message.type === 'playback-drained').length === 0,
+          'terminal drain must wait for the explicit post-roll',
+        );
+
+        const firstPostRoll = new Float32Array(10);
+        processor.process([], [[firstPostRoll]]);
+        assert(
+          firstPostRoll.every((sample) => sample === 0),
+          'terminal post-roll must contain only silence',
+        );
+        assert(
+          messages.filter((message) => message.type === 'playback-drained').length === 0,
+          'terminal drain must retain the full 20 ms post-roll',
+        );
+
+        const secondPostRoll = new Float32Array(10);
+        processor.process([], [[secondPostRoll]]);
+        const drained = messages.filter((message) => message.type === 'playback-drained');
+        assert(
+          drained.length === 1,
+          'terminal drain must be reported exactly once after the 20 ms post-roll',
+        );
+        assert(
+          drained[0].playedMs === 100,
+          'synthetic post-roll must not increase acknowledged model-audio duration',
         );
         """
     )
