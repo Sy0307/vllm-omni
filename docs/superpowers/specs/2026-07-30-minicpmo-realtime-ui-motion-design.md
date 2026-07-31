@@ -157,8 +157,9 @@ Under `prefers-reduced-motion: reduce`:
 
 ### Definition
 
-The UI displays a browser-side turn-transition measurement together with the
-full response duration:
+The UI labels its browser-side turn-transition measurement `TTFT` and displays
+it together with the full response duration. In this demo, TTFT has the
+following concrete client-observed definition:
 
 ```text
 VAD end             = client PCM energy stays below the end threshold for 420 ms
@@ -181,11 +182,11 @@ client observations rather than server-only model-generation metrics.
 
 ### Display states
 
-- Waiting for state change: `VAD end → Speaking · waiting / Responding · 0.8s`
-- Speaking: `VAD end → Speaking · 0.6s / Responding · 3.8s`
-- Completed: `VAD end → Speaking · 0.6s / Fully completed · 8.2s`
-- Cancelled/interrupted: `VAD end → Speaking · 0.6s / Interrupted · 2.6s`
-- No valid VAD endpoint: `VAD end → Speaking · unavailable / Failed · 1.4s`
+- Waiting for state change: `TTFT · waiting / Responding · 0.8s`
+- Speaking: `TTFT · 0.6s / Responding · 3.8s`
+- Completed: `TTFT · 0.6s / Fully completed · 8.2s`
+- Cancelled/interrupted: `TTFT · 0.6s / Interrupted · 2.6s`
+- No valid VAD endpoint: `TTFT · unavailable / Failed · 1.4s`
 
 The metadata appears below the assistant text in enlarged data typography. It
 does not create a separate dashboard row.

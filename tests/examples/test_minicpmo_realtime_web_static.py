@@ -85,7 +85,8 @@ def test_client_tracks_pcm_bars_vad_end_to_speaking_and_full_response_duration()
     assert "function finishResponseTiming(responseId, status)" in source
     assert "input_audio_buffer.committed" in source
     assert "performance.now()" in source
-    assert "VAD end → Speaking ·" in source
+    assert "TTFT ·" in source
+    assert "VAD end → Speaking ·" not in source
     assert "First audio ·" not in source
     assert "Responding ·" in source
     assert "Fully completed ·" in source

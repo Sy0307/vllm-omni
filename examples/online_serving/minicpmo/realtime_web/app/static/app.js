@@ -257,7 +257,7 @@
     for (const timing of responseTimings.values()) {
       if (timing.finishedAt !== null) continue;
       ensureResponseMeta(timing.turn).textContent =
-        `VAD end → Speaking · ${formatVadToSpeaking(timing)} / Responding · `
+        `TTFT · ${formatVadToSpeaking(timing)} / Responding · `
         + formatResponseDuration(now - timing.startedAt);
     }
   }
@@ -284,7 +284,7 @@
     turn.responseId = responseId;
     responseTimings.set(responseId, timing);
     ensureResponseMeta(turn).textContent =
-      'VAD end → Speaking · waiting / Responding · 0.0s';
+      'TTFT · waiting / Responding · 0.0s';
     if (responseTimer === null) {
       responseTimer = window.setInterval(updateResponseTimers, RESPONSE_TIMER_INTERVAL_MS);
     }
@@ -301,7 +301,7 @@
     timing.speakingAt = speakingAt;
     latestVadEndAt = null;
     ensureResponseMeta(timing.turn).textContent =
-      `VAD end → Speaking · ${formatVadToSpeaking(timing)}`
+      `TTFT · ${formatVadToSpeaking(timing)}`
       + ` / Responding · ${formatResponseDuration(timing.speakingAt - timing.startedAt)}`;
   }
 
@@ -319,11 +319,11 @@
       : finalStatus === 'failed' ? 'failed' : 'completed';
     const meta = ensureResponseMeta(timing.turn);
     const vadToSpeaking = formatVadToSpeaking(timing);
-    meta.textContent = `VAD end → Speaking · ${vadToSpeaking} / ${label} ${duration}`;
+    meta.textContent = `TTFT · ${vadToSpeaking} / ${label} ${duration}`;
     meta.removeAttribute('aria-hidden');
     meta.setAttribute(
       'aria-label',
-      `VAD end to speaking in ${vadToSpeaking}; response ${accessibleLabel} in ${duration}`,
+      `TTFT ${vadToSpeaking}; response ${accessibleLabel} in ${duration}`,
     );
     if ([...responseTimings.values()].every((entry) => entry.finishedAt !== null)) {
       window.clearInterval(responseTimer);
