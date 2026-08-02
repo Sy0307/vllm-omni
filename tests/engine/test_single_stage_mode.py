@@ -1380,7 +1380,20 @@ class TestLaunchOmniCoreEngines:
         def fake_socket_ctx(*args, **kwargs):
             yield mocker.Mock()
 
-        mocker.patch("vllm_omni.engine.stage_engine_startup.DPCoordinator", return_value=coordinator)
+        coordinator_env = []
+        mocker.patch.dict(
+            os.environ,
+            {"OMNI_TEST_STAGE_ENV": "baseline"},
+        )
+
+        def _construct_coordinator(*_args, **_kwargs):
+            coordinator_env.append(os.environ.get("OMNI_TEST_STAGE_ENV"))
+            return coordinator
+
+        mocker.patch(
+            "vllm_omni.engine.stage_engine_startup.DPCoordinator",
+            side_effect=_construct_coordinator,
+        )
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(
@@ -1405,12 +1418,15 @@ class TestLaunchOmniCoreEngines:
             stage_id=7,
             stage_config={"stage_id": 7},
             replica_id=3,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "distributed-stage"}},
         ) as (_, yielded_coordinator, yielded_addresses):
             assert yielded_coordinator is coordinator
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
             assert yielded_addresses.coordinator_output == "tcp://coord-out"
             assert yielded_addresses.frontend_stats_publish_address == "tcp://stats"
 
+        assert coordinator_env == ["distributed-stage"]
+        assert os.environ["OMNI_TEST_STAGE_ENV"] == "baseline"
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=26000,

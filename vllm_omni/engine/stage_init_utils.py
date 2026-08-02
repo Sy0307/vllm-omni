@@ -731,18 +731,25 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
             yield
             return
 
+    normalized_env = [(str(key), str(value)) for key, value in runtime_env.items()]
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
-        previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
-
-    if previous_env:
-        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
+    applied_keys: list[str] = []
     try:
+        for env_key, env_value in normalized_env:
+            previous_env[env_key] = os.environ.get(env_key)
+            os.environ[env_key] = env_value
+            applied_keys.append(env_key)
+
+        if applied_keys:
+            logger.info(
+                "[stage_init] Stage-%s applied runtime env keys: %s",
+                stage_id,
+                sorted(applied_keys),
+            )
         yield
     finally:
-        for key, old_value in previous_env.items():
+        for key in reversed(applied_keys):
+            old_value = previous_env[key]
             if old_value is None:
                 os.environ.pop(key, None)
             else:

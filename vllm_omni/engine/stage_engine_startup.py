@@ -42,6 +42,12 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+# ``os.environ`` is process-global. StageRuntime instances and headless launch
+# groups can start concurrently, so their caller-owned locks are insufficient
+# to keep per-stage device/runtime env scopes from overlapping. An RLock also
+# permits a launch helper to re-enter a scoped spawn on the same thread.
+_PROCESS_SPAWN_ENV_LOCK = threading.RLock()
+
 StageRoute = tuple[int, int]
 
 # Sentinel that signals "auto-assign me a replica_id" on the wire. Negative
@@ -896,23 +902,65 @@ def connect_remote_diffusion_proc(
 def scoped_spawn_device_env(
     stage_visible_devices: str | None,
     spawn_device_lock: threading.Lock | None,
+    *,
+    stage_id: int | None = None,
+    stage_runtime_cfg: Any = None,
 ) -> Iterator[None]:
-    """Briefly scope device visibility while spawning a stage subprocess."""
-    if stage_visible_devices is None or spawn_device_lock is None:
-        yield
+    """Atomically scope per-stage env while spawning a stage subprocess.
+
+    Both device visibility and ``runtime.env`` are process-global environment
+    variables inherited by ``multiprocessing.Process.start()``.  They must be
+    applied under the same lock so concurrent stage launches cannot inherit a
+    mixed environment.
+    """
+    if stage_visible_devices is None and stage_runtime_cfg is None:
+        # A spawn with no local overrides must still wait for another stage's
+        # temporary process-global env scope to restore the baseline.
+        with _PROCESS_SPAWN_ENV_LOCK:
+            yield
         return
 
     device_control_env = current_omni_platform.device_control_env_var
-    with spawn_device_lock:
-        previous_visible_devices = os.environ.get(device_control_env)
-        try:
-            current_omni_platform.set_device_control_env_var(stage_visible_devices)
-            yield
-        finally:
-            if previous_visible_devices is None:
-                current_omni_platform.unset_device_control_env_var()
-            else:
-                current_omni_platform.set_device_control_env_var(previous_visible_devices)
+    lock_scope = spawn_device_lock if spawn_device_lock is not None else contextlib.nullcontext()
+    with _PROCESS_SPAWN_ENV_LOCK:
+        with lock_scope:
+            with stage_init_utils.stage_runtime_env(
+                -1 if stage_id is None else stage_id,
+                stage_runtime_cfg,
+            ):
+                previous_visible_devices = os.environ.get(device_control_env)
+                try:
+                    if stage_visible_devices is not None:
+                        current_omni_platform.set_device_control_env_var(stage_visible_devices)
+                    yield
+                finally:
+                    if stage_visible_devices is not None:
+                        if previous_visible_devices is None:
+                            current_omni_platform.unset_device_control_env_var()
+                        else:
+                            current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+
+def _spawn_dp_coordinator(
+    parallel_config: Any,
+    *,
+    enable_wave_coordination: bool,
+    stage_id: int,
+    stage_visible_devices: str | None = None,
+    spawn_device_lock: threading.Lock | None = None,
+    stage_runtime_cfg: Any = None,
+) -> DPCoordinator:
+    """Start a DP Coordinator inside the process-global stage env scope."""
+    with scoped_spawn_device_env(
+        stage_visible_devices,
+        spawn_device_lock,
+        stage_id=stage_id,
+        stage_runtime_cfg=stage_runtime_cfg,
+    ):
+        return DPCoordinator(
+            parallel_config,
+            enable_wave_coordination=enable_wave_coordination,
+        )
 
 
 @contextlib.contextmanager
@@ -928,6 +976,7 @@ def _launch_omni_core_engines(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    stage_runtime_cfg: Any = None,
 ) -> Iterator[tuple[CoreEngineProcManager, DPCoordinator | None, EngineZmqAddresses]]:
     """Launch local engine cores using the omni registration flow.
 
@@ -950,9 +999,13 @@ def _launch_omni_core_engines(
     run_coordinator = vllm_config.needs_dp_coordinator and dp_rank == 0
 
     if run_coordinator:
-        coordinator = DPCoordinator(
+        coordinator = _spawn_dp_coordinator(
             parallel_config,
             enable_wave_coordination=vllm_config.model_config.is_moe,
+            stage_id=stage_id,
+            stage_visible_devices=stage_visible_devices,
+            spawn_device_lock=spawn_device_lock,
+            stage_runtime_cfg=stage_runtime_cfg,
         )
 
         addresses.coordinator_input, addresses.coordinator_output = coordinator.get_engine_socket_addresses()
@@ -1007,7 +1060,12 @@ def _launch_omni_core_engines(
                 # an OmniCoordClientForStage and heartbeats to the coordinator.
                 from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-                with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+                with scoped_spawn_device_env(
+                    stage_visible_devices,
+                    spawn_device_lock,
+                    stage_id=stage_id,
+                    stage_runtime_cfg=stage_runtime_cfg,
+                ):
                     local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
                         local_engine_count=local_engine_count,
                         start_index=start_index,
@@ -1022,7 +1080,12 @@ def _launch_omni_core_engines(
                         omni_replica_base_id=replica_id,
                     )
             else:
-                with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+                with scoped_spawn_device_env(
+                    stage_visible_devices,
+                    spawn_device_lock,
+                    stage_id=stage_id,
+                    stage_runtime_cfg=stage_runtime_cfg,
+                ):
                     local_engine_manager = CoreEngineProcManager(
                         local_engine_count=local_engine_count,
                         start_index=start_index,
@@ -1067,6 +1130,7 @@ def launch_stage_replica(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    stage_runtime_cfg: Any = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1088,6 +1152,7 @@ def launch_stage_replica(
             omni_coordinator_address=omni_coordinator_address,
             stage_visible_devices=stage_visible_devices,
             spawn_device_lock=spawn_device_lock,
+            stage_runtime_cfg=stage_runtime_cfg,
         ) as resources:
             engine_manager, coordinator, addresses = resources
             yield StageReplicaResources(
@@ -1104,7 +1169,12 @@ def launch_stage_replica(
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
-    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+    with scoped_spawn_device_env(
+        stage_visible_devices,
+        spawn_device_lock,
+        stage_id=stage_id,
+        stage_runtime_cfg=stage_runtime_cfg,
+    ):
         engine_manager = StageEngineCoreProcManager(
             local_engine_count=1,
             start_index=0,
@@ -1217,9 +1287,11 @@ def launch_headless_llm_replicas(
     dp_rank = parallel_config.data_parallel_rank if parallel_config.data_parallel_rank is not None else 0
     coordinator = None
     if vllm_config.needs_dp_coordinator and dp_rank == 0:
-        coordinator = DPCoordinator(
+        coordinator = _spawn_dp_coordinator(
             parallel_config,
             enable_wave_coordination=vllm_config.model_config.is_moe,
+            stage_id=stage_id,
+            stage_runtime_cfg=getattr(stage_config, "runtime", None),
         )
         logger.info(
             "[Headless] Started DP Coordinator process for stage %d (PID: %d)",
@@ -1257,6 +1329,7 @@ def launch_headless_llm_replicas(
             omni_dp_size_local=omni_dp_size_local,
             per_replica_devices=per_replica_devices,
             launch_one=_launch_one,
+            stage_runtime_cfg=getattr(stage_config, "runtime", None),
         )
     finally:
         if coordinator is not None:
@@ -1400,13 +1473,16 @@ def launch_headless_replica_group(
     per_replica_devices: list[str | None],
     launch_one: Callable[[int], Any],
     wait_for_replicas: Callable[[list[Any]], None] = wait_for_manager_liveness,
+    stage_runtime_cfg: Any = None,
 ) -> None:
     """Launch, monitor, and clean up a group of local headless replicas."""
     managers: list[Any] = []
     try:
         for rep_idx in range(omni_dp_size_local):
-            with replica_device_env(stage_id, per_replica_devices[rep_idx]):
-                managers.append(launch_one(rep_idx))
+            with _PROCESS_SPAWN_ENV_LOCK:
+                with stage_init_utils.stage_runtime_env(stage_id, stage_runtime_cfg):
+                    with replica_device_env(stage_id, per_replica_devices[rep_idx]):
+                        managers.append(launch_one(rep_idx))
         wait_for_replicas(managers)
     finally:
         logger.info("[Headless] Shutting down stage %d (%d manager(s)).", stage_id, len(managers))
@@ -1481,6 +1557,7 @@ def launch_headless_diffusion_replicas(
         per_replica_devices=per_replica_devices,
         launch_one=_launch_one,
         wait_for_replicas=wait_for_diffusion_manager_liveness,
+        stage_runtime_cfg=getattr(stage_cfg, "runtime", None),
     )
 
 

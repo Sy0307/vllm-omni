@@ -323,9 +323,16 @@ class StageRuntime:
 
     @contextmanager
     def _stage_device_scope(self, stage_id: int, runtime_cfg: Any) -> Iterator[None]:
-        """Temporarily apply the stage device env while launching a replica."""
+        """Temporarily apply stage env and devices while launching a replica."""
+        from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
+
         physical_devices = self._resolve_replica_physical_devices(stage_id, runtime_cfg)
-        with self._scoped_spawn_device_env(physical_devices):
+        with scoped_spawn_device_env(
+            physical_devices,
+            self._spawn_device_lock,
+            stage_id=stage_id,
+            stage_runtime_cfg=runtime_cfg,
+        ):
             yield
 
     # ---- Internal methods ----
@@ -583,6 +590,7 @@ class StageRuntime:
                     omni_coordinator_address=self._get_coordinator_address(),
                     stage_visible_devices=physical_devices,
                     spawn_device_lock=self._spawn_device_lock,
+                    stage_runtime_cfg=plan.metadata.runtime_cfg,
                 ) as resources:
                     pass
 

@@ -1,6 +1,10 @@
 import contextlib
 import importlib
+import json
 import os
+import subprocess
+import sys
+import threading
 import time
 import types
 
@@ -208,6 +212,464 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
             os.environ.pop(env_var, None)
         else:
             os.environ[env_var] = old_env
+
+
+def test_initialize_local_diffusion_replica_applies_and_restores_stage_env(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+    plan.metadata.runtime_cfg["env"] = {"OMNI_TEST_STAGE_ENV": "diffusion"}
+    observed = []
+
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+
+    def _capture_launch(**_kwargs):
+        observed.append(os.environ.get("OMNI_TEST_STAGE_ENV"))
+        return types.SimpleNamespace(), StageReplicaResources()
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        _capture_launch,
+    )
+
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert observed == ["diffusion"]
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+def test_scoped_spawn_env_applies_device_and_stage_env_under_one_lock(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "baseline")
+    monkeypatch.setenv("OMNI_TEST_STAGE_ENV", "baseline")
+    observations = []
+    spawn_lock = threading.Lock()
+
+    def _observe(stage_id, device, value):
+        with scoped_spawn_device_env(
+            device,
+            spawn_lock,
+            stage_id=stage_id,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": value}},
+        ):
+            observations.append(
+                (
+                    stage_id,
+                    os.environ.get(device_env),
+                    os.environ.get("OMNI_TEST_STAGE_ENV"),
+                )
+            )
+            time.sleep(0.01)
+
+    threads = [
+        threading.Thread(target=_observe, args=(0, "0", "stage0")),
+        threading.Thread(target=_observe, args=(1, "1", "stage1")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(observations) == [
+        (0, "0", "stage0"),
+        (1, "1", "stage1"),
+    ]
+    assert os.environ[device_env] == "baseline"
+    assert os.environ["OMNI_TEST_STAGE_ENV"] == "baseline"
+
+
+def test_scoped_spawn_env_serializes_distinct_stage_runtime_locks(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
+
+    runtimes = [
+        StageRuntime(
+            stage_configs=[],
+            model="dummy-model",
+            config_path="dummy-config",
+            stage_init_timeout=1,
+            diffusion_batch_size=1,
+            async_chunk=False,
+        )
+        for _ in range(2)
+    ]
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def _hold_first_scope():
+        with scoped_spawn_device_env(
+            "0",
+            runtimes[0]._spawn_device_lock,
+            stage_id=0,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "stage0"}},
+        ):
+            first_entered.set()
+            assert release_first.wait(timeout=2)
+
+    def _enter_second_scope():
+        assert first_entered.wait(timeout=2)
+        with scoped_spawn_device_env(
+            "1",
+            runtimes[1]._spawn_device_lock,
+            stage_id=1,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "stage1"}},
+        ):
+            second_entered.set()
+
+    first_thread = threading.Thread(target=_hold_first_scope)
+    second_thread = threading.Thread(target=_enter_second_scope)
+    first_thread.start()
+    assert first_entered.wait(timeout=2)
+    second_thread.start()
+    try:
+        assert not second_entered.wait(timeout=0.1)
+    finally:
+        release_first.set()
+        first_thread.join(timeout=2)
+        second_thread.join(timeout=2)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert second_entered.is_set()
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+def test_headless_spawn_env_shares_process_global_lock(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import (
+        launch_headless_replica_group,
+        scoped_spawn_device_env,
+    )
+
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+    headless_entered = threading.Event()
+    release_headless = threading.Event()
+    colocated_entered = threading.Event()
+
+    class _Manager:
+        def shutdown(self):
+            pass
+
+    def _launch_headless(_replica_id):
+        headless_entered.set()
+        assert release_headless.wait(timeout=2)
+        return _Manager()
+
+    def _run_headless():
+        launch_headless_replica_group(
+            stage_id=0,
+            omni_dp_size_local=1,
+            per_replica_devices=["0"],
+            launch_one=_launch_headless,
+            wait_for_replicas=lambda _managers: None,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "headless"}},
+        )
+
+    def _run_colocated():
+        assert headless_entered.wait(timeout=2)
+        with scoped_spawn_device_env(
+            "1",
+            threading.Lock(),
+            stage_id=1,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "colocated"}},
+        ):
+            colocated_entered.set()
+
+    headless_thread = threading.Thread(target=_run_headless)
+    colocated_thread = threading.Thread(target=_run_colocated)
+    headless_thread.start()
+    assert headless_entered.wait(timeout=2)
+    colocated_thread.start()
+    try:
+        assert not colocated_entered.wait(timeout=0.1)
+    finally:
+        release_headless.set()
+        headless_thread.join(timeout=2)
+        colocated_thread.join(timeout=2)
+
+    assert not headless_thread.is_alive()
+    assert not colocated_thread.is_alive()
+    assert colocated_entered.is_set()
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("stage_runtime", "expected_env"),
+    [
+        ({"env": {"OMNI_TEST_STAGE_ENV": "headless-stage"}}, "headless-stage"),
+        (None, None),
+    ],
+)
+def test_headless_dp_coordinator_spawn_shares_process_global_lock(
+    monkeypatch,
+    stage_runtime,
+    expected_env,
+):
+    import vllm_omni.engine.stage_engine_startup as startup
+
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+    other_scope_entered = threading.Event()
+    release_other_scope = threading.Event()
+    coordinator_constructed = threading.Event()
+    observed = []
+    errors = []
+
+    class _Coordinator:
+        proc = types.SimpleNamespace(pid=1234)
+
+        def shutdown(self):
+            pass
+
+    def _construct_coordinator(*_args, **_kwargs):
+        observed.append(os.environ.get("OMNI_TEST_STAGE_ENV"))
+        coordinator_constructed.set()
+        return _Coordinator()
+
+    def _hold_other_stage_scope():
+        with startup.scoped_spawn_device_env(
+            "1",
+            threading.Lock(),
+            stage_id=1,
+            stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "other-stage"}},
+        ):
+            other_scope_entered.set()
+            assert release_other_scope.wait(timeout=2)
+
+    def _launch_headless_stage():
+        try:
+            startup.launch_headless_llm_replicas(
+                vllm_config=types.SimpleNamespace(
+                    parallel_config=types.SimpleNamespace(
+                        data_parallel_size_local=1,
+                        data_parallel_rank=0,
+                    ),
+                    needs_dp_coordinator=True,
+                    model_config=types.SimpleNamespace(is_moe=False),
+                ),
+                executor_class=object,
+                log_stats=False,
+                omni_master_address="127.0.0.1",
+                omni_master_port=12345,
+                stage_id=0,
+                stage_config=types.SimpleNamespace(runtime=stage_runtime),
+                omni_dp_size_local=1,
+                per_replica_devices=["0"],
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(startup, "DPCoordinator", _construct_coordinator)
+    monkeypatch.setattr(startup, "launch_headless_replica_group", lambda **_kwargs: None)
+
+    other_thread = threading.Thread(target=_hold_other_stage_scope)
+    headless_thread = threading.Thread(target=_launch_headless_stage)
+    other_thread.start()
+    assert other_scope_entered.wait(timeout=2)
+    headless_thread.start()
+    try:
+        assert not coordinator_constructed.wait(timeout=0.1)
+    finally:
+        release_other_scope.set()
+        other_thread.join(timeout=2)
+        headless_thread.join(timeout=2)
+
+    assert not other_thread.is_alive()
+    assert not headless_thread.is_alive()
+    assert not errors
+    assert coordinator_constructed.is_set()
+    assert observed == [expected_env]
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+def test_scoped_spawn_env_reaches_spawned_child_and_grandchild(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env = current_omni_platform.device_control_env_var
+    stage_env = "OMNI_TEST_STAGE_ENV"
+    monkeypatch.setenv(device_env, "baseline")
+    monkeypatch.delenv(stage_env, raising=False)
+
+    grandchild_code = (
+        "import json, os, sys; print(json.dumps([os.environ.get(sys.argv[1]), os.environ.get(sys.argv[2])]))"
+    )
+    child_code = (
+        "import json, os, subprocess, sys; "
+        "child = [os.environ.get(sys.argv[1]), os.environ.get(sys.argv[2])]; "
+        "grandchild = json.loads(subprocess.check_output("
+        "[sys.executable, '-c', sys.argv[3], sys.argv[1], sys.argv[2]], "
+        "text=True)); "
+        "print(json.dumps([child, grandchild]))"
+    )
+    with scoped_spawn_device_env(
+        "3",
+        threading.Lock(),
+        stage_id=3,
+        stage_runtime_cfg={"env": {stage_env: "spawned"}},
+    ):
+        result = subprocess.check_output(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                device_env,
+                stage_env,
+                grandchild_code,
+            ],
+            text=True,
+        )
+
+    assert json.loads(result) == [["3", "spawned"], ["3", "spawned"]]
+    assert os.environ[device_env] == "baseline"
+    assert stage_env not in os.environ
+
+
+def test_scoped_spawn_env_applies_env_without_device_override(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
+
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+
+    with scoped_spawn_device_env(
+        None,
+        threading.Lock(),
+        stage_id=0,
+        stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "env-only"}},
+    ):
+        assert os.environ["OMNI_TEST_STAGE_ENV"] == "env-only"
+
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+def test_launch_stage_replica_constructs_manager_inside_stage_env_scope(monkeypatch):
+    import vllm.utils.network_utils as network_utils
+
+    import vllm_omni.engine.stage_engine_core_proc_manager as proc_manager_mod
+    import vllm_omni.engine.stage_engine_startup as startup
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "baseline")
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+    observed = []
+    addresses = types.SimpleNamespace()
+
+    class _FakeManager:
+        def __init__(self, **_kwargs):
+            observed.append(
+                (
+                    os.environ.get(device_env),
+                    os.environ.get("OMNI_TEST_STAGE_ENV"),
+                )
+            )
+
+    @contextlib.contextmanager
+    def _fake_socket_ctx(*_args, **_kwargs):
+        yield object()
+
+    monkeypatch.setattr(startup, "get_engine_zmq_addresses", lambda _cfg: addresses)
+    monkeypatch.setattr(network_utils, "get_open_zmq_ipc_path", lambda: "ipc://fake")
+    monkeypatch.setattr(startup, "zmq_socket_ctx", _fake_socket_ctx)
+    monkeypatch.setattr(startup, "wait_for_engine_startup", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        proc_manager_mod,
+        "StageEngineCoreProcManager",
+        _FakeManager,
+    )
+
+    with startup.launch_stage_replica(
+        vllm_config=types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(),
+            cache_config=None,
+        ),
+        executor_class=object,
+        log_stats=False,
+        stage_id=0,
+        stage_visible_devices="0",
+        spawn_device_lock=threading.Lock(),
+        stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "stage0"}},
+    ):
+        pass
+
+    assert observed == [("0", "stage0")]
+    assert os.environ[device_env] == "baseline"
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+def test_stage_runtime_env_rolls_back_if_an_assignment_fails(monkeypatch):
+    from vllm_omni.engine.stage_init_utils import stage_runtime_env
+
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+
+    with pytest.raises(ValueError):
+        with stage_runtime_env(
+            0,
+            {
+                "env": {
+                    "OMNI_TEST_STAGE_ENV": "temporary",
+                    "INVALID=ENV=KEY": "value",
+                }
+            },
+        ):
+            pytest.fail("invalid environment must fail before entering scope")
+
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
+
+
+def test_headless_replica_group_applies_stage_env_at_launch_boundary(monkeypatch):
+    from vllm_omni.engine.stage_engine_startup import (
+        launch_headless_replica_group,
+    )
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env = current_omni_platform.device_control_env_var
+    monkeypatch.setenv(device_env, "baseline")
+    monkeypatch.delenv("OMNI_TEST_STAGE_ENV", raising=False)
+    observations = []
+
+    class _Manager:
+        def shutdown(self):
+            pass
+
+    def _launch_one(replica_id):
+        observations.append(
+            (
+                replica_id,
+                os.environ.get(device_env),
+                os.environ.get("OMNI_TEST_STAGE_ENV"),
+            )
+        )
+        return _Manager()
+
+    launch_headless_replica_group(
+        stage_id=1,
+        omni_dp_size_local=2,
+        per_replica_devices=["2", "3"],
+        launch_one=_launch_one,
+        wait_for_replicas=lambda _managers: None,
+        stage_runtime_cfg={"env": {"OMNI_TEST_STAGE_ENV": "headless"}},
+    )
+
+    assert observations == [
+        (0, "2", "headless"),
+        (1, "3", "headless"),
+    ]
+    assert os.environ[device_env] == "baseline"
+    assert "OMNI_TEST_STAGE_ENV" not in os.environ
 
 
 def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
@@ -519,6 +981,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
     captured_timeout: int | None = None
+    captured_runtime_cfg = None
 
     plan = ReplicaInitPlan(
         replica_id=0,
@@ -548,6 +1011,8 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
 
     @contextlib.contextmanager
     def _fake_launch_stage_replica(**_kwargs):
+        nonlocal captured_runtime_cfg
+        captured_runtime_cfg = _kwargs["stage_runtime_cfg"]
         yield StageReplicaResources(
             manager=types.SimpleNamespace(shutdown=lambda: None),
             addresses=fake_addresses,
@@ -569,6 +1034,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == 302
+    assert captured_runtime_cfg == {"devices": "0"}
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
