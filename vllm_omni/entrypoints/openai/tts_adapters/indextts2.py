@@ -208,6 +208,18 @@ class IndexTTS2Adapter(ARTTSAdapter):
             estimate_indextts2_prefill_prompt_len,
         )
 
+        prompt_kwargs: dict[str, Any] = {}
+        if self.name == "indextts2_5":
+            from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+                INDEXTTS25_TOKENIZER_FILE,
+            )
+
+            hf_config = getattr(server.engine_client.model_config, "hf_config", None)
+            prompt_kwargs["tokenizer_file"] = getattr(
+                hf_config,
+                "tokenizer_file",
+                INDEXTTS25_TOKENIZER_FILE,
+            )
         ph_len = estimate_indextts2_prefill_prompt_len(
             server.engine_client.model_config.model,
             request.input,
@@ -218,6 +230,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
                 if "text_normalization" in tts_params
                 else True
             ),
+            **prompt_kwargs,
         )
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = tts_params

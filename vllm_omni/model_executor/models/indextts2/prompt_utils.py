@@ -11,6 +11,9 @@ from vllm_omni.model_executor.models.indextts2.text_processing_v2_5 import (
     prepare_indextts25_text,
 )
 from vllm_omni.model_executor.models.indextts2.tokenizer import IndexTTS2Tokenizer
+from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+    INDEXTTS25_TOKENIZER_FILE,
+)
 
 _V2_CONDITIONING_PREFIX_TOKENS = 34
 _V25_CONDITIONING_PREFIX_TOKENS = 3
@@ -39,6 +42,7 @@ def estimate_indextts2_prefill_prompt_len(
     model_type: str = "indextts2",
     lang: str = "zh",
     text_normalization: bool = True,
+    tokenizer_file: str = INDEXTTS25_TOKENIZER_FILE,
 ) -> int:
     """Return the placeholder prompt length expected by the IndexTTS2 talker.
 
@@ -51,6 +55,7 @@ def estimate_indextts2_prefill_prompt_len(
             lang=lang,
             model_dir=model_id_or_path,
             text_normalization=text_normalization,
+            tokenizer_file=tokenizer_file,
         )
         conditioning_prefix_tokens = _V25_CONDITIONING_PREFIX_TOKENS
         text_token_count = (
@@ -70,6 +75,7 @@ def build_indextts2_prefill_prompt_ids(
     model_type: str = "indextts2",
     lang: str = "zh",
     text_normalization: bool = True,
+    tokenizer_file: str = INDEXTTS25_TOKENIZER_FILE,
     placeholder_token_id: int = 1,
 ) -> list[int]:
     prompt_len = estimate_indextts2_prefill_prompt_len(
@@ -78,5 +84,6 @@ def build_indextts2_prefill_prompt_ids(
         model_type=model_type,
         lang=lang,
         text_normalization=text_normalization,
+        tokenizer_file=tokenizer_file,
     )
     return [placeholder_token_id] * prompt_len

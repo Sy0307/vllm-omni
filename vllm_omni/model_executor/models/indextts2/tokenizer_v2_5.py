@@ -129,6 +129,10 @@ LANGUAGES = (
 )
 LANGUAGE_DICT = {lang: index for index, lang in enumerate(LANGUAGES)}
 
+# ``zhen`` is an official mixed Chinese/English frontend mode, but it has no
+# dedicated checkpoint language-embedding row or registered special token.
+_FRONTEND_LANGUAGE_TO_EMBEDDING = {"zhen": "common"}
+
 TO_LANGUAGE_CODE = {
     "english": "en",
     "chinese": "zh",
@@ -141,6 +145,8 @@ TO_LANGUAGE_CODE = {
     "portuguese": "pt",
     "turkish": "tr",
     "cantonese": "yue",
+    # Intentional vLLM-Omni convenience alias; upstream would route the name
+    # ``mandarin`` to the ``common`` language-embedding row.
     "mandarin": "zh",
     "burmese": "my",
     "valencian": "ca",
@@ -203,13 +209,16 @@ _PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(
 def normalize_language_code(lang: str) -> str:
     normalized = lang.strip().lower()
     normalized = TO_LANGUAGE_CODE.get(normalized, normalized)
-    if normalized not in LANGUAGE_DICT:
-        raise ValueError(f"Unsupported IndexTTS 2.5 language {lang!r}; expected one of {', '.join(LANGUAGES)}")
+    if normalized not in LANGUAGE_DICT and normalized not in _FRONTEND_LANGUAGE_TO_EMBEDDING:
+        supported = (*LANGUAGES, *sorted(_FRONTEND_LANGUAGE_TO_EMBEDDING))
+        raise ValueError(f"Unsupported IndexTTS 2.5 language {lang!r}; expected one of {', '.join(supported)}")
     return normalized
 
 
 def lang_to_token(lang: str) -> int:
-    return LANGUAGE_DICT[normalize_language_code(lang)]
+    normalized = normalize_language_code(lang)
+    embedding_language = _FRONTEND_LANGUAGE_TO_EMBEDDING.get(normalized, normalized)
+    return LANGUAGE_DICT[embedding_language]
 
 
 def resolve_indextts25_tokenizer_file(

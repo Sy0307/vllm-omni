@@ -239,6 +239,9 @@ class OmniEngineArgs(EngineArgs):
             # omni config class supplies defaults once model_type is injected.
             if not os.path.isdir(self.model):
                 return
+            config_path = os.path.join(self.model, "config.json")
+            if os.path.lexists(config_path):
+                return
             config_dict = {}
 
         # Create a temp dir with a patched config.json

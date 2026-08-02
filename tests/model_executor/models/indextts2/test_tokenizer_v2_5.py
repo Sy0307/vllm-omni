@@ -6,6 +6,7 @@ import pytest
 from vllm_omni.model_executor.models.indextts2 import text_processing_v2_5
 from vllm_omni.model_executor.models.indextts2.text_processing_v2_5 import (
     apply_pronunciation_annotations,
+    clean_indextts25_text,
     prepare_indextts25_text,
 )
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
@@ -13,8 +14,11 @@ from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_VOCAB_SIZE,
     LANGUAGE_DICT,
     lang_to_token,
+    normalize_language_code,
     resolve_indextts25_tokenizer_file,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_special_token_layout_matches_official_checkpoint_vocab():
@@ -58,10 +62,69 @@ def test_prepare_text_applies_language_prefix_case_and_annotation(monkeypatch):
     }
 
 
-def test_language_alias_and_invalid_language():
+def test_mandarin_alias_is_an_intentional_vllm_omni_convenience():
+    assert normalize_language_code("Mandarin") == "zh"
     assert lang_to_token("mandarin") == LANGUAGE_DICT["zh"]
+
+
+def test_invalid_language_does_not_fall_back_to_common():
     with pytest.raises(ValueError, match="Unsupported IndexTTS 2.5 language"):
         lang_to_token("xx-invalid")
+
+
+def test_zhen_uses_mixed_normalization():
+    calls = []
+
+    def fake_mixed_normalizer(text):
+        calls.append(text)
+        return "MIXED"
+
+    original = text_processing_v2_5._normalize_zh_or_en
+    text_processing_v2_5._normalize_zh_or_en = fake_mixed_normalizer
+    try:
+        result = text_processing_v2_5._normalize_with_official_backend(
+            "中文 and English",
+            "zhen",
+        )
+    finally:
+        text_processing_v2_5._normalize_zh_or_en = original
+
+    assert calls == ["中文 and English"]
+    assert result == "MIXED"
+
+
+def test_zhen_keeps_literal_prefix_and_uses_common_embedding(monkeypatch):
+    captured = {}
+
+    def fake_encode(text, *, model_dir, tokenizer_file):
+        captured["text"] = text
+        return [7, 8, 9]
+
+    monkeypatch.setattr(text_processing_v2_5, "encode_indextts25_text", fake_encode)
+
+    token_ids, lang_id = prepare_indextts25_text(
+        "HELLO 中文",
+        lang="zhen",
+        model_dir="/model",
+        text_normalization=False,
+    )
+
+    assert token_ids == [7, 8, 9]
+    assert captured["text"] == "<|zhen|> hello 中文"
+    assert lang_id == LANGUAGE_DICT["common"]
+    assert "<|zhen|>" not in INDEXTTS25_SPECIAL_TOKENS
+    assert "<|common|>" not in INDEXTTS25_SPECIAL_TOKENS
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("，，，", "…"),
+        ("测试，，，结束", "测试…结束"),
+    ],
+)
+def test_repeated_full_width_commas_use_longest_first_cleanup(text, expected):
+    assert clean_indextts25_text(text) == expected
 
 
 def test_default_text_normalizer_is_shared_by_prompt_and_talker(monkeypatch):

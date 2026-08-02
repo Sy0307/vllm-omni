@@ -69,6 +69,8 @@ _CHAR_REPLACEMENTS = {
     "」": "'",
     ":": ",",
 }
+# Deliberately prefer the longest replacement. This diverges from the
+# insertion-ordered upstream regex so ``，，，`` becomes one ellipsis, not ``,,,``.
 _CLEAN_PATTERN = re.compile("|".join(re.escape(key) for key in sorted(_CHAR_REPLACEMENTS, key=len, reverse=True)))
 
 
@@ -96,29 +98,41 @@ def clean_indextts25_text(text: str) -> str:
 
 @lru_cache(maxsize=2)
 def _load_wetext_normalizer(lang: str):
-    try:
-        import platform
+    import platform
 
-        if platform.system() == "Linux":
+    if platform.system() == "Linux":
+        try:
             if lang == "zh":
                 from tn.chinese.normalizer import Normalizer
-
-                return Normalizer(
-                    remove_interjections=False,
-                    remove_erhua=False,
-                    overwrite_cache=False,
-                )
-            from tn.english.normalizer import Normalizer
-
-            return Normalizer(overwrite_cache=False)
-
-        from wetext import Normalizer
-
+            else:
+                from tn.english.normalizer import Normalizer
+        except ModuleNotFoundError as exc:
+            if exc.name != "tn":
+                raise
+            raise RuntimeError(
+                f"IndexTTS 2.5 text normalization backend for {lang!r} is unavailable. "
+                "Install it with pip install 'vllm-omni[indextts2]'"
+            ) from exc
         if lang == "zh":
-            return Normalizer(remove_erhua=False, lang="zh", operator="tn")
-        return Normalizer(lang="en", operator="tn")
-    except Exception as exc:
-        raise RuntimeError(f"IndexTTS 2.5 text normalization backend for {lang!r} is unavailable") from exc
+            return Normalizer(
+                remove_interjections=False,
+                remove_erhua=False,
+                overwrite_cache=False,
+            )
+        return Normalizer(overwrite_cache=False)
+
+    try:
+        from wetext import Normalizer
+    except ModuleNotFoundError as exc:
+        if exc.name != "wetext":
+            raise
+        raise RuntimeError(
+            f"IndexTTS 2.5 text normalization backend for {lang!r} is unavailable. "
+            "Install it with pip install 'vllm-omni[indextts2]'"
+        ) from exc
+    if lang == "zh":
+        return Normalizer(remove_erhua=False, lang="zh", operator="tn")
+    return Normalizer(lang="en", operator="tn")
 
 
 def _uses_chinese_normalizer(text: str) -> bool:
@@ -205,7 +219,7 @@ def _normalize_zh_or_en(text: str) -> str:
 
 
 def _normalize_with_official_backend(text: str, lang: str) -> str:
-    if lang in {"zh", "en"}:
+    if lang in {"zh", "en", "zhen"}:
         return _normalize_zh_or_en(text)
     if lang == "es":
         # NeMo is optional in the upstream implementation and falls back to
@@ -226,10 +240,16 @@ def _normalize_with_official_backend(text: str, lang: str) -> str:
 def _load_japanese_tagger():
     try:
         import fugashi
-
-        return fugashi.Tagger()
-    except Exception as exc:
-        raise RuntimeError("IndexTTS 2.5 Japanese preprocessing requires fugashi and unidic-lite") from exc
+        import unidic_lite
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"fugashi", "unidic_lite"}:
+            raise
+        raise RuntimeError(
+            "IndexTTS 2.5 Japanese preprocessing requires fugashi and unidic-lite. "
+            "Install them with pip install 'vllm-omni[indextts2]'"
+        ) from exc
+    _ = unidic_lite
+    return fugashi.Tagger()
 
 
 def _process_japanese_text(text: str) -> str:
@@ -260,7 +280,7 @@ def normalize_indextts25_text(
     if text_normalization:
         normalize = normalizer or _normalize_with_official_backend
         text = normalize(text, lang)
-    if lang in {"ja", "zh", "en"}:
+    if lang in {"ja", "zh", "en", "zhen"}:
         text = text.lower()
     elif lang == "es":
         text = text.upper()
@@ -294,6 +314,9 @@ def prepare_indextts25_text(
         text_normalization=text_normalization,
         normalizer=normalizer,
     )
+    # ``zhen`` is not a registered special token. Keep its official literal
+    # prefix so tiktoken encodes it through existing mergeable ranks; remapping
+    # it to ``common`` would change both the text ABI and preprocessing route.
     prefixed = f"<|{lang_code}|> {normalized}"
     token_ids = encode_indextts25_text(
         prefixed,

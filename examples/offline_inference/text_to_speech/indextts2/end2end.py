@@ -53,6 +53,7 @@ def build_request(
     model_type: str = "indextts2",
     lang: str = "zh",
     text_normalization: bool = True,
+    tokenizer_file: str | None = None,
 ) -> dict:
     additional: dict = {"text": [text]}
     if ref_audio_path:
@@ -72,16 +73,39 @@ def build_request(
     if model_type == "indextts2_5":
         additional["lang"] = [lang]
         additional["text_normalization"] = [text_normalization]
+    prompt_kwargs = {
+        "model_type": model_type,
+        "lang": lang,
+        "text_normalization": text_normalization,
+    }
+    if tokenizer_file is not None:
+        prompt_kwargs["tokenizer_file"] = tokenizer_file
     return {
         "prompt_token_ids": build_indextts2_prefill_prompt_ids(
             model,
             text,
-            model_type=model_type,
-            lang=lang,
-            text_normalization=text_normalization,
+            **prompt_kwargs,
         ),
         "additional_information": additional,
     }
+
+
+def _get_stage0_tokenizer_file(omni: Omni) -> str | None:
+    """Read the effective tokenizer override from the resolved Stage 0 config."""
+    stage_configs = omni.stage_configs
+    if not stage_configs:
+        return None
+    engine_args = getattr(stage_configs[0], "engine_args", None)
+    if engine_args is None:
+        return None
+    hf_overrides = getattr(engine_args, "hf_overrides", None)
+    if hf_overrides is None and isinstance(engine_args, dict):
+        hf_overrides = engine_args.get("hf_overrides")
+    if hf_overrides is None:
+        return None
+    if hasattr(hf_overrides, "get"):
+        return hf_overrides.get("tokenizer_file")
+    return getattr(hf_overrides, "tokenizer_file", None)
 
 
 def save_audio(waveform: torch.Tensor, path: str, sample_rate: int = 22050) -> None:
@@ -120,7 +144,8 @@ def main(args) -> None:
         raise ValueError("--use-gpt-latent is only valid for --model-version 2.5")
     elif args.use_gpt_latent and args.deploy_config is not None:
         raise ValueError(
-            "--use-gpt-latent selects the bundled compatibility deploy config; do not combine it with --deploy-config"
+            "--use-gpt-latent selects the bundled experimental vLLM-Omni-specific "
+            "latent variant; do not combine it with --deploy-config"
         )
 
     omni = Omni(
@@ -154,7 +179,7 @@ def main(args) -> None:
     print(f"Synthesizing: {args.text!r}")
     if args.ref_audio:
         print(f"  ref_audio: {args.ref_audio}")
-    inputs = build_request(
+    request_kwargs = dict(
         model=args.model,
         text=args.text,
         ref_audio_path=args.ref_audio,
@@ -168,6 +193,11 @@ def main(args) -> None:
         lang=args.lang,
         text_normalization=args.text_normalization,
     )
+    if model_type == "indextts2_5":
+        tokenizer_file = _get_stage0_tokenizer_file(omni)
+        if tokenizer_file is not None:
+            request_kwargs["tokenizer_file"] = tokenizer_file
+    inputs = build_request(**request_kwargs)
 
     for i, omni_out in enumerate(omni.generate(inputs, sampling_params_list=sampling_params)):
         mm = omni_out.multimodal_output
@@ -199,7 +229,10 @@ def parse_args():
     parser.add_argument(
         "--lang",
         default="zh",
-        help="IndexTTS 2.5 language code, for example zh/en/ja/yue.",
+        help=(
+            "IndexTTS 2.5 language code, for example zh/en/zhen/ja/yue; "
+            "zhen is mixed Chinese/English and Mandarin is a vLLM-Omni alias for zh."
+        ),
     )
     parser.add_argument(
         "--no-text-normalization",
@@ -210,7 +243,10 @@ def parse_args():
     parser.add_argument(
         "--use-gpt-latent",
         action="store_true",
-        help="Use the experimental IndexTTS 2.5 GPT-latent compatibility path.",
+        help=(
+            "Use the experimental vLLM-Omni-specific IndexTTS 2.5 latent variant; "
+            "its nearest-neighbor interpolation has no official runnable reference output."
+        ),
     )
     parser.add_argument("--text", default="你好，这是IndexTTS2语音合成测试。")
     parser.add_argument("--ref-audio", required=True, help="Reference audio for voice cloning.")
@@ -226,7 +262,15 @@ def parse_args():
     parser.add_argument("--emo-alpha", type=float, default=None, help="Emotion weight in [0, 1].")
     parser.add_argument("--use-emo-text", action="store_true", help="Infer emotion vector from emo-text or text.")
     parser.add_argument("--use-random", action="store_true", help="Use random emotion prototypes.")
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed Stage 0 AR sampling and per-request CFM noise; changing the "
+            "concurrent batch composition may still change the final waveform."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         default=os.path.join(

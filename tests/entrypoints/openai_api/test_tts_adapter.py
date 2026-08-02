@@ -4,6 +4,9 @@
 Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 """
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.entrypoints.openai.tts_adapters import (
@@ -18,6 +21,12 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS25Adapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.model_executor.models.indextts2 import prompt_utils
+from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
+    INDEXTTS25_TOKENIZER_FILE,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
@@ -104,6 +113,50 @@ def test_indextts25_validates_explicit_language():
 
     assert adapter._validate_extra_params({"lang": "ja"}) is None
     assert "Unsupported IndexTTS 2.5 language" in adapter._validate_extra_params({"lang": "xx-invalid"})
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "expected_tokenizer_file"),
+    [
+        (SimpleNamespace(tokenizer_file="custom-tokenizer.tiktoken"), "custom-tokenizer.tiktoken"),
+        (SimpleNamespace(), INDEXTTS25_TOKENIZER_FILE),
+    ],
+)
+def test_indextts25_build_uses_configured_tokenizer_file(
+    monkeypatch,
+    hf_config,
+    expected_tokenizer_file,
+):
+    captured = {}
+
+    def fake_estimate(*args, **kwargs):
+        captured.update(kwargs)
+        return 4
+
+    async def fake_build_params(request):
+        return {"lang": ["en"], "text_normalization": [True]}
+
+    monkeypatch.setattr(
+        prompt_utils,
+        "estimate_indextts2_prefill_prompt_len",
+        fake_estimate,
+    )
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="/model",
+                hf_config=hf_config,
+            )
+        )
+    )
+    adapter = IndexTTS25Adapter(SimpleNamespace(server=server))
+    monkeypatch.setattr(adapter, "_build_params", fake_build_params)
+    request = SimpleNamespace(input="hello", ref_audio=None)
+
+    prepared = asyncio.run(adapter.build(request, [], False))
+
+    assert prepared.prompt["prompt_token_ids"] == [1] * 4
+    assert captured["tokenizer_file"] == expected_tokenizer_file
 
 
 def test_diffusion_adapter_extra_body_params_fallback():
