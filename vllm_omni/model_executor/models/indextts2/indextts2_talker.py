@@ -154,11 +154,17 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = True
         self.requires_raw_input_tokens = True
         self.enable_update_additional_information = True
-        # S2Mel consumes the complete code sequence only at request end, but
-        # the connector accumulator needs to observe each appendable AR delta.
-        # Keep runner request-end gating disabled and emit per-step rows from
-        # make_omni_output; the full-payload builder reconstructs the sequence.
-        self.omni_payload_at_request_end = False
+        # Stage 1 consumes the hidden-state stream only in the legacy
+        # ``use_gpt_latent`` mode.  IndexTTS 2.5 transports mel codes plus
+        # reference conditioning, so asking the generic runner to include
+        # hidden states would add a synchronous [num_tokens, model_dim] D2H
+        # copy on every decode step without adding anything to the payload.
+        self.omni_pooler_payload_include_hidden = self.use_gpt_latent
+        # S2Mel consumes the complete sequence only at request end. In latent
+        # mode the runner retains aligned code/latent deltas on GPU; no-latent
+        # mode reuses the CPU output-token history and retains only conditioning
+        # metadata here.
+        self.omni_payload_at_request_end = True
         self.omni_request_end_token_ids = ()
         self._speaker_cache = get_speaker_cache()
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
@@ -368,7 +374,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     # ------------------------------------------------------------------
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
-        """Collect mel_codes and hidden_states from intermediate buffer."""
+        """Build the per-step Stage 1 payload from the intermediate buffer."""
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
@@ -381,7 +387,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         device = hidden.device
         latent_dim = hidden.shape[-1]
-        _zero_codes = torch.zeros(0, 1, dtype=torch.long, device=device)
+        _zero_codes = torch.zeros(0, 1, dtype=torch.long, device=device) if self.use_gpt_latent else None
         _zero_latent = torch.zeros(0, latent_dim, dtype=hidden.dtype, device=device) if self.use_gpt_latent else None
 
         # Per-request lists: to_payload_element dispatches lists via
@@ -389,33 +395,38 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # mixed prefill+decode steps. Zero-length placeholders for prefill
         # requests are harmless — torch.cat ignores them in accumulation.
         #
-        # Export semantics are appendable deltas for the existing full-payload
-        # accumulator: codes.mel is a 2-D row [1, 1], hidden_states.latent is
-        # the aligned one-row [1, D] slice from meta.latent_acc.
+        # Latent-mode exports are appendable deltas for the existing
+        # full-payload accumulator: codes.mel is a 2-D row [1, 1], while
+        # hidden_states.latent is the aligned one-row [1, D] slice from
+        # meta.latent_acc. No-latent mode only uses meta_list.
         mel_codes_list: list[torch.Tensor] = []
         latent_list: list[torch.Tensor] = []
         meta_list: list[dict[str, Any]] = []
 
         for info in info_dicts:
             if not isinstance(info, dict):
-                mel_codes_list.append(_zero_codes)
-                if _zero_latent is not None:
+                if self.use_gpt_latent:
+                    assert _zero_codes is not None
+                    mel_codes_list.append(_zero_codes)
+                    assert _zero_latent is not None
                     latent_list.append(_zero_latent)
                 meta_list.append({})
                 continue
-            codes = info.get("codes", {})
-            mc = codes.get("mel")
             info_meta = info.get("meta", {})
             # mel_len now comes from the int counter in meta, not from
             # code_seq.shape[0] (codes.mel is a single-token delta).
             mel_len = int(info_meta.get("mel_code_count", 0))
-            if isinstance(mc, torch.Tensor) and mc.numel() > 0 and mel_len > 0:
-                code_seq = mc.reshape(-1)
-                mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
-            else:
-                mel_codes_list.append(_zero_codes)
 
             if self.use_gpt_latent:
+                codes = info.get("codes", {})
+                mc = codes.get("mel")
+                if isinstance(mc, torch.Tensor) and mc.numel() > 0 and mel_len > 0:
+                    code_seq = mc.reshape(-1)
+                    mel_codes_list.append(code_seq[-1:].reshape(1, 1).contiguous())
+                else:
+                    assert _zero_codes is not None
+                    mel_codes_list.append(_zero_codes)
+
                 lat_acc = info_meta.get("latent_acc")
                 if isinstance(lat_acc, torch.Tensor) and lat_acc.numel() > 0 and mel_len > 0:
                     lat_seq = lat_acc.reshape(-1, lat_acc.shape[-1]) if lat_acc.ndim != 2 else lat_acc
@@ -431,8 +442,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                         assert _zero_latent is not None
                         latent_list.append(_zero_latent)
 
-            req_meta: dict[str, Any] = {"use_gpt_latent": self.use_gpt_latent}
+            req_meta: dict[str, Any] = {}
             if mel_len == 1:
+                req_meta["use_gpt_latent"] = self.use_gpt_latent
                 s_ref = info_meta.get("S_ref")
                 ref_mel = info_meta.get("ref_mel")
                 style = info_meta.get("style")
@@ -444,14 +456,22 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     req_meta["style"] = style
             meta_list.append(req_meta)
 
-        if not any(t.numel() > 0 for t in mel_codes_list):
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
-
-        mm: OmniPayload = {
-            "codes": {"mel": mel_codes_list},
-        }
         if self.use_gpt_latent:
+            if not any(t.numel() > 0 for t in mel_codes_list):
+                return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+            mm: OmniPayload = {
+                "codes": {"mel": mel_codes_list},
+            }
             mm["hidden_states"] = {"latent": latent_list}
+        else:
+            # vLLM already materializes sampled token IDs on CPU for scheduler
+            # bookkeeping and stop-token handling. Stage 1 consumes the complete
+            # sequence only after request completion, so retain the conditioning
+            # metadata once and read the finished request.output_token_ids there
+            # instead of snapshotting a duplicate GPU code row every step.
+            if not any(meta_list):
+                return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+            mm = {}
         if any(meta_list):
             mm["meta"] = meta_list
 

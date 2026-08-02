@@ -14,6 +14,8 @@ from vllm_omni.model_executor.models.indextts2.indextts2_talker import (
     resolve_indextts_conditioning_policy,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_v25_conditioning_policy():
     policy = resolve_indextts_conditioning_policy("indextts2_5")
@@ -114,7 +116,12 @@ def test_matching_prefill_span_is_accepted():
     )
 
 
-def test_mel_head_preserves_official_checkpoint_bias(monkeypatch):
+def _make_minimal_talker(
+    monkeypatch,
+    *,
+    model_type,
+    use_gpt_latent,
+):
     import vllm_omni.model_executor.models.indextts2.indextts2_talker as talker_module
 
     seen = {}
@@ -127,7 +134,11 @@ def test_mel_head_preserves_official_checkpoint_bias(monkeypatch):
     monkeypatch.setattr(
         talker_module,
         "make_layers",
-        lambda *_args, **_kwargs: (0, 0, torch.nn.ModuleList()),
+        lambda *_args, **_kwargs: (
+            0,
+            1,
+            torch.nn.ModuleList([torch.nn.Linear(8, 8)]),
+        ),
     )
     monkeypatch.setattr(
         talker_module,
@@ -137,13 +148,18 @@ def test_mel_head_preserves_official_checkpoint_bias(monkeypatch):
     monkeypatch.setattr(talker_module, "get_speaker_cache", object)
     monkeypatch.setattr(
         talker_module,
+        "LogitsProcessor",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        talker_module,
         "ConformerEncoder",
-        lambda **_kwargs: torch.nn.Identity(),
+        lambda **_kwargs: torch.nn.Linear(1, 1),
     )
     monkeypatch.setattr(
         talker_module,
         "PerceiverResampler",
-        lambda *_args, **_kwargs: torch.nn.Identity(),
+        lambda *_args, **_kwargs: torch.nn.Linear(1, 1),
     )
 
     gpt = {
@@ -162,8 +178,9 @@ def test_mel_head_preserves_official_checkpoint_bias(monkeypatch):
     }
     config = SimpleNamespace(
         gpt=gpt,
-        model_type="indextts2_5",
-        use_gpt_latent=False,
+        model_type=model_type,
+        use_gpt_latent=use_gpt_latent,
+        gpt_checkpoint="gpt.pth",
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(model="/model", hf_config=config),
@@ -172,11 +189,80 @@ def test_mel_head_preserves_official_checkpoint_bias(monkeypatch):
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
     )
 
-    talker = IndexTTS2TalkerForConditionalGeneration(vllm_config=vllm_config)
+    return (
+        IndexTTS2TalkerForConditionalGeneration(vllm_config=vllm_config),
+        seen,
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "use_gpt_latent"),
+    [
+        ("indextts2", True),
+        ("indextts2_5", False),
+    ],
+)
+def test_mel_head_preserves_official_checkpoint_bias_and_hidden_payload_policy(
+    monkeypatch,
+    model_type,
+    use_gpt_latent,
+):
+    talker, seen = _make_minimal_talker(
+        monkeypatch,
+        model_type=model_type,
+        use_gpt_latent=use_gpt_latent,
+    )
 
     assert seen["bias"] is True
     assert talker.mel_head.bias is not None
-    assert talker.omni_pooler_payload_include_hidden is False
+    assert talker.omni_pooler_payload_include_hidden is use_gpt_latent
+    assert talker.omni_payload_at_request_end is True
+
+
+def test_v2_load_weights_loads_exact_mel_head_bias_parameter(monkeypatch):
+    import vllm_omni.model_executor.models.indextts2.indextts2_talker as talker_module
+
+    talker, _ = _make_minimal_talker(
+        monkeypatch,
+        model_type="indextts2",
+        use_gpt_latent=True,
+    )
+    checkpoint = {
+        name: parameter.detach().clone() for name, parameter in talker.named_parameters(remove_duplicate=False)
+    }
+    expected_bias = torch.arange(
+        talker.number_mel_codes,
+        dtype=talker.mel_head.bias.dtype,
+    )
+    checkpoint["mel_head.bias"] = expected_bias
+    with torch.no_grad():
+        talker.mel_head.bias.zero_()
+
+    monkeypatch.setattr(
+        talker_module,
+        "resolve_model_file",
+        lambda *_args, **_kwargs: "/model/gpt.pth",
+    )
+    monkeypatch.setattr(
+        talker_module.torch,
+        "load",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(
+        talker_module,
+        "is_pp_missing_parameter",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        talker,
+        "_warmup_external_models",
+        lambda _device: None,
+    )
+
+    loaded = talker.load_weights([])
+
+    assert "mel_head.bias" in loaded
+    torch.testing.assert_close(talker.mel_head.bias, expected_bias)
 
 
 def test_compute_logits_passes_mel_head_bias_to_logits_processor():
@@ -200,6 +286,64 @@ def test_compute_logits_passes_mel_head_bias_to_logits_processor():
     assert seen["head"] is talker.mel_head
     assert seen["hidden"] is hidden_states
     assert seen["embedding_bias"] is talker.mel_head.bias
+
+
+def test_no_latent_sampled_token_payload_emits_only_first_step_metadata():
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.use_gpt_latent = False
+    hidden = torch.zeros(1, 8)
+    info = {
+        "codes": {"mel": torch.tensor([17])},
+        "meta": {
+            "mel_code_count": 1,
+            "S_ref": torch.ones(1, 4),
+            "ref_mel": torch.ones(1, 80, 3),
+            "style": torch.ones(1, 192),
+        },
+    }
+
+    output = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[info],
+    )
+
+    assert "codes" not in output.multimodal_outputs
+    assert "hidden_states" not in output.multimodal_outputs
+    assert output.multimodal_outputs["meta"][0]["use_gpt_latent"] is False
+    assert output.multimodal_outputs["meta"][0]["S_ref"] is info["meta"]["S_ref"]
+
+    later = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {
+                "codes": {"mel": torch.tensor([23])},
+                "meta": {"mel_code_count": 2},
+            }
+        ],
+    )
+    assert later.multimodal_outputs == {}
+
+
+def test_latent_sampled_token_payload_keeps_aligned_gpu_deltas():
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.use_gpt_latent = True
+    hidden = torch.zeros(1, 8)
+    info = {
+        "codes": {"mel": torch.tensor([17])},
+        "meta": {
+            "mel_code_count": 1,
+            "latent_acc": torch.arange(8, dtype=torch.float32).reshape(1, 8),
+        },
+    }
+
+    output = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[info],
+    )
+
+    assert output.multimodal_outputs["codes"]["mel"][0].tolist() == [[17]]
+    assert output.multimodal_outputs["hidden_states"]["latent"][0].tolist() == [list(range(8))]
+    assert output.multimodal_outputs["meta"][0]["use_gpt_latent"] is True
 
 
 def test_v25_default_emotion_reuses_speaker_w2v_features(monkeypatch):

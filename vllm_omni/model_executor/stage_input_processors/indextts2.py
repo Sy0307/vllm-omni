@@ -212,14 +212,6 @@ def talker2s2mel_full_payload(
         logger.warning("talker2s2mel_full_payload: pooling_output not a dict for req=%s", rid)
         return None
 
-    mel_codes = _get_payload_value(pooling_output, "codes.mel", "codes", "mel")
-    if not isinstance(mel_codes, torch.Tensor) or mel_codes.numel() == 0:
-        logger.warning("talker2s2mel_full_payload: missing codes.mel for req=%s", rid)
-        return None
-
-    latent = _get_payload_value(pooling_output, "hidden_states.latent", "hidden_states", "latent")
-
-    mel_seq = _normalize_mel_sequence(mel_codes)
     use_gpt_latent_value = _get_payload_value(
         pooling_output,
         "meta.use_gpt_latent",
@@ -228,6 +220,39 @@ def talker2s2mel_full_payload(
     )
     # Missing policy metadata identifies the legacy IndexTTS 2 producer.
     use_gpt_latent = True if use_gpt_latent_value is None else bool(use_gpt_latent_value)
+    payload_mel_codes = _get_payload_value(
+        pooling_output,
+        "codes.mel",
+        "codes",
+        "mel",
+    )
+    if use_gpt_latent:
+        mel_codes = payload_mel_codes
+        latent = _get_payload_value(
+            pooling_output,
+            "hidden_states.latent",
+            "hidden_states",
+            "latent",
+        )
+    else:
+        output_token_ids = list(getattr(request, "output_token_ids", None) or [])
+        if output_token_ids:
+            mel_codes = torch.tensor(output_token_ids, dtype=torch.long)
+        else:
+            # Compatibility with an older no-latent producer that still ships
+            # accumulated codes.mel in the full payload.
+            mel_codes = payload_mel_codes
+        latent = None
+
+    if not isinstance(mel_codes, torch.Tensor) or mel_codes.numel() == 0:
+        logger.warning(
+            "talker2s2mel_full_payload: missing mel codes for req=%s (use_gpt_latent=%s)",
+            rid,
+            use_gpt_latent,
+        )
+        return None
+
+    mel_seq = _normalize_mel_sequence(mel_codes)
     if mel_seq.numel() == 0:
         logger.warning("talker2s2mel_full_payload: empty normalized mel for req=%s", rid)
         return None
