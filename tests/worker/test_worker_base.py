@@ -52,6 +52,32 @@ def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int = 0, model
 
 
 # --------------------------------------------------------------------------- #
+# profiler delegation                                                         #
+# --------------------------------------------------------------------------- #
+def test_cuda_profile_delegates_to_vllm_lazy_profiler(monkeypatch):
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.profiler = None
+    worker.vllm_config = SimpleNamespace(
+        profiler_config=SimpleNamespace(profiler="cuda"),
+        model_config=SimpleNamespace(stage_id=0),
+    )
+    calls = []
+
+    def fake_vllm_profile(self, is_start=True, profile_prefix=None):
+        calls.append((self, is_start, profile_prefix))
+
+    monkeypatch.setattr(base.GPUWorker, "profile", fake_vllm_profile)
+
+    OmniGPUWorkerBase.profile(
+        worker,
+        is_start=True,
+        profile_prefix="request_end_d2h",
+    )
+
+    assert calls == [(worker, True, "request_end_d2h")]
+
+
+# --------------------------------------------------------------------------- #
 # determine_available_memory                                                  #
 # --------------------------------------------------------------------------- #
 def test_determine_available_memory_nvml_arm(monkeypatch):

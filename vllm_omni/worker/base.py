@@ -72,9 +72,12 @@ class OmniGPUWorkerBase(GPUWorker):
         trace filename here before delegating to the profiler.
         """
         if self.profiler is None:
-            raise RuntimeError(
-                "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "
-                "For omni models, add profiler_config to your stage config file."
+            # vLLM constructs its CUDA profiler lazily on the first start.
+            # Preserve that path while keeping the Omni-specific wrapper and
+            # trace naming below for torch profiling.
+            return super().profile(
+                is_start=is_start,
+                profile_prefix=profile_prefix,
             )
         if is_start:
             from vllm_omni.profiler import OmniTorchProfilerWrapper
