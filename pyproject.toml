@@ -316,3 +316,7 @@ byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.
 seeked = "seeked"
+# IndexTTS 2.5 language codes and speech-emotion-recognition event token.
+fo = "fo"
+ba = "ba"
+SER = "SER"
