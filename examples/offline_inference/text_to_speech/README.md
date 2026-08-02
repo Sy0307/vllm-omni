@@ -440,7 +440,7 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 
 ## IndexTTS-2 and IndexTTS-2.5
 
-Both versions use a 2-stage TTS pipeline and produce 22.05 kHz mono audio. Stage 0 is a GPT AR talker. IndexTTS-2 Stage 1 uses RepCodec semantic embeddings, GPT latent, S2Mel CFM/DiT, and BigVGAN. IndexTTS-2.5 replaces RepCodec with EnhancedCodec and defaults to the official code-only path (`use_gpt_latent=false`); its GPT-latent route is retained as an explicit experimental compatibility mode. Every request requires reference audio for zero-shot voice cloning.
+Both versions use a 2-stage TTS pipeline and produce 22.05 kHz mono audio. Stage 0 is a GPT AR talker. IndexTTS-2 Stage 1 uses RepCodec semantic embeddings, GPT latent, S2Mel CFM/DiT, and BigVGAN. IndexTTS-2.5 replaces RepCodec with EnhancedCodec and defaults to the official code-only path (`use_gpt_latent=false`); its GPT-latent route is an experimental vLLM-Omni-specific latent variant. Every request requires reference audio for zero-shot voice cloning.
 
 ### Quick start
 
@@ -453,6 +453,12 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --ref-audio /path/to/reference.wav
 ```
 
+IndexTTS-2 uses its existing frontend and does not require the IndexTTS-2.5 text dependencies. Before running IndexTTS-2.5, install its optional frontend dependencies:
+
+```bash
+pip install 'vllm-omni[indextts2]'
+```
+
 IndexTTS-2.5 with a native repository/lab bundle whose model root contains `checkpoints/`:
 
 ```bash
@@ -463,13 +469,13 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --text "こんにちは、音声合成のテストです。" \
     --ref-audio /path/to/reference.wav
 
-# Explicit experimental GPT-latent compatibility mode:
+# Experimental vLLM-Omni-specific GPT-latent variant:
 python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --model /path/to/indextts-2.5 \
     --model-version 2.5 \
     --use-gpt-latent \
     --lang en \
-    --text "This is the latent compatibility path." \
+    --text "This is the experimental latent variant." \
     --ref-audio /path/to/reference.wav
 ```
 
@@ -499,10 +505,11 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
 
 ### Notes
 - `--ref-audio` is **required** — neither version provides text-only synthesis.
-- Stage 0 (AR Talker): GPT-2 generates mel codes from text + reference audio.
-- IndexTTS-2.5 accepts explicit language codes such as `zh`, `en`, `ja`, and `yue`; use `--no-text-normalization` only when the input is already normalized.
+- IndexTTS-2.5 Stage 0 (AR Talker) generates mel codes from text + reference audio using plain vLLM sampling. It does not reproduce the official default `num_beams=3` beam search. For parity comparisons, run upstream with `num_beams=1`; output quality can differ from the official beam-search result.
+- IndexTTS-2.5 accepts language codes such as `zh`, `en`, `zhen` (mixed Chinese/English), `ja`, and `yue`. `Mandarin` is a vLLM-Omni convenience alias for `zh`. Japanese (`ja`) uses `fugashi` tokenization and produces audio, but it does not automatically expand numbers, dates, or percentages; write those inputs as readable Japanese text before calling the model. Use `--no-text-normalization` only when the input is already normalized.
+- A seed controls Stage 0 AR sampling and per-request CFM noise. Different concurrent batch compositions do not guarantee a bit-identical waveform.
 - Stage 1 (semantic codec + S2Mel + BigVGAN): CFM/DiT converts the complete semantic-code sequence to waveform.
-- Deploy configs: `vllm_omni/deploy/indextts2.yaml`, `indextts2_5.yaml`, and the explicit `indextts2_5_latent.yaml` compatibility config.
+- Deploy configs: `vllm_omni/deploy/indextts2.yaml`, `indextts2_5.yaml`, and `indextts2_5_latent.yaml` for the experimental vLLM-Omni-specific latent variant. The variant uses nearest-neighbor interpolation to align the projected latent with EnhancedCodec output; no official runnable reference output exists for this combination, so official output cannot be used for parity regression.
 - `async_chunk=false` is intentional for IndexTTS-2.5 correctness: S2Mel consumes the completed semantic sequence.
 
 ---

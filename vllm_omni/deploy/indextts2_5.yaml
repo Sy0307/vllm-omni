@@ -12,6 +12,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 4
+    attention_backend: FLASHINFER
     gpu_memory_utilization: 0.4
     enable_prefix_caching: false
     skip_tokenizer_init: true
@@ -23,6 +24,8 @@ stages:
       to_stage_1: connector_of_shared_memory
     hf_overrides:
       use_gpt_latent: false
+    # Stage 0 uses plain vLLM sampling, not the upstream default
+    # num_beams=3 beam search. Use upstream num_beams=1 for parity comparisons.
     default_sampling_params:
       temperature: 0.8
       top_p: 0.8
@@ -46,9 +49,13 @@ stages:
     hf_overrides:
       use_gpt_latent: false
       diffusion_steps: 25
+      s2mel_dit_bf16: true
+      s2mel_cfm_batch_size: 4
       inference_cfg_rate: 0.7
-      s2mel_dit_cuda_graph: true
-      s2mel_dit_cuda_graph_max_graphs: 4
+      s2mel_dit_cuda_graph: false
+      s2mel_dit_torch_compile: true
+      s2mel_dit_torch_compile_mode: default
+      s2mel_vocoder_torch_compile: false
     default_sampling_params:
       temperature: 0.0
       max_tokens: 32767

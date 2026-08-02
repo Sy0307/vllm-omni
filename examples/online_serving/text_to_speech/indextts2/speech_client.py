@@ -63,7 +63,10 @@ def main() -> None:
     parser.add_argument(
         "--lang",
         default="zh",
-        help="IndexTTS 2.5 language code, for example zh/en/ja/yue",
+        help=(
+            "IndexTTS 2.5 language code, for example zh/en/zhen/ja/yue; "
+            "zhen is mixed Chinese/English and Mandarin is a vLLM-Omni alias for zh"
+        ),
     )
     parser.add_argument(
         "--no-text-normalization",

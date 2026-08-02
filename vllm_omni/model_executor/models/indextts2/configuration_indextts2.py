@@ -165,8 +165,9 @@ class IndexTTS25Config(IndexTTS2Config):
 
     IndexTTS 2.5 keeps the GPT/S2Mel backbone shapes used by IndexTTS 2,
     but switches text tokenization and speaker conditioning, and decodes
-    semantic codes with EnhancedCodec. GPT latent conditioning remains an
-    explicit compatibility option and is disabled by default upstream.
+    semantic codes with EnhancedCodec. GPT latent conditioning is disabled by
+    default upstream; the opt-in path is an experimental vLLM-Omni-specific
+    latent variant with no official runnable reference output.
     """
 
     model_type = "indextts2_5"

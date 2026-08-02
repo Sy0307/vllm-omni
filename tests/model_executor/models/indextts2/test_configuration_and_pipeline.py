@@ -61,6 +61,14 @@ def test_indextts25_pipeline_is_registered_with_two_distinct_stages():
     assert all("tokenizer" not in stage.extras for stage in INDEXTTS25_PIPELINE.stages)
 
 
+def test_indextts25_default_deploy_selects_validated_flashinfer_backend():
+    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "indextts2_5.yaml"
+    config = yaml.safe_load(deploy_path.read_text(encoding="utf-8"))
+    stage0 = next(stage for stage in config["stages"] if stage["stage_id"] == 0)
+
+    assert stage0["attention_backend"] == "FLASHINFER"
+
+
 def test_indextts25_deploy_configs_keep_latent_policy_in_sync():
     deploy_dir = Path(__file__).parents[4] / "vllm_omni" / "deploy"
     expected = {

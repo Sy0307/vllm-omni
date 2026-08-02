@@ -18,7 +18,10 @@ USE_GPT_LATENT="${USE_GPT_LATENT:-0}"
 PORT="${PORT:-8092}"
 
 if [[ "$MODEL_VERSION" == "2.5" ]]; then
-    MODEL="${MODEL:-/home/admin/workspace/aop_lab/app_data/.cache/models--test-shimei--test-tts/snapshots/20260728043522}"
+    if [[ -z "${MODEL:-}" ]]; then
+        echo "Usage: MODEL_VERSION=2.5 MODEL=/path/to/native/bundle [USE_GPT_LATENT=0|1] bash $0" >&2
+        exit 2
+    fi
     if [[ "$USE_GPT_LATENT" == "1" ]]; then
         DEFAULT_DEPLOY_CONFIG="$ROOT_DIR/vllm_omni/deploy/indextts2_5_latent.yaml"
     else
