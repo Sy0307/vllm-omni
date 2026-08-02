@@ -79,11 +79,14 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
+    #   "mask_has_padding": bool — static padding hint for compiled backends;
+    #     absent means the backend retains its existing runtime mask check.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
     query_ranges: tuple[QueryRange, ...] | None = None
+    unpad_data: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)

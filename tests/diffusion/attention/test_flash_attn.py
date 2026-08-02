@@ -327,6 +327,95 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     assert calls[0]["softmax_scale"] == 0.5
 
 
+@pytest.mark.parametrize("method_name", ["forward_cuda", "forward_xpu"])
+def test_padding_hint_skips_dynamic_mask_check_and_uses_varlen(monkeypatch, method_name):
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(
+        torch,
+        "any",
+        lambda *_args, **_kwargs: pytest.fail("static padding hint must bypass torch.any"),
+    )
+
+    impl = FlashAttentionImpl(num_heads=1, head_size=4, softmax_scale=0.5, causal=False)
+    expected = torch.full((2, 3, 1, 4), 7.0)
+    calls = []
+
+    def fake_varlen_masked(query, key, value, attention_mask, unpad_data=None):
+        calls.append((query, key, value, attention_mask, unpad_data))
+        return expected
+
+    monkeypatch.setattr(impl, "_forward_varlen_masked", fake_varlen_masked)
+    query = torch.randn(2, 3, 1, 4)
+    key = query.clone()
+    value = query.clone()
+    attention_mask = torch.tensor(
+        [
+            [True, True, True],
+            [True, True, False],
+        ]
+    )
+    metadata = AttentionMetadata(
+        attn_mask=attention_mask,
+        extra={"mask_has_padding": True},
+    )
+
+    output = getattr(impl, method_name)(query, key, value, metadata)
+
+    assert output is expected
+    assert len(calls) == 1
+    assert calls[0][3] is attention_mask
+    assert calls[0][4] is None
+
+
+@pytest.mark.parametrize("method_name", ["forward_cuda", "forward_xpu"])
+def test_supplied_unpad_data_skips_mask_scan_and_matches_fallback(monkeypatch, method_name):
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((q.clone(), k.clone(), v.clone(), kwargs))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    impl = FlashAttentionImpl(num_heads=1, head_size=2, softmax_scale=0.5, causal=False)
+    query = torch.arange(16, dtype=torch.float32).reshape(2, 4, 1, 2)
+    key = query.clone()
+    value = query.clone()
+    attention_mask = torch.tensor(
+        [
+            [True, True, True, True],
+            [True, True, False, False],
+        ]
+    )
+    fallback_metadata = AttentionMetadata(
+        attn_mask=attention_mask,
+        extra={"mask_has_padding": True},
+    )
+    fallback = getattr(impl, method_name)(query, key, value, fallback_metadata)
+
+    def fail_get_unpad_data(_attention_mask):
+        pytest.fail("supplied unpad data must bypass _get_unpad_data")
+
+    monkeypatch.setattr(fa, "_get_unpad_data", fail_get_unpad_data)
+    supplied_metadata = AttentionMetadata(
+        attn_mask=attention_mask,
+        unpad_data=(
+            torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64),
+            torch.tensor([0, 4, 6], dtype=torch.int32),
+        ),
+        extra={"mask_has_padding": True},
+    )
+
+    supplied = getattr(impl, method_name)(query, key, value, supplied_metadata)
+
+    assert torch.equal(supplied, fallback)
+    assert len(calls) == 2
+    assert torch.equal(calls[1][0], query.reshape(-1, 1, 2)[supplied_metadata.unpad_data[0]])
+    assert calls[1][3]["max_seqlen_q"] == query.size(1)
+    assert calls[1][3]["max_seqlen_k"] == query.size(1)
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)

@@ -110,7 +110,8 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        unpad_data: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _pad_input,
@@ -119,11 +120,28 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        if unpad_data is None:
+            assert attention_mask is not None and attention_mask.ndim == 2, (
+                "attention_mask must be 2D, (batch_size, seq_len)"
+            )
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
+        else:
+            indices_q, cu_seq_lens_q = unpad_data
+            if indices_q.dtype != torch.int64:
+                raise TypeError(f"FlashAttention unpad indices must be int64, got {indices_q.dtype}")
+            if cu_seq_lens_q.dtype != torch.int32:
+                raise TypeError(f"FlashAttention cu_seqlens must be int32, got {cu_seq_lens_q.dtype}")
+            if key.size(1) != query_length or value.size(1) != query_length:
+                raise ValueError("Supplied FlashAttention unpad data requires equal padded Q/K/V sequence lengths")
+            q = query.flatten(0, 1).index_select(0, indices_q)
+            k = key.flatten(0, 1).index_select(0, indices_q)
+            v = value.flatten(0, 1).index_select(0, indices_q)
+            cu_seq_lens_k = cu_seq_lens_q
+            max_length_q = query_length
+            max_length_k = query_length
 
         out_unpad = flash_attn_varlen_func(
             q,
@@ -206,6 +224,8 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        unpad_data = attn_metadata.unpad_data if attn_metadata is not None else None
+        mask_has_padding = attn_metadata.extra.get("mask_has_padding") if attn_metadata is not None else None
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -233,12 +253,16 @@ class FlashAttentionImpl(AttentionImpl):
                 query_ranges=attn_metadata.query_ranges,
             )
 
-        if attention_mask is not None and torch.any(~attention_mask):
+        if unpad_data is not None or (
+            attention_mask is not None
+            and (mask_has_padding is True or (mask_has_padding is None and torch.any(~attention_mask)))
+        ):
             return self._forward_varlen_masked(
                 query,
                 key,
                 value,
                 attention_mask,
+                unpad_data,
             )
 
         if flash_attn_func is not None:
@@ -277,13 +301,19 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        unpad_data = attn_metadata.unpad_data if attn_metadata is not None else None
+        mask_has_padding = attn_metadata.extra.get("mask_has_padding") if attn_metadata is not None else None
 
-        if attention_mask is not None and torch.any(~attention_mask):
+        if unpad_data is not None or (
+            attention_mask is not None
+            and (mask_has_padding is True or (mask_has_padding is None and torch.any(~attention_mask)))
+        ):
             return self._forward_varlen_masked(
                 query,
                 key,
                 value,
                 attention_mask,
+                unpad_data,
             )
 
         return self._forward_varlen_dense(
