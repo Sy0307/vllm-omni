@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
 
 import numpy as np
 from vllm.logger import init_logger
@@ -40,28 +39,16 @@ class MiniCPMO45DataPlaneContext:
 
 
 @dataclass(frozen=True, slots=True)
-class _MiniCPMO45TtsSegmentControl:
+class MiniCPMO45TtsSegmentControl:
     output_context: DuplexOutputContext
     request_id: str | None
     output_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class _MiniCPMO45ProjectionBatch:
+class MiniCPMO45ProjectionBatch:
     events: tuple[DuplexModelEvent, ...]
-    tts_segment_controls: tuple[_MiniCPMO45TtsSegmentControl, ...]
-
-
-@runtime_checkable
-class MiniCPMO45SideControlProjection(Protocol):
-    """Optional MiniCPM-only projection extension for runtime side controls."""
-
-    def project_runtime_batches(
-        self,
-        result: object,
-        *,
-        context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[_MiniCPMO45ProjectionBatch]: ...
+    tts_segment_controls: tuple[MiniCPMO45TtsSegmentControl, ...]
 
 
 @dataclass(slots=True)
@@ -115,9 +102,6 @@ class MiniCPMO45DataPlaneSession:
     def begin_request(self, request_id: str) -> None:
         state = self._requests.setdefault(request_id, _RequestState())
         state.terminal = False
-        # A resumable append starts a new Talker segment, even when it
-        # continues the same model turn.
-        state.completed_tts_segments.clear()
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:
@@ -189,7 +173,7 @@ class MiniCPMO45DataPlaneSession:
         result: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[_MiniCPMO45ProjectionBatch]:
+    ) -> Iterator[MiniCPMO45ProjectionBatch]:
         """Project one runtime result with MiniCPM-local control side records."""
         if not isinstance(result, dict):
             return
@@ -197,16 +181,16 @@ class MiniCPMO45DataPlaneSession:
         if not isinstance(outputs, list):
             return
         for output in outputs:
-            controls: list[_MiniCPMO45TtsSegmentControl] = []
+            controls: list[MiniCPMO45TtsSegmentControl] = []
             events = tuple(self._project_output(output, context=context, tts_segment_controls=controls))
-            yield _MiniCPMO45ProjectionBatch(events=events, tts_segment_controls=tuple(controls))
+            yield MiniCPMO45ProjectionBatch(events=events, tts_segment_controls=tuple(controls))
 
     def _project_output(
         self,
         output: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-        tts_segment_controls: list[_MiniCPMO45TtsSegmentControl] | None,
+        tts_segment_controls: list[MiniCPMO45TtsSegmentControl] | None,
     ) -> Iterator[DuplexModelEvent]:
         context = context or MiniCPMO45DataPlaneContext()
         output_context = get_duplex_output_context(output)
@@ -337,7 +321,7 @@ class MiniCPMO45DataPlaneSession:
             )
         ):
             tts_segment_controls.append(
-                _MiniCPMO45TtsSegmentControl(
+                MiniCPMO45TtsSegmentControl(
                     output_context=output_context,
                     request_id=request_id,
                     output_id=ledger.active_output_id,

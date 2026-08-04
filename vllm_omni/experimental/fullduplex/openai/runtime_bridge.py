@@ -22,8 +22,10 @@ from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexSpeakStart,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
-    MiniCPMO45SideControlProjection,
-    _MiniCPMO45TtsSegmentControl,
+    MiniCPMO45TtsSegmentControl,
+)
+from vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter import (
+    MiniCPMO45SideControlServingAdapter,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     ActiveOutputContinuation,
@@ -659,9 +661,10 @@ class NativeRuntimeBridgeMixin:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
+        serving_adapter = self._serving_runtime_adapter
         data_plane = self._serving_runtime_adapter.data_plane
-        if isinstance(data_plane, MiniCPMO45SideControlProjection):
-            for batch in data_plane.project_runtime_batches(result, context=context):
+        if isinstance(serving_adapter, MiniCPMO45SideControlServingAdapter):
+            for batch in serving_adapter.project_runtime_batches(result, context=context):
                 for native_result in batch.events:
                     close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                         send_json,
@@ -699,7 +702,7 @@ class NativeRuntimeBridgeMixin:
     async def _consume_minicpmo_tts_segment_control(
         self,
         send_json,
-        control: _MiniCPMO45TtsSegmentControl,
+        control: MiniCPMO45TtsSegmentControl,
         *,
         session: DuplexSession,
         expected_epoch: int | None,
