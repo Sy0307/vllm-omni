@@ -29,7 +29,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
     get_stage_connector_role,
 )
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, StageTransferFailure
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
     merge_tensor_spans,
@@ -189,6 +189,8 @@ class OmniConnectorModelRunnerMixin:
         self._stage_recv_req_ids: set[str] = set()
         self._full_payload_pending_broadcast_req_ids: set[str] = set()
         self._async_chunk_updated_req_ids: set[str] = set()
+        self._transfer_failures: dict[str, StageTransferFailure] = {}
+        self._transfer_failure_lock = threading.Lock()
 
         # -- Model Runner local payload cache (RFC §2.4) --
         # Full stage payloads land here first on the recv side. We
@@ -675,8 +677,13 @@ class OmniConnectorModelRunnerMixin:
         payload_req_ids.update(self._finished_load_reqs)
         payload_req_ids.update(self._chunk_finished_req_ids)
         payload_req_ids.update(self._local_request_metadata)
+        transfer_failures = self._drain_transfer_failures()
         if not (
-            payload_req_ids or self._finished_load_reqs or self._chunk_finished_req_ids or self._local_request_metadata
+            payload_req_ids
+            or self._finished_load_reqs
+            or self._chunk_finished_req_ids
+            or self._local_request_metadata
+            or transfer_failures
         ):
             return None
 
@@ -690,6 +697,7 @@ class OmniConnectorModelRunnerMixin:
             "request_metadata": dict(self._local_request_metadata),
             "newly_finished": set(self._finished_load_reqs),
             "chunk_finished": set(self._chunk_finished_req_ids),
+            "transfer_failures": transfer_failures,
         }
 
         self._async_chunk_updated_req_ids.clear()
@@ -1004,11 +1012,23 @@ class OmniConnectorModelRunnerMixin:
 
             payload = raw_output
             if self._custom_process_func is not None:
-                payload = self._build_custom_process_payload(
-                    request_id=req_id,
-                    request=request,
-                    pooling_output=raw_output,
-                )
+                external_req_id = self._resolve_external_req_id(request, req_id)
+                try:
+                    payload = self._build_custom_process_payload(
+                        request_id=req_id,
+                        request=request,
+                        pooling_output=raw_output,
+                    )
+                except Exception as exc:
+                    self._record_transfer_failure(
+                        internal_request_id=str(req_id),
+                        external_request_id=str(external_req_id),
+                        source_stage=self._stage_id,
+                        destination_stage=next_stage_id,
+                        code="stage_payload_processor_failed",
+                        message=(f"custom stage payload processor raised {type(exc).__name__}"),
+                    )
+                    continue
                 if payload is None:
                     continue
             if payload is None:
@@ -1137,18 +1157,32 @@ class OmniConnectorModelRunnerMixin:
         if not self.is_data_transfer_rank():
             return True
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
-        request_id = self._resolve_external_req_id(request, raw_req_id)
+        if not raw_req_id:
+            return False
+        internal_request_id = str(raw_req_id)
+        request_id = str(self._resolve_external_req_id(request, internal_request_id))
         # Cache the internal→external mapping so that finish sentinels can
         # resolve the external ID even after the request is freed.
         if raw_req_id and raw_req_id != request_id:
             self._request_ids_mapping.setdefault(raw_req_id, request_id)
         chunk_id = self._put_req_chunk[request_id]
 
-        payload_data = self._build_custom_process_payload(
-            request_id=request_id,
-            request=request,
-            pooling_output=pooling_output,
-        )
+        try:
+            payload_data = self._build_custom_process_payload(
+                request_id=request_id,
+                request=request,
+                pooling_output=pooling_output,
+            )
+        except Exception as exc:
+            self._record_transfer_failure(
+                internal_request_id=internal_request_id,
+                external_request_id=request_id,
+                source_stage=self._stage_id,
+                destination_stage=self._next_stage_id,
+                code="stage_payload_processor_failed",
+                message=(f"custom stage payload processor raised {type(exc).__name__}"),
+            )
+            return False
         if payload_data is None:
             if chunk_id == 0:
                 logger.warning(
@@ -1547,12 +1581,14 @@ class OmniConnectorModelRunnerMixin:
                 newly_finished = set()
                 chunk_finished = set()
                 request_metadata = {}
+                transfer_failures = {}
             else:
                 if not self.is_data_transfer_rank():
                     self._apply_async_chunk_fanout_packet(fanout_packet)
                 newly_finished = set(fanout_packet["newly_finished"])
                 chunk_finished = set(fanout_packet["chunk_finished"])
                 request_metadata = dict(fanout_packet["request_metadata"])
+                transfer_failures = dict(fanout_packet.get("transfer_failures", {}))
         else:
             with self._lock:
                 newly_finished = set(self._finished_load_reqs)
@@ -1573,6 +1609,7 @@ class OmniConnectorModelRunnerMixin:
                     self._send_side_request_payload.pop(ext_req_id, None)
                     if ext_req_id != req_id:
                         self._send_side_request_payload.pop(req_id, None)
+            transfer_failures = self._drain_transfer_failures()
         self._chunk_ready_req_ids.update(newly_finished)
 
         output = OmniConnectorOutput(
@@ -1582,6 +1619,7 @@ class OmniConnectorModelRunnerMixin:
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
+            transfer_failures=transfer_failures,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1605,6 +1643,7 @@ class OmniConnectorModelRunnerMixin:
             or output.kv_sent_req_ids
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
+            or output.transfer_failures
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -1745,6 +1784,33 @@ class OmniConnectorModelRunnerMixin:
                 self._MAX_SEND_RETRIES,
             )
             self._decrement_pending_save_count(req_id)
+
+    def _record_transfer_failure(
+        self,
+        *,
+        internal_request_id: str,
+        external_request_id: str | None,
+        source_stage: int,
+        destination_stage: int,
+        code: str,
+        message: str,
+    ) -> None:
+        failure = StageTransferFailure(
+            internal_request_id=internal_request_id,
+            external_request_id=external_request_id,
+            source_stage=source_stage,
+            destination_stage=destination_stage,
+            code=code,
+            message=message,
+        )
+        with self._transfer_failure_lock:
+            self._transfer_failures.setdefault(internal_request_id, failure)
+
+    def _drain_transfer_failures(self) -> dict[str, StageTransferFailure]:
+        with self._transfer_failure_lock:
+            failures = self._transfer_failures
+            self._transfer_failures = {}
+        return failures
 
     # ------------------------------------------------------------------ #
     #  Chunk-level poll / send  (ported from OmniChunkTransferAdapter)
@@ -1916,16 +1982,16 @@ class OmniConnectorModelRunnerMixin:
         except TypeError as exc:
             if "is_finished" not in kwargs or not self._is_unexpected_is_finished_kwarg_error(exc):
                 logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-                return None
+                raise
             kwargs.pop("is_finished", None)
             try:
                 return self._custom_process_func(**kwargs)
             except Exception:
                 logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-                return None
+                raise
         except Exception:
             logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
-            return None
+            raise
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""
