@@ -78,6 +78,16 @@ def test_new_processor_receives_exactly_one_context():
     assert processor.contexts == [context]
 
 
+def test_loader_instantiates_processor_classes():
+    processor = load_stage_payload_processor("tests.distributed.omni_connectors.fixtures.RecordingProcessor")
+    context = _context()
+
+    result = processor.process(context)
+
+    assert isinstance(result, NoPayloadYet)
+    assert processor.contexts == [context]
+
+
 def test_failure_injection_processor_exception_escapes():
     processor = load_stage_payload_processor("tests.distributed.omni_connectors.fixtures.build_failing_processor")
 

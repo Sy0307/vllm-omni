@@ -149,10 +149,12 @@ def reconcile_envelope_legacy_boundary(
 
 
 def load_stage_payload_processor(path: str) -> StagePayloadProcessor:
-    """Resolve one zero-argument processor factory or processor object."""
+    """Resolve one processor class, zero-argument factory, or processor object."""
     resolved = _load_dotted_object(path)
     candidate = resolved
-    if not callable(getattr(candidate, "process", None)):
+    if isinstance(resolved, type):
+        candidate = resolved()
+    elif not callable(getattr(candidate, "process", None)):
         if not callable(resolved):
             raise TypeError(f"stage payload processor {path!r} is neither a processor nor a factory")
         candidate = resolved()
