@@ -3349,31 +3349,20 @@ async def test_typed_tts_last_chunk_schedules_output_owned_silence_without_endin
             identity=DuplexRequestIdentity(session.session_id, fence),
             final_stage_id=1,
             segment_finished=True,
-            source_input_seq=7,
+            source_input_seq=1,
         ),
     )
 
-    projected = _project_data_plane(
-        handler._minicpmo_data_plane,
-        {"data_plane_outputs": [raw_output]},
-        session=session,
-    )
-    assert projected == [
-        DuplexListen(
-            fence=DuplexFence(session.session_id),
-            source_input_seq=1,
-            reason="model_unit_completed_without_output",
-        )
-    ]
-    close_reason, emitted = await handler._send_one_native_duplex_event(
+    close_reason, emitted = await handler._send_native_duplex_events(
         ws.send_json,
-        projected[0],
+        {"data_plane_outputs": [raw_output]},
         session=session,
         expected_epoch=session.epoch,
     )
 
     assert close_reason is None
     assert emitted is True
+    assert [type(event) for event in typed_events] == [DuplexSpeakStart, DuplexSpeakChunk]
     assert all(
         isinstance(event, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)) for event in typed_events
     )
@@ -6766,15 +6755,16 @@ async def test_minicpmo_native_duplex_accepts_next_append_after_response_done():
     session_id = "sid-native-next-turn"
     request_id = "duplex-sid-native-next-turn-e0-stage0-s1"
 
-    def _stage_output(*, source_input_seq: int):
+    def _stage_output(*, source_input_seq: int, text: str):
         return attach_duplex_output_context(
             SimpleNamespace(
                 request_id=request_id,
                 finished=True,
-                outputs=[SimpleNamespace(text="", multimodal_output={})],
+                outputs=[SimpleNamespace(text=text, multimodal_output={})],
                 multimodal_output={
                     "audio": np.zeros(10, dtype=np.float32),
                     "sr": 24000,
+                    "meta.llm_output_text_utf8": np.frombuffer(text.encode("utf-8"), dtype=np.uint8),
                     "meta.duplex_speech_end": np.array([1], dtype=np.int32),
                 },
             ),
@@ -6786,7 +6776,7 @@ async def test_minicpmo_native_duplex_accepts_next_append_after_response_done():
             ),
         )
 
-    def control_result(source_input_seq: int):
+    def control_result(source_input_seq: int, text: str):
         return {
             "operation": "append",
             "session_id": session_id,
@@ -6806,10 +6796,15 @@ async def test_minicpmo_native_duplex_accepts_next_append_after_response_done():
                     },
                 },
             ],
-            "data_plane_outputs": [_stage_output(source_input_seq=source_input_seq)],
+            "data_plane_outputs": [_stage_output(source_input_seq=source_input_seq, text=text)],
         }
 
-    engine = FakeEngineClient(append_results=[control_result(0), control_result(1)])
+    engine = FakeEngineClient(
+        append_results=[
+            control_result(0, "first response"),
+            control_result(1, "second response"),
+        ]
+    )
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
     done_count = 0
