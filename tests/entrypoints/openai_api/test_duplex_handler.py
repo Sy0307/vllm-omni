@@ -3148,7 +3148,9 @@ async def test_typed_tts_segment_control_requires_context_and_preserves_pending_
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
-    session.input_commit_seq = 7
+    for _ in range(7):
+        session.commit_native_audio_input()
+    assert session.input_commit_seq == 7
     session.bind_request(request_id)
     _install_direct_silence_scheduler(handler, session)
     fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
