@@ -47,11 +47,7 @@ class ActiveOutputContinuation:
             raise ValueError("output_id must be a non-empty string")
 
     def is_stale(self, *, fence: DuplexFence, output_id: str) -> bool:
-        return (
-            fence.incarnation != self.incarnation
-            or fence.epoch != self.epoch
-            or output_id != self.output_id
-        )
+        return fence.incarnation != self.incarnation or fence.epoch != self.epoch or output_id != self.output_id
 
 
 @dataclass(slots=True)

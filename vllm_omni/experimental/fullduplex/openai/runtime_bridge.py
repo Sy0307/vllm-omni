@@ -994,11 +994,7 @@ class NativeRuntimeBridgeMixin:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
             )
-            if (
-                tts_segment_ended
-                and self._session_auto_responds(session)
-                and session.active_response_id is not None
-            ):
+            if tts_segment_ended and self._session_auto_responds(session) and session.active_response_id is not None:
                 await self._maybe_continue_native_response(
                     send_json,
                     session=session,
