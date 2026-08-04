@@ -62,7 +62,7 @@ class _TurnState:
 class _RequestState:
     audio_offset: int = 0
     uses_segment_text_metadata: bool = False
-    pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
+    pending_audio_without_text: list[_PendingAudioChunk] = field(default_factory=list)
     terminal: bool = False
     turns: dict[object, _TurnState] = field(default_factory=dict)
     completed_tts_segments: OrderedDict[tuple[int, int, int, str | None], None] = field(default_factory=OrderedDict)
@@ -84,6 +84,17 @@ class _RequestState:
         while len(self.completed_tts_segments) > 256:
             self.completed_tts_segments.popitem(last=False)
         return True
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingAudioChunk:
+    fence: DuplexFence
+    source_input_seq: int
+    text_delta: str
+    audio_data: str
+    audio_format: str
+    audio_duration_ms: int | None
+    audio_text_marks: tuple[tuple[int, int], ...]
 
 
 class MiniCPMO45DataPlaneSession:
@@ -279,25 +290,78 @@ class MiniCPMO45DataPlaneSession:
         audio_text_marks = _audio_text_marks(mm_output)
         fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
 
+        projected_chunks: list[_PendingAudioChunk] = []
         if audio_chunks:
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
                 raw_marks = audio_text_marks if idx == len(audio_chunks) - 1 else None
                 if raw_marks is None and idx < len(fallback_marks):
                     raw_marks = fallback_marks[idx]
                 marks = tuple((int(mark["text_chars"]), int(mark["audio_end_ms"])) for mark in (raw_marks or ()))
-                yield from ledger.emit_chunk(
-                    source_input_seq=source_input_seq,
-                    text_delta=delta_text if idx == 0 else "",
-                    audio_data=audio,
-                    audio_format=context.response_format,
-                    audio_duration_ms=duration_ms,
-                    audio_text_marks=marks,
+                projected_chunks.append(
+                    _PendingAudioChunk(
+                        fence=output_fence,
+                        source_input_seq=source_input_seq,
+                        text_delta=delta_text if idx == 0 else "",
+                        audio_data=audio,
+                        audio_format=context.response_format,
+                        audio_duration_ms=duration_ms,
+                        audio_text_marks=marks,
+                    )
                 )
         elif delta_text:
+            projected_chunks.append(
+                _PendingAudioChunk(
+                    fence=output_fence,
+                    source_input_seq=source_input_seq,
+                    text_delta=delta_text,
+                    audio_data="",
+                    audio_format=context.response_format,
+                    audio_duration_ms=None,
+                    audio_text_marks=(),
+                )
+            )
+
+        if request_state is not None:
+            request_state.pending_audio_without_text = [
+                chunk for chunk in request_state.pending_audio_without_text if chunk.fence == output_fence
+            ]
+        if (
+            context.auto_responds
+            and request_state is not None
+            and ledger.active_output_id is None
+            and audio_chunks
+            and not delta_text
+        ):
+            if speech_end:
+                request_state.pending_audio_without_text.clear()
+            else:
+                request_state.pending_audio_without_text.extend(projected_chunks)
+            projected_chunks = []
+        elif request_state is not None and delta_text and request_state.pending_audio_without_text:
+            pending_chunks = request_state.pending_audio_without_text
+            request_state.pending_audio_without_text = []
+            if projected_chunks and not projected_chunks[0].audio_data:
+                first = pending_chunks[0]
+                pending_chunks[0] = _PendingAudioChunk(
+                    fence=first.fence,
+                    source_input_seq=first.source_input_seq,
+                    text_delta=projected_chunks[0].text_delta,
+                    audio_data=first.audio_data,
+                    audio_format=first.audio_format,
+                    audio_duration_ms=first.audio_duration_ms,
+                    audio_text_marks=first.audio_text_marks,
+                )
+                projected_chunks = []
+            projected_chunks = pending_chunks + projected_chunks
+
+        for chunk in projected_chunks:
             yield from ledger.emit_chunk(
-                source_input_seq=source_input_seq,
-                text_delta=delta_text,
-                audio_format=context.response_format,
+                source_input_seq=chunk.source_input_seq,
+                text_delta=chunk.text_delta,
+                audio_data=chunk.audio_data,
+                audio_format=chunk.audio_format,
+                audio_duration_ms=chunk.audio_duration_ms,
+                audio_text_marks=chunk.audio_text_marks,
             )
 
         if speech_end:
