@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import struct
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +17,7 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_client import Duple
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
+from vllm_omni.experimental.fullduplex.engine.model_events import DuplexEventProtocolError
 from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexListen,
     DuplexSpeakChunk,
@@ -475,6 +477,126 @@ async def test_typed_old_epoch_event_cannot_mutate_current_response():
     assert session.active_response_id is None
     assert session.active_output_id is None
     assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_typed_dispatcher_deduplicates_terminals_and_rejects_invalid_output_order():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-typed-output-order",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+        epoch=1,
+    )
+    fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
+    ws = TimedWebSocket()
+    start = DuplexSpeakStart(fence=fence, source_input_seq=1, output_id="o7")
+    chunk = DuplexSpeakChunk(fence=fence, output_id="o7", output_seq=0, text_delta="hello")
+    end = DuplexSpeakEnd(fence=fence, output_id="o7")
+
+    for event in (start, chunk, chunk, end, end):
+        await handler._send_one_native_duplex_event(ws.send_json, event, session=session)
+
+    assert ws.sent_types() == [
+        "response.created",
+        "response.speak",
+        "response.output_audio.delta",
+        "response.done",
+    ]
+
+    with pytest.raises(DuplexEventProtocolError, match="unknown output"):
+        await handler._send_one_native_duplex_event(
+            ws.send_json,
+            DuplexSpeakChunk(fence=fence, output_id="unknown", output_seq=0, text_delta="nope"),
+            session=session,
+        )
+
+    fresh = DuplexSession(session_id="sid-typed-output-gap", config=DuplexSessionConfig())
+    fresh_fence = DuplexFence(fresh.session_id, incarnation=fresh.incarnation, epoch=fresh.epoch)
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        DuplexSpeakStart(fence=fresh_fence, source_input_seq=1, output_id="gap"),
+        session=fresh,
+    )
+    with pytest.raises(DuplexEventProtocolError, match="sequence gap"):
+        await handler._send_one_native_duplex_event(
+            ws.send_json,
+            DuplexSpeakChunk(fence=fresh_fence, output_id="gap", output_seq=1, text_delta="gap"),
+            session=fresh,
+        )
+
+    sent_before_old_epoch = list(ws.sent)
+    assert await handler._send_one_native_duplex_event(
+        ws.send_json,
+        DuplexSpeakStart(
+            fence=DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch - 1),
+            source_input_seq=2,
+            output_id="old-epoch",
+        ),
+        session=session,
+    ) == (None, False)
+    assert ws.sent == sent_before_old_epoch
+
+
+def test_typed_client_payload_metadata_never_exposes_model_turn_id():
+    payload: dict[str, object] = {}
+
+    OmniDuplexSessionHandler._attach_native_runtime_metadata(
+        payload,
+        {
+            "runtime_impl": "minicpmo45",
+            "model_turn_id": 17,
+            "runner_kv_backed": True,
+        },
+    )
+
+    assert payload["vllm_omni"] == {
+        "runtime_impl": "minicpmo45",
+        "runner_kv_backed": True,
+    }
+
+
+def test_typed_continuation_ownership_separates_pending_input_from_active_output():
+    # These imports are deliberately local: the RED contract names the public
+    # ownership types without making unrelated handler tests fail collection.
+    from vllm_omni.experimental.fullduplex.minicpmo45.session import (
+        ActiveOutputContinuation,
+        PendingInputContinuation,
+    )
+
+    fence = DuplexFence("sid-continuation", incarnation=2, epoch=4)
+    pending = PendingInputContinuation(incarnation=2, epoch=4, source_input_seq=7)
+    active = ActiveOutputContinuation(incarnation=2, epoch=4, output_id="o7")
+    native = MiniCPMO45ServingSessionState()
+
+    with pytest.raises(FrozenInstanceError):
+        pending.source_input_seq = 8  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        active.output_id = "o8"  # type: ignore[misc]
+
+    assert native.pending_input_continuation is None
+    assert native.active_output_continuation is None
+    native.pending_input_continuation = pending
+    native.active_output_continuation = active
+    assert native.pending_input_continuation == pending
+    assert native.active_output_continuation == active
+    assert not isinstance(native.pending_input_continuation, str)
+    assert not isinstance(native.active_output_continuation, str)
+
+    # Before SPEAK_START, a later input commit or a new fence supersedes the
+    # pending input.  After start, input commits do not supersede output o7;
+    # only its terminal/cancellation/close fence does.
+    assert pending.is_stale(fence=fence, source_input_seq=7) is False
+    assert pending.is_stale(fence=fence, source_input_seq=8) is True
+    assert pending.is_stale(
+        fence=DuplexFence("sid-continuation", incarnation=2, epoch=5),
+        source_input_seq=7,
+    ) is True
+    assert active.is_stale(fence=fence, output_id="o7") is False
+    assert active.is_stale(fence=fence, output_id="o8") is True
+    assert active.is_stale(
+        fence=DuplexFence("sid-continuation", incarnation=2, epoch=5),
+        output_id="o7",
+    ) is True
 
 
 def test_native_realtime_protocol_emits_speak_once_per_response():
