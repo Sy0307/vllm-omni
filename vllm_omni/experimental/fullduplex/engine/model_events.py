@@ -123,7 +123,9 @@ class DuplexOutputLedger:
         self._fence = fence
         self._completed_output_limit = completed_output_limit
         self._active_output_id: str | None = None
+        self._active_output_source_input_seq: int | None = None
         self._next_output_seq = 0
+        self._completed_source_input_seq: int | None = None
         self._completed: OrderedDict[str, _CompletedOutput] = OrderedDict()
         self._seen_listens: OrderedDict[tuple[int, int], None] = OrderedDict()
 
@@ -152,7 +154,9 @@ class DuplexOutputLedger:
             return
         self._fence = fence
         self._active_output_id = None
+        self._active_output_source_input_seq = None
         self._next_output_seq = 0
+        self._completed_source_input_seq = None
         self._completed.clear()
         self._seen_listens.clear()
 
@@ -177,11 +181,17 @@ class DuplexOutputLedger:
             return True
 
         if isinstance(event, DuplexSpeakStart):
+            if (
+                self._completed_source_input_seq is not None
+                and event.source_input_seq <= self._completed_source_input_seq
+            ):
+                return False
             if event.output_id == self._active_output_id or event.output_id in self._completed:
                 return False
             if self._active_output_id is not None:
                 raise DuplexEventProtocolError(f"duplex output {self._active_output_id!r} is already active")
             self._active_output_id = event.output_id
+            self._active_output_source_input_seq = event.source_input_seq
             self._next_output_seq = 0
             return True
 
@@ -215,7 +225,14 @@ class DuplexOutputLedger:
         self._completed.move_to_end(event.output_id)
         while len(self._completed) > self._completed_output_limit:
             self._completed.popitem(last=False)
+        assert self._active_output_source_input_seq is not None
+        if (
+            self._completed_source_input_seq is None
+            or self._active_output_source_input_seq > self._completed_source_input_seq
+        ):
+            self._completed_source_input_seq = self._active_output_source_input_seq
         self._active_output_id = None
+        self._active_output_source_input_seq = None
         self._next_output_seq = 0
         return True
 
@@ -256,6 +273,8 @@ class DuplexOutputLedger:
         _validate_non_negative_int("source_input_seq", source_input_seq)
         events: list[DuplexModelEvent] = []
         if self._active_output_id is None:
+            if self._completed_source_input_seq is not None and source_input_seq <= self._completed_source_input_seq:
+                return ()
             events.append(self.emit_start(source_input_seq=source_input_seq))
         assert self._active_output_id is not None
         chunk = DuplexSpeakChunk(

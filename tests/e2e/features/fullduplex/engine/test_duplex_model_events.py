@@ -132,6 +132,16 @@ def test_ledger_drops_completed_input_replays_before_starting_newer_output() -> 
     first_end = ledger.emit_end()
 
     assert first_chunk.output_id == first_end.output_id == first_start.output_id
+    assert (
+        ledger.accept(
+            DuplexSpeakStart(
+                fence=fence,
+                source_input_seq=7,
+                output_id="duplicate-start",
+            )
+        )
+        is False
+    )
     assert ledger.emit_chunk(source_input_seq=7, text_delta="duplicate") == ()
     assert ledger.emit_chunk(source_input_seq=6, text_delta="older") == ()
 
