@@ -45,10 +45,9 @@ def _delta(*codes: int):
 
 def _duplex_delta(
     *codes: int,
-    epoch: int = 3,
-    turn_id: int = 7,
+    execution_id: int = 7,
     text: str = "segment",
-    turn_end: bool = False,
+    speech_end: bool = False,
 ):
     text_utf8 = torch.tensor(list(text.encode("utf-8")), dtype=torch.uint8)
     return {
@@ -56,10 +55,9 @@ def _duplex_delta(
         "meta": {
             "finished": torch.tensor(False),
             "native_duplex": torch.tensor(True),
-            "duplex_epoch": torch.tensor(epoch),
-            "duplex_turn_id": torch.tensor(turn_id),
+            "duplex_execution_id": torch.tensor(execution_id),
             "llm_output_text_utf8": text_utf8,
-            "turn_end": torch.tensor(turn_end),
+            "duplex_speech_end": torch.tensor(speech_end),
         },
     }
 
@@ -129,33 +127,33 @@ def test_short_final_flushes_silence_prefix_and_tail() -> None:
     assert final.meta.finished.item() is True
 
 
-def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
+def test_duplex_speech_end_waits_for_terminal_codec_flush() -> None:
     manager = _manager()
     request = _request("req-duplex")
 
     body = tts2code2wav_async_chunk(
         manager,
-        _duplex_delta(*range(25), turn_end=True),
+        _duplex_delta(*range(25), speech_end=True),
         request,
         False,
     )
     final = tts2code2wav_async_chunk(
         manager,
-        _duplex_delta(turn_end=True),
+        _duplex_delta(speech_end=True),
         request,
         True,
     )
 
     assert body is not None
     assert body.meta.last_chunk is False
-    assert body.meta.turn_end is False
+    assert body.meta.duplex_speech_end is False
     assert final is not None
     assert _codes(final) == [22, 23, 24]
     assert final.meta.last_chunk is True
-    assert final.meta.turn_end is True
+    assert final.meta.duplex_speech_end is True
 
 
-def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
+def test_first_chunk_forwards_reference_voice_without_duplex_identity() -> None:
     manager = _manager()
     request = _request("req")
     request.additional_information = {
@@ -165,7 +163,7 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
 
     payload = tts2code2wav_async_chunk(
         manager,
-        _duplex_delta(*range(7), text="hello", turn_end=True),
+        _duplex_delta(*range(7), text="hello", speech_end=True),
         request,
         True,
     )
@@ -177,10 +175,10 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
         payload.meta.llm_output_text_utf8,
         torch.tensor(list(b"hello"), dtype=torch.uint8),
     )
-    assert payload.meta.duplex_epoch == 3
-    assert payload.meta.duplex_turn_id == 7
+    assert not hasattr(payload.meta, "duplex_epoch")
+    assert not hasattr(payload.meta, "duplex_turn_id")
     assert payload.meta.tts_is_last_chunk is True
-    assert payload.meta.turn_end is True
+    assert payload.meta.duplex_speech_end is True
 
 
 def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
@@ -192,9 +190,8 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
             "ref_audio_sr": 16000,
             "native_duplex_segment_text": "hello",
             "segment_end": True,
-            "turn_end": True,
+            "duplex_speech_end": True,
         },
-        "duplex": {"epoch": 3, "model_turn_id": 7},
     }
 
     payload = tts2code2wav_full_payload(
@@ -218,10 +215,10 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     assert payload.meta.finished.item() is True
     assert payload.meta.ref_audio_sr == 16000
     assert payload.meta.native_duplex_segment_text == "hello"
-    assert payload.meta.duplex_epoch == 3
-    assert payload.meta.duplex_turn_id == 7
+    assert not hasattr(payload.meta, "duplex_epoch")
+    assert not hasattr(payload.meta, "duplex_turn_id")
     assert payload.meta.segment_end is True
-    assert payload.meta.turn_end is True
+    assert payload.meta.duplex_speech_end is True
 
 
 def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
@@ -313,14 +310,14 @@ def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     assert second.codes.ref is None
     assert second.meta.cache_epoch == first.meta.cache_epoch
     assert second.meta.chunk_seq == first.meta.chunk_seq + 1
-    assert second.meta.duplex_epoch == 3
-    assert second.meta.duplex_turn_id == 7
+    assert not hasattr(second.meta, "duplex_epoch")
+    assert not hasattr(second.meta, "duplex_turn_id")
     torch.testing.assert_close(
         second.meta.llm_output_text_utf8,
         torch.tensor(list(b"second"), dtype=torch.uint8),
     )
     assert second.meta.tts_is_last_chunk is True
-    assert second.meta.turn_end is False
+    assert second.meta.duplex_speech_end is False
     assert first.meta.is_segment_finished.item() is False
     assert second.meta.is_segment_finished.item() is False
 
@@ -413,29 +410,29 @@ def test_duplex_short_tail_does_not_replay_previous_segment_text() -> None:
     assert next_flush.meta.llm_output_text_utf8.tolist() == list("的距离大约是".encode())
 
 
-def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
+def test_duplex_speech_end_closes_execution_and_next_one_restarts_sequence() -> None:
     manager = _manager()
     request = _request("req-duplex")
 
-    turn_end = tts2code2wav_async_chunk(
+    speech_end = tts2code2wav_async_chunk(
         manager,
-        _duplex_delta(14, turn_id=7, turn_end=True),
+        _duplex_delta(14, execution_id=7, speech_end=True),
         request,
         True,
     )
     next_turn = tts2code2wav_async_chunk(
         manager,
-        _duplex_delta(20, turn_id=8),
+        _duplex_delta(20, execution_id=8),
         request,
         True,
     )
 
-    assert turn_end is not None
+    assert speech_end is not None
     assert next_turn is not None
-    assert turn_end.meta.last_chunk is True
-    assert turn_end.meta.turn_end is True
-    assert turn_end.meta.is_segment_finished.item() is True
-    assert next_turn.meta.cache_epoch == turn_end.meta.cache_epoch + 1
+    assert speech_end.meta.last_chunk is True
+    assert speech_end.meta.duplex_speech_end is True
+    assert speech_end.meta.is_segment_finished.item() is True
+    assert next_turn.meta.cache_epoch == speech_end.meta.cache_epoch + 1
     assert next_turn.meta.chunk_seq == 0
     assert next_turn.meta.last_chunk is False
 
