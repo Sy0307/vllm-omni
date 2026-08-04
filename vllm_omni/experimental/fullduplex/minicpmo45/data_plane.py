@@ -171,12 +171,13 @@ class MiniCPMO45DataPlaneSession:
     ) -> Iterator[DuplexModelEvent]:
         yield from self._project_output(output, context=context, tts_segment_controls=None)
 
-    def _project_batches(
+    def project_runtime_batches(
         self,
         result: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
     ) -> Iterator[_MiniCPMO45ProjectionBatch]:
+        """Project one runtime result with MiniCPM-local control side records."""
         if not isinstance(result, dict):
             return
         outputs = result.get("data_plane_outputs")

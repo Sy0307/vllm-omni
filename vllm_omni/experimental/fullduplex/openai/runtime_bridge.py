@@ -658,7 +658,7 @@ class NativeRuntimeBridgeMixin:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
-        for batch in self._serving_runtime_adapter.data_plane._project_batches(result, context=context):
+        for batch in self._serving_runtime_adapter.data_plane.project_runtime_batches(result, context=context):
             for native_result in batch.events:
                 close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                     send_json,
