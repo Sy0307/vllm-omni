@@ -391,6 +391,19 @@ class TimedWebSocket:
         return [m.get("type", "") for m in self.sent]
 
 
+class _GenericTestServingAdapter:
+    def __init__(self, data_plane: object) -> None:
+        self.data_plane = data_plane
+        self.session_states: dict[str, MiniCPMO45ServingSessionState] = {}
+
+    def session_state(self, session_id: str) -> MiniCPMO45ServingSessionState:
+        return self.session_states.setdefault(session_id, MiniCPMO45ServingSessionState())
+
+    @staticmethod
+    def data_plane_context(**kwargs):
+        return MiniCPMO45DataPlaneContext(**kwargs)
+
+
 @pytest.mark.asyncio
 async def test_typed_model_events_bind_one_output_to_one_realtime_response():
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
@@ -3280,7 +3293,7 @@ async def test_native_duplex_events_use_declared_runtime_data_plane_project_meth
             return [DuplexListen(fence=context.fence, source_input_seq=context.source_input_seq)]
 
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
-    handler._serving_runtime_adapter.data_plane = ProjectOnlyDataPlane()
+    handler._serving_runtime_adapter = _GenericTestServingAdapter(ProjectOnlyDataPlane())
     session = DuplexSession(
         session_id="sid-runtime-data-plane-project",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
@@ -3326,20 +3339,8 @@ async def test_runtime_data_plane_method_collision_does_not_opt_into_minicpmo_si
         def project_runtime_batches(self):
             raise AssertionError("method-name collision must not opt into MiniCPM side controls")
 
-    class GenericServingAdapter:
-        def __init__(self) -> None:
-            self.data_plane = CollidingDataPlane()
-            self.session_states: dict[str, MiniCPMO45ServingSessionState] = {}
-
-        def session_state(self, session_id: str) -> MiniCPMO45ServingSessionState:
-            return self.session_states.setdefault(session_id, MiniCPMO45ServingSessionState())
-
-        @staticmethod
-        def data_plane_context(**kwargs):
-            return MiniCPMO45DataPlaneContext(**kwargs)
-
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
-    handler._serving_runtime_adapter = GenericServingAdapter()
+    handler._serving_runtime_adapter = _GenericTestServingAdapter(CollidingDataPlane())
     session = DuplexSession(
         session_id="sid-runtime-data-plane-collision",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
