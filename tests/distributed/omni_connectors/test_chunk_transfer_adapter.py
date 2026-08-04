@@ -16,6 +16,18 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+from vllm_omni.distributed.omni_connectors.stage_payload import (
+    NoPayloadYet,
+    PayloadEmission,
+    StageBoundary,
+    StagePayloadEnvelope,
+    StagePayloadIdentity,
+    StageRoute,
+)
+from vllm_omni.distributed.omni_connectors.stage_payload_processor import (
+    LegacyProcessorMode,
+    LegacyStagePayloadProcessorAdapter,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -44,6 +56,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         num_output_placeholders=0,
         prefill_stats=None,
         additional_information=None,
+        resumable=False,
         is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
 
@@ -122,6 +135,8 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self._cancelled_load_reqs = set()
             self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
+            self._transfer_failures = {}
+            self._transfer_failure_lock = threading.Lock()
             self.stop_event = threading.Event()
             self._recv_cond = threading.Condition()
             self._save_cond = threading.Condition()
@@ -149,6 +164,21 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         return adapter, connector
 
     return _build
+
+
+def _set_legacy_async_processor(adapter, processor) -> None:
+    adapter.stage_payload_processor = LegacyStagePayloadProcessorAdapter(
+        processor,
+        mode=LegacyProcessorMode.ASYNC_CHUNK,
+        transfer_manager=adapter,
+        request_provider=lambda view: adapter._legacy_processor_requests[view.internal_request_id],
+        normalize_async_transport_flags=True,
+    )
+
+
+def _send_queued_chunk(adapter) -> None:
+    task = adapter._pending_save_reqs.popleft()
+    assert adapter._send_single_request(task) is True
 
 
 @pytest.mark.parametrize(
@@ -259,13 +289,11 @@ def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": False}
     adapter.save_async(multimodal_output=None, request=request)
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: {}
     adapter.save_async(multimodal_output=None, request=request)
 
     task = adapter._pending_save_reqs.popleft()
-    assert task["is_finished"] is False
+    assert task["context"].boundary is StageBoundary.NONE
 
 
 def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_adapter):
@@ -298,17 +326,110 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
             codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.long)),
         )
 
-    adapter.custom_process_next_stage_input_func = recording_processor
+    _set_legacy_async_processor(adapter, recording_processor)
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": False}
-    )
+    adapter.save_async(multimodal_output=None, request=request)
+    _send_queued_chunk(adapter)
 
     assert seen_flush_flags == [True]
-    sent_payload = connector.put.call_args.kwargs["data"]
+    envelope = connector.put.call_args.kwargs["data"]
+    assert isinstance(envelope, StagePayloadEnvelope)
+    assert envelope.boundary is StageBoundary.STREAM_END
+    sent_payload = envelope.payload
     assert bool(sent_payload.meta.finished.item()) is True
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
+
+
+def test_processor_exception_fails_internal_request_without_connector_put(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=0)
+
+    class BrokenProcessor:
+        def process(self, _context):
+            raise ValueError("bad codec rank")
+
+        def drop_request(self, _identity):
+            return None
+
+    adapter.stage_payload_processor = BrokenProcessor()
+    request = _req(
+        "internal-1",
+        RequestStatus.WAITING,
+        external_req_id="external-1",
+    )
+
+    adapter.save_async(multimodal_output={"value": 42}, request=request)
+    _send_queued_chunk(adapter)
+
+    connector.put.assert_not_called()
+    failures = adapter.drain_transfer_failures()
+    assert set(failures) == {"internal-1"}
+    assert failures["internal-1"].external_request_id == "external-1"
+    assert failures["internal-1"].code == "stage_payload_processor_failed"
+
+
+def test_terminal_no_payload_yet_fails_contract_without_finish_marker(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=0)
+
+    class DeferredProcessor:
+        def process(self, _context):
+            return NoPayloadYet()
+
+        def drop_request(self, _identity):
+            return None
+
+    adapter.stage_payload_processor = DeferredProcessor()
+    request = _req(
+        "internal-terminal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="external-terminal",
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+    _send_queued_chunk(adapter)
+
+    connector.put.assert_not_called()
+    failures = adapter.drain_transfer_failures()
+    assert set(failures) == {"internal-terminal"}
+    assert failures["internal-terminal"].code == "stage_payload_contract_failed"
+
+
+def test_terminal_payload_without_stream_end_fails_contract(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=0)
+
+    class MissingBoundaryProcessor:
+        def process(self, _context):
+            return PayloadEmission(
+                payload=OmniPayloadStruct(
+                    codes=CodesStruct(
+                        audio=torch.tensor([1, 2, 3], dtype=torch.long),
+                    ),
+                ),
+            )
+
+        def drop_request(self, _identity):
+            return None
+
+    adapter.stage_payload_processor = MissingBoundaryProcessor()
+    request = _req(
+        "internal-terminal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="external-terminal",
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+    _send_queued_chunk(adapter)
+
+    connector.put.assert_not_called()
+    failures = adapter.drain_transfer_failures()
+    assert set(failures) == {"internal-terminal"}
+    assert failures["internal-terminal"].code == "stage_payload_contract_failed"
 
 
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
@@ -320,15 +441,17 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-no-meta", RequestStatus.WAITING, external_req_id="ext-no-meta")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
-        codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+    _set_legacy_async_processor(
+        adapter,
+        lambda **kwargs: OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+        ),
     )
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
-    )
+    adapter.save_async(multimodal_output=None, request=request)
+    _send_queued_chunk(adapter)
 
     assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
 
@@ -343,15 +466,16 @@ def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatc
     adapter, connector = build_adapter(stage_id=1)
     request = _req("req-empty", RequestStatus.WAITING, external_req_id="ext-empty")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    _set_legacy_async_processor(adapter, lambda **kwargs: OmniPayloadStruct())
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": False}
-    )
+    adapter.save_async(multimodal_output=None, request=request)
+    _send_queued_chunk(adapter)
 
     assert connector.put.called
-    sent_payload = connector.put.call_args.kwargs["data"]
+    envelope = connector.put.call_args.kwargs["data"]
+    assert isinstance(envelope, StagePayloadEnvelope)
+    sent_payload = envelope.payload
     assert isinstance(sent_payload, OmniPayloadStruct)
     assert sent_payload.meta.finished.item() is False
     assert sent_payload.meta.is_segment_finished.item() is False
@@ -361,14 +485,19 @@ def test_send_single_request_struct_preserves_segment_finished(build_adapter, mo
     adapter, connector = build_adapter(stage_id=1)
     request = _req("req-segment", RequestStatus.WAITING, external_req_id="ext-segment")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    _set_legacy_async_processor(adapter, lambda **kwargs: OmniPayloadStruct())
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
     )
+    _send_queued_chunk(adapter)
 
-    sent_payload = connector.put.call_args.kwargs["data"]
+    envelope = connector.put.call_args.kwargs["data"]
+    assert envelope.boundary is StageBoundary.SEGMENT_END
+    sent_payload = envelope.payload
     assert sent_payload.meta.finished.item() is False
     assert sent_payload.meta.is_segment_finished.item() is True
 
@@ -377,16 +506,22 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     adapter, connector = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
-        meta=MetaStruct(is_segment_finished=torch.tensor(False, dtype=torch.bool))
+    _set_legacy_async_processor(
+        adapter,
+        lambda **kwargs: OmniPayloadStruct(meta=MetaStruct(is_segment_finished=torch.tensor(False, dtype=torch.bool))),
     )
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
 
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": False, "is_segment_finished": True}
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
     )
+    _send_queued_chunk(adapter)
 
-    sent_payload = connector.put.call_args.kwargs["data"]
+    envelope = connector.put.call_args.kwargs["data"]
+    assert envelope.boundary is StageBoundary.NONE
+    sent_payload = envelope.payload
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
@@ -413,15 +548,18 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
-        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool))
+    _set_legacy_async_processor(
+        adapter, lambda **kwargs: OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
     )
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
     )
+    _send_queued_chunk(adapter)
 
     assert len(cleanup_calls) == 1
     args, _ = cleanup_calls[0]
@@ -529,6 +667,53 @@ def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter)
     prompt_token_stats.update_from_output(second_chunk_stats)
     assert prompt_token_stats.total == 5
     assert prompt_token_stats.computed == 5
+
+
+def test_legacy_envelope_non_ar_projects_current_chunk(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-envelope", RequestStatus.WAITING, external_req_id="ext-envelope")
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    identity = StagePayloadIdentity(
+        external_request_id=request.external_req_id,
+        source_request_id="source-envelope",
+    )
+    route = StageRoute(source_stage=1, destination_stage=2)
+    connector.get.side_effect = [
+        (
+            StagePayloadEnvelope(
+                schema_version=1,
+                route=route,
+                identity=identity,
+                chunk_seq=0,
+                payload=OmniPayloadStruct(
+                    codes=CodesStruct(audio=torch.tensor([7, 8], dtype=torch.long)),
+                    meta=MetaStruct(finished=torch.tensor(False, dtype=torch.bool)),
+                ),
+            ),
+            8,
+        ),
+        (
+            StagePayloadEnvelope(
+                schema_version=1,
+                route=route,
+                identity=identity,
+                chunk_seq=1,
+                payload=OmniPayloadStruct(
+                    codes=CodesStruct(audio=torch.tensor([9, 10, 11], dtype=torch.long)),
+                    meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                ),
+                boundary=StageBoundary.STREAM_END,
+            ),
+            8,
+        ),
+    ]
+
+    assert adapter._poll_single_request(request) is True
+    assert request.prompt_token_ids == [7, 8]
+
+    assert adapter._poll_single_request(request) is True
+    assert request.prompt_token_ids == [9, 10, 11]
+    assert adapter.get_req_chunk[request.request_id] == 2
 
 
 def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):

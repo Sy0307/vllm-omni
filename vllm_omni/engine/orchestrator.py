@@ -106,6 +106,25 @@ def _build_terminal_empty_output(
     )
 
 
+def _llm_terminal_error(output: Any) -> str | None:
+    """Return the error carried by a processed LLM terminal output.
+
+    vLLM represents ``RequestStatus.FINISHED_ERROR`` as a completion whose
+    ``finish_reason`` is ``"error"``.  It does not populate the top-level
+    ``RequestOutput.error`` field used by diffusion stages.  Streaming-input
+    output processing also forces ``RequestOutput.finished`` to false, so the
+    completion finish reason is the terminal authority here.
+    """
+    for completion in getattr(output, "outputs", ()) or ():
+        if getattr(completion, "finish_reason", None) != "error":
+            continue
+        stop_reason = getattr(completion, "stop_reason", None)
+        if stop_reason is None:
+            return "Stage request finished with error"
+        return str(stop_reason)
+    return None
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -1052,8 +1071,15 @@ class Orchestrator:
                 )
                 continue
 
-            if getattr(output, "error", None) is not None:
-                await self._handle_stage_error(stage_id, output)
+            stage_error = getattr(output, "error", None)
+            if stage_error is None:
+                stage_error = _llm_terminal_error(output)
+            if stage_error is not None:
+                await self._handle_stage_error(
+                    stage_id,
+                    output,
+                    error=stage_error,
+                )
                 continue
 
             stage_metrics = None
@@ -1070,7 +1096,13 @@ class Orchestrator:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
+    async def _handle_stage_error(
+        self,
+        stage_id: int,
+        output: Any,
+        *,
+        error: str | None = None,
+    ) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
@@ -1080,7 +1112,7 @@ class Orchestrator:
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
-                error=output.error,
+                error=error if error is not None else output.error,
                 status_code=getattr(output, "error_status_code", None),
                 error_type=getattr(output, "error_type", None),
             )

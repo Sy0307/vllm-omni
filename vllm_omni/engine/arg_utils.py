@@ -128,6 +128,9 @@ class OmniEngineArgs(EngineArgs):
         custom_process_next_stage_input_func: Optional path to a custom function for processing
             inputs from previous stages
             If None, default processing is used.
+        stage_payload_processor: Optional zero-argument factory for the new
+            StagePayloadProcessor ABI.
+        stage_payload_schema: Optional edge-owned StagePayloadSchema object.
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
@@ -156,6 +159,9 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    stage_payload_processor: str | None = None
+    stage_payload_schema: str | None = None
+    stage_payload_input_schema: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
@@ -350,6 +356,9 @@ class OmniEngineArgs(EngineArgs):
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
+            stage_payload_processor=self.stage_payload_processor,
+            stage_payload_schema=self.stage_payload_schema,
+            stage_payload_input_schema=self.stage_payload_input_schema,
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,

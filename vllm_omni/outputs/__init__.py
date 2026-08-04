@@ -9,6 +9,28 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass(frozen=True, slots=True)
+class StageTransferFailure:
+    """A terminal inter-stage failure addressed to a scheduler-local request."""
+
+    internal_request_id: str
+    external_request_id: str | None
+    source_stage: int
+    destination_stage: int
+    code: str
+    message: str
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.internal_request_id:
+            raise ValueError("internal_request_id must not be empty")
+        if not self.code:
+            raise ValueError("failure code must not be empty")
+        sanitized = "".join(character if character.isprintable() else " " for character in str(self.message))
+        sanitized = " ".join(sanitized.split())[:512]
+        object.__setattr__(self, "message", sanitized or "stage transfer failed")
+
+
 @dataclass
 class OmniConnectorOutput:
     """Communication results from Model Runner to Scheduler.
@@ -34,6 +56,7 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    transfer_failures: dict[str, StageTransferFailure] = field(default_factory=dict)
 
 
 @dataclass

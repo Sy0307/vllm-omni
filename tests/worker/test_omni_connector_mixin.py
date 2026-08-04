@@ -17,8 +17,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import CodesStruct, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
+)
+from vllm_omni.distributed.omni_connectors.stage_payload import (
+    StageBoundary,
+    StagePayloadEnvelope,
+    StagePayloadIdentity,
+    StageRoute,
+)
+from vllm_omni.distributed.omni_connectors.stage_payload_processor import (
+    LegacyProcessorMode,
+    LegacyStagePayloadProcessorAdapter,
 )
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -62,6 +73,7 @@ def _make_model_config(
     custom_func: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        stage_id=stage_id,
         stage_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
@@ -121,24 +133,33 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         seen = {}
 
-        def mock_process(transfer_manager, pooling_output, request, is_finished=False):
+        def mock_process(
+            transfer_manager,
+            multimodal_output,
+            request,
+            is_finished=False,
+        ):
             seen["connector"] = transfer_manager.connector
             seen["is_finished"] = is_finished
-            return {"data": pooling_output, "finished": is_finished}
+            return OmniPayloadStruct(
+                codes=CodesStruct(
+                    audio=torch.tensor(
+                        [multimodal_output["value"]],
+                        dtype=torch.long,
+                    )
+                )
+            )
 
-        sender._custom_process_func = mock_process
+        sender._stage_payload_processor = LegacyStagePayloadProcessorAdapter(
+            mock_process,
+            mode=LegacyProcessorMode.ASYNC_CHUNK,
+            transfer_manager=sender,
+            request_provider=lambda view: sender._legacy_processor_requests[view.internal_request_id],
+        )
 
         request = _make_request("req-1", "ext-req-1")
         request.is_finished = lambda: True
-        sender._send_single_request(
-            {
-                "stage_id": 0,
-                "next_stage_id": 1,
-                "request_id": "ext-req-1",
-                "request": request,
-                "pooling_output": {"value": 42},
-            }
-        )
+        self.assertTrue(sender.send_chunk(request, pooling_output={"value": 42}))
         self.assertIs(seen["connector"], connector)
         self.assertTrue(seen["is_finished"])
 
@@ -157,11 +178,22 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         seen = {"calls": 0}
 
-        def broken_process(transfer_manager, pooling_output, request, is_finished=""):
+        def broken_process(
+            transfer_manager,
+            multimodal_output,
+            request,
+            is_finished="",
+        ):
+            del transfer_manager, multimodal_output, request
             seen["calls"] += 1
             return {"data": is_finished + "tail"}
 
-        sender._custom_process_func = broken_process
+        sender._stage_payload_processor = LegacyStagePayloadProcessorAdapter(
+            broken_process,
+            mode=LegacyProcessorMode.ASYNC_CHUNK,
+            transfer_manager=sender,
+            request_provider=lambda view: sender._legacy_processor_requests[view.internal_request_id],
+        )
 
         request = _make_request("req-1", "ext-req-1")
         request.is_finished = lambda: True
@@ -169,6 +201,136 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(seen["calls"], 1)
 
+        sender.shutdown_omni_connectors()
+
+    def test_processor_exception_fails_internal_request_without_connector_put(self):
+        connector = MockConnector(stage_id=0)
+
+        class BrokenProcessor:
+            def process(self, _context):
+                raise ValueError("bad codec rank")
+
+            def drop_request(self, _identity):
+                return None
+
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_payload_processor = BrokenProcessor()
+
+        request = _make_request("internal-1", "external-1")
+        request.is_finished = lambda: False
+
+        self.assertFalse(sender.send_chunk(request, pooling_output={"value": 42}))
+        self.assertEqual(connector._store, {})
+        output = sender.get_omni_connector_output()
+        self.assertEqual(set(output.transfer_failures), {"internal-1"})
+        self.assertEqual(
+            output.transfer_failures["internal-1"].external_request_id,
+            "external-1",
+        )
+        self.assertEqual(
+            output.transfer_failures["internal-1"].code,
+            "stage_payload_processor_failed",
+        )
+
+        sender.shutdown_omni_connectors()
+
+    def test_tp_rank_zero_processor_failure_is_fanned_out_without_peer_processing(
+        self,
+    ):
+        class BrokenProcessor:
+            def __init__(self):
+                self.calls = 0
+
+            def process(self, _context):
+                self.calls += 1
+                raise ValueError("bad codec rank")
+
+            def drop_request(self, _identity):
+                return None
+
+        leader = MixinHost()
+        leader.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        leader_connector = MockConnector(stage_id=0)
+        leader._omni_connector = leader_connector
+        leader_processor = BrokenProcessor()
+        leader._stage_payload_processor = leader_processor
+        leader_request = _make_request("internal-1", "external-1")
+        leader_request.is_finished = lambda: False
+        leader_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group",
+            return_value=leader_group,
+        ):
+            self.assertFalse(leader.send_chunk(leader_request, pooling_output={"value": 42}))
+            leader_output = leader.get_omni_connector_output()
+
+        self.assertEqual(leader_processor.calls, 1)
+        self.assertEqual(leader_connector._store, {})
+        self.assertEqual(
+            leader_output.transfer_failures["internal-1"].code,
+            "stage_payload_processor_failed",
+        )
+        self.assertEqual(len(leader_group.broadcast_inputs), 1)
+        fanout_packet = leader_group.broadcast_inputs[0]
+
+        follower = MixinHost()
+        follower.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        follower_connector = MockConnector(stage_id=0)
+        follower._omni_connector = follower_connector
+        follower_processor = BrokenProcessor()
+        follower._stage_payload_processor = follower_processor
+        follower_request = _make_request("internal-1", "external-1")
+        follower_request.is_finished = lambda: False
+        follower_group = _FakeTPGroup(
+            world_size=2,
+            rank_in_group=1,
+            follower_result=fanout_packet,
+        )
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group",
+            return_value=follower_group,
+        ):
+            self.assertTrue(
+                follower.send_chunk(
+                    follower_request,
+                    pooling_output={"value": 42},
+                )
+            )
+            follower_output = follower.get_omni_connector_output()
+
+        self.assertEqual(follower_processor.calls, 0)
+        self.assertEqual(follower_connector._store, {})
+        self.assertEqual(
+            follower_output.transfer_failures["internal-1"].code,
+            "stage_payload_processor_failed",
+        )
+        self.assertEqual(follower_group.broadcast_inputs, [None])
+
+        leader.shutdown_omni_connectors()
+        follower.shutdown_omni_connectors()
+
+    def test_explicit_schema_supplies_non_adjacent_runtime_route(self):
+        model_config = _make_model_config(stage_id=0, async_chunk=True)
+        model_config.stage_payload_schema = "tests.distributed.omni_connectors.fixtures.STAGE_0_TO_2_SCHEMA"
+
+        sender = MixinHost()
+        sender.init_omni_connectors(model_config=model_config)
+
+        self.assertEqual(
+            sender._outbound_payload_route,
+            StageRoute(source_stage=0, destination_stage=2),
+        )
+        self.assertEqual(sender._next_stage_id, 2)
         sender.shutdown_omni_connectors()
 
 
@@ -365,21 +527,31 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
                 )
             )
             assert selected_path != func_path
-            assert func is None or MixinHost._is_connector_payload_builder(func)
+            if selected_path is None:
+                assert func is None
+            else:
+                assert selected_path.endswith(("_full_payload", "_batch"))
+                assert callable(func)
 
 
 class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
     """Test B4: send_full_payload_outputs with full_payload_mode custom process func."""
 
-    def test_full_payload_send_passes_is_finished_and_connector(self):
+    def test_full_payload_send_passes_declared_legacy_arguments(self):
         seen = {}
 
-        def full_payload_func(transfer_manager, pooling_output, request, is_finished=False):
+        def full_payload_func(transfer_manager, pooling_output, request):
             seen["connector"] = transfer_manager.connector
-            seen["is_finished"] = is_finished
             seen["data"] = pooling_output
             seen["rid"] = request.request_id if request else None
-            return {"processed": True, "finished": is_finished}
+            return OmniPayloadStruct(
+                codes=CodesStruct(
+                    audio=torch.tensor(
+                        [pooling_output["raw"]],
+                        dtype=torch.long,
+                    )
+                )
+            )
 
         host = MixinHost()
         host.init_omni_connectors(
@@ -387,7 +559,12 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
         )
         host._omni_connector = MockConnector(stage_id=0)
         host._stage_id = 0
-        host._custom_process_func = full_payload_func
+        host._stage_payload_processor = LegacyStagePayloadProcessorAdapter(
+            full_payload_func,
+            mode=LegacyProcessorMode.FULL_PAYLOAD,
+            transfer_manager=host,
+            request_provider=lambda view: host._legacy_processor_requests[view.internal_request_id],
+        )
 
         req = _make_request("req-1")
         req.is_finished = lambda: True
@@ -400,7 +577,6 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
             seen,
             {
                 "connector": host._omni_connector,
-                "is_finished": True,
                 "data": {"raw": 100},
                 "rid": "req-1",
             },
@@ -413,7 +589,14 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
 
         def full_payload_func(transfer_manager, pooling_output, request):
             call_log.append(request.request_id if request else None)
-            return {"processed": True}
+            return OmniPayloadStruct(
+                codes=CodesStruct(
+                    audio=torch.tensor(
+                        [pooling_output["raw"]],
+                        dtype=torch.long,
+                    )
+                )
+            )
 
         host = MixinHost()
         host.init_omni_connectors(
@@ -421,7 +604,12 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
         )
         host._omni_connector = MockConnector(stage_id=0)
         host._stage_id = 0
-        host._custom_process_func = full_payload_func
+        host._stage_payload_processor = LegacyStagePayloadProcessorAdapter(
+            full_payload_func,
+            mode=LegacyProcessorMode.FULL_PAYLOAD,
+            transfer_manager=host,
+            request_provider=lambda view: host._legacy_processor_requests[view.internal_request_id],
+        )
 
         req = _make_request("req-1")
         host.accumulate_full_payload_output("req-1", {"raw": 42}, req)
@@ -766,13 +954,29 @@ class TestSendChunkCachesMapping(unittest.TestCase):
         host._stage_id = 0
         host._async_chunk = True
 
-        def mock_process(transfer_manager, pooling_output, request):
-            return {"data": "test", "finished": False}
+        def mock_process(
+            transfer_manager,
+            multimodal_output,
+            request,
+            is_finished=False,
+        ):
+            del transfer_manager, multimodal_output, request, is_finished
+            return OmniPayloadStruct(
+                codes=CodesStruct(
+                    audio=torch.tensor([1], dtype=torch.long),
+                )
+            )
 
-        host._custom_process_func = mock_process
+        host._stage_payload_processor = LegacyStagePayloadProcessorAdapter(
+            mock_process,
+            mode=LegacyProcessorMode.ASYNC_CHUNK,
+            transfer_manager=host,
+            request_provider=lambda view: host._legacy_processor_requests[view.internal_request_id],
+        )
 
         request = _make_request("internal-1", "external-1")
-        host.send_chunk(request, pooling_output={"v": 1})
+        request.is_finished = lambda: False
+        self.assertTrue(host.send_chunk(request, pooling_output={"v": 1}))
 
         # The mapping should be cached
         self.assertEqual(
@@ -787,13 +991,12 @@ class TestSendChunkCachesMapping(unittest.TestCase):
 class TestLocalPayloadCacheLifecycle(unittest.TestCase):
     """Unit tests for the local payload cache API (RFC §2.4)."""
 
-    def _make_host(self) -> MixinHost:
+    def _make_host(self, *, stage_id: int = 0) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
-            model_config=_make_model_config(stage_id=0),
+            model_config=_make_model_config(stage_id=stage_id),
         )
-        host._omni_connector = MockConnector(stage_id=0)
-        host._stage_id = 0
+        host._omni_connector = MockConnector(stage_id=stage_id)
         return host
 
     def test_put_get_pop(self):
@@ -822,9 +1025,8 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host.shutdown_omni_connectors()
 
     def test_rank0_only_polls_connector_for_tp_full_payload(self):
-        host = self._make_host()
+        host = self._make_host(stage_id=2)
         host._omni_connector = MagicMock()
-        host._stage_id = 2
         host._local_rank = 0
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
@@ -846,9 +1048,8 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_full_payload(self):
-        host = self._make_host()
+        host = self._make_host(stage_id=2)
         host._omni_connector = MagicMock()
-        host._stage_id = 2
         host._local_rank = 1
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
@@ -1338,11 +1539,31 @@ class TestSendRetry(unittest.TestCase):
         return sender
 
     def _make_task(self, req_id="r1"):
+        identity = StagePayloadIdentity(
+            external_request_id=req_id,
+            source_request_id=req_id,
+        )
+        envelope = StagePayloadEnvelope(
+            schema_version=1,
+            route=StageRoute(source_stage=0, destination_stage=1),
+            identity=identity,
+            chunk_seq=0,
+            payload=OmniPayloadStruct(
+                codes=CodesStruct(
+                    audio=torch.tensor([1], dtype=torch.long),
+                )
+            ),
+            boundary=StageBoundary.NONE,
+        )
         return {
             "stage_id": 0,
             "next_stage_id": 1,
             "request_id": req_id,
-            "data": {"payload": "test"},
+            "internal_request_id": req_id,
+            "external_request_id": req_id,
+            "put_key": f"{req_id}_0_0",
+            "data": envelope,
+            "identity": identity,
         }
 
     def test_send_single_request_returns_false_on_put_failure(self):

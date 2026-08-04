@@ -5,6 +5,8 @@ import threading
 from collections import deque
 from typing import Any
 
+from vllm_omni.outputs import StageTransferFailure
+
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
@@ -31,6 +33,8 @@ class OmniTransferAdapterBase:
         self._pending_save_reqs = deque()
         # Requests that have successfully saved data
         self._finished_save_reqs = set()
+        self._transfer_failures: dict[str, StageTransferFailure] = {}
+        self._transfer_failure_lock = threading.Lock()
 
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()
@@ -88,9 +92,16 @@ class OmniTransferAdapterBase:
             while self._pending_save_reqs:
                 task = self._pending_save_reqs.popleft()
                 try:
-                    self._send_single_request(task)
-                except Exception as e:
-                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
+                    success = self._send_single_request(task)
+                except Exception:
+                    logger.warning(
+                        "Error saving data for %s",
+                        task.get("internal_request_id") or task.get("request_id"),
+                        exc_info=True,
+                    )
+                    success = False
+                if success is False:
+                    self._requeue_or_fail_send(task)
 
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():
@@ -125,6 +136,61 @@ class OmniTransferAdapterBase:
     def get_finished_requests(self):
         """Get finished loaded or saved requests"""
         raise NotImplementedError
+
+    _MAX_SEND_RETRIES = 3
+
+    def _requeue_or_fail_send(self, task: dict[str, Any]) -> None:
+        retry_count = int(task.get("_retry_count", 0)) + 1
+        if retry_count <= self._MAX_SEND_RETRIES:
+            task["_retry_count"] = retry_count
+            self._pending_save_reqs.appendleft(task)
+            logger.warning(
+                "Re-enqueuing failed stage send for %s (retry %d/%d)",
+                task.get("internal_request_id") or task.get("request_id"),
+                retry_count,
+                self._MAX_SEND_RETRIES,
+            )
+            return
+
+        self._record_transfer_failure_from_task(
+            task,
+            code="stage_payload_transport_failed",
+            message="connector send failed after bounded retries",
+        )
+        self._settle_failed_send(task)
+
+    def _record_transfer_failure_from_task(
+        self,
+        task: dict[str, Any],
+        *,
+        code: str,
+        message: str,
+    ) -> None:
+        internal_request_id = task.get("internal_request_id") or task.get("request_id")
+        if not internal_request_id:
+            logger.error("Cannot deliver %s without an internal request ID", code)
+            return
+        source_stage = int(task.get("stage_id", getattr(self.connector, "stage_id", 0)))
+        destination_stage = int(task.get("next_stage_id", source_stage + 1))
+        failure = StageTransferFailure(
+            internal_request_id=internal_request_id,
+            external_request_id=task.get("external_request_id"),
+            source_stage=source_stage,
+            destination_stage=destination_stage,
+            code=code,
+            message=message,
+        )
+        with self._transfer_failure_lock:
+            self._transfer_failures.setdefault(internal_request_id, failure)
+
+    def _settle_failed_send(self, task: dict[str, Any]) -> None:
+        """Subclass hook for pending-save and cleanup bookkeeping."""
+
+    def drain_transfer_failures(self) -> dict[str, StageTransferFailure]:
+        with self._transfer_failure_lock:
+            failures = self._transfer_failures
+            self._transfer_failures = {}
+        return failures
 
     def shutdown(self):
         """Stop background loops and close the connector."""

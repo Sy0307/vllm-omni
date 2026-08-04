@@ -13,6 +13,7 @@ from transformers import Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.config.omni_config import (
     BaseVllmOmniStageConfig,
     OmniStageCacheConfig,
@@ -36,9 +37,11 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -339,6 +342,131 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
 
     assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert pipeline.get_stage(1).custom_process_input_func is None
+
+
+_PAYLOAD_PROCESSOR = "tests.distributed.omni_connectors.fixtures.build_processor"
+_PAYLOAD_SCHEMA = "tests.distributed.omni_connectors.fixtures.STAGE_0_TO_1_SCHEMA"
+_WRONG_PAYLOAD_SCHEMA = "tests.distributed.omni_connectors.fixtures.WRONG_ROUTE_SCHEMA"
+_LEGACY_ASYNC_PROCESSOR = "tests.distributed.omni_connectors.fixtures.legacy_async_processor"
+_LEGACY_FULL_PROCESSOR = "tests.distributed.omni_connectors.fixtures.legacy_full_processor"
+
+
+def _stage_payload_pipeline(
+    *,
+    processor: str | None,
+    schema: str | None,
+    fanout: bool = False,
+) -> PipelineConfig:
+    stages = [
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="source",
+            custom_process_next_stage_input_func=_LEGACY_FULL_PROCESSOR,
+            async_chunk_process_next_stage_input_func=_LEGACY_ASYNC_PROCESSOR,
+            stage_payload_processor=processor,
+            stage_payload_schema=schema,
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="destination",
+            input_sources=(0,),
+            final_output=not fanout,
+        ),
+    ]
+    if fanout:
+        stages.append(
+            StagePipelineConfig(
+                stage_id=2,
+                model_stage="second_destination",
+                input_sources=(0,),
+                final_output=True,
+            )
+        )
+    return PipelineConfig(model_type="stage-payload-test", stages=tuple(stages))
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_stage_payload_paths_reach_structured_and_legacy_stage_configs(
+    async_chunk,
+):
+    pipeline = _stage_payload_pipeline(
+        processor=_PAYLOAD_PROCESSOR,
+        schema=_PAYLOAD_SCHEMA,
+    )
+    deploy = DeployConfig(async_chunk=async_chunk)
+
+    structured = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+    )
+    structured_source = structured.stage_by_id(0)
+    structured_destination = structured.stage_by_id(1)
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    legacy_source = legacy[0]
+    legacy_destination = legacy[1]
+
+    assert structured_source.stage_payload_processor == _PAYLOAD_PROCESSOR
+    assert structured_source.stage_payload_schema == _PAYLOAD_SCHEMA
+    assert structured_destination.stage_payload_input_schema == _PAYLOAD_SCHEMA
+    assert legacy_source.yaml_engine_args["stage_payload_processor"] == _PAYLOAD_PROCESSOR
+    assert legacy_source.yaml_engine_args["stage_payload_schema"] == _PAYLOAD_SCHEMA
+    assert legacy_destination.yaml_engine_args["stage_payload_input_schema"] == _PAYLOAD_SCHEMA
+
+
+@pytest.mark.parametrize(
+    ("processor", "schema", "valid"),
+    [
+        (None, None, True),
+        (None, _PAYLOAD_SCHEMA, True),
+        (_PAYLOAD_PROCESSOR, _PAYLOAD_SCHEMA, True),
+        (_PAYLOAD_PROCESSOR, None, False),
+    ],
+)
+def test_stage_payload_configuration_matrix(processor, schema, valid):
+    pipeline = _stage_payload_pipeline(processor=processor, schema=schema)
+
+    if valid:
+        VllmOmniConfig.from_pipeline_config(pipeline)
+        merge_pipeline_deploy(pipeline, DeployConfig())
+    else:
+        with pytest.raises(ValueError, match="processor.*schema"):
+            VllmOmniConfig.from_pipeline_config(pipeline)
+        with pytest.raises(ValueError, match="processor.*schema"):
+            merge_pipeline_deploy(pipeline, DeployConfig())
+
+
+def test_stage_payload_schema_route_must_match_the_single_destination():
+    pipeline = _stage_payload_pipeline(
+        processor=None,
+        schema=_WRONG_PAYLOAD_SCHEMA,
+    )
+
+    with pytest.raises(ValueError, match="route"):
+        VllmOmniConfig.from_pipeline_config(pipeline)
+    with pytest.raises(ValueError, match="route"):
+        merge_pipeline_deploy(pipeline, DeployConfig())
+
+
+def test_stage_payload_contract_rejects_data_plane_fanout():
+    pipeline = _stage_payload_pipeline(
+        processor=_PAYLOAD_PROCESSOR,
+        schema=_PAYLOAD_SCHEMA,
+        fanout=True,
+    )
+
+    with pytest.raises(ValueError, match="exactly one.*destination"):
+        VllmOmniConfig.from_pipeline_config(pipeline)
+    with pytest.raises(ValueError, match="exactly one.*destination"):
+        merge_pipeline_deploy(pipeline, DeployConfig())
+
+
+def test_runtime_model_config_declares_stage_payload_paths():
+    assert "stage_payload_processor" in OmniEngineArgs.__dataclass_fields__
+    assert "stage_payload_schema" in OmniEngineArgs.__dataclass_fields__
+    assert "stage_payload_input_schema" in OmniEngineArgs.__dataclass_fields__
+    assert "stage_payload_processor" in OmniModelConfig.__dataclass_fields__
+    assert "stage_payload_schema" in OmniModelConfig.__dataclass_fields__
+    assert "stage_payload_input_schema" in OmniModelConfig.__dataclass_fields__
 
 
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():

@@ -15,6 +15,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, ShutdownRequestMessage
@@ -22,9 +23,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 from .test_orchestrator import (
+    FakeOutputProcessor,
     FakeStageClient,
     OrchestratorFixture,
     _build_harness,
+    _engine_core_outputs,
     _enqueue_add_request,
     _wait_for,
 )
@@ -129,6 +132,79 @@ async def test_engine_dead_error_broadcasts_fatal_and_shuts_down(orchestrator_fa
 
 
 # ───────── Diffusion stage error output routing ─────────
+
+
+@pytest.mark.asyncio
+async def test_llm_error_finish_from_nonfinal_stage_is_frontend_visible(orchestrator_factory) -> None:
+    """A scheduler ``FINISHED_ERROR`` is encoded as a completion finish reason.
+
+    The orchestrator must not treat that terminal output as an ordinary stage
+    completion and wait forever for a downstream stage that will never receive
+    a payload.
+    """
+    request_id = "req-stage-transfer-error"
+    message = "stage_payload_processor_failed: injected processor failure"
+    completion = CompletionOutput(
+        index=0,
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="error",
+        stop_reason=message,
+    )
+    error_output = RequestOutput(
+        request_id=request_id,
+        prompt="prompt",
+        prompt_token_ids=[1],
+        prompt_logprobs=None,
+        outputs=[completion],
+        # vLLM's OutputProcessor forces this false for streaming-input
+        # requests even when the completion carries FinishReason.ERROR.
+        finished=False,
+    )
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[
+            FakeOutputProcessor(request_outputs=[error_output]),
+            FakeOutputProcessor(),
+        ],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1]),
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        stage0.push_engine_core_outputs(
+            _engine_core_outputs(
+                SimpleNamespace(
+                    request_id=request_id,
+                    finish_reason="error",
+                    is_segment_finished=False,
+                ),
+                time.time(),
+            )
+        )
+
+        output = await _get_any_output_message(orchestrator_fixture)
+        assert isinstance(output, ErrorMessage)
+        assert output.request_id == request_id
+        assert output.stage_id == 0
+        assert output.error == message
+        assert stage1.add_request_calls == []
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        orchestrator_fixture.thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

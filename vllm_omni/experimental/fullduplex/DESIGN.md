@@ -42,6 +42,16 @@ scope limits are recorded below.
 
 ## Scope
 
+### Common inter-stage payload boundary
+
+The Full-Duplex runtime consumes the stable connector contract documented in
+[`docs/design/stage_payload_contract.md`](../../../docs/design/stage_payload_contract.md).
+That common layer owns immutable inter-stage envelopes, edge validation,
+request-global sequencing, and explicit transfer failures. This experimental
+runtime continues to own session/turn policy, fences, control-plane aborts,
+model intermediate state, and resource lifecycle; those concerns do not move
+into the payload envelope.
+
 The checkpoint keeps these verified contracts:
 
 - MiniCPM Stage0 conversation KV continuity;

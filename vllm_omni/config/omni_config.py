@@ -36,6 +36,7 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
+    validate_stage_payload_contracts,
 )
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
@@ -913,6 +914,18 @@ class BaseVllmOmniStageConfig:
         )
 
     @property
+    def stage_payload_processor(self) -> str | None:
+        return self.stage_pipeline_config.stage_payload_processor
+
+    @property
+    def stage_payload_schema(self) -> str | None:
+        return self.stage_pipeline_config.stage_payload_schema
+
+    @property
+    def stage_payload_input_schema(self) -> str | None:
+        return getattr(self, "_resolved_stage_payload_input_schema", None)
+
+    @property
     def is_comprehension(self) -> bool:
         return self.stage_pipeline_config.owns_tokenizer
 
@@ -1280,6 +1293,7 @@ class VllmOmniConfig:
         deploy = _apply_platform_overrides(deploy)
         if len(pipeline_cfg.stages) <= 1:
             deploy.async_chunk = False
+        validate_stage_payload_contracts(pipeline_cfg)
         _validate_async_chunk_support(pipeline_cfg, deploy)
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
         model = cli_overrides.get("model")
@@ -1298,6 +1312,16 @@ class VllmOmniConfig:
             )
             for topology in pipeline_cfg.stages
         )
+        stage_config_by_id = {stage.stage_id: stage for stage in stage_configs}
+        for source in pipeline_cfg.stages:
+            if source.stage_payload_schema is None:
+                continue
+            destination_id = next(
+                destination.stage_id
+                for destination in pipeline_cfg.stages
+                if source.stage_id in destination.input_sources
+            )
+            stage_config_by_id[destination_id]._resolved_stage_payload_input_schema = source.stage_payload_schema
 
         orchestrator_config = VllmOmniOrchestratorConfig(
             deploy_config_path=loaded_deploy_config_path,

@@ -10,6 +10,15 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.distributed.omni_connectors.payload_schema import (
+    PayloadMergeMode,
+    StagePayloadFieldRule,
+    StagePayloadSchema,
+    TensorFieldConstraint,
+)
+from vllm_omni.distributed.omni_connectors.stage_payload import (
+    StageRoute,
+)
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -24,17 +33,56 @@ _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
 
 
-class _MiniCPMO45MetaStruct(MetaStruct):
-    """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
-
-    ref_audio_sr: int | None = None
-    native_duplex_segment_text: str | None = None
-    llm_output_text_utf8: torch.Tensor | None = None
-    duplex_turn_id: int | None = None
-    duplex_epoch: int | None = None
-    segment_end: bool | None = None
-    turn_end: bool | None = None
-    tts_is_last_chunk: bool | None = None
+MINICPMO45_TTS_TO_CODE2WAV_SCHEMA = StagePayloadSchema(
+    schema_version=1,
+    route=StageRoute(source_stage=1, destination_stage=2),
+    fields={
+        ("codes", "audio"): StagePayloadFieldRule(
+            # Each emission is a self-contained codec window including its
+            # left-context overlap. Appending windows would replay old codes
+            # into Code2Wav, so the destination keeps only the latest window.
+            mode=PayloadMergeMode.REPLACE,
+            tensor=TensorFieldConstraint(
+                rank=1,
+                dtypes=frozenset({torch.int64}),
+                concat_dim=0,
+            ),
+        ),
+        ("codes", "ref"): StagePayloadFieldRule(
+            mode=PayloadMergeMode.SNAPSHOT,
+            tensor=TensorFieldConstraint(
+                rank=1,
+                dtypes=frozenset({torch.float32}),
+            ),
+        ),
+        ("request_id",): StagePayloadFieldRule(mode=PayloadMergeMode.REPLACE),
+        **{
+            ("meta", field_name): StagePayloadFieldRule(mode=PayloadMergeMode.REPLACE)
+            for field_name in (
+                "request_id",
+                "chunk_seq",
+                "cache_epoch",
+                "code_flat_numel",
+                "codec_chunk_frames",
+                "codec_left_context_frames",
+                "left_context_size",
+                "last_chunk",
+                "stream_finished",
+                "finished",
+                "is_segment_finished",
+                "req_id",
+                "duplex_epoch",
+                "duplex_turn_id",
+                "llm_output_text_utf8",
+                "tts_is_last_chunk",
+                "segment_end",
+                "turn_end",
+                "ref_audio_sr",
+                "native_duplex_segment_text",
+            )
+        },
+    },
+)
 
 
 def _extract_first_audio_ref(multi_modal_data):
@@ -355,7 +403,7 @@ def tts2code2wav_async_chunk(
             audio=torch.tensor(output_codes, dtype=torch.long),
             ref=ref_audio,
         ),
-        meta=_MiniCPMO45MetaStruct(
+        meta=MetaStruct(
             request_id=request_id,
             chunk_seq=chunk_seq,
             cache_epoch=int(record["cache_epoch"]),
@@ -419,7 +467,7 @@ def tts2code2wav_full_payload(
             audio=torch.tensor(output_codes, dtype=torch.long),
             ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
         ),
-        meta=_MiniCPMO45MetaStruct(
+        meta=MetaStruct(
             request_id=request_id,
             chunk_seq=0,
             cache_epoch=0,

@@ -62,6 +62,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            stage_payload_schema=(f"{_PROC}.MINICPMO45_TTS_TO_CODE2WAV_SCHEMA"),
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(

@@ -58,8 +58,13 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
+    # Deprecated as transport control. Migrated edges use
+    # StagePayloadEnvelope.boundary; the legacy bridge translates only
+    # ``finished`` and ``is_segment_finished``.
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
+    # Model metadata only until explicit consumers rename these fields. They
+    # do not define the generic transport boundary.
     stream_finished: torch.Tensor
     request_id: str
     chunk_seq: int
@@ -71,6 +76,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     req_id: list[str]
     left_context_size: int
     right_holdback_size: int
+    # Deprecated merge control. Migrated edges declare merge behavior in a
+    # StagePayloadSchema. Only the legacy bridge may inspect this field.
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
@@ -91,6 +98,16 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_included: bool
     talker_prefill_offset: int
     omni_final_stage_id: int
+    # MiniCPM-o 4.5 model-owned Talker -> Code2Wav metadata. These fields
+    # remain payload data; StagePayloadEnvelope owns transport boundaries.
+    ref_audio_sr: int
+    native_duplex_segment_text: str
+    llm_output_text_utf8: torch.Tensor
+    duplex_turn_id: int
+    duplex_epoch: int
+    segment_end: bool
+    turn_end: bool
+    tts_is_last_chunk: bool
 
 
 class OmniPayload(TypedDict, total=False):
@@ -156,8 +173,12 @@ class IdsStruct(_StructBase):
 
 
 class MetaStruct(_StructBase):
+    # Deprecated as transport control. StagePayloadEnvelope.boundary is
+    # authoritative for migrated edges; the legacy bridge translates only
+    # ``finished`` and ``is_segment_finished``.
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
+    # Model-owned compatibility metadata, not generic transport boundaries.
     stream_finished: torch.Tensor | None = None
     request_id: str | None = None
     chunk_seq: int | None = None
@@ -166,6 +187,7 @@ class MetaStruct(_StructBase):
     req_id: list[str] | None = None
     left_context_size: int | None = None
     right_holdback_size: int | None = None
+    # Deprecated merge control, honored only by the legacy payload bridge.
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
@@ -189,6 +211,14 @@ class MetaStruct(_StructBase):
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
+    ref_audio_sr: int | None = None
+    native_duplex_segment_text: str | None = None
+    llm_output_text_utf8: torch.Tensor | None = None
+    duplex_turn_id: int | None = None
+    duplex_epoch: int | None = None
+    segment_end: bool | None = None
+    turn_end: bool | None = None
+    tts_is_last_chunk: bool | None = None
 
 
 class OmniPayloadStruct(_StructBase):

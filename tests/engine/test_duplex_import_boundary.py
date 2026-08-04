@@ -44,6 +44,42 @@ if loaded:
 """)
 
 
+def test_common_stage_payload_imports_do_not_load_experimental_duplex() -> None:
+    _assert_isolated_import_succeeds("""
+import sys
+
+import vllm_omni.distributed.omni_connectors.payload_schema
+import vllm_omni.distributed.omni_connectors.stage_payload
+import vllm_omni.distributed.omni_connectors.stage_payload_processor
+
+loaded = sorted(
+    name
+    for name in sys.modules
+    if name == "vllm_omni.experimental.fullduplex"
+    or name.startswith("vllm_omni.experimental.fullduplex.")
+)
+if loaded:
+    raise SystemExit("stage payload imports loaded experimental duplex: " + ", ".join(loaded))
+""")
+
+
+def test_payload_schema_common_layer_does_not_import_worker_package() -> None:
+    _assert_isolated_import_succeeds("""
+import sys
+
+import vllm_omni.distributed.omni_connectors.payload_schema
+
+loaded = sorted(
+    name
+    for name in sys.modules
+    if name == "vllm_omni.worker"
+    or name.startswith("vllm_omni.worker.")
+)
+if loaded:
+    raise SystemExit("payload schema imported worker modules: " + ", ".join(loaded))
+""")
+
+
 def test_stable_engine_does_not_expose_duplex_contract_modules() -> None:
     _assert_isolated_import_succeeds("""
 import importlib.util

@@ -20,7 +20,7 @@ import pytest
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.engine import EngineCoreEventType, FinishReason
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -155,6 +155,56 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     output = outputs[session.client_index].outputs[0]
     assert output.finish_reason is not None
     assert output.is_segment_finished is True
+
+
+def test_generation_finished_only_transfer_failure_emits_error_output() -> None:
+    request_id = "req-generation-transfer-error"
+    message = "stage_payload_processor_failed: injected processor failure"
+    sched = MagicMock()
+    sched.perf_metrics = None
+    sched.requests = {}
+    sched.running = []
+    sched.waiting = MagicMock()
+    sched.skipped_waiting = MagicMock()
+    sched.structured_output_manager.should_advance.return_value = False
+    sched._pending_finish_reqs = []
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {0: {request_id}}
+    sched.make_stats.return_value = None
+    sched._stage_transfer_error_outputs = {request_id: message}
+    sched._pop_stage_transfer_error_output = OmniSchedulerMixin._pop_stage_transfer_error_output.__get__(sched)
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = []
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {}
+    model_runner_output.routed_experts = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    assert outputs[0].finished_requests == {request_id}
+    assert len(outputs[0].outputs) == 1
+    terminal = outputs[0].outputs[0]
+    assert terminal.request_id == request_id
+    assert terminal.finish_reason is FinishReason.ERROR
+    assert terminal.stop_reason == message
+    assert sched._stage_transfer_error_outputs == {}
 
 
 def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:

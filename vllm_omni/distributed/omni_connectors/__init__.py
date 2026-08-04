@@ -23,6 +23,20 @@ try:
 except ImportError:
     MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
 from .factory import OmniConnectorFactory
+from .stage_payload import (
+    NoPayloadYet,
+    NormalizedStageOutput,
+    PayloadEmission,
+    ProcessorResult,
+    StageBoundary,
+    StagePayloadBuildContext,
+    StagePayloadEnvelope,
+    StagePayloadIdentity,
+    StagePayloadProcessor,
+    StageRequestView,
+    StageRoute,
+    StageSessionFence,
+)
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
     build_stage_connectors,
@@ -45,6 +59,19 @@ __all__ = [
     "OmniConnectorBase",
     # Factory
     "OmniConnectorFactory",
+    # Stage payload contract
+    "NoPayloadYet",
+    "NormalizedStageOutput",
+    "PayloadEmission",
+    "ProcessorResult",
+    "StageBoundary",
+    "StagePayloadBuildContext",
+    "StagePayloadEnvelope",
+    "StagePayloadIdentity",
+    "StagePayloadProcessor",
+    "StageRequestView",
+    "StageRoute",
+    "StageSessionFence",
     # Specific implementations
     "MooncakeConnector",  # compat alias → MooncakeStoreConnector
     "MooncakeStoreConnector",

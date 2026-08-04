@@ -231,6 +231,10 @@ class StagePipelineConfig:
     custom_process_next_stage_input_func: str | None = None
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
+    # New producer ABI and edge-owned merge contract. A processor requires an
+    # explicit schema; a schema alone intentionally supports legacy producers.
+    stage_payload_processor: str | None = None
+    stage_payload_schema: str | None = None
     sync_process_input_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -795,6 +799,47 @@ def _select_processor_funcs(
     return input_proc, next_stage_proc
 
 
+def validate_stage_payload_contracts(pipeline: PipelineConfig) -> None:
+    """Validate the migration matrix and route-owned schema configuration."""
+    destinations: dict[int, list[int]] = {stage.stage_id: [] for stage in pipeline.stages}
+    for destination in pipeline.stages:
+        for source_stage in destination.input_sources:
+            destinations.setdefault(source_stage, []).append(destination.stage_id)
+
+    for source in pipeline.stages:
+        processor_path = source.stage_payload_processor
+        schema_path = source.stage_payload_schema
+        if processor_path is not None and schema_path is None:
+            raise ValueError(
+                f"Stage {source.stage_id} configures a stage payload processor without an explicit stage payload schema"
+            )
+        if schema_path is None:
+            continue
+
+        stage_destinations = destinations.get(source.stage_id, [])
+        if len(stage_destinations) != 1:
+            raise ValueError(
+                f"Stage {source.stage_id} with an explicit stage payload contract "
+                "must have exactly one data-plane destination; received "
+                f"{stage_destinations}"
+            )
+
+        # Import lazily so ordinary legacy pipelines don't pull connector
+        # modules into config-only processes.
+        from vllm_omni.distributed.omni_connectors.stage_payload import StageRoute
+        from vllm_omni.distributed.omni_connectors.stage_payload_processor import (
+            load_stage_payload_schema,
+        )
+
+        load_stage_payload_schema(
+            schema_path,
+            expected_route=StageRoute(
+                source_stage=source.stage_id,
+                destination_stage=stage_destinations[0],
+            ),
+        )
+
+
 # Pipeline-wide DeployConfig fields that are propagated to every stage's
 # engine args during merge. These live at top level of the deploy YAML.
 _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
@@ -833,6 +878,10 @@ def _build_engine_args(
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
+    if ps.stage_payload_processor:
+        engine_args["stage_payload_processor"] = ps.stage_payload_processor
+    if ps.stage_payload_schema:
+        engine_args["stage_payload_schema"] = ps.stage_payload_schema
     # Subdirectory indirections from StagePipelineConfig (structural, not
     # deployment knobs).  Deploy YAML ``engine_extras`` can still override
     # these per-stage if needed.
@@ -895,6 +944,8 @@ def merge_pipeline_deploy(
     """Merge pipeline + deploy + platform overrides → list[StageConfig]."""
     if cli_overrides is None:
         cli_overrides = {}
+
+    validate_stage_payload_contracts(pipeline)
 
     deploy = _apply_platform_overrides(deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
@@ -971,6 +1022,14 @@ def merge_pipeline_deploy(
                 yaml_extras=extras,
             )
         )
+    result_by_id = {stage.stage_id: stage for stage in result}
+    for source in pipeline.stages:
+        if source.stage_payload_schema is None:
+            continue
+        destination_id = next(
+            destination.stage_id for destination in pipeline.stages if source.stage_id in destination.input_sources
+        )
+        result_by_id[destination_id].yaml_engine_args["stage_payload_input_schema"] = source.stage_payload_schema
     return result
 
 

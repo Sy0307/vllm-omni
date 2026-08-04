@@ -45,13 +45,16 @@ class TestOmniPayloadStruct:
         with pytest.raises(msgspec.ValidationError, match="unknown field"):
             to_struct({"meta": {"finisheed": True}})
 
-    def test_to_struct_rejects_minicpmo_duplex_runtime_handoff_fields(self):
+    def test_to_struct_accepts_declared_minicpmo_wire_metadata(self):
+        payload = to_struct({"meta": {"ref_audio_sr": 16000}})
+
+        assert payload.meta.ref_audio_sr == 16000
+
+    def test_to_struct_rejects_minicpmo_runtime_only_handoff_fields(self):
         with pytest.raises(msgspec.ValidationError, match="unknown field"):
             to_struct({"hidden_states": {"tts": torch.zeros(1)}})
         with pytest.raises(msgspec.ValidationError, match="unknown field"):
             to_struct({"ids": {"tts": [1]}})
-        with pytest.raises(msgspec.ValidationError, match="unknown field"):
-            to_struct({"meta": {"ref_audio_sr": 16000}})
         with pytest.raises(msgspec.ValidationError, match="unknown field"):
             to_struct({"meta": {"listen_token_id": 151685}})
 
