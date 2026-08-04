@@ -289,7 +289,7 @@ class MiniCPMO45DataPlaneSession:
         projected_chunks: list[_PendingAudioChunk] = []
         if audio_chunks:
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
-                raw_marks = audio_text_marks if idx == len(audio_chunks) - 1 else None
+                raw_marks = audio_text_marks if idx == len(audio_chunks) - 1 and audio_text_marks else None
                 if raw_marks is None and idx < len(fallback_marks):
                     raw_marks = fallback_marks[idx]
                 marks = tuple((int(mark["text_chars"]), int(mark["audio_end_ms"])) for mark in (raw_marks or ()))

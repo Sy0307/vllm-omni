@@ -138,6 +138,26 @@ def test_first_visible_chunk_starts_and_speech_end_finishes_one_output() -> None
     assert end.output_id == start.output_id
 
 
+def test_missing_native_alignment_uses_text_audio_fallback_mark() -> None:
+    fence = DuplexFence("session", incarnation=1, epoch=0)
+    data_plane = MiniCPMO45DataPlaneSession(_encode_audio)
+
+    events = tuple(
+        data_plane.project_output(
+            _output(
+                fence,
+                source_input_seq=3,
+                text="hello",
+                samples=240,
+            ),
+            context=_context(fence, source_input_seq=3),
+        )
+    )
+
+    chunk = next(event for event in events if isinstance(event, DuplexSpeakChunk))
+    assert chunk.audio_text_marks == ((5, 10),)
+
+
 def test_tts_segment_end_does_not_end_active_speech_output() -> None:
     fence = DuplexFence("session", incarnation=1, epoch=0)
     data_plane = MiniCPMO45DataPlaneSession(_encode_audio)
