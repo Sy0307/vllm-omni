@@ -3189,6 +3189,50 @@ async def test_typed_tts_segment_control_requires_context_and_preserves_pending_
 
 
 @pytest.mark.asyncio
+async def test_native_duplex_events_use_declared_runtime_data_plane_project_method():
+    class ProjectOnlyDataPlane:
+        def begin_request(self, request_id: str) -> None:
+            del request_id
+
+        def is_terminal(self, request_id: str | None) -> bool:
+            del request_id
+            return False
+
+        def mark_terminal(self, request_id: str) -> None:
+            del request_id
+
+        def close_stream(self, request_id: str) -> None:
+            del request_id
+
+        def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
+            del session_id, active_request_id
+
+        def project(self, result: object, *, context: object | None = None):
+            del result
+            assert isinstance(context, MiniCPMO45DataPlaneContext)
+            return [DuplexListen(fence=context.fence, source_input_seq=context.source_input_seq)]
+
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    handler._serving_runtime_adapter.data_plane = ProjectOnlyDataPlane()
+    session = DuplexSession(
+        session_id="sid-runtime-data-plane-project",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    ws = TimedWebSocket()
+
+    close_reason, emitted = await handler._send_native_duplex_events(
+        ws.send_json,
+        {"data_plane_outputs": []},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert ws.sent_types() == ["response.listen"]
+
+
+@pytest.mark.asyncio
 async def test_minicpmo_auto_response_pre_response_tts_boundary_continues_model_turn():
     request_id = "duplex-sid-pre-response-boundary-e0-stage0"
     engine = FakeEngineClient()
