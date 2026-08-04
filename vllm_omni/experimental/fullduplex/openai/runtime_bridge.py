@@ -22,6 +22,7 @@ from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexSpeakStart,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
+    MiniCPMO45SideControlProjection,
     _MiniCPMO45TtsSegmentControl,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
@@ -658,8 +659,31 @@ class NativeRuntimeBridgeMixin:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
-        for batch in self._serving_runtime_adapter.data_plane.project_runtime_batches(result, context=context):
-            for native_result in batch.events:
+        data_plane = self._serving_runtime_adapter.data_plane
+        if isinstance(data_plane, MiniCPMO45SideControlProjection):
+            for batch in data_plane.project_runtime_batches(result, context=context):
+                for native_result in batch.events:
+                    close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
+                        send_json,
+                        native_result,
+                        session=session,
+                        expected_epoch=expected_epoch,
+                    )
+                    emitted_response = emitted_response or did_emit
+                    close_reason = close_reason or close_reason_for_result
+                    if expected_epoch is not None and session.epoch != expected_epoch:
+                        return None, emitted_response
+                for control in batch.tts_segment_controls:
+                    await self._consume_minicpmo_tts_segment_control(
+                        send_json,
+                        control,
+                        session=session,
+                        expected_epoch=expected_epoch,
+                    )
+                    if expected_epoch is not None and session.epoch != expected_epoch:
+                        return None, emitted_response
+        else:
+            for native_result in data_plane.project(result, context=context):
                 close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                     send_json,
                     native_result,
@@ -668,15 +692,6 @@ class NativeRuntimeBridgeMixin:
                 )
                 emitted_response = emitted_response or did_emit
                 close_reason = close_reason or close_reason_for_result
-                if expected_epoch is not None and session.epoch != expected_epoch:
-                    return None, emitted_response
-            for control in batch.tts_segment_controls:
-                await self._consume_minicpmo_tts_segment_control(
-                    send_json,
-                    control,
-                    session=session,
-                    expected_epoch=expected_epoch,
-                )
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     return None, emitted_response
         return close_reason, emitted_response

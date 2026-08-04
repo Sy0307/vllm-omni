@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 from vllm.logger import init_logger
@@ -49,6 +50,18 @@ class _MiniCPMO45TtsSegmentControl:
 class _MiniCPMO45ProjectionBatch:
     events: tuple[DuplexModelEvent, ...]
     tts_segment_controls: tuple[_MiniCPMO45TtsSegmentControl, ...]
+
+
+@runtime_checkable
+class MiniCPMO45SideControlProjection(Protocol):
+    """Optional MiniCPM-only projection extension for runtime side controls."""
+
+    def project_runtime_batches(
+        self,
+        result: object,
+        *,
+        context: MiniCPMO45DataPlaneContext | None = None,
+    ) -> Iterator[_MiniCPMO45ProjectionBatch]: ...
 
 
 @dataclass(slots=True)
