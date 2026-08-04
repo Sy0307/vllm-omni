@@ -17,6 +17,10 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_client import Duple
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
+from vllm_omni.experimental.fullduplex.engine.contracts import (
+    DuplexOutputContext,
+    DuplexRequestIdentity,
+)
 from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexEventProtocolError,
     DuplexListen,
@@ -36,6 +40,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
+    ActiveOutputContinuation,
     MiniCPMO45ServingSessionState,
     PendingInputContinuation,
 )
@@ -54,7 +59,10 @@ from vllm_omni.experimental.fullduplex.openai.serving import (
     should_enable_duplex_endpoint,
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import DuplexWebSocketActor
-from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
+from vllm_omni.experimental.fullduplex.output import (
+    attach_duplex_output_context,
+    attach_duplex_output_decision,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -1609,11 +1617,9 @@ def _install_direct_silence_scheduler(
         if handler._native_silence_continuation_is_stale(
             session,
             request_id=kwargs["request_id"],
-            response_id=kwargs["response_id"],
-            response_owned=kwargs["response_owned"],
+            continuation=kwargs["continuation"],
             expected_epoch=kwargs["expected_epoch"],
             expected_incarnation=kwargs["expected_incarnation"],
-            expected_model_turn_id=kwargs["expected_model_turn_id"],
         ):
             return False
         append_ok, _ = await handler._append_runtime_input(
@@ -3035,6 +3041,71 @@ async def test_minicpmo_auto_response_tts_segment_boundary_appends_silence_unit(
     assert final is False
     assert session.active_response_id is not None
     assert "response.done" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_typed_tts_last_chunk_schedules_output_owned_silence_without_ending_response(monkeypatch):
+    request_id = "duplex-sid-typed-tts-last-chunk-e0-stage1"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-typed-tts-last-chunk",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.bind_request(request_id)
+    _install_direct_silence_scheduler(handler, session)
+    ws = TimedWebSocket()
+    fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
+    typed_events: list[object] = []
+    send_one_native_event = handler._send_one_native_duplex_event
+
+    async def capture_typed_event(send_json, event, **kwargs):
+        typed_events.append(event)
+        return await send_one_native_event(send_json, event, **kwargs)
+
+    monkeypatch.setattr(handler, "_send_one_native_duplex_event", capture_typed_event)
+    raw_output = attach_duplex_output_context(
+        SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[SimpleNamespace(text="keep speaking", token_ids=[], multimodal_output={})],
+            multimodal_output={
+                "audio": np.zeros(24000, dtype=np.float32),
+                "sr": 24000,
+                "meta.tts_is_last_chunk": np.array([1], dtype=np.int32),
+                "meta.duplex_speech_end": np.array([0], dtype=np.int32),
+            },
+        ),
+        DuplexOutputContext(
+            identity=DuplexRequestIdentity(session.session_id, fence),
+            final_stage_id=1,
+            segment_finished=True,
+            source_input_seq=7,
+        ),
+    )
+
+    close_reason, emitted = await handler._send_native_duplex_events(
+        ws.send_json,
+        {"data_plane_outputs": [raw_output]},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert not any(isinstance(event, DuplexSpeakEnd) for event in typed_events)
+    assert "response.done" not in ws.sent_types()
+    assert session.active_response_id is not None
+    assert session.active_request_id == request_id
+    assert len(engine.appended) == 1
+    native = handler._minicpmo_session_state(session)
+    assert isinstance(native.active_output_continuation, ActiveOutputContinuation)
+    assert native.active_output_continuation.output_id == session.active_output_id
+    _, mode, payload, final = engine.appended[0]
+    assert mode == "append_audio_chunk"
+    assert final is False
+    assert "duplex_turn_id" not in payload
 
 
 @pytest.mark.asyncio
