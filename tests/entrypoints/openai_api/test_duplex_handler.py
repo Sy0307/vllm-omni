@@ -13,14 +13,14 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
-from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
-from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexOutputContext,
     DuplexRequestIdentity,
 )
+from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
+from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexEventProtocolError,
     DuplexListen,

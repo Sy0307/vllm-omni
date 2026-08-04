@@ -12,7 +12,6 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.model_events import (
-    DuplexModelEvent,
     DuplexOutputLedger,
 )
 from vllm_omni.experimental.fullduplex.output import (
@@ -35,6 +34,16 @@ class MiniCPMO45DataPlaneContext:
     response_format: str = "wav"
     speed: float | None = None
     modalities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MiniCPMO45TtsSegmentComplete:
+    """Model-local control emitted after a non-terminal TTS segment."""
+
+    fence: DuplexFence
+    source_input_seq: int
+    request_id: str | None
+    output_id: str | None
 
 
 @dataclass(slots=True)
@@ -127,7 +136,7 @@ class MiniCPMO45DataPlaneSession:
         result: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[DuplexModelEvent]:
+    ) -> Iterator[object]:
         if not isinstance(result, dict):
             return
         outputs = result.get("data_plane_outputs")
@@ -141,7 +150,7 @@ class MiniCPMO45DataPlaneSession:
         output: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[DuplexModelEvent]:
+    ) -> Iterator[object]:
         context = context or MiniCPMO45DataPlaneContext()
         output_context = get_duplex_output_context(output)
         if isinstance(output_context, DuplexOutputContext):
@@ -221,6 +230,10 @@ class MiniCPMO45DataPlaneSession:
             ("duplex_speech_end", "turn_end", "end_of_turn"),
             default=False,
         ) or (finished and not context.auto_responds)
+        tts_segment_complete = not speech_end and (
+            _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
+            or (isinstance(output_context, DuplexOutputContext) and output_context.segment_finished)
+        )
         delta_text = self.segment_text_delta(request_id, text, turn_id="output")
         audio_text_marks = _audio_text_marks(mm_output)
         fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
@@ -254,6 +267,19 @@ class MiniCPMO45DataPlaneSession:
                 )
             else:
                 yield ledger.emit_end()
+        elif tts_segment_complete:
+            turn_state = None
+            if request_state is not None:
+                turn_state = request_state.turn(output_turn_id_from_metadata(mm_output) or "output")
+            if turn_state is None or not turn_state.tts_eos_done:
+                if turn_state is not None:
+                    turn_state.tts_eos_done = True
+                yield MiniCPMO45TtsSegmentComplete(
+                    fence=output_fence,
+                    source_input_seq=source_input_seq,
+                    request_id=request_id,
+                    output_id=ledger.active_output_id,
+                )
 
     def _output_ledger(self, fence: DuplexFence) -> DuplexOutputLedger:
         key = (fence.session_id, fence.incarnation)

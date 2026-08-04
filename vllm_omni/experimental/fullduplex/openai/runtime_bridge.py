@@ -21,6 +21,9 @@ from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexSpeakEnd,
     DuplexSpeakStart,
 )
+from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
+    MiniCPMO45TtsSegmentComplete,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     ActiveOutputContinuation,
     PendingInputContinuation,
@@ -788,6 +791,26 @@ class NativeRuntimeBridgeMixin:
         close_reason: str | None = None
         emitted_response = False
         if expected_epoch is not None and session.epoch != expected_epoch:
+            return close_reason, emitted_response
+        if isinstance(native_result, MiniCPMO45TtsSegmentComplete):
+            current_fence = DuplexFence(
+                session.session_id,
+                incarnation=session.incarnation,
+                epoch=session.epoch,
+            )
+            if native_result.fence != current_fence or native_result.request_id != session.active_request_id:
+                return close_reason, emitted_response
+            if native_result.output_id is None:
+                if session.active_output_id is not None:
+                    return close_reason, emitted_response
+            elif session.active_output_id != native_result.output_id:
+                return close_reason, emitted_response
+            await self._maybe_continue_native_response(
+                send_json,
+                session=session,
+                expected_epoch=expected_epoch,
+                source_input_seq=native_result.source_input_seq,
+            )
             return close_reason, emitted_response
         if isinstance(native_result, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)):
             return await self._send_typed_duplex_model_event(
