@@ -277,11 +277,7 @@ class MiniCPMO45DataPlaneSession:
                 speed=context.speed,
             )
         )
-        speech_end = _bool_metadata(
-            mm_output,
-            ("duplex_speech_end", "turn_end", "end_of_turn"),
-            default=False,
-        ) or (finished and not context.auto_responds)
+        speech_end = _bool_metadata(mm_output, ("duplex_speech_end",), default=False)
         tts_segment_complete = not speech_end and (
             _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
             or (isinstance(output_context, DuplexOutputContext) and output_context.segment_finished)
