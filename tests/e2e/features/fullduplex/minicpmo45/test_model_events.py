@@ -147,6 +147,7 @@ def test_tts_segment_end_does_not_end_active_speech_output() -> None:
             _output(
                 fence,
                 source_input_seq=1,
+                text="first segment",
                 samples=100,
                 finished=True,
                 tts_segment_end=True,
@@ -179,7 +180,7 @@ def test_listen_during_speech_does_not_end_or_replace_active_output() -> None:
 
     first = tuple(
         data_plane.project_output(
-            _output(fence, source_input_seq=1, samples=100),
+            _output(fence, source_input_seq=1, text="active speech", samples=100),
             context=_context(fence, source_input_seq=1),
         )
     )
