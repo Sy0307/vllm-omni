@@ -316,7 +316,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     f"prompt_len={info_dict.get('_omni_prompt_len')}"
                 )
             duplex_boundary = isinstance(meta, dict) and (
-                bool(meta.get("turn_start", False)) or bool(meta.get("turn_end", False))
+                bool(meta.get("turn_start", False)) or bool(meta.get("duplex_speech_end", False))
             )
             if native_duplex:
                 max_tokens = _DUPLEX_CODEC_TOKENS_PER_CHUNK
@@ -430,30 +430,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
         native_duplex_flags: list[torch.Tensor] = []
-        duplex_epochs: list[torch.Tensor] = []
-        duplex_turn_ids: list[torch.Tensor] = []
+        duplex_execution_ids: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
-        turn_end_flags: list[torch.Tensor] = []
+        speech_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             native_duplex = info_dict.get("native_duplex") is True
             if emit_duplex_metadata:
-                duplex_info = info_dict.get("duplex")
-                if not isinstance(duplex_info, dict):
-                    duplex_info = {}
-                epoch = duplex_info.get("epoch", -1)
-                turn_id = duplex_info.get("turn_id", -1)
-                if native_duplex and not all(
-                    isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
-                ):
-                    raise RuntimeError(
-                        "MiniCPM-o native duplex Talker requires non-negative integer "
-                        f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
-                    )
                 meta_info = info_dict.get("meta")
                 if not isinstance(meta_info, dict):
                     meta_info = {}
+                execution_id = meta_info.get("duplex_execution_id", -1)
+                if native_duplex and not (
+                    isinstance(execution_id, int) and not isinstance(execution_id, bool) and execution_id >= 0
+                ):
+                    raise RuntimeError(
+                        "MiniCPM-o native duplex Talker requires non-negative integer "
+                        f"duplex_execution_id, got {execution_id!r}"
+                    )
                 segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
                 if not isinstance(segment_text, str):
                     segment_text = ""
@@ -469,15 +464,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 else:
                     contains_turn_eos = False
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                duplex_execution_ids.append(
+                    torch.tensor(execution_id if isinstance(execution_id, int) else -1, dtype=torch.long)
+                )
                 segment_texts_utf8.append(
                     torch.tensor(
                         list(segment_text.encode("utf-8")),
                         dtype=torch.uint8,
                     )
                 )
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                speech_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
                 stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
@@ -553,10 +549,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             meta_outputs.update(
                 {
                     "native_duplex": native_duplex_flags,
-                    "duplex_epoch": duplex_epochs,
-                    "duplex_turn_id": duplex_turn_ids,
+                    "duplex_execution_id": duplex_execution_ids,
                     "llm_output_text_utf8": segment_texts_utf8,
-                    "turn_end": turn_end_flags,
+                    "duplex_speech_end": speech_end_flags,
                 }
             )
         multimodal_outputs: dict[str, Any] = {

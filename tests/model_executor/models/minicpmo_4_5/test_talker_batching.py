@@ -383,7 +383,7 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
     [
         ({"turn_start": True}, 0),
         ({}, 26),
-        ({"turn_end": True}, 0),
+        ({"duplex_speech_end": True}, 0),
     ],
 )
 def test_native_duplex_prefill_uses_official_chunk_limits(

@@ -118,7 +118,6 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
         bridge_states={
             "duplex": {
                 "epoch": 3,
-                "model_turn_id": 7,
             }
         }
     )
@@ -132,9 +131,10 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 3
     assert info["meta"]["turn_start"] is True
+    assert info["meta"]["duplex_execution_id"] == 0
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
-    assert info["duplex"]["turn_id"] == 7
+    assert "turn_id" not in info["duplex"]
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
@@ -152,7 +152,6 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
         bridge_states={
             "duplex": {
                 "epoch": 3,
-                "model_turn_id": 7,
             }
         }
     )
@@ -167,7 +166,7 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
             "meta": token_ids,
         },
     )
-    second_ids = [*first_ids, 9304, 23, 24, 9308]
+    second_ids = [*first_ids, 9304, 23, 9310]
     second = _output(
         prompt_ids=prompt_ids,
         output_ids=second_ids,
@@ -190,15 +189,18 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
 
     first_input = llm2tts([first], prompt=[{}], _streaming_context=context)[0]
     second_input = llm2tts([second], prompt=[{}], _streaming_context=context)[0]
-    context.bridge_states["duplex"]["model_turn_id"] = 8
     third_input = llm2tts([third], prompt=[{}], _streaming_context=context)[0]
 
     assert first_input["model_intermediate_buffer"]["ids"]["tts"] == [21, 22]
-    assert second_input["model_intermediate_buffer"]["ids"]["tts"] == [23, 24]
+    assert second_input["model_intermediate_buffer"]["ids"]["tts"] == [23, 9310]
     assert third_input["model_intermediate_buffer"]["ids"]["tts"] == [25, 26]
     assert first_input["model_intermediate_buffer"]["meta"]["turn_start"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["turn_start"] is False
     assert third_input["model_intermediate_buffer"]["meta"]["turn_start"] is True
+    assert first_input["model_intermediate_buffer"]["meta"]["duplex_execution_id"] == 0
+    assert second_input["model_intermediate_buffer"]["meta"]["duplex_execution_id"] == 0
+    assert second_input["model_intermediate_buffer"]["meta"]["duplex_speech_end"] is True
+    assert third_input["model_intermediate_buffer"]["meta"]["duplex_execution_id"] == 1
     assert first_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
@@ -231,7 +233,7 @@ def test_native_duplex_transcript_decodes_the_talker_condition_slice() -> None:
         )
 
     context = SimpleNamespace(
-        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        bridge_states={"duplex": {"epoch": 3}},
         source_token_decoder=lambda ids, **_: "".join(token_text.get(int(token_id), "") for token_id in ids),
     )
     first_ids = [9304, 21, 22, 9308]
