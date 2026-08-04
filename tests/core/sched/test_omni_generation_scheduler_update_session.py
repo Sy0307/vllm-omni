@@ -175,6 +175,7 @@ def test_generation_finished_only_transfer_failure_emits_error_output() -> None:
     sched.make_stats.return_value = None
     sched._stage_transfer_error_outputs = {request_id: message}
     sched._pop_stage_transfer_error_output = OmniSchedulerMixin._pop_stage_transfer_error_output.__get__(sched)
+    sched._attach_finished_request_sets = OmniSchedulerMixin._attach_finished_request_sets.__get__(sched)
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {}
