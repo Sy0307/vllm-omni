@@ -188,13 +188,16 @@ def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig
     if (
         deploy.async_chunk
         and has_inter_stage_edges
-        and not any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
+        and not any(
+            stage.stage_payload_processor or stage.async_chunk_process_next_stage_input_func
+            for stage in pipeline.stages
+        )
     ):
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
+            "declares a stage payload processor or dedicated legacy async-chunk "
+            "next-stage processor (``async_chunk_process_next_stage_input_func``). "
+            "Either set async_chunk=False or implement an async-chunk producer."
         )
 
 

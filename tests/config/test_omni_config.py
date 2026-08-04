@@ -356,13 +356,15 @@ def _stage_payload_pipeline(
     processor: str | None,
     schema: str | None,
     fanout: bool = False,
+    legacy_async_processor: bool = True,
+    legacy_full_processor: bool = True,
 ) -> PipelineConfig:
     stages = [
         StagePipelineConfig(
             stage_id=0,
             model_stage="source",
-            custom_process_next_stage_input_func=_LEGACY_FULL_PROCESSOR,
-            async_chunk_process_next_stage_input_func=_LEGACY_ASYNC_PROCESSOR,
+            custom_process_next_stage_input_func=(_LEGACY_FULL_PROCESSOR if legacy_full_processor else None),
+            async_chunk_process_next_stage_input_func=(_LEGACY_ASYNC_PROCESSOR if legacy_async_processor else None),
             stage_payload_processor=processor,
             stage_payload_schema=schema,
         ),
@@ -383,6 +385,28 @@ def _stage_payload_pipeline(
             )
         )
     return PipelineConfig(model_type="stage-payload-test", stages=tuple(stages))
+
+
+def test_stage_payload_processor_is_an_async_chunk_producer() -> None:
+    pipeline = _stage_payload_pipeline(
+        processor=_PAYLOAD_PROCESSOR,
+        schema=_PAYLOAD_SCHEMA,
+        legacy_async_processor=False,
+        legacy_full_processor=False,
+    )
+
+    stages = merge_pipeline_deploy(
+        pipeline,
+        DeployConfig(async_chunk=True),
+    )
+    structured = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(async_chunk=True),
+    )
+
+    assert stages[0].yaml_engine_args["stage_payload_processor"] == _PAYLOAD_PROCESSOR
+    assert "custom_process_next_stage_input_func" not in stages[0].yaml_engine_args
+    assert structured.stage_by_id(0).stage_payload_processor == _PAYLOAD_PROCESSOR
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
