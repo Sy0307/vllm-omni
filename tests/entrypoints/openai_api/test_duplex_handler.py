@@ -17,8 +17,8 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_client import Duple
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
-from vllm_omni.experimental.fullduplex.engine.model_events import DuplexEventProtocolError
 from vllm_omni.experimental.fullduplex.engine.model_events import (
+    DuplexEventProtocolError,
     DuplexListen,
     DuplexSpeakChunk,
     DuplexSpeakEnd,
@@ -37,6 +37,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     MiniCPMO45ServingSessionState,
+    PendingInputContinuation,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
@@ -1693,17 +1694,16 @@ async def test_minicpmo_clear_continuation_does_not_cancel_pending_silence_task(
 
     native = MiniCPMO45ServingSessionState()
     task = asyncio.create_task(_pending())
-    native.continuation_owner_id = "owner"
+    native.pending_input_continuation = PendingInputContinuation(incarnation=0, epoch=0, source_input_seq=1)
     native.continuation_units = 1
     native.pending_silence_task = task
-    native.pending_silence_owner_id = "owner"
 
     native.clear_continuation()
 
-    assert native.continuation_owner_id is None
+    assert native.pending_input_continuation is None
+    assert native.active_output_continuation is None
     assert native.continuation_units == 0
     assert native.pending_silence_task is None
-    assert native.pending_silence_owner_id is None
     assert not task.cancelled()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -3104,11 +3104,9 @@ async def test_minicpmo_pre_response_continuation_drops_after_model_turn_ends():
         if handler._native_silence_continuation_is_stale(
             session,
             request_id=kwargs["request_id"],
-            response_id=kwargs["response_id"],
-            response_owned=kwargs["response_owned"],
+            continuation=kwargs["continuation"],
             expected_epoch=kwargs["expected_epoch"],
             expected_incarnation=kwargs["expected_incarnation"],
-            expected_model_turn_id=kwargs["expected_model_turn_id"],
         ):
             return False
         append_ok, _ = await handler._append_runtime_input(

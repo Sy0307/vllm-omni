@@ -4,9 +4,54 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.input import (
     MiniCPMO45PcmAppendBuffer,
 )
+
+
+def _validate_identity_int(name: str, value: object) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a plain non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInputContinuation:
+    incarnation: int
+    epoch: int
+    source_input_seq: int
+
+    def __post_init__(self) -> None:
+        _validate_identity_int("incarnation", self.incarnation)
+        _validate_identity_int("epoch", self.epoch)
+        _validate_identity_int("source_input_seq", self.source_input_seq)
+
+    def is_stale(self, *, fence: DuplexFence, source_input_seq: int) -> bool:
+        return (
+            fence.incarnation != self.incarnation
+            or fence.epoch != self.epoch
+            or source_input_seq != self.source_input_seq
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveOutputContinuation:
+    incarnation: int
+    epoch: int
+    output_id: str
+
+    def __post_init__(self) -> None:
+        _validate_identity_int("incarnation", self.incarnation)
+        _validate_identity_int("epoch", self.epoch)
+        if not isinstance(self.output_id, str) or not self.output_id.strip():
+            raise ValueError("output_id must be a non-empty string")
+
+    def is_stale(self, *, fence: DuplexFence, output_id: str) -> bool:
+        return (
+            fence.incarnation != self.incarnation
+            or fence.epoch != self.epoch
+            or output_id != self.output_id
+        )
 
 
 @dataclass(slots=True)
@@ -23,10 +68,10 @@ class MiniCPMO45ServingSessionState:
     deferred_precreate_response: bool = False
     data_plane_task: asyncio.Task[None] | None = None
     data_plane_restart_requested: bool = False
-    continuation_owner_id: str | None = None
+    pending_input_continuation: PendingInputContinuation | None = None
+    active_output_continuation: ActiveOutputContinuation | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
-    pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
 
     def retain_committed_audio(
@@ -50,7 +95,7 @@ class MiniCPMO45ServingSessionState:
         return reserved_bytes
 
     def clear_continuation(self) -> None:
-        self.continuation_owner_id = None
+        self.pending_input_continuation = None
+        self.active_output_continuation = None
         self.continuation_units = 0
         self.pending_silence_task = None
-        self.pending_silence_owner_id = None

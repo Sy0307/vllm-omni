@@ -29,7 +29,6 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     PcmAppendReservation,
     ServingRuntimeSessionState,
-    payload_turn_id,
 )
 from vllm_omni.experimental.fullduplex.openai.session_attachment import (
     DuplexJournalOverflowError,
@@ -287,7 +286,7 @@ class DuplexSessionRunnerMixin:
             task = native.pending_silence_task
             if task is not None and task.done():
                 native.pending_silence_task = None
-                native.pending_silence_owner_id = None
+                native.pending_input_continuation = None
 
         def mark_pending_silence_superseded() -> None:
             task = native.pending_silence_task
@@ -299,7 +298,7 @@ class DuplexSessionRunnerMixin:
             # silence append may already have reached the Engine, and local
             # cancellation cannot retract that RPC. The sequencer preserves
             # wire order; before_append will skip silence that has not started.
-            native.pending_silence_owner_id = None
+            native.pending_input_continuation = None
 
         def real_native_input_waiting() -> bool:
             clear_completed_pending_silence()
@@ -325,16 +324,11 @@ class DuplexSessionRunnerMixin:
             if not silence_continuation:
                 mark_pending_silence_superseded()
             append_epoch = session.epoch
-            append_turn_id = payload_turn_id(payload)
-            if append_turn_id is None:
-                append_turn_id = session.turn_id
             request_id = self._native_stage0_request_id(session, append_epoch)
             if final or precreate_response:
                 session.bind_request(request_id)
-            if precreate_response:
-                session.bind_response_turn(append_turn_id)
             if precreate_response and session.active_response_id is None:
-                response_id = session.begin_response(turn_id=append_turn_id)
+                response_id = session.begin_response()
                 await emit_event(
                     self._response_created_payload(
                         session,
@@ -477,7 +471,7 @@ class DuplexSessionRunnerMixin:
                 def _clear_done_pending_silence(done: asyncio.Task[bool]) -> None:
                     if native.pending_silence_task is done:
                         native.pending_silence_task = None
-                        native.pending_silence_owner_id = None
+                        native.pending_input_continuation = None
 
                 task.add_done_callback(_clear_done_pending_silence)
             # Let this wire-order effect start before the next mailbox event can
@@ -489,12 +483,9 @@ class DuplexSessionRunnerMixin:
             payload: object,
             *,
             request_id: str,
-            owner_id: str,
-            response_id: str | None,
-            response_owned: bool,
+            continuation,
             expected_epoch: int | None,
             expected_incarnation: int,
-            expected_model_turn_id: int | None,
             send_json,
         ) -> bool:
             del send_json
@@ -534,11 +525,9 @@ class DuplexSessionRunnerMixin:
                     or self._native_silence_continuation_is_stale(
                         session,
                         request_id=request_id,
-                        response_id=response_id,
-                        response_owned=response_owned,
+                        continuation=continuation,
                         expected_epoch=expected_epoch,
                         expected_incarnation=expected_incarnation,
-                        expected_model_turn_id=expected_model_turn_id,
                     )
                 ):
                     return False
@@ -547,14 +536,11 @@ class DuplexSessionRunnerMixin:
                 return not real_native_input_waiting() and not self._native_silence_continuation_is_stale(
                     session,
                     request_id=request_id,
-                    response_id=response_id,
-                    response_owned=response_owned,
+                    continuation=continuation,
                     expected_epoch=expected_epoch,
                     expected_incarnation=expected_incarnation,
-                    expected_model_turn_id=expected_model_turn_id,
                 )
 
-            native.pending_silence_owner_id = owner_id
             task = await start_native_append(
                 payload,
                 final=False,
@@ -562,7 +548,7 @@ class DuplexSessionRunnerMixin:
                 before_append=_still_valid,
             )
             if task is None:
-                native.pending_silence_owner_id = None
+                native.pending_input_continuation = None
                 return False
             return True
 

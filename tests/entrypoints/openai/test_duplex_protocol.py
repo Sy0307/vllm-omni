@@ -362,7 +362,7 @@ def test_duplex_session_composes_single_owner_ledgers():
 
     session.append_text("hello")
     session.bind_request("req-1")
-    response_id = session.begin_response(turn_id=3)
+    response_id = session.begin_response()
     session.mark_audio_sent(duration_ms=240)
 
     assert not hasattr(session, "input")
@@ -372,7 +372,6 @@ def test_duplex_session_composes_single_owner_ledgers():
     assert session.pending_text == ("hello",)
     assert session.active_request_id == "req-1"
     assert session.active_response_id == response_id
-    assert session.active_response_turn_id == 3
     assert session.playback.sent_ms == 240
 
     try:

@@ -74,10 +74,10 @@ class ServingRuntimeSessionState(Protocol):
     deferred_precreate_response: bool
     data_plane_task: asyncio.Task[None] | None
     data_plane_restart_requested: bool
-    continuation_owner_id: str | None
+    pending_input_continuation: object | None
+    active_output_continuation: object | None
     continuation_units: int
     pending_silence_task: asyncio.Task[bool] | None
-    pending_silence_owner_id: str | None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None
 
     def retain_committed_audio(
