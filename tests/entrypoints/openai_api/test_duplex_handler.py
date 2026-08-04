@@ -3110,6 +3110,73 @@ async def test_typed_tts_last_chunk_schedules_output_owned_silence_without_endin
 
 
 @pytest.mark.asyncio
+async def test_typed_tts_segment_replay_stays_deduplicated_across_request_rearm():
+    request_id = "duplex-sid-typed-tts-replay-e0-stage1"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-typed-tts-replay",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    for _ in range(7):
+        session.commit_native_audio_input()
+    session.bind_request(request_id)
+    _install_direct_silence_scheduler(handler, session)
+    fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
+
+    def segment_output(*, source_input_seq: int, samples: int, text: str):
+        return attach_duplex_output_context(
+            SimpleNamespace(
+                request_id=request_id,
+                finished=False,
+                outputs=[SimpleNamespace(text=text, token_ids=[], multimodal_output={})],
+                multimodal_output={
+                    "audio": np.zeros(samples, dtype=np.float32),
+                    "sr": 24000,
+                    "meta.tts_is_last_chunk": np.array([1], dtype=np.int32),
+                    "meta.duplex_speech_end": np.array([0], dtype=np.int32),
+                },
+            ),
+            DuplexOutputContext(
+                identity=DuplexRequestIdentity(session.session_id, fence),
+                final_stage_id=1,
+                segment_finished=True,
+                source_input_seq=source_input_seq,
+            ),
+        )
+
+    segment_a = segment_output(source_input_seq=7, samples=24000, text="segment A")
+    await handler._send_native_duplex_events(
+        TimedWebSocket().send_json,
+        {"data_plane_outputs": [segment_a]},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+    assert len(engine.appended) == 1
+
+    handler._minicpmo_data_plane.begin_request(request_id)
+    await handler._send_native_duplex_events(
+        TimedWebSocket().send_json,
+        {"data_plane_outputs": [segment_a]},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+    assert len(engine.appended) == 1
+
+    session.commit_native_audio_input()
+    assert session.input_commit_seq == 8
+    segment_b = segment_output(source_input_seq=8, samples=48000, text="segment B")
+    await handler._send_native_duplex_events(
+        TimedWebSocket().send_json,
+        {"data_plane_outputs": [segment_b]},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+    assert len(engine.appended) == 2
+
+
+@pytest.mark.asyncio
 async def test_typed_tts_segment_control_requires_context_and_preserves_pending_input_source():
     request_id = "duplex-sid-typed-tts-control-e0-stage1"
 
@@ -3216,6 +3283,65 @@ async def test_native_duplex_events_use_declared_runtime_data_plane_project_meth
     handler._serving_runtime_adapter.data_plane = ProjectOnlyDataPlane()
     session = DuplexSession(
         session_id="sid-runtime-data-plane-project",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    ws = TimedWebSocket()
+
+    close_reason, emitted = await handler._send_native_duplex_events(
+        ws.send_json,
+        {"data_plane_outputs": []},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert ws.sent_types() == ["response.listen"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_data_plane_method_collision_does_not_opt_into_minicpmo_side_controls():
+    class CollidingDataPlane:
+        def begin_request(self, request_id: str) -> None:
+            del request_id
+
+        def is_terminal(self, request_id: str | None) -> bool:
+            del request_id
+            return False
+
+        def mark_terminal(self, request_id: str) -> None:
+            del request_id
+
+        def close_stream(self, request_id: str) -> None:
+            del request_id
+
+        def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
+            del session_id, active_request_id
+
+        def project(self, result: object, *, context: object | None = None):
+            del result
+            assert isinstance(context, MiniCPMO45DataPlaneContext)
+            return [DuplexListen(fence=context.fence, source_input_seq=context.source_input_seq)]
+
+        def project_runtime_batches(self):
+            raise AssertionError("method-name collision must not opt into MiniCPM side controls")
+
+    class GenericServingAdapter:
+        def __init__(self) -> None:
+            self.data_plane = CollidingDataPlane()
+            self.session_states: dict[str, MiniCPMO45ServingSessionState] = {}
+
+        def session_state(self, session_id: str) -> MiniCPMO45ServingSessionState:
+            return self.session_states.setdefault(session_id, MiniCPMO45ServingSessionState())
+
+        @staticmethod
+        def data_plane_context(**kwargs):
+            return MiniCPMO45DataPlaneContext(**kwargs)
+
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    handler._serving_runtime_adapter = GenericServingAdapter()
+    session = DuplexSession(
+        session_id="sid-runtime-data-plane-collision",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     ws = TimedWebSocket()
