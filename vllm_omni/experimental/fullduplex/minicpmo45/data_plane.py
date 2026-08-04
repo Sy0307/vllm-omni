@@ -7,9 +7,18 @@ import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
+    DuplexOutputContext,
     duplex_resource_request_belongs_to_session,
 )
-from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.model_events import (
+    DuplexModelEvent,
+    DuplexOutputLedger,
+)
+from vllm_omni.experimental.fullduplex.output import (
+    get_duplex_output_context,
+    get_duplex_output_decision,
+)
 
 logger = init_logger(__name__)
 
@@ -20,10 +29,8 @@ EncodeAudio = Callable[[object, int, str, float | None], str | None]
 class MiniCPMO45DataPlaneContext:
     """Serving state needed to project one MiniCPM data-plane output."""
 
-    epoch: int = 0
-    turn_id: int = 0
-    active_response_turn_id: int | None = None
-    active_response_id: str | None = None
+    fence: DuplexFence = field(default_factory=lambda: DuplexFence("unbound"))
+    source_input_seq: int = 0
     auto_responds: bool = False
     response_format: str = "wav"
     speed: float | None = None
@@ -44,9 +51,9 @@ class _RequestState:
     uses_segment_text_metadata: bool = False
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
-    turns: dict[int | None, _TurnState] = field(default_factory=dict)
+    turns: dict[object, _TurnState] = field(default_factory=dict)
 
-    def turn(self, turn_id: int | None) -> _TurnState:
+    def turn(self, turn_id: object) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
 
 
@@ -61,6 +68,7 @@ class MiniCPMO45DataPlaneSession:
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
         self._requests: dict[str, _RequestState] = {}
+        self._output_ledgers: dict[tuple[str, int], DuplexOutputLedger] = {}
 
     def begin_request(self, request_id: str) -> None:
         state = self._requests.setdefault(request_id, _RequestState())
@@ -97,6 +105,9 @@ class MiniCPMO45DataPlaneSession:
         for request_id in list(self._requests):
             if self.request_belongs_to_session(request_id, session_id):
                 self.close_request(request_id)
+        for key in tuple(self._output_ledgers):
+            if key[0] == session_id:
+                self._output_ledgers.pop(key, None)
 
     def has_request(self, request_id: str) -> bool:
         return request_id in self._requests
@@ -116,7 +127,7 @@ class MiniCPMO45DataPlaneSession:
         result: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[dict[str, object]]:
+    ) -> Iterator[DuplexModelEvent]:
         if not isinstance(result, dict):
             return
         outputs = result.get("data_plane_outputs")
@@ -130,15 +141,22 @@ class MiniCPMO45DataPlaneSession:
         output: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[dict[str, object]]:
+    ) -> Iterator[DuplexModelEvent]:
         context = context or MiniCPMO45DataPlaneContext()
-        stage_metrics = _output_stage_metrics(output)
-
-        def runtime_result(**values: object) -> dict[str, object]:
-            result = _runtime_result(**values)
-            if stage_metrics is not None:
-                result["stage_metrics"] = stage_metrics
-            return result
+        output_context = get_duplex_output_context(output)
+        if isinstance(output_context, DuplexOutputContext):
+            output_fence = output_context.identity.fence
+            source_input_seq = output_context.source_input_seq
+        else:
+            output_fence = context.fence
+            source_input_seq = context.source_input_seq
+        if (
+            output_fence.session_id != context.fence.session_id
+            or output_fence.incarnation != context.fence.incarnation
+            or output_fence.epoch != context.fence.epoch
+        ):
+            return
+        ledger = self._output_ledger(context.fence)
 
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str) or not request_id:
@@ -175,16 +193,6 @@ class MiniCPMO45DataPlaneSession:
                         mm_output = inner_mm_output
         mm_output = dict(mm_output) if isinstance(mm_output, Mapping) else {}
 
-        output_turn_id = output_turn_id_from_metadata(mm_output)
-        output_epoch = output_epoch_from_metadata(mm_output)
-        expected_turn_id = context.active_response_turn_id
-        stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id < expected_turn_id
-        if expected_turn_id is None and output_turn_id is not None:
-            stale_turn = output_turn_id < context.turn_id
-        stale_epoch = output_epoch is not None and output_epoch != context.epoch
-        if context.auto_responds and (stale_turn or stale_epoch):
-            return
-
         mm_text = _llm_output_text(mm_output)
         if mm_text:
             text = mm_text
@@ -194,26 +202,12 @@ class MiniCPMO45DataPlaneSession:
             text = ""
 
         finished = bool(getattr(output, "finished", False))
-        tts_is_last_chunk = _bool_metadata(mm_output, ("tts_is_last_chunk",), default=False)
         token_ids = _completion_token_ids(completion)
         native_decision = _native_decision(completion, mm_output, token_ids=token_ids, finished=finished)
         if native_decision == "listen":
-            listen_result = runtime_result(
-                stage_role="llm",
-                is_listen=True,
-                model_listen=True,
-                listen_source="model_listen",
-                data_plane_request_id=request_id,
-                end_of_turn=False,
-            )
-            if output_turn_id is not None:
-                listen_result["model_turn_id"] = output_turn_id
-            yield listen_result
+            yield ledger.emit_listen(source_input_seq=source_input_seq)
             return
 
-        raw_audio = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
-        raw_audio_samples = _audio_num_samples(raw_audio)
-        offset_before = self.audio_offset(request_id)
         audio_chunks = list(
             self._encode_audio_chunks_with_duration(
                 mm_output,
@@ -222,236 +216,54 @@ class MiniCPMO45DataPlaneSession:
                 speed=context.speed,
             )
         )
-        stage_turn_end = _bool_metadata(mm_output, ("turn_end", "end_of_turn"), default=False)
-        terminal_turn_state = request_state.turn(output_turn_id) if request_state is not None else None
-        stage_tts_eos = (
-            context.auto_responds
-            and 151645 in token_ids
-            and not audio_chunks
-            and raw_audio_samples is not None
-            and (raw_audio_samples == 0 or raw_audio_samples == offset_before)
-            and (terminal_turn_state is None or not terminal_turn_state.tts_eos_done)
-        )
-        tts_segment_end = bool(tts_is_last_chunk or stage_tts_eos) and (
-            terminal_turn_state is None or not terminal_turn_state.tts_eos_done
-        )
-        if tts_segment_end and terminal_turn_state is not None:
-            terminal_turn_state.tts_eos_done = True
-        stage_turn_end_new = bool(stage_turn_end) and (
-            terminal_turn_state is None or not terminal_turn_state.turn_eos_done
-        )
-        if stage_turn_end_new and terminal_turn_state is not None:
-            terminal_turn_state.turn_eos_done = True
-        unit_end_of_turn = stage_turn_end_new or (finished and not context.auto_responds)
+        speech_end = _bool_metadata(
+            mm_output,
+            ("duplex_speech_end", "turn_end", "end_of_turn"),
+            default=False,
+        ) or (finished and not context.auto_responds)
+        delta_text = self.segment_text_delta(request_id, text, turn_id="output")
+        audio_text_marks = _audio_text_marks(mm_output)
+        fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
 
-        text_turn_id = output_turn_id if output_turn_id is not None else context.turn_id
-        text_turn_state = request_state.turn(text_turn_id) if request_state is not None else None
         if audio_chunks:
-            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
-            last_idx = len(audio_chunks) - 1
-            sample_rate_hz = _sample_rate_hz(mm_output)
-            audio_text_marks = _audio_text_marks(mm_output)
-            fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
-            audio_results: list[dict[str, object]] = []
             for idx, (audio, duration_ms) in enumerate(audio_chunks):
-                native_result = runtime_result(
-                    stage_role="tts",
-                    is_listen=False,
-                    data_plane_request_id=request_id,
-                    text=delta_text if idx == 0 else "",
+                raw_marks = audio_text_marks if idx == len(audio_chunks) - 1 else None
+                if raw_marks is None and idx < len(fallback_marks):
+                    raw_marks = fallback_marks[idx]
+                marks = tuple((int(mark["text_chars"]), int(mark["audio_end_ms"])) for mark in (raw_marks or ()))
+                yield from ledger.emit_chunk(
+                    source_input_seq=source_input_seq,
+                    text_delta=delta_text if idx == 0 else "",
                     audio_data=audio,
                     audio_format=context.response_format,
                     audio_duration_ms=duration_ms,
-                    audio_text_mark=idx == last_idx,
-                    sample_rate_hz=sample_rate_hz,
-                    end_of_turn=unit_end_of_turn and idx == last_idx,
-                    abort_data_plane_request=tts_segment_end and idx == last_idx,
+                    audio_text_marks=marks,
                 )
-                if output_turn_id is not None:
-                    native_result["model_turn_id"] = output_turn_id
-                if audio_text_marks and idx == last_idx:
-                    native_result["audio_text_marks"] = audio_text_marks
-                    native_result["audio_text_marks_are_cumulative"] = True
-                elif idx < len(fallback_marks) and fallback_marks[idx]:
-                    native_result["audio_text_marks"] = fallback_marks[idx]
-                    native_result["audio_text_marks_are_cumulative"] = True
-                audio_results.append(native_result)
-
-            if context.auto_responds:
-                if delta_text and text_turn_state is not None:
-                    text_turn_state.has_text = True
-                future_model_turn = (
-                    context.active_response_turn_id is not None
-                    and output_turn_id is not None
-                    and output_turn_id > context.active_response_turn_id
-                )
-                response_turn_bound = context.active_response_id is not None and (
-                    output_turn_id is None
-                    or context.active_response_turn_id is None
-                    or context.active_response_turn_id == output_turn_id
-                )
-                turn_has_text = text_turn_state is not None and text_turn_state.has_text
-                if not future_model_turn and not response_turn_bound and not turn_has_text:
-                    if request_state is not None:
-                        if tts_segment_end:
-                            request_state.pending_audio_without_text.clear()
-                        else:
-                            request_state.pending_audio_without_text.extend(audio_results)
-                    if tts_segment_end:
-                        terminal_result = dict(audio_results[-1])
-                        terminal_result.update(
-                            audio_data="",
-                            audio_duration_ms=0,
-                            audio_text_mark=False,
-                            end_of_turn=True,
-                        )
-                        yield terminal_result
-                    return
-                if request_state is not None and request_state.pending_audio_without_text:
-                    pending = request_state.pending_audio_without_text
-                    request_state.pending_audio_without_text = []
-                    yield from pending
-            yield from audio_results
-            return
-
-        if context.auto_responds and request_state is not None and isinstance(text, str) and text:
-            pending_audio = request_state.pending_audio_without_text
-            request_state.pending_audio_without_text = []
-            if pending_audio:
-                delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
-                if delta_text:
-                    pending_audio[0]["text"] = delta_text
-                    if text_turn_state is not None:
-                        text_turn_state.has_text = True
-                    total_duration_ms = sum(
-                        max(0, int(result.get("audio_duration_ms", 0) or 0)) for result in pending_audio
-                    )
-                    if total_duration_ms > 0 and not pending_audio[-1].get("audio_text_marks"):
-                        pending_audio[-1]["audio_text_marks"] = [
-                            {"text_chars": len(delta_text), "audio_end_ms": total_duration_ms}
-                        ]
-                        pending_audio[-1]["audio_text_marks_are_cumulative"] = True
-                    if unit_end_of_turn:
-                        pending_audio[-1]["end_of_turn"] = True
-                    if tts_segment_end:
-                        pending_audio[-1]["abort_data_plane_request"] = True
-                    yield from pending_audio
-                    return
-                request_state.pending_audio_without_text = pending_audio
-
-        if tts_segment_end:
-            if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
-                request_state.pending_audio_without_text[-1]["end_of_turn"] = True
-                request_state.pending_audio_without_text[-1]["abort_data_plane_request"] = True
-            terminal_result = runtime_result(
-                stage_role="tts",
-                is_listen=False,
-                data_plane_request_id=request_id,
-                text="",
-                audio_data="",
+        elif delta_text:
+            yield from ledger.emit_chunk(
+                source_input_seq=source_input_seq,
+                text_delta=delta_text,
                 audio_format=context.response_format,
-                audio_text_mark=False,
-                end_of_turn=unit_end_of_turn,
-                abort_data_plane_request=True,
             )
-            if output_turn_id is not None:
-                terminal_result["model_turn_id"] = output_turn_id
-            yield terminal_result
-            return
 
-        if context.active_response_id is not None and unit_end_of_turn:
-            terminal_result = runtime_result(
-                stage_role="tts",
-                is_listen=False,
-                data_plane_request_id=request_id,
-                text="",
-                audio_data="",
-                audio_format=context.response_format,
-                audio_text_mark=False,
-                end_of_turn=True,
-            )
-            if output_turn_id is not None:
-                terminal_result["model_turn_id"] = output_turn_id
-            yield terminal_result
-            return
-
-        if request_id is not None and context.auto_responds and unit_end_of_turn and context.active_response_id is None:
-            # The legacy projector only removed the request-scoped pending
-            # buffer here when no explicit model-turn key was present.
-            if request_state is not None and output_turn_id is None:
-                request_state.pending_audio_without_text.clear()
-            terminal_result = runtime_result(
-                stage_role="tts",
-                is_listen=False,
-                data_plane_request_id=request_id,
-                text="",
-                audio_data="",
-                audio_format=context.response_format,
-                audio_text_mark=False,
-                end_of_turn=True,
-                abort_data_plane_request=True,
-            )
-            if output_turn_id is not None:
-                terminal_result["model_turn_id"] = output_turn_id
-            yield terminal_result
-            return
-
-        if (
-            finished
-            and context.auto_responds
-            and context.active_response_id is not None
-            and request_id is not None
-            and not unit_end_of_turn
-        ):
-            listen_result = runtime_result(
-                stage_role="llm",
-                is_listen=True,
-                model_listen=False,
-                listen_source="auto_response_segment_complete",
-                reason="auto_response_segment_complete",
-                data_plane_request_id=request_id,
-                end_of_turn=False,
-            )
-            if output_turn_id is not None:
-                listen_result["model_turn_id"] = output_turn_id
-            yield listen_result
-            return
-
-        if not text:
-            if context.auto_responds:
-                return
-            if finished:
-                listen_result = runtime_result(
-                    stage_role="llm",
-                    is_listen=True,
-                    model_listen=False,
-                    listen_source="data_plane_finished_without_output",
-                    reason="data_plane_finished_without_output",
-                    data_plane_request_id=request_id,
-                    end_of_turn=False,
+        if speech_end:
+            if ledger.active_output_id is None:
+                yield ledger.emit_listen(
+                    source_input_seq=source_input_seq,
+                    reason="model_unit_completed_without_output",
                 )
-                if output_turn_id is not None:
-                    listen_result["model_turn_id"] = output_turn_id
-                yield listen_result
-            return
-        if context.auto_responds:
-            return
-        if "audio" in context.modalities:
-            yield runtime_result(
-                stage_role="tts",
-                error_code="runtime_data_plane_text_without_audio",
-                error="MiniCPM-o native duplex data-plane produced text without audio.",
-                data_plane_request_id=request_id,
-            )
-            return
-        yield runtime_result(
-            stage_role="llm",
-            is_listen=False,
-            data_plane_request_id=request_id,
-            text=text if isinstance(text, str) else "",
-            audio_data="",
-            end_of_turn=unit_end_of_turn,
-        )
+            else:
+                yield ledger.emit_end()
+
+    def _output_ledger(self, fence: DuplexFence) -> DuplexOutputLedger:
+        key = (fence.session_id, fence.incarnation)
+        ledger = self._output_ledgers.get(key)
+        if ledger is None:
+            ledger = DuplexOutputLedger(fence)
+            self._output_ledgers[key] = ledger
+        elif ledger.fence.epoch < fence.epoch:
+            ledger.advance_epoch(fence)
+        return ledger
 
     def segment_text_delta(self, request_id: str | None, text: object, *, turn_id: int | None = None) -> str:
         if not isinstance(text, str) or not text:

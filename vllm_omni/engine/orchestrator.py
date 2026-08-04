@@ -1303,6 +1303,15 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
+            if self._is_duplex_session_request(req_state):
+                from vllm_omni.experimental.fullduplex.output import (
+                    attach_duplex_output_context,
+                )
+
+                attach_duplex_output_context(
+                    output,
+                    self._duplex_output_context(req_state, stage_id=stage_id),
+                )
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
@@ -1341,6 +1350,7 @@ class Orchestrator:
                 req_id,
                 output,
                 duplex_output_decision,
+                self._duplex_output_context(req_state, stage_id=stage_id),
                 stage_metrics,
                 submit_ts,
             )
@@ -1544,13 +1554,17 @@ class Orchestrator:
         req_id: str,
         output: Any,
         decision: DuplexOutputDecision,
+        context: DuplexOutputContext | None,
         stage_metrics: Any,
         submit_ts: float | None,
     ) -> None:
         action = getattr(decision.action, "value", decision.action)
         if action != "direct_response":
             raise ValueError(f"Unsupported duplex output action: {action}")
-        from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
+        from vllm_omni.experimental.fullduplex.output import (
+            attach_duplex_output_context,
+            attach_duplex_output_decision,
+        )
 
         engine_output = attach_duplex_output_decision(
             OmniRequestOutput(
@@ -1562,6 +1576,8 @@ class Orchestrator:
             ),
             decision,
         )
+        if context is not None:
+            attach_duplex_output_context(engine_output, context)
         await self.output_async_queue.put(
             OutputMessage(
                 request_id=req_id,
