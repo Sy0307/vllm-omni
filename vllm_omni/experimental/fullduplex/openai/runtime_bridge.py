@@ -19,7 +19,6 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     coerce_int,
-    payload_turn_id,
 )
 
 logger = init_logger(__name__)
@@ -62,7 +61,6 @@ class NativeRuntimeBridgeMixin:
                 open_kwargs["fence"] = DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=session.turn_id,
                     incarnation=session.incarnation,
                 )
             result = await open_session(session.session_id, **open_kwargs)
@@ -119,19 +117,9 @@ class NativeRuntimeBridgeMixin:
             if expected_epoch is not None and self._callable_accepts_keyword(append_input, "expected_epoch"):
                 append_kwargs["expected_epoch"] = expected_epoch
             if self._callable_accepts_keyword(append_input, "fence"):
-                payload_turn = payload_turn_id(payload)
                 append_kwargs["fence"] = DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=(
-                        payload_turn
-                        if payload_turn is not None
-                        else (
-                            session.active_response_turn_id
-                            if session.active_response_turn_id is not None
-                            else session.turn_id
-                        )
-                    ),
                     incarnation=session.incarnation,
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
@@ -466,7 +454,6 @@ class NativeRuntimeBridgeMixin:
                 signal_kwargs["fence"] = fence or DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=session.turn_id,
                     incarnation=session.incarnation,
                 )
             if next_fence is not None and self._callable_accepts_keyword(signal_turn, "next_fence"):
@@ -513,7 +500,6 @@ class NativeRuntimeBridgeMixin:
                 close_kwargs["fence"] = DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=session.turn_id,
                     incarnation=session.incarnation,
                 )
             result = await close_session(session.session_id, **close_kwargs)

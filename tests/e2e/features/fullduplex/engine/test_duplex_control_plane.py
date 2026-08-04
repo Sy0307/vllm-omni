@@ -50,14 +50,13 @@ class _Extension:
         fence,
         session_config,
         runtime_config,
-        seq,
-        turn_seq,
+        input_seq,
         mode,
         payload,
         final,
         sampling_params,
     ):
-        del request_id, fence, session_config, runtime_config, seq, turn_seq, mode, payload, final
+        del request_id, fence, session_config, runtime_config, input_seq, mode, payload, final
         assert sampling_params == "configured-0"
         return DuplexAppendPlan(prompt={"prompt_token_ids": [1, 2, 3]})
 
@@ -1186,6 +1185,7 @@ def test_stale_output_is_rejected_before_extension_decision() -> None:
         ),
         final_stage_id=1,
         segment_finished=True,
+        source_input_seq=0,
     )
 
     assert plane.decide_output(0, object(), context) is None
@@ -1268,3 +1268,40 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
         for submission in stage_port.submit_calls
         if submission.context.session_id == blocked.session_id
     ] == [blocked.session_id]
+
+
+@pytest.mark.asyncio
+async def test_completed_operation_retry_preserves_input_sequence() -> None:
+    stage_port = _TypedStagePort()
+    result_sink: asyncio.Queue = asyncio.Queue()
+    plane = DuplexControlPlane(
+        extension=_Extension(),
+        stage_port=stage_port,
+        result_sink=result_sink,
+    )
+    fence = DuplexFence("sid-operation-retry")
+    session = plane.sessions.open_session(
+        fence,
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+
+    for control_id in ("append-first", "append-retry"):
+        await plane.handle(
+            AppendDuplexInputMessage(
+                control_id=control_id,
+                operation_id="same-operation",
+                fence=fence,
+                session_id=fence.session_id,
+                mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
+                payload={"audio": b"pcm"},
+            )
+        )
+
+    first = await result_sink.get()
+    retry = await result_sink.get()
+    assert first.stage_results == retry.stage_results
+    assert first.stage_results[0]["result"]["input_seq"] == 1
+    assert session.input_seq == 1
+    assert len(stage_port.submit_calls) == 1

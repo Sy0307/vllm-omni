@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +36,64 @@ def test_duplex_fence_is_immutable():
     assert not hasattr(fence, "__dict__")
 
 
+def test_duplex_fence_contains_only_session_incarnation_and_epoch() -> None:
+    assert [field.name for field in fields(DuplexFence)] == [
+        "session_id",
+        "incarnation",
+        "epoch",
+    ]
+
+
+def test_output_progress_does_not_partition_input_sequence() -> None:
+    manager = DuplexSessionRuntimeManager()
+    session = manager.open_session(
+        DuplexFence("sid-independent-input-output", incarnation=3, epoch=1),
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+
+    first = session.append_input(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=session.fence,
+    )
+    session.output_ledger.emit_chunk(
+        source_input_seq=first.input_seq,
+        audio_data="YQ==",
+        audio_format="pcm16",
+    )
+    second = session.append_input(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=session.fence,
+    )
+
+    assert first.input_seq == 1
+    assert second.input_seq == 2
+
+
+def test_rejected_append_reservation_does_not_consume_input_sequence() -> None:
+    manager = DuplexSessionRuntimeManager()
+    session = manager.open_session(
+        DuplexFence("sid-stale-reservation"),
+        capabilities=DuplexRuntimeCapabilities(
+            input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK},
+        ),
+    )
+    first = session.prepare_append(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=session.fence,
+    )
+    stale = session.prepare_append(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=session.fence,
+    )
+
+    assert session.commit_append(first).input_seq == 1
+    with pytest.raises(RuntimeError, match="reservation is stale"):
+        session.commit_append(stale)
+    assert session.input_seq == 1
+
+
 def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
     manager = DuplexSessionRuntimeManager()
     session = manager.open_session(
@@ -52,7 +110,7 @@ def test_duplex_runtime_tracks_stage_bindings_and_barge_in_epoch():
     stale_request_ids = session.release_fence(session.fence)
     session.accept_fence(next_fence)
 
-    assert update.seq == 1
+    assert update.input_seq == 1
     assert session.fence == next_fence
     assert stale_request_ids == ["req-stage0", "req-stage1"]
     assert session.stage_bindings == {}
@@ -228,7 +286,7 @@ def test_duplex_runtime_cancel_fence_rejects_late_append_and_accepts_next_epoch(
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
         fence=next_fence,
     )
-    assert update.seq == 1
+    assert update.input_seq == 1
 
 
 def test_duplex_runtime_stale_close_preserves_live_session_and_bindings():
@@ -275,7 +333,7 @@ def test_duplex_runtime_reopen_rejects_late_append_from_old_incarnation():
         new_session.append_input(
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
             fence=new_fence,
-        ).seq
+        ).input_seq
         == 1
     )
 
@@ -288,8 +346,7 @@ def test_duplex_prompt_expands_incarnation_metadata():
         fence=fence,
         session_config={},
         runtime_config={},
-        seq=1,
-        turn_seq=1,
+        input_seq=1,
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
         payload={"is_speech": True},
         final=False,
@@ -298,7 +355,7 @@ def test_duplex_prompt_expands_incarnation_metadata():
     assert prompt["model_intermediate_buffer"]["duplex"]["incarnation"] == 3
 
 
-def test_duplex_runtime_tracks_turn_local_append_sequence():
+def test_duplex_runtime_tracks_monotonic_input_sequence_until_epoch_change():
     manager = DuplexSessionRuntimeManager()
     session = manager.open_session(
         DuplexFence("sid-turn-seq"),
@@ -309,19 +366,22 @@ def test_duplex_runtime_tracks_turn_local_append_sequence():
 
     first = session.append_input(mode=DuplexInputMode.APPEND_AUDIO_CHUNK, fence=session.fence)
     second = session.append_input(mode=DuplexInputMode.APPEND_AUDIO_CHUNK, fence=session.fence)
-    next_turn = DuplexFence("sid-turn-seq", turn_id=1, response_seq=1)
     third = session.append_input(
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-        fence=next_turn,
+        fence=session.fence,
     )
     fourth = session.append_input(
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-        fence=next_turn,
+        fence=session.fence,
+    )
+    next_epoch = DuplexFence("sid-turn-seq", epoch=1)
+    after_cancel = session.append_input(
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        fence=next_epoch,
     )
 
-    assert [first.seq, second.seq, third.seq, fourth.seq] == [1, 2, 3, 4]
-    assert [first.turn_seq, second.turn_seq, third.turn_seq, fourth.turn_seq] == [1, 2, 1, 2]
-    assert [first.turn_id, second.turn_id, third.turn_id, fourth.turn_id] == [0, 0, 1, 1]
+    assert [first.input_seq, second.input_seq, third.input_seq, fourth.input_seq] == [1, 2, 3, 4]
+    assert after_cancel.input_seq == 1
 
 
 def test_duplex_runtime_rejects_unsupported_append_mode():
@@ -399,18 +459,14 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
 
 
 def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():
-    current = DuplexFence("sid", epoch=2, turn_id=3, response_seq=4)
+    current = DuplexFence("sid", epoch=2)
     manager = DuplexSessionRuntimeManager()
     session = manager.open_session(
         current,
         capabilities=DuplexRuntimeCapabilities(input_modes={DuplexInputMode.APPEND_AUDIO_CHUNK}),
     )
 
-    for stale in (
-        DuplexFence("sid", epoch=1, turn_id=99, response_seq=99),
-        DuplexFence("sid", epoch=2, turn_id=2, response_seq=4),
-        DuplexFence("sid", epoch=2, turn_id=3, response_seq=3),
-    ):
+    for stale in (DuplexFence("sid", epoch=1),):
         with pytest.raises(RuntimeError, match="fence mismatch"):
             session.accept_fence(stale)
         assert session.fence == current
@@ -426,7 +482,7 @@ def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():
 
 
 def test_resource_request_id_is_derived_from_fence_and_role():
-    fence = DuplexFence("sid-with-dashes", epoch=7, turn_id=11, response_seq=13)
+    fence = DuplexFence("sid-with-dashes", epoch=7)
 
     assert duplex_resource_request_id(fence, "stage0") == "duplex-s.c2lkLXdpdGgtZGFzaGVz.i.0.e.7.r.stage0"
     assert duplex_resource_request_id(fence, "stage1") == "duplex-s.c2lkLXdpdGgtZGFzaGVz.i.0.e.7.r.stage1"
@@ -457,14 +513,13 @@ def test_resource_request_id_session_membership_uses_encoded_identity():
 
 
 def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
-    fence = DuplexFence("sid", turn_id=1, response_seq=1)
+    fence = DuplexFence("sid", epoch=1)
     prompt = build_duplex_data_plane_prompt(
         request_id=duplex_resource_request_id(fence, "stage0"),
         fence=fence,
         session_config={},
         runtime_config={},
-        seq=2,
-        turn_seq=1,
+        input_seq=2,
         mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
         payload={
             "audio": "AAAAAA==",

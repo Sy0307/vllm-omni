@@ -257,17 +257,12 @@ class _OrchestratorDuplexStagePort:
         if not isinstance(duplex_state, dict):
             duplex_state = {}
             request_state.streaming.bridge_states["duplex"] = duplex_state
-        previous_epoch = duplex_state.get("epoch")
-        if not isinstance(duplex_state.get("model_turn_id"), int) or previous_epoch != context.fence.epoch:
-            duplex_state["model_turn_id"] = context.fence.turn_id
         duplex_state.update(
             {
                 "session_id": context.session_id,
                 "fence": context.fence,
                 "incarnation": context.fence.incarnation,
                 "epoch": context.fence.epoch,
-                "turn_id": context.fence.turn_id,
-                "response_seq": context.fence.response_seq,
                 "session_config": dict(context.session_config),
                 "runtime_config": dict(context.runtime_config),
             }
@@ -303,6 +298,9 @@ class _OrchestratorDuplexStagePort:
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+        duplex_state = request_state.streaming.bridge_states.setdefault("duplex", {})
+        if isinstance(duplex_state, dict):
+            duplex_state["source_input_seq"] = submission.source_input_seq
         request = build_engine_core_request_from_tokens(
             request_id=context.request_id,
             prompt=dict(submission.prompt),
@@ -1498,6 +1496,15 @@ class Orchestrator:
             ),
             final_stage_id=req_state.final_stage_id,
             segment_finished=req_state.streaming.enabled and req_state.streaming.segment_finished,
+            source_input_seq=(
+                int(duplex_state["source_input_seq"])
+                if isinstance(
+                    (duplex_state := req_state.streaming.bridge_states.get("duplex")),
+                    dict,
+                )
+                and type(duplex_state.get("source_input_seq")) is int
+                else 0
+            ),
             segment_token_ids=tuple(req_state.streaming.segment_token_ids),
             segment_output_metadata=req_state.streaming.segment_output_metadata,
         )

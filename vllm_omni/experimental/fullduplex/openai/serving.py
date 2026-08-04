@@ -1024,7 +1024,6 @@ class OmniDuplexSessionHandler(
                 fence=DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=session.turn_id,
                     incarnation=session.incarnation,
                 ),
                 expected_lease_generation=expected_generation,

@@ -78,8 +78,8 @@ async def test_async_omni_open_duplex_forwards_session_config_and_timeout():
 @pytest.mark.asyncio
 async def test_async_omni_duplex_runtime_controls_forward_timeout():
     calls = []
-    cancelled_fence = DuplexFence("sid", epoch=2, turn_id=3)
-    next_fence = DuplexFence("sid", epoch=3, turn_id=3)
+    cancelled_fence = DuplexFence("sid", epoch=2)
+    next_fence = DuplexFence("sid", epoch=3)
 
     async def append_duplex_input_async(session_id, **kwargs):
         calls.append(("append", session_id, kwargs))
@@ -242,7 +242,7 @@ async def test_async_omni_duplex_append_forwards_fence():
     app.request_states = {}
     app._final_output_handler = lambda: None
     app.engine = SimpleNamespace(append_duplex_input_async=append_duplex_input_async)
-    fence = DuplexFence("sid", epoch=1, turn_id=2)
+    fence = DuplexFence("sid", epoch=1)
 
     await app.append_duplex_input_async(
         "sid",

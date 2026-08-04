@@ -762,7 +762,6 @@ class DuplexSessionRunnerMixin:
                             fence=DuplexFence(
                                 session.session_id,
                                 epoch=session.epoch,
-                                turn_id=session.turn_id,
                                 incarnation=session.incarnation,
                             ),
                             activity=DuplexLeaseActivity.HEARTBEAT,
@@ -880,7 +879,6 @@ class DuplexSessionRunnerMixin:
                     cancelled_fence = DuplexFence(
                         session.session_id,
                         epoch=session.epoch,
-                        turn_id=session.turn_id,
                         incarnation=session.incarnation,
                     )
                     if event_type == "response.cancel":
@@ -1020,7 +1018,6 @@ class DuplexSessionRunnerMixin:
                             DuplexFence(
                                 session.session_id,
                                 epoch=session.epoch,
-                                turn_id=session.turn_id,
                                 incarnation=session.incarnation,
                             )
                             if session.epoch > cancelled_fence.epoch
@@ -1278,7 +1275,6 @@ class DuplexSessionRunnerMixin:
                                 cancelled_fence = DuplexFence(
                                     session.session_id,
                                     epoch=session.epoch,
-                                    turn_id=session.turn_id,
                                     incarnation=session.incarnation,
                                 )
                                 playback_was_active = self._assistant_playback_active(session)
@@ -1347,7 +1343,6 @@ class DuplexSessionRunnerMixin:
                                         next_fence=DuplexFence(
                                             session.session_id,
                                             epoch=session.epoch,
-                                            turn_id=session.turn_id,
                                             incarnation=session.incarnation,
                                         ),
                                     ):
@@ -1910,7 +1905,6 @@ class DuplexSessionRunnerMixin:
                                 fence=DuplexFence(
                                     session.session_id,
                                     epoch=session.epoch,
-                                    turn_id=session.turn_id,
                                     incarnation=session.incarnation,
                                 ),
                                 activity=DuplexLeaseActivity.DETACH,

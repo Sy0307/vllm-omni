@@ -1052,7 +1052,7 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
         duplex_runtime_extension=FailingPlanExtension(),
         enable_duplex_control=True,
     )
-    fence = DuplexFence("sid-append-rollback", turn_id=1)
+    fence = DuplexFence("sid-append-rollback")
     session = orchestrator.duplex_sessions.open_session(
         DuplexFence("sid-append-rollback"),
         capabilities=DuplexRuntimeCapabilities(
@@ -1075,7 +1075,6 @@ async def test_duplex_failed_append_does_not_advance_sequence_or_fence() -> None
     assert result.ok is False
     assert session.fence == DuplexFence("sid-append-rollback")
     assert session.input_seq == 0
-    assert session.input_turn_seq == 0
     assert stage0.add_request_calls == []
 
 
@@ -1510,7 +1509,7 @@ async def test_duplex_cancel_rejects_late_old_append_and_accepts_next_epoch() ->
 
 
 @pytest.mark.asyncio
-async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request() -> None:
+async def test_duplex_append_updates_source_input_seq_on_long_lived_stage0_request() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=True)
     stage_pools = _build_stage_pools(
         [[stage0]],
@@ -1555,7 +1554,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     duplex_state1 = req_state1.streaming.bridge_states["duplex"]
     assert duplex_state1["session_id"] == "sid-bridge-turn"
     assert duplex_state1["epoch"] == 0
-    assert duplex_state1["turn_id"] == 0
+    assert duplex_state1["source_input_seq"] == 1
     assert duplex_state1["session_config"] == session.session_config
     assert req_state1.sampling_params_list[0].stop_token_ids == [151645]
     submitted_request = stage0.add_request_calls[0][0]
@@ -1566,7 +1565,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
         orchestrator,
         AppendDuplexInputMessage(
             control_id="append-2",
-            fence=DuplexFence("sid-bridge-turn", turn_id=1, response_seq=1),
+            fence=DuplexFence("sid-bridge-turn"),
             session_id="sid-bridge-turn",
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK.value,
             payload={"is_speech": True, "new_user_turn": True},
@@ -1575,7 +1574,7 @@ async def test_duplex_append_updates_bridge_turn_id_on_long_lived_stage0_request
     req_state2 = _duplex_request_state(orchestrator, session, stage_id=0)
     assert req_state2 is req_state1
     duplex_state2 = req_state2.streaming.bridge_states["duplex"]
-    assert duplex_state2["turn_id"] == 1
+    assert duplex_state2["source_input_seq"] == 2
     assert duplex_state2["epoch"] == 0
     expected_request_id = duplex_resource_request_id(DuplexFence("sid-bridge-turn"), "stage0")
     assert [call[0].request_id for call in stage0.add_request_calls] == [

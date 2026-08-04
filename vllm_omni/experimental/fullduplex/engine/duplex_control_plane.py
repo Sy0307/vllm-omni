@@ -365,7 +365,7 @@ class DuplexControlPlane:
                         fence=message.fence,
                         operation="append",
                         session_id=message.session_id,
-                        stage_results=completed,
+                        stage_results=[dict(result) for result in completed.stage_results],
                     )
                     return
             session.begin_operation(message.fence, lease_operation_id)
@@ -383,6 +383,7 @@ class DuplexControlPlane:
                     fence=message.fence,
                     mode=mode,
                     final=message.final,
+                    input_seq=reservation.update.input_seq,
                     stage_results=stage_results,
                 )
             await self.put_result(
@@ -423,9 +424,7 @@ class DuplexControlPlane:
                     "result": {
                         "supported": True,
                         "data_plane_append": False,
-                        "seq": update.seq,
-                        "turn_id": update.turn_id,
-                        "turn_seq": update.turn_seq,
+                        "input_seq": update.input_seq,
                         "mode": mode.value,
                     },
                 }
@@ -457,8 +456,7 @@ class DuplexControlPlane:
             fence=message.fence,
             session_config=dict(request_context.session_config),
             runtime_config=dict(request_context.runtime_config),
-            seq=reservation.update.seq,
-            turn_seq=reservation.update.turn_seq,
+            input_seq=reservation.update.input_seq,
             mode=mode,
             payload=message.payload,
             final=message.final,
@@ -470,6 +468,7 @@ class DuplexControlPlane:
             context=request_context,
             prompt=append_plan.prompt,
             already_submitted=already_submitted,
+            source_input_seq=reservation.update.input_seq,
         )
         submission_result = await self._stage_port.submit(submission)
         try:
@@ -501,10 +500,7 @@ class DuplexControlPlane:
                     "data_plane_append": True,
                     "request_id": request_id,
                     "response_stage_id": request_context.final_stage_id,
-                    "seq": update.seq,
-                    "turn_id": update.turn_id,
-                    "response_seq": message.fence.response_seq,
-                    "turn_seq": update.turn_seq,
+                    "input_seq": update.input_seq,
                     "mode": mode.value,
                     "resumable": True,
                 },
@@ -844,12 +840,12 @@ class DuplexControlPlane:
             self._request_cleanups_in_progress.discard(key)
 
     @staticmethod
-    def _cleanup_key(kind: str, fence: DuplexFence) -> tuple[str, str, int, int, int, int]:
-        return (kind, fence.session_id, fence.incarnation, fence.epoch, fence.turn_id, fence.response_seq)
+    def _cleanup_key(kind: str, fence: DuplexFence) -> tuple[str, str, int, int]:
+        return (kind, fence.session_id, fence.incarnation, fence.epoch)
 
     async def _complete_control_cleanup(
         self,
-        key: tuple[str, str, int, int, int, int],
+        key: tuple[str, str, int, int],
         pending: _PendingControlCleanup,
     ) -> None:
         task = self._control_cleanup_tasks.get(key)
@@ -872,7 +868,7 @@ class DuplexControlPlane:
 
     async def _run_control_cleanup(
         self,
-        key: tuple[str, str, int, int, int, int],
+        key: tuple[str, str, int, int],
         pending: _PendingControlCleanup,
     ) -> None:
         if pending.submitted_request_ids:

@@ -77,8 +77,7 @@ class DuplexRuntimeExtension(Protocol):
         fence: DuplexFence,
         session_config: dict[str, Any],
         runtime_config: dict[str, Any],
-        seq: int,
-        turn_seq: int,
+        input_seq: int,
         mode: DuplexInputMode,
         payload: object,
         final: bool,
@@ -130,9 +129,12 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, Any]
     already_submitted: bool
+    source_input_seq: int
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
+        if type(self.source_input_seq) is not int or self.source_input_seq < 0:
+            raise ValueError("source_input_seq must be a non-negative plain integer")
 
 
 @dataclass(frozen=True)
@@ -147,10 +149,13 @@ class DuplexOutputContext:
     identity: DuplexRequestIdentity
     final_stage_id: int
     segment_finished: bool
+    source_input_seq: int
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if type(self.source_input_seq) is not int or self.source_input_seq < 0:
+            raise ValueError("source_input_seq must be a non-negative plain integer")
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
         object.__setattr__(
             self,
