@@ -2771,6 +2771,70 @@ def test_duplex_auto_response_tts_scheduler_eos_fallback():
     assert results[0]["abort_data_plane_request"] is True
 
 
+@pytest.mark.parametrize(
+    ("boundary_metadata", "segment_finished", "expect_speak_end"),
+    [
+        ({"meta.tts_is_last_chunk": np.array([1], dtype=np.int32)}, False, False),
+        ({}, True, False),
+        ({"meta.turn_end": np.array([1], dtype=np.int32)}, False, False),
+        ({"meta.end_of_turn": np.array([1], dtype=np.int32)}, False, False),
+        ({"meta.duplex_speech_end": np.array([1], dtype=np.int32)}, False, True),
+    ],
+    ids=[
+        "tts-last-chunk-is-private-control",
+        "scheduler-segment-finished-is-private-control",
+        "legacy-turn-end-is-not-public-boundary",
+        "legacy-end-of-turn-is-not-public-boundary",
+        "explicit-duplex-speech-end-is-public-boundary",
+    ],
+)
+def test_duplex_public_speak_end_requires_explicit_typed_speech_boundary(
+    boundary_metadata: dict[str, object],
+    segment_finished: bool,
+    expect_speak_end: bool,
+):
+    data_plane = _test_data_plane()
+    session = DuplexSession(
+        session_id="sid-explicit-speech-boundary",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    fence = DuplexFence(
+        session.session_id,
+        incarnation=session.incarnation,
+        epoch=session.epoch,
+    )
+    output = attach_duplex_output_context(
+        SimpleNamespace(
+            request_id="duplex-sid-explicit-speech-boundary-e0-stage0",
+            finished=False,
+            outputs=[SimpleNamespace(text="hello", token_ids=[], multimodal_output={})],
+            multimodal_output={
+                "audio": np.zeros(100, dtype=np.float32),
+                "sr": 24000,
+                **boundary_metadata,
+            },
+        ),
+        DuplexOutputContext(
+            identity=DuplexRequestIdentity(session.session_id, fence),
+            final_stage_id=1,
+            segment_finished=segment_finished,
+            source_input_seq=1,
+        ),
+    )
+
+    events = _project_data_plane(data_plane, {"data_plane_outputs": [output]}, session=session)
+
+    expected_types = [DuplexSpeakStart, DuplexSpeakChunk]
+    if expect_speak_end:
+        expected_types.append(DuplexSpeakEnd)
+    assert [type(event) for event in events] == expected_types
+    assert all(event.fence == fence for event in events)
+    start, chunk = events[:2]
+    assert start.source_input_seq == 1
+    assert chunk.output_id == start.output_id
+    assert chunk.output_seq == 0
+
+
 def test_duplex_auto_response_rearms_tts_boundary_for_next_segment_in_same_turn():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-next-segment-same-turn-e0-stage0"
