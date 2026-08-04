@@ -609,16 +609,22 @@ def test_typed_continuation_ownership_separates_pending_input_from_active_output
     # only its terminal/cancellation/close fence does.
     assert pending.is_stale(fence=fence, source_input_seq=7) is False
     assert pending.is_stale(fence=fence, source_input_seq=8) is True
-    assert pending.is_stale(
-        fence=DuplexFence("sid-continuation", incarnation=2, epoch=5),
-        source_input_seq=7,
-    ) is True
+    assert (
+        pending.is_stale(
+            fence=DuplexFence("sid-continuation", incarnation=2, epoch=5),
+            source_input_seq=7,
+        )
+        is True
+    )
     assert active.is_stale(fence=fence, output_id="o7") is False
     assert active.is_stale(fence=fence, output_id="o8") is True
-    assert active.is_stale(
-        fence=DuplexFence("sid-continuation", incarnation=2, epoch=5),
-        output_id="o7",
-    ) is True
+    assert (
+        active.is_stale(
+            fence=DuplexFence("sid-continuation", incarnation=2, epoch=5),
+            output_id="o7",
+        )
+        is True
+    )
 
 
 def test_native_realtime_protocol_emits_speak_once_per_response():
@@ -2890,32 +2896,55 @@ def test_duplex_auto_response_discards_terminal_only_audio_before_response_creat
     assert not data_plane.is_terminal(request_id)
 
 
-def test_duplex_auto_response_releases_buffered_audio_when_transcript_arrives():
+def test_duplex_auto_response_releases_typed_buffered_audio_when_transcript_arrives():
     data_plane = _test_data_plane()
     request_id = "duplex-sid-delayed-transcript-e0-stage0"
     session = DuplexSession(
         session_id="sid-delayed-transcript",
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
-    audio_before_text = _duplex_tts_output(
-        request_id=request_id,
-        samples=100,
-        finished=False,
-        text="",
+    fence = DuplexFence(
+        session.session_id,
+        incarnation=session.incarnation,
+        epoch=session.epoch,
     )
+    source_input_seq = 1
+
+    def output(*, samples: int, text: str):
+        return attach_duplex_output_context(
+            SimpleNamespace(
+                request_id=request_id,
+                finished=False,
+                outputs=[SimpleNamespace(text=text, token_ids=[], multimodal_output={})],
+                multimodal_output={
+                    "audio": np.zeros(samples, dtype=np.float32),
+                    "sr": 24000,
+                },
+            ),
+            DuplexOutputContext(
+                identity=DuplexRequestIdentity(session.session_id, fence),
+                final_stage_id=1,
+                segment_finished=False,
+                source_input_seq=source_input_seq,
+            ),
+        )
+
+    audio_before_text = output(samples=100, text="")
 
     assert _project_data_plane(data_plane, {"data_plane_outputs": [audio_before_text]}, session=session) == []
 
-    audio_with_text = _duplex_tts_output(
-        request_id=request_id,
-        samples=200,
-        finished=False,
-        text="hello",
-    )
+    audio_with_text = output(samples=200, text="hello")
     results = _project_data_plane(data_plane, {"data_plane_outputs": [audio_with_text]}, session=session)
 
-    assert [result["audio_data"] for result in results] == ["wav-100", "wav-100"]
-    assert [result["text"] for result in results] == ["", "hello"]
+    assert [type(result) for result in results] == [DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakChunk]
+    start, first_chunk, second_chunk = results
+    assert start.fence == fence
+    assert start.source_input_seq == source_input_seq
+    assert first_chunk.fence == second_chunk.fence == fence
+    assert first_chunk.output_id == second_chunk.output_id == start.output_id
+    assert [first_chunk.output_seq, second_chunk.output_seq] == [0, 1]
+    assert [first_chunk.audio_data, second_chunk.audio_data] == ["wav-100", "wav-100"]
+    assert [first_chunk.text_delta, second_chunk.text_delta] == ["", "hello"]
 
 
 def test_duplex_auto_response_releases_buffered_audio_on_text_only_terminal():
@@ -3107,7 +3136,9 @@ async def test_typed_tts_last_chunk_schedules_output_owned_silence_without_endin
 
     assert close_reason is None
     assert emitted is True
-    assert all(isinstance(event, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)) for event in typed_events)
+    assert all(
+        isinstance(event, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)) for event in typed_events
+    )
     assert not any(isinstance(event, DuplexSpeakEnd) for event in typed_events)
     assert "response.done" not in ws.sent_types()
     assert session.active_response_id is not None
