@@ -311,6 +311,35 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
 
 
+def test_processor_exception_fails_request_without_finish_marker(build_adapter):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req(
+        "internal-processor-error",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="external-processor-error",
+    )
+
+    def broken_processor(**_kwargs):
+        raise ValueError("bad codec rank")
+
+    adapter.custom_process_next_stage_input_func = broken_processor
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    connector.put.assert_not_called()
+    failures = adapter.drain_transfer_failures()
+    assert set(failures) == {"internal-processor-error"}
+    failure = failures["internal-processor-error"]
+    assert failure.external_request_id == "external-processor-error"
+    assert failure.code == "stage_payload_processor_failed"
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``

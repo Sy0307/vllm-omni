@@ -112,6 +112,34 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
+    def _record_stage_transfer_error_output(
+        self,
+        request_id: str,
+        message: str,
+    ) -> None:
+        pending = getattr(self, "_stage_transfer_error_outputs", None)
+        if pending is None:
+            pending = {}
+            self._stage_transfer_error_outputs = pending
+        pending[request_id] = message
+
+    def _pop_stage_transfer_error_output(
+        self,
+        request_id: str,
+    ) -> EngineCoreOutput | None:
+        pending = getattr(self, "_stage_transfer_error_outputs", None)
+        if not pending:
+            return None
+        message = pending.pop(request_id, None)
+        if message is None:
+            return None
+        return EngineCoreOutput(
+            request_id,
+            [],
+            finish_reason=FinishReason.ERROR,
+            stop_reason=message,
+        )
+
     def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
         """Replace a downstream stage's placeholder with its next payload."""
         adapter = getattr(self, "chunk_transfer_adapter", None)
@@ -162,6 +190,39 @@ class OmniSchedulerMixin:
         """
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
+        failures = dict(getattr(connector_output, "transfer_failures", {}) or {})
+        chunk_adapter = getattr(self, "chunk_transfer_adapter", None)
+        drain_failures = getattr(chunk_adapter, "drain_transfer_failures", None)
+        if callable(drain_failures):
+            for request_id, failure in drain_failures().items():
+                failures.setdefault(request_id, failure)
+
+        failed_request_ids: set[str] = set()
+        for internal_request_id, failure in failures.items():
+            request = self.requests.get(internal_request_id)
+            if request is None:
+                continue
+            request.stop_reason = (f"{failure.code}: {failure.message}")[:576]
+            request.resumable = False
+            self._record_stage_transfer_error_output(
+                internal_request_id,
+                request.stop_reason,
+            )
+            failed_request_ids.add(internal_request_id)
+            logger.error(
+                "Stage transfer failed: code=%s internal_request_id=%s external_request_id=%s route=%s->%s",
+                failure.code,
+                internal_request_id,
+                failure.external_request_id,
+                failure.source_stage,
+                failure.destination_stage,
+            )
+        if failed_request_ids:
+            self.finish_requests(
+                failed_request_ids,
+                RequestStatus.FINISHED_ERROR,
+            )
+
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
@@ -389,13 +450,23 @@ class OmniSchedulerMixin:
             if output is None:
                 output = EngineCoreOutputs()
                 engine_core_outputs[client_index] = output
-            if synthesize_abort_outputs:
-                emitted = {item.request_id for item in output.outputs}
-                output.outputs.extend(
-                    EngineCoreOutput(req_id, [], finish_reason=FinishReason.ABORT)
-                    for req_id in finished_set
-                    if req_id not in emitted
+            emitted = {item.request_id for item in output.outputs}
+            for request_id in finished_set:
+                terminal_error = OmniSchedulerMixin._pop_stage_transfer_error_output(
+                    self,
+                    request_id,
                 )
+                if terminal_error is not None:
+                    output.outputs[:] = [item for item in output.outputs if item.request_id != request_id]
+                    output.outputs.append(terminal_error)
+                elif synthesize_abort_outputs and request_id not in emitted:
+                    output.outputs.append(
+                        EngineCoreOutput(
+                            request_id,
+                            [],
+                            finish_reason=FinishReason.ABORT,
+                        )
+                    )
             output.finished_requests = finished_set
         finished_req_ids.clear()
 

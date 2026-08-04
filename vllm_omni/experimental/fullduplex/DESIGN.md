@@ -121,6 +121,25 @@ Important distinctions:
 - runtime open/close acknowledgements are handler-local effect bookkeeping,
   not Session lifecycle.
 
+### Inter-stage payload incubation boundary
+
+Full-Duplex currently reuses the existing `OmniPayloadStruct` wire shape and
+legacy stage payload callbacks. It does not make a versioned payload envelope,
+field merge schema, or new processor ABI part of the common connector surface.
+Session identity and lifecycle remain owned by `DuplexFence`,
+`DuplexStageRequestContext`, and the control-plane input sequence.
+
+One common-path hardening is required now: if a legacy payload processor
+raises, the sender records a terminal `StageTransferFailure` using the
+scheduler-local request ID, sends no data or synthetic finish marker, and the
+scheduler/orchestrator surface an explicit request error. A successful
+processor return of `None` keeps its existing no-payload/finish-only behavior.
+
+A broader payload contract should be reconsidered only after at least two
+Full-Duplex consumers demonstrate the same wire boundary, ordering, and
+per-field merge semantics. Until then, model-specific PCM, codec, turn, and
+pending-output policy stays under `experimental.fullduplex`.
+
 ## Implemented Concurrency Contracts
 
 ### Single inbound mailbox

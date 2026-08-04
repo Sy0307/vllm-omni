@@ -199,6 +199,90 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
 
         sender.shutdown_omni_connectors()
 
+    def test_processor_exception_is_reported_without_sending(self):
+        connector = MockConnector(stage_id=0)
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        sender._omni_connector = connector
+
+        def broken_process(**_kwargs):
+            raise ValueError("bad codec rank")
+
+        sender._custom_process_func = broken_process
+        request = _make_request(
+            "internal-processor-error",
+            "external-processor-error",
+        )
+        request.is_finished = lambda: False
+
+        self.assertFalse(sender.send_chunk(request, pooling_output={"value": 42}))
+        self.assertEqual(connector._store, {})
+        output = sender.get_omni_connector_output()
+        self.assertEqual(set(output.transfer_failures), {"internal-processor-error"})
+        failure = output.transfer_failures["internal-processor-error"]
+        self.assertEqual(failure.external_request_id, "external-processor-error")
+        self.assertEqual(failure.code, "stage_payload_processor_failed")
+
+        sender.shutdown_omni_connectors()
+
+    def test_tp_processor_failure_is_fanned_out_from_data_rank(self):
+        def broken_process(**_kwargs):
+            raise ValueError("bad codec rank")
+
+        leader = MixinHost()
+        leader.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        leader._omni_connector = MockConnector(stage_id=0)
+        leader._custom_process_func = broken_process
+        request = _make_request(
+            "internal-processor-error",
+            "external-processor-error",
+        )
+        request.is_finished = lambda: False
+        leader_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group",
+            return_value=leader_group,
+        ):
+            self.assertFalse(leader.send_chunk(request, pooling_output={"value": 42}))
+            leader_output = leader.get_omni_connector_output()
+
+        self.assertEqual(
+            leader_output.transfer_failures["internal-processor-error"].code,
+            "stage_payload_processor_failed",
+        )
+        fanout_packet = leader_group.broadcast_inputs[0]
+
+        follower = MixinHost()
+        follower.init_omni_connectors(
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        follower._omni_connector = MockConnector(stage_id=0)
+        follower._custom_process_func = broken_process
+        follower_group = _FakeTPGroup(
+            world_size=2,
+            rank_in_group=1,
+            follower_result=fanout_packet,
+        )
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group",
+            return_value=follower_group,
+        ):
+            self.assertTrue(follower.send_chunk(request, pooling_output={"value": 42}))
+            follower_output = follower.get_omni_connector_output()
+
+        self.assertEqual(
+            follower_output.transfer_failures["internal-processor-error"].code,
+            "stage_payload_processor_failed",
+        )
+        leader.shutdown_omni_connectors()
+        follower.shutdown_omni_connectors()
+
 
 class TestMixinKVCacheTransfer(unittest.TestCase):
     """Test 3: KV cache delegation to OmniKVTransferManager."""

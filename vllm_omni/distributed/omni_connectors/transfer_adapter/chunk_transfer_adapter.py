@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import threading
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -11,6 +12,7 @@ from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.outputs import StageTransferFailure
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -58,6 +60,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
         self.connector = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
+        self._transfer_failures: dict[str, StageTransferFailure] = {}
+        self._transfer_failure_lock = threading.Lock()
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -341,8 +345,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     is_finished=is_segment_finished or is_finished,
                 )
 
-            except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+            except Exception as exc:
+                self._record_transfer_failure(
+                    request,
+                    source_stage=stage_id,
+                    destination_stage=next_stage_id,
+                    code="stage_payload_processor_failed",
+                    message=(f"custom stage payload processor raised {type(exc).__name__}"),
+                )
+                return
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
@@ -391,6 +402,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
+
+    def _record_transfer_failure(
+        self,
+        request: Request,
+        *,
+        source_stage: int,
+        destination_stage: int,
+        code: str,
+        message: str,
+    ) -> None:
+        internal_request_id = str(request.request_id)
+        external_request_id = getattr(request, "external_req_id", None)
+        failure = StageTransferFailure(
+            internal_request_id=internal_request_id,
+            external_request_id=(str(external_request_id) if external_request_id is not None else None),
+            source_stage=source_stage,
+            destination_stage=destination_stage,
+            code=code,
+            message=message,
+        )
+        with self._transfer_failure_lock:
+            self._transfer_failures.setdefault(internal_request_id, failure)
+
+    def drain_transfer_failures(self) -> dict[str, StageTransferFailure]:
+        with self._transfer_failure_lock:
+            failures = self._transfer_failures
+            self._transfer_failures = {}
+        return failures
 
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
