@@ -368,6 +368,8 @@ class MiniCPMO45DataPlaneSession:
                 )
             else:
                 yield ledger.emit_end()
+            if request_state is not None:
+                request_state.turns.pop("output", None)
         elif (
             tts_segment_complete
             and isinstance(output_context, DuplexOutputContext)
