@@ -3094,6 +3094,7 @@ async def test_typed_tts_last_chunk_schedules_output_owned_silence_without_endin
 
     assert close_reason is None
     assert emitted is True
+    assert all(isinstance(event, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)) for event in typed_events)
     assert not any(isinstance(event, DuplexSpeakEnd) for event in typed_events)
     assert "response.done" not in ws.sent_types()
     assert session.active_response_id is not None
@@ -3106,6 +3107,82 @@ async def test_typed_tts_last_chunk_schedules_output_owned_silence_without_endin
     assert mode == "append_audio_chunk"
     assert final is False
     assert "duplex_turn_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_typed_tts_segment_control_requires_context_and_preserves_pending_input_source():
+    request_id = "duplex-sid-typed-tts-control-e0-stage1"
+
+    no_context_engine = FakeEngineClient()
+    no_context_handler = OmniDuplexSessionHandler(chat_service=FakeChatService(no_context_engine))
+    no_context_session = DuplexSession(
+        session_id="sid-typed-tts-control-no-context",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    no_context_session.capabilities = DuplexCapabilities.minicpmo45_native()
+    no_context_session.bind_request(request_id)
+    _install_direct_silence_scheduler(no_context_handler, no_context_session)
+    no_context_output = SimpleNamespace(
+        request_id=request_id,
+        finished=False,
+        outputs=[SimpleNamespace(text="", token_ids=[], multimodal_output={})],
+        multimodal_output={
+            "meta.tts_is_last_chunk": np.array([1], dtype=np.int32),
+            "meta.duplex_speech_end": np.array([0], dtype=np.int32),
+        },
+    )
+
+    await no_context_handler._send_native_duplex_events(
+        TimedWebSocket().send_json,
+        {"data_plane_outputs": [no_context_output]},
+        session=no_context_session,
+        expected_epoch=no_context_session.epoch,
+    )
+
+    assert no_context_engine.appended == []
+
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-typed-tts-control",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.bind_request(request_id)
+    _install_direct_silence_scheduler(handler, session)
+    fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
+    context_output = attach_duplex_output_context(
+        SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[SimpleNamespace(text="", token_ids=[], multimodal_output={})],
+            multimodal_output={
+                "meta.tts_is_last_chunk": np.array([1], dtype=np.int32),
+                "meta.duplex_speech_end": np.array([0], dtype=np.int32),
+            },
+        ),
+        DuplexOutputContext(
+            identity=DuplexRequestIdentity(session.session_id, fence),
+            final_stage_id=1,
+            segment_finished=True,
+            source_input_seq=7,
+        ),
+    )
+
+    await handler._send_native_duplex_events(
+        TimedWebSocket().send_json,
+        {"data_plane_outputs": [context_output]},
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert len(engine.appended) == 1
+    native = handler._minicpmo_session_state(session)
+    assert native.pending_input_continuation == PendingInputContinuation(
+        incarnation=session.incarnation,
+        epoch=session.epoch,
+        source_input_seq=7,
+    )
 
 
 @pytest.mark.asyncio
