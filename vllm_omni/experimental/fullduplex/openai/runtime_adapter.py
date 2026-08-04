@@ -5,6 +5,9 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMappi
 from importlib import import_module
 from typing import Any, Protocol
 
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.model_events import DuplexModelEvent
+
 
 class ServingRuntimeConfigError(ValueError):
     """A model serving plugin rejected client-visible runtime configuration."""
@@ -101,7 +104,7 @@ class RuntimeDataPlane(Protocol):
 
     def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None: ...
 
-    def project(self, result: object, *, context: object | None = None) -> Iterable[dict[str, object]]: ...
+    def project(self, result: object, *, context: object | None = None) -> Iterable[DuplexModelEvent]: ...
 
 
 class ServingRuntimeAdapter(Protocol):
@@ -135,10 +138,8 @@ class ServingRuntimeAdapter(Protocol):
     def data_plane_context(
         self,
         *,
-        epoch: int,
-        turn_id: int,
-        active_response_turn_id: int | None,
-        active_response_id: str | None,
+        fence: DuplexFence,
+        source_input_seq: int,
         auto_responds: bool,
         response_format: str,
         speed: float | None,

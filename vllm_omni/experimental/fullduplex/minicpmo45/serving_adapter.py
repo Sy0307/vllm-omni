@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.adapter import (
     MiniCPMO45NativeDuplexServingAdapter,
 )
@@ -75,20 +76,16 @@ class MiniCPMO45ServingRuntimeAdapter:
     @staticmethod
     def data_plane_context(
         *,
-        epoch: int,
-        turn_id: int,
-        active_response_turn_id: int | None,
-        active_response_id: str | None,
+        fence: DuplexFence,
+        source_input_seq: int,
         auto_responds: bool,
         response_format: str,
         speed: float | None,
         modalities: tuple[str, ...],
     ) -> MiniCPMO45DataPlaneContext:
         return MiniCPMO45DataPlaneContext(
-            epoch=epoch,
-            turn_id=turn_id,
-            active_response_turn_id=active_response_turn_id,
-            active_response_id=active_response_id,
+            fence=fence,
+            source_input_seq=source_input_seq,
             auto_responds=auto_responds,
             response_format=response_format,
             speed=speed,

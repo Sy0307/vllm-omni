@@ -13,6 +13,14 @@ from vllm.logger import init_logger
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_plane_request_info
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.model_events import (
+    DuplexEventProtocolError,
+    DuplexListen,
+    DuplexModelEvent,
+    DuplexSpeakChunk,
+    DuplexSpeakEnd,
+    DuplexSpeakStart,
+)
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
@@ -751,10 +759,12 @@ class NativeRuntimeBridgeMixin:
     def _runtime_data_plane_context(self, session: DuplexSession) -> object:
         response_config = session.response_config
         return self._serving_runtime_adapter.data_plane_context(
-            epoch=session.epoch,
-            turn_id=session.turn_id,
-            active_response_turn_id=session.active_response_turn_id,
-            active_response_id=session.active_response_id,
+            fence=DuplexFence(
+                session.session_id,
+                incarnation=session.incarnation,
+                epoch=session.epoch,
+            ),
+            source_input_seq=0,
             auto_responds=self._session_auto_responds(session),
             response_format=response_config.response_format,
             speed=response_config.speed,
@@ -764,7 +774,7 @@ class NativeRuntimeBridgeMixin:
     async def _send_one_native_duplex_event(
         self,
         send_json,
-        native_result: dict[str, object],
+        native_result: DuplexModelEvent | dict[str, object],
         *,
         session: DuplexSession,
         expected_epoch: int | None = None,
@@ -773,6 +783,12 @@ class NativeRuntimeBridgeMixin:
         emitted_response = False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return close_reason, emitted_response
+        if isinstance(native_result, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)):
+            return await self._send_typed_duplex_model_event(
+                send_json,
+                native_result,
+                session=session,
+            )
         data_plane_request_id = native_result.get("data_plane_request_id")
         if isinstance(data_plane_request_id, str) and self._serving_runtime_adapter.data_plane.is_terminal(
             data_plane_request_id
@@ -1112,6 +1128,126 @@ class NativeRuntimeBridgeMixin:
                 }
             )
         return close_reason, emitted_response
+
+    async def _send_typed_duplex_model_event(
+        self,
+        send_json,
+        event: DuplexModelEvent,
+        *,
+        session: DuplexSession,
+    ) -> tuple[str | None, bool]:
+        current_fence = DuplexFence(
+            session.session_id,
+            incarnation=session.incarnation,
+            epoch=session.epoch,
+        )
+        if event.fence != current_fence:
+            return None, False
+
+        if isinstance(event, DuplexListen):
+            await send_json(
+                {
+                    "type": "response.listen",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "reason": event.reason,
+                    "model_listen": event.reason == "model_listen",
+                }
+            )
+            return None, True
+
+        if isinstance(event, DuplexSpeakStart):
+            if session.active_output_id == event.output_id:
+                return None, False
+            if session.active_output_id is not None:
+                raise DuplexEventProtocolError(f"duplex output {session.active_output_id!r} is already active")
+            response_id = session.begin_response(output_id=event.output_id)
+            await send_json(
+                self._response_created_payload(
+                    session,
+                    response_id,
+                    epoch=session.epoch,
+                )
+            )
+            await send_json(
+                {
+                    "type": "response.speak",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "text": "",
+                    "end_of_turn": False,
+                    "model_speak": True,
+                }
+            )
+            return None, True
+
+        response_id = session.response_for_output(event.output_id)
+        if response_id is None or session.active_output_id != event.output_id:
+            raise DuplexEventProtocolError(f"duplex event references unknown output: output_id={event.output_id!r}")
+
+        if isinstance(event, DuplexSpeakChunk):
+            try:
+                accepted = session.accept_output_chunk(event.output_id, event.output_seq)
+            except RuntimeError as exc:
+                raise DuplexEventProtocolError(str(exc)) from exc
+            if not accepted:
+                return None, False
+            previous_sent_ms = session.playback.sent_ms
+            text_chars_before = len("".join(session.assistant_text_buffer))
+            session.append_assistant_text(event.text_delta)
+            duration_ms = None
+            if event.audio_duration_ms is not None:
+                duration_ms = previous_sent_ms + event.audio_duration_ms
+            marks = [
+                {
+                    "text_chars": text_chars_before + text_chars,
+                    "audio_end_ms": previous_sent_ms + audio_end_ms,
+                }
+                for text_chars, audio_end_ms in event.audio_text_marks
+            ]
+            session.mark_audio_sent(
+                duration_ms,
+                text_chars=(len("".join(session.assistant_text_buffer)) if duration_ms is not None else None),
+                audio_text_marks=marks,
+            )
+            payload: dict[str, object] = {
+                "type": "response.output_audio.delta",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "text": event.text_delta,
+                "audio": event.audio_data,
+                "format": event.audio_format,
+                "end_of_turn": False,
+                "model_speak": True,
+                "playback": session.playback.as_dict(),
+            }
+            if duration_ms is not None:
+                payload["audio_duration_ms"] = duration_ms
+            if marks:
+                payload["audio_text_marks"] = marks
+            await send_json(payload)
+            return None, True
+
+        should_commit = self._should_commit_response_to_history(session, response_id)
+        committed_message = session.end_response(
+            commit_text=should_commit,
+            preserve_request=self._session_auto_responds(session),
+        )
+        if should_commit:
+            session.register_history_item(f"item_{response_id}", committed_message)
+        await send_json(
+            {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": committed_message is not None,
+                "playback": session.playback.as_dict(),
+            }
+        )
+        return None, True
 
     async def _end_active_response_before_future_model_turn(
         self,

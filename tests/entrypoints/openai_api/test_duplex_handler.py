@@ -321,10 +321,12 @@ def _data_plane_context(session: DuplexSession | None = None) -> MiniCPMO45DataP
     if session is None:
         return MiniCPMO45DataPlaneContext()
     return MiniCPMO45DataPlaneContext(
-        epoch=session.epoch,
-        turn_id=session.turn_id,
-        active_response_turn_id=session.active_response_turn_id,
-        active_response_id=session.active_response_id,
+        fence=DuplexFence(
+            session.session_id,
+            incarnation=session.incarnation,
+            epoch=session.epoch,
+        ),
+        source_input_seq=session.input_commit_seq,
         auto_responds=bool(session.config.extra_body.get("auto_response", False)),
         response_format=session.config.response_format,
         speed=session.config.speed,
@@ -337,7 +339,7 @@ def _project_data_plane(
     result: object,
     *,
     session: DuplexSession | None = None,
-) -> list[dict[str, object]]:
+) -> list[object]:
     return list(data_plane.project(result, context=_data_plane_context(session)))
 
 
