@@ -124,6 +124,25 @@ def test_ledger_emits_one_start_and_monotonic_chunks_then_end() -> None:
     assert ledger.active_output_id is None
 
 
+def test_ledger_drops_completed_input_replays_before_starting_newer_output() -> None:
+    fence = DuplexFence("session")
+    ledger = DuplexOutputLedger(fence)
+
+    first_start, first_chunk = ledger.emit_chunk(source_input_seq=7, text_delta="first")
+    first_end = ledger.emit_end()
+
+    assert first_chunk.output_id == first_end.output_id == first_start.output_id
+    assert ledger.emit_chunk(source_input_seq=7, text_delta="duplicate") == ()
+    assert ledger.emit_chunk(source_input_seq=6, text_delta="older") == ()
+
+    next_start, next_chunk = ledger.emit_chunk(source_input_seq=8, text_delta="next")
+    (continued_chunk,) = ledger.emit_chunk(source_input_seq=9, text_delta="continued")
+
+    assert next_start.output_id != first_start.output_id
+    assert next_chunk.output_id == continued_chunk.output_id == next_start.output_id
+    assert (next_chunk.output_seq, continued_chunk.output_seq) == (0, 1)
+
+
 def test_ledger_ignores_exact_duplicate_events() -> None:
     fence = DuplexFence("session")
     ledger = DuplexOutputLedger(fence)
