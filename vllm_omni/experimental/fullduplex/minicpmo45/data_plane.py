@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
@@ -12,6 +13,7 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.model_events import (
+    DuplexModelEvent,
     DuplexOutputLedger,
 )
 from vllm_omni.experimental.fullduplex.output import (
@@ -37,20 +39,22 @@ class MiniCPMO45DataPlaneContext:
 
 
 @dataclass(frozen=True, slots=True)
-class MiniCPMO45TtsSegmentComplete:
-    """Model-local control emitted after a non-terminal TTS segment."""
-
-    fence: DuplexFence
-    source_input_seq: int
+class _MiniCPMO45TtsSegmentControl:
+    output_context: DuplexOutputContext
     request_id: str | None
     output_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _MiniCPMO45ProjectionBatch:
+    events: tuple[DuplexModelEvent, ...]
+    tts_segment_controls: tuple[_MiniCPMO45TtsSegmentControl, ...]
 
 
 @dataclass(slots=True)
 class _TurnState:
     sent_segment_text: str = ""
     has_text: bool = False
-    tts_eos_done: bool = False
     turn_eos_done: bool = False
 
 
@@ -61,9 +65,25 @@ class _RequestState:
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
     turns: dict[object, _TurnState] = field(default_factory=dict)
+    completed_tts_segments: OrderedDict[tuple[int, int, int, str | None], None] = field(default_factory=OrderedDict)
 
     def turn(self, turn_id: object) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
+
+    def consume_tts_segment_control(
+        self,
+        *,
+        fence: DuplexFence,
+        source_input_seq: int,
+        output_id: str | None,
+    ) -> bool:
+        key = (fence.incarnation, fence.epoch, source_input_seq, output_id)
+        if key in self.completed_tts_segments:
+            return False
+        self.completed_tts_segments[key] = None
+        while len(self.completed_tts_segments) > 256:
+            self.completed_tts_segments.popitem(last=False)
+        return True
 
 
 class MiniCPMO45DataPlaneSession:
@@ -83,10 +103,8 @@ class MiniCPMO45DataPlaneSession:
         state = self._requests.setdefault(request_id, _RequestState())
         state.terminal = False
         # A resumable append starts a new Talker segment, even when it
-        # continues the same model turn. Re-arm only the segment boundary;
-        # turn EOS remains deduplicated until the model advances the turn.
-        for turn_state in state.turns.values():
-            turn_state.tts_eos_done = False
+        # continues the same model turn.
+        state.completed_tts_segments.clear()
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:
@@ -136,7 +154,7 @@ class MiniCPMO45DataPlaneSession:
         result: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[object]:
+    ) -> Iterator[DuplexModelEvent]:
         if not isinstance(result, dict):
             return
         outputs = result.get("data_plane_outputs")
@@ -150,7 +168,32 @@ class MiniCPMO45DataPlaneSession:
         output: object,
         *,
         context: MiniCPMO45DataPlaneContext | None = None,
-    ) -> Iterator[object]:
+    ) -> Iterator[DuplexModelEvent]:
+        yield from self._project_output(output, context=context, tts_segment_controls=None)
+
+    def _project_batches(
+        self,
+        result: object,
+        *,
+        context: MiniCPMO45DataPlaneContext | None = None,
+    ) -> Iterator[_MiniCPMO45ProjectionBatch]:
+        if not isinstance(result, dict):
+            return
+        outputs = result.get("data_plane_outputs")
+        if not isinstance(outputs, list):
+            return
+        for output in outputs:
+            controls: list[_MiniCPMO45TtsSegmentControl] = []
+            events = tuple(self._project_output(output, context=context, tts_segment_controls=controls))
+            yield _MiniCPMO45ProjectionBatch(events=events, tts_segment_controls=tuple(controls))
+
+    def _project_output(
+        self,
+        output: object,
+        *,
+        context: MiniCPMO45DataPlaneContext | None = None,
+        tts_segment_controls: list[_MiniCPMO45TtsSegmentControl] | None,
+    ) -> Iterator[DuplexModelEvent]:
         context = context or MiniCPMO45DataPlaneContext()
         output_context = get_duplex_output_context(output)
         if isinstance(output_context, DuplexOutputContext):
@@ -267,19 +310,25 @@ class MiniCPMO45DataPlaneSession:
                 )
             else:
                 yield ledger.emit_end()
-        elif tts_segment_complete:
-            turn_state = None
-            if request_state is not None:
-                turn_state = request_state.turn(output_turn_id_from_metadata(mm_output) or "output")
-            if turn_state is None or not turn_state.tts_eos_done:
-                if turn_state is not None:
-                    turn_state.tts_eos_done = True
-                yield MiniCPMO45TtsSegmentComplete(
-                    fence=output_fence,
-                    source_input_seq=source_input_seq,
+        elif (
+            tts_segment_complete
+            and isinstance(output_context, DuplexOutputContext)
+            and output_context.source_input_seq > 0
+            and request_state is not None
+            and tts_segment_controls is not None
+            and request_state.consume_tts_segment_control(
+                fence=output_fence,
+                source_input_seq=output_context.source_input_seq,
+                output_id=ledger.active_output_id,
+            )
+        ):
+            tts_segment_controls.append(
+                _MiniCPMO45TtsSegmentControl(
+                    output_context=output_context,
                     request_id=request_id,
                     output_id=ledger.active_output_id,
                 )
+            )
 
     def _output_ledger(self, fence: DuplexFence) -> DuplexOutputLedger:
         key = (fence.session_id, fence.incarnation)
@@ -399,10 +448,6 @@ def payload_turn_id(payload: object) -> int | None:
     if not isinstance(payload, Mapping):
         return None
     return coerce_int(payload.get("duplex_turn_id"))
-
-
-def output_turn_id_from_metadata(mm_output: dict[str, object]) -> int | None:
-    return _first_metadata_int(mm_output, "duplex_turn_id", "turn_id")
 
 
 def output_epoch_from_metadata(mm_output: dict[str, object]) -> int | None:

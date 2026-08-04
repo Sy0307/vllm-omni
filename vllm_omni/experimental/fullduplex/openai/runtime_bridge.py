@@ -22,7 +22,7 @@ from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexSpeakStart,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
-    MiniCPMO45TtsSegmentComplete,
+    _MiniCPMO45TtsSegmentControl,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     ActiveOutputContinuation,
@@ -658,18 +658,60 @@ class NativeRuntimeBridgeMixin:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
-        for native_result in self._serving_runtime_adapter.data_plane.project(result, context=context):
-            close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
-                send_json,
-                native_result,
-                session=session,
-                expected_epoch=expected_epoch,
-            )
-            emitted_response = emitted_response or did_emit
-            close_reason = close_reason or close_reason_for_result
-            if expected_epoch is not None and session.epoch != expected_epoch:
-                return None, emitted_response
+        for batch in self._serving_runtime_adapter.data_plane._project_batches(result, context=context):
+            for native_result in batch.events:
+                close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
+                    send_json,
+                    native_result,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                )
+                emitted_response = emitted_response or did_emit
+                close_reason = close_reason or close_reason_for_result
+                if expected_epoch is not None and session.epoch != expected_epoch:
+                    return None, emitted_response
+            for control in batch.tts_segment_controls:
+                await self._consume_minicpmo_tts_segment_control(
+                    send_json,
+                    control,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                )
+                if expected_epoch is not None and session.epoch != expected_epoch:
+                    return None, emitted_response
         return close_reason, emitted_response
+
+    async def _consume_minicpmo_tts_segment_control(
+        self,
+        send_json,
+        control: _MiniCPMO45TtsSegmentControl,
+        *,
+        session: DuplexSession,
+        expected_epoch: int | None,
+    ) -> None:
+        output_context = control.output_context
+        current_fence = DuplexFence(
+            session.session_id,
+            incarnation=session.incarnation,
+            epoch=session.epoch,
+        )
+        if (
+            output_context.identity.fence != current_fence
+            or output_context.source_input_seq <= 0
+            or control.request_id != session.active_request_id
+        ):
+            return
+        if control.output_id is None:
+            if session.active_output_id is not None:
+                return
+        elif session.active_output_id != control.output_id:
+            return
+        await self._maybe_continue_native_response(
+            send_json,
+            session=session,
+            expected_epoch=expected_epoch,
+            source_input_seq=output_context.source_input_seq,
+        )
 
     async def _drain_native_data_plane_stream(
         self,
@@ -791,26 +833,6 @@ class NativeRuntimeBridgeMixin:
         close_reason: str | None = None
         emitted_response = False
         if expected_epoch is not None and session.epoch != expected_epoch:
-            return close_reason, emitted_response
-        if isinstance(native_result, MiniCPMO45TtsSegmentComplete):
-            current_fence = DuplexFence(
-                session.session_id,
-                incarnation=session.incarnation,
-                epoch=session.epoch,
-            )
-            if native_result.fence != current_fence or native_result.request_id != session.active_request_id:
-                return close_reason, emitted_response
-            if native_result.output_id is None:
-                if session.active_output_id is not None:
-                    return close_reason, emitted_response
-            elif session.active_output_id != native_result.output_id:
-                return close_reason, emitted_response
-            await self._maybe_continue_native_response(
-                send_json,
-                session=session,
-                expected_epoch=expected_epoch,
-                source_input_seq=native_result.source_input_seq,
-            )
             return close_reason, emitted_response
         if isinstance(native_result, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)):
             return await self._send_typed_duplex_model_event(
