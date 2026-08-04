@@ -1599,7 +1599,6 @@ async def test_auto_response_overlap_exact_unit_commit_does_not_block_or_replay_
         expected_fence = DuplexFence(
             session.session_id,
             epoch=session.epoch,
-            turn_id=session.turn_id,
             incarnation=session.incarnation,
         )
 
@@ -2755,7 +2754,7 @@ async def test_native_append_propagates_current_turn_fence_to_engine():
         expected_epoch=0,
     )
 
-    assert engine.appended_fences == [DuplexFence("sid-fenced-append", epoch=0, turn_id=2)]
+    assert engine.appended_fences == [DuplexFence("sid-fenced-append", epoch=0)]
 
 
 @pytest.mark.asyncio

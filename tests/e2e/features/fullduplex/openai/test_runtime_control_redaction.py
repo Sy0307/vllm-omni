@@ -33,8 +33,8 @@ def _control_result() -> dict[str, object]:
         "ok": True,
         "operation": "open",
         "session_id": "sess-1",
-        "fence": DuplexFence("sess-1", epoch=0, turn_id=0, response_seq=0, incarnation=0),
-        "accepted_fence": DuplexFence("sess-1", epoch=1, turn_id=2, response_seq=3, incarnation=4),
+        "fence": DuplexFence("sess-1", epoch=0, incarnation=0),
+        "accepted_fence": DuplexFence("sess-1", epoch=1, incarnation=4),
         "stage_results": [{"stage_id": -1, "replica_id": -1, "result": {"supported": True}}],
     }
 
@@ -51,14 +51,10 @@ def test_fences_are_converted_to_plain_dicts() -> None:
     assert redacted["fence"] == {
         "session_id": "sess-1",
         "epoch": 0,
-        "turn_id": 0,
-        "response_seq": 0,
         "incarnation": 0,
     }
     # Field values are preserved, not just the type.
     assert redacted["accepted_fence"]["epoch"] == 1
-    assert redacted["accepted_fence"]["turn_id"] == 2
-    assert redacted["accepted_fence"]["response_seq"] == 3
     assert redacted["accepted_fence"]["incarnation"] == 4
 
 
