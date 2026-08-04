@@ -16,6 +16,12 @@ from vllm_omni.experimental.fullduplex.engine.duplex_control_client import Duple
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
+from vllm_omni.experimental.fullduplex.engine.model_events import (
+    DuplexListen,
+    DuplexSpeakChunk,
+    DuplexSpeakEnd,
+    DuplexSpeakStart,
+)
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
     MiniCPMO45NativeDuplexServingAdapter,
     MiniCPMO45PcmAppendBuffer,
@@ -370,6 +376,103 @@ class TimedWebSocket:
 
     def sent_types(self) -> list[str]:
         return [m.get("type", "") for m in self.sent]
+
+
+@pytest.mark.asyncio
+async def test_typed_model_events_bind_one_output_to_one_realtime_response():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-typed-events",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
+    ws = TimedWebSocket()
+
+    start = DuplexSpeakStart(fence=fence, source_input_seq=3, output_id="output-7")
+    chunk = DuplexSpeakChunk(
+        fence=fence,
+        output_id="output-7",
+        output_seq=0,
+        text_delta="hello",
+        audio_data="audio-0",
+        audio_format="pcm16",
+        audio_duration_ms=100,
+    )
+    end = DuplexSpeakEnd(fence=fence, output_id="output-7")
+
+    for event in (start, chunk, end):
+        await handler._send_one_native_duplex_event(
+            ws.send_json,
+            event,
+            session=session,
+            expected_epoch=session.epoch,
+        )
+
+    assert ws.sent_types() == [
+        "response.created",
+        "response.speak",
+        "response.output_audio.delta",
+        "response.done",
+    ]
+    response_ids = {payload["response_id"] for payload in ws.sent}
+    assert len(response_ids) == 1
+    assert session.active_response_id is None
+    assert session.active_output_id is None
+
+
+@pytest.mark.asyncio
+async def test_typed_listen_during_speech_does_not_end_active_output():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-typed-listen",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
+    ws = TimedWebSocket()
+
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        DuplexSpeakStart(fence=fence, source_input_seq=1, output_id="output-active"),
+        session=session,
+    )
+    response_id = session.active_response_id
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        DuplexListen(fence=fence, source_input_seq=2),
+        session=session,
+    )
+
+    assert session.active_response_id == response_id
+    assert session.active_output_id == "output-active"
+    assert ws.sent_types() == ["response.created", "response.speak", "response.listen"]
+
+
+@pytest.mark.asyncio
+async def test_typed_old_epoch_event_cannot_mutate_current_response():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-typed-stale",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+        incarnation=1,
+        epoch=2,
+    )
+    ws = TimedWebSocket()
+
+    result = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        DuplexSpeakStart(
+            fence=DuplexFence(session.session_id, incarnation=1, epoch=1),
+            source_input_seq=9,
+            output_id="stale-output",
+        ),
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert result == (None, False)
+    assert session.active_response_id is None
+    assert session.active_output_id is None
+    assert ws.sent == []
 
 
 def test_native_realtime_protocol_emits_speak_once_per_response():
