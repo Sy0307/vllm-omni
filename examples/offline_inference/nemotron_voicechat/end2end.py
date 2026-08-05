@@ -112,22 +112,39 @@ def main() -> None:
     agent_text = None
     audio = None
     sr = 22050
-    for request_output in outputs:
-        for stage_output in request_output.outputs if hasattr(request_output, "outputs") else []:
-            text = getattr(stage_output, "text", None)
+    for stage_outputs in outputs:
+        # One entry per final stage (text from the thinker, audio from code2wav);
+        # mirrors the qwen2_5_omni offline example's collection loop.
+        output = getattr(stage_outputs, "request_output", stage_outputs)
+        final_type = getattr(stage_outputs, "final_output_type", None)
+        completions = getattr(output, "outputs", None) or []
+        if not completions:
+            continue
+        completion = completions[0]
+        if final_type in (None, "text"):
+            text = getattr(completion, "text", None)
             if text:
                 agent_text = text
-        mm = getattr(request_output, "multimodal_output", None) or {}
-        model_outputs = mm.get("model_outputs") if isinstance(mm, dict) else None
-        if model_outputs is not None:
-            candidate = model_outputs[0] if isinstance(model_outputs, list) else model_outputs
-            arr = np.asarray(candidate.float().cpu() if hasattr(candidate, "cpu") else candidate, dtype=np.float32)
-            if arr.size > 0:
-                audio = arr.reshape(-1)
-            sr_val = mm.get("sr")
-            if sr_val is not None:
-                sr_item = sr_val[0] if isinstance(sr_val, list) else sr_val
-                sr = int(sr_item.item() if hasattr(sr_item, "item") else sr_item)
+        if final_type in (None, "audio"):
+            mm = getattr(completion, "multimodal_output", None) or {}
+            candidate = None
+            for key in ("audio", "model_outputs", "wav", "waveform"):
+                if isinstance(mm, dict) and mm.get(key) is not None:
+                    candidate = mm[key]
+                    break
+            if candidate is not None:
+                if isinstance(candidate, list):
+                    candidate = candidate[0] if candidate else None
+            if candidate is not None:
+                arr = np.asarray(
+                    candidate.float().cpu() if hasattr(candidate, "cpu") else candidate, dtype=np.float32
+                ).reshape(-1)
+                if arr.size > 0:
+                    audio = arr
+                sr_val = mm.get("sr") if isinstance(mm, dict) else None
+                if sr_val is not None:
+                    sr_item = sr_val[0] if isinstance(sr_val, list) else sr_val
+                    sr = int(sr_item.item() if hasattr(sr_item, "item") else sr_item)
 
     if agent_text is not None:
         # The frame-locked text channel emits PAD tokens on silent frames;

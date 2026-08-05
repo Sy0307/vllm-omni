@@ -119,11 +119,12 @@ def talker2code2wav_full_payload(
     talker (it only stores codes for generated positions), so no extra trim is
     needed here. Ships once, at request finish, with replace semantics.
     """
-    del transfer_manager
-
-    if not is_finished:
-        pending = torch.tensor(False, dtype=torch.bool)
-        return OmniPayloadStruct(meta=MetaStruct(finished=pending, is_segment_finished=pending))
+    # NOTE: no is_finished gating — in sync full-payload mode the producer only
+    # runs at flush time (request already finished), and the flush-time request
+    # object may still report is_finished()=False. Returning a meta-only
+    # "pending" struct here would be SENT as the real payload and starve the
+    # code2wav stage of its codes.
+    del transfer_manager, is_finished
 
     def _codes_from(src: Any) -> torch.Tensor | None:
         if not isinstance(src, dict):
@@ -143,6 +144,16 @@ def talker2code2wav_full_payload(
         if audio is not None:
             break
     if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+        import logging
+
+        logging.getLogger(__name__).error(
+            "nemotron_voicechat talker full-payload producer found no codes: "
+            "pooling_output keys=%s, request.additional_information keys=%s",
+            sorted(pooling_output.keys()) if isinstance(pooling_output, dict) else type(pooling_output).__name__,
+            sorted(getattr(request, "additional_information", None) or {})
+            if isinstance(getattr(request, "additional_information", None), dict)
+            else type(getattr(request, "additional_information", None)).__name__,
+        )
         return _empty_finished_payload()
     if audio.ndim == 1:
         audio = audio.reshape(1, -1)

@@ -65,11 +65,14 @@ def test_full_payload_trims_prompt_region_rows() -> None:
     assert bool(payload.meta.finished)
 
 
-def test_full_payload_not_finished_is_pending() -> None:
+def test_full_payload_without_codes_is_empty_finished() -> None:
+    # The sync producer must never emit a meta-only "pending" struct (it would
+    # be shipped as the real payload); with no codes it ships an empty finished
+    # payload regardless of the request's is_finished flag.
     payload = talker2code2wav_full_payload(request=SimpleNamespace(), is_finished=False)
     assert payload is not None
-    assert not bool(payload.meta.finished)
-    assert payload.codes is None
+    assert bool(payload.meta.finished)
+    assert payload.codes.audio.numel() == 0
 
 
 def test_full_payload_replace_semantics_declared() -> None:

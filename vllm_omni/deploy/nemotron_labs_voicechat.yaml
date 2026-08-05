@@ -41,7 +41,9 @@ stages:
     skip_tokenizer_init: true
     max_num_batched_tokens: 4096
     max_model_len: 16384
-    dtype: bfloat16
+    # fp32 like the NeMo reference: the EAR-TTS MoG/codec-embedding path mixes
+    # fp32 buffers into the forward, and 1B params in fp32 are cheap.
+    dtype: float32
     devices: "0"
     output_connectors:
       to_stage_2: connector_of_shared_memory
