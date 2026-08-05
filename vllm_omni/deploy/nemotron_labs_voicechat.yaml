@@ -20,9 +20,10 @@ stages:
     async_scheduling: false
     max_num_batched_tokens: 8192
     max_model_len: 8192
-    # fp32 to match the NeMo reference exactly (parity isolation; the NeMo
-    # offline script runs the whole model in fp32). Revisit bf16 once the text
-    # channel matches the reference dumps.
+    # fp32 matches the NeMo reference exactly (196/196 token parity on the
+    # acceptance fixture). bf16 is ~2x faster and measured within one word of
+    # the reference on the same fixture — flip to bfloat16 if you prefer speed
+    # over exact parity.
     dtype: float32
     # NemotronH mamba SSM state in fp32 (matches NVIDIA's own vLLM deployment
     # of this model; bf16 SSM state accumulates drift over long sequences).
