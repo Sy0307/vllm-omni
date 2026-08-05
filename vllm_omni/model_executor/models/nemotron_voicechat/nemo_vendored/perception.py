@@ -152,25 +152,6 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
 
-        # Log debug info if frame_idx and utterance_name are provided (only first 3 frames)
-        # if sample_id is not None:
-        #     import os
-        #     debug_dir = "/lustre/fsw/portfolios/convai/users/kevinhu/debug"
-        #     os.makedirs(debug_dir, exist_ok=True)
-            
-        #     debug_filename = f"offline_perception_{sample_id[0]}.pt"
-        #     debug_path = os.path.join(debug_dir, debug_filename)
-            
-        #     debug_data = {
-        #         'processed_signal': processed_signal[:3*1280].cpu(),
-        #         'encoder_emb': encoder_emb[:3,:].cpu(),
-        #         'encoded': encoded_orig[:3,:].cpu(),
-        #         'encoded_proj': encoded[:3,:].cpu(),
-        #         'sample_id': sample_id
-        #     }
-            
-        #     torch.save(debug_data, debug_path)
-        #     print(f"[Perception Debug] Saved to {debug_path}")
 
         if return_encoder_emb:
             return encoded, encoded_len, encoder_emb.transpose(1, 2)

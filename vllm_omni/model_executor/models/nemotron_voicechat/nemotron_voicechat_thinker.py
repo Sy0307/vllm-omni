@@ -354,7 +354,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             raise ValueError(
                 f"NemotronVoiceChat frame-count mismatch: the request was sized for "
                 f"{int(expected)} acoustic frames but perception produced {n_frames}. "
-                "The example must size min_tokens/max_tokens with compute_acoustic_frame_count()."
+                "The example must size max_tokens with compute_acoustic_frame_count() (never min_tokens)."
             )
 
         # Fused prefill embeds for positions 0..P (P prompt slots + frame 0).

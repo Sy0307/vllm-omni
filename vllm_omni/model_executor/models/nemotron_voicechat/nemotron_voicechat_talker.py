@@ -160,13 +160,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
 
     def _timeline(self, info: dict[str, Any]) -> torch.Tensor:
         timeline = info.get("nvc_text_timeline")
-        if timeline is None:
-            timeline = info.get("prompt_token_ids")
-        if timeline is None:
+        if timeline is None or info.get("nvc_logical_prompt_len") is None:
+            # Explicit failure — no prompt_token_ids fallback: an implicit
+            # timeline would silently skip the prompt-region trim downstream.
             raise ValueError(
-                "NemotronVoiceChat talker request is missing its text timeline "
-                "('nvc_text_timeline' in additional_information); the stage cannot "
-                "synthesize speech without the thinker's frame-locked tokens."
+                "NemotronVoiceChat talker request is missing its timeline metadata "
+                "('nvc_text_timeline'/'nvc_logical_prompt_len' in additional_information); "
+                "the stage cannot synthesize speech without the thinker's frame-locked tokens."
             )
         if isinstance(timeline, torch.Tensor):
             return timeline.reshape(-1).to(torch.long)

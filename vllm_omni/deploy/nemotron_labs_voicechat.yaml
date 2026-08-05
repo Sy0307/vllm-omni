@@ -30,7 +30,7 @@ stages:
     mamba_ssm_cache_dtype: float32
     devices: "0"
     default_sampling_params:
-      # Greedy, frame-locked: the example sets min_tokens == max_tokens to the
+      # Greedy, frame-locked: the example sets max_tokens to the
       # exact acoustic frame count per request; text EOS never stops generation.
       temperature: 0.0
       ignore_eos: true

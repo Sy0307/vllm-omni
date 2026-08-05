@@ -77,7 +77,59 @@ def test_full_payload_without_codes_is_empty_finished() -> None:
 
 def test_full_payload_replace_semantics_declared() -> None:
     # Full-sequence tensors must REPLACE in the accumulator, not concatenate.
+    # The AR runner flattens nested payloads before accumulation, so the
+    # flattened "codes.audio" key is the one that matters.
+    assert "codes.audio" in _FULL_PAYLOAD_REPLACE_KEYS
     assert "codes" in _FULL_PAYLOAD_REPLACE_KEYS
+
+
+def test_full_payload_missing_prompt_len_fails_explicitly() -> None:
+    codes = torch.zeros((5, 31), dtype=torch.long)
+    request = SimpleNamespace(
+        additional_information={"codes": {"audio": codes}},
+        additional_information_cpu=None,
+    )
+    with pytest.raises(ValueError, match="nvc_logical_prompt_len"):
+        talker2code2wav_full_payload(request=request, is_finished=True)
+
+
+def test_validate_code_stack_negatives() -> None:
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        validate_code_stack,
+    )
+
+    good = torch.zeros((4, 31), dtype=torch.long)
+    assert validate_code_stack(good, 31, 1024).shape == (4, 31)
+    with pytest.raises(ValueError, match="not divisible"):
+        validate_code_stack(torch.zeros(100, dtype=torch.long), 31, 1024)
+    with pytest.raises(ValueError, match="shaped"):
+        validate_code_stack(torch.zeros((4, 30), dtype=torch.long), 31, 1024)
+    bad = good.clone()
+    bad[1, 5] = 1024
+    with pytest.raises(ValueError, match="out-of-range"):
+        validate_code_stack(bad, 31, 1024)
+
+
+def test_tokenizer_resolution_failure_is_actionable(monkeypatch) -> None:
+    from transformers import AutoConfig
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.configuration_nemotron_voicechat import (
+        NemotronVoiceChatConfig,
+    )
+
+    def _boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", _boom)
+    with pytest.raises(RuntimeError, match="NEMOTRON_VOICECHAT_LLM_PATH"):
+        NemotronVoiceChatConfig(
+            data={"frame_length": 0.08, "source_sample_rate": 16000, "target_sample_rate": 22050},
+            model={
+                "inference_speaker_name": "Aria",
+                "stt": {"model": {"perception": {"encoder": {}}, "pretrained_llm": "nvidia/nope"}},
+                "speech_generation": {"model": {"tts_config": {}, "codec_config": {}}},
+            },
+        )
 
 
 def test_code2wav_token_only_sizes_placeholder() -> None:

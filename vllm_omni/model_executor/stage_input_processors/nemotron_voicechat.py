@@ -29,8 +29,10 @@ from vllm_omni.data_entry_keys import (
 )
 
 # Full-sequence tensors are re-shipped whole; the full-payload accumulator must
-# replace (not concatenate) them if the producer fires more than once.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes"})
+# replace (not concatenate) them if the producer fires more than once. The AR
+# runner flattens nested payloads before accumulation, so the effective key is
+# the flattened "codes.audio" (the unflattened root is kept for robustness).
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes", "codes.audio"})
 
 # <SPECIAL_12> in the Nemotron-Nano-9B-v2 vocab; the checkpoint config's
 # stt pad_token. The thinker also reports it in its latent metadata, which
@@ -164,8 +166,14 @@ def talker2code2wav_full_payload(
     prompt_len = _info_get(getattr(request, "additional_information", None), "nvc_logical_prompt_len")
     if prompt_len is None:
         prompt_len = _info_get(getattr(request, "additional_information_cpu", None), "nvc_logical_prompt_len")
-    trim = max(int(prompt_len) - 1, 0) if prompt_len is not None else 0
-    audio = audio[trim:]
+    if prompt_len is None:
+        # Explicit failure, never a silent trim=0 (untrimmed prompt-region codes
+        # would ship to the codec). The connector layer logs producer errors.
+        raise ValueError(
+            "NemotronVoiceChat talker request is missing 'nvc_logical_prompt_len' in its "
+            "additional_information; cannot trim the prompt-region codes for code2wav."
+        )
+    audio = audio[max(int(prompt_len) - 1, 0) :]
     if audio.shape[0] == 0:
         return _empty_finished_payload()
     # 2-D [frames, Q] payload: the chunk/full-payload transfer adapters route

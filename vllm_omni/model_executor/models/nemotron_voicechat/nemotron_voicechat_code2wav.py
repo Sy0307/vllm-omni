@@ -29,6 +29,35 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 
+def validate_code_stack(codes: torch.Tensor, num_quantizers: int, codebook_size: int) -> torch.Tensor:
+    """Validate and reshape a code payload to ``[frames, num_quantizers]``.
+
+    Out-of-range codes are a hard error (an early numeric-drift signal
+    upstream), never clamped.
+    """
+    q = num_quantizers
+    if codes.dim() == 1:
+        if codes.numel() % q != 0:
+            raise ValueError(
+                f"NemotronVoiceChat code2wav received a flat code sequence of length "
+                f"{codes.numel()} which is not divisible by num_quantizers={q}."
+            )
+        codes = codes.reshape(-1, q)
+    if codes.dim() != 2 or codes.shape[-1] != q:
+        raise ValueError(f"NemotronVoiceChat code2wav expects codes shaped [frames, {q}], got {tuple(codes.shape)}.")
+    codes = codes.to(dtype=torch.long)
+    bad = (codes < 0) | (codes >= codebook_size)
+    if bool(bad.any()):
+        bad_vals = codes[bad]
+        raise ValueError(
+            "NemotronVoiceChat code2wav received out-of-range codec codes "
+            f"(min={int(bad_vals.min())}, max={int(bad_vals.max())}, count={int(bad.sum())}); "
+            f"valid range is [0, {codebook_size}). Refusing to clamp — this usually "
+            "signals numeric drift or a corrupted stage payload upstream."
+        )
+    return codes
+
+
 class NemotronVoiceChatCode2Wav(nn.Module):
     """RVQ-VAE codec decoder stage (GenerationModelRunner)."""
 
@@ -83,29 +112,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         return None
 
     def _validate_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        q = self._num_quantizers
-        if codes.dim() == 1:
-            if codes.numel() % q != 0:
-                raise ValueError(
-                    f"NemotronVoiceChat code2wav received a flat code sequence of length "
-                    f"{codes.numel()} which is not divisible by num_quantizers={q}."
-                )
-            codes = codes.reshape(-1, q)
-        if codes.dim() != 2 or codes.shape[-1] != q:
-            raise ValueError(
-                f"NemotronVoiceChat code2wav expects codes shaped [frames, {q}], got {tuple(codes.shape)}."
-            )
-        codes = codes.to(dtype=torch.long)
-        bad = (codes < 0) | (codes >= self._codebook_size)
-        if bool(bad.any()):
-            bad_vals = codes[bad]
-            raise ValueError(
-                "NemotronVoiceChat code2wav received out-of-range codec codes "
-                f"(min={int(bad_vals.min())}, max={int(bad_vals.max())}, count={int(bad.sum())}); "
-                f"valid range is [0, {self._codebook_size}). Refusing to clamp — this usually "
-                "signals numeric drift or a corrupted stage payload upstream."
-            )
-        return codes
+        return validate_code_stack(codes, self._num_quantizers, self._codebook_size)
 
     @torch.no_grad()
     def forward(

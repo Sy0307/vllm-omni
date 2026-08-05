@@ -379,7 +379,6 @@ class FilterbankFeatures(nn.Module):
         with torch.amp.autocast(x.device.type, enabled=False):
             x = self.stft(x)
 
-        # import pdb; pdb.set_trace()
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
         # guard is needed for sqrt if grads are passed through
@@ -448,10 +447,6 @@ class FilterbankFeatures(nn.Module):
         
         # Debug: Save all intermediate steps
         # import os
-        # debug_dir = "/lustre/fsw/portfolios/convai/users/kevinhu/debug"
-        # os.makedirs(debug_dir, exist_ok=True)
-        # debug_filename = f"offline_preprocessor_steps_seqlen{seq_len[0].item()}.pt"
-        # debug_path = os.path.join(debug_dir, debug_filename)
         
         # # Add final output and config to debug snapshots
         # debug_snapshots['final_output'] = x[0].cpu()
@@ -469,7 +464,6 @@ class FilterbankFeatures(nn.Module):
         # torch.save(debug_snapshots, debug_path)
         # print(f"[Preprocessor Debug] Saved {len(debug_snapshots)} steps to {debug_path}")
         # print(f"  Input length: {debug_snapshots['input_len']}, Output seq_len: {seq_len[0].item()}, Final shape: {x.shape}")
-        # import pdb; pdb.set_trace()
         
         return x, seq_len
 
