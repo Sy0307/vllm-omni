@@ -14,13 +14,16 @@ connectors:
 stages:
   - stage_id: 0  # thinker: speech -> frame-locked text (final text output)
     max_num_seqs: 1
-    gpu_memory_utilization: 0.55
+    gpu_memory_utilization: 0.62
     enforce_eager: true
     enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 8192
     max_model_len: 8192
-    dtype: bfloat16
+    # fp32 to match the NeMo reference exactly (parity isolation; the NeMo
+    # offline script runs the whole model in fp32). Revisit bf16 once the text
+    # channel matches the reference dumps.
+    dtype: float32
     # NemotronH mamba SSM state in fp32 (matches NVIDIA's own vLLM deployment
     # of this model; bf16 SSM state accumulates drift over long sequences).
     mamba_ssm_cache_dtype: float32

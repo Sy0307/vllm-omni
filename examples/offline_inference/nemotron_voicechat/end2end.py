@@ -38,9 +38,13 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 def load_wav_16k_mono(path: str) -> np.ndarray:
-    import librosa
+    wav, sr = sf.read(path, dtype="float32")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != 16000:
+        from vllm.multimodal.audio import resample_audio_scipy
 
-    wav, sr = librosa.load(path, sr=16000, mono=True)
+        wav = resample_audio_scipy(wav, orig_sr=sr, target_sr=16000)
     return wav.astype(np.float32)
 
 
@@ -94,8 +98,11 @@ def main() -> None:
         },
     }
     sampling_params_list = [
-        # thinker: greedy, frame-locked generation length.
-        SamplingParams(temperature=0.0, min_tokens=n_frames, max_tokens=n_frames, ignore_eos=True, seed=0),
+        # thinker: greedy, frame-locked generation length. NO min_tokens: the
+        # tokenizer's eos_token is <SPECIAL_12> — the frame-locked PAD/silence
+        # token — and vLLM's min_tokens masks "EOS" to -inf, which would forbid
+        # silence and force the agent to babble through the whole utterance.
+        SamplingParams(temperature=0.0, max_tokens=n_frames, ignore_eos=True, seed=0),
         # talker: placeholder loop, stops on the stage's stop token.
         SamplingParams(temperature=0.0, max_tokens=16384, stop_token_ids=[1], detokenize=False, seed=0),
         # code2wav: single decode step.
@@ -125,23 +132,36 @@ def main() -> None:
             text = getattr(completion, "text", None)
             if text:
                 agent_text = text
+            token_ids = getattr(completion, "token_ids", None)
+            if token_ids:
+                import json as _json
+
+                out_dir_early = Path(args.output_dir)
+                out_dir_early.mkdir(parents=True, exist_ok=True)
+                (out_dir_early / f"{Path(args.wav).stem}_text_tokens.json").write_text(
+                    _json.dumps(list(map(int, token_ids)))
+                )
         if final_type in (None, "audio"):
-            mm = getattr(completion, "multimodal_output", None) or {}
+            # multimodal_output is a MultimodalPayload (Mapping) — duck-type it.
+            mm = getattr(completion, "multimodal_output", None)
+            get = getattr(mm, "get", None)
+            if not callable(get):
+                continue
             candidate = None
             for key in ("audio", "model_outputs", "wav", "waveform"):
-                if isinstance(mm, dict) and mm.get(key) is not None:
-                    candidate = mm[key]
+                value = get(key)
+                if value is not None:
+                    candidate = value
                     break
-            if candidate is not None:
-                if isinstance(candidate, list):
-                    candidate = candidate[0] if candidate else None
+            if isinstance(candidate, list):
+                candidate = candidate[0] if candidate else None
             if candidate is not None:
                 arr = np.asarray(
                     candidate.float().cpu() if hasattr(candidate, "cpu") else candidate, dtype=np.float32
                 ).reshape(-1)
                 if arr.size > 0:
                     audio = arr
-                sr_val = mm.get("sr") if isinstance(mm, dict) else None
+                sr_val = get("sr")
                 if sr_val is not None:
                     sr_item = sr_val[0] if isinstance(sr_val, list) else sr_val
                     sr = int(sr_item.item() if hasattr(sr_item, "item") else sr_item)

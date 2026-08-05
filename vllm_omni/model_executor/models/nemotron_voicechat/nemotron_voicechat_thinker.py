@@ -26,7 +26,9 @@ Timeline contract (verified against NeMo ``_init_inference``/``_step_zero``/
 * Each decode step t consumes conformer frame t (held in per-request state)
   fused with the previously sampled text token and the previous greedy
   function token. Text EOS never terminates generation (``ignore_eos``); the
-  example sets ``min_tokens = max_tokens = acoustic_frame_count``.
+  example sets ``max_tokens = acoustic_frame_count``. Never set ``min_tokens``:
+  the tokenizer's eos_token is <SPECIAL_12> — the frame-locked PAD/silence
+  token — and min_tokens masks "EOS" to -inf, forbidding silence entirely.
 * The function channel exists for numerical correctness (fusion weight 2.0)
   even though tool calling is out of scope; the greedy token timeline is
   exposed for debugging via the request info.
@@ -99,15 +101,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     """
 
     @classmethod
-    def get_mamba_state_dtype_from_config(cls, vllm_config: "VllmConfig") -> tuple[torch.dtype, torch.dtype]:
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
         from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
 
         return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
-    def get_mamba_state_shape_from_config(
-        cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int, int], tuple[int, int, int]]:
         from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
         parallel_config = vllm_config.parallel_config
