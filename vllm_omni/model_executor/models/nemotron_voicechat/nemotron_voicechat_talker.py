@@ -70,6 +70,15 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         self.has_postprocess = False
         self.requires_full_prefix_cached_hidden_states = False
 
+        # Stateful per-request execution is only validated at batch size 1
+        # (the shipped offline scope); fail fast on silent multi-request use.
+        max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
+        if max_num_seqs != 1:
+            raise NotImplementedError(
+                f"NemotronVoiceChat talker supports max_num_seqs=1 only (got {max_num_seqs}); "
+                "the vendored EAR-TTS session state is not batch-safe."
+            )
+
         # Vendored DuplexEARTTS; constructed in load_weights.
         self.tts: nn.Module | None = None
         # request_id -> mutable session state (past_key_values, prev code, ...).

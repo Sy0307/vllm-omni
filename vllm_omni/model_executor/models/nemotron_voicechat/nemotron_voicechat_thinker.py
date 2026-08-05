@@ -193,9 +193,19 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         # Omni AR runner contract.
         self.have_multimodal_outputs = True
         self.has_preprocess = True
-        self.has_postprocess = True  # capture per-step hidden for the function channel
+        self.has_postprocess = True  # per-step greedy function-channel token
         self.requires_full_prefix_cached_hidden_states = False
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
+        # The per-step function token is a scalar; no GPU-resident buffers needed.
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = set()
+
+        # Stateful per-request execution is only validated at batch size 1
+        # (the shipped offline scope); fail fast on silent multi-request use.
+        max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
+        if max_num_seqs != 1:
+            raise NotImplementedError(
+                f"NemotronVoiceChat thinker supports max_num_seqs=1 only (got {max_num_seqs}); "
+                "multi-request batching of the per-request fusion state is not implemented."
+            )
 
         # request_id -> per-request state (audio frames, prefill embeds, counters).
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -398,18 +408,17 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         session = self._sessions[request_id]
         pad_id = self._resolve_special_ids()["pad"]
 
-        # Function channel: greedy argmax over the PREVIOUS position's hidden
-        # (captured by postprocess). At the first decode step that hidden is the
-        # prefill's last position (acoustic frame 0), matching NeMo's
-        # gen_function[prompt_len].
+        # Function channel: greedy argmax over the PREVIOUS position's hidden,
+        # computed by postprocess right after each forward (so the final frame's
+        # token exists too — NeMo produces gen_function for every non-prompt
+        # position). At the first decode step this is the prefill's last
+        # position (acoustic frame 0), matching NeMo's gen_function[prompt_len].
         if self._use_function_head:
-            hs = info.get("hidden_states", {})
-            last_hidden = hs.get("last") if isinstance(hs, dict) else None
-            if isinstance(last_hidden, torch.Tensor) and last_hidden.numel() > 0:
-                with torch.inference_mode():
-                    func_logits = self.function_head(last_hidden.reshape(1, -1).to(self._dtype))
-                session["func_token"] = int(func_logits.argmax(dim=-1))
-                session["func_tokens"].append(session["func_token"])
+            prev_func = info.get("nvc_prev_function_token")
+            if prev_func is not None:
+                token = int(prev_func.reshape(-1)[0]) if isinstance(prev_func, torch.Tensor) else int(prev_func)
+                session["func_token"] = token
+                session["func_tokens"].append(token)
 
         session["decode_step"] = int(session["decode_step"]) + 1
         frame_idx = session["decode_step"]  # decode step k consumes frame k
@@ -432,10 +441,19 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         return input_ids, fused, info_update
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
-        """Capture the step's last hidden for the next function-channel argmax."""
-        if hidden_states is None or hidden_states.numel() == 0:
+        """Greedy function-channel token from this step's last hidden.
+
+        Runs after EVERY forward (prefill and each decode step), so the final
+        acoustic frame's function token is produced as well; it stays in the
+        request info as ``nvc_prev_function_token`` (the cumulative timeline in
+        ``nvc_function_tokens`` covers positions consumed by later fusion
+        steps).
+        """
+        if hidden_states is None or hidden_states.numel() == 0 or not self._use_function_head:
             return {}
-        return {"hidden_states": {"last": hidden_states[-1, :].detach()}}
+        with torch.inference_mode():
+            func_logits = self.function_head(hidden_states[-1, :].reshape(1, -1).to(self._dtype))
+        return {"nvc_prev_function_token": func_logits.argmax(dim=-1).reshape(()).detach()}
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
