@@ -42,6 +42,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -87,8 +88,47 @@ def compute_acoustic_frame_count(nemo_stt_cfg: dict[str, Any], num_samples: int)
     return int(out[0])
 
 
-class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module):
-    """vLLM-native thinker (perception + fusion + NemotronH + dual heads)."""
+class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+    """vLLM-native thinker (perception + fusion + NemotronH + dual heads).
+
+    Declares the hybrid-Mamba interfaces (``IsHybrid``/``HasInnerState``) so
+    vLLM configures the mamba state cache for the wrapped NemotronH backbone;
+    the state shape/dtype classmethods mirror ``NemotronHForCausalLM`` but read
+    the NemotronH sub-config (``get_text_config()``) instead of the top-level
+    checkpoint config.
+    """
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: "VllmConfig") -> tuple[torch.dtype, torch.dtype]:
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        return NemotronHForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_config.get_text_config()
+        intermediate_size = hf_config.mamba_num_heads * hf_config.mamba_head_dim
+        return MambaStateShapeCalculator.mamba2_state_shape(
+            intermediate_size=intermediate_size,
+            tp_world_size=parallel_config.tensor_parallel_size,
+            n_groups=hf_config.n_groups,
+            num_heads=hf_config.mamba_num_heads,
+            head_dim=hf_config.mamba_head_dim,
+            state_size=hf_config.ssm_state_size,
+            conv_kernel=hf_config.conv_kernel,
+            num_spec=vllm_config.num_speculative_tokens,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        return NemotronHForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -125,7 +165,9 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module):
         perception_cfg = stt_cfg.get("perception")
         if not perception_cfg:
             raise ValueError("'model.stt.model.perception' missing from the checkpoint config.")
-        self.perception = AudioPerceptionModule(perception_cfg)
+        from omegaconf import DictConfig
+
+        self.perception = AudioPerceptionModule(DictConfig(perception_cfg))
 
         # AddFusion weights (the checkpoint uses fuse_method="add" defaults;
         # the same duplex_*_weight keys double as the fusion weights).
@@ -208,7 +250,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> torch.Tensor:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
-        return self.language_model.compute_logits(hidden_states, sampling_metadata)
+        # vLLM >= 0.25 dropped the sampling_metadata parameter.
+        return self.language_model.compute_logits(hidden_states)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

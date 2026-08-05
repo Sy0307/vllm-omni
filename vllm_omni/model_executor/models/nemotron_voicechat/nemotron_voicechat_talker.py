@@ -276,12 +276,23 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             DuplexEARTTS,
         )
 
-        tts_cfg = dict(getattr(self.config, "tts_cfg", {}) or {})
-        if not tts_cfg:
+        tts_model_cfg = dict(getattr(self.config, "tts_cfg", {}) or {})
+        if not tts_model_cfg:
             raise ValueError(
                 "NemotronVoiceChat checkpoint config lacks 'model.speech_generation.model'; cannot build the talker."
             )
-        tts = DuplexEARTTS(tts_cfg)
+        # Mirror NeMo's inference-time config overrides (load_hf_config): the
+        # CAS tokenizer is baked into the checkpoint weights, not fetched.
+        cas_cfg = (tts_model_cfg.get("tts_config") or {}).get("cas_config")
+        if isinstance(cas_cfg, dict):
+            cas_cfg.pop("pretrained_tokenizer_name", None)
+        tts_data = dict(getattr(self.config, "tts_data", {}) or {})
+        tts_data.setdefault("source_sample_rate", 22050)
+        tts_data.setdefault("target_sample_rate", int(getattr(self.config, "target_sample_rate", 22050)))
+        tts_data.setdefault("frame_length", float(getattr(self.config, "frame_length", 0.08)))
+        # DuplexEARTTS consumes the whole speech_generation section layout
+        # ({"data": ..., "model": ...}), matching NeMo's constructor call.
+        tts = DuplexEARTTS({"data": tts_data, "model": tts_model_cfg})
 
         prefix = "tts_model."
         state: dict[str, torch.Tensor] = {}

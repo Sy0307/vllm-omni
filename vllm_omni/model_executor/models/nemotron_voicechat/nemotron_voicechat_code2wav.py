@@ -181,7 +181,9 @@ class NemotronVoiceChatCode2Wav(nn.Module):
                 "NemotronVoiceChat checkpoint config lacks "
                 "'model.speech_generation.model.codec_config'; cannot build the RVQ-VAE codec."
             )
-        codec = RVQVAEModel(codec_cfg)
+        from omegaconf import DictConfig
+
+        codec = RVQVAEModel(DictConfig(codec_cfg))
 
         prefix = "tts_model.audio_codec."
         state: dict[str, torch.Tensor] = {}

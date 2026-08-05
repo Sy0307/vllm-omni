@@ -85,7 +85,9 @@ def main() -> None:
         # frame 0); the thinker replaces every position with fused embeddings.
         "prompt_token_ids": prompt_ids + [pad_id],
         "additional_information": {
-            "nvc_audio": wav,
+            # Plain float list: raw ndarrays do not survive the engine-core
+            # message serialization.
+            "nvc_audio": wav.astype(np.float32).tolist(),
             "nvc_sr": 16000,
             "nvc_prompt_token_ids": prompt_ids,
             "nvc_expected_frames": n_frames,
@@ -128,7 +130,10 @@ def main() -> None:
                 sr = int(sr_item.item() if hasattr(sr_item, "item") else sr_item)
 
     if agent_text is not None:
-        # Strip pad/bos/eos artifacts the frame-locked channel produces.
+        # The frame-locked text channel emits PAD tokens on silent frames;
+        # strip them (NeMo's post-inference detokenizer does the same).
+        pad_token = stt_cfg.get("pad_token", "<SPECIAL_12>")
+        agent_text = " ".join(agent_text.replace(pad_token, " ").split())
         text_path = out_dir / f"{stem}_output.txt"
         text_path.write_text(agent_text + "\n")
         print(f"agent text -> {text_path}\n{agent_text}")

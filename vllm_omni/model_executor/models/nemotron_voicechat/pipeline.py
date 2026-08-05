@@ -31,7 +31,10 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.nemotron_voicechat"
 NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
-    default_deploy_config_name="nemotron_voicechat.yaml",
+    # Named after the alias key so the deploy-yaml stem substring-matches the
+    # checkpoint directory name (NVIDIA-NemotronLabs-VoiceChat-11B) during
+    # bare-path auto-detection.
+    default_deploy_config_name="nemotron_labs_voicechat.yaml",
     stages=(
         StagePipelineConfig(
             stage_id=0,
