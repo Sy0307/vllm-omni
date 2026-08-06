@@ -132,6 +132,36 @@ def test_tokenizer_resolution_failure_is_actionable(monkeypatch) -> None:
         )
 
 
+def test_sanitize_tts_model_cfg_disables_pretrained_loads(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_talker import (
+        sanitize_tts_model_cfg,
+    )
+
+    original = {
+        "pretrained_lm_name": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        "tts_config": {
+            "pretrained_text_name": "some/hub-llm",
+            "backbone_type": "gemma3_text",
+            "cas_config": {"pretrained_tokenizer_name": "some/hub-tokenizer", "keep": 1},
+        },
+    }
+    monkeypatch.delenv("NEMOTRON_VOICECHAT_LLM_PATH", raising=False)
+    cfg = sanitize_tts_model_cfg(original)
+    # External weight-load triggers are gone; construction is config-only.
+    assert "pretrained_text_name" not in cfg["tts_config"]
+    assert "pretrained_tokenizer_name" not in cfg["tts_config"]["cas_config"]
+    assert cfg["tts_config"]["cas_config"]["keep"] == 1
+    # Tokenizer reference survives.
+    assert cfg["pretrained_lm_name"] == "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    # The shared stage config is never mutated (deep copy).
+    assert original["tts_config"]["pretrained_text_name"] == "some/hub-llm"
+
+    # Air-gapped override reroutes the tokenizer reference.
+    monkeypatch.setenv("NEMOTRON_VOICECHAT_LLM_PATH", "/local/nemotron")
+    cfg = sanitize_tts_model_cfg(original)
+    assert cfg["pretrained_lm_name"] == "/local/nemotron"
+
+
 def test_code2wav_token_only_sizes_placeholder() -> None:
     talker_output = SimpleNamespace(
         finished=True,

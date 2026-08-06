@@ -51,6 +51,39 @@ _CONTINUE_TOKEN = 0
 _STOP_TOKEN = 1
 
 
+def sanitize_tts_model_cfg(tts_model_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Make the vendored DuplexEARTTS construction config-only.
+
+    Every parameter comes from the unified checkpoint streamed in
+    ``load_weights``; the vendored constructors must never download or load
+    external pretrained weights. Returns a deep copy so the shared stage
+    config is never mutated:
+
+    * ``tts_config.pretrained_text_name`` would make ``RVQEARTTSModel``
+      download a full LLM backbone — dropped (the backbone builds from
+      ``backbone_type``/``backbone_config``).
+    * ``tts_config.cas_config.pretrained_tokenizer_name`` is dropped, matching
+      NeMo's own inference override (the CAS vocab is baked into the weights).
+    * ``pretrained_lm_name`` survives ONLY as the tokenizer reference (the
+      context-LM load path is disabled by ``context_hidden_size: null``); the
+      ``NEMOTRON_VOICECHAT_LLM_PATH`` override keeps it air-gap friendly.
+    """
+    import copy
+    import os
+
+    cfg = copy.deepcopy(tts_model_cfg)
+    tts_config = cfg.get("tts_config")
+    if isinstance(tts_config, dict):
+        tts_config.pop("pretrained_text_name", None)
+        cas_cfg = tts_config.get("cas_config")
+        if isinstance(cas_cfg, dict):
+            cas_cfg.pop("pretrained_tokenizer_name", None)
+    llm_override = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH")
+    if llm_override:
+        cfg["pretrained_lm_name"] = llm_override
+    return cfg
+
+
 class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
     """vLLM AR stage wrapping the vendored NeMo EAR-TTS per-frame step."""
 
@@ -290,11 +323,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             raise ValueError(
                 "NemotronVoiceChat checkpoint config lacks 'model.speech_generation.model'; cannot build the talker."
             )
-        # Mirror NeMo's inference-time config overrides (load_hf_config): the
-        # CAS tokenizer is baked into the checkpoint weights, not fetched.
-        cas_cfg = (tts_model_cfg.get("tts_config") or {}).get("cas_config")
-        if isinstance(cas_cfg, dict):
-            cas_cfg.pop("pretrained_tokenizer_name", None)
+        tts_model_cfg = sanitize_tts_model_cfg(tts_model_cfg)
         tts_data = dict(getattr(self.config, "tts_data", {}) or {})
         tts_data.setdefault("source_sample_rate", 22050)
         tts_data.setdefault("target_sample_rate", int(getattr(self.config, "target_sample_rate", 22050)))
