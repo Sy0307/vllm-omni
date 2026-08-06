@@ -347,18 +347,6 @@ class ConformerConvolution(nn.Module):
         else:
             return x, cache
 
-    def reset_parameters_conv(self):
-        pw1_max = pw2_max = self.d_model**-0.5
-        dw_max = self.kernel_size**-0.5
-
-        with torch.no_grad():
-            nn.init.uniform_(self.pointwise_conv1.weight, -pw1_max, pw1_max)
-            nn.init.uniform_(self.pointwise_conv2.weight, -pw2_max, pw2_max)
-            nn.init.uniform_(self.depthwise_conv.weight, -dw_max, dw_max)
-            if self.use_bias:
-                nn.init.uniform_(self.pointwise_conv1.bias, -pw1_max, pw1_max)
-                nn.init.uniform_(self.pointwise_conv2.bias, -pw2_max, pw2_max)
-                nn.init.uniform_(self.depthwise_conv.bias, -dw_max, dw_max)
 
 
 class ConformerFeedForward(nn.Module):
@@ -384,12 +372,3 @@ class ConformerFeedForward(nn.Module):
         x = self.linear2(x)
         return x
 
-    def reset_parameters_ff(self):
-        ffn1_max = self.d_model**-0.5
-        ffn2_max = self.d_ff**-0.5
-        with torch.no_grad():
-            nn.init.uniform_(self.linear1.weight, -ffn1_max, ffn1_max)
-            nn.init.uniform_(self.linear2.weight, -ffn2_max, ffn2_max)
-            if self.use_bias:
-                nn.init.uniform_(self.linear1.bias, -ffn1_max, ffn1_max)
-                nn.init.uniform_(self.linear2.bias, -ffn2_max, ffn2_max)

@@ -20,13 +20,8 @@ from omegaconf import DictConfig
 from torch import nn
 
 from .compat import (
-    AcousticEncodedRepresentation,
-    AudioSignal,
     Exportable,
-    LengthsType,
     NeuralModule,
-    NeuralType,
-    SpectrogramType,
     typecheck,
 )
 
@@ -34,33 +29,8 @@ from .compat import (
 class AudioPerceptionModule(NeuralModule, Exportable):
     """Audio perception module that consists of audio encoder(s) and modality adapter."""
 
-    def input_example(self, max_batch: int = 8, max_dim: int = 32000, min_length: int = 200):
-        batch_size = torch.randint(low=1, high=max_batch, size=[1]).item()
-        max_length = torch.randint(low=min_length, high=max_dim, size=[1]).item()
-        signals = torch.rand(size=[batch_size, max_length]) * 2 - 1
-        lengths = torch.randint(low=min_length, high=max_dim, size=[batch_size])
-        lengths[0] = max_length
-        return signals, lengths, None, None
 
-    @property
-    def input_types(self):
-        """Returns definitions of module input ports."""
-        return {
-            "input_signal": NeuralType(("B", "T"), AudioSignal(freq=self.preprocessor._sample_rate)),
-            "input_signal_length": NeuralType(
-                tuple("B"), LengthsType()
-            ),  # Please note that length should be in samples not seconds.
-            "processed_signal": NeuralType(("B", "D", "T"), SpectrogramType()),
-            "processed_signal_length": NeuralType(tuple("B"), LengthsType()),
-        }
 
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports."""
-        return {
-            "encoded": NeuralType(("B", "T", "D"), AcousticEncodedRepresentation()),
-            "encoded_len": NeuralType(tuple("B"), LengthsType()),
-        }
 
     def __init__(self, cfg: DictConfig):
         super().__init__()

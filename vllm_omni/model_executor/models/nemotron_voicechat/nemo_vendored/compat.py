@@ -113,57 +113,28 @@ class typecheck:
 # ==============================================================================
 # Neural type stubs (replace nemo.core.neural_types)
 # ==============================================================================
-class NeuralType:
-    """Stub of nemo.core.neural_types.NeuralType; only used declaratively."""
-
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
 
 
-class ElementType:
-    def __init__(self, *args, **kwargs):
-        pass
 
 
-class AcousticEncodedRepresentation(ElementType):
-    pass
 
 
-class AudioSignal(ElementType):
-    pass
 
 
-class LengthsType(ElementType):
-    pass
 
 
-class SpectrogramType(ElementType):
-    pass
 
 
-class MelSpectrogramType(ElementType):
-    pass
 
 
-class MFCCSpectrogramType(ElementType):
-    pass
 
 
-class ChannelType(ElementType):
-    pass
 
 
-class BoolType(ElementType):
-    pass
 
 
-class FloatType(ElementType):
-    pass
 
 
-class IntType(ElementType):
-    pass
 
 
 # ==============================================================================
@@ -234,20 +205,7 @@ class NeuralModule(nn.Module):
     def from_config_dict(config):
         return from_config_dict(config)
 
-    def input_example(self, max_batch=None, max_dim=None):
-        return None
 
-    def freeze(self) -> None:
-        r"""Freeze all params for inference. (exact copy of NeuralModule.freeze)"""
-        grad_map = {}
-        for pname, param in self.named_parameters():
-            grad_map[pname] = param.requires_grad
-            param.requires_grad = False
-        if hasattr(self, '_frozen_grad_map'):
-            self._frozen_grad_map.update(grad_map)
-        else:
-            self._frozen_grad_map = grad_map
-        self.eval()
 
     def unfreeze(self, partial: bool = False) -> None:
         """Unfreeze all parameters for training. (exact copy of NeuralModule.unfreeze)"""
@@ -262,22 +220,6 @@ class NeuralModule(nn.Module):
             delattr(self, '_frozen_grad_map')
         self.train()
 
-    @contextmanager
-    def as_frozen(self):
-        """Context manager which temporarily freezes a module."""
-        training_mode = self.training
-        grad_map = {pname: param.requires_grad for pname, param in self.named_parameters()}
-        self.freeze()
-        try:
-            yield
-        finally:
-            self.unfreeze()
-            for pname, param in self.named_parameters():
-                param.requires_grad = grad_map[pname]
-            if training_mode:
-                self.train()
-            else:
-                self.eval()
 
 
 class Exportable:
@@ -306,18 +248,11 @@ class AccessMixin:
     def is_access_enabled(self, guid=None):
         return False
 
-    def set_access_enabled(self, access_enabled: bool, guid=None):
-        pass
 
     def register_accessible_tensor(self, name, tensor):
         pass
 
-    @classmethod
-    def get_module_registry(cls, module):
-        return {}
 
-    def reset_registry(self, registry_key=None):
-        pass
 
 
 class AttentionAdapterModuleMixin:
@@ -327,8 +262,6 @@ class AttentionAdapterModuleMixin:
     def is_adapter_available(self) -> bool:
         return False
 
-    def get_enabled_adapters(self):
-        return []
 
 
 class AdapterModuleMixin(AttentionAdapterModuleMixin):
@@ -356,51 +289,8 @@ class StreamingEncoder(ABC):
         """
         pass
 
-    @abstractmethod
-    def get_initial_cache_state(self, batch_size, dtype, device, max_dim):
-        pass
 
-    @staticmethod
-    def to_numpy(tensor):
-        if tensor is None:
-            return None
-        return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
 
-    def cache_aware_stream_step(
-        self,
-        processed_signal,
-        processed_signal_length=None,
-        cache_last_channel=None,
-        cache_last_time=None,
-        cache_last_channel_len=None,
-        keep_all_outputs=True,
-        drop_extra_pre_encoded=None,
-    ):
-        if self.streaming_cfg is None:
-            self.setup_streaming_params()
-        if drop_extra_pre_encoded is not None:
-            prev_drop_extra_pre_encoded = self.streaming_cfg.drop_extra_pre_encoded
-            self.streaming_cfg.drop_extra_pre_encoded = drop_extra_pre_encoded
-        else:
-            prev_drop_extra_pre_encoded = None
-
-        if processed_signal_length is None:
-            processed_signal_length = processed_signal.new_full(processed_signal.size(0), processed_signal.size(-1))
-
-        encoder_output = self(
-            audio_signal=processed_signal,
-            length=processed_signal_length,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-        )
-
-        encoder_output = self.streaming_post_process(encoder_output, keep_all_outputs=keep_all_outputs)
-
-        if prev_drop_extra_pre_encoded is not None:
-            self.streaming_cfg.drop_extra_pre_encoded = prev_drop_extra_pre_encoded
-
-        return encoder_output
 
 
 # ==============================================================================
@@ -436,16 +326,6 @@ class CacheAwareStreamingConfig:
 # avoid_float16_autocast_context / avoid_bfloat16_autocast_context — exact
 # copies of NeMo nemo/utils/cast_utils.py
 # ==============================================================================
-def avoid_bfloat16_autocast_context():
-    """
-    If the current autocast context is bfloat16,
-    cast it to float32
-    """
-
-    if torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.bfloat16:
-        return torch.amp.autocast('cuda', dtype=torch.float32)
-    else:
-        return nullcontext()
 
 
 def avoid_float16_autocast_context():
@@ -703,24 +583,6 @@ class FusedBatchNorm1d(nn.Module):
         self.weight = nn.Parameter(torch.ones(num_features))
         self.bias = nn.Parameter(torch.zeros(num_features))
 
-    @classmethod
-    def from_batchnorm(cls, bn: nn.BatchNorm1d) -> "FusedBatchNorm1d":
-        """
-        Construct FusedBatchNorm1d module from BatchNorm1d
-        Args:
-            bn: original BatchNorm module
-
-        Returns:
-            FusedBatchNorm1d module with initialized params; in eval mode result is equivalent to original BatchNorm
-        """
-        assert isinstance(bn, nn.BatchNorm1d)
-        fused_bn = FusedBatchNorm1d(bn.num_features)
-        # init projection params from original batch norm
-        # so, for inference mode output is the same
-        std = torch.sqrt(bn.running_var.data + bn.eps)
-        fused_bn.weight.data = bn.weight.data / std
-        fused_bn.bias.data = bn.bias.data - bn.running_mean.data * fused_bn.weight.data
-        return fused_bn
 
     def forward(self, x: torch.Tensor):
         if x.dim() == 3:

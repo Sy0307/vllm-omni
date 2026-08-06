@@ -41,10 +41,6 @@ class TokenizerSpec(ABC):
         """Converts text into a list of tokens."""
         pass
 
-    @abstractmethod
-    def tokens_to_text(self, tokens):
-        """Converts a list of tokens back into text."""
-        pass
 
     @abstractmethod
     def tokens_to_ids(self, tokens):
@@ -61,10 +57,6 @@ class TokenizerSpec(ABC):
         """Converts text directly to token IDs."""
         pass
 
-    @abstractmethod
-    def ids_to_text(self, ids):
-        """Converts token IDs back to text."""
-        pass
 
     def add_special_tokens(self, special_tokens: List[str]):
         """Adds special tokens (eos, pad, cls...) to vocab."""
@@ -79,10 +71,6 @@ class TokenizerSpec(ABC):
         """name of the class"""
         return type(self).__name__
 
-    @property
-    def unique_identifiers(self):
-        """Property required for use with megatron-core datasets."""
-        return OrderedDict({"class": f"{type(self).__module__}.{type(self).__qualname__}"})
 
     @property
     def cls(self):
@@ -337,15 +325,6 @@ class AutoTokenizer(TokenizerSpec):
             setattr(self, k, getattr(self.tokenizer, k, None))
         return num_tokens_added
 
-    @property
-    def additional_special_tokens_ids(self):
-        """
-        Returns a list of the additional special tokens' IDs (excluding bos, eos, pad, unk).
-
-        Returns:
-            List[int]: List of token IDs for additional special tokens, such as sentinel tokens for T5.
-        """
-        return [self.token_to_id(token) for token in self.additional_special_tokens]
 
     def text_to_tokens(self, text):
         """
@@ -360,30 +339,7 @@ class AutoTokenizer(TokenizerSpec):
         tokens = self.tokenizer.tokenize(text)
         return tokens
 
-    def tokens_to_text(self, tokens):
-        """
-        Converts a list of tokens back into text.
 
-        Args:
-            tokens (List[str]): List of tokens to be converted.
-
-        Returns:
-            str: The reconstructed text.
-        """
-        text = self.tokenizer.convert_tokens_to_string(tokens)
-        return text
-
-    def token_to_id(self, token):
-        """
-        Converts a single token to its corresponding ID.
-
-        Args:
-            token (str): The token to convert.
-
-        Returns:
-            int: The ID corresponding to the token.
-        """
-        return self.tokens_to_ids([token])[0]
 
     def tokens_to_ids(self, tokens):
         """
@@ -432,25 +388,6 @@ class AutoTokenizer(TokenizerSpec):
         """Appies chat template and tokenizes results"""
         return self.tokenizer.apply_chat_template(*args, **kwargs)
 
-    def ids_to_text(self, ids, remove_special_tokens=True):
-        """
-        Converts token IDs back to text.
-
-        Args:
-            ids (List[int]): List of token IDs to convert to text.
-            remove_special_tokens (bool): Whether to remove special tokens (like [PAD], [CLS], etc.) from the output
-            text.
-
-        Returns:
-            str: The reconstructed text.
-        """
-        tokens = self.ids_to_tokens(ids)
-        if remove_special_tokens:
-            tokens_clean = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
-        else:
-            tokens_clean = tokens
-        text = self.tokens_to_text(tokens_clean)
-        return text
 
     @property
     def vocab(self):
@@ -463,17 +400,6 @@ class AutoTokenizer(TokenizerSpec):
         id2vocab = {v: k for k, v in self.tokenizer.vocab.items()}
         return [id2vocab[i] for i in range(len(id2vocab))]
 
-    @property
-    def inv_vocab(self):
-        """
-        Returns the inverse vocabulary mapping (token to ID).
-
-        Returns:
-            Dict[str, int]: Dictionary mapping tokens to their IDs.
-        """
-        if self._inv_vocab_dict == {}:
-            self._inv_vocab_dict = {v: k for k, v in self.tokenizer.vocab.items()}
-        return self._inv_vocab_dict
 
     @property
     def pad_id(self):
@@ -579,9 +505,6 @@ class AutoTokenizer(TokenizerSpec):
         """
         return type(self.tokenizer).__name__
 
-    def save_vocabulary(self, save_directory: str, filename_prefix: str = None):
-        """Saves tokenizer's vocabulary and other artifacts to the specified directory"""
-        return self.tokenizer.save_vocabulary(save_directory=save_directory, filename_prefix=filename_prefix)
 
     def save_pretrained(self, save_directory: str):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""

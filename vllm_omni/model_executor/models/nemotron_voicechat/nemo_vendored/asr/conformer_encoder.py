@@ -28,15 +28,9 @@ from torch import nn
 
 from ..compat import (
     AccessMixin,
-    AcousticEncodedRepresentation,
-    BoolType,
     CacheAwareStreamingConfig,
-    ChannelType,
     Exportable,
-    LengthsType,
     NeuralModule,
-    NeuralType,
-    SpectrogramType,
     StreamingEncoder,
     logging,
     typecheck,
@@ -178,115 +172,12 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             as a part of the training step.
     """
 
-    def input_example(self, max_batch=1, max_dim=256):
-        """
-        Generates input examples for tracing etc.
-        Returns:
-            A tuple of input examples.
-        """
-        dev = next(self.parameters()).device
-        if self.export_cache_support:
-            window_size = max_dim
-            if self.streaming_cfg is not None:
-                if isinstance(self.streaming_cfg.chunk_size, list):
-                    chunk_size = self.streaming_cfg.chunk_size[1]
-                else:
-                    chunk_size = self.streaming_cfg.chunk_size
-                if isinstance(self.streaming_cfg.pre_encode_cache_size, list):
-                    pre_encode_cache_size = self.streaming_cfg.pre_encode_cache_size[1]
-                else:
-                    pre_encode_cache_size = self.streaming_cfg.pre_encode_cache_size
-                window_size = chunk_size + pre_encode_cache_size
-            input_example = torch.randn(max_batch, self._feat_in, window_size, device=dev)
-            input_example_length = torch.randint(
-                window_size // 4, window_size, (max_batch,), device=dev, dtype=torch.int64
-            )
-            cache_last_channel, cache_last_time, cache_last_channel_len = self.get_initial_cache_state(
-                batch_size=max_batch, device=dev, max_dim=max_dim
-            )
-            all_input_example = tuple(
-                [
-                    input_example,
-                    input_example_length,
-                    cache_last_channel.transpose(0, 1),
-                    cache_last_time.transpose(0, 1),
-                    cache_last_channel_len,
-                ]
-            )
-        else:
-            input_example = torch.randn(max_batch, self._feat_in, max_dim, device=dev)
-            input_example_length = torch.randint(max_dim // 4, max_dim, (max_batch,), device=dev, dtype=torch.int64)
-            all_input_example = tuple([input_example, input_example_length])
 
-        return all_input_example
 
-    @property
-    def input_types(self):
-        """Returns definitions of module input ports."""
-        return OrderedDict(
-            {
-                "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
-                "length": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-                "bypass_pre_encode": NeuralType(tuple(), BoolType(), optional=True),
-            }
-        )
 
-    @property
-    def input_types_for_export(self):
-        """Returns definitions of module input ports."""
-        return OrderedDict(
-            {
-                "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
-                "length": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel": NeuralType(('B', 'D', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time": NeuralType(('B', 'D', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-                "bypass_pre_encode": NeuralType(tuple(), BoolType(), optional=True),
-            }
-        )
 
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports."""
-        return OrderedDict(
-            {
-                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel_next": NeuralType(('D', 'B', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time_next": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-            }
-        )
 
-    @property
-    def output_types_for_export(self):
-        """Returns definitions of module output ports."""
-        return OrderedDict(
-            {
-                "outputs": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
-                "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
-                "cache_last_channel_next": NeuralType(('B', 'D', 'T', 'D'), ChannelType(), optional=True),
-                "cache_last_time_next": NeuralType(('B', 'D', 'D', 'T'), ChannelType(), optional=True),
-                "cache_last_channel_next_len": NeuralType(tuple('B'), LengthsType(), optional=True),
-            }
-        )
 
-    @property
-    def disabled_deployment_input_names(self):
-        if not self.export_cache_support:
-            return set(["cache_last_channel", "cache_last_time", "cache_last_channel_len"])
-        else:
-            return set()
-
-    @property
-    def disabled_deployment_output_names(self):
-        if not self.export_cache_support:
-            return set(["cache_last_channel_next", "cache_last_time_next", "cache_last_channel_next_len"])
-        else:
-            return set()
 
     def __init__(
         self,
@@ -491,61 +382,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         # will be set in self.forward() if defined in AccessMixin config
         self.interctc_capture_at_layers = None
 
-    def forward_for_export(
-        self, audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
-    ):
-        """
-        Forward function for model export. Please see `forward()` for more details.
-        """
-        if cache_last_channel is not None:
-            cache_last_channel = cache_last_channel.transpose(0, 1)
-            cache_last_time = cache_last_time.transpose(0, 1)
 
-        rets = self.forward_internal(
-            audio_signal,
-            length,
-            cache_last_channel=cache_last_channel,
-            cache_last_time=cache_last_time,
-            cache_last_channel_len=cache_last_channel_len,
-        )
-        rets = self.streaming_post_process(rets, keep_all_outputs=False)
-        if len(rets) == 2:
-            return rets
-        elif rets[2] is None and rets[3] is None and rets[4] is None:
-            return (rets[0], rets[1])
-        else:
-            return (
-                rets[0],
-                rets[1],
-                rets[2].transpose(0, 1),
-                rets[3].transpose(0, 1),
-                rets[4],
-            )
-
-    def streaming_post_process(self, rets, keep_all_outputs=True):
-        """
-        Post-process the output of the forward function for streaming.
-
-        Args:
-            rets: The output of the forward function.
-            keep_all_outputs: Whether to keep all outputs.
-        """
-        if len(rets) == 2:
-            return rets[0], rets[1], None, None, None
-
-        (encoded, encoded_len, cache_last_channel_next, cache_last_time_next, cache_last_channel_next_len) = rets
-
-        if cache_last_channel_next is not None and self.streaming_cfg.last_channel_cache_size >= 0:
-            if self.streaming_cfg.last_channel_cache_size > 0:
-                cache_last_channel_next = cache_last_channel_next[
-                    :, :, -self.streaming_cfg.last_channel_cache_size :, :
-                ]
-
-        if self.streaming_cfg.valid_out_len > 0 and (not keep_all_outputs or self.att_context_style == "regular"):
-            encoded = encoded[:, :, : self.streaming_cfg.valid_out_len]
-            encoded_len = torch.clamp(encoded_len, max=self.streaming_cfg.valid_out_len)
-
-        return (encoded, encoded_len, cache_last_channel_next, cache_last_time_next, cache_last_channel_next_len)
 
     @typecheck()
     def forward(
@@ -851,17 +688,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         pad_mask = ~pad_mask
         return pad_mask, att_mask
 
-    def enable_pad_mask(self, on=True):
-        """
-        Enables or disables the pad mask and assign the boolean state `on`.
-
-        Returns:
-            mask (bool): The current state of the pad mask.
-        """
-        # On inference, user may choose to disable pad mask
-        mask = self.use_pad_mask
-        self.use_pad_mask = on
-        return mask
 
     def _calc_context_sizes(
         self, att_context_size, att_context_probs, att_context_style, conv_context_size, conv_kernel_size
@@ -911,22 +737,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             conv_context_size = [(conv_kernel_size - 1) // 2, (conv_kernel_size - 1) // 2]
         return att_context_size_all, att_context_size_all[0], att_context_probs, conv_context_size
 
-    def set_default_att_context_size(self, att_context_size):
-        """
-        Sets the default attention context size from `att_context_size` argument.
-
-        Args:
-            att_context_size (list): The attention context size to be set.
-        """
-        if att_context_size not in self.att_context_size_all:
-            logging.warning(
-                f"att_context_size={att_context_size} is not among the list of the supported "
-                f"look-aheads: {self.att_context_size_all}"
-            )
-        if att_context_size is not None:
-            self.att_context_size = att_context_size
-
-        self.setup_streaming_params()
 
     def setup_streaming_params(
         self,
@@ -1035,174 +845,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         self.streaming_cfg = streaming_cfg
 
-    def get_initial_cache_state(self, batch_size=1, dtype=torch.float32, device=None, max_dim=0):
-        if device is None:
-            device = next(self.parameters()).device
-        if max_dim > 0:
-            create_tensor = torch.randn
-        else:
-            create_tensor = torch.zeros
-        last_time_cache_size = self.conv_context_size[0]
-        cache_last_channel = create_tensor(
-            (
-                len(self.layers),
-                batch_size,
-                self.streaming_cfg.last_channel_cache_size,
-                self.d_model,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        cache_last_time = create_tensor(
-            (len(self.layers), batch_size, self.d_model, last_time_cache_size),
-            device=device,
-            dtype=dtype,
-        )
-        if max_dim > 0:
-            cache_last_channel_len = torch.randint(
-                0,
-                min(max_dim, self.streaming_cfg.last_channel_cache_size),
-                (batch_size,),
-                device=device,
-                dtype=torch.int64,
-            )
-            for i in range(batch_size):
-                cache_last_channel[:, i, cache_last_channel_len[i] :, :] = 0
-                # what is the right rule to zero out cache_last_time?
-                if cache_last_channel_len[i] == 0:
-                    cache_last_time[:, i, :, :] = 0
-        else:
-            cache_last_channel_len = torch.zeros(batch_size, device=device, dtype=torch.int64)
-        return cache_last_channel, cache_last_time, cache_last_channel_len
 
-    def change_attention_model(
-        self,
-        self_attention_model: str = None,
-        att_context_size: List[int] = None,
-        update_config: bool = True,
-        device: torch.device = None,
-    ):
-        """
-        Update the self_attention_model which changes the positional encoding and attention layers.
-
-        Args:
-            self_attention_model (str): type of the attention layer and positional encoding
-
-                'rel_pos':
-                    relative positional embedding and Transformer-XL
-
-                'rel_pos_local_attn':
-                    relative positional embedding and Transformer-XL with local attention using
-                    overlapping windows. Attention context is determined by att_context_size parameter.
-
-                'abs_pos':
-                    absolute positional embedding and Transformer
-
-                If None is provided, the self_attention_model isn't changed. Defaults to None.
-            att_context_size (List[int]): List of 2 ints corresponding to left and right attention context sizes,
-                or None to keep as it is. Defaults to None.
-            update_config (bool): Whether to update the config or not with the new attention model.
-                Defaults to True.
-            device (torch.device): If provided, new layers will be moved to the device.
-                Defaults to None.
-        """
-
-        if att_context_size:
-            att_context_size = list(att_context_size)
-        else:
-            att_context_size = self.att_context_size
-
-        if self_attention_model is None:
-            self_attention_model = self.self_attention_model
-
-        if self_attention_model == 'rel_pos_local_attn' and max(att_context_size) <= 0:
-            raise ValueError("When using local attention, context size must be set > 0")
-
-        if self_attention_model == "rel_pos":
-            new_pos_enc = RelPositionalEncoding(
-                d_model=self._cfg.d_model,
-                dropout_rate=self._cfg.dropout,
-                max_len=self._cfg.pos_emb_max_len,
-                xscale=self.xscale,
-                dropout_rate_emb=self._cfg.dropout_emb,
-            )
-        elif self_attention_model == 'rel_pos_local_attn':
-            new_pos_enc = LocalAttRelPositionalEncoding(
-                att_context_size=att_context_size,
-                d_model=self._cfg.d_model,
-                dropout_rate=self._cfg.dropout,
-                max_len=self._cfg.pos_emb_max_len,
-                xscale=self.xscale,
-                dropout_rate_emb=self._cfg.dropout_emb,
-            )
-        elif self_attention_model == "abs_pos":
-            new_pos_enc = PositionalEncoding(
-                d_model=self._cfg.d_model,
-                dropout_rate=self._cfg.dropout,
-                max_len=self._cfg.pos_emb_max_len,
-                xscale=self.xscale,
-            )
-        else:
-            raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
-
-        if device is not None:
-            new_pos_enc = new_pos_enc.to(device=device)
-        del self.pos_enc
-        self.pos_enc = new_pos_enc
-        self.self_attention_model = self_attention_model
-        self.att_context_size = att_context_size
-        self.set_max_audio_length(self.pos_emb_max_len)
-
-        for _, m in self.named_modules():
-            if type(m) == ConformerLayer:
-                if self_attention_model == 'rel_pos':
-                    new_attn = RelPositionMultiHeadAttention(
-                        n_head=self._cfg.n_heads,
-                        n_feat=self._cfg.d_model,
-                        dropout_rate=self._cfg.dropout_att,
-                        max_cache_len=att_context_size[0],
-                        pos_bias_u=None,
-                        pos_bias_v=None,
-                        use_pytorch_sdpa=self.use_pytorch_sdpa,
-                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
-                    )
-                elif self_attention_model == 'rel_pos_local_attn':
-                    new_attn = RelPositionMultiHeadAttentionLongformer(
-                        n_head=self._cfg.n_heads,
-                        n_feat=self._cfg.d_model,
-                        dropout_rate=self._cfg.dropout_att,
-                        max_cache_len=att_context_size[0],
-                        att_context_size=att_context_size,
-                        pos_bias_u=None,
-                        pos_bias_v=None,
-                        use_pytorch_sdpa=self.use_pytorch_sdpa,
-                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
-                    )
-                elif self_attention_model == 'abs_pos':
-                    new_attn = MultiHeadAttention(
-                        n_head=self._cfg.n_heads,
-                        n_feat=self._cfg.d_model,
-                        dropout_rate=self._cfg.dropout_att,
-                        max_cache_len=att_context_size[0],
-                        use_pytorch_sdpa=self.use_pytorch_sdpa,
-                        use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
-                    )
-                else:
-                    raise ValueError(
-                        f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
-                        f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
-                    )
-                if device is not None:
-                    new_attn = new_attn.to(device=device)
-                new_attn.load_state_dict(m.self_attn.state_dict(), strict=False)
-                del m.self_attn
-                m.self_attn = new_attn
-                m.self_attention_model = self_attention_model
-
-        if update_config:
-            with open_dict(self._cfg):
-                self._cfg.self_attention_model = self_attention_model
-                self._cfg.att_context_size = att_context_size
 
     def change_subsampling_conv_chunking_factor(self, subsampling_conv_chunking_factor: int):
         """
@@ -1224,22 +867,3 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         )
 
 
-@dataclass
-class ConformerChangeConfig:
-    """
-    Change self_attention_model for Conformer.
-
-    Options:
-     'rel_pos': relative positional embedding and Transformer-XL
-     'rel_pos_local_attn': relative positional embedding and Transformer-XL with local attention using
-      overlapping chunks. Attention context is determined by att_context_size parameter.
-     'abs_pos': absolute positional embedding and Transformer
-    """
-
-    # If None is provided, self_attention_model is not changed.
-    self_attention_model: Optional[str] = None
-
-    # Change the attention context size by providing 2 integers,
-    # corresponding to left and right context, or -1 for full context.
-    # If None is provided, the attention context size isn't changed.
-    att_context_size: Optional[List[int]] = None

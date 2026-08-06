@@ -222,60 +222,6 @@ class PreTrainedModel(nn.Module):
         model.load_state_dict(model_state_dict, strict=strict)
         return model
 
-    def get_optimizer_param_groups(self, weight_decay: float = 0.0) -> list[dict]:
-        """
-        Separates model parameters into two groups: one with weight decay and one without.
-
-        This is a common practice in training deep learning models, where weight decay
-        is typically applied to the weights of linear and convolutional layers, but not
-        to biases or normalization layer parameters.
-
-        Args:
-            weight_decay (float, optional): The weight decay value to apply to the
-                                            first group of parameters. Defaults to 0.0.
-
-        Returns:
-            list[dict]: A list of two dictionaries, each suitable for an optimizer's
-                        parameter groups. The first group has weight decay, and the
-                        second does not.
-        """
-
-        def _get_weight_names(module):
-            """Recursively finds the names of all 'weight' parameters in conv/linear layers."""
-            result = []
-            is_weight_layer = isinstance(
-                module,
-                (
-                    nn.Linear
-                    | nn.Conv1d
-                    | nn.Conv2d
-                    | nn.Conv3d
-                    | nn.ConvTranspose1d
-                    | nn.ConvTranspose2d
-                    | nn.ConvTranspose3d
-                ),
-            )
-            if is_weight_layer:
-                result.append("weight")
-            else:
-                for name, child in module.named_children():
-                    result += [f"{name}.{n}" for n in _get_weight_names(child)]
-            return result
-
-        # Separate parameters
-        params_w_decay, params_wo_decay = [], []
-        param_names_w_decay = set(_get_weight_names(self))
-
-        for n, p in self.named_parameters():
-            if p.requires_grad:
-                if n in param_names_w_decay:
-                    params_w_decay.append(p)
-                else:
-                    params_wo_decay.append(p)
-        return [
-            {"params": params_w_decay, "weight_decay": weight_decay},
-            {"params": params_wo_decay, "weight_decay": 0.0},
-        ]
 
 
 # ==============================================================================
@@ -283,61 +229,8 @@ class PreTrainedModel(nn.Module):
 # ==============================================================================
 
 
-def check_git_hash() -> str | None:
-    """
-    Retrieves the current git commit hash of the repository containing this file.
-
-    This is useful for reproducibility, allowing you to track the exact version
-    of the code used for a particular experiment.
-
-    Returns:
-        str | None: The git commit hash as a string if successful, otherwise None.
-    """
-
-    try:
-        # Get the directory where this script is located
-        source_sub_dir = os.path.dirname(os.path.realpath(__file__))
-        # Execute the git command to get the current HEAD commit hash
-        git_hash = (
-            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_sub_dir, stderr=subprocess.DEVNULL)
-            .decode(sys.stdout.encoding)
-            .strip()
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # Handle cases where git is not installed or the directory is not a git repo
-        logging.warning(
-            "Could not retrieve git hash. This may be because the code is not in a git repository "
-            "or git is not installed. Git hash checking will be ignored."
-        )
-        return None
-    return git_hash
 
 
-def write_git_hash(workdir_path: str) -> None:
-    """
-    Writes the current git hash to a file in a specified directory.
-
-    If a hash file already exists, it compares the current hash with the saved one
-    and logs a warning if they differ.
-
-    Args:
-        workdir_path (str): The path to the directory where the git hash file will be saved.
-    """
-    git_hash = check_git_hash()
-    if git_hash is None:
-        return
-
-    saved_git_hash_path = os.path.join(workdir_path, GIT_HASH_NAME)
-    if os.path.exists(saved_git_hash_path):
-        # If hash file exists, compare it with the current hash
-        with open(saved_git_hash_path) as f:
-            saved_git_hash = f.read().strip()
-        if saved_git_hash != git_hash:
-            logging.warning(f"Git hash has changed. Saved: {saved_git_hash[:8]}, Current: {git_hash[:8]}")
-    else:
-        # If no hash file exists, write the current hash
-        with open(saved_git_hash_path, "w") as f:
-            f.write(git_hash)
 
 
 def latest_checkpoint_path(dir_path: str, regex: str | None = None) -> str:
@@ -374,20 +267,3 @@ def latest_checkpoint_path(dir_path: str, regex: str | None = None) -> str:
     return latest_path
 
 
-def manage_checkpoints(dir_path: str, max_checkpoints: int, regex: str | None = None):
-    """Keeps the most recent checkpoints and deletes older ones."""
-    if regex is None:
-        regex = CHECKPOINT_FORMAT.format("*")
-
-    checkpoints = glob.glob(os.path.join(dir_path, regex))
-
-    if len(checkpoints) > max_checkpoints:
-        # Sort files based on the integer values in their names
-        checkpoints.sort(key=lambda f: int("".join(filter(str.isdigit, f))))
-        num_to_delete = len(checkpoints) - max_checkpoints
-        for old_checkpoint in checkpoints[:num_to_delete]:
-            logging.info(f"Deleting old checkpoint: {old_checkpoint}")
-            if os.path.isfile(old_checkpoint):
-                os.remove(old_checkpoint)
-            else:
-                shutil.rmtree(old_checkpoint)

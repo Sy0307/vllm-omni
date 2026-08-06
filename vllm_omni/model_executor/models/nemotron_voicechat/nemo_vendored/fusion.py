@@ -44,10 +44,6 @@ class FusionModule(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
     
-    @property
-    def uses_learned_gating(self) -> bool:
-        """Return True if this fusion method uses learned gating (bypasses manual weights)."""
-        return False
     
     def forward(
         self,
@@ -204,9 +200,6 @@ class GatedFusionSimple(FusionModule):
         # Initialize for uniform weighting
         self._init_uniform()
     
-    @property
-    def uses_learned_gating(self) -> bool:
-        return True
     
     def _init_uniform(self):
         """Initialize gate network for uniform initial weighting."""
@@ -290,9 +283,6 @@ class GatedFusionGMU(FusionModule):
         # Initialize for uniform weighting (all logits = 0 → equal softmax weights)
         self._init_uniform()
     
-    @property
-    def uses_learned_gating(self) -> bool:
-        return True
     
     def _init_uniform(self):
         """Initialize gate networks for uniform initial weighting."""

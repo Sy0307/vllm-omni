@@ -671,44 +671,6 @@ class MoGHead(nn.Module):
             return torch.abs(dist)
 
 
-class NeMoSubwordFlagEmbedding(nn.Module):
-    """
-    Adds a tiny embedding table for continuation tokens
-    (subwords that do NOT start with Ġ or the word-boundary marker).
-    Compatible with NeMo AutoTokenizer.
-    """
-
-    def __init__(self, tokenizer: AutoTokenizer, d_model: int):
-        super().__init__()
-
-        self.tokenizer = tokenizer
-        self.vocab_size = self.tokenizer.vocab_size
-        self.d_model = d_model
-
-        # Precompute continuation flags
-        tokens = [self.tokenizer.ids_to_tokens(i) for i in range(self.vocab_size)]
-        self.register_buffer(
-            'is_continuation',
-            torch.tensor(
-                [1 if not (tok.startswith("Ġ") or tok.startswith("▁")) else 0 for tok in tokens], dtype=torch.long
-            ),
-        )
-
-        # Tiny embedding table: 0 = word-start, 1 = continuation
-        init_std = self.d_model**-0.5
-        self.cont_emb = nn.Embedding(2, self.d_model)
-        nn.init.normal_(self.cont_emb.weight, mean=0.0, std=init_std)
-
-        # Force word-start embedding to zero so only continuation tokens get shifted
-        self.cont_emb.weight.data[0].zero_()
-
-    def forward(self, subword_embeds: torch.Tensor, token_ids: torch.LongTensor):
-        # Continuation flags
-        cont_flags = self.is_continuation[token_ids]
-
-        # Add continuation embedding
-        cont_emb = self.cont_emb(cont_flags)
-        return subword_embeds + cont_emb
 
 
 class SubwordFlagEmbedding(nn.Module):
@@ -806,34 +768,6 @@ class BOSEOSEmbedding(nn.Module):
         return token_embeds + self.special_emb(flags)
 
 
-class SubwordEmbedding(nn.Module):
-    """
-    Produces subword embeddings from a Hugging Face tokenizer vocabulary.
-    No special handling for OOVs or padding — assumes token_ids are valid.
-    """
-
-    def __init__(self, tokenizer: AutoTokenizer, d_model: int):
-        super().__init__()
-        self.tokenizer = tokenizer
-
-        # Get vocab size from tokenizer
-        vocab_dict = self.tokenizer.tokenizer.get_vocab()
-        self.vocab_size = max(vocab_dict.values()) + 1  # +1 for safety
-        self.d_model = d_model
-
-        # Subword embedding table
-        init_std = d_model**-0.5
-        self.subword_emb = nn.Embedding(self.vocab_size, d_model)
-        nn.init.normal_(self.subword_emb.weight, mean=0.0, std=init_std)
-
-    def forward(self, token_ids: torch.LongTensor, subword_mask: torch.tensor = None):
-        """
-        token_ids: (B, T)
-        subword_mask: (B, T)
-        Returns:
-            subword_embeds: (B, T, d_model)
-        """
-        return self.subword_emb(token_ids)
 
 
 class CharAwareSubwordEncoder(nn.Module):

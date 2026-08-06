@@ -111,14 +111,6 @@ class DuplexEARTTS(nn.Module):
         self._use_fsdp = False
         self._use_tp = False
         self.audio_prompt_latents = nn.ParameterDict()
-    def get_codec_silence_frame_last_one(self):
-        audio = torch.zeros(1, 10 * self.target_sample_rate).float().to(self.device)
-        audio_len = torch.tensor([audio.size(-1)]).long()
-        audio, audio_len = self.pad_audio_to_factor(audio, audio_len, self.target_samples_per_frame)
-
-        with ensures_target_precision(self.audio_codec_run_dtype), torch.no_grad():
-            sil_codes, sil_codes_lens = self.audio_codec.encode(audio.unsqueeze(1), audio_len)
-            return sil_codes[0, -1]
 
     def get_codec_silence_frame(self):
 
@@ -169,27 +161,6 @@ class DuplexEARTTS(nn.Module):
             language_model = None
         return language_model
 
-    def restore_from_pretrained_checkpoint(self, checkpoint_path):
-        """
-        Loads model weights a pretrained checkpoint file, supporting partial loading from safetensor and PyTorch formats.
-
-        Args:
-            checkpoint_path (str): Path to checkpoint file.
-
-        Returns:
-            None. The model is updated in-place.
-        """
-        if checkpoint_path is not None:
-            checkpoint_state = load_checkpoint(checkpoint_path)
-            checkpoint_state = set_model_dict_for_partial_init(checkpoint_state, self.state_dict())
-
-            if self.cfg.get("rescale_pretrained_weights", None):
-                checkpoint_state = rescale_state_dict(
-                    checkpoint_state, first_n_layers=self.cfg.get("rescale_first_n_layers", None)
-                )
-
-            self.load_state_dict(checkpoint_state, strict=True)
-            logging.info(f"Model restored from the checkpoint: {checkpoint_path} !")
 
     @property
     def device(self):
@@ -465,32 +436,6 @@ class DuplexEARTTS(nn.Module):
             "non_prompt_mask": non_prompt_mask,
             "target_text_tokens": target_text_tokens
         }
-    def get_teacher_force_inference_audio(self, batch, guidance_enabled=True):
-        inputs = self.prepare_inputs(batch)
-
-        tts_output = self.tts_model(
-            code=inputs["code"],
-            audio_mask=inputs["audio_mask"],
-            attention_mask=inputs["attention_mask"],
-            position_ids=inputs["position_ids"],
-            context_hidden_state=inputs["context_hidden_state"],
-            subword_ids=inputs["subword_ids"],
-            subword_mask=inputs["subword_mask"],
-            non_prompt_mask=inputs["non_prompt_mask"],
-            generation_config=self._get_generation_config(guidance_enabled=guidance_enabled),
-            teacher_forcing_inference=True,
-            guidance_enabled=guidance_enabled,
-        )
-        tf_audio_codes_pred = tts_output["codes"].squeeze(2)
-
-        # decode audio
-        tf_audio_codes_pred = replace_control_speech_codes(
-            tf_audio_codes_pred, self._control_codes, self.codec_silence_tokens
-        )
-        with ensures_target_precision(self.audio_codec_run_dtype), torch.no_grad():
-            audio_pred, audio_len = self.audio_codec.decode(tf_audio_codes_pred, inputs["output_lens"])
-
-        return audio_pred.squeeze(1), audio_len, tts_output
 
     def _get_generation_config(self, guidance_enabled: bool = False):
         """Get default generation config for EAR-TTS."""
@@ -501,69 +446,6 @@ class DuplexEARTTS(nn.Module):
             "noise_scale": self.cfg.get("inference_noise_scale", 0.8),
             "eos_threshold": -3.0,
         }
-    def set_audio_prompt_latent(
-        self,
-        speaker_audio,
-        speaker_audio_lens,
-        system_prompt=None,
-        batch_size=1,
-        name="default_speaker",
-    ):
-        """
-        Compute and cache an audio prompt latent representation for a given speaker.
-
-        This function runs a one-time "warmup" forward pass through the TTS model using
-        the provided speaker audio (and optional system prompt) to extract an
-        `audio_prompt_latent`. The latent is cached and can be reused during inference
-        to bypass (and potentially remove) the speaker-prompt projection path; as a
-        result, this inference path is not intended to support voice cloning from
-        arbitrary user-provided reference audio.
-
-        Typical usage:
-            - Call once per speaker (or per prompt configuration).
-            - Cache the resulting latent under a unique `name`.
-            - Reuse the cached latent during subsequent inference calls.
-
-        Args:
-            speaker_audio (Tensor):
-                Input speaker audio waveform(s), shape [B, T].
-            speaker_audio_lens (Tensor):
-                Lengths of the speaker audio, shape [B].
-            system_prompt (Optional[str]):
-                Optional system prompt text to condition the model during prompt encoding.
-            batch_size (int):
-                Batch size used during the warmup forward pass (commonly 1).
-            name (str):
-                Key under which the computed audio prompt latent is cached.
-
-        Side Effects:
-            - Creates/updates `self.audio_prompt_latents[name]` with a detached, cloned
-            tensor stored on CPU.
-            - Performs a forward pass through `self.tts_model` with caching enabled.
-
-        Returns:
-            Tensor:
-                The cached audio prompt latent (stored on CPU).
-        """
-        self.set_init_inputs(
-            speaker_audio=speaker_audio,
-            speaker_audio_lens=speaker_audio_lens,
-            system_prompt=system_prompt,
-        )
-        init_inputs = self.get_init_inputs(B=batch_size)
-        init_inputs.update(
-            {
-                "use_cache": True,
-                "past_key_values": None,
-                "guidance_enabled": False,
-            }
-        )
-
-        audio_prompt_latent = self.tts_model(**init_inputs).audio_prompt_latent
-
-        cached = audio_prompt_latent.detach().clone().cpu()
-        self.audio_prompt_latents[name] = nn.Parameter(cached, requires_grad=False)
-        return cached
 
     def get_audio_prompt_latent(self, name, B):
         """
@@ -1090,35 +972,8 @@ class DuplexEARTTS(nn.Module):
             model_dict = set_model_dict_for_partial_init(state_dict, self.state_dict())
             return super().load_state_dict(model_dict, strict=False)
 
-def load_audio_librosa(path, sr=None):
-    """
-    Load audio with torchaudio-like behavior (librosa replaced by soundfile:
-    librosa is not a dependency of this repo).
-
-    Returns:
-        audio_tensor: torch.FloatTensor of shape [channels, time]
-        sr: sampling rate
-    """
-    import soundfile as sf
-
-    audio, file_sr = sf.read(str(path), dtype="float32", always_2d=True)
-    audio = audio.T  # [channels, time]
-    if sr is not None and int(sr) != int(file_sr):
-        from vllm.multimodal.audio import resample_audio_scipy
-
-        audio = np.stack([resample_audio_scipy(ch, orig_sr=file_sr, target_sr=int(sr)) for ch in audio])
-        file_sr = int(sr)
-
-    audio_tensor = torch.from_numpy(np.ascontiguousarray(audio)).float()
-    return audio_tensor, file_sr
 
 
-def maybe_to(x, dtype):
-    if x is None:
-        return None
-    if isinstance(x, torch.Tensor) and torch.is_floating_point(x):
-        return x.to(dtype)
-    return x
 
 
 @contextmanager
@@ -1137,28 +992,6 @@ def ensures_target_precision(target_dtype):
         torch.set_default_dtype(default_dtype)
 
 
-def generate_multiturn_speaking_mask(input_ids: torch.Tensor, bos_token_id: int = 0, eos_token_id: int = 1):
-    """
-    Efficient, batched speaking mask generator that marks 1 between <bos> and <eos> pairs.
-    If <eos> is missing after a <bos>, mask continues to end. Handles multiple turns.
-
-    Args:
-        input_ids (torch.Tensor): LongTensor of shape (B, T)
-        bos_token_id (int): Token ID for <bos>
-        eos_token_id (int): Token ID for <eos>
-
-    Returns:
-        torch.Tensor: FloatTensor of shape (B, T), with 1.0 for speaking, 0.0 for silence.
-
-    Note BOS is considered as speaking (1) and EOS as non speaking 0
-    """
-    device = input_ids.device
-    bos_mask = (input_ids == bos_token_id).to(torch.int32).to(device)
-    eos_mask = (input_ids == eos_token_id).to(torch.int32).to(device)
-    bos_cumsum = torch.cumsum(bos_mask, dim=1)
-    eos_cumsum = torch.cumsum(eos_mask, dim=1)
-    speaking_mask = (bos_cumsum > eos_cumsum).to(torch.float32)
-    return speaking_mask.long()
 
 
 def replace_control_speech_codes(
@@ -1181,28 +1014,6 @@ def replace_control_speech_codes(
         return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
 
 
-def ensures_codec_target_dtype(model):
-    """
-    Ensures the audio codec is instantiated with the target dtype.
-
-    This function checks whether `model.audio_codec` exists and whether its
-    parameters match `model.audio_codec_run_dtype`. If the codec is missing
-    or is running with the wrong dtype (e.g., due to PTL auto-downcasting),
-    the codec is reloaded by calling `setup_audio_codec()`.
-
-    Intended to be called at runtime boundaries such as:
-      - `on_train_epoch_start`
-      - `on_validation_epoch_start`
-
-    Args:
-        model: Model instance of DuplexEARTTS
-
-    """
-    if hasattr(model, "audio_codec") and next(model.audio_codec.parameters()).dtype == model.audio_codec_run_dtype:
-        model.audio_codec.eval()
-        return  # already correct precision → no-op
-
-    setup_audio_codec(model)
 
 
 def setup_audio_codec(model):
@@ -1240,72 +1051,3 @@ def setup_audio_codec(model):
     model.target_samples_per_frame = model.audio_codec.config.wav_to_token_ratio
 
 
-def rescale_state_dict(state_dict, target_std=0.02, first_n_layers=None, layer_prefix="tts_model.backbone.layers."):
-    """
-    Rescale trainable weights in a state_dict for BF16/FP16 stability.
-
-    Args:
-        state_dict: PyTorch state_dict
-        target_std: desired target std for weights
-        first_n_layers: if not None, rescale only the first N transformer blocks
-        layer_prefix: prefix for layer names (default: "tts_model.backbone.layers.")
-    Returns:
-        new_state_dict
-    """
-    weight_tensors = []
-
-    # Compute which prefixes to match if first_n_layers is set
-    prefixes_to_match = []
-    if first_n_layers is not None:
-        prefixes_to_match = [f"{layer_prefix}{i}" for i in range(first_n_layers)]
-
-    for name, param in state_dict.items():
-        if not torch.is_tensor(param):
-            continue
-
-        if "rvq_embs" in name:
-            continue
-
-        # Skip biases & 1-dim params (norm weights/gates)
-        if param.ndim <= 1:
-            continue
-
-        # Skip layers not in the first N
-        if first_n_layers is not None and not any(name.startswith(pfx) for pfx in prefixes_to_match):
-            continue
-
-        weight_tensors.append(param.float())
-
-    if not weight_tensors:
-        if first_n_layers is not None:
-            logging.info(f"No weights found for first {first_n_layers} layers with prefix '{layer_prefix}'.")
-        else:
-            logging.info("No weights found to rescale in state_dict.")
-        return state_dict
-
-    # Compute global std across selected weights (on CPU)
-    cpu_weights = [p.detach().cpu() for p in weight_tensors]
-    flat = torch.cat([p.flatten() for p in cpu_weights])
-    current_std = float(torch.std(flat))
-    scale = target_std / (current_std + 1e-8)
-
-    logging.info(
-        f"Rescaling state_dict "
-        f"{'(first N layers)' if first_n_layers else '(all layers)'}: "
-        f"current std = {current_std:.6f}, target = {target_std}, scale = {scale:.6f}"
-    )
-
-    # Apply scaling
-    new_state_dict = {}
-    for name, param in state_dict.items():
-        if (
-            torch.is_tensor(param)
-            and param.ndim > 1
-            and (first_n_layers is None or any(name.startswith(pfx) for pfx in prefixes_to_match))
-        ):
-            new_state_dict[name] = param * scale
-        else:
-            new_state_dict[name] = param
-
-    logging.info("Done: weights rescaled.")
-    return new_state_dict

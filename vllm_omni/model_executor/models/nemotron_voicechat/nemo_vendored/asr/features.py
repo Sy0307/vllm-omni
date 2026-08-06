@@ -112,23 +112,6 @@ def normalize_batch(x, seq_len, normalize_type):
         return x, x_mean, x_std
 
 
-def clean_spectrogram_batch(spectrogram: torch.Tensor, spectrogram_len: torch.Tensor, fill_value=0.0) -> torch.Tensor:
-    """
-    Fill spectrogram values outside the length with `fill_value`
-
-    Args:
-        spectrogram: Tensor with shape [B, C, L] containing batched spectrograms
-        spectrogram_len: Tensor with shape [B] containing the sequence length of each batch element
-        fill_value: value to fill with, 0.0 by default
-
-    Returns:
-        cleaned spectrogram, tensor with shape equal to `spectrogram`
-    """
-    device = spectrogram.device
-    batch_size, _, max_len = spectrogram.shape
-    mask = torch.arange(max_len, device=device)[None, :] >= spectrogram_len[:, None]
-    mask = mask.unsqueeze(1).expand_as(spectrogram)
-    return spectrogram.masked_fill(mask, fill_value)
 
 
 def splice_frames(x, frame_splicing):
@@ -347,9 +330,6 @@ class FilterbankFeatures(nn.Module):
         seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length) + 1
         return seq_len.to(dtype=torch.long)
 
-    @property
-    def filter_banks(self):
-        return self.fb
 
     def forward(self, x, seq_len, linear_spec=False):
         # Initialize debug dictionary
@@ -559,10 +539,6 @@ class FilterbankFeaturesTA(nn.Module):
             wkwargs={"periodic": False},
         )
 
-    @property
-    def filter_banks(self):
-        """Matches the analogous class"""
-        return self._mel_spec_extractor.mel_scale.fb
 
     def _resolve_log_zero_guard_value(self, dtype: torch.dtype) -> float:
         if isinstance(self.log_zero_guard_value, float):

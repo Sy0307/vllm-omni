@@ -21,8 +21,6 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, Concatenate
 
-# librosa replaced by the vendored exact-math filterbank (see librosa_mel.py).
-from .librosa_mel import mel as _librosa_mel
 import torch
 from omegaconf import DictConfig
 from torch import Tensor, nn
@@ -254,187 +252,10 @@ def spec_to_wav(
         return wav
 
 
-def spectrogram_mag(
-    wav: Tensor,
-    n_fft: int,
-    hop_length: int,
-    win_length: int,
-    window_fn: Callable[Concatenate[int, ...], Tensor] = torch.hann_window,
-    power: float = 1.0,
-) -> Tensor:
-    """
-    Computes the magnitude spectrogram from an audio waveform.
-
-    This function first calculates the complex-valued spectrogram using the
-    Short-Time Fourier Transform (STFT), then computes the magnitude of the
-    resulting complex numbers. An optional power can be applied to the
-    magnitude spectrogram.
-
-    Args:
-        wav (Tensor): The input audio waveform.
-                      Shape: [batch_size?, time_steps], where batch_size? is
-                      an optional batch dimension.
-        n_fft (int): The size of the Fast Fourier Transform (FFT) to use.
-        hop_length (int): The number of audio samples between adjacent STFT columns.
-        win_length (int): The size of the window function for each frame.
-        window_fn (function, optional): The windowing function to apply to each
-                                        frame. Defaults to torch.hann_window.
-        power (float, optional): The exponent to apply to the magnitude spectrogram.
-                                 A value of 2.0 yields a power spectrogram.
-                                 Defaults to 1.0 (magnitude).
-
-    Returns:
-        Tensor: The resulting magnitude spectrogram.
-                Shape: [batch_size?, n_fft // 2 + 1, num_frames]
-    """
-    # Calculate the complex spectrogram
-    spec = spectrogram(wav, n_fft, hop_length, win_length, window_fn)
-
-    # Compute the magnitude by taking the absolute value
-    spec = spec.abs()
-
-    # Apply power if it's not the default value of 1.0
-    if power != 1.0:
-        spec = spec.pow(power)
-
-    return spec
 
 
-@functools.cache
-def get_fbanks(
-    sample_rate: int,
-    n_fft: int,
-    n_mels: int,
-    f_min: float,
-    f_max: float,
-    norm: str = "slaney",
-    mel_scale: str = "slaney",
-) -> Tensor:
-    """
-    Creates and caches Mel filterbanks.
-
-    This function generates a set of triangular filters on the Mel scale.
-    The `@functools.cache` decorator memoizes the result, so the filterbanks
-    are only computed once for a given set of parameters, improving efficiency
-    when the function is called multiple times with the same arguments.
-
-    Note: This implementation only supports Mel filterbanks (vendored librosa math).
-
-    Args:
-        sample_rate (int): The sample rate of the audio.
-        n_fft (int): The size of the FFT used to compute the spectrogram.
-        n_mels (int): The number of Mel bands to generate.
-        f_min (float): The lowest frequency (in Hz) for the filterbanks.
-        f_max (float): The highest frequency (in Hz) for the filterbanks.
-        norm (str, optional): The normalization method to use for the triangles.
-                              'slaney' normalizes to unit area. None applies no norm.
-                              Defaults to "slaney".
-        mel_scale (str, optional): The Mel scale to use, "htk" or "slaney".
-                                   Defaults to "slaney".
-
-    Returns:
-        Tensor: The Mel filterbank matrix.
-                Shape: [n_mels, n_fft // 2 + 1]
-    """
-    # Generate Mel filterbanks using librosa's functional API
-    fb = _librosa_mel(
-        sr=sample_rate,
-        n_fft=n_fft,
-        n_mels=n_mels,
-        fmin=f_min,
-        fmax=f_max,
-        norm=norm,
-        htk=(mel_scale == "htk"),
-    )  # [n_mels, n_freqs]
-    fb = torch.from_numpy(fb).float()
-    return fb
 
 
-def mel_spectrogram(
-    wav: Tensor,
-    n_fft: int,
-    hop_length: int,
-    win_length: int,
-    sample_rate: int,
-    n_mels: int,
-    f_min: float,
-    f_max: float | None = None,
-    window_fn: Callable[Concatenate[int, ...], Tensor] = torch.hann_window,
-    power: float = 1.0,
-    log_scale: str | None = "natural",
-) -> Tensor:
-    """
-    Computes a Mel-scaled spectrogram from an audio waveform.
-
-    This function transforms a standard spectrogram into a Mel spectrogram by
-    applying Mel-scaled filterbanks. It can optionally return the result on a
-    logarithmic scale.
-
-    Args:
-        wav (Tensor): The input audio waveform.
-                      Shape: [batch_size?, time_steps], where batch_size? is an
-                      optional batch dimension.
-        n_fft (int): The size of the FFT.
-        hop_length (int): The number of samples between adjacent frames.
-        win_length (int): The size of the window function.
-        sample_rate (int): The sample rate of the audio.
-        n_mels (int): The number of Mel bands to generate.
-        f_min (float): The lowest frequency (in Hz) for the Mel scale.
-        f_max (float | None, optional): The highest frequency (in Hz). If None,
-                                        it defaults to sample_rate / 2 (Nyquist).
-        window_fn (function, optional): The windowing function. Defaults to torch.hann_window.
-        power (float, optional): The exponent for the magnitude spectrogram before
-                                 Mel conversion. Defaults to 1.0.
-        log_scale (str | None, optional): The type of logarithmic scaling to apply.
-                                          Can be "natural" (for `log`), "log10", or `None`
-                                          to return the linear-amplitude Mel spectrogram.
-                                          Defaults to "natural".
-
-    Returns:
-        Tensor: The resulting Mel spectrogram.
-                Shape: [batch_size?, n_mels, num_frames]
-
-    Raises:
-        ValueError: If an unsupported string is provided for `log_scale`.
-    """
-    # If f_max is not provided, use the Nyquist frequency.
-    f_max = f_max or sample_rate / 2
-
-    # 1. Compute the magnitude spectrogram.
-    spec = spectrogram_mag(wav, n_fft, hop_length, win_length, window_fn=window_fn, power=power)
-
-    # Use a torch.autocast context to ensure the following operations
-    # are performed in float32 precision for numerical stability, especially
-    # when the input `spec` might be in a lower precision format like float16.
-    with torch.autocast(device_type=spec.device.type, enabled=False):
-        # 2. Get the Mel filterbanks (cached for efficiency).
-        fb = (
-            get_fbanks(
-                sample_rate,
-                n_fft,
-                n_mels,
-                f_min,
-                f_max,
-            )
-            .float()
-            .to(device=spec.device)
-        )  # Ensure filterbank is float32 and on the correct device.
-
-        # 3. Apply the filterbanks to the spectrogram via matrix multiplication.
-        # This maps the linear frequency scale to the Mel scale.
-        # (n_mels, n_freqs) @ (..., n_freqs, time) -> (..., n_mels, time)
-        mel = torch.matmul(fb, spec.float())
-
-        # 4. Optionally, apply a logarithmic function.
-        # A small value (epsilon) is added to prevent taking the log of zero.
-        if log_scale == "natural":
-            mel = torch.log(torch.clamp(mel, min=1e-6))
-        elif log_scale == "log10":
-            mel = torch.log10(torch.clamp(mel, min=1e-6))
-        elif log_scale is not None:
-            raise ValueError(f"Unsupported log_scale: '{log_scale}'. Choose from 'natural', 'log10', or None.")
-
-    return mel
 
 
 # ==============================================================================
@@ -648,9 +469,6 @@ class PreTrainedProbabilisticVQ(nn.Module):
         )
         self._variance_list = nn.ModuleList([PreTrainedEMAVariance() for _ in range(depth)])
 
-    @property
-    def log_std(self) -> Tensor:
-        return torch.log(self._variance_list[-1]()) * 0.5
 
     def encode(self, z: Tensor, return_z_q: bool = False) -> list[Tensor] | tuple[list[Tensor], Tensor]:
         r = z

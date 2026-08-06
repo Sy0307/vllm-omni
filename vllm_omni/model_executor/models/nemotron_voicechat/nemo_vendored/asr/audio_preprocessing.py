@@ -27,12 +27,8 @@ import torch
 from packaging import version
 
 from ..compat import (
-    AudioSignal,
     Exportable,
-    LengthsType,
-    MelSpectrogramType,
     NeuralModule,
-    NeuralType,
     logging,
     logging_mode,
     typecheck,
@@ -183,31 +179,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
     def restore_from(cls, restore_path: str):
         pass
 
-    @property
-    def input_types(self):
-        """Returns definitions of module input ports."""
-        return {
-            "input_signal": NeuralType(('B', 'T'), AudioSignal(freq=self._sample_rate)),
-            "length": NeuralType(
-                tuple('B'), LengthsType()
-            ),  # Please note that length should be in samples not seconds.
-        }
 
-    @property
-    def output_types(self):
-        """Returns definitions of module output ports.
-
-        processed_signal:
-            0: AxisType(BatchTag)
-            1: AxisType(MelSpectrogramSignalTag)
-            2: AxisType(ProcessedTimeTag)
-        processed_length:
-            0: AxisType(BatchTag)
-        """
-        return {
-            "processed_signal": NeuralType(('B', 'D', 'T'), MelSpectrogramType()),
-            "processed_length": NeuralType(tuple('B'), LengthsType()),
-        }
 
     def __init__(
         self,
@@ -287,51 +259,10 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
             stft_conv=stft_conv,  # Deprecated arguments; kept for config compatibility
         )
 
-    def input_example(self, max_batch: int = 8, max_dim: int = 32000, min_length: int = 200):
-        dev = self.filter_banks.device
-
-        signals = torch.randn(size=[max_batch, max_dim], device=dev)
-        lengths = torch.randint(low=min_length, high=max_dim, size=[max_batch], device=dev)
-        lengths[0] = max_dim
-        return signals, lengths
 
     def get_features(self, input_signal, length):
         return self.featurizer(input_signal, length)
 
-    @property
-    def filter_banks(self):
-        return self.featurizer.filter_banks
 
 
-@dataclass
-class AudioToMelSpectrogramPreprocessorConfig:
-    _target_: str = "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor"
-    sample_rate: int = 16000
-    window_size: float = 0.02
-    window_stride: float = 0.01
-    n_window_size: Optional[int] = None
-    n_window_stride: Optional[int] = None
-    window: str = "hann"
-    normalize: str = "per_feature"
-    n_fft: Optional[int] = None
-    preemph: float = 0.97
-    features: int = 64
-    lowfreq: int = 0
-    highfreq: Optional[int] = None
-    log: bool = True
-    log_zero_guard_type: str = "add"
-    log_zero_guard_value: float = 2**-24
-    dither: float = 1e-5
-    pad_to: int = 16
-    frame_splicing: int = 1
-    exact_pad: bool = False
-    pad_value: int = 0
-    mag_power: float = 2.0
-    rng: Optional[str] = None
-    nb_augmentation_prob: float = 0.0
-    nb_max_freq: int = 4000
-    use_torchaudio: bool = False
-    mel_norm: str = "slaney"
-    stft_exact_pad: bool = False  # Deprecated argument, kept for compatibility with older checkpoints.
-    stft_conv: bool = False  # Deprecated argument, kept for compatibility with older checkpoints.
 
