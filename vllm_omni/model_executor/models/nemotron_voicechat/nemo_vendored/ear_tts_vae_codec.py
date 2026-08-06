@@ -252,12 +252,6 @@ def spec_to_wav(
         return wav
 
 
-
-
-
-
-
-
 # ==============================================================================
 # Basic Modules
 # ==============================================================================
@@ -469,7 +463,6 @@ class PreTrainedProbabilisticVQ(nn.Module):
         )
         self._variance_list = nn.ModuleList([PreTrainedEMAVariance() for _ in range(depth)])
 
-
     def encode(self, z: Tensor, return_z_q: bool = False) -> list[Tensor] | tuple[list[Tensor], Tensor]:
         r = z
         ids_sel = []
@@ -548,9 +541,7 @@ class Wav2Latent(nn.Module):
             hidden_size = base_hidden_size * ch_mult
             # Add ConvNeXt blocks for this stage
             for j in range(num_blocks):
-                layers.append(
-                    ConvNeXt1d(hidden_size, hidden_size * 4, kernel_size, True, layer_idx=i * num_blocks + j)
-                )
+                layers.append(ConvNeXt1d(hidden_size, hidden_size * 4, kernel_size, True, layer_idx=i * num_blocks + j))
             # Add downsampling convolution
             next_hidden_size = base_hidden_size * channel_mult[i + 1] if i < len(channel_mult) - 1 else latent_size
             layers.append(
@@ -634,9 +625,7 @@ class Latent2Wav(nn.Module):
             )
             # Add ConvNeXt blocks for this stage
             for j in range(num_blocks):
-                layers.append(
-                    ConvNeXt1d(hidden_size, hidden_size * 4, kernel_size, True, layer_idx=i * num_blocks + j)
-                )
+                layers.append(ConvNeXt1d(hidden_size, hidden_size * 4, kernel_size, True, layer_idx=i * num_blocks + j))
 
         # Final projection to spectrogram dimensions (magnitude + phase)
         layers.append(nn.Conv1d(hidden_size, n_fft + 2, 1, bias=False))

@@ -72,7 +72,7 @@ class DuplexEARTTS(nn.Module):
         if self.cfg.tts_config.context_hidden_size is not None:
             self.language_model = self._load_language_model(self.cfg)
             self.embed_tokens = self._load_embed_tokens(self.cfg)
-            # delete llm because we use it only to get the  embbeding tokens
+            # delete llm because we use it only to get the  embedding tokens
             del self.language_model
 
         # get codec run precision
@@ -113,7 +113,6 @@ class DuplexEARTTS(nn.Module):
         self.audio_prompt_latents = nn.ParameterDict()
 
     def get_codec_silence_frame(self):
-
         # Generate long zero waveform (silence)
         audio = torch.zeros(1, 10 * self.target_sample_rate).float().to(self.device)
         audio_len = torch.tensor([audio.size(-1)]).long()
@@ -160,7 +159,6 @@ class DuplexEARTTS(nn.Module):
         else:
             language_model = None
         return language_model
-
 
     @property
     def device(self):
@@ -330,9 +328,7 @@ class DuplexEARTTS(nn.Module):
             eos_mask = target_text_tokens == self.text_eos_id
 
             # Random dropout only on EOS positions
-            dropout_mask = (
-                torch.rand(eos_mask.sum(), device=target_text_tokens.device) < self.cfg.text_eos_dropout_prob
-            )
+            dropout_mask = torch.rand(eos_mask.sum(), device=target_text_tokens.device) < self.cfg.text_eos_dropout_prob
 
             # Scatter dropout decisions into [B, T]
             full_dropout_mask = torch.zeros_like(target_text_tokens, dtype=torch.bool)
@@ -343,16 +339,13 @@ class DuplexEARTTS(nn.Module):
                 full_dropout_mask, torch.full_like(target_text_tokens, self.text_pad_id), target_text_tokens
             )
 
-
         # BOS dropout to make the model more robust
         if self.training and self.cfg.get("text_bos_dropout_prob", 0.0) > 0:
             # Mask BOS positions
             bos_mask = target_text_tokens == self.text_bos_id
 
             # Random dropout only on BOS positions
-            dropout_mask = (
-                torch.rand(bos_mask.sum(), device=target_text_tokens.device) < self.cfg.text_bos_dropout_prob
-            )
+            dropout_mask = torch.rand(bos_mask.sum(), device=target_text_tokens.device) < self.cfg.text_bos_dropout_prob
 
             # Scatter dropout decisions into [B, T]
             full_dropout_mask = torch.zeros_like(target_text_tokens, dtype=torch.bool)
@@ -368,14 +361,14 @@ class DuplexEARTTS(nn.Module):
         # BOS dropout to make the model more robust
         if self.training and self.cfg.get("text_bos_dropout_prob", 0.0) > 0:
             prob = self.cfg.text_bos_dropout_prob  # e.g., 0.5
-            
+
             # Identify all BOS positions [B, T]
-            bos_mask = (target_text_tokens == self.text_bos_id)
-            
+            bos_mask = target_text_tokens == self.text_bos_id
+
             # Get indices of sequences that actually have a BOS token
             # We need to know *where* the BOS tokens are to drop them.
             # tensor of coordinates: [[batch_idx, seq_idx], ...]
-            bos_indices = torch.nonzero(bos_mask) 
+            bos_indices = torch.nonzero(bos_mask)
             num_bos = bos_indices.shape[0]
 
             if num_bos > 0:
@@ -392,7 +385,7 @@ class DuplexEARTTS(nn.Module):
                 # We need to map the decisions back to the full tensor
                 # Create a mask of the same shape as target_text_tokens
                 full_dropout_mask = torch.zeros_like(target_text_tokens, dtype=torch.bool)
-                
+
                 # Set True only at the specific (batch, seq) coordinates we chose to drop
                 # bos_indices[:, 0] are batch indices, bos_indices[:, 1] are seq indices
                 full_dropout_mask[bos_indices[:, 0], bos_indices[:, 1]] = drop_decisions
@@ -434,7 +427,7 @@ class DuplexEARTTS(nn.Module):
             "context_hidden_state": context_hidden_state,
             "output_lens": target_codes_lens,
             "non_prompt_mask": non_prompt_mask,
-            "target_text_tokens": target_text_tokens
+            "target_text_tokens": target_text_tokens,
         }
 
     def _get_generation_config(self, guidance_enabled: bool = False):
@@ -473,9 +466,7 @@ class DuplexEARTTS(nn.Module):
                 If `name` does not exist in `self.audio_prompt_latents`.
         """
         if not hasattr(self, "audio_prompt_latents") or name not in self.audio_prompt_latents:
-            raise KeyError(
-                f"Unknown audio prompt latent '{name}'. Call set_audio_prompt_latent(...) first."
-            )
+            raise KeyError(f"Unknown audio prompt latent '{name}'. Call set_audio_prompt_latent(...) first.")
 
         audio_prompt_latent = self.audio_prompt_latents[name]  # cached on CPU
 
@@ -512,7 +503,9 @@ class DuplexEARTTS(nn.Module):
             )
 
             if speaker_name is not None:
-                logging.info(f"set_init_inputs: using pre-baked latent for speaker '{speaker_name}' (silent carrier audio)")
+                logging.info(
+                    f"set_init_inputs: using pre-baked latent for speaker '{speaker_name}' (silent carrier audio)"
+                )
                 speaker_audio = torch.zeros((1, prompt_audio_size), device=self.device, dtype=torch.float32)
                 speaker_audio_lens = torch.LongTensor([speaker_audio.shape[1]]).to(self.device)
 
@@ -553,8 +546,10 @@ class DuplexEARTTS(nn.Module):
         # create a eos token id
         if system_prompt is not None and self.cfg.get("use_system_prompt", None) and system_prompt != "":
             text_prompt = torch.as_tensor(
-                    [self.tokenizer.bos] + self.tokenizer.text_to_ids(system_prompt) + [self.tokenizer.eos], dtype=torch.long, device=self.device
-                )
+                [self.tokenizer.bos] + self.tokenizer.text_to_ids(system_prompt) + [self.tokenizer.eos],
+                dtype=torch.long,
+                device=self.device,
+            )
         else:
             text_prompt = torch.tensor([self.tokenizer.eos], dtype=torch.long, device=self.device)
 
@@ -650,7 +645,7 @@ class DuplexEARTTS(nn.Module):
             "context_hidden_state",
             "subword_ids",
             "subword_mask",
-            "non_prompt_mask"
+            "non_prompt_mask",
         ],
     ):
         """
@@ -738,7 +733,7 @@ class DuplexEARTTS(nn.Module):
             context_hidden_state = None
 
         # force silence as next token
-        if self.cfg.get('inference_force_speech_silence_on_eos', True):
+        if self.cfg.get("inference_force_speech_silence_on_eos", True):
             silence_codes = self.codec_silence_tokens.view(1, 1, -1).expand(prev_audio_tokens.shape)
             prev_audio_tokens = torch.where(
                 current_subword_id.unsqueeze(-1) == self.text_eos_id,
@@ -910,7 +905,7 @@ class DuplexEARTTS(nn.Module):
 
             # create subword_mask
             current_subword_mask = subword_mask[:, i].unsqueeze(-1)
-    
+
             code, past_key_values = self.infer_codes_one_step(
                 current_subword_id=current_subword_id,
                 prev_subword_id=prev_subword_id,
@@ -949,6 +944,7 @@ class DuplexEARTTS(nn.Module):
                 audio_pred, audio_pred_len = self.audio_codec.decode(gen_audio_codes, gen_audio_codes_lens)
 
         return audio_pred.squeeze(1), audio_pred_len
+
     def maybe_recreate_cached_audio_prompt_latents_structure(self, state_dict):
         """
         Recreate audio_prompt_latents ParameterDict structure
@@ -973,9 +969,6 @@ class DuplexEARTTS(nn.Module):
             return super().load_state_dict(model_dict, strict=False)
 
 
-
-
-
 @contextmanager
 def ensures_target_precision(target_dtype):
     """
@@ -992,8 +985,6 @@ def ensures_target_precision(target_dtype):
         torch.set_default_dtype(default_dtype)
 
 
-
-
 def replace_control_speech_codes(
     speech_codes: torch.Tensor, control_codes: torch.Tensor, silence_tokens: torch.Tensor = None
 ) -> torch.Tensor:
@@ -1007,13 +998,9 @@ def replace_control_speech_codes(
         return torch.where(torch.isin(speech_codes, control_codes), silence_tokens_expanded, speech_codes)
 
     if torch.isin(speech_codes[:, :1], control_codes).any():
-        return torch.where(
-            torch.isin(speech_codes, control_codes), torch.zeros_like(speech_codes[:, :1]), speech_codes
-        )
+        return torch.where(torch.isin(speech_codes, control_codes), torch.zeros_like(speech_codes[:, :1]), speech_codes)
     else:
         return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
-
-
 
 
 def setup_audio_codec(model):
@@ -1049,5 +1036,3 @@ def setup_audio_codec(model):
     # compute target fps
     model.target_fps = model.target_sample_rate / model.audio_codec.config.wav_to_token_ratio
     model.target_samples_per_frame = model.audio_codec.config.wav_to_token_ratio
-
-

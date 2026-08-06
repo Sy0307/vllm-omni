@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ['CausalConv2D', 'CausalConv1D']
+__all__ = ["CausalConv2D", "CausalConv1D"]
 
 
 class CausalConv2D(nn.Conv2d):
@@ -40,7 +40,7 @@ class CausalConv2D(nn.Conv2d):
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = 'zeros',
+        padding_mode: str = "zeros",
         device=None,
         dtype=None,
     ) -> None:
@@ -65,7 +65,8 @@ class CausalConv2D(nn.Conv2d):
         )
 
     def forward(
-        self, x,
+        self,
+        x,
     ):
         x = F.pad(x, pad=(self._left_padding, self._right_padding, self._left_padding, self._right_padding))
         x = super().forward(x)
@@ -94,7 +95,7 @@ class CausalConv1D(nn.Conv1d):
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
-        padding_mode: str = 'zeros',
+        padding_mode: str = "zeros",
         device=None,
         dtype=None,
     ) -> None:

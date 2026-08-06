@@ -32,9 +32,9 @@ import torch.nn.functional as F
 from ..compat import avoid_float16_autocast_context
 
 __all__ = [
-    'RelPositionMultiHeadAttention',
-    'RelPositionalEncoding',
-    'PositionalEncoding',
+    "RelPositionMultiHeadAttention",
+    "RelPositionalEncoding",
+    "PositionalEncoding",
 ]
 
 INF_VAL = 10000.0
@@ -481,7 +481,6 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
             scores += d_mask
 
             if self.global_tokens > 0:
-
                 # create q, k, v for global attn
                 if self.global_attn_separate:
                     global_q = self.global_q(query).view(n_batch, -1, self.h, self.d_k)
@@ -747,9 +746,9 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
 
         # need to transpose since ONNX export only supports consecutive indexing: https://pytorch.org/docs/stable/onnx.html#writes-sets
         global_attn_scores = global_attn_scores.transpose(1, 2)
-        global_attn_scores[
-            is_local_index_no_global_attn_nonzero[0], is_local_index_no_global_attn_nonzero[1], :, :
-        ] = torch.finfo(global_attn_scores.dtype).min
+        global_attn_scores[is_local_index_no_global_attn_nonzero[0], is_local_index_no_global_attn_nonzero[1], :, :] = (
+            torch.finfo(global_attn_scores.dtype).min
+        )
         global_attn_scores = global_attn_scores.transpose(1, 2)
 
         global_attn_scores = global_attn_scores.masked_fill(
@@ -840,10 +839,9 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
 
     @lru_cache()
     def _get_invalid_locations_mask(self, w: int, device: str):
-
         diagonals_list = []
         for j in range(-w, 1):
-            diagonal_mask = torch.zeros(w, device='cpu', dtype=torch.uint8)
+            diagonal_mask = torch.zeros(w, device="cpu", dtype=torch.uint8)
             diagonal_mask[:-j] = 1
             diagonals_list.append(diagonal_mask)
 
@@ -869,11 +867,11 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
         seq_len = input_tensor.size(2)
         beginning_input = input_tensor[:, :, :w, : w + 1]
         beginning_mask = beginning_mask[:, :, :seq_len].expand(beginning_input.size())
-        beginning_input.masked_fill_(beginning_mask, -float('inf'))
+        beginning_input.masked_fill_(beginning_mask, -float("inf"))
 
         ending_input = input_tensor[:, :, -w:, -(w + 1) :]
         ending_mask = ending_mask[:, :, -seq_len:].expand(ending_input.size())
-        ending_input.masked_fill_(ending_mask, -float('inf'))
+        ending_input.masked_fill_(ending_mask, -float("inf"))
 
     def sliding_chunks_matmul_qk(self, q: torch.Tensor, k: torch.Tensor, w: int, padding_value: float) -> torch.Tensor:
         """Matrix multiplication of query x key tensors using with a sliding window attention pattern.
@@ -902,11 +900,11 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
         chunk_q = self._chunk_overlap(q, w)  # (batch x head, chunk_count, 2w, size)
         chunk_k = self._chunk_overlap(k, w)  # (batch x head, chunk_count, 2w, size)
 
-        # matrix multipication
+        # matrix multiplication
         # bcxd: bsz*num_heads x chunks x 2w x head_dim
         # bcyd: bsz*num_heads x chunks x 2w x head_dim
         # bcxy: bsz*num_heads x chunks x 2w x 2w
-        chunk_attn = torch.einsum('bcxd,bcyd->bcxy', (chunk_q, chunk_k))  # multiply
+        chunk_attn = torch.einsum("bcxd,bcyd->bcxy", (chunk_q, chunk_k))  # multiply
         # (batch x head, chunk_count, 2w, 2w)
 
         # convert diagonals into columns
@@ -972,7 +970,7 @@ class RelPositionMultiHeadAttentionLongformer(RelPositionMultiHeadAttention):
         skewed_prob = self._skew2(chunk_prob, padding_value=0)
         # (batch x head, chunks_count + 1, w, 3w)
 
-        context = torch.einsum('bcwd,bcdh->bcwh', (skewed_prob, chunk_v))
+        context = torch.einsum("bcwd,bcdh->bcwh", (skewed_prob, chunk_v))
         # (batch x head, chunks_count + 1, w, size)
 
         return context.view(bsz, num_heads, seqlen, head_dim).transpose(1, 2)
@@ -1010,14 +1008,14 @@ class PositionalEncoding(torch.nn.Module):
         pe[:, 0::2] = torch.sin(positions * div_term)
         pe[:, 1::2] = torch.cos(positions * div_term)
         pe = pe.unsqueeze(0).to(dtype)
-        if hasattr(self, 'pe'):
+        if hasattr(self, "pe"):
             self.pe = pe
         else:
-            self.register_buffer('pe', pe, persistent=False)
+            self.register_buffer("pe", pe, persistent=False)
 
     def extend_pe(self, length, device, dtype):
         """Reset and extend the positional encodings if needed."""
-        if hasattr(self, 'pe') and self.pe.size(1) >= length:
+        if hasattr(self, "pe") and self.pe.size(1) >= length:
             return
         positions = torch.arange(0, length, dtype=torch.float32, device=device).unsqueeze(1)
         self.create_pe(positions=positions, dtype=dtype)
@@ -1055,7 +1053,7 @@ class RelPositionalEncoding(PositionalEncoding):
     def extend_pe(self, length, device, dtype):
         """Reset and extend the positional encodings if needed."""
         needed_size = 2 * length - 1
-        if hasattr(self, 'pe') and self.pe.size(1) >= needed_size:
+        if hasattr(self, "pe") and self.pe.size(1) >= needed_size:
             return
         # positions would be from negative numbers to positive
         # positive positions would be used for left positions and negative for right positions
@@ -1108,7 +1106,7 @@ class LocalAttRelPositionalEncoding(PositionalEncoding):
 
     def extend_pe(self, length, device, dtype):
         """Reset and extend the positional encodings only at the beginning"""
-        if hasattr(self, 'pe'):
+        if hasattr(self, "pe"):
             return
 
         positions = torch.arange(

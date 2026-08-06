@@ -41,14 +41,14 @@ try:
     import torchaudio.transforms
 
     TORCHAUDIO_VERSION = version.parse(torchaudio.__version__)
-    TORCHAUDIO_VERSION_MIN = version.parse('0.5')
+    TORCHAUDIO_VERSION_MIN = version.parse("0.5")
 
     HAVE_TORCHAUDIO = True
 except ModuleNotFoundError:
     HAVE_TORCHAUDIO = False
 
 __all__ = [
-    'AudioToMelSpectrogramPreprocessor',
+    "AudioToMelSpectrogramPreprocessor",
 ]
 
 
@@ -65,11 +65,11 @@ class AudioPreprocessor(NeuralModule, ABC):
         self.hop_length = hop_length
 
         self.torch_windows = {
-            'hann': torch.hann_window,
-            'hamming': torch.hamming_window,
-            'blackman': torch.blackman_window,
-            'bartlett': torch.bartlett_window,
-            'ones': torch.ones,
+            "hann": torch.hann_window,
+            "hamming": torch.hamming_window,
+            "blackman": torch.blackman_window,
+            "bartlett": torch.bartlett_window,
+            "ones": torch.ones,
             None: torch.ones,
         }
 
@@ -179,8 +179,6 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
     def restore_from(cls, restore_path: str):
         pass
 
-
-
     def __init__(
         self,
         sample_rate=16000,
@@ -216,11 +214,9 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
 
         self._sample_rate = sample_rate
         if window_size and n_window_size:
-            raise ValueError(f"{self} received both window_size and " f"n_window_size. Only one should be specified.")
+            raise ValueError(f"{self} received both window_size and n_window_size. Only one should be specified.")
         if window_stride and n_window_stride:
-            raise ValueError(
-                f"{self} received both window_stride and " f"n_window_stride. Only one should be specified."
-            )
+            raise ValueError(f"{self} received both window_stride and n_window_stride. Only one should be specified.")
         if window_size:
             n_window_size = int(window_size * self._sample_rate)
         if window_stride:
@@ -259,10 +255,5 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
             stft_conv=stft_conv,  # Deprecated arguments; kept for config compatibility
         )
 
-
     def get_features(self, input_signal, length):
         return self.featurizer(input_signal, length)
-
-
-
-

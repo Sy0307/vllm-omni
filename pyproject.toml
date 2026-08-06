@@ -301,6 +301,10 @@ extend-ignore-identifiers-re = [
     ".*[Nn][Dd]3.*",
     ".*updator.*",
     "byt5.*",
+    # NemotronVoiceChat vendored triton kernel: dout/DOUT abbreviate d_out
+    # (output feature dim), not "doubt".
+    ".*dout.*",
+    ".*DOUT.*",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -321,3 +325,6 @@ byt5 = "byt5"
 # "seeked" is the standard HTML media element DOM event name (fires when a
 # seek completes), used by the word-timestamps Gradio demo. Not a typo.
 seeked = "seeked"
+# Ryan Leary: author credited in the NemotronVoiceChat vendored NeMo
+# features.py copyright header. A surname, not a typo of "leery".
+Leary = "Leary"

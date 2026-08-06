@@ -33,6 +33,7 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
 
+
 # ==============================================================================
 # Logging shim (replaces the nemo.utils logging import)
 # ==============================================================================
@@ -115,28 +116,6 @@ class typecheck:
 # ==============================================================================
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ==============================================================================
 # from_config_dict target resolver (replaces hydra-based NeMo Serialization)
 # ==============================================================================
@@ -172,9 +151,7 @@ def from_config_dict(config):
     """
     cfg = OmegaConf.create(config) if not OmegaConf.is_config(config) else config
     if "_target_" not in cfg:
-        raise ValueError(
-            f"from_config_dict requires a '_target_' key in the config; got keys: {list(cfg.keys())}"
-        )
+        raise ValueError(f"from_config_dict requires a '_target_' key in the config; got keys: {list(cfg.keys())}")
     target = cfg["_target_"]
     if target not in _TARGET_REGISTRY:
         raise ValueError(
@@ -205,21 +182,18 @@ class NeuralModule(nn.Module):
     def from_config_dict(config):
         return from_config_dict(config)
 
-
-
     def unfreeze(self, partial: bool = False) -> None:
         """Unfreeze all parameters for training. (exact copy of NeuralModule.unfreeze)"""
-        if partial and not hasattr(self, '_frozen_grad_map'):
+        if partial and not hasattr(self, "_frozen_grad_map"):
             raise ValueError("Cannot unfreeze partially without first freezing the module with `freeze()`")
         for pname, param in self.named_parameters():
             if not partial:
                 param.requires_grad = True
             elif pname in self._frozen_grad_map:
                 param.requires_grad = self._frozen_grad_map[pname]
-        if hasattr(self, '_frozen_grad_map'):
-            delattr(self, '_frozen_grad_map')
+        if hasattr(self, "_frozen_grad_map"):
+            delattr(self, "_frozen_grad_map")
         self.train()
-
 
 
 class Exportable:
@@ -248,11 +222,8 @@ class AccessMixin:
     def is_access_enabled(self, guid=None):
         return False
 
-
     def register_accessible_tensor(self, name, tensor):
         pass
-
-
 
 
 class AttentionAdapterModuleMixin:
@@ -261,7 +232,6 @@ class AttentionAdapterModuleMixin:
 
     def is_adapter_available(self) -> bool:
         return False
-
 
 
 class AdapterModuleMixin(AttentionAdapterModuleMixin):
@@ -290,21 +260,14 @@ class StreamingEncoder(ABC):
         pass
 
 
-
-
-
 # ==============================================================================
 # CacheAwareStreamingConfig — exact copy of the dataclass from
 # nemo/collections/asr/models/configs/asr_models_config.py
 # ==============================================================================
 @dataclass
 class CacheAwareStreamingConfig:
-    chunk_size: int = (
-        0  # the size of each chunk at each step, it can be a list of two integers to specify different chunk sizes for the first step and others
-    )
-    shift_size: int = (
-        0  # the size of the shift in each step, it can be a list of two integers to specify different shift sizes for the first step and others
-    )
+    chunk_size: int = 0  # the size of each chunk at each step, it can be a list of two integers to specify different chunk sizes for the first step and others
+    shift_size: int = 0  # the size of the shift in each step, it can be a list of two integers to specify different shift sizes for the first step and others
 
     cache_drop_size: int = 0  # the number of steps to drop from the cache
     last_channel_cache_size: int = 0  # the size of the needed cache for last channel layers
@@ -313,9 +276,7 @@ class CacheAwareStreamingConfig:
         0  # the number of the steps in the final output which are valid (have the same value as in the offline mode)
     )
 
-    pre_encode_cache_size: int = (
-        0  # the size of the needed cache for the pre-encoding part of the model to avoid caching inside the pre-encoding layers
-    )
+    pre_encode_cache_size: int = 0  # the size of the needed cache for the pre-encoding part of the model to avoid caching inside the pre-encoding layers
     drop_extra_pre_encoded: int = 0  # the number of steps to get dropped after the pre-encoding layer
 
     last_channel_num: int = 0  # number of the last channel layers (like MHA layers) which need caching in the model
@@ -336,12 +297,12 @@ def avoid_float16_autocast_context():
 
     if torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16:
         if torch.jit.is_scripting() or torch.jit.is_tracing():
-            return torch.amp.autocast('cuda', dtype=torch.float32)
+            return torch.amp.autocast("cuda", dtype=torch.float32)
 
         if torch.cuda.is_bf16_supported():
-            return torch.amp.autocast('cuda', dtype=torch.bfloat16)
+            return torch.amp.autocast("cuda", dtype=torch.bfloat16)
         else:
-            return torch.amp.autocast('cuda', dtype=torch.float32)
+            return torch.amp.autocast("cuda", dtype=torch.float32)
     else:
         return nullcontext()
 
@@ -394,12 +355,12 @@ def resample(
     lowpass_filter_width: int = 6,
     rolloff: float = 0.99,
     resampling_method: str = "sinc_interp_hann",
-    beta: Optional[float] = None,
+    beta: float | None = None,
 ) -> torch.Tensor:
     r"""Resamples the waveform at the new frequency using bandlimited interpolation. :cite:`RESAMPLE`."""
 
     if orig_freq <= 0.0 or new_freq <= 0.0:
-        raise ValueError("Original frequency and desired frequecy should be positive")
+        raise ValueError("Original frequency and desired frequency should be positive")
 
     if orig_freq == new_freq:
         return waveform
@@ -428,9 +389,9 @@ def _get_sinc_resample_kernel(
     lowpass_filter_width: int = 6,
     rolloff: float = 0.99,
     resampling_method: str = "sinc_interp_hann",
-    beta: Optional[float] = None,
+    beta: float | None = None,
     device: torch.device = "cpu",
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ):
     if not (int(orig_freq) == orig_freq and int(new_freq) == new_freq):
         raise Exception(
@@ -582,7 +543,6 @@ class FusedBatchNorm1d(nn.Module):
         self.num_features = num_features
         self.weight = nn.Parameter(torch.ones(num_features))
         self.bias = nn.Parameter(torch.zeros(num_features))
-
 
     def forward(self, x: torch.Tensor):
         if x.dim() == 3:

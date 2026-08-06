@@ -58,7 +58,7 @@ class StackingSubsampling(torch.nn.Module):
         _, t, _ = x.size()
         x = torch.reshape(x, (b, t // self.subsampling_factor, h * self.subsampling_factor))
         x = self.proj_out(x)
-        lengths = torch.div(lengths + pad_size, self.subsampling_factor, rounding_mode='floor')
+        lengths = torch.div(lengths + pad_size, self.subsampling_factor, rounding_mode="floor")
         return x, lengths
 
 
@@ -69,7 +69,7 @@ class ConvSubsampling(torch.nn.Module):
     Args:
         subsampling (str): The subsampling technique from {"vggnet", "striding", "dw-striding"}
         subsampling_factor (int): The subsampling factor which should be a power of 2
-        subsampling_conv_chunking_factor (int): Input chunking factor which can be -1 (no chunking) 
+        subsampling_conv_chunking_factor (int): Input chunking factor which can be -1 (no chunking)
         1 (auto) or a power of 2. Default is 1
         feat_in (int): size of the input features
         feat_out (int): size of the output features
@@ -111,7 +111,7 @@ class ConvSubsampling(torch.nn.Module):
         in_channels = 1
         layers = []
 
-        if subsampling == 'vggnet':
+        if subsampling == "vggnet":
             self._stride = 2
             self._kernel_size = 2
             self._ceil_mode = True
@@ -142,7 +142,7 @@ class ConvSubsampling(torch.nn.Module):
                 )
                 in_channels = conv_channels
 
-        elif subsampling == 'dw_striding':
+        elif subsampling == "dw_striding":
             self._stride = 2
             self._kernel_size = 3
             self._ceil_mode = False
@@ -217,7 +217,7 @@ class ConvSubsampling(torch.nn.Module):
                 layers.append(activation)
                 in_channels = conv_channels
 
-        elif subsampling == 'striding':
+        elif subsampling == "striding":
             self._stride = 2
             self._kernel_size = 3
             self._ceil_mode = False
@@ -255,8 +255,7 @@ class ConvSubsampling(torch.nn.Module):
                 layers.append(activation)
                 in_channels = conv_channels
 
-        elif subsampling == 'striding_conv1d':
-
+        elif subsampling == "striding_conv1d":
             in_channels = feat_in
 
             self._stride = 2
@@ -296,8 +295,7 @@ class ConvSubsampling(torch.nn.Module):
                 layers.append(activation)
                 in_channels = conv_channels
 
-        elif subsampling == 'dw_striding_conv1d':
-
+        elif subsampling == "dw_striding_conv1d":
             in_channels = feat_in
 
             self._stride = 2
@@ -359,7 +357,6 @@ class ConvSubsampling(torch.nn.Module):
             raise ValueError(f"Not valid sub-sampling: {subsampling}!")
 
         if subsampling in ["vggnet", "dw_striding", "striding"]:
-
             in_length = torch.tensor(feat_in, dtype=torch.float)
             out_length = calc_length(
                 lengths=in_length,
@@ -408,7 +405,7 @@ class ConvSubsampling(torch.nn.Module):
                 # if subsampling_conv_chunking_factor is 1, we split only if needed
                 # avoiding a bug / feature limiting indexing of tensors to 2**31
                 # see https://github.com/pytorch/pytorch/issues/80020
-                x_ceil = 2 ** 31 / self._conv_channels * self._stride * self._stride
+                x_ceil = 2**31 / self._conv_channels * self._stride * self._stride
                 if torch.numel(x) > x_ceil:
                     need_to_split = True
                 else:
@@ -420,7 +417,7 @@ class ConvSubsampling(torch.nn.Module):
             if need_to_split:
                 x, success = self.conv_split_by_batch(x)
                 if not success:  # if unable to split by batch, try by channel
-                    if self._subsampling == 'dw_striding':
+                    if self._subsampling == "dw_striding":
                         x = self.conv_split_by_channel(x)
                     else:
                         x = self.conv(x)  # try anyway
@@ -441,12 +438,12 @@ class ConvSubsampling(torch.nn.Module):
 
     def reset_parameters(self):
         # initialize weights
-        if self._subsampling == 'dw_striding':
+        if self._subsampling == "dw_striding":
             with torch.no_grad():
                 # init conv
                 scale = 1.0 / self._kernel_size
-                dw_max = (self._kernel_size ** 2) ** -0.5
-                pw_max = self._conv_channels ** -0.5
+                dw_max = (self._kernel_size**2) ** -0.5
+                pw_max = self._conv_channels**-0.5
 
                 torch.nn.init.uniform_(self.conv[0].weight, -scale, scale)
                 torch.nn.init.uniform_(self.conv[0].bias, -scale, scale)
@@ -463,31 +460,31 @@ class ConvSubsampling(torch.nn.Module):
                 torch.nn.init.uniform_(self.out.bias, -fc_scale, fc_scale)
 
     def conv_split_by_batch(self, x):
-        """ Tries to split input by batch, run conv and concat results """
+        """Tries to split input by batch, run conv and concat results"""
         b, _, _, _ = x.size()
         if b == 1:  # can't split if batch size is 1
             return x, False
 
         if self.subsampling_conv_chunking_factor > 1:
             cf = self.subsampling_conv_chunking_factor
-            logging.debug(f'using manually set chunking factor: {cf}')
+            logging.debug(f"using manually set chunking factor: {cf}")
         else:
             # avoiding a bug / feature limiting indexing of tensors to 2**31
             # see https://github.com/pytorch/pytorch/issues/80020
-            x_ceil = 2 ** 31 / self._conv_channels * self._stride * self._stride
+            x_ceil = 2**31 / self._conv_channels * self._stride * self._stride
             p = math.ceil(math.log(torch.numel(x) / x_ceil, 2))
-            cf = 2 ** p
-            logging.debug(f'using auto set chunking factor: {cf}')
+            cf = 2**p
+            logging.debug(f"using auto set chunking factor: {cf}")
 
         new_batch_size = b // cf
         if new_batch_size == 0:  # input is too big
             return x, False
 
-        logging.debug(f'conv subsampling: using split batch size {new_batch_size}')
+        logging.debug(f"conv subsampling: using split batch size {new_batch_size}")
         return torch.cat([self.conv(chunk) for chunk in torch.split(x, new_batch_size, 0)]), True
 
     def conv_split_by_channel(self, x):
-        """ For dw convs, tries to split input by time, run conv and concat results """
+        """For dw convs, tries to split input by time, run conv and concat results"""
         x = self.conv[0](x)  # full conv2D
         x = self.conv[1](x)  # activation
 
@@ -496,25 +493,25 @@ class ConvSubsampling(torch.nn.Module):
 
             if self.subsampling_conv_chunking_factor > 1:
                 cf = self.subsampling_conv_chunking_factor
-                logging.debug(f'using manually set chunking factor: {cf}')
+                logging.debug(f"using manually set chunking factor: {cf}")
             else:
                 # avoiding a bug / feature limiting indexing of tensors to 2**31
                 # see https://github.com/pytorch/pytorch/issues/80020
-                p = math.ceil(math.log(torch.numel(x) / 2 ** 31, 2))
-                cf = 2 ** p
-                logging.debug(f'using auto set chunking factor: {cf}')
+                p = math.ceil(math.log(torch.numel(x) / 2**31, 2))
+                cf = 2**p
+                logging.debug(f"using auto set chunking factor: {cf}")
 
             new_c = int(c // cf)
             if new_c == 0:
-                logging.warning(f'chunking factor {cf} is too high; splitting down to one channel.')
+                logging.warning(f"chunking factor {cf} is too high; splitting down to one channel.")
                 new_c = 1
 
             new_t = int(t // cf)
             if new_t == 0:
-                logging.warning(f'chunking factor {cf} is too high; splitting down to one timestep.')
+                logging.warning(f"chunking factor {cf} is too high; splitting down to one timestep.")
                 new_t = 1
 
-            logging.debug(f'conv dw subsampling: using split C size {new_c} and split T size {new_t}')
+            logging.debug(f"conv dw subsampling: using split C size {new_c} and split T size {new_t}")
             x = self.channel_chunked_conv(self.conv[i * 3 + 2], new_c, x)  # conv2D, depthwise
 
             # splitting pointwise convs by time
@@ -523,7 +520,7 @@ class ConvSubsampling(torch.nn.Module):
         return x
 
     def channel_chunked_conv(self, conv, chunk_size, x):
-        """ Performs channel chunked convolution"""
+        """Performs channel chunked convolution"""
 
         ind = 0
         out_chunks = []
@@ -567,7 +564,7 @@ class ConvSubsampling(torch.nn.Module):
 
 
 def calc_length(lengths, all_paddings, kernel_size, stride, ceil_mode, repeat_num=1):
-    """ Calculates the output length of a Tensor passed through a convolution or max pooling layer"""
+    """Calculates the output length of a Tensor passed through a convolution or max pooling layer"""
     add_pad: float = all_paddings - kernel_size
     one: float = 1.0
     for i in range(repeat_num):
@@ -579,28 +576,26 @@ def calc_length(lengths, all_paddings, kernel_size, stride, ceil_mode, repeat_nu
     return lengths.to(dtype=torch.int)
 
 
-
-
 class SubsamplingReductionModule(nn.Module):
     """Downsamples the audio signal in time dimension."""
 
     def __init__(self, reduction: str, d_model: int, reduction_factor: int = 2):
         super().__init__()
 
-        assert reduction in ['pooling', 'striding']
+        assert reduction in ["pooling", "striding"]
 
         self.reduction = reduction
         self.d_model = d_model
         self._sampling_num = int(math.log(reduction_factor, 2))
 
-        if reduction == 'pooling':
+        if reduction == "pooling":
             self.reduction_enc = nn.MaxPool1d(kernel_size=reduction_factor)
             self.padding = 0
             self.kernel_size = self.reduction_enc.kernel_size
             self.stride = self.reduction_enc.stride
-        elif reduction == 'striding':
+        elif reduction == "striding":
             self.reduction_enc = ConvSubsampling(
-                subsampling='striding',
+                subsampling="striding",
                 subsampling_factor=reduction_factor,
                 feat_in=d_model,
                 feat_out=d_model,
@@ -611,11 +606,11 @@ class SubsamplingReductionModule(nn.Module):
 
     def forward(self, x, lengths):
         """Shapes:
-            - x: [B, T, C]
-            - lengths: [B]
+        - x: [B, T, C]
+        - lengths: [B]
         """
 
-        if self.reduction == 'striding':
+        if self.reduction == "striding":
             x, lengths = self.reduction_enc(x=x, lengths=lengths)
         else:
             x = torch.transpose(x, 1, 2)  # [B, C, T]

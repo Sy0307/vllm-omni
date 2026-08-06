@@ -34,7 +34,7 @@ from torch import nn
 from .compat import logging
 
 # ==============================================================================
-# Contants
+# Constants
 # ==============================================================================
 PYTHON_CONFIG_GETTER_NAME = "get_config"
 CHECKPOINT_FORMAT = "checkpoint_{}/ema.safetensors"
@@ -83,9 +83,9 @@ def get_config_from_file(config_path: str) -> DictConfig:
             config = json.load(f)
     else:
         config_module = importlib.machinery.SourceFileLoader("_config", config_path).load_module()
-        assert hasattr(
-            config_module, PYTHON_CONFIG_GETTER_NAME
-        ), f"Python config file must define a `{PYTHON_CONFIG_GETTER_NAME}` function."
+        assert hasattr(config_module, PYTHON_CONFIG_GETTER_NAME), (
+            f"Python config file must define a `{PYTHON_CONFIG_GETTER_NAME}` function."
+        )
         config = getattr(config_module, PYTHON_CONFIG_GETTER_NAME)(py_config_name)
         assert isinstance(config, Mapping), f"`{PYTHON_CONFIG_GETTER_NAME}` must return a dictionary-like object."
     cfg = DictConfig(config)
@@ -111,9 +111,7 @@ def get_config() -> DictConfig:
     """
     parser = argparse.ArgumentParser(description="Load training configuration.")
     parser.add_argument("-c", "--config", type=str, default=None, help="Path to a Python or JSON configuration file.")
-    parser.add_argument(
-        "-w", "--workdir", type=str, required=True, help="Work directory to save logs and checkpoints."
-    )
+    parser.add_argument("-w", "--workdir", type=str, required=True, help="Work directory to save logs and checkpoints.")
 
     args = parser.parse_args()
     workdir_path = args.workdir
@@ -223,14 +221,9 @@ class PreTrainedModel(nn.Module):
         return model
 
 
-
 # ==============================================================================
 # IO and Checkpointing Utilities
 # ==============================================================================
-
-
-
-
 
 
 def latest_checkpoint_path(dir_path: str, regex: str | None = None) -> str:
@@ -265,5 +258,3 @@ def latest_checkpoint_path(dir_path: str, regex: str | None = None) -> str:
     latest_path = f_list[-1]
     logging.info(f"Latest checkpoint '{os.path.relpath(latest_path, start=dir_path)}' found in '{dir_path}'.")
     return latest_path
-
-

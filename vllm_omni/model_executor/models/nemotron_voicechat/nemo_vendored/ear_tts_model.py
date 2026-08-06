@@ -318,9 +318,9 @@ def get_mask(
     if validate:
         # Reconstruct the expected contiguous mask and assert equality.
         expected_mask = sequence_mask(num_valid.view(-1), depth).view_as(code_mask)
-        assert torch.equal(
-            code_mask, expected_mask
-        ), "Input `code_mask` must have contiguous `True` values at the beginning."
+        assert torch.equal(code_mask, expected_mask), (
+            "Input `code_mask` must have contiguous `True` values at the beginning."
+        )
 
     # Calculate the target number of valid tokens.
     if not unmasking:
@@ -572,7 +572,6 @@ class MoGHead(nn.Module):
 
         # Apply top-p or top-k filtering to the mixture logits
         if top_p_or_k is not None:
-
             logits = (
                 TopPLogitsWarper(top_p_or_k)(
                     None,
@@ -659,9 +658,7 @@ class MoGHead(nn.Module):
                     x,
                     low_mat_sq.to(x),
                 )
-            ).sum(
-                -1
-            )  # [b, t, n]
+            ).sum(-1)  # [b, t, n]
             y_sq = y.pow(2).sum(-1, keepdim=True)  # [b, t, 1]
             xwy = (x * torch.einsum("bti,nij->btnj", y, self.low_mat.to(y))).sum(
                 -1
@@ -669,8 +666,6 @@ class MoGHead(nn.Module):
 
             dist = wx_sq + y_sq - 2 * xwy
             return torch.abs(dist)
-
-
 
 
 class SubwordFlagEmbedding(nn.Module):
@@ -766,8 +761,6 @@ class BOSEOSEmbedding(nn.Module):
         # Lookup flags (0=regular, 1=BOS, 2=EOS)
         flags = self.special_flags[safe_ids]
         return token_embeds + self.special_emb(flags)
-
-
 
 
 class CharAwareSubwordEncoder(nn.Module):
@@ -1037,7 +1030,11 @@ class RVQEARTTSModel(nn.Module):
             else None
         )
 
-        cas_config = {k: v for k, v in self.config.cas_config.items() if k != "pretrained_tokenizer_name"} if self.config.cas_config else {}
+        cas_config = (
+            {k: v for k, v in self.config.cas_config.items() if k != "pretrained_tokenizer_name"}
+            if self.config.cas_config
+            else {}
+        )
         self.embed_subword = (
             CharAwareSubwordEncoder(
                 tokenizer=tokenizer,
@@ -1064,13 +1061,13 @@ class RVQEARTTSModel(nn.Module):
 
         if self.config.get("use_audio_prompt_frozen_projection", False):
             with fp32_precision():
-                U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
-                V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size)) 
+                U, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
+                V, _ = torch.linalg.qr(torch.randn(self.hidden_size, self.hidden_size))
                 smin, smax = 0.4, 2.5
-                s = (smin + (smax - smin) * torch.rand(self.hidden_size)) 
+                s = smin + (smax - smin) * torch.rand(self.hidden_size)
                 W = U @ torch.diag(s) @ V.T
-                self.register_buffer("audio_prompt_projection_W", W) # register as buffer to avoid weight update
-    
+                self.register_buffer("audio_prompt_projection_W", W)  # register as buffer to avoid weight update
+
         # Prediction Heads
         if not self.config.disable_eos_prediction:
             self.lm_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -1113,9 +1110,7 @@ class RVQEARTTSModel(nn.Module):
 
         src_code_mask = torch.ones((b, t, d), dtype=torch.bool, device=device)
         src_code_mask = get_mask(src_code_mask, src_num_masking)
-        src_masked_code = code * src_code_mask + (torch.zeros_like(code) + self.config.codebook_size) * (
-            ~src_code_mask
-        )
+        src_masked_code = code * src_code_mask + (torch.zeros_like(code) + self.config.codebook_size) * (~src_code_mask)
 
         if self.config.random_target_masking:
             tgt_rate = src_rate + (1.0 - src_rate) * torch.rand((b, t), device=device)
@@ -1145,7 +1140,7 @@ class RVQEARTTSModel(nn.Module):
         context_hidden_state: Tensor | None,
         subword_ids: Tensor | None,
         subword_mask: Tensor | None,
-        uncond_dec_flag: Tensor
+        uncond_dec_flag: Tensor,
     ) -> Tensor:
         """Computes the final conditioning tensor by combining all sources."""
         cond = torch.zeros((1, 1, self.hidden_size), device=uncond_dec_flag.device)
@@ -1157,7 +1152,7 @@ class RVQEARTTSModel(nn.Module):
             # Infer subword mask from context if not provided
             if subword_mask is None and context_hidden_state is not None:
                 subword_mask = torch.any(context_hidden_state != 0, dim=-1)
-            # at least one value should be true, otherwise we can completly skip it to avoid errors
+            # at least one value should be true, otherwise we can completely skip it to avoid errors
             if subword_mask is not None and subword_mask.any():
                 cond = cond + self.embed_subword(subword_ids, subword_mask)
 
@@ -1203,7 +1198,9 @@ class RVQEARTTSModel(nn.Module):
             mog_logs = mog_logs.float()
             with fp32_precision():
                 # Log probability of the true code under each Gaussian component
-                logp_code = (-0.5 * math.log(2 * math.pi) - mog_logs) * self.config.latent_size - 0.5 * self.mog_head.dist(
+                logp_code = (
+                    -0.5 * math.log(2 * math.pi) - mog_logs
+                ) * self.config.latent_size - 0.5 * self.mog_head.dist(
                     mog_mus, (cont_code_target - mog_mu_res) * torch.exp(-mog_logs)
                 )
 
@@ -1302,9 +1299,9 @@ class RVQEARTTSModel(nn.Module):
             bos_mask = bos_mask.unsqueeze(-1)  # [B, T, 1]
 
             # Mask for tokens BEFORE BOS
-            pre_bos_mask = (bos_mask.cumsum(dim=1) == 0)  # [B, T, 1]
+            pre_bos_mask = bos_mask.cumsum(dim=1) == 0  # [B, T, 1]
 
-            # Apply projection to model size 
+            # Apply projection to model size
             code_embed = self.embed_code(code_embed)
 
             # Choose projection
@@ -1361,12 +1358,7 @@ class RVQEARTTSModel(nn.Module):
             uncond_dec_flag = torch.cat([uncond_dec_flag, torch.ones_like(uncond_dec_flag)], 0)
 
         # Prepare conditioning
-        cond = self._prepare_conditioning(
-            context_hidden_state,
-            subword_ids,
-            subword_mask,
-            uncond_dec_flag
-        )
+        cond = self._prepare_conditioning(context_hidden_state, subword_ids, subword_mask, uncond_dec_flag)
 
         if asr_speech_tokens_emb is not None:
             cond = cond + asr_speech_tokens_emb
@@ -1405,7 +1397,11 @@ class RVQEARTTSModel(nn.Module):
             total_loss = lm_loss + c_loss + k_loss
 
             return RVQEARTTSOutput(
-                loss=total_loss, lm_loss=lm_loss, c_loss=c_loss, k_loss=k_loss, hidden_states=hidden_states,
+                loss=total_loss,
+                lm_loss=lm_loss,
+                c_loss=c_loss,
+                k_loss=k_loss,
+                hidden_states=hidden_states,
                 audio_prompt_latent=audio_prompt_latent,
             )
         else:  # Inference
@@ -1461,7 +1457,8 @@ class RVQEARTTSModel(nn.Module):
 
             # call original generate_step
             generated_codes, lm_logits, eos_flag = self.generate_step(
-                frame_hidden.unsqueeze(1), **generation_config  # keep batch dim + frame dim
+                frame_hidden.unsqueeze(1),
+                **generation_config,  # keep batch dim + frame dim
             )
             if generated_codes is not None:
                 # store in cache
@@ -1503,7 +1500,7 @@ class RVQEARTTSModel(nn.Module):
                                     this should be the combined [uncond, cond] tensor.
             num_iter (int): The number of unmasking iterations.
             guidance_scale (list[float] | float | None): The scale for Classifier-Free Guidance.
-            top_p_or_k (ist[float | int] | float | int | None): The value for top-p or top-k sampling.
+            top_p_or_k (list[float | int] | float | int | None): The value for top-p or top-k sampling.
             noise_scale (list[float] | float | None): The scale of noise to add during MoG sampling.
             exponent (float | None): The exponent for the masking schedule.
             eos_threshold (float | None): The threshold for EOS prediction.

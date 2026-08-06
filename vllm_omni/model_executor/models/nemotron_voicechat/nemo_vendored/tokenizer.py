@@ -27,8 +27,7 @@ from transformers import AutoTokenizer as AUTOTOKENIZER
 
 from .compat import logging
 
-__all__ = ['TokenizerSpec', 'AutoTokenizer']
-
+__all__ = ["TokenizerSpec", "AutoTokenizer"]
 
 
 class TokenizerSpec(ABC):
@@ -40,7 +39,6 @@ class TokenizerSpec(ABC):
     def text_to_tokens(self, text):
         """Converts text into a list of tokens."""
         pass
-
 
     @abstractmethod
     def tokens_to_ids(self, tokens):
@@ -57,13 +55,12 @@ class TokenizerSpec(ABC):
         """Converts text directly to token IDs."""
         pass
 
-
     def add_special_tokens(self, special_tokens: List[str]):
         """Adds special tokens (eos, pad, cls...) to vocab."""
         raise NotImplementedError("To be implemented")
 
     def apply_chat_template(self, *args, **kwargs):
-        """Appies chat template and tokenizes results"""
+        """Applies chat template and tokenizes results"""
         raise NotImplementedError("To be implemented")
 
     @property
@@ -71,34 +68,33 @@ class TokenizerSpec(ABC):
         """name of the class"""
         return type(self).__name__
 
-
     @property
     def cls(self):
         """Property alias to match MegatronTokenizer; returns cls_id if available."""
-        if hasattr(self, 'cls_id'):
+        if hasattr(self, "cls_id"):
             return self.cls_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'cls' or 'cls_id'")
 
     @property
     def sep(self):
         """Property alias to match MegatronTokenizer; returns sep_id if available."""
-        if hasattr(self, 'sep_id'):
+        if hasattr(self, "sep_id"):
             return self.sep_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'sep' or 'sep_id'")
 
     @property
     def pad(self):
         """Property alias to match MegatronTokenizer; returns pad_id if available."""
-        if hasattr(self, 'pad_id'):
+        if hasattr(self, "pad_id"):
             return self.pad_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'pad' or 'pad_id'")
 
     @property
     def eod(self):
         """Property alias to match MegatronTokenizer; returns eod_id if available."""
-        if hasattr(self, 'eod_id'):
+        if hasattr(self, "eod_id"):
             return self.eod_id
-        if hasattr(self, 'eos_id'):
+        if hasattr(self, "eos_id"):
             # Default to end-of-sentence id if end-of-document is not defined.
             return self.eos_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'eod', 'eod_id', 'eos', or 'eos_id'")
@@ -106,21 +102,21 @@ class TokenizerSpec(ABC):
     @property
     def bos(self):
         """Property alias to match MegatronTokenizer; returns bos_id if available."""
-        if hasattr(self, 'bos_id'):
+        if hasattr(self, "bos_id"):
             return self.bos_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'bos' or 'bos_id'")
 
     @property
     def eos(self):
         """Property alias to match MegatronTokenizer; returns eos_id if available."""
-        if hasattr(self, 'eos_id'):
+        if hasattr(self, "eos_id"):
             return self.eos_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'eos' or 'eos_id'")
 
     @property
     def mask(self):
         """Property alias to match MegatronTokenizer; returns mask_id if available."""
-        if hasattr(self, 'mask_id'):
+        if hasattr(self, "mask_id"):
             return self.mask_id
         raise AttributeError(f"{type(self).__name__} has no attribute 'mask' or 'mask_id'")
 
@@ -135,18 +131,18 @@ class AutoTokenizer(TokenizerSpec):
     def __init__(
         self,
         pretrained_model_name: str,
-        vocab_file: Optional[str] = None,
-        merges_file: Optional[str] = None,
-        mask_token: Optional[str] = None,
-        bos_token: Optional[str] = None,
-        eos_token: Optional[str] = None,
-        pad_token: Optional[str] = None,
-        sep_token: Optional[str] = None,
-        cls_token: Optional[str] = None,
-        unk_token: Optional[str] = None,
-        additional_special_tokens: Optional[List] = [],
-        use_fast: Optional[bool] = True,
-        trust_remote_code: Optional[bool] = False,
+        vocab_file: str | None = None,
+        merges_file: str | None = None,
+        mask_token: str | None = None,
+        bos_token: str | None = None,
+        eos_token: str | None = None,
+        pad_token: str | None = None,
+        sep_token: str | None = None,
+        cls_token: str | None = None,
+        unk_token: str | None = None,
+        additional_special_tokens: List | None = [],
+        use_fast: bool | None = True,
+        trust_remote_code: bool | None = False,
         include_special_tokens: bool = False,
     ):
         """
@@ -181,7 +177,7 @@ class AutoTokenizer(TokenizerSpec):
                 assert self.tokenizer, "tokenizer not initialized"
             except Exception as e:
                 raise ValueError(
-                    f'Unable to instantiate HuggingFace AUTOTOKENIZER for {pretrained_model_name}. Exception: {e}'
+                    f"Unable to instantiate HuggingFace AUTOTOKENIZER for {pretrained_model_name}. Exception: {e}"
                 )
 
         self.include_special_tokens = include_special_tokens
@@ -254,21 +250,21 @@ class AutoTokenizer(TokenizerSpec):
             See NLP_Tokenizers.ipynb for more details.
             """
             logging.warning(
-                f'{new_tokens_in_vocab} \n will be added to the vocabulary.\n'
-                f'Please resize your model accordingly, '
-                f'see NLP_Tokenizers.ipynb for more details.'
+                f"{new_tokens_in_vocab} \n will be added to the vocabulary.\n"
+                f"Please resize your model accordingly, "
+                f"see NLP_Tokenizers.ipynb for more details."
             )
         self.add_special_tokens(special_tokens_dict)
-        self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens('x') + self.text_to_tokens('y')
+        self.space_sensitive = self.text_to_tokens("x y") != self.text_to_tokens("x") + self.text_to_tokens("y")
         self._inv_vocab_dict = {}
 
     def _initialize_tokenizer(
         self,
         pretrained_model_name: str,
-        vocab_file: Optional[str] = None,
-        merges_file: Optional[str] = None,
-        use_fast: Optional[bool] = False,
-        trust_remote_code: Optional[bool] = False,
+        vocab_file: str | None = None,
+        merges_file: str | None = None,
+        use_fast: bool | None = False,
+        trust_remote_code: bool | None = False,
     ):
         # this logic deals with different huggingface tokenizers having different positional args
         if vocab_file is None:
@@ -320,11 +316,10 @@ class AutoTokenizer(TokenizerSpec):
         num_tokens_added = self.tokenizer.add_special_tokens(special_tokens_dict)
 
         if num_tokens_added > 0:
-            logging.info(f'{num_tokens_added} special tokens added, resize your model accordingly.')
+            logging.info(f"{num_tokens_added} special tokens added, resize your model accordingly.")
         for k in self.tokenizer.SPECIAL_TOKENS_ATTRIBUTES:
             setattr(self, k, getattr(self.tokenizer, k, None))
         return num_tokens_added
-
 
     def text_to_tokens(self, text):
         """
@@ -338,8 +333,6 @@ class AutoTokenizer(TokenizerSpec):
         """
         tokens = self.tokenizer.tokenize(text)
         return tokens
-
-
 
     def tokens_to_ids(self, tokens):
         """
@@ -385,9 +378,8 @@ class AutoTokenizer(TokenizerSpec):
         return ids
 
     def apply_chat_template(self, *args, **kwargs):
-        """Appies chat template and tokenizes results"""
+        """Applies chat template and tokenizes results"""
         return self.tokenizer.apply_chat_template(*args, **kwargs)
-
 
     @property
     def vocab(self):
@@ -400,7 +392,6 @@ class AutoTokenizer(TokenizerSpec):
         id2vocab = {v: k for k, v in self.tokenizer.vocab.items()}
         return [id2vocab[i] for i in range(len(id2vocab))]
 
-
     @property
     def pad_id(self):
         """
@@ -409,9 +400,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the padding token if it exists, None otherwise.
         """
-        if getattr(self, 'pad_token') is None:
+        if getattr(self, "pad_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'pad_token')])[0]
+        return self.tokens_to_ids([getattr(self, "pad_token")])[0]
 
     @property
     def bos_id(self):
@@ -421,9 +412,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the BOS token if it exists, None otherwise.
         """
-        if getattr(self, 'bos_token') is None:
+        if getattr(self, "bos_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'bos_token')])[0]
+        return self.tokens_to_ids([getattr(self, "bos_token")])[0]
 
     @property
     def eos_id(self):
@@ -433,9 +424,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the EOS token if it exists, None otherwise.
         """
-        if getattr(self, 'eos_token') is None:
+        if getattr(self, "eos_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'eos_token')])[0]
+        return self.tokens_to_ids([getattr(self, "eos_token")])[0]
 
     @property
     def eod(self):
@@ -445,7 +436,7 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int: The ID of the EOD/EOS token.
         """
-        return self.tokens_to_ids([getattr(self, 'eos_token')])[0]
+        return self.tokens_to_ids([getattr(self, "eos_token")])[0]
 
     @property
     def sep_id(self):
@@ -455,9 +446,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the separator token if it exists, None otherwise.
         """
-        if getattr(self, 'sep_token') is None:
+        if getattr(self, "sep_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'sep_token')])[0]
+        return self.tokens_to_ids([getattr(self, "sep_token")])[0]
 
     @property
     def cls_id(self):
@@ -467,9 +458,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the classifier token if it exists, None otherwise.
         """
-        if getattr(self, 'cls_token') is None:
+        if getattr(self, "cls_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'cls_token')])[0]
+        return self.tokens_to_ids([getattr(self, "cls_token")])[0]
 
     @property
     def unk_id(self):
@@ -479,9 +470,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the unknown token if it exists, None otherwise.
         """
-        if getattr(self, 'unk_token') is None:
+        if getattr(self, "unk_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'unk_token')])[0]
+        return self.tokens_to_ids([getattr(self, "unk_token")])[0]
 
     @property
     def mask_id(self):
@@ -491,9 +482,9 @@ class AutoTokenizer(TokenizerSpec):
         Returns:
             int or None: The ID of the mask token if it exists, None otherwise.
         """
-        if getattr(self, 'mask_token') is None:
+        if getattr(self, "mask_token") is None:
             return None
-        return self.tokens_to_ids([getattr(self, 'mask_token')])[0]
+        return self.tokens_to_ids([getattr(self, "mask_token")])[0]
 
     @property
     def name(self):
@@ -504,7 +495,6 @@ class AutoTokenizer(TokenizerSpec):
             str: Name of the tokenizer class.
         """
         return type(self.tokenizer).__name__
-
 
     def save_pretrained(self, save_directory: str):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""

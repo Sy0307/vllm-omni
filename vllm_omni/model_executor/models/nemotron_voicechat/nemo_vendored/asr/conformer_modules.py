@@ -27,7 +27,7 @@ from .multi_head_attention import (
     RelPositionMultiHeadAttentionLongformer,
 )
 
-__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer']
+__all__ = ["ConformerConvolution", "ConformerFeedForward", "ConformerLayer"]
 
 
 class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
@@ -61,13 +61,13 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self,
         d_model,
         d_ff,
-        self_attention_model='rel_pos',
+        self_attention_model="rel_pos",
         global_tokens=0,
         global_tokens_spacing=1,
         global_attn_separate=False,
         n_heads=4,
         conv_kernel_size=31,
-        conv_norm_type='batch_norm',
+        conv_norm_type="batch_norm",
         conv_context_size=None,
         dropout=0.1,
         dropout_att=0.1,
@@ -106,7 +106,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.norm_self_att = LayerNorm(d_model)
         MHA_max_cache_len = att_context_size[0]
 
-        if self_attention_model == 'rel_pos':
+        if self_attention_model == "rel_pos":
             self.self_attn = RelPositionMultiHeadAttention(
                 n_head=n_heads,
                 n_feat=d_model,
@@ -118,7 +118,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
             )
-        elif self_attention_model == 'rel_pos_local_attn':
+        elif self_attention_model == "rel_pos_local_attn":
             self.self_attn = RelPositionMultiHeadAttentionLongformer(
                 n_head=n_heads,
                 n_feat=d_model,
@@ -132,7 +132,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
                 global_attn_separate=global_attn_separate,
                 use_bias=use_bias,
             )
-        elif self_attention_model == 'abs_pos':
+        elif self_attention_model == "abs_pos":
             self.self_attn = MultiHeadAttention(
                 n_head=n_heads,
                 n_feat=d_model,
@@ -175,11 +175,11 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         residual = residual + self.dropout(x) * self.fc_factor
 
         x = self.norm_self_att(residual)
-        if self.self_attention_model == 'rel_pos':
+        if self.self_attention_model == "rel_pos":
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
-        elif self.self_attention_model == 'rel_pos_local_attn':
+        elif self.self_attention_model == "rel_pos_local_attn":
             x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
-        elif self.self_attention_model == 'abs_pos':
+        elif self.self_attention_model == "abs_pos":
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
         else:
             x = None
@@ -192,13 +192,13 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         if self.is_adapter_available():
             # Call the MHA adapters
             pack_input = {
-                'x': residual,
-                'loc': 'mha',
-                'att_mask': att_mask,
-                'pos_emb': pos_emb,
+                "x": residual,
+                "loc": "mha",
+                "att_mask": att_mask,
+                "pos_emb": pos_emb,
             }
             pack_input = self.forward_enabled_adapters(pack_input)
-            residual = pack_input['x']
+            residual = pack_input["x"]
 
         x = self.norm_conv(residual)
         x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time)
@@ -215,16 +215,16 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         if self.is_adapter_available():
             # Call the adapters
             pack_input = {
-                'x': x,
-                'loc': 'post',
+                "x": x,
+                "loc": "post",
             }
             pack_input = self.forward_enabled_adapters(pack_input)
-            x = pack_input['x']
+            x = pack_input["x"]
 
         if self.is_access_enabled(getattr(self, "model_guid", None)) and self.access_cfg.get(
-            'save_encoder_tensors', False
+            "save_encoder_tensors", False
         ):
-            self.register_accessible_tensor(name='encoder', tensor=x)
+            self.register_accessible_tensor(name="encoder", tensor=x)
         if cache_last_channel is None:
             return x
         else:
@@ -247,9 +247,9 @@ class ConformerConvolution(nn.Module):
         self,
         d_model,
         kernel_size,
-        norm_type='batch_norm',
+        norm_type="batch_norm",
         conv_context_size=None,
-        pointwise_activation='glu_',
+        pointwise_activation="glu_",
         use_bias=True,
     ):
         super(ConformerConvolution, self).__init__()
@@ -266,7 +266,7 @@ class ConformerConvolution(nn.Module):
             self.pointwise_activation = activation_registry[pointwise_activation]()
             dw_conv_input_dim = d_model * 2
 
-            if hasattr(self.pointwise_activation, 'inplace'):
+            if hasattr(self.pointwise_activation, "inplace"):
                 self.pointwise_activation.inplace = True
         else:
             self.pointwise_activation = pointwise_activation
@@ -291,15 +291,15 @@ class ConformerConvolution(nn.Module):
             bias=self.use_bias,
         )
 
-        if norm_type == 'batch_norm':
+        if norm_type == "batch_norm":
             self.batch_norm = nn.BatchNorm1d(dw_conv_input_dim)
-        elif norm_type == 'instance_norm':
+        elif norm_type == "instance_norm":
             self.batch_norm = nn.InstanceNorm1d(dw_conv_input_dim)
-        elif norm_type == 'layer_norm':
+        elif norm_type == "layer_norm":
             self.batch_norm = nn.LayerNorm(dw_conv_input_dim)
-        elif norm_type == 'fused_batch_norm':
+        elif norm_type == "fused_batch_norm":
             self.batch_norm = FusedBatchNorm1d(dw_conv_input_dim)
-        elif norm_type.startswith('group_norm'):
+        elif norm_type.startswith("group_norm"):
             num_groups = int(norm_type.replace("group_norm", ""))
             self.batch_norm = nn.GroupNorm(num_groups=num_groups, num_channels=d_model)
         else:
@@ -320,7 +320,7 @@ class ConformerConvolution(nn.Module):
         x = self.pointwise_conv1(x)
 
         # Compute the activation function or use GLU for original Conformer
-        if self.pointwise_activation == 'glu_':
+        if self.pointwise_activation == "glu_":
             x = nn.functional.glu(x, dim=1)
         else:
             x = self.pointwise_activation(x)
@@ -348,7 +348,6 @@ class ConformerConvolution(nn.Module):
             return x, cache
 
 
-
 class ConformerFeedForward(nn.Module):
     """
     feed-forward module of Conformer model.
@@ -371,4 +370,3 @@ class ConformerFeedForward(nn.Module):
         x = self.dropout(x)
         x = self.linear2(x)
         return x
-

@@ -29,9 +29,6 @@ from .compat import (
 class AudioPerceptionModule(NeuralModule, Exportable):
     """Audio perception module that consists of audio encoder(s) and modality adapter."""
 
-
-
-
     def __init__(self, cfg: DictConfig):
         super().__init__()
         # Initialize components
@@ -39,16 +36,16 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         self.preprocessor = self.from_config_dict(cfg.preprocessor)
         self.encoder = self.from_config_dict(cfg.encoder)
 
-        if 'spec_augment' in cfg and cfg.spec_augment is not None:
+        if "spec_augment" in cfg and cfg.spec_augment is not None:
             self.spec_augmentation = self.from_config_dict(cfg.spec_augment)
         else:
             self.spec_augmentation = None
         self.modality_adapter = self.from_config_dict(cfg.modality_adapter)
-        if 'output_dim' not in cfg.modality_adapter and "d_model" in cfg.modality_adapter:  # e.g., conformer encoder
+        if "output_dim" not in cfg.modality_adapter and "d_model" in cfg.modality_adapter:  # e.g., conformer encoder
             self.proj = nn.Linear(cfg.modality_adapter.d_model, cfg.output_dim)
         else:
             self.proj = nn.Identity()
-        
+
         self.modality_adapter_quantizer_levels = cfg.get("modality_adapter_quantizer_levels", None)
         if self.modality_adapter_quantizer_levels:
             # FiniteScalarQuantizer (nemo.collections.tts.modules.audio_codec_modules) was not
@@ -118,11 +115,11 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
 
-
         if return_encoder_emb:
             return encoded, encoded_len, encoder_emb.transpose(1, 2)
         else:
             return encoded, encoded_len
+
 
 class IdentityConnector(NeuralModule, Exportable):
     """User to pass encoder's representations as-is to the LLM."""

@@ -63,7 +63,7 @@ def normalize_batch(x, seq_len, normalize_type):
         max_time = x.shape[2]
 
         # When doing stream capture to a graph, item() is not allowed
-        # becuase it calls cudaStreamSynchronize(). Therefore, we are
+        # because it calls cudaStreamSynchronize(). Therefore, we are
         # sacrificing some error checking when running with cuda graphs.
         if (
             torch.cuda.is_available()
@@ -108,8 +108,6 @@ def normalize_batch(x, seq_len, normalize_type):
         )
     else:
         return x, x_mean, x_std
-
-
 
 
 def splice_frames(x, frame_splicing):
@@ -215,8 +213,7 @@ class FilterbankFeatures(nn.Module):
             or n_window_stride <= 0
         ):
             raise ValueError(
-                f"{self} got an invalid value for either n_window_size or "
-                f"n_window_stride. Both must be positive ints."
+                f"{self} got an invalid value for either n_window_size or n_window_stride. Both must be positive ints."
             )
         logging.info(f"PADDING: {pad_to}")
 
@@ -229,11 +226,11 @@ class FilterbankFeatures(nn.Module):
         if exact_pad:
             logging.info("STFT using exact pad")
         torch_windows = {
-            'hann': torch.hann_window,
-            'hamming': torch.hamming_window,
-            'blackman': torch.blackman_window,
-            'bartlett': torch.bartlett_window,
-            'none': None,
+            "hann": torch.hann_window,
+            "hamming": torch.hamming_window,
+            "blackman": torch.blackman_window,
+            "bartlett": torch.bartlett_window,
+            "none": None,
         }
         window_fn = torch_windows.get(window, None)
         window_tensor = window_fn(self.win_length, periodic=False) if window_fn else None
@@ -340,13 +337,12 @@ class FilterbankFeatures(nn.Module):
         seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length) + 1
         return seq_len.to(dtype=torch.long)
 
-
     def forward(self, x, seq_len, linear_spec=False):
         # Initialize debug dictionary
         # debug_snapshots = {}
         # debug_snapshots['step0_input'] = x[0, :1280].cpu() if x.shape[1] >= 1280 else x[0].cpu()
         # debug_snapshots['input_len'] = seq_len[0].item()
-        
+
         seq_len = self.get_seq_len(seq_len)
         # debug_snapshots['output_seq_len'] = seq_len[0].item()
 
@@ -369,7 +365,6 @@ class FilterbankFeatures(nn.Module):
         # disable autocast to get full range of stft values
         with torch.amp.autocast(x.device.type, enabled=False):
             x = self.stft(x)
-
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
         # guard is needed for sqrt if grads are passed through
@@ -398,7 +393,7 @@ class FilterbankFeatures(nn.Module):
             # dot with filterbank energies
             x = torch.matmul(self.fb.to(x.dtype), x)
         # debug_snapshots['step6_after_mel_filterbank'] = x[0, :, :10].cpu()
-        
+
         # log features if required
         if self.log:
             if self.log_zero_guard_type == "add":
@@ -426,7 +421,7 @@ class FilterbankFeatures(nn.Module):
         x = x.masked_fill(mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value)
         # debug_snapshots['step10_after_masking'] = x[0, :, :10].cpu()
         del mask
-        
+
         pad_to = self.pad_to
         if pad_to == "max":
             x = nn.functional.pad(x, (0, self.max_length - x.size(-1)), value=self.pad_value)
@@ -435,10 +430,10 @@ class FilterbankFeatures(nn.Module):
             if pad_amt != 0:
                 x = nn.functional.pad(x, (0, pad_to - pad_amt), value=self.pad_value)
         # debug_snapshots['step11_after_padding'] = x[0, :, :10].cpu()
-        
+
         # Debug: Save all intermediate steps
         # import os
-        
+
         # # Add final output and config to debug snapshots
         # debug_snapshots['final_output'] = x[0].cpu()
         # debug_snapshots['final_shape'] = list(x.shape)
@@ -451,11 +446,11 @@ class FilterbankFeatures(nn.Module):
         #     'preemph': self.preemph,
         #     'mag_power': self.mag_power,
         # }
-        
+
         # torch.save(debug_snapshots, debug_path)
         # print(f"[Preprocessor Debug] Saved {len(debug_snapshots)} steps to {debug_path}")
         # print(f"  Input length: {debug_snapshots['input_len']}, Output seq_len: {seq_len[0].item()}, Final shape: {x.shape}")
-        
+
         return x, seq_len
 
 
@@ -472,12 +467,12 @@ class FilterbankFeaturesTA(nn.Module):
         sample_rate: int = 16000,
         n_window_size: int = 320,
         n_window_stride: int = 160,
-        normalize: Optional[str] = "per_feature",
+        normalize: str | None = "per_feature",
         nfilt: int = 64,
-        n_fft: Optional[int] = None,
+        n_fft: int | None = None,
         preemph: float = 0.97,
         lowfreq: float = 0,
-        highfreq: Optional[float] = None,
+        highfreq: float | None = None,
         log: bool = True,
         log_zero_guard_type: str = "add",
         log_zero_guard_value: Union[float, str] = 2**-24,
@@ -486,7 +481,7 @@ class FilterbankFeaturesTA(nn.Module):
         pad_to: int = 0,
         pad_value: float = 0.0,
         mel_norm="slaney",
-        # Seems like no one uses these options anymore. Don't convolute the code by supporting thm.
+        # Seems like no one uses these options anymore. Don't convolute the code by supporting them.
         use_grads: bool = False,  # Deprecated arguments; kept for config compatibility
         max_duration: float = 16.7,  # Deprecated arguments; kept for config compatibility
         frame_splicing: int = 1,  # Deprecated arguments; kept for config compatibility
@@ -494,7 +489,7 @@ class FilterbankFeaturesTA(nn.Module):
         nb_augmentation_prob: float = 0.0,  # Deprecated arguments; kept for config compatibility
         nb_max_freq: int = 4000,  # Deprecated arguments; kept for config compatibility
         mag_power: float = 2.0,  # Deprecated arguments; kept for config compatibility
-        rng: Optional[random.Random] = None,  # Deprecated arguments; kept for config compatibility
+        rng: random.Random | None = None,  # Deprecated arguments; kept for config compatibility
         stft_exact_pad: bool = False,  # Deprecated arguments; kept for config compatibility
         stft_conv: bool = False,  # Deprecated arguments; kept for config compatibility
     ):
@@ -511,11 +506,11 @@ class FilterbankFeaturesTA(nn.Module):
 
         # Copied from `AudioPreprocessor` due to the ad-hoc structuring of the Mel Spec extractor class
         self.torch_windows = {
-            'hann': torch.hann_window,
-            'hamming': torch.hamming_window,
-            'blackman': torch.blackman_window,
-            'bartlett': torch.bartlett_window,
-            'ones': torch.ones,
+            "hann": torch.hann_window,
+            "hamming": torch.hamming_window,
+            "blackman": torch.blackman_window,
+            "bartlett": torch.bartlett_window,
+            "ones": torch.ones,
             None: torch.ones,
         }
 
@@ -548,7 +543,6 @@ class FilterbankFeaturesTA(nn.Module):
             f_min=lowfreq,
             wkwargs={"periodic": False},
         )
-
 
     def _resolve_log_zero_guard_value(self, dtype: torch.dtype) -> float:
         if isinstance(self.log_zero_guard_value, float):
@@ -592,7 +586,7 @@ class FilterbankFeaturesTA(nn.Module):
 
     def _extract_spectrograms(self, signals: torch.Tensor) -> torch.Tensor:
         # Complex FFT needs to be done in single precision
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             features = self._mel_spec_extractor(waveform=signals)
         return features
 

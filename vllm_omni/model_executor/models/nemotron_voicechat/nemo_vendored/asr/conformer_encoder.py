@@ -52,7 +52,7 @@ from .subsampling import (
     SubsamplingReductionModule,
 )
 
-__all__ = ['ConformerEncoder']
+__all__ = ["ConformerEncoder"]
 
 
 class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
@@ -172,13 +172,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             as a part of the training step.
     """
 
-
-
-
-
-
-
-
     def __init__(
         self,
         feat_in,
@@ -186,7 +179,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         d_model,
         feat_out=-1,
         causal_downsampling=False,
-        subsampling='striding',
+        subsampling="striding",
         subsampling_factor=4,
         subsampling_conv_chunking_factor=1,
         subsampling_conv_channels=-1,
@@ -194,16 +187,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         reduction_position=None,
         reduction_factor=1,
         ff_expansion_factor=4,
-        self_attention_model='rel_pos',
+        self_attention_model="rel_pos",
         n_heads=4,
         att_context_size=None,
         att_context_probs=None,
-        att_context_style='regular',
+        att_context_style="regular",
         xscaling=True,
         untie_biases=True,
         pos_emb_max_len=5000,
         conv_kernel_size=31,
-        conv_norm_type='batch_norm',
+        conv_norm_type="batch_norm",
         conv_context_size=None,
         use_bias=True,
         dropout=0.1,
@@ -262,13 +255,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if subsampling_conv_channels == -1:
             subsampling_conv_channels = d_model
         if subsampling and subsampling_factor > 1:
-            if subsampling in ['stacking', 'stacking_norm']:
+            if subsampling in ["stacking", "stacking_norm"]:
                 # stacking_norm has an extra layer norm after stacking comparing to stacking
                 self.pre_encode = StackingSubsampling(
                     subsampling_factor=subsampling_factor,
                     feat_in=feat_in,
                     feat_out=d_model,
-                    norm=True if subsampling == 'stacking_norm' else False,
+                    norm=True if subsampling == "stacking_norm" else False,
                 )
             else:
                 self.pre_encode = ConvSubsampling(
@@ -320,7 +313,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 xscale=self.xscale,
                 dropout_rate_emb=dropout_emb,
             )
-        elif self_attention_model == 'rel_pos_local_attn':
+        elif self_attention_model == "rel_pos_local_attn":
             if max(att_context_size) <= 0:
                 raise ValueError("When using local attention, context size must be set > 0")
             self.pos_enc = LocalAttRelPositionalEncoding(
@@ -381,8 +374,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         )
         # will be set in self.forward() if defined in AccessMixin config
         self.interctc_capture_at_layers = None
-
-
 
     @typecheck()
     def forward(
@@ -565,16 +556,16 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             # saving tensors if required for interctc loss
             if self.is_access_enabled(getattr(self, "model_guid", None)):
                 if self.interctc_capture_at_layers is None:
-                    self.interctc_capture_at_layers = self.access_cfg.get('interctc', {}).get('capture_layers', [])
+                    self.interctc_capture_at_layers = self.access_cfg.get("interctc", {}).get("capture_layers", [])
                 if lth in self.interctc_capture_at_layers:
                     lth_audio_signal = audio_signal
                     if self.out_proj is not None:
                         lth_audio_signal = self.out_proj(audio_signal)
                     # shape is the same as the shape of audio_signal output, i.e. [B, D, T]
                     self.register_accessible_tensor(
-                        name=f'interctc/layer_output_{lth}', tensor=torch.transpose(lth_audio_signal, 1, 2)
+                        name=f"interctc/layer_output_{lth}", tensor=torch.transpose(lth_audio_signal, 1, 2)
                     )
-                    self.register_accessible_tensor(name=f'interctc/layer_length_{lth}', tensor=length)
+                    self.register_accessible_tensor(name=f"interctc/layer_length_{lth}", tensor=length)
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal)
@@ -688,7 +679,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         pad_mask = ~pad_mask
         return pad_mask, att_mask
 
-
     def _calc_context_sizes(
         self, att_context_size, att_context_probs, att_context_style, conv_context_size, conv_kernel_size
     ):
@@ -715,9 +705,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 raise ValueError("The size of the att_context_probs should be the same as att_context_size.")
             att_context_probs = list(att_context_probs)
             if sum(att_context_probs) != 1:
-                raise ValueError(
-                    "The sum of numbers in att_context_probs should be equal to one to be a distribution."
-                )
+                raise ValueError("The sum of numbers in att_context_probs should be equal to one to be a distribution.")
         else:
             att_context_probs = [1.0 / len(att_context_size_all)] * len(att_context_size_all)
 
@@ -736,7 +724,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         else:
             conv_context_size = [(conv_kernel_size - 1) // 2, (conv_kernel_size - 1) // 2]
         return att_context_size_all, att_context_size_all[0], att_context_probs, conv_context_size
-
 
     def setup_streaming_params(
         self,
@@ -784,9 +771,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             streaming_cfg.last_channel_cache_size = att_context_size[0] if att_context_size[0] >= 0 else max_context
         else:
             if left_chunks is None:
-                streaming_cfg.last_channel_cache_size = (
-                    att_context_size[0] if att_context_size[0] >= 0 else max_context
-                )
+                streaming_cfg.last_channel_cache_size = att_context_size[0] if att_context_size[0] >= 0 else max_context
                 logging.warning(
                     f"left_chunks is not set. Setting it to default: {streaming_cfg.last_channel_cache_size}."
                 )
@@ -845,8 +830,6 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         self.streaming_cfg = streaming_cfg
 
-
-
     def change_subsampling_conv_chunking_factor(self, subsampling_conv_chunking_factor: int):
         """
         Update the conv_chunking_factor (int)
@@ -865,5 +848,3 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.pre_encode.change_subsampling_conv_chunking_factor(
             subsampling_conv_chunking_factor=subsampling_conv_chunking_factor
         )
-
-
