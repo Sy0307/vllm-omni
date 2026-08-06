@@ -21,7 +21,8 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, Concatenate
 
-import librosa
+# librosa replaced by the vendored exact-math filterbank (see librosa_mel.py).
+from .librosa_mel import mel as _librosa_mel
 import torch
 from omegaconf import DictConfig
 from torch import Tensor, nn
@@ -317,7 +318,7 @@ def get_fbanks(
     are only computed once for a given set of parameters, improving efficiency
     when the function is called multiple times with the same arguments.
 
-    Note: This implementation only supports Mel filterbanks via librosa.
+    Note: This implementation only supports Mel filterbanks (vendored librosa math).
 
     Args:
         sample_rate (int): The sample rate of the audio.
@@ -336,7 +337,7 @@ def get_fbanks(
                 Shape: [n_mels, n_fft // 2 + 1]
     """
     # Generate Mel filterbanks using librosa's functional API
-    fb = librosa.filters.mel(
+    fb = _librosa_mel(
         sr=sample_rate,
         n_fft=n_fft,
         n_mels=n_mels,

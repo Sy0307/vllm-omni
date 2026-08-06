@@ -126,3 +126,20 @@ def test_prefill_contract_arithmetic() -> None:
     talker_rows = (logical_prompt_len + frames) - 1
     trimmed = talker_rows - (logical_prompt_len - 1)
     assert trimmed == frames
+
+
+def test_vendored_mel_filterbank_matches_librosa() -> None:
+    librosa = pytest.importorskip("librosa")
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.librosa_mel import (
+        mel as vendored_mel,
+    )
+
+    for kwargs in (
+        {"sr": 16000, "n_fft": 512, "n_mels": 128, "fmin": 0.0, "fmax": 8000.0, "norm": "slaney"},
+        {"sr": 22050, "n_fft": 1024, "n_mels": 80, "fmin": 0.0, "fmax": None, "norm": "slaney", "htk": True},
+        {"sr": 16000, "n_fft": 512, "n_mels": 80, "fmin": 0.0, "fmax": 8000.0, "norm": None},
+    ):
+        ours = vendored_mel(**kwargs)
+        reference = librosa.filters.mel(**kwargs)
+        assert (ours == reference).all(), f"vendored mel diverged for {kwargs}"

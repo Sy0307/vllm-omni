@@ -38,7 +38,8 @@ import math
 import random
 from typing import Optional, Tuple, Union
 
-import librosa
+# librosa replaced by the vendored exact-math filterbank (see librosa_mel.py).
+from ..librosa_mel import mel as _librosa_mel
 import numpy as np
 import torch
 import torch.nn as nn
@@ -267,7 +268,7 @@ class FilterbankFeatures(nn.Module):
         highfreq = highfreq or sample_rate / 2
 
         filterbanks = torch.tensor(
-            librosa.filters.mel(
+            _librosa_mel(
                 sr=sample_rate, n_fft=self.n_fft, n_mels=nfilt, fmin=lowfreq, fmax=highfreq, norm=mel_norm
             ),
             dtype=torch.float,

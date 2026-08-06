@@ -90,10 +90,6 @@ class AudioPerceptionModule(NeuralModule, Exportable):
                 "NVIDIA-NemotronLabs-VoiceChat-11B checkpoint). Vendor "
                 "nemo.collections.tts.modules.audio_codec_modules.FiniteScalarQuantizer to enable it."
             )
-            bottleneck_dim = len(self.modality_adapter_quantizer_levels)
-            self.modality_adapter_quantizer_bottleneck = nn.Linear(cfg.modality_adapter.d_model, bottleneck_dim)
-            self.modality_adapter_vector_quantizer = FiniteScalarQuantizer(self.modality_adapter_quantizer_levels)
-            self.modality_adapter_quantizer_projection = nn.Linear(bottleneck_dim, cfg.modality_adapter.d_model)
 
     def maybe_preprocess_audio(
         self,

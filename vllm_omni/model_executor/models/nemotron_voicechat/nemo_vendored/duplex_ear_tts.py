@@ -24,7 +24,7 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 
-import librosa
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1092,23 +1092,25 @@ class DuplexEARTTS(nn.Module):
 
 def load_audio_librosa(path, sr=None):
     """
-    Load audio using librosa with torchaudio-like behavior.
+    Load audio with torchaudio-like behavior (librosa replaced by soundfile:
+    librosa is not a dependency of this repo).
 
     Returns:
         audio_tensor: torch.FloatTensor of shape [channels, time]
         sr: sampling rate
     """
-    # Load with librosa (preserve original sampling rate)
-    audio, sr = librosa.load(path, sr=sr, mono=False)
+    import soundfile as sf
 
-    # Ensure shape is [channels, time]
-    if audio.ndim == 1:
-        # Mono: (time,) -> (1, time)
-        audio = audio[None, :]
+    audio, file_sr = sf.read(str(path), dtype="float32", always_2d=True)
+    audio = audio.T  # [channels, time]
+    if sr is not None and int(sr) != int(file_sr):
+        from vllm.multimodal.audio import resample_audio_scipy
 
-    # Convert to torch float32 (torchaudio behavior)
-    audio_tensor = torch.from_numpy(audio).float()
-    return audio_tensor, sr
+        audio = np.stack([resample_audio_scipy(ch, orig_sr=file_sr, target_sr=int(sr)) for ch in audio])
+        file_sr = int(sr)
+
+    audio_tensor = torch.from_numpy(np.ascontiguousarray(audio)).float()
+    return audio_tensor, file_sr
 
 
 def maybe_to(x, dtype):
