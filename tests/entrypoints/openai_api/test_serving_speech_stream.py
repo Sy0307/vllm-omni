@@ -38,6 +38,8 @@ def _build_test_app(
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
 
+    speech_service._validate_speech_streaming_request.return_value = ("pcm", None)
+
     handler = OmniStreamingSpeechHandler(
         speech_service=speech_service,
         idle_timeout=idle_timeout,
@@ -134,6 +136,54 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].response_format == "pcm"
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert speech_service._generate_audio_bytes.await_count == 0
+
+    def test_native_speed_streaming_uses_model_aware_validation(self, mocker: MockerFixture):
+        _, speech_service = _build_test_app(mocker=mocker)
+        handler = OmniStreamingSpeechHandler(speech_service=speech_service)
+        websocket = mocker.MagicMock()
+        websocket.send_json = mocker.AsyncMock()
+        websocket.send_bytes = mocker.AsyncMock()
+        config = streaming_speech_module.StreamingSpeechSessionConfig(
+            response_format="pcm",
+            stream_audio=True,
+        )
+        config.speed = 2.0
+
+        asyncio.run(handler._generate_and_send(websocket, config, "Hello world.", 0))
+
+        validated_request = speech_service._validate_speech_streaming_request.call_args.args[0]
+        speech_service._validate_speech_streaming_request.assert_called_once_with(
+            validated_request,
+            mode_label="WebSocket streaming",
+        )
+        assert validated_request.speed == 2.0
+        speech_service._prepare_speech_generation.assert_awaited_once_with(validated_request)
+
+    def test_generic_speed_streaming_returns_validation_error_before_generation(self, mocker: MockerFixture):
+        _, speech_service = _build_test_app(mocker=mocker)
+        message = "WebSocket streaming is not supported with speed adjustment."
+        validation_error = SimpleNamespace(error=SimpleNamespace(message=message))
+        speech_service._validate_speech_streaming_request.return_value = ("pcm", validation_error)
+        handler = OmniStreamingSpeechHandler(speech_service=speech_service)
+        websocket = mocker.MagicMock()
+        websocket.send_json = mocker.AsyncMock()
+        websocket.send_bytes = mocker.AsyncMock()
+        config = streaming_speech_module.StreamingSpeechSessionConfig(
+            response_format="pcm",
+            stream_audio=True,
+        )
+        config.speed = 2.0
+
+        asyncio.run(handler._generate_and_send(websocket, config, "Hello world.", 0))
+
+        validated_request = speech_service._validate_speech_streaming_request.call_args.args[0]
+        speech_service._validate_speech_streaming_request.assert_called_once_with(
+            validated_request,
+            mode_label="WebSocket streaming",
+        )
+        websocket.send_json.assert_awaited_once_with({"type": "error", "message": message})
+        speech_service._prepare_speech_generation.assert_not_awaited()
+        speech_service._generate_audio_bytes.assert_not_awaited()
 
     def test_word_timestamps_requires_configured_aligner(self, mocker: MockerFixture):
         app, _ = _build_test_app(mocker=mocker)
@@ -521,6 +571,7 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_config = None
+        speech_service._validate_speech_streaming_request.return_value = ("pcm", None)
 
         async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
             yield b"\x01\x02"

@@ -716,6 +716,28 @@ class TestSpeechAPI:
         assert passed_params is not mock_engine.default_sampling_params_list
         assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
 
+    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_preserves_requested_speed(self, mocker: MockerFixture):
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [mocker.MagicMock(extra_args=None)]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        create_audio = mocker.patch.object(
+            server,
+            "create_audio",
+            return_value=SimpleNamespace(audio_data=b"dummy", media_type="audio/wav"),
+        )
+
+        await server._create_diffusion_speech(OpenAICreateSpeechRequest(input="Hello", speed=2.0))
+
+        audio_obj = create_audio.call_args.args[0]
+        assert isinstance(audio_obj, CreateAudio)
+        assert audio_obj.speed == 2.0
+
 
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
@@ -741,6 +763,72 @@ class TestTTSMethods:
         # Fixture creates server with stage_configs = [] -> _is_tts should be False
         assert speech_server._is_tts is False
         assert speech_server._tts_stage is None
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected_speed"),
+        [("indextts2_5", 1.0), ("qwen3_tts", 2.0)],
+    )
+    def test_audio_encode_speed_respects_adapter_native_control(
+        self,
+        speech_server,
+        model_type,
+        expected_speed,
+    ):
+        speech_server._tts_model_type = model_type
+        request = OpenAICreateSpeechRequest(input="Hello", speed=2.0)
+
+        assert speech_server._audio_encode_speed(request) == expected_speed
+
+    @pytest.mark.parametrize(
+        ("model_type", "expects_error"),
+        [("indextts2_5", False), ("qwen3_tts", True)],
+    )
+    def test_streaming_speed_validation_respects_adapter_native_control(
+        self,
+        speech_server,
+        model_type,
+        expects_error,
+    ):
+        speech_server._tts_model_type = model_type
+        request = OpenAICreateSpeechRequest(input="Hello", response_format="pcm", speed=2.0)
+
+        _, error = speech_server._validate_speech_streaming_request(
+            request,
+            mode_label="SSE streaming",
+        )
+
+        if expects_error:
+            assert error is not None
+            assert "not supported with speed adjustment" in error.error.message
+        else:
+            assert error is None
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_native_speed_skips_generic_audio_adjustment(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        speech_server._tts_model_type = "indextts2_5"
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(return_value=("speech-native-speed", mock_generate(), {})),
+        )
+        create_audio = mocker.patch.object(
+            speech_server,
+            "create_audio",
+            return_value=SimpleNamespace(audio_data=b"dummy", media_type="audio/wav"),
+        )
+
+        await speech_server._generate_audio_bytes(OpenAICreateSpeechRequest(input="Hello", speed=2.0))
+
+        audio_obj = create_audio.call_args.args[0]
+        assert isinstance(audio_obj, CreateAudio)
+        assert audio_obj.speed == 1.0
 
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
@@ -2163,17 +2251,24 @@ class TestStreamingProtocolValidation:
         assert req.is_streaming() is False
 
     def test_stream_validation_errors(self):
-        """stream=True requires response_format in ('pcm', 'wav') and speed=1.0."""
+        """stream=True requires response_format in ('pcm', 'wav')."""
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
-        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
 
     def test_stream_format_audio_validation_errors(self):
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="mp3")
-        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
+
+    def test_stream_with_speed_adjustment_parses_for_model_aware_validation(self):
+        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+
+        assert req.stream is True
+        assert req.speed == 2.0
+
+    @pytest.mark.parametrize("speed", [0.24, 4.01])
+    def test_stream_speed_still_respects_global_range(self, speed):
+        with pytest.raises(ValidationError):
+            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=speed)
 
     def test_stream_valid(self):
         """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted as SSE."""
@@ -2263,7 +2358,13 @@ class TestStreamingResponse:
         new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
 
         async def awaitable_create_speech(*args, **kwargs):
-            return await original_create_speech(*args, **kwargs)
+            result = await original_create_speech(*args, **kwargs)
+            if isinstance(result, ErrorResponse):
+                return JSONResponse(
+                    content=result.model_dump(),
+                    status_code=result.error.code or 400,
+                )
+            return result
 
         awaitable_create_speech.__signature__ = new_sig
         speech_server.create_speech = awaitable_create_speech
@@ -2357,6 +2458,7 @@ class TestStreamingResponse:
 
         assert response.status_code in (400, 422)
         assert "text/event-stream" not in response.headers.get("content-type", "")
+        assert "not supported with speed adjustment" in response.json()["error"]["message"]
 
     def test_stream_format_audio_rejects_unsupported_response_format(self, streaming_app):
         client = TestClient(streaming_app)
@@ -2377,6 +2479,7 @@ class TestStreamingResponse:
 
         assert response.status_code in (400, 422)
         assert "audio/" not in response.headers.get("content-type", "")
+        assert "not supported with speed adjustment" in response.json()["error"]["message"]
 
     @pytest.fixture
     def erroring_streaming_app(self, mocker: MockerFixture):
@@ -2599,6 +2702,31 @@ def test_streaming_speech_session_config_accepts_non_streaming_mode():
     config = StreamingSpeechSessionConfig(non_streaming_mode=True)
 
     assert config.non_streaming_mode is True
+
+
+def test_streaming_speech_session_config_allows_native_speed_validation():
+    config = StreamingSpeechSessionConfig(
+        response_format="pcm",
+        stream_audio=True,
+        speed=2.0,
+    )
+
+    assert config.stream_audio is True
+    assert config.speed == 2.0
+
+
+@pytest.mark.parametrize(
+    ("model", "field"),
+    [
+        (OpenAICreateSpeechRequest, "stream"),
+        (StreamingSpeechSessionConfig, "stream_audio"),
+    ],
+)
+def test_stream_speed_schema_describes_native_model_support(model, field):
+    description = model.model_fields[field].description
+
+    assert description is not None
+    assert "native speed control" in description
 
 
 class TestAsyncOmniSupportedTasks:

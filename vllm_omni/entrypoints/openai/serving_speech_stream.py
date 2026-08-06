@@ -251,6 +251,15 @@ class OmniStreamingSpeechHandler:
             word_timestamps=config.word_timestamps,
         )
 
+        if config.stream_audio:
+            _, error = self._speech_service._validate_speech_streaming_request(
+                request,
+                mode_label="WebSocket streaming",
+            )
+            if error is not None:
+                await self._send_error(websocket, error.error.message)
+                return
+
         start_payload = {
             "type": "audio.start",
             "sentence_index": sentence_index,

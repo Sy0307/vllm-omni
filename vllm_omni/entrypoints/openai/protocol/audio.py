@@ -82,7 +82,8 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=(
             "Streaming switch; defaults to OpenAI speech.audio.* SSE events. "
             "Set stream_format='audio' to opt into raw pcm/wav byte streaming. "
-            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
+            "Requires response_format='pcm' or 'wav'. Non-1.0 speed is allowed "
+            "only for models with native speed control."
         ),
     )
 
@@ -317,8 +318,6 @@ class OpenAICreateSpeechRequest(BaseModel):
                 )
             if self.speed is None:
                 self.speed = 1.0
-            elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when streaming. Set speed=1.0 or omit it.")
         return self
 
 
@@ -532,7 +531,7 @@ class StreamingSpeechSessionConfig(BaseModel):
         default=False,
         description=(
             "If true, send raw PCM audio chunks progressively over WebSocket. "
-            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+            "Requires response_format='pcm'. Non-1.0 speed is allowed only for models with native speed control."
         ),
     )
     word_timestamps: bool = Field(
@@ -555,6 +554,4 @@ class StreamingSpeechSessionConfig(BaseModel):
                 )
             if self.speed is None:
                 self.speed = 1.0
-            elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
         return self
