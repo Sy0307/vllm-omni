@@ -275,6 +275,59 @@ def test_s2mel_payload_latent_policy_must_match_stage_config():
         decoder._validate_payload_policy([{"use_gpt_latent": True}])
 
 
+def test_s2mel_target_lengths_apply_request_local_duration_factors():
+    assert IndexTTS2S2MelDecoder._target_lengths(
+        [100, 80],
+        semantic_time_scale=2,
+        mel_code_to_frame_ratio=1.72,
+        duration_factors=[0.5, 2.0],
+    ) == [172, 550]
+
+
+def test_s2mel_duration_factors_default_to_one_without_request_infos():
+    assert IndexTTS2S2MelDecoder._duration_factors([], batch_size=2) == [1.0, 1.0]
+
+
+def test_s2mel_duration_factors_default_missing_request_value_to_one():
+    assert IndexTTS2S2MelDecoder._duration_factors(
+        [{}, {"duration_factor": 0.5}],
+        batch_size=2,
+    ) == [1.0, 0.5]
+
+
+def test_s2mel_duration_factor_count_must_match_batch_size():
+    with pytest.raises(ValueError) as exc_info:
+        IndexTTS2S2MelDecoder._duration_factors(
+            [{"duration_factor": 1.0}],
+            batch_size=2,
+        )
+
+    assert str(exc_info.value) == "IndexTTS duration-factor batch mismatch: factors=1 batch=2"
+
+
+def test_s2mel_target_length_count_must_match_duration_factors():
+    with pytest.raises(ValueError) as exc_info:
+        IndexTTS2S2MelDecoder._target_lengths(
+            [100, 80],
+            semantic_time_scale=2,
+            mel_code_to_frame_ratio=1.72,
+            duration_factors=[1.0],
+        )
+
+    assert str(exc_info.value) == "IndexTTS target-length batch mismatch: codes=2 factors=1"
+
+
+@pytest.mark.parametrize("duration_factor", [float("nan"), float("inf"), 0.0, -0.5])
+def test_s2mel_duration_factors_must_be_finite_and_positive(duration_factor):
+    with pytest.raises(ValueError) as exc_info:
+        IndexTTS2S2MelDecoder._duration_factors(
+            [{"duration_factor": duration_factor}],
+            batch_size=1,
+        )
+
+    assert str(exc_info.value) == "IndexTTS duration_factor values must be finite and positive"
+
+
 def test_cfm_unpad_data_builder_accounts_for_token_offsets_and_cfg_row_order():
     indices, cu_seqlens = flow_matching.build_cfm_unpad_data(
         [3, 5],

@@ -9,6 +9,7 @@ to synthesize mel spectrogram, then BigVGAN to produce waveform audio.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections.abc import Iterable
 from typing import Any
@@ -399,6 +400,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 else:
                     code_lens_list.append(mel_codes.shape[1])
             code_lens = torch.tensor(code_lens_list, device=device, dtype=torch.long)
+        duration_factors = self._duration_factors(request_infos, len(code_lens_list))
 
         # Trim to actual length
         max_len = max(code_lens_list)
@@ -456,9 +458,12 @@ class IndexTTS2S2MelDecoder(nn.Module):
         semantic_time_scale = (
             int(getattr(semantic_codec, "downsample_scale", 1) or 1) if self.semantic_codec_type == "enhanced" else 1
         )
-        target_lengths_list = [
-            int(length * semantic_time_scale * self.mel_code_to_frame_ratio) for length in code_lens_list
-        ]
+        target_lengths_list = self._target_lengths(
+            code_lens_list,
+            semantic_time_scale=semantic_time_scale,
+            mel_code_to_frame_ratio=self.mel_code_to_frame_ratio,
+            duration_factors=duration_factors,
+        )
         target_lengths = torch.tensor(target_lengths_list, device=device, dtype=torch.long)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[S2Mel] step3 length_regulator target_lengths=%s", target_lengths_list)
@@ -645,6 +650,32 @@ class IndexTTS2S2MelDecoder(nn.Module):
                     f"{index}: payload={bool(payload_value)} "
                     f"stage_config={self.use_gpt_latent}"
                 )
+
+    @staticmethod
+    def _duration_factors(infos: list[dict[str, Any]], batch_size: int) -> list[float]:
+        factors = [float(info.get("duration_factor", 1.0)) for info in infos] if infos else [1.0] * batch_size
+        if len(factors) != batch_size:
+            raise ValueError(f"IndexTTS duration-factor batch mismatch: factors={len(factors)} batch={batch_size}")
+        if any(not math.isfinite(factor) or factor <= 0 for factor in factors):
+            raise ValueError("IndexTTS duration_factor values must be finite and positive")
+        return factors
+
+    @staticmethod
+    def _target_lengths(
+        code_lens: list[int],
+        *,
+        semantic_time_scale: int,
+        mel_code_to_frame_ratio: float,
+        duration_factors: list[float],
+    ) -> list[int]:
+        if len(code_lens) != len(duration_factors):
+            raise ValueError(
+                f"IndexTTS target-length batch mismatch: codes={len(code_lens)} factors={len(duration_factors)}"
+            )
+        return [
+            int(length * semantic_time_scale * mel_code_to_frame_ratio * factor)
+            for length, factor in zip(code_lens, duration_factors)
+        ]
 
     def _run_cfm_groups(
         self,
