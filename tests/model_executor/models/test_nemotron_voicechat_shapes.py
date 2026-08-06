@@ -130,18 +130,22 @@ def test_prefill_contract_arithmetic() -> None:
     assert trimmed == frames
 
 
-def test_vendored_mel_filterbank_matches_librosa() -> None:
+def test_torchaudio_mel_filterbank_matches_librosa() -> None:
+    """The perception frontend builds its mel filterbank with torchaudio.
+
+    torchaudio's melscale_fbanks(norm="slaney", mel_scale="slaney") implements
+    the same slaney-convention math as librosa.filters.mel (the NeMo reference
+    dependency) up to float32 rounding. The 1e-6 tolerance is ~4x the observed
+    2.6e-7 max diff; e2e this stays token- and WAV-identical to the reference
+    on the parity fixture (per-feature normalization absorbs it).
+    """
     librosa = pytest.importorskip("librosa")
+    torchaudio = pytest.importorskip("torchaudio")
 
-    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.librosa_mel import (
-        mel as vendored_mel,
-    )
-
-    for kwargs in (
-        {"sr": 16000, "n_fft": 512, "n_mels": 128, "fmin": 0.0, "fmax": 8000.0, "norm": "slaney"},
-        {"sr": 22050, "n_fft": 1024, "n_mels": 80, "fmin": 0.0, "fmax": None, "norm": "slaney", "htk": True},
-        {"sr": 16000, "n_fft": 512, "n_mels": 80, "fmin": 0.0, "fmax": 8000.0, "norm": None},
-    ):
-        ours = vendored_mel(**kwargs)
-        reference = librosa.filters.mel(**kwargs)
-        assert (ours == reference).all(), f"vendored mel diverged for {kwargs}"
+    # The checkpoint's perception preprocessor config (16 kHz, n_fft=512, 128 mels).
+    ta = torchaudio.functional.melscale_fbanks(
+        n_freqs=257, f_min=0.0, f_max=8000.0, n_mels=128, sample_rate=16000, norm="slaney", mel_scale="slaney"
+    ).T.numpy()
+    reference = librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000.0, norm="slaney")
+    assert ta.shape == reference.shape
+    assert abs(ta - reference).max() < 1e-6
