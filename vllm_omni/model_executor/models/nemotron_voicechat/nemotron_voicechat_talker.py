@@ -62,6 +62,10 @@ def sanitize_tts_model_cfg(tts_model_cfg: dict[str, Any]) -> dict[str, Any]:
     * ``tts_config.pretrained_text_name`` would make ``RVQEARTTSModel``
       download a full LLM backbone — dropped (the backbone builds from
       ``backbone_type``/``backbone_config``).
+    * ``pretrained_codec_model`` would make ``setup_audio_codec`` load an
+      external codec checkpoint at construction — dropped (the codec weights
+      arrive with the ``tts_model.audio_codec.*`` subtree, and the RVQ
+      embedding binding is overwritten by the same ``load_state_dict``).
     * ``tts_config.cas_config.pretrained_tokenizer_name`` is dropped, matching
       NeMo's own inference override (the CAS vocab is baked into the weights).
     * ``pretrained_lm_name`` survives ONLY as the tokenizer reference (the
@@ -72,6 +76,7 @@ def sanitize_tts_model_cfg(tts_model_cfg: dict[str, Any]) -> dict[str, Any]:
     import os
 
     cfg = copy.deepcopy(tts_model_cfg)
+    cfg.pop("pretrained_codec_model", None)
     tts_config = cfg.get("tts_config")
     if isinstance(tts_config, dict):
         tts_config.pop("pretrained_text_name", None)

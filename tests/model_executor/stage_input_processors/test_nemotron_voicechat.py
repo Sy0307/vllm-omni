@@ -139,6 +139,7 @@ def test_sanitize_tts_model_cfg_disables_pretrained_loads(monkeypatch) -> None:
 
     original = {
         "pretrained_lm_name": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        "pretrained_codec_model": "/some/external/codec.ckpt",
         "tts_config": {
             "pretrained_text_name": "some/hub-llm",
             "backbone_type": "gemma3_text",
@@ -149,6 +150,7 @@ def test_sanitize_tts_model_cfg_disables_pretrained_loads(monkeypatch) -> None:
     cfg = sanitize_tts_model_cfg(original)
     # External weight-load triggers are gone; construction is config-only.
     assert "pretrained_text_name" not in cfg["tts_config"]
+    assert "pretrained_codec_model" not in cfg
     assert "pretrained_tokenizer_name" not in cfg["tts_config"]["cas_config"]
     assert cfg["tts_config"]["cas_config"]["keep"] == 1
     # Tokenizer reference survives.
