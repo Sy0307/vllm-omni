@@ -448,6 +448,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 s_ref = info_meta.get("S_ref")
                 ref_mel = info_meta.get("ref_mel")
                 style = info_meta.get("style")
+                req_meta["duration_factor"] = info_meta.get("duration_factor", 1.0)
                 if isinstance(s_ref, torch.Tensor):
                     req_meta["S_ref"] = s_ref
                 if isinstance(ref_mel, torch.Tensor):
@@ -553,6 +554,10 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         def _first(key, default=None):
             v = info_dict.get(key)
             return v[0] if isinstance(v, list) and v else default
+
+        duration_factor = float(_first("duration_factor", 1.0))
+        if not 0.5 <= duration_factor <= 2.0:
+            raise ValueError("IndexTTS 2.5 duration_factor must be between 0.5 and 2.0")
 
         text = _first("text")
         if not text:
@@ -723,6 +728,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 "ref_mel": ref_mel.cpu().contiguous(),
                 "style": style.cpu().contiguous(),
                 "use_gpt_latent": self.use_gpt_latent,
+                "duration_factor": duration_factor,
             },
             "codes": {"mel": torch.zeros(0, dtype=torch.long, device=device)},
         }

@@ -145,6 +145,9 @@ def _build_s2mel_additional_information(
             raise ValueError(f"{context} requires GPT latent but none was provided")
         additional_information["latent"] = _cpu_view(latent_clean)
 
+    duration_factor = meta.get("duration_factor", 1.0)
+    additional_information["duration_factor"] = 1.0 if duration_factor is None else float(duration_factor)
+
     for key in ("S_ref", "ref_mel", "style"):
         val = meta.get(key)
         if isinstance(val, torch.Tensor):
@@ -277,6 +280,12 @@ def talker2s2mel_full_payload(
         "S_ref": _get_payload_value(pooling_output, "meta.S_ref", "meta", "S_ref"),
         "ref_mel": _get_payload_value(pooling_output, "meta.ref_mel", "meta", "ref_mel"),
         "style": _get_payload_value(pooling_output, "meta.style", "meta", "style"),
+        "duration_factor": _get_payload_value(
+            pooling_output,
+            "meta.duration_factor",
+            "meta",
+            "duration_factor",
+        ),
     }
     additional_information = _build_s2mel_additional_information(
         mel_seq,

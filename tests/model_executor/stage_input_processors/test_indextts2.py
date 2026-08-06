@@ -139,6 +139,7 @@ def test_talker2s2mel_full_payload_flat_keys_builds_s2mel_contract():
         "meta.S_ref": cond["S_ref"],
         "meta.ref_mel": cond["ref_mel"],
         "meta.style": cond["style"],
+        "meta.duration_factor": 0.5,
     }
 
     result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-flat"))
@@ -152,6 +153,23 @@ def test_talker2s2mel_full_payload_flat_keys_builds_s2mel_contract():
     assert result["ref_mel"].device.type == "cpu"
     assert result["style"].device.type == "cpu"
     assert result["S_ref"].data_ptr() != cond["S_ref"].data_ptr()
+    assert result["duration_factor"] == 0.5
+
+
+def test_talker2s2mel_full_payload_defaults_missing_duration_factor_to_one():
+    cond = _conditioning_tensors()
+    payload = {
+        "codes.mel": torch.tensor([[10], [20]]),
+        "hidden_states.latent": torch.randn(2, LATENT_DIM),
+        "meta.S_ref": cond["S_ref"],
+        "meta.ref_mel": cond["ref_mel"],
+        "meta.style": cond["style"],
+    }
+
+    result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-default-duration"))
+
+    assert result is not None
+    assert result["duration_factor"] == 1.0
 
 
 def test_talker2s2mel_full_payload_preserves_explicit_request_seed():

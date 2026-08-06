@@ -288,7 +288,112 @@ def test_compute_logits_passes_mel_head_bias_to_logits_processor():
     assert seen["embedding_bias"] is talker.mel_head.bias
 
 
+def _make_cached_v25_prefill_talker(monkeypatch):
+    talker, _ = _make_minimal_talker(
+        monkeypatch,
+        model_type="indextts2_5",
+        use_gpt_latent=False,
+    )
+    talker._speaker_cache = SimpleNamespace(
+        make_cache_key=lambda *_args: "cached-speaker",
+        get=lambda _key: {
+            "S_ref": torch.ones(1, 3, 8),
+            "ref_mel": torch.ones(1, 80, 3),
+            "style": torch.ones(1, 192),
+            "spk_cond_emb": torch.ones(1, 3, 8),
+        },
+    )
+    monkeypatch.setattr(
+        talker,
+        "_compute_emotion_vector",
+        lambda **_kwargs: torch.zeros(1, talker.model_dim),
+    )
+    monkeypatch.setattr(
+        talker,
+        "_tokenize_text",
+        lambda *_args, **_kwargs: (torch.tensor([[1]]), None),
+    )
+    return talker
+
+
+def test_prefill_preserves_duration_factor_in_metadata(monkeypatch):
+    talker = _make_cached_v25_prefill_talker(monkeypatch)
+
+    _, _, info_update = talker._preprocess_prefill(
+        torch.zeros(5, dtype=torch.long),
+        None,
+        {
+            "text": ["hello"],
+            "voice": ["/speaker.wav"],
+            "voice_name": ["cached"],
+            "duration_factor": [0.5],
+        },
+        span_len=5,
+    )
+
+    assert info_update["meta"]["duration_factor"] == 0.5
+
+
+@pytest.mark.parametrize("duration_factor", [0.49, 2.01])
+def test_prefill_rejects_duration_factor_outside_supported_range(monkeypatch, duration_factor):
+    talker = _make_cached_v25_prefill_talker(monkeypatch)
+
+    with pytest.raises(
+        ValueError,
+        match="^IndexTTS 2.5 duration_factor must be between 0.5 and 2.0$",
+    ):
+        talker._preprocess_prefill(
+            torch.zeros(5, dtype=torch.long),
+            None,
+            {
+                "text": ["hello"],
+                "voice": ["/speaker.wav"],
+                "voice_name": ["cached"],
+                "duration_factor": [duration_factor],
+            },
+            span_len=5,
+        )
+
+
 def test_no_latent_sampled_token_payload_emits_only_first_step_metadata():
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    talker.use_gpt_latent = False
+    hidden = torch.zeros(1, 8)
+    info = {
+        "codes": {"mel": torch.tensor([17])},
+        "meta": {
+            "mel_code_count": 1,
+            "S_ref": torch.ones(1, 4),
+            "ref_mel": torch.ones(1, 80, 3),
+            "style": torch.ones(1, 192),
+            "duration_factor": 0.5,
+        },
+    }
+
+    first_decode_output = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[info],
+    )
+
+    assert "codes" not in first_decode_output.multimodal_outputs
+    assert "hidden_states" not in first_decode_output.multimodal_outputs
+    assert first_decode_output.multimodal_outputs["meta"][0]["use_gpt_latent"] is False
+    assert first_decode_output.multimodal_outputs["meta"][0]["S_ref"] is info["meta"]["S_ref"]
+    assert first_decode_output.multimodal_outputs["meta"][0]["duration_factor"] == 0.5
+
+    later = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {
+                "codes": {"mel": torch.tensor([23])},
+                "meta": {"mel_code_count": 2},
+            }
+        ],
+    )
+    assert later.multimodal_outputs == {}
+
+
+def test_first_decode_payload_defaults_missing_duration_factor_to_one():
     talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
     talker.use_gpt_latent = False
     hidden = torch.zeros(1, 8)
@@ -307,21 +412,7 @@ def test_no_latent_sampled_token_payload_emits_only_first_step_metadata():
         model_intermediate_buffer=[info],
     )
 
-    assert "codes" not in output.multimodal_outputs
-    assert "hidden_states" not in output.multimodal_outputs
-    assert output.multimodal_outputs["meta"][0]["use_gpt_latent"] is False
-    assert output.multimodal_outputs["meta"][0]["S_ref"] is info["meta"]["S_ref"]
-
-    later = talker.make_omni_output(
-        hidden,
-        model_intermediate_buffer=[
-            {
-                "codes": {"mel": torch.tensor([23])},
-                "meta": {"mel_code_count": 2},
-            }
-        ],
-    )
-    assert later.multimodal_outputs == {}
+    assert output.multimodal_outputs["meta"][0]["duration_factor"] == 1.0
 
 
 def test_latent_sampled_token_payload_keeps_aligned_gpu_deltas():
@@ -333,6 +424,7 @@ def test_latent_sampled_token_payload_keeps_aligned_gpu_deltas():
         "meta": {
             "mel_code_count": 1,
             "latent_acc": torch.arange(8, dtype=torch.float32).reshape(1, 8),
+            "duration_factor": 1.0,
         },
     }
 
