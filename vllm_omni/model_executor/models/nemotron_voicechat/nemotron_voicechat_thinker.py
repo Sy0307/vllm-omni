@@ -47,6 +47,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 
+from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
+    merge_runtime_info,
+    require_request_id,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -314,26 +318,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     # ------------------------------------------------------------------
     # Per-request session.
     # ------------------------------------------------------------------
-    @staticmethod
-    def _merge_info(info_dict: dict[str, Any]) -> dict[str, Any]:
-        additional = info_dict.get("additional_information")
-        if isinstance(additional, dict):
-            merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
-            for k, v in additional.items():
-                merged.setdefault(k, v)
-            return merged
-        return info_dict
-
-    def _request_id(self, info: dict[str, Any]) -> str:
-        request_id = info.get("request_id")
-        if request_id is None:
-            meta = info.get("meta")
-            if isinstance(meta, dict):
-                request_id = meta.get("request_id")
-        if request_id is None:
-            raise RuntimeError("NemotronVoiceChat thinker requires a request_id in the runtime info.")
-        return str(request_id)
-
     def _load_audio(self, info: dict[str, Any], device: torch.device) -> torch.Tensor:
         audio = info.get("nvc_audio")
         if audio is None:
@@ -418,12 +402,12 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        info = self._merge_info(info_dict)
+        info = merge_runtime_info(info_dict)
         device = input_ids.device
         span = int(input_ids.shape[0])
         is_prefill_raw = info.get("_omni_is_prefill")
         is_prefill = bool(is_prefill_raw) if isinstance(is_prefill_raw, bool) else span > 1
-        request_id = self._request_id(info)
+        request_id = require_request_id(info, "thinker")
 
         if is_prefill or request_id not in self._sessions:
             session = self._sessions.get(request_id) or self._init_session(request_id, info, device)

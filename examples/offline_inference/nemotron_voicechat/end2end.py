@@ -136,24 +136,14 @@ def main() -> None:
                 agent_text = text
             token_ids = getattr(completion, "token_ids", None)
             if token_ids:
-                import json as _json
-
-                out_dir_early = Path(args.output_dir)
-                out_dir_early.mkdir(parents=True, exist_ok=True)
-                (out_dir_early / f"{Path(args.wav).stem}_text_tokens.json").write_text(
-                    _json.dumps(list(map(int, token_ids)))
-                )
+                (out_dir / f"{stem}_text_tokens.json").write_text(json.dumps(list(map(int, token_ids))))
             # Best-effort: dump the function-channel debug timeline if the
             # engine surfaced the request info on this output.
             info = getattr(output, "additional_information", None)
             func_timeline = info.get("nvc_function_tokens") if isinstance(info, dict) else None
             if func_timeline is not None:
-                import json as _json
-
                 values = func_timeline.tolist() if hasattr(func_timeline, "tolist") else list(func_timeline)
-                (Path(args.output_dir) / f"{Path(args.wav).stem}_function_tokens.json").write_text(
-                    _json.dumps([int(v) for v in values])
-                )
+                (out_dir / f"{stem}_function_tokens.json").write_text(json.dumps([int(v) for v in values]))
                 print(f"function-channel timeline: {len(values)} entries")
         if final_type in (None, "audio"):
             # multimodal_output is a MultimodalPayload (Mapping) — duck-type it.

@@ -86,8 +86,6 @@ class NemotronVoiceChatCode2Wav(nn.Module):
     # Runner-facing placeholder hooks.
     # ------------------------------------------------------------------
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
-        if input_ids.numel() == 0:
-            return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
         return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
 
     def compute_logits(self, hidden_states: Any, sampling_metadata: Any = None) -> None:
@@ -119,9 +117,6 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         if isinstance(codes, torch.Tensor):
             return codes
         return None
-
-    def _validate_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        return validate_code_stack(codes, self._num_quantizers, self._codebook_size)
 
     @torch.no_grad()
     def forward(
@@ -156,7 +151,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
                     codes = input_ids.reshape(-1)
                 else:
                     continue
-            codes = self._validate_codes(codes).to(device=device)
+            codes = validate_code_stack(codes, self._num_quantizers, self._codebook_size).to(device=device)
             frames = codes.shape[0]
             if frames == 0:
                 continue

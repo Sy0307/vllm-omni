@@ -43,6 +43,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
+    merge_runtime_info,
+    require_request_id,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -176,26 +180,6 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
     # ------------------------------------------------------------------
     # Per-frame vendored TTS step.
     # ------------------------------------------------------------------
-    @staticmethod
-    def _merge_info(info_dict: dict[str, Any]) -> dict[str, Any]:
-        additional = info_dict.get("additional_information")
-        if isinstance(additional, dict):
-            merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
-            for k, v in additional.items():
-                merged.setdefault(k, v)
-            return merged
-        return info_dict
-
-    def _request_id(self, info: dict[str, Any]) -> str:
-        request_id = info.get("request_id")
-        if request_id is None:
-            meta = info.get("meta")
-            if isinstance(meta, dict):
-                request_id = meta.get("request_id")
-        if request_id is None:
-            raise RuntimeError("NemotronVoiceChat talker requires a request_id in the runtime info.")
-        return str(request_id)
-
     def _timeline(self, info: dict[str, Any]) -> torch.Tensor:
         timeline = info.get("nvc_text_timeline")
         if timeline is None or info.get("nvc_logical_prompt_len") is None:
@@ -278,12 +262,12 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        info = self._merge_info(info_dict)
+        info = merge_runtime_info(info_dict)
         device = input_ids.device
         span = int(input_ids.shape[0])
         is_prefill_raw = info.get("_omni_is_prefill")
         is_prefill = bool(is_prefill_raw) if isinstance(is_prefill_raw, bool) else span > 1
-        request_id = self._request_id(info)
+        request_id = require_request_id(info, "talker")
 
         embeds = torch.zeros((span, self._hidden), device=device, dtype=self._dtype)
         if is_prefill or request_id not in self._sessions:
