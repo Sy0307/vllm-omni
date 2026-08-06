@@ -19,6 +19,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS2Adapter,
     IndexTTS25Adapter,
+    indextts2_conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
@@ -113,6 +114,55 @@ def test_indextts25_validates_explicit_language():
 
     assert adapter._validate_extra_params({"lang": "ja"}) is None
     assert "Unsupported IndexTTS 2.5 language" in adapter._validate_extra_params({"lang": "xx-invalid"})
+
+
+def _indextts25_adapter_and_request(*, speed: float):
+    server = SimpleNamespace(
+        uploaded_speakers={},
+        _validate_ref_audio_format=lambda ref_audio: None,
+    )
+    adapter = IndexTTS25Adapter(SimpleNamespace(server=server))
+    request = SimpleNamespace(
+        input="hello",
+        voice="alloy",
+        ref_audio=object(),
+        max_new_tokens=None,
+        extra_params=None,
+        speed=speed,
+    )
+    return adapter, request
+
+
+def test_indextts25_uses_native_speed_control_duration_factor():
+    adapter, fast_request = _indextts25_adapter_and_request(speed=2.0)
+    _, slow_request = _indextts25_adapter_and_request(speed=0.5)
+
+    assert adapter.native_speed_control is True
+    assert adapter.validate(fast_request) is None
+    assert adapter.validate(slow_request) is None
+    assert asyncio.run(adapter._build_params(fast_request))["duration_factor"] == [0.5]
+    assert asyncio.run(adapter._build_params(slow_request))["duration_factor"] == [2.0]
+
+
+@pytest.mark.parametrize("speed", [0.49, 2.01])
+def test_indextts25_rejects_out_of_range_native_speed(speed):
+    adapter, request = _indextts25_adapter_and_request(speed=speed)
+
+    assert adapter.validate(request) == "IndexTTS 2.5 speed must be between 0.5 and 2.0"
+
+
+def test_indextts25_speed_does_not_change_conditioning_cache_salt():
+    adapter, fast_request = _indextts25_adapter_and_request(speed=2.0)
+    _, slow_request = _indextts25_adapter_and_request(speed=0.5)
+    slow_request.ref_audio = fast_request.ref_audio
+
+    fast_params = asyncio.run(adapter._build_params(fast_request))
+    slow_params = asyncio.run(adapter._build_params(slow_request))
+
+    assert indextts2_conditioning_cache_salt(
+        fast_request,
+        fast_params,
+    ) == indextts2_conditioning_cache_salt(slow_request, slow_params)
 
 
 @pytest.mark.parametrize(

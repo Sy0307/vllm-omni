@@ -103,6 +103,8 @@ class TTSModelAdapter(ABC):
     stage_keys: ClassVar[frozenset[str]] = frozenset()
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
+    #: Whether the model consumes ``request.speed`` in its native parameters.
+    native_speed_control: ClassVar[bool] = False
 
     max_new_tokens_min = 1
 

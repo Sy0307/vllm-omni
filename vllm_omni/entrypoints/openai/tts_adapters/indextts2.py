@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -269,6 +269,16 @@ class IndexTTS2Adapter(ARTTSAdapter):
 class IndexTTS25Adapter(IndexTTS2Adapter):
     stage_keys = frozenset({"indextts2_5_talker"})
     name = "indextts2_5"
+    native_speed_control: ClassVar[bool] = True
+
+    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
+        error = super().validate(request)
+        if error is not None:
+            return error
+        speed = request.speed if request.speed is not None else 1.0
+        if speed < 0.5 or speed > 2.0:
+            return "IndexTTS 2.5 speed must be between 0.5 and 2.0"
+        return None
 
     def _validate_extra_params(self, extras: Mapping[str, Any]) -> str | None:
         error = super()._validate_extra_params(extras)
@@ -306,4 +316,6 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
 
         params["lang"] = [normalize_language_code(str(extras.get("lang", "zh")))]
         params["text_normalization"] = [bool(extras.get("text_normalization", True))]
+        speed = request.speed if request.speed is not None else 1.0
+        params["duration_factor"] = [1.0 / speed]
         return params
