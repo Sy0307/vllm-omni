@@ -147,7 +147,6 @@ def main(args) -> None:
             "--use-gpt-latent selects the bundled experimental vLLM-Omni-specific "
             "latent variant; do not combine it with --deploy-config"
         )
-
     omni = Omni(
         model=args.model,
         deploy_config=deploy_config,
@@ -198,6 +197,8 @@ def main(args) -> None:
         if tokenizer_file is not None:
             request_kwargs["tokenizer_file"] = tokenizer_file
     inputs = build_request(**request_kwargs)
+    if model_type == "indextts2_5":
+        inputs["additional_information"]["duration_factor"] = [1.0 / args.speed]
 
     for i, omni_out in enumerate(omni.generate(inputs, sampling_params_list=sampling_params)):
         mm = omni_out.multimodal_output
@@ -241,6 +242,12 @@ def parse_args():
         help="Disable IndexTTS 2.5 text normalization.",
     )
     parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="IndexTTS 2.5 native synthesis speed in [0.5, 2.0]; 2.0 is faster.",
+    )
+    parser.add_argument(
         "--use-gpt-latent",
         action="store_true",
         help=(
@@ -280,7 +287,10 @@ def parse_args():
     )
     parser.add_argument("--deploy-config", default=None)
     parser.add_argument("--stage-init-timeout", type=int, default=600)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.model_version == "2.5" and not 0.5 <= args.speed <= 2.0:
+        parser.error("IndexTTS 2.5 --speed must be between 0.5 and 2.0")
+    return args
 
 
 if __name__ == "__main__":

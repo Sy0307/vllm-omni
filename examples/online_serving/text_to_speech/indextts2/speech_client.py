@@ -74,6 +74,12 @@ def main() -> None:
         dest="text_normalization",
         help="Disable IndexTTS 2.5 text normalization",
     )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="IndexTTS 2.5 native synthesis speed in [0.5, 2.0]; 2.0 is faster",
+    )
     parser.add_argument("--voice", type=str, default=None, help="Uploaded voice name to use instead of --ref-audio")
     parser.add_argument("--output", type=str, default="output.wav")
     parser.add_argument("--api-base", type=str, default=DEFAULT_API_BASE)
@@ -84,6 +90,8 @@ def main() -> None:
         if args.model_version == "2.5":
             parser.error("--model is required for IndexTTS 2.5")
         args.model = "IndexTeam/IndexTTS-2"
+    if args.model_version == "2.5" and not 0.5 <= args.speed <= 2.0:
+        parser.error("IndexTTS 2.5 --speed must be between 0.5 and 2.0")
 
     if not args.ref_audio and not args.voice:
         parser.error("IndexTTS2 requires --ref-audio or --voice for voice cloning")
@@ -121,6 +129,7 @@ def main() -> None:
     if args.use_random:
         extra_params["use_random"] = True
     if args.model_version == "2.5":
+        payload["speed"] = args.speed
         extra_params["lang"] = args.lang
         extra_params["text_normalization"] = args.text_normalization
     if extra_params:

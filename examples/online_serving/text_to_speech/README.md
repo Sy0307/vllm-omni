@@ -189,12 +189,21 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
     --lang ja \
     --text "こんにちは、音声合成のテストです。" \
     --ref-audio /path/to/ref.wav
+
+# IndexTTS-2.5 native speed control
+python examples/online_serving/text_to_speech/indextts2/speech_client.py \
+    --model-version 2.5 \
+    --model /path/to/indextts-2.5 \
+    --speed 2.0 \
+    --text "这是两倍速度的语音合成测试。" \
+    --ref-audio /path/to/ref.wav
 ```
 
 ### Notes
 - Output: 22.05 kHz mono WAV.
 - Provide `ref_audio` on the documented raw request path, or pass `voice` only when it names an uploaded audio voice; neither version provides a built-in text-only preset voice.
 - IndexTTS-2.5 request controls `lang` and `text_normalization` are carried in `extra_params`; the client does this for `--model-version 2.5`.
+- IndexTTS-2.5 accepts the public `speed` request field in `[0.5, 2.0]`: `2.0` generates shorter, faster speech and `0.5` generates longer, slower speech. This is native Stage 1 duration control, so serving does not apply the generic playback-speed adjustment a second time. IndexTTS-2 does not use this control.
 - IndexTTS-2.5 accepts language codes such as `zh`, `en`, `zhen` (mixed Chinese/English), `ja`, and `yue`. `Mandarin` is a vLLM-Omni convenience alias for `zh`. Japanese (`ja`) uses `fugashi` tokenization and produces audio, but it does not automatically expand numbers, dates, or percentages; callers should first write those inputs as readable Japanese text.
 - A request `seed` controls Stage 0 AR sampling and per-request CFM noise. Different concurrent batch compositions do not guarantee a bit-identical waveform.
 - IndexTTS-2.5 Stage 0 uses plain vLLM sampling and does not reproduce the official default `num_beams=3` beam search. For parity comparisons, run upstream with `num_beams=1`; output quality can differ from the official beam-search result.
