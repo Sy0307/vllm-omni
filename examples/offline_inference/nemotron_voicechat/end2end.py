@@ -103,8 +103,10 @@ def main() -> None:
         # token — and vLLM's min_tokens masks "EOS" to -inf, which would forbid
         # silence and force the agent to babble through the whole utterance.
         SamplingParams(temperature=0.0, max_tokens=n_frames, ignore_eos=True, seed=0),
-        # talker: placeholder loop, stops on the stage's stop token.
-        SamplingParams(temperature=0.0, max_tokens=16384, stop_token_ids=[1], detokenize=False, seed=0),
+        # talker: placeholder loop, stops on the stage's stop token. 16383:
+        # the 1-token placeholder prompt + max_tokens must fit the stage's
+        # max_model_len (16384).
+        SamplingParams(temperature=0.0, max_tokens=16383, stop_token_ids=[1], detokenize=False, seed=0),
         # code2wav: single decode step.
         SamplingParams(temperature=0.0, max_tokens=1, detokenize=False, seed=0),
     ]
