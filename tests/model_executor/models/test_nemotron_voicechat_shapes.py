@@ -47,20 +47,22 @@ def test_timeline_max_model_len_validation() -> None:
         validate_timeline_fits_max_model_len,
     )
 
-    # The acceptance fixture (56 + 196 = 252) fits the shipped 8192 limit.
+    # The acceptance fixture (56 + 1 + 196 = 253) fits the shipped 8192 limit.
     validate_timeline_fits_max_model_len(56, 196, 8192)
-    # Exactly at the limit is allowed.
-    validate_timeline_fits_max_model_len(56, 8136, 8192)
-    # One frame over must be rejected, naming every offending length.
+    # Exactly at the limit: the vLLM request occupies prompt + 1 (frame-0
+    # placeholder) + frames tokens, so 57 + 8135 == 8192 is allowed...
+    validate_timeline_fits_max_model_len(56, 8135, 8192)
+    # ...and one more frame must be rejected, naming every offending length.
     with pytest.raises(ValueError) as excinfo:
-        validate_timeline_fits_max_model_len(56, 8137, 8192)
+        validate_timeline_fits_max_model_len(56, 8136, 8192)
     message = str(excinfo.value)
     for fragment in (
-        "logical_prompt_token_len=56",
-        "acoustic_frame_count=8137",
-        "logical_total_len=8193",
-        "max_model_len=8192",
         "vllm_prefill_len=57",
+        "acoustic_frame_count=8136",
+        "vllm_total_len=8193",
+        "max_model_len=8192",
+        "logical_prompt_token_len=56",
+        "logical_total_len=8192",
     ):
         assert fragment in message
 

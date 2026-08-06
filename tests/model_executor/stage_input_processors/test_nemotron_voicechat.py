@@ -93,6 +93,26 @@ def test_full_payload_missing_prompt_len_fails_explicitly() -> None:
         talker2code2wav_full_payload(request=request, is_finished=True)
 
 
+def test_code2wav_distinguishes_empty_payload_from_missing_info() -> None:
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        NemotronVoiceChatCode2Wav,
+    )
+
+    extract = NemotronVoiceChatCode2Wav._codes_from_runtime_info
+    # Explicit empty payload (e.g. zero frames after the prompt trim): the
+    # empty tensor comes back as-is -> empty audio, never a placeholder-id
+    # decode.
+    empty = extract(None, {"codes": {"audio": torch.empty(0, dtype=torch.long)}})
+    assert isinstance(empty, torch.Tensor) and empty.numel() == 0
+    # Missing codes info entirely -> None (fallback territory).
+    assert extract(None, {"meta": {}}) is None
+    assert extract(None, None) is None
+    # Normal payload passes through (nested and flattened key forms).
+    codes = torch.zeros((3, 31), dtype=torch.long)
+    assert extract(None, {"codes": {"audio": codes}}) is codes
+    assert extract(None, {"codes.audio": codes}) is codes
+
+
 def test_validate_code_stack_negatives() -> None:
     from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
         validate_code_stack,

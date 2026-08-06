@@ -100,14 +100,23 @@ class NemotronVoiceChatCode2Wav(nn.Module):
     # Decode.
     # ------------------------------------------------------------------
     def _codes_from_runtime_info(self, runtime_info: Mapping[str, Any] | None) -> torch.Tensor | None:
+        """Extract the codes payload; None means "no codes info at all".
+
+        An EMPTY tensor is returned as-is: it is an explicit empty payload
+        (e.g. zero acoustic frames after the prompt trim) and must yield empty
+        audio, NOT a fallback decode of the placeholder input_ids.
+        """
         if not isinstance(runtime_info, Mapping):
             return None
-        codes = runtime_info.get("codes")
-        if isinstance(codes, Mapping):
-            codes = codes.get("audio")
-        if isinstance(codes, list | tuple) and codes:
+        if "codes" in runtime_info:
+            codes = runtime_info["codes"]
+            if isinstance(codes, Mapping):
+                codes = codes.get("audio")
+        else:
+            codes = runtime_info.get("codes.audio")
+        if isinstance(codes, list | tuple):
             codes = torch.as_tensor(codes, dtype=torch.long)
-        if isinstance(codes, torch.Tensor) and codes.numel() > 0:
+        if isinstance(codes, torch.Tensor):
             return codes
         return None
 

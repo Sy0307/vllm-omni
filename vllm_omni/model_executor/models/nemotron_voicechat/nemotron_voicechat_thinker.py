@@ -61,20 +61,22 @@ def validate_timeline_fits_max_model_len(
 ) -> None:
     """Reject audio whose frame-locked timeline exceeds the stage limit.
 
-    The logical timeline is ``prompt + acoustic frames`` (NeMo's T); the vLLM
-    request occupies ``prompt + 1`` prefill positions plus
-    ``acoustic_frame_count`` sampled tokens, so the logical total is the
-    binding size on both sides.
+    The vLLM request occupies ``logical_prompt_token_len + 1`` prefill
+    positions (the +1 is the acoustic-frame-0 placeholder) plus
+    ``acoustic_frame_count`` sampled tokens, so the binding sequence size is
+    one MORE than NeMo's logical timeline (``prompt + frames``).
     """
     logical_total_len = logical_prompt_token_len + acoustic_frame_count
     vllm_prefill_len = logical_prompt_token_len + 1
-    if logical_total_len > max_model_len:
+    vllm_total_len = vllm_prefill_len + acoustic_frame_count
+    if vllm_total_len > max_model_len:
         raise ValueError(
             "NemotronVoiceChat input exceeds the thinker stage's max_model_len: "
-            f"logical_prompt_token_len={logical_prompt_token_len} + "
+            f"vllm_prefill_len={vllm_prefill_len} + "
             f"acoustic_frame_count={acoustic_frame_count} = "
-            f"logical_total_len={logical_total_len} > max_model_len={max_model_len} "
-            f"(vllm_prefill_len={vllm_prefill_len}). Use shorter audio or raise the "
+            f"vllm_total_len={vllm_total_len} > max_model_len={max_model_len} "
+            f"(logical_prompt_token_len={logical_prompt_token_len}, "
+            f"logical_total_len={logical_total_len}). Use shorter audio or raise the "
             "stage's max_model_len in the deploy yaml."
         )
 
