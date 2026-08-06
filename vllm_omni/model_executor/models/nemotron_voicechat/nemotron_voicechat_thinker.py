@@ -54,6 +54,31 @@ logger = init_logger(__name__)
 _LM_ARCHITECTURE = "NemotronHForCausalLM"
 
 
+def validate_timeline_fits_max_model_len(
+    logical_prompt_token_len: int,
+    acoustic_frame_count: int,
+    max_model_len: int,
+) -> None:
+    """Reject audio whose frame-locked timeline exceeds the stage limit.
+
+    The logical timeline is ``prompt + acoustic frames`` (NeMo's T); the vLLM
+    request occupies ``prompt + 1`` prefill positions plus
+    ``acoustic_frame_count`` sampled tokens, so the logical total is the
+    binding size on both sides.
+    """
+    logical_total_len = logical_prompt_token_len + acoustic_frame_count
+    vllm_prefill_len = logical_prompt_token_len + 1
+    if logical_total_len > max_model_len:
+        raise ValueError(
+            "NemotronVoiceChat input exceeds the thinker stage's max_model_len: "
+            f"logical_prompt_token_len={logical_prompt_token_len} + "
+            f"acoustic_frame_count={acoustic_frame_count} = "
+            f"logical_total_len={logical_total_len} > max_model_len={max_model_len} "
+            f"(vllm_prefill_len={vllm_prefill_len}). Use shorter audio or raise the "
+            "stage's max_model_len in the deploy yaml."
+        )
+
+
 def compute_acoustic_frame_count(nemo_stt_cfg: dict[str, Any], num_samples: int) -> int:
     """Exact 12.5 Hz frame count for ``num_samples`` of 16 kHz audio.
 
@@ -357,10 +382,16 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 "The example must size max_tokens with compute_acoustic_frame_count() (never min_tokens)."
             )
 
+        p = int(prompt_ids.numel())
+        validate_timeline_fits_max_model_len(
+            logical_prompt_token_len=p,
+            acoustic_frame_count=n_frames,
+            max_model_len=int(self.vllm_config.model_config.max_model_len),
+        )
+
         # Fused prefill embeds for positions 0..P (P prompt slots + frame 0).
         # All prompt positions use the PAD text channel (NeMo's
         # _get_bos_embedding returns the PAD embedding) and PAD function channel.
-        p = int(prompt_ids.numel())
         timeline = torch.cat([self.embed_tokens(prompt_ids).to(self._dtype), audio_embeds[0:1]], dim=0)  # [P+1, H]
         pad_ids = torch.full((p + 1,), pad_id, dtype=torch.long, device=device)
         prefill = self._fuse(pad_ids, timeline, pad_ids)  # [P+1, H]
@@ -371,7 +402,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             "prompt_len": p,
             "n_frames": n_frames,
             "func_token": int(pad_id),
-            "func_tokens": [],
             "decode_step": 0,
         }
         self._sessions[request_id] = session
@@ -409,16 +439,16 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         pad_id = self._resolve_special_ids()["pad"]
 
         # Function channel: greedy argmax over the PREVIOUS position's hidden,
-        # computed by postprocess right after each forward (so the final frame's
-        # token exists too — NeMo produces gen_function for every non-prompt
-        # position). At the first decode step this is the prefill's last
-        # position (acoustic frame 0), matching NeMo's gen_function[prompt_len].
+        # computed by postprocess right after each forward. At the first decode
+        # step this is the prefill's last position (acoustic frame 0), matching
+        # NeMo's gen_function[prompt_len]. The cumulative debug timeline
+        # (nvc_function_tokens) is owned by postprocess, which also covers the
+        # final acoustic frame (no later preprocess exists for it).
         if self._use_function_head:
             prev_func = info.get("nvc_prev_function_token")
             if prev_func is not None:
                 token = int(prev_func.reshape(-1)[0]) if isinstance(prev_func, torch.Tensor) else int(prev_func)
                 session["func_token"] = token
-                session["func_tokens"].append(token)
 
         session["decode_step"] = int(session["decode_step"]) + 1
         frame_idx = session["decode_step"]  # decode step k consumes frame k
@@ -435,25 +465,37 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         info_update: dict[str, Any] = {
             "meta": {"nvc_frame": frame_idx},
-            "nvc_function_tokens": torch.tensor(session["func_tokens"], dtype=torch.long),
             "nvc_text_pad_id": pad_id,
         }
         return input_ids, fused, info_update
 
-    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
+    def postprocess(self, hidden_states: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
         """Greedy function-channel token from this step's last hidden.
 
         Runs after EVERY forward (prefill and each decode step), so the final
-        acoustic frame's function token is produced as well; it stays in the
-        request info as ``nvc_prev_function_token`` (the cumulative timeline in
-        ``nvc_function_tokens`` covers positions consumed by later fusion
-        steps).
+        acoustic frame's token is covered too — NeMo produces gen_function for
+        every non-prompt position. Owns the cumulative debug timeline: appends
+        the new token to the ``nvc_function_tokens`` carried in the request
+        info, giving exactly ``acoustic_frame_count`` entries at request end.
+        On multi-chunk prefill, only the final chunk (whose forward covers the
+        last prefill position, acoustic frame 0) contributes a token.
         """
         if hidden_states is None or hidden_states.numel() == 0 or not self._use_function_head:
             return {}
+        if kwargs.get("_omni_is_prefill"):
+            computed = int(kwargs.get("_omni_num_computed_tokens", 0) or 0)
+            prompt_len = int(kwargs.get("_omni_prompt_len", 0) or 0)
+            if prompt_len and computed + int(hidden_states.shape[0]) < prompt_len:
+                return {}  # intermediate prefill chunk: frame 0 not reached yet
         with torch.inference_mode():
             func_logits = self.function_head(hidden_states[-1, :].reshape(1, -1).to(self._dtype))
-        return {"nvc_prev_function_token": func_logits.argmax(dim=-1).reshape(()).detach()}
+        token = func_logits.argmax(dim=-1).reshape(()).detach()
+        existing = kwargs.get("nvc_function_tokens")
+        if isinstance(existing, torch.Tensor) and existing.numel() > 0:
+            timeline = torch.cat([existing.reshape(-1).cpu(), token.reshape(1).cpu()])
+        else:
+            timeline = token.reshape(1).cpu()
+        return {"nvc_prev_function_token": token, "nvc_function_tokens": timeline}
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:

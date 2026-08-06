@@ -42,6 +42,76 @@ def test_acoustic_frame_count_golden(num_samples: int, expected_frames: int) -> 
     assert compute_acoustic_frame_count(_STT_CFG, num_samples) == expected_frames
 
 
+def test_timeline_max_model_len_validation() -> None:
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
+        validate_timeline_fits_max_model_len,
+    )
+
+    # The acceptance fixture (56 + 196 = 252) fits the shipped 8192 limit.
+    validate_timeline_fits_max_model_len(56, 196, 8192)
+    # Exactly at the limit is allowed.
+    validate_timeline_fits_max_model_len(56, 8136, 8192)
+    # One frame over must be rejected, naming every offending length.
+    with pytest.raises(ValueError) as excinfo:
+        validate_timeline_fits_max_model_len(56, 8137, 8192)
+    message = str(excinfo.value)
+    for fragment in (
+        "logical_prompt_token_len=56",
+        "acoustic_frame_count=8137",
+        "logical_total_len=8193",
+        "max_model_len=8192",
+        "vllm_prefill_len=57",
+    ):
+        assert fragment in message
+
+
+def _bare_thinker():
+    import torch
+    from torch import nn
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
+        NemotronVoiceChatThinkerForConditionalGeneration,
+    )
+
+    thinker = NemotronVoiceChatThinkerForConditionalGeneration.__new__(NemotronVoiceChatThinkerForConditionalGeneration)
+    nn.Module.__init__(thinker)
+    thinker._use_function_head = True
+    thinker._dtype = torch.float32
+    thinker.function_head = nn.Linear(8, 16, bias=False)
+    return thinker
+
+
+def test_postprocess_appends_function_token_to_timeline() -> None:
+    import torch
+
+    thinker = _bare_thinker()
+    hidden = torch.randn(3, 8)
+    expected = int(thinker.function_head(hidden[-1:]).argmax(dim=-1))
+
+    # No existing timeline: starts one.
+    update = thinker.postprocess(hidden)
+    assert int(update["nvc_prev_function_token"]) == expected
+    assert update["nvc_function_tokens"].tolist() == [expected]
+
+    # Existing timeline: appended, not replaced.
+    existing = torch.tensor([7, 8, 9], dtype=torch.long)
+    update = thinker.postprocess(hidden, nvc_function_tokens=existing)
+    assert update["nvc_function_tokens"].tolist() == [7, 8, 9, expected]
+
+
+def test_postprocess_skips_intermediate_prefill_chunks() -> None:
+    import torch
+
+    thinker = _bare_thinker()
+    hidden = torch.randn(4, 8)
+    # Intermediate chunk: 0 computed + 4 rows < prompt_len 10 -> no token.
+    assert thinker.postprocess(hidden, _omni_is_prefill=True, _omni_num_computed_tokens=0, _omni_prompt_len=10) == {}
+    # Final chunk reaches the last prefill position (acoustic frame 0).
+    update = thinker.postprocess(hidden, _omni_is_prefill=True, _omni_num_computed_tokens=6, _omni_prompt_len=10)
+    assert "nvc_prev_function_token" in update
+    assert update["nvc_function_tokens"].numel() == 1
+
+
 def test_prefill_contract_arithmetic() -> None:
     # vllm_prefill_len = logical_prompt_token_len + 1 (the +1 is acoustic
     # frame 0); decode steps == acoustic_frame_count; NeMo timeline
