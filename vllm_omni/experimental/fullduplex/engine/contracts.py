@@ -11,6 +11,7 @@ serving remain in sibling experimental modules.
 from __future__ import annotations
 
 import base64
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -43,6 +44,29 @@ class DuplexOutputAction(str, Enum):
 class DuplexRuntimeCapabilities:
     input_modes: set[DuplexInputMode] = field(default_factory=lambda: {DuplexInputMode.TURN_COMMIT_ONLY})
     implementation_level: str = "serving_session_adapter"
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexExecutionProfile:
+    """Optional observability and prewarm hints for one duplex model."""
+
+    prewarm_batch_sizes: tuple[int, ...] = ()
+    step_latency_budget_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prewarm_batch_sizes, tuple):
+            raise TypeError("prewarm_batch_sizes must be a tuple")
+        if any(type(size) is not int or size <= 0 for size in self.prewarm_batch_sizes):
+            raise ValueError("prewarm_batch_sizes must contain positive integers")
+        if len(self.prewarm_batch_sizes) != len(set(self.prewarm_batch_sizes)):
+            raise ValueError("prewarm_batch_sizes must not contain duplicates")
+        if self.step_latency_budget_ms is not None and (
+            not isinstance(self.step_latency_budget_ms, int | float)
+            or isinstance(self.step_latency_budget_ms, bool)
+            or not math.isfinite(float(self.step_latency_budget_ms))
+            or self.step_latency_budget_ms <= 0
+        ):
+            raise ValueError("step_latency_budget_ms must be a positive finite number or null")
 
 
 @dataclass(frozen=True)
@@ -263,6 +287,7 @@ __all__ = [
     "CorrelatedRpcTransport",
     "DuplexAppendPlan",
     "DuplexControlPlanePort",
+    "DuplexExecutionProfile",
     "DuplexInputMode",
     "DuplexOutputAction",
     "DuplexOutputContext",

@@ -88,6 +88,13 @@ class OmniServeCommand(CLISubcommand):
             os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
             log_logo()
 
+        # External Omni pipelines must be registered in the API/head process
+        # before AsyncOmni resolves the deploy pipeline. Stage-local engine
+        # argument construction happens after that resolution and is too late.
+        from vllm_omni.plugins import load_omni_general_plugins
+
+        load_omni_general_plugins()
+
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag

@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Contract tests for the fullduplex core (PR #3907 alignment).
 
-Covers the DuplexFence identity value, the session identity rules (epoch only
-advances on barge-in, response_index once per begin_response), stale-output
-dropping in the turn lifecycle. The lockstep (single-eternal-response)
-lifecycle is model-owned (see
+Covers the DuplexFence Session/incarnation/epoch identity, the legacy core
+session rules (epoch only advances on barge-in, response_index once per
+begin_response), and stale-output dropping in the turn lifecycle. The lockstep
+(single-eternal-response) lifecycle is model-owned (see
 tests/e2e/features/fullduplex/test_personaplex_adapter.py).
 """
 
@@ -33,11 +33,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_fence_is_frozen_value_identity():
     f = DuplexFence(session_id="s1")
-    assert (f.epoch, f.turn_id, f.response_seq) == (0, 0, 0)
+    assert (f.incarnation, f.epoch) == (0, 0)
     with pytest.raises(dataclasses.FrozenInstanceError):
         f.epoch = 1  # type: ignore[misc]
-    assert DuplexFence("s1", 1, 2, 3) == DuplexFence("s1", 1, 2, 3)
-    assert DuplexFence("s1", 1, 2, 3) != DuplexFence("s1", 2, 2, 3)
+    assert DuplexFence("s1", 1, 2) == DuplexFence("s1", 1, 2)
+    assert DuplexFence("s1", 1, 2) != DuplexFence("s1", 2, 2)
 
 
 def test_session_identity_rules():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -15,25 +16,24 @@ from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexEventProtocolError,
+    DuplexFunctionCallDelta,
+    DuplexFunctionCallEnd,
+    DuplexFunctionCallStart,
     DuplexListen,
     DuplexModelEvent,
     DuplexSpeakChunk,
     DuplexSpeakEnd,
     DuplexSpeakStart,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
-    MiniCPMO45TtsSegmentControl,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter import (
-    MiniCPMO45SideControlServingAdapter,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.session import (
-    ActiveOutputContinuation,
-    PendingInputContinuation,
+    DuplexUserTranscriptDelta,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
+)
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexActiveOutputContinuation,
+    DuplexInputCompletionMode,
+    DuplexPendingInputContinuation,
 )
 
 logger = init_logger(__name__)
@@ -138,7 +138,12 @@ class NativeRuntimeBridgeMixin:
                     incarnation=session.incarnation,
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
-                append_kwargs["collect_outputs"] = False
+                completion_mode = getattr(
+                    self._serving_runtime_adapter,
+                    "input_completion_mode",
+                    DuplexInputCompletionMode.APPEND_ACCEPTED,
+                )
+                append_kwargs["collect_outputs"] = completion_mode is DuplexInputCompletionMode.OUTPUT_PROJECTED
             result = await append_input(session.session_id, **append_kwargs)
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -350,7 +355,7 @@ class NativeRuntimeBridgeMixin:
         session: DuplexSession,
         *,
         request_id: str,
-        continuation: PendingInputContinuation | ActiveOutputContinuation,
+        continuation: DuplexPendingInputContinuation | DuplexActiveOutputContinuation,
         expected_epoch: int | None,
         expected_incarnation: int,
     ) -> bool:
@@ -361,7 +366,7 @@ class NativeRuntimeBridgeMixin:
             or (expected_epoch is not None and session.epoch != expected_epoch)
         )
         fence = DuplexFence(session.session_id, incarnation=session.incarnation, epoch=session.epoch)
-        if isinstance(continuation, PendingInputContinuation):
+        if isinstance(continuation, DuplexPendingInputContinuation):
             return stale_common_owner or continuation.is_stale(
                 fence=fence,
                 source_input_seq=session.input_commit_seq,
@@ -392,10 +397,12 @@ class NativeRuntimeBridgeMixin:
             return
         auto_response = self._session_auto_responds(session)
         if session.active_output_id is not None:
-            continuation: PendingInputContinuation | ActiveOutputContinuation = ActiveOutputContinuation(
-                incarnation=session.incarnation,
-                epoch=session.epoch,
-                output_id=session.active_output_id,
+            continuation: DuplexPendingInputContinuation | DuplexActiveOutputContinuation = (
+                DuplexActiveOutputContinuation(
+                    incarnation=session.incarnation,
+                    epoch=session.epoch,
+                    output_id=session.active_output_id,
+                )
             )
             native.pending_input_continuation = None
             previous_continuation = native.active_output_continuation
@@ -404,7 +411,7 @@ class NativeRuntimeBridgeMixin:
             if not auto_response:
                 native.clear_continuation()
                 return
-            continuation = PendingInputContinuation(
+            continuation = DuplexPendingInputContinuation(
                 incarnation=session.incarnation,
                 epoch=session.epoch,
                 source_input_seq=session.input_commit_seq if source_input_seq is None else source_input_seq,
@@ -543,10 +550,18 @@ class NativeRuntimeBridgeMixin:
 
     @staticmethod
     def _runtime_control_timeout_s(session: DuplexSession) -> float:
+        server_raw = session.runtime_config.get("runtime_control_timeout_s")
+        if (
+            isinstance(server_raw, int | float)
+            and not isinstance(server_raw, bool)
+            and math.isfinite(server_raw)
+            and server_raw > 0
+        ):
+            return float(server_raw)
         raw = session.config.extra_body.get("duplex_control_timeout_s") or session.config.extra_body.get(
             "runtime_control_timeout_s"
         )
-        if isinstance(raw, int | float) and raw > 0:
+        if isinstance(raw, int | float) and not isinstance(raw, bool) and math.isfinite(raw) and raw > 0:
             return float(raw)
         if session.capabilities.implementation_level == "model_native_duplex":
             return 60.0
@@ -661,10 +676,14 @@ class NativeRuntimeBridgeMixin:
         if request_id is not None and session.active_request_id is None:
             session.bind_request(request_id)
         context = self._runtime_data_plane_context(session)
-        serving_adapter = self._serving_runtime_adapter
         data_plane = self._serving_runtime_adapter.data_plane
-        if isinstance(serving_adapter, MiniCPMO45SideControlServingAdapter):
-            for batch in serving_adapter.project_runtime_batches(result, context=context):
+        project_batches = getattr(
+            self._serving_runtime_adapter,
+            "project_runtime_batches",
+            None,
+        )
+        if callable(project_batches):
+            for batch in project_batches(result, context=context):
                 for native_result in batch.events:
                     close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                         send_json,
@@ -676,8 +695,8 @@ class NativeRuntimeBridgeMixin:
                     close_reason = close_reason or close_reason_for_result
                     if expected_epoch is not None and session.epoch != expected_epoch:
                         return None, emitted_response
-                for control in batch.tts_segment_controls:
-                    await self._consume_minicpmo_tts_segment_control(
+                for control in batch.controls:
+                    await self._consume_duplex_segment_control(
                         send_json,
                         control,
                         session=session,
@@ -686,7 +705,12 @@ class NativeRuntimeBridgeMixin:
                     if expected_epoch is not None and session.epoch != expected_epoch:
                         return None, emitted_response
         else:
-            for native_result in data_plane.project(result, context=context):
+            project_async = getattr(data_plane, "project_async", None)
+            if callable(project_async):
+                projected_events = await project_async(result, context=context)
+            else:
+                projected_events = data_plane.project(result, context=context)
+            for native_result in projected_events:
                 close_reason_for_result, did_emit = await self._send_one_native_duplex_event(
                     send_json,
                     native_result,
@@ -699,36 +723,42 @@ class NativeRuntimeBridgeMixin:
                     return None, emitted_response
         return close_reason, emitted_response
 
-    async def _consume_minicpmo_tts_segment_control(
+    async def _consume_duplex_segment_control(
         self,
         send_json,
-        control: MiniCPMO45TtsSegmentControl,
+        control: object,
         *,
         session: DuplexSession,
         expected_epoch: int | None,
     ) -> None:
-        output_context = control.output_context
+        output_context = getattr(control, "output_context", None)
+        request_id = getattr(control, "request_id", None)
+        output_id = getattr(control, "output_id", None)
+        identity = getattr(output_context, "identity", None)
+        control_fence = getattr(identity, "fence", None)
+        source_input_seq = getattr(output_context, "source_input_seq", None)
         current_fence = DuplexFence(
             session.session_id,
             incarnation=session.incarnation,
             epoch=session.epoch,
         )
         if (
-            output_context.identity.fence != current_fence
-            or output_context.source_input_seq <= 0
-            or control.request_id != session.active_request_id
+            control_fence != current_fence
+            or type(source_input_seq) is not int
+            or source_input_seq <= 0
+            or request_id != session.active_request_id
         ):
             return
-        if control.output_id is None:
+        if output_id is None:
             if session.active_output_id is not None:
                 return
-        elif session.active_output_id != control.output_id:
+        elif session.active_output_id != output_id:
             return
         await self._maybe_continue_native_response(
             send_json,
             session=session,
             expected_epoch=expected_epoch,
-            source_input_seq=output_context.source_input_seq,
+            source_input_seq=source_input_seq,
         )
 
     async def _drain_native_data_plane_stream(
@@ -852,7 +882,19 @@ class NativeRuntimeBridgeMixin:
         emitted_response = False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return close_reason, emitted_response
-        if isinstance(native_result, (DuplexListen, DuplexSpeakStart, DuplexSpeakChunk, DuplexSpeakEnd)):
+        if isinstance(
+            native_result,
+            (
+                DuplexListen,
+                DuplexSpeakStart,
+                DuplexSpeakChunk,
+                DuplexSpeakEnd,
+                DuplexUserTranscriptDelta,
+                DuplexFunctionCallStart,
+                DuplexFunctionCallDelta,
+                DuplexFunctionCallEnd,
+            ),
+        ):
             return await self._send_typed_duplex_model_event(
                 send_json,
                 native_result,
@@ -1174,6 +1216,59 @@ class NativeRuntimeBridgeMixin:
         if event.fence != current_fence:
             return None, False
 
+        if isinstance(event, DuplexUserTranscriptDelta):
+            await send_json(
+                {
+                    "type": "input.transcript.delta",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "source_input_seq": event.source_input_seq,
+                    "transcript_seq": event.transcript_seq,
+                    "delta": event.text_delta,
+                    "final": event.final,
+                }
+            )
+            return None, True
+
+        if isinstance(event, DuplexFunctionCallStart):
+            await send_json(
+                {
+                    "type": "function_call.start",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "source_input_seq": event.source_input_seq,
+                    "call_id": event.call_id,
+                    "name": event.name,
+                }
+            )
+            return None, True
+
+        if isinstance(event, DuplexFunctionCallDelta):
+            await send_json(
+                {
+                    "type": "function_call.delta",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "call_id": event.call_id,
+                    "function_seq": event.function_seq,
+                    "delta": event.arguments_delta,
+                }
+            )
+            return None, True
+
+        if isinstance(event, DuplexFunctionCallEnd):
+            await send_json(
+                {
+                    "type": "function_call.done",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "call_id": event.call_id,
+                    "function_seq": event.function_seq,
+                    "reason": event.reason,
+                }
+            )
+            return None, True
+
         if isinstance(event, DuplexListen):
             self._runtime_session_state(session).pending_input_continuation = None
             await send_json(
@@ -1195,7 +1290,7 @@ class NativeRuntimeBridgeMixin:
             response_id = session.begin_response(output_id=event.output_id)
             native = self._runtime_session_state(session)
             native.pending_input_continuation = None
-            native.active_output_continuation = ActiveOutputContinuation(
+            native.active_output_continuation = DuplexActiveOutputContinuation(
                 incarnation=event.fence.incarnation,
                 epoch=event.fence.epoch,
                 output_id=event.output_id,

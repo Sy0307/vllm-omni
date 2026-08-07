@@ -9,6 +9,7 @@ from importlib import import_module
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
+    DuplexExecutionProfile,
     DuplexInputMode,
     DuplexOutputAction,
     DuplexOutputDecision,
@@ -19,6 +20,30 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
+
+
+def duplex_execution_profile(extension: object | None) -> DuplexExecutionProfile:
+    if extension is None:
+        return DuplexExecutionProfile()
+    factory = getattr(extension, "execution_profile", None)
+    if not callable(factory):
+        return DuplexExecutionProfile()
+    profile = factory()
+    if not isinstance(profile, DuplexExecutionProfile):
+        raise TypeError("Duplex runtime extension execution_profile() must return DuplexExecutionProfile")
+    return profile
+
+
+def duplex_resource_lease_providers(extension: object | None) -> tuple[object, ...]:
+    if extension is None:
+        return ()
+    factory = getattr(extension, "resource_lease_providers", None)
+    if not callable(factory):
+        return ()
+    providers = factory()
+    if not isinstance(providers, tuple):
+        raise TypeError("Duplex runtime extension resource_lease_providers() must return a tuple")
+    return providers
 
 
 def load_duplex_runtime_extension(path: str | None) -> DuplexRuntimeExtension | None:
@@ -94,6 +119,7 @@ __all__ = [
     "DuplexAppendReservation",
     "DuplexCompletedAppend",
     "DuplexEventProtocolError",
+    "DuplexExecutionProfile",
     "DuplexFenceMismatchError",
     "DuplexInputAppend",
     "DuplexInputMode",
@@ -117,6 +143,8 @@ __all__ = [
     "DuplexSpeakStart",
     "SessionMode",
     "duplex_data_plane_request_info",
+    "duplex_execution_profile",
+    "duplex_resource_lease_providers",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
     "load_duplex_runtime_extension",

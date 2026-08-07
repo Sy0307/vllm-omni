@@ -14,7 +14,16 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexInputAppendCommand,
+    DuplexInputClearCommand,
+    DuplexInputCloseCommand,
+    DuplexInputCommitCommand,
+    DuplexInputCompletionMode,
+    DuplexInputEffect,
+    DuplexInputFlushCommand,
+    DuplexInputSnapshot,
     ServingRuntimeConfigError,
+    ServingRuntimeSessionState,
 )
 from vllm_omni.experimental.fullduplex.personaplex.config import DEFAULT_PERSONA
 from vllm_omni.experimental.fullduplex.personaplex.data_plane import (
@@ -80,20 +89,125 @@ class PersonaPlexServingSessionState:
         self.pending_silence_owner_id = None
 
 
+class PersonaPlexInputController:
+    @staticmethod
+    def create_state() -> PersonaPlexServingSessionState:
+        return PersonaPlexServingSessionState()
+
+    @staticmethod
+    def snapshot(state: object) -> DuplexInputSnapshot:
+        if not isinstance(state, PersonaPlexServingSessionState):
+            raise TypeError("invalid PersonaPlex serving input state")
+        return DuplexInputSnapshot(
+            pending_byte_count=state.audio_buffer.pending_byte_count,
+            has_pending=state.audio_buffer.has_pending(),
+            has_reserved=state.audio_buffer.has_reserved(),
+            input_since_commit=state.input_since_commit,
+            speech_since_commit=state.speech_since_commit,
+            committed_payload=state.committed_audio_payload,
+            committed_operation_id=state.committed_audio_operation_id,
+            committed_reserved_bytes=state.committed_audio_reserved_bytes,
+        )
+
+    @staticmethod
+    def append(
+        state: object,
+        command: DuplexInputAppendCommand,
+    ) -> DuplexInputEffect:
+        if not isinstance(state, PersonaPlexServingSessionState):
+            raise TypeError("invalid PersonaPlex serving input state")
+        if not isinstance(command.payload, dict):
+            raise TypeError("PersonaPlex append payload must be a dictionary")
+        reservation = state.audio_buffer.prepare_append(
+            command.payload,
+            operation_id=command.operation_id,
+            chunk_period_ms=command.chunk_period_ms,
+            allow_emit=command.allow_emit,
+        )
+        if reservation is None:
+            return DuplexInputEffect()
+        payloads = () if reservation.payload is None else (reservation.payload,)
+        return DuplexInputEffect(
+            append_payloads=payloads,
+            reservations=(reservation,),
+        )
+
+    @staticmethod
+    def commit(
+        state: object,
+        command: DuplexInputCommitCommand,
+    ) -> DuplexInputEffect:
+        if not isinstance(state, PersonaPlexServingSessionState):
+            raise TypeError("invalid PersonaPlex serving input state")
+        reservation = state.audio_buffer.prepare_commit(
+            operation_id=command.operation_id,
+            chunk_period_ms=command.chunk_period_ms,
+        )
+        payloads = () if reservation.payload is None else (reservation.payload,)
+        return DuplexInputEffect(
+            append_payloads=payloads,
+            reservations=(reservation,),
+        )
+
+    @staticmethod
+    def clear(
+        state: object,
+        command: DuplexInputClearCommand,
+    ) -> DuplexInputEffect:
+        if not isinstance(state, PersonaPlexServingSessionState):
+            raise TypeError("invalid PersonaPlex serving input state")
+        if command.clear_buffer:
+            state.audio_buffer.clear()
+        if command.clear_force_listen:
+            state.audio_buffer.clear_force_listen()
+        state.input_since_commit = False
+        state.speech_since_commit = False
+        return DuplexInputEffect(released_bytes=state.clear_committed_audio())
+
+    @staticmethod
+    def flush(
+        state: object,
+        command: DuplexInputFlushCommand,
+    ) -> DuplexInputEffect:
+        if not isinstance(state, PersonaPlexServingSessionState):
+            raise TypeError("invalid PersonaPlex serving input state")
+        payload = state.audio_buffer.flush(
+            chunk_period_ms=command.chunk_period_ms,
+        )
+        return DuplexInputEffect(
+            append_payloads=() if payload is None else (payload,),
+        )
+
+    def close(
+        self,
+        state: object,
+        command: DuplexInputCloseCommand,
+    ) -> DuplexInputEffect:
+        del command
+        return self.clear(
+            state,
+            DuplexInputClearCommand(reason="session_close"),
+        )
+
+
 class PersonaPlexServingRuntimeAdapter:
     adapter_id = "personaplex"
+    input_completion_mode = DuplexInputCompletionMode.APPEND_ACCEPTED
     clean_response_done_prefix = ""
     interrupted_tts_prefix = ""
     private_runtime_config_keys = _PRIVATE_RUNTIME_CONFIG_KEYS
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
-        self.session_states: dict[str, PersonaPlexServingSessionState] = {}
+        self.input_controller = PersonaPlexInputController()
+        self.session_states: dict[str, ServingRuntimeSessionState] = {}
         self.data_plane = PersonaPlexDataPlaneSession(encode_audio)
 
-    def create_session_state(self) -> PersonaPlexServingSessionState:
-        return PersonaPlexServingSessionState()
+    def create_session_state(self) -> ServingRuntimeSessionState:
+        return ServingRuntimeSessionState(
+            input_state=self.input_controller.create_state(),
+        )
 
-    def session_state(self, session_id: str) -> PersonaPlexServingSessionState:
+    def session_state(self, session_id: str) -> ServingRuntimeSessionState:
         return self.session_states.setdefault(session_id, self.create_session_state())
 
     def remove_session_state(self, session_id: str) -> None:

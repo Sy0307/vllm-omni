@@ -15,6 +15,31 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingName
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_serve_command_loads_plugins_before_runtime_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setenv("VLLM_DISABLE_LOG_LOGO", "1")
+    monkeypatch.setattr(
+        "vllm_omni.plugins.load_omni_general_plugins",
+        lambda: calls.append("plugins"),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.cli.serve.run_headless",
+        lambda _args: calls.append("runtime"),
+    )
+    args = SimpleNamespace(
+        model_tag="fake-model",
+        model=None,
+        no_guardrails=False,
+        headless=True,
+    )
+
+    OmniServeCommand.cmd(args)
+
+    assert calls == ["plugins", "runtime"]
+
+
 def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     """``--no-async-chunk`` should parse to ``async_chunk=False`` and mark the
     shared deploy-level dest as explicitly provided by the user."""

@@ -702,19 +702,79 @@ append plans.
 
 The following work is deliberately not hidden inside this checkpoint.
 
+### Engine-first second-consumer plan
+
+Nemotron VoiceChat is the second model-native consumer used to separate the
+Full-Duplex architecture from MiniCPM-specific serving policy. The work follows
+an engine-first order, but completion requires both engine and Realtime E2E:
+
+1. Engine E2E proves the long-lived Session contract independently of OpenAI
+   serving. One accepted 80 ms Nemotron frame reserves one `input_seq`, resumes
+   the same Stage-0 request and KV identity, executes one model step, and then
+   waits for the next append. Text EOS ends only the current speaking span.
+2. Realtime E2E proves that WebSocket ingress and output projection select
+   model-owned policy instead of assuming MiniCPM PCM, commit, or silence-
+   continuation state.
+
+This does not introduce a Duplex scheduler. MiniCPM and Nemotron use the same
+append/resume scheduling primitive; their model-owned append plans differ in
+unit size and in how many decode steps one accepted unit permits. SHM rings,
+mandatory VAD, ingress-pattern enums, and changes to ordinary request
+scheduling remain out of scope until measurements demonstrate a missing
+mechanism.
+
+The second consumer adds only four Full-Duplex-local contracts:
+
+- A model-owned `DuplexInputController` converts Realtime input commands into
+  transactional append reservations. A reservation contains the engine mode,
+  immutable payload, operation id, byte count, and commit/rollback callbacks.
+  MiniCPM keeps its existing one-second PCM and continuation policy behind its
+  controller; Nemotron owns 1280-sample frame assembly and pacing behind its
+  controller. The generic runner owns mailbox ordering, fence checks,
+  backpressure accounting, and effect execution, but no model buffer fields.
+- Typed user-transcript and function-call events use their own epoch-scoped
+  sequence ledger. They carry `DuplexFence`, `source_input_seq`, and channel-
+  local sequence/call identity. They never reuse assistant `output_id` and
+  never carry an OpenAI `response_id`; Realtime assigns wire identities while
+  projecting accepted events.
+- `DuplexResourceLeaseProvider.reserve(fence, ...)` returns an opaque handle,
+  and `release(handle, abort=...)` releases it. The control plane reserves all
+  configured providers in declaration order and rolls back successful
+  reservations in reverse order on failure. Close, expiry, and failed open do
+  not release the logical admission slot until provider and Stage cleanup has
+  completed. The provider owns model resources such as perception, RNNT,
+  EarTTS, and codec Session state; the control plane owns only the saga.
+- An optional immutable `DuplexExecutionProfile` declares prewarm batch sizes
+  and a per-step latency budget. Providers may prewarm those sizes once before
+  first admission. Append timing records deadline misses for observability;
+  the budget does not reorder requests, change ordinary scheduler policy, or
+  turn a late but correct model step into a request failure.
+
+Engine acceptance covers append idempotency, monotonic `input_seq`, stable
+request/KV identity, speaking-span EOS without Session teardown, stale-fence
+suppression, reverse resource rollback, and isolated one/two-Session cleanup.
+Realtime acceptance additionally covers arbitrary PCM packetization, typed
+transcript/function projection, cancel without stale audio, and nonempty finite
+22.05 kHz output without obvious silence, clipping, or truncation on H20.
+
 ### Serving composition
 
-The generic runner and runtime bridge now depend on the model-neutral
-`ServingRuntimeAdapter` protocol and no longer import MiniCPM modules. The
-`MiniCPMO45ServingRuntimeAdapter` owns MiniCPM serving state, PCM preparation,
-data-plane projection, client/runtime configuration validation, prefix policy,
-and capability projection. `PipelineConfig.duplex_serving_adapter` explicitly
-selects its import path; `AsyncOmniEngine` and `AsyncOmni` carry that path to the
-API server, which passes it into the generic handler. The handler has no model
-default and fails startup when the duplex endpoint is enabled without an
-adapter. Tests may inject an adapter instance directly. Import-boundary tests
-verify that loading the generic runner, bridge, or handler does not load MiniCPM
-modules.
+The handler selects a nominal `ServingRuntimeAdapter`, but the current session
+state protocol and parts of the runner/bridge still access MiniCPM PCM,
+committed-audio, TTS-side-control, and silence-continuation details directly.
+The `MiniCPMO45ServingRuntimeAdapter` owns the implementations, yet a second
+model would still have to imitate that state shape. This is therefore an
+incubating boundary, not a completed model-neutral composition layer.
+
+The Engine-first work leaves those paths unchanged. The Realtime milestone
+moves input reservation and response-boundary behavior behind the model-owned
+`DuplexInputController`, removes MiniCPM imports from generic runtime modules,
+and adds a Nemotron controller as the proof consumer.
+`PipelineConfig.duplex_serving_adapter` continues to select the adapter import
+path; Realtime client payloads cannot select or override it. The handler has no
+model default and fails startup when a duplex endpoint is enabled without an
+adapter. Import-boundary tests must verify that loading the generic runner,
+bridge, or handler does not import either MiniCPM or Nemotron modules.
 
 Behavior is still assembled through `DuplexSessionRunnerMixin`,
 `NativeRuntimeBridgeMixin`, and `ChatFallbackProjectorMixin`, so explicit

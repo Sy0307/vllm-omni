@@ -4,50 +4,15 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.minicpmo45.input import (
     MiniCPMO45PcmAppendBuffer,
 )
-
-
-def _validate_identity_int(name: str, value: object) -> None:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be a plain non-negative integer")
-
-
-@dataclass(frozen=True, slots=True)
-class PendingInputContinuation:
-    incarnation: int
-    epoch: int
-    source_input_seq: int
-
-    def __post_init__(self) -> None:
-        _validate_identity_int("incarnation", self.incarnation)
-        _validate_identity_int("epoch", self.epoch)
-        _validate_identity_int("source_input_seq", self.source_input_seq)
-
-    def is_stale(self, *, fence: DuplexFence, source_input_seq: int) -> bool:
-        return (
-            fence.incarnation != self.incarnation
-            or fence.epoch != self.epoch
-            or source_input_seq != self.source_input_seq
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ActiveOutputContinuation:
-    incarnation: int
-    epoch: int
-    output_id: str
-
-    def __post_init__(self) -> None:
-        _validate_identity_int("incarnation", self.incarnation)
-        _validate_identity_int("epoch", self.epoch)
-        if not isinstance(self.output_id, str) or not self.output_id.strip():
-            raise ValueError("output_id must be a non-empty string")
-
-    def is_stale(self, *, fence: DuplexFence, output_id: str) -> bool:
-        return fence.incarnation != self.incarnation or fence.epoch != self.epoch or output_id != self.output_id
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexActiveOutputContinuation as ActiveOutputContinuation,
+)
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexPendingInputContinuation as PendingInputContinuation,
+)
 
 
 @dataclass(slots=True)

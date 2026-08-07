@@ -323,6 +323,8 @@ def test_runtime_extension_builds_one_frame_scheduler_append() -> None:
     assert duplex["epoch"] == 3
     assert duplex["seq"] == 1
     assert duplex["data_plane"] is True
+    assert "turn_id" not in duplex
+    assert "response_seq" not in duplex
 
 
 def test_projector_emits_only_cumulative_audio_and_text_suffixes() -> None:

@@ -96,8 +96,6 @@ class PersonaPlexDuplexRuntimeExtension:
                         "session_id": fence.session_id,
                         "incarnation": fence.incarnation,
                         "epoch": fence.epoch,
-                        "turn_id": fence.turn_id,
-                        "response_seq": fence.response_seq,
                         "seq": seq,
                         "turn_seq": turn_seq,
                         "mode": mode.value,

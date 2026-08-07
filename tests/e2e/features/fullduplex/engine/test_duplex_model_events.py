@@ -5,17 +5,36 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from vllm_omni.experimental.fullduplex.engine.contracts import (
+    DuplexExecutionProfile,
+)
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.engine.model_events import (
     DuplexEventProtocolError,
+    DuplexFunctionCallDelta,
+    DuplexFunctionCallEnd,
+    DuplexFunctionCallStart,
     DuplexListen,
     DuplexOutputLedger,
+    DuplexSideChannelLedger,
     DuplexSpeakChunk,
     DuplexSpeakEnd,
     DuplexSpeakStart,
+    DuplexUserTranscriptDelta,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_engine_package_exports_full_duplex_extension_contracts() -> None:
+    from vllm_omni.experimental.fullduplex import engine
+
+    assert engine.DuplexExecutionProfile is DuplexExecutionProfile
+    assert engine.DuplexFunctionCallDelta is DuplexFunctionCallDelta
+    assert engine.DuplexFunctionCallEnd is DuplexFunctionCallEnd
+    assert engine.DuplexFunctionCallStart is DuplexFunctionCallStart
+    assert engine.DuplexSideChannelLedger is DuplexSideChannelLedger
+    assert engine.DuplexUserTranscriptDelta is DuplexUserTranscriptDelta
 
 
 def test_model_events_are_immutable_and_accept_valid_fields() -> None:
@@ -259,3 +278,162 @@ def test_event_from_another_session_or_incarnation_is_rejected() -> None:
         ledger.accept(DuplexListen(fence=DuplexFence("other", incarnation=1), source_input_seq=0))
     with pytest.raises(DuplexEventProtocolError, match="fence"):
         ledger.accept(DuplexListen(fence=DuplexFence("session", incarnation=2), source_input_seq=0))
+
+
+def test_side_channel_events_are_immutable_and_independent_from_output_ids() -> None:
+    fence = DuplexFence("session", incarnation=2, epoch=3)
+    transcript = DuplexUserTranscriptDelta(
+        fence=fence,
+        source_input_seq=7,
+        transcript_seq=0,
+        text_delta="hello",
+    )
+    start = DuplexFunctionCallStart(
+        fence=fence,
+        source_input_seq=7,
+        call_id="call-1",
+        name="get_weather",
+    )
+    delta = DuplexFunctionCallDelta(
+        fence=fence,
+        call_id="call-1",
+        function_seq=0,
+        arguments_delta='{"city":"Paris"}',
+    )
+    end = DuplexFunctionCallEnd(
+        fence=fence,
+        call_id="call-1",
+        function_seq=1,
+    )
+
+    assert transcript.transcript_seq == 0
+    assert start.call_id == delta.call_id == end.call_id
+    assert not hasattr(transcript, "output_id")
+    assert not hasattr(start, "response_id")
+    with pytest.raises(FrozenInstanceError):
+        delta.function_seq = 1  # type: ignore[misc]
+
+
+def test_side_channel_ledger_orders_transcript_and_function_independently() -> None:
+    fence = DuplexFence("session")
+    ledger = DuplexSideChannelLedger(fence)
+    transcript = DuplexUserTranscriptDelta(
+        fence=fence,
+        source_input_seq=3,
+        transcript_seq=0,
+        text_delta="hello",
+    )
+    start = DuplexFunctionCallStart(
+        fence=fence,
+        source_input_seq=3,
+        call_id="call-1",
+        name="get_weather",
+    )
+    delta = DuplexFunctionCallDelta(
+        fence=fence,
+        call_id="call-1",
+        function_seq=0,
+        arguments_delta='{"city":',
+    )
+    final_transcript = DuplexUserTranscriptDelta(
+        fence=fence,
+        source_input_seq=4,
+        transcript_seq=1,
+        text_delta=" world",
+        final=True,
+    )
+    end = DuplexFunctionCallEnd(
+        fence=fence,
+        call_id="call-1",
+        function_seq=1,
+    )
+
+    assert ledger.accept(transcript) is True
+    assert ledger.accept(start) is True
+    assert ledger.accept(delta) is True
+    assert ledger.accept(final_transcript) is True
+    assert ledger.accept(end) is True
+    assert ledger.accept(transcript) is False
+    assert ledger.accept(delta) is False
+    assert ledger.accept(end) is False
+
+
+def test_side_channel_ledger_rejects_gaps_unknown_calls_and_parallel_calls() -> None:
+    fence = DuplexFence("session")
+    ledger = DuplexSideChannelLedger(fence)
+
+    with pytest.raises(DuplexEventProtocolError, match="transcript sequence gap"):
+        ledger.accept(
+            DuplexUserTranscriptDelta(
+                fence=fence,
+                source_input_seq=1,
+                transcript_seq=1,
+                text_delta="future",
+            )
+        )
+    with pytest.raises(DuplexEventProtocolError, match="unknown function call"):
+        ledger.accept(
+            DuplexFunctionCallDelta(
+                fence=fence,
+                call_id="missing",
+                function_seq=0,
+                arguments_delta="{}",
+            )
+        )
+
+    ledger.accept(
+        DuplexFunctionCallStart(
+            fence=fence,
+            source_input_seq=1,
+            call_id="first",
+            name="one",
+        )
+    )
+    with pytest.raises(DuplexEventProtocolError, match="already active"):
+        ledger.accept(
+            DuplexFunctionCallStart(
+                fence=fence,
+                source_input_seq=2,
+                call_id="second",
+                name="two",
+            )
+        )
+    with pytest.raises(DuplexEventProtocolError, match="function sequence gap"):
+        ledger.accept(
+            DuplexFunctionCallDelta(
+                fence=fence,
+                call_id="first",
+                function_seq=2,
+                arguments_delta="future",
+            )
+        )
+
+
+def test_side_channel_ledger_filters_old_epoch_and_resets_future_epoch() -> None:
+    current = DuplexFence("session", incarnation=4, epoch=2)
+    ledger = DuplexSideChannelLedger(current)
+
+    assert (
+        ledger.accept(
+            DuplexUserTranscriptDelta(
+                fence=DuplexFence("session", incarnation=4, epoch=1),
+                source_input_seq=1,
+                transcript_seq=0,
+                text_delta="old",
+            )
+        )
+        is False
+    )
+    future = DuplexFence("session", incarnation=4, epoch=3)
+    assert (
+        ledger.accept(
+            DuplexUserTranscriptDelta(
+                fence=future,
+                source_input_seq=0,
+                transcript_seq=0,
+                text_delta="new",
+            )
+        )
+        is True
+    )
+    assert ledger.fence == future

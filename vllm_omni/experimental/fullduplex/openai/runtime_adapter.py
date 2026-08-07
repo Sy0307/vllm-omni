@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
+from dataclasses import dataclass
+from enum import Enum
 from importlib import import_module
 from typing import Any, Protocol
 
@@ -17,9 +19,145 @@ class ServingRuntimeConfigError(ValueError):
         self.code = code
 
 
-class PcmAppendReservation(Protocol):
+class DuplexInputCompletionMode(str, Enum):
+    """Point at which one model-owned input append is acknowledged."""
+
+    APPEND_ACCEPTED = "append_accepted"
+    OUTPUT_PROJECTED = "output_projected"
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputAppendCommand:
+    payload: object
     operation_id: str
-    payload: dict[str, object] | None
+    chunk_period_ms: int
+    allow_emit: bool
+    fence: DuplexFence | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, str) or not self.operation_id:
+            raise ValueError("operation_id must be a non-empty string")
+        if type(self.chunk_period_ms) is not int or self.chunk_period_ms <= 0:
+            raise ValueError("chunk_period_ms must be a positive integer")
+        if not isinstance(self.allow_emit, bool):
+            raise TypeError("allow_emit must be a boolean")
+        if self.fence is not None and not isinstance(self.fence, DuplexFence):
+            raise TypeError("fence must be a DuplexFence or null")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputCommitCommand:
+    operation_id: str
+    chunk_period_ms: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, str) or not self.operation_id:
+            raise ValueError("operation_id must be a non-empty string")
+        if type(self.chunk_period_ms) is not int or self.chunk_period_ms <= 0:
+            raise ValueError("chunk_period_ms must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputClearCommand:
+    reason: str
+    clear_force_listen: bool = True
+    clear_buffer: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("reason must be a non-empty string")
+        if not isinstance(self.clear_force_listen, bool):
+            raise TypeError("clear_force_listen must be a boolean")
+        if not isinstance(self.clear_buffer, bool):
+            raise TypeError("clear_buffer must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputCloseCommand:
+    abort: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.abort, bool):
+            raise TypeError("abort must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputFlushCommand:
+    chunk_period_ms: int
+
+    def __post_init__(self) -> None:
+        if type(self.chunk_period_ms) is not int or self.chunk_period_ms <= 0:
+            raise ValueError("chunk_period_ms must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputSnapshot:
+    pending_byte_count: int = 0
+    has_pending: bool = False
+    has_reserved: bool = False
+    input_since_commit: bool = False
+    speech_since_commit: bool = False
+    committed_payload: object | None = None
+    committed_operation_id: str | None = None
+    committed_reserved_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexInputEffect:
+    append_payloads: tuple[object, ...] = ()
+    reservations: tuple[DuplexInputReservation, ...] = ()
+    released_bytes: int = 0
+
+
+def ordered_input_emissions(
+    effect: DuplexInputEffect,
+) -> tuple[tuple[object, DuplexInputReservation], ...]:
+    """Pair model work with its rollback token without imposing packet size."""
+    if len(effect.append_payloads) != len(effect.reservations):
+        raise RuntimeError("Duplex input controller must return one reservation per ordered append payload")
+    return tuple(zip(effect.append_payloads, effect.reservations, strict=True))
+
+
+class DuplexInputController(Protocol):
+    """Model-owned packetization and input-state lifecycle."""
+
+    def create_state(self) -> object: ...
+
+    def snapshot(self, state: object) -> DuplexInputSnapshot: ...
+
+    def append(
+        self,
+        state: object,
+        command: DuplexInputAppendCommand,
+    ) -> DuplexInputEffect: ...
+
+    def commit(
+        self,
+        state: object,
+        command: DuplexInputCommitCommand,
+    ) -> DuplexInputEffect: ...
+
+    def clear(
+        self,
+        state: object,
+        command: DuplexInputClearCommand,
+    ) -> DuplexInputEffect: ...
+
+    def flush(
+        self,
+        state: object,
+        command: DuplexInputFlushCommand,
+    ) -> DuplexInputEffect: ...
+
+    def close(
+        self,
+        state: object,
+        command: DuplexInputCloseCommand,
+    ) -> DuplexInputEffect: ...
+
+
+class DuplexInputReservation(Protocol):
+    operation_id: str
 
     @property
     def active(self) -> bool: ...
@@ -32,53 +170,73 @@ class PcmAppendReservation(Protocol):
     def rollback(self) -> None: ...
 
 
-class PcmAppendBuffer(Protocol):
-    @property
-    def pending_byte_count(self) -> int: ...
-
-    def clear(self) -> None: ...
-
-    def clear_force_listen(self) -> None: ...
-
-    def has_pending(self) -> bool: ...
-
-    def has_reserved(self) -> bool: ...
-
-    def prepare_append(
-        self,
-        payload: dict[str, object],
-        *,
-        operation_id: str,
-        chunk_period_ms: int,
-        allow_emit: bool,
-    ) -> PcmAppendReservation | None: ...
-
-    def prepare_commit(
-        self,
-        *,
-        operation_id: str,
-        chunk_period_ms: int,
-    ) -> PcmAppendReservation: ...
-
-    def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None: ...
+def _validate_identity_int(name: str, value: object) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a plain non-negative integer")
 
 
-class ServingRuntimeSessionState(Protocol):
-    audio_buffer: PcmAppendBuffer
-    input_since_commit: bool
-    speech_since_commit: bool
-    committed_audio_payload: dict[str, object] | None
-    committed_audio_operation_id: str | None
-    committed_audio_reserved_bytes: int
-    deferred_response_create: bool
-    deferred_precreate_response: bool
-    data_plane_task: asyncio.Task[None] | None
-    data_plane_restart_requested: bool
-    pending_input_continuation: object | None
-    active_output_continuation: object | None
-    continuation_units: int
-    pending_silence_task: asyncio.Task[bool] | None
-    silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None
+@dataclass(frozen=True, slots=True)
+class DuplexPendingInputContinuation:
+    incarnation: int
+    epoch: int
+    source_input_seq: int
+
+    def __post_init__(self) -> None:
+        _validate_identity_int("incarnation", self.incarnation)
+        _validate_identity_int("epoch", self.epoch)
+        _validate_identity_int("source_input_seq", self.source_input_seq)
+
+    def is_stale(self, *, fence: DuplexFence, source_input_seq: int) -> bool:
+        return (
+            fence.incarnation != self.incarnation
+            or fence.epoch != self.epoch
+            or source_input_seq != self.source_input_seq
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexActiveOutputContinuation:
+    incarnation: int
+    epoch: int
+    output_id: str
+
+    def __post_init__(self) -> None:
+        _validate_identity_int("incarnation", self.incarnation)
+        _validate_identity_int("epoch", self.epoch)
+        if not isinstance(self.output_id, str) or not self.output_id.strip():
+            raise ValueError("output_id must be a non-empty string")
+
+    def is_stale(self, *, fence: DuplexFence, output_id: str) -> bool:
+        return fence.incarnation != self.incarnation or fence.epoch != self.epoch or output_id != self.output_id
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexRuntimeProjectionBatch:
+    events: tuple[DuplexModelEvent, ...] = ()
+    controls: tuple[object, ...] = ()
+
+
+@dataclass(slots=True)
+class ServingRuntimeSessionState:
+    """Framework lifecycle state plus an opaque model-owned input state."""
+
+    input_state: object
+    input_since_commit: bool = False
+    speech_since_commit: bool = False
+    committed_audio_payload: dict[str, object] | None = None
+    committed_audio_operation_id: str | None = None
+    committed_audio_reserved_bytes: int = 0
+    deferred_response_create: bool = False
+    deferred_precreate_response: bool = False
+    data_plane_task: asyncio.Task[None] | None = None
+    data_plane_restart_requested: bool = False
+    pending_input_continuation: object | None = None
+    active_output_continuation: object | None = None
+    continuation_owner_id: str | None = None
+    continuation_units: int = 0
+    pending_silence_task: asyncio.Task[bool] | None = None
+    pending_silence_owner_id: str | None = None
+    silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
 
     def retain_committed_audio(
         self,
@@ -86,11 +244,27 @@ class ServingRuntimeSessionState(Protocol):
         *,
         operation_id: str | None,
         reserved_bytes: int = 0,
-    ) -> None: ...
+    ) -> None:
+        self.committed_audio_payload = payload
+        self.committed_audio_operation_id = operation_id
+        self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
 
-    def clear_committed_audio(self) -> int: ...
+    def clear_committed_audio(self) -> int:
+        reserved_bytes = self.committed_audio_reserved_bytes
+        self.committed_audio_payload = None
+        self.committed_audio_operation_id = None
+        self.committed_audio_reserved_bytes = 0
+        self.deferred_response_create = False
+        self.deferred_precreate_response = False
+        return reserved_bytes
 
-    def clear_continuation(self) -> None: ...
+    def clear_continuation(self) -> None:
+        self.pending_input_continuation = None
+        self.active_output_continuation = None
+        self.continuation_owner_id = None
+        self.continuation_units = 0
+        self.pending_silence_task = None
+        self.pending_silence_owner_id = None
 
 
 class RuntimeDataPlane(Protocol):
@@ -109,7 +283,9 @@ class RuntimeDataPlane(Protocol):
 
 class ServingRuntimeAdapter(Protocol):
     adapter_id: str
-    session_states: MutableMapping[str, ServingRuntimeSessionState]
+    input_completion_mode: DuplexInputCompletionMode
+    session_states: MutableMapping[str, object]
+    input_controller: DuplexInputController
     data_plane: RuntimeDataPlane
     clean_response_done_prefix: str
     interrupted_tts_prefix: str
@@ -175,8 +351,33 @@ def validate_serving_runtime_adapter(adapter: object) -> ServingRuntimeAdapter:
         raise TypeError(f"Duplex serving runtime adapter is missing callable method(s): {', '.join(missing)}")
     if not isinstance(getattr(adapter, "adapter_id", None), str) or not adapter.adapter_id:
         raise TypeError("Duplex serving runtime adapter must declare adapter_id")
+    completion_mode = getattr(
+        adapter,
+        "input_completion_mode",
+        DuplexInputCompletionMode.APPEND_ACCEPTED,
+    )
+    if not isinstance(completion_mode, DuplexInputCompletionMode):
+        raise TypeError("Duplex serving runtime adapter input_completion_mode must be a DuplexInputCompletionMode")
     if not isinstance(getattr(adapter, "session_states", None), MutableMapping):
         raise TypeError("Duplex serving runtime adapter must declare mutable session_states")
+    input_controller = getattr(adapter, "input_controller", None)
+    input_controller_methods = (
+        "create_state",
+        "snapshot",
+        "append",
+        "commit",
+        "clear",
+        "flush",
+        "close",
+    )
+    missing_input_controller_methods = [
+        name for name in input_controller_methods if not callable(getattr(input_controller, name, None))
+    ]
+    if missing_input_controller_methods:
+        raise TypeError(
+            "Duplex serving runtime adapter input_controller is missing "
+            "callable method(s): " + ", ".join(missing_input_controller_methods)
+        )
     for prefix_name in ("clean_response_done_prefix", "interrupted_tts_prefix"):
         if not isinstance(getattr(adapter, prefix_name, None), str):
             raise TypeError(f"Duplex serving runtime adapter must declare {prefix_name}")

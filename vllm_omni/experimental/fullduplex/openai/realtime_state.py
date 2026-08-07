@@ -89,6 +89,31 @@ class _RealtimeResponseState:
 
 
 @dataclass(slots=True)
+class _RealtimeInputTranscriptionState:
+    item_id: str
+    transcript_parts: list[str] = field(default_factory=list)
+    completed: bool = False
+
+    @property
+    def transcript(self) -> str:
+        return "".join(self.transcript_parts)
+
+
+@dataclass(slots=True)
+class _RealtimeFunctionCallState:
+    response_id: str
+    item_id: str
+    call_id: str
+    name: str
+    argument_parts: list[str] = field(default_factory=list)
+    completed: bool = False
+
+    @property
+    def arguments(self) -> str:
+        return "".join(self.argument_parts)
+
+
+@dataclass(slots=True)
 class RealtimeSessionState:
     """Single mutable authority for one Realtime protocol session."""
 
@@ -120,6 +145,10 @@ class RealtimeSessionState:
     _input_audio_buffer_has_audio: bool = False
     _input_audio_buffer_had_non_speech: bool = False
     _input_audio_buffer_transcript_parts: list[str] = field(default_factory=list)
+    _model_input_transcriptions: dict[tuple[str, int, int], _RealtimeInputTranscriptionState] = field(
+        default_factory=dict
+    )
+    _model_function_calls: dict[tuple[str, int, str], _RealtimeFunctionCallState] = field(default_factory=dict)
 
     @classmethod
     def from_query_params(cls, query_params: Any) -> RealtimeSessionState:
@@ -195,3 +224,5 @@ class RealtimeStateOwner:
     _input_audio_buffer_has_audio: bool = _RealtimeStateField()
     _input_audio_buffer_had_non_speech: bool = _RealtimeStateField()
     _input_audio_buffer_transcript_parts: list[str] = _RealtimeStateField()
+    _model_input_transcriptions: dict[tuple[str, int, int], _RealtimeInputTranscriptionState] = _RealtimeStateField()
+    _model_function_calls: dict[tuple[str, int, str], _RealtimeFunctionCallState] = _RealtimeStateField()

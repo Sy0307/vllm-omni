@@ -101,7 +101,78 @@ class DuplexSpeakEnd:
         _validate_non_empty_string("reason", self.reason)
 
 
-DuplexModelEvent: TypeAlias = DuplexListen | DuplexSpeakStart | DuplexSpeakChunk | DuplexSpeakEnd
+@dataclass(frozen=True, slots=True)
+class DuplexUserTranscriptDelta:
+    fence: DuplexFence
+    source_input_seq: int
+    transcript_seq: int
+    text_delta: str
+    final: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_fence(self.fence)
+        _validate_non_negative_int("source_input_seq", self.source_input_seq)
+        _validate_non_negative_int("transcript_seq", self.transcript_seq)
+        if not isinstance(self.text_delta, str):
+            raise TypeError("text_delta must be a string")
+        if not self.text_delta and not self.final:
+            raise ValueError("transcript delta must contain text unless it is final")
+        if not isinstance(self.final, bool):
+            raise TypeError("final must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexFunctionCallStart:
+    fence: DuplexFence
+    source_input_seq: int
+    call_id: str
+    name: str
+
+    def __post_init__(self) -> None:
+        _validate_fence(self.fence)
+        _validate_non_negative_int("source_input_seq", self.source_input_seq)
+        _validate_non_empty_string("call_id", self.call_id)
+        _validate_non_empty_string("name", self.name)
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexFunctionCallDelta:
+    fence: DuplexFence
+    call_id: str
+    function_seq: int
+    arguments_delta: str
+
+    def __post_init__(self) -> None:
+        _validate_fence(self.fence)
+        _validate_non_empty_string("call_id", self.call_id)
+        _validate_non_negative_int("function_seq", self.function_seq)
+        _validate_non_empty_string("arguments_delta", self.arguments_delta)
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexFunctionCallEnd:
+    fence: DuplexFence
+    call_id: str
+    function_seq: int
+    reason: str = "completed"
+
+    def __post_init__(self) -> None:
+        _validate_fence(self.fence)
+        _validate_non_empty_string("call_id", self.call_id)
+        _validate_non_negative_int("function_seq", self.function_seq)
+        _validate_non_empty_string("reason", self.reason)
+
+
+DuplexModelEvent: TypeAlias = (
+    DuplexListen
+    | DuplexSpeakStart
+    | DuplexSpeakChunk
+    | DuplexSpeakEnd
+    | DuplexUserTranscriptDelta
+    | DuplexFunctionCallStart
+    | DuplexFunctionCallDelta
+    | DuplexFunctionCallEnd
+)
 
 
 class DuplexEventProtocolError(RuntimeError):
@@ -303,12 +374,125 @@ class DuplexOutputLedger:
         return event
 
 
+class DuplexSideChannelLedger:
+    """Validate transcript and function channels independently of speech."""
+
+    def __init__(self, fence: DuplexFence, *, completed_call_limit: int = 256) -> None:
+        _validate_fence(fence)
+        if type(completed_call_limit) is not int or completed_call_limit <= 0:
+            raise ValueError("completed_call_limit must be a positive integer")
+        self._fence = fence
+        self._completed_call_limit = completed_call_limit
+        self._next_transcript_seq = 0
+        self._active_call_id: str | None = None
+        self._next_function_seq = 0
+        self._completed_calls: OrderedDict[str, int] = OrderedDict()
+
+    @property
+    def fence(self) -> DuplexFence:
+        return self._fence
+
+    def advance_epoch(self, fence: DuplexFence) -> None:
+        _validate_fence(fence)
+        if fence.session_id != self._fence.session_id or fence.incarnation != self._fence.incarnation:
+            raise DuplexEventProtocolError(f"duplex event fence does not belong to this ledger: {fence!r}")
+        if fence.epoch < self._fence.epoch:
+            raise DuplexEventProtocolError(
+                f"duplex event fence moved backwards: current={self._fence!r}, next={fence!r}"
+            )
+        if fence.epoch == self._fence.epoch:
+            self._fence = fence
+            return
+        self._fence = fence
+        self._next_transcript_seq = 0
+        self._active_call_id = None
+        self._next_function_seq = 0
+        self._completed_calls.clear()
+
+    def _accept_fence(self, fence: DuplexFence) -> bool:
+        if fence.session_id != self._fence.session_id or fence.incarnation != self._fence.incarnation:
+            raise DuplexEventProtocolError(f"duplex event fence does not belong to this ledger: {fence!r}")
+        if fence.epoch < self._fence.epoch:
+            return False
+        if fence.epoch > self._fence.epoch:
+            self.advance_epoch(fence)
+        return True
+
+    def accept(
+        self,
+        event: (DuplexUserTranscriptDelta | DuplexFunctionCallStart | DuplexFunctionCallDelta | DuplexFunctionCallEnd),
+    ) -> bool:
+        if not isinstance(
+            event,
+            (
+                DuplexUserTranscriptDelta,
+                DuplexFunctionCallStart,
+                DuplexFunctionCallDelta,
+                DuplexFunctionCallEnd,
+            ),
+        ):
+            raise TypeError(f"unsupported duplex side-channel event: {type(event).__name__}")
+        if not self._accept_fence(event.fence):
+            return False
+
+        if isinstance(event, DuplexUserTranscriptDelta):
+            if event.transcript_seq < self._next_transcript_seq:
+                return False
+            if event.transcript_seq > self._next_transcript_seq:
+                raise DuplexEventProtocolError(
+                    "duplex transcript sequence gap: "
+                    f"expected={self._next_transcript_seq}, actual={event.transcript_seq}"
+                )
+            self._next_transcript_seq += 1
+            return True
+
+        if isinstance(event, DuplexFunctionCallStart):
+            if event.call_id == self._active_call_id or event.call_id in self._completed_calls:
+                return False
+            if self._active_call_id is not None:
+                raise DuplexEventProtocolError(f"duplex function call {self._active_call_id!r} is already active")
+            self._active_call_id = event.call_id
+            self._next_function_seq = 0
+            return True
+
+        completed_next_seq = self._completed_calls.get(event.call_id)
+        if completed_next_seq is not None:
+            if event.function_seq < completed_next_seq or isinstance(event, DuplexFunctionCallEnd):
+                return False
+            raise DuplexEventProtocolError(f"duplex function event arrived after end: call_id={event.call_id!r}")
+        if self._active_call_id is None or event.call_id != self._active_call_id:
+            raise DuplexEventProtocolError(f"duplex event references unknown function call: call_id={event.call_id!r}")
+        if event.function_seq < self._next_function_seq:
+            return False
+        if event.function_seq > self._next_function_seq:
+            raise DuplexEventProtocolError(
+                f"duplex function sequence gap: expected={self._next_function_seq}, actual={event.function_seq}"
+            )
+
+        self._next_function_seq += 1
+        if isinstance(event, DuplexFunctionCallDelta):
+            return True
+
+        self._completed_calls[event.call_id] = self._next_function_seq
+        self._completed_calls.move_to_end(event.call_id)
+        while len(self._completed_calls) > self._completed_call_limit:
+            self._completed_calls.popitem(last=False)
+        self._active_call_id = None
+        self._next_function_seq = 0
+        return True
+
+
 __all__ = [
     "DuplexEventProtocolError",
+    "DuplexFunctionCallDelta",
+    "DuplexFunctionCallEnd",
+    "DuplexFunctionCallStart",
     "DuplexListen",
     "DuplexModelEvent",
     "DuplexOutputLedger",
+    "DuplexSideChannelLedger",
     "DuplexSpeakChunk",
     "DuplexSpeakEnd",
     "DuplexSpeakStart",
+    "DuplexUserTranscriptDelta",
 ]

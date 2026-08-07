@@ -16,6 +16,7 @@ own stage pools, request queues, or OpenAI Realtime protocol state.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -37,6 +38,10 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
     SessionMode,
     duplex_resource_request_id,
 )
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+    duplex_execution_profile,
+    duplex_resource_lease_providers,
+)
 from vllm_omni.experimental.fullduplex.engine.duplex_session import (
     DuplexAppendReservation,
     DuplexFenceMismatchError,
@@ -44,6 +49,7 @@ from vllm_omni.experimental.fullduplex.engine.duplex_session import (
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
 )
+from vllm_omni.experimental.fullduplex.engine.execution import DuplexStepLatencyMetrics
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.experimental.fullduplex.engine.messages import (
     AppendDuplexInputMessage,
@@ -57,6 +63,9 @@ from vllm_omni.experimental.fullduplex.engine.messages import (
     SignalDuplexTurnMessage,
     TouchDuplexSessionMessage,
 )
+from vllm_omni.experimental.fullduplex.engine.resource_lease import (
+    DuplexResourceLeaseCoordinator,
+)
 
 logger = init_logger(__name__)
 
@@ -68,6 +77,7 @@ class _PendingControlCleanup:
     fence: DuplexFence
     submitted_request_ids: tuple[str, ...]
     reserved_request_ids: tuple[str, ...] = ()
+    next_fence: DuplexFence | None = None
 
 
 @dataclass(frozen=True)
@@ -120,8 +130,14 @@ class DuplexControlPlane:
         self._result_sink = result_sink
         self._lifecycle_sink = lifecycle_sink
         self._lease_config = lease_config or DuplexLeaseConfig()
+        self._clock = clock or time.monotonic
+        self._execution_profile = duplex_execution_profile(extension)
+        self._execution_metrics = DuplexStepLatencyMetrics()
+        self._resource_leases = DuplexResourceLeaseCoordinator(
+            duplex_resource_lease_providers(extension),  # type: ignore[arg-type]
+        )
         self._sessions = DuplexSessionRuntimeManager(
-            clock=clock,
+            clock=self._clock,
             max_sessions=max_sessions,
             completed_append_limit=completed_append_limit,
         )
@@ -146,6 +162,10 @@ class DuplexControlPlane:
     @property
     def pending_submission_cleanup_count(self) -> int:
         return len(self._pending_submission_cleanups)
+
+    @property
+    def execution_metrics(self) -> DuplexStepLatencyMetrics:
+        return self._execution_metrics
 
     def accepts(self, message: object) -> bool:
         return isinstance(message, self._MESSAGE_TYPES)
@@ -286,6 +306,12 @@ class DuplexControlPlane:
                 runtime_config=message.runtime_config,
                 lease_config=self._lease_config,
             )
+            await self._resource_leases.prewarm(self._execution_profile.prewarm_batch_sizes)
+            await self._resource_leases.reserve(
+                message.fence,
+                session_config=message.session_config,
+                runtime_config=message.runtime_config,
+            )
             request_context = self.ensure_stage_request(session, stage_id=0) if self._extension is not None else None
             await self.put_result(
                 message.control_id,
@@ -343,6 +369,7 @@ class DuplexControlPlane:
 
     async def handle_append(self, message: AppendDuplexInputMessage) -> None:
         session: DuplexSessionRuntimeState | None = None
+        step_started_at = self._clock()
         lease_operation_id = f"append:{message.control_id}"
         operation_started = False
         try:
@@ -377,6 +404,20 @@ class DuplexControlPlane:
                 reservation=reservation,
                 mode=mode,
             )
+            if self._extension is not None:
+                latency_ms = max(0.0, (self._clock() - step_started_at) * 1000.0)
+                deadline_missed = self._execution_metrics.record(
+                    latency_ms,
+                    budget_ms=self._execution_profile.step_latency_budget_ms,
+                )
+                if deadline_missed:
+                    logger.warning(
+                        "duplex step latency budget missed: session_id=%s input_seq=%d latency_ms=%.3f budget_ms=%.3f",
+                        message.session_id,
+                        reservation.update.input_seq,
+                        latency_ms,
+                        self._execution_profile.step_latency_budget_ms,
+                    )
             if message.operation_id is not None:
                 session.record_completed_append(
                     message.operation_id,
@@ -527,6 +568,7 @@ class DuplexControlPlane:
                         session_id=message.session_id,
                         fence=message.fence,
                         submitted_request_ids=tuple(stale_request_ids),
+                        next_fence=effective_next_fence,
                     )
                     self._pending_control_cleanups[cleanup_key] = pending
                 await self._complete_control_cleanup(cleanup_key, pending)
@@ -743,6 +785,7 @@ class DuplexControlPlane:
                     await self._stage_port.cleanup(list(item.submitted_request_ids), abort=True)
                 if item.reserved_request_ids:
                     await self._stage_port.cleanup(list(item.reserved_request_ids))
+                await self._resource_leases.release(item.fence, abort=True)
                 if self._lifecycle_sink is not None:
                     await self._lifecycle_sink.put(
                         DuplexSessionLifecycleMessage(
@@ -827,7 +870,9 @@ class DuplexControlPlane:
         key: tuple[str, int, int],
         pending: _PendingRequestCleanup,
     ) -> None:
-        await self._stage_port.cleanup(list(pending.request_ids), abort=pending.abort)
+        if pending.request_ids:
+            await self._stage_port.cleanup(list(pending.request_ids), abort=pending.abort)
+        await self._resource_leases.release(pending.fence, abort=pending.abort)
         session = self.sessions.get(pending.session_id)
         if (
             session is not None
@@ -875,6 +920,21 @@ class DuplexControlPlane:
             await self._stage_port.cleanup(list(pending.submitted_request_ids), abort=True)
         if pending.reserved_request_ids:
             await self._stage_port.cleanup(list(pending.reserved_request_ids))
+        # A cancel advances only the Session epoch. Model-owned resources are
+        # scoped to (session_id, incarnation), but state coupled to a replaced
+        # Stage request must atomically advance to the new epoch.
+        if pending.kind == "cancel":
+            if pending.next_fence is None:
+                raise RuntimeError("duplex cancel cleanup omitted next_fence")
+            await self._resource_leases.advance_epoch(
+                pending.fence,
+                pending.next_fence,
+            )
+        else:
+            await self._resource_leases.release(
+                pending.fence,
+                abort=pending.kind != "close",
+            )
         session = self.sessions.get(pending.session_id)
         if session is not None:
             if pending.kind == "cancel":
@@ -1041,9 +1101,21 @@ class DuplexControlPlane:
         for key in list(self._pending_request_cleanups):
             if key[0] not in session_id_set:
                 continue
+            if self._resource_leases.providers:
+                pending = self._pending_request_cleanups[key]
+                self._pending_request_cleanups[key] = _PendingRequestCleanup(
+                    session_id=pending.session_id,
+                    fence=pending.fence,
+                    lease_generation=pending.lease_generation,
+                    request_ids=(),
+                    abort=pending.abort,
+                )
+                self._request_cleanups_in_progress.discard(key)
+                continue
             self._pending_request_cleanups.pop(key, None)
             self._request_cleanups_in_progress.discard(key)
-        self._sessions.finalize_closed_sessions(session_ids)
+        if not self._resource_leases.providers:
+            self._sessions.finalize_closed_sessions(session_ids)
 
 
 __all__ = [

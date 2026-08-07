@@ -6,6 +6,7 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine import duplex_runtime
 from vllm_omni.experimental.fullduplex.engine.contracts import (
+    DuplexExecutionProfile,
     duplex_data_plane_request_info,
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
@@ -165,6 +166,47 @@ def test_duplex_runtime_extension_validation_rejects_sampling_type_mismatch():
             WrongSamplingTypeExtension(),
             sampling_defaults=(SamplingParams(), SamplingParams()),
         )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"prewarm_batch_sizes": (1, 1)}, "duplicates"),
+        ({"prewarm_batch_sizes": (0,)}, "positive integers"),
+        ({"prewarm_batch_sizes": [1]}, "tuple"),
+        ({"step_latency_budget_ms": 0.0}, "positive finite"),
+        ({"step_latency_budget_ms": float("inf")}, "positive finite"),
+    ],
+)
+def test_duplex_execution_profile_rejects_invalid_values(kwargs, match: str) -> None:
+    with pytest.raises((TypeError, ValueError), match=match):
+        DuplexExecutionProfile(**kwargs)
+
+
+def test_duplex_runtime_extension_defaults_to_no_execution_policy_or_resources() -> None:
+    extension = MiniCPMO45DuplexRuntimeExtension()
+
+    assert duplex_runtime.duplex_execution_profile(extension) == DuplexExecutionProfile()
+    assert duplex_runtime.duplex_resource_lease_providers(extension) == ()
+
+
+def test_duplex_runtime_extension_exposes_optional_execution_policy_and_resources() -> None:
+    provider = object()
+
+    class Extension(MiniCPMO45DuplexRuntimeExtension):
+        def execution_profile(self):
+            return DuplexExecutionProfile(
+                prewarm_batch_sizes=(1, 2),
+                step_latency_budget_ms=80.0,
+            )
+
+        def resource_lease_providers(self):
+            return (provider,)
+
+    extension = Extension()
+
+    assert duplex_runtime.duplex_execution_profile(extension).prewarm_batch_sizes == (1, 2)
+    assert duplex_runtime.duplex_resource_lease_providers(extension) == (provider,)
 
 
 def test_duplex_output_decision_metadata_is_immutable():
