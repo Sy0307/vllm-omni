@@ -163,6 +163,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         hidden = model_outputs
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         codes_list: list[torch.Tensor] = []
+        prompt_len: int | None = None
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
@@ -170,29 +171,91 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             audio = codes.get("audio") if isinstance(codes, dict) else None
             if isinstance(audio, torch.Tensor):
                 codes_list.append(audio)
+            meta = info.get("meta")
+            reported = meta.get("nvc_logical_prompt_len") if isinstance(meta, dict) else None
+            if reported is None:
+                reported = info.get("meta.nvc_logical_prompt_len")
+            if reported is not None:
+                prompt_len = int(reported)
         if not codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+        outputs: dict[str, Any] = {"codes": {"audio": torch.cat(codes_list, dim=0)}}
+        # The prompt length must ride the WIRE payload (multimodal_outputs):
+        # the async-chunk dispatcher hands exactly this dict to the
+        # talker2code2wav producer, while request.additional_information is
+        # overwritten concurrently by arriving thinker chunks.
+        if prompt_len is not None:
+            # 1-D on purpose: the wire-payload builder indexes element.shape[0].
+            outputs["meta"] = {"nvc_logical_prompt_len": torch.tensor([prompt_len], dtype=torch.long)}
         return OmniOutput(
             text_hidden_states=hidden,
-            multimodal_outputs={"codes": {"audio": torch.cat(codes_list, dim=0)}},
+            multimodal_outputs=outputs,
         )
 
     # ------------------------------------------------------------------
     # Per-frame vendored TTS step.
     # ------------------------------------------------------------------
-    def _timeline(self, info: dict[str, Any]) -> torch.Tensor:
+    def _try_timeline(self, info: dict[str, Any]) -> torch.Tensor | None:
+        """Extract the frame-locked text timeline from either payload shape.
+
+        Sync mode ships ``nvc_text_timeline`` (+ ``nvc_logical_prompt_len``) in
+        additional_information; async-chunk mode replaces the request info with
+        the connector payload each chunk, carrying the CUMULATIVE timeline under
+        ``ids.all`` (and the logical prompt length under
+        ``meta.num_processed_tokens``). Returns None when neither is present.
+        """
         timeline = info.get("nvc_text_timeline")
-        if timeline is None or info.get("nvc_logical_prompt_len") is None:
+        if timeline is not None and info.get("nvc_logical_prompt_len") is None:
+            raise ValueError(
+                "NemotronVoiceChat talker got 'nvc_text_timeline' without "
+                "'nvc_logical_prompt_len'; the code2wav producer needs the prompt "
+                "length to trim prompt-region codes."
+            )
+        if timeline is None:
+            ids = info.get("ids")
+            timeline = ids.get("all") if isinstance(ids, dict) else None
+            if timeline is None:
+                timeline = info.get("ids.all")
+        if timeline is None:
+            return None
+        if isinstance(timeline, torch.Tensor):
+            return timeline.reshape(-1).to(torch.long)
+        return torch.as_tensor(list(timeline), dtype=torch.long)
+
+    @staticmethod
+    def _logical_prompt_len(info: dict[str, Any]) -> int | None:
+        """Logical prompt length from either payload shape (sync/async)."""
+        value = info.get("nvc_logical_prompt_len")
+        if value is None:
+            meta = info.get("meta")
+            value = meta.get("num_processed_tokens") if isinstance(meta, dict) else None
+            if value is None:
+                value = info.get("meta.num_processed_tokens")
+        return int(value) if value is not None else None
+
+    @staticmethod
+    def _upstream_finished(info: dict[str, Any]) -> bool:
+        """True when the async producer marked its final chunk (meta.finished)."""
+        meta = info.get("meta")
+        flag = meta.get("finished") if isinstance(meta, dict) else None
+        if flag is None:
+            flag = info.get("meta.finished")
+        if isinstance(flag, torch.Tensor):
+            return bool(flag.reshape(-1)[0].item()) if flag.numel() else False
+        return bool(flag)
+
+    def _timeline(self, info: dict[str, Any]) -> torch.Tensor:
+        timeline = self._try_timeline(info)
+        if timeline is None:
             # Explicit failure — no prompt_token_ids fallback: an implicit
             # timeline would silently skip the prompt-region trim downstream.
             raise ValueError(
                 "NemotronVoiceChat talker request is missing its timeline metadata "
-                "('nvc_text_timeline'/'nvc_logical_prompt_len' in additional_information); "
-                "the stage cannot synthesize speech without the thinker's frame-locked tokens."
+                "('nvc_text_timeline' in additional_information, or 'ids.all' on the "
+                "async-chunk payload); the stage cannot synthesize speech without "
+                "the thinker's frame-locked tokens."
             )
-        if isinstance(timeline, torch.Tensor):
-            return timeline.reshape(-1).to(torch.long)
-        return torch.as_tensor(list(timeline), dtype=torch.long)
+        return timeline
 
     def _init_session(self, request_id: str, info: dict[str, Any], device: torch.device) -> dict[str, Any]:
         assert self.tts is not None
@@ -210,8 +273,17 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": self._guidance_enabled()})
         with torch.inference_mode():
             outputs = self.tts.tts_model(**init_inputs)
+        prompt_len = self._logical_prompt_len(info)
+        if prompt_len is None:
+            raise ValueError(
+                "NemotronVoiceChat talker request is missing its logical prompt length "
+                "('nvc_logical_prompt_len' in additional_information, or async "
+                "meta.num_processed_tokens); the code2wav producer cannot trim the "
+                "prompt-region codes without it."
+            )
         session = {
             "timeline": timeline,
+            "prompt_len": prompt_len,
             "step": 1,  # NeMo's loop starts at t=1
             "past_key_values": outputs.past_key_values,
             "code": init_inputs["code"][:, -1:],
@@ -219,9 +291,21 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             "tts_initialized": False,
             "generation_config": generation_config,
             "codes_rows": [],
+            # Async-chunk mode: the timeline grows across chunks and the last
+            # chunk sets meta.finished; sync mode ships the whole timeline up
+            # front (upstream_finished starts True and never matters).
+            "upstream_finished": self._upstream_finished(info) or info.get("nvc_text_timeline") is not None,
         }
         self._sessions[request_id] = session
         return session
+
+    def _refresh_session_timeline(self, session: dict[str, Any], info: dict[str, Any], device: torch.device) -> None:
+        """Adopt a longer timeline from the latest async-chunk payload."""
+        latest = self._try_timeline(info)
+        if latest is not None and latest.numel() > int(session["timeline"].numel()):
+            session["timeline"] = latest.to(device)
+        if self._upstream_finished(info):
+            session["upstream_finished"] = True
 
     def _guidance_enabled(self) -> bool:
         return bool(getattr(self.config, "tts_cfg", {}).get("inference_guidance_enabled", True))
@@ -232,6 +316,17 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         timeline: torch.Tensor = session["timeline"]
         t = int(session["step"])
         total = int(timeline.numel())
+        if t >= total:
+            # Only reachable in async-chunk mode: the scheduler woke this
+            # request before the next thinker chunk delivered timeline[t].
+            # Hard-fail rather than fabricating a frame — a repeated/guessed
+            # subword would silently desync the audio from the text channel.
+            raise RuntimeError(
+                f"NemotronVoiceChat talker outpaced the thinker stream: step {t} needs "
+                f"timeline position {t} but only {total} positions have arrived "
+                f"(upstream_finished={session['upstream_finished']}). The async-chunk "
+                "scheduler should have parked this request until the next chunk."
+            )
         current_subword_id = timeline[t].reshape(1, 1)
         if not session["tts_initialized"]:
             prev_subword_id = session["first_context_subword_id"]
@@ -253,7 +348,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         session["code"] = code
         session["past_key_values"] = past_key_values
         session["step"] = t + 1
-        finished = (t + 1) >= total
+        # Async mode: exhausting the received timeline only ends the request
+        # once the upstream marked its final chunk; otherwise more entries are
+        # in flight and the scheduler parks us until they arrive.
+        finished = (t + 1) >= int(session["timeline"].numel()) and bool(session["upstream_finished"])
         return code.reshape(1, -1).to(torch.long), finished
 
     def preprocess(
@@ -277,6 +375,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             return input_ids, embeds, {}
 
         session = self._sessions[request_id]
+        self._refresh_session_timeline(session, info, device)
         codes_row, finished = self._step_session(session)
         session["codes_rows"].append(codes_row.cpu())
         cumulative = torch.cat(session["codes_rows"], dim=0)
@@ -284,7 +383,12 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             embeds[:, 0] = 1.0  # stop flag -> compute_logits emits the stop token
         info_update: dict[str, Any] = {
             "codes": {"audio": cumulative},
-            "meta": {"nvc_tts_step": int(session["step"])},
+            # nvc_logical_prompt_len rides EVERY step's payload: the request's
+            # additional_information is overwritten both by arriving thinker
+            # chunks and by these model updates, so the async code2wav producer
+            # reads the prompt length from the per-step multimodal_output
+            # instead of racing the request-level dict.
+            "meta": {"nvc_tts_step": int(session["step"]), "nvc_logical_prompt_len": int(session["prompt_len"])},
         }
         return input_ids, embeds, info_update
 

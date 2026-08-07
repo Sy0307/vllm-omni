@@ -45,10 +45,14 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="text",
             engine_output_type="latent",
-            # thinker -> talker is token-path only: the frame-locked text
-            # timeline rides the talker's prompt_token_ids (built by
+            # thinker -> talker sync mode is token-path only: the frame-locked
+            # text timeline rides the talker's prompt_token_ids (built by
             # thinker2talker_token_only on the talker stage); no connector
-            # payload and no full-payload wait for stage 1.
+            # payload and no full-payload wait for stage 1. With
+            # ``async_chunk: true`` in the deploy yaml, the timeline instead
+            # streams incrementally over the connector (cumulative ids.all per
+            # thinker step) so the talker starts before the thinker finishes.
+            async_chunk_process_next_stage_input_func=f"{_PROC}.thinker2talker_async_chunk",
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -60,6 +64,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             input_sources=(0,),
             engine_output_type="latent",
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             sampling_constraints={"detokenize": False},
         ),

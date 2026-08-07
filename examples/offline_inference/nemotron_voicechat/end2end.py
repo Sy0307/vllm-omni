@@ -66,6 +66,16 @@ def main() -> None:
     parser.add_argument("--wav", required=True, help="user speech (any sr; resampled to 16 kHz mono)")
     parser.add_argument("--output-dir", default="results/nemotron_voicechat")
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument(
+        "--stage-configs-path",
+        default=None,
+        help=(
+            "Deploy yaml override. Pass vllm_omni/deploy/nemotron_labs_voicechat_streaming.yaml "
+            "for the async-chunk streaming pipeline (stages overlap; audio starts decoding "
+            "before the thinker finishes). Default: the bundled non-streaming yaml (bit-exact "
+            "parity path)."
+        ),
+    )
     args = parser.parse_args()
 
     if not Path(args.wav).is_file():
@@ -123,7 +133,10 @@ def main() -> None:
         SamplingParams(temperature=0.0, max_tokens=1, detokenize=False, seed=0),
     ]
 
-    omni = Omni(model=str(ckpt), trust_remote_code=True)
+    omni_kwargs: dict = {}
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    omni = Omni(model=str(ckpt), trust_remote_code=True, **omni_kwargs)
     outputs = omni.generate(inputs, sampling_params_list)
 
     out_dir = Path(args.output_dir)

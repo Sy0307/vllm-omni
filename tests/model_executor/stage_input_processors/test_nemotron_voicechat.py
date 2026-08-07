@@ -193,3 +193,93 @@ def test_code2wav_token_only_sizes_placeholder() -> None:
     inputs = talker2code2wav_token_only([talker_output])
     assert len(inputs) == 1
     assert len(inputs[0]["prompt_token_ids"]) == 9
+
+
+# =========================
+# Async-chunk (streaming) producers
+# =========================
+
+
+def _fake_transfer_manager(codec_chunk_frames: int | None = None):
+    extra = {}
+    if codec_chunk_frames is not None:
+        extra["codec_chunk_frames"] = codec_chunk_frames
+    return SimpleNamespace(
+        request_payload={},
+        connector=SimpleNamespace(config={"extra": extra}),
+        put_req_chunk={},
+    )
+
+
+def _streaming_request(prompt_len: int, generated: list[int], info: dict | None = None):
+    return SimpleNamespace(
+        external_req_id="req-0",
+        prompt_token_ids=list(range(100, 100 + prompt_len)) + [_PAD],
+        output_token_ids=generated,
+        additional_information=info,
+    )
+
+
+def test_thinker2talker_async_chunk_cumulative_timeline() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        thinker2talker_async_chunk,
+    )
+
+    tm = _fake_transfer_manager()
+    req = _streaming_request(prompt_len=3, generated=[7])
+    payload = thinker2talker_async_chunk(tm, {}, req, is_finished=False)
+    assert payload is not None
+    assert payload.ids.all == [_PAD] * 3 + [7]
+    assert payload.meta.num_processed_tokens == 3
+    assert not bool(payload.meta.finished)
+
+    # No new tokens since the last chunk -> skip.
+    assert thinker2talker_async_chunk(tm, {}, req, is_finished=False) is None
+
+    # More tokens -> longer cumulative timeline; final chunk sets finished.
+    req.output_token_ids = [7, 8, 9]
+    payload = thinker2talker_async_chunk(tm, {}, req, is_finished=True)
+    assert payload.ids.all == [_PAD] * 3 + [7, 8, 9]
+    assert bool(payload.meta.finished)
+
+
+def test_talker2code2wav_async_chunk_cadence_and_left_context() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=2)
+    prompt_len = 3
+    info = {"nvc_logical_prompt_len": prompt_len}
+    req = _streaming_request(prompt_len=prompt_len, generated=[], info=info)
+
+    def cumulative(rows: int) -> dict:
+        # Talker rows are timeline steps t=1..; prompt region occupies the
+        # first prompt_len-1 rows before acoustic frames start.
+        return {"codes": {"audio": torch.arange((prompt_len - 1 + rows) * 31).reshape(-1, 31)}}
+
+    # Only prompt-region rows so far -> nothing to ship.
+    assert talker2code2wav_async_chunk(tm, cumulative(0), req, is_finished=False) is None
+    # One new frame < chunk size 2 -> hold.
+    assert talker2code2wav_async_chunk(tm, cumulative(1), req, is_finished=False) is None
+    # Two frames -> first chunk, no left context.
+    payload = talker2code2wav_async_chunk(tm, cumulative(2), req, is_finished=False)
+    assert payload is not None
+    assert payload.meta.left_context_size == 0
+    assert payload.codes.audio.shape == (2, 31)
+    # Third frame + finished -> cumulative history with left context 2.
+    payload = talker2code2wav_async_chunk(tm, cumulative(3), req, is_finished=True)
+    assert payload.meta.left_context_size == 2
+    assert payload.codes.audio.shape == (3, 31)
+    assert bool(payload.meta.finished)
+
+
+def test_talker2code2wav_async_chunk_requires_prompt_len() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager()
+    req = _streaming_request(prompt_len=3, generated=[], info=None)
+    with pytest.raises(ValueError, match="logical prompt length"):
+        talker2code2wav_async_chunk(tm, {"codes": {"audio": torch.zeros(5, 31, dtype=torch.long)}}, req)

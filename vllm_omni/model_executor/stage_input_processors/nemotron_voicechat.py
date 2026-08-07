@@ -24,6 +24,7 @@ import torch
 
 from vllm_omni.data_entry_keys import (
     CodesStruct,
+    IdsStruct,
     MetaStruct,
     OmniPayloadStruct,
 )
@@ -32,7 +33,7 @@ from vllm_omni.data_entry_keys import (
 # replace (not concatenate) them if the producer fires more than once. The AR
 # runner flattens nested payloads before accumulation, so the effective key is
 # the flattened "codes.audio" (the unflattened root is kept for robustness).
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes", "codes.audio"})
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes", "codes.audio", "meta", "meta.nvc_logical_prompt_len"})
 
 # <SPECIAL_12> in the Nemotron-Nano-9B-v2 vocab; the checkpoint config's
 # stt pad_token. The thinker also reports it in its latent metadata, which
@@ -98,6 +99,139 @@ def thinker2talker_token_only(
             )
         )
     return inputs
+
+
+def thinker2talker_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: Any = None,
+    request: Any = None,
+    is_finished: bool = False,
+    **kwargs: Any,
+) -> OmniPayloadStruct | None:
+    """Streaming producer: ship the CUMULATIVE text timeline each thinker step.
+
+    The AR receive path REPLACES the downstream request's
+    additional_information with each chunk payload, so every chunk must carry
+    the whole timeline so far: ``[pad] * logical_prompt_len + sampled tokens``
+    under ``ids.all`` (the talker adopts any longer timeline it sees). The
+    timeline is a few hundred ints, so cumulative re-ship is cheap and keeps
+    the payload self-contained. ``meta.num_processed_tokens`` carries the
+    logical prompt length for the code2wav producer's prompt-region trim.
+    """
+    del multimodal_output, kwargs
+    request_id = request.external_req_id
+    prompt_ids = list(getattr(request, "prompt_token_ids", None) or [])
+    # vLLM prompt = logical prompt + 1 placeholder (acoustic frame 0).
+    logical_prompt_len = max(len(prompt_ids) - 1, 0)
+    generated = list(getattr(request, "output_token_ids", None) or [])
+    pad_id = _DEFAULT_TEXT_PAD_ID
+    reported_pad = _info_get(getattr(request, "additional_information", None), "nvc_text_pad_id")
+    if reported_pad is not None:
+        pad_id = int(reported_pad)
+    timeline = [pad_id] * logical_prompt_len + [int(t) for t in generated]
+
+    # Skip no-progress wakeups (same length as the last emitted chunk).
+    state = transfer_manager.request_payload.get(request_id)
+    last_len = int(state.get("nvc_timeline_len", -1)) if isinstance(state, dict) else -1
+    if len(timeline) <= last_len and not is_finished:
+        return None
+    transfer_manager.request_payload[request_id] = {"nvc_timeline_len": len(timeline)}
+
+    return OmniPayloadStruct(
+        ids=IdsStruct(all=timeline),
+        meta=MetaStruct(
+            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+            num_processed_tokens=logical_prompt_len,
+            # The talker's vLLM prompt stays a single placeholder token.
+            next_stage_prompt_len=1,
+        ),
+    )
+
+
+def talker2code2wav_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: Any = None,
+    request: Any = None,
+    is_finished: bool = False,
+    **kwargs: Any,
+) -> OmniPayloadStruct | None:
+    """Streaming producer: ship prompt-trimmed CUMULATIVE code stacks in chunks.
+
+    Follows the NeMo incremental-decode recipe (``decode_one_audio_step``):
+    each chunk carries the FULL trimmed code history and
+    ``meta.left_context_size`` = frames the codec already emitted, so the
+    code2wav stage re-decodes the whole prefix and slices off only the new
+    samples — no seams, no crossfade, and the concatenated stream equals the
+    prefix-decode of the final stack. Chunk cadence comes from the connector
+    config key ``codec_chunk_frames`` (default 13 frames ~= 1 s of audio).
+    """
+    del kwargs
+    request_id = request.external_req_id
+
+    codes = None
+    if isinstance(multimodal_output, dict):
+        nested = multimodal_output.get("codes")
+        codes = nested.get("audio") if isinstance(nested, dict) else None
+        if codes is None:
+            codes = multimodal_output.get("codes.audio")
+    if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
+        if not is_finished:
+            return None
+        return _empty_finished_payload()
+    if codes.ndim == 1:
+        codes = codes.reshape(1, -1)
+
+    # Prompt-region trim (rows are NeMo timeline steps t=1..; keep t >= P).
+    # Read the prompt length from the PER-STEP model payload first: the
+    # request-level additional_information is overwritten both by arriving
+    # thinker chunks and by talker info updates, so it races. Cache the first
+    # sighting in the transfer-manager state as a fallback.
+    state = transfer_manager.request_payload.get(request_id)
+    prompt_len = _info_get(multimodal_output if isinstance(multimodal_output, dict) else None, "nvc_logical_prompt_len")
+    if prompt_len is None and isinstance(multimodal_output, dict):
+        prompt_len = multimodal_output.get("meta.nvc_logical_prompt_len")
+    if prompt_len is None:
+        info = getattr(request, "additional_information", None)
+        prompt_len = _info_get(info, "nvc_logical_prompt_len")
+        if prompt_len is None:
+            prompt_len = _info_get(info, "num_processed_tokens")
+    if prompt_len is None and isinstance(state, dict):
+        prompt_len = state.get("nvc_prompt_len")
+    if prompt_len is None:
+        raise ValueError(
+            "NemotronVoiceChat talker request is missing its logical prompt length "
+            "('nvc_logical_prompt_len' or async meta.num_processed_tokens); cannot "
+            "trim the prompt-region codes for streaming code2wav."
+        )
+    trimmed = codes[max(int(prompt_len) - 1, 0) :]
+
+    frames_sent = int(state.get("nvc_frames_sent", 0)) if isinstance(state, dict) else 0
+    new_frames = int(trimmed.shape[0]) - frames_sent
+    if new_frames <= 0 and not is_finished:
+        return None
+
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_frames = int(cfg.get("codec_chunk_frames", 13))
+    if new_frames < chunk_frames and not is_finished:
+        return None
+    if new_frames <= 0 and is_finished and frames_sent > 0:
+        # Everything already shipped; emit a terminal empty chunk so the
+        # code2wav request observes meta.finished.
+        return _empty_finished_payload()
+
+    transfer_manager.request_payload[request_id] = {
+        "nvc_frames_sent": int(trimmed.shape[0]),
+        "nvc_prompt_len": int(prompt_len),
+    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=trimmed.detach().to(dtype=torch.long, device="cpu")),
+        meta=MetaStruct(
+            left_context_size=frames_sent,
+            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+        ),
+    )
 
 
 def _empty_finished_payload() -> OmniPayloadStruct:
@@ -214,6 +348,8 @@ def talker2code2wav_token_only(
 
 __all__ = [
     "thinker2talker_token_only",
+    "thinker2talker_async_chunk",
     "talker2code2wav_full_payload",
+    "talker2code2wav_async_chunk",
     "talker2code2wav_token_only",
 ]

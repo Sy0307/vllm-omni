@@ -71,6 +71,8 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         self._num_quantizers = int(getattr(codec_cfg, "num_quantizers", 31))
         self._codebook_size = int(getattr(codec_cfg, "codebook_size", 1024))
         self._sample_rate = int(getattr(codec_cfg, "sample_rate", 22050))
+        # Samples per 12.5 Hz frame (streaming chunks slice new audio by frame).
+        self._wav_per_frame = int(getattr(codec_cfg, "wav_to_token_ratio", 1764))
 
         # Runner-facing capability flags (same contract as PersonaPlexCode2Wav).
         self.have_multimodal_outputs = True
@@ -160,11 +162,26 @@ class NemotronVoiceChatCode2Wav(nn.Module):
             frames = codes.shape[0]
             if frames == 0:
                 continue
+            # Async-chunk streaming: the payload carries the CUMULATIVE trimmed
+            # code history plus meta.left_context_size = frames whose audio was
+            # already emitted by earlier chunks. Mirroring NeMo's
+            # decode_one_audio_step (unbounded window), we re-decode the whole
+            # prefix and slice off only the new tail — seam-free by
+            # construction. Sync full-payload chunks carry no left context.
+            left_context_frames = 0
+            if isinstance(meta, Mapping) and meta.get("left_context_size") is not None:
+                left_context_frames = max(int(meta["left_context_size"]), 0)
+            elif isinstance(runtime_info, Mapping) and runtime_info.get("meta.left_context_size") is not None:
+                left_context_frames = max(int(runtime_info["meta.left_context_size"]), 0)
+            if left_context_frames >= frames:
+                continue  # terminal empty chunk: all frames already emitted
             lens = torch.tensor([frames], device=device, dtype=torch.long)
             # NeMo decodes the codec strictly in fp32.
             with torch.autocast(device_type=device.type, enabled=False):
                 wav, wav_len = self.audio_codec.decode(codes.unsqueeze(0), lens)
             wav = wav.reshape(-1)[: int(wav_len.reshape(-1)[0])]
+            if left_context_frames > 0:
+                wav = wav[left_context_frames * self._wav_per_frame :]
             audios[i] = wav.detach().to(dtype=torch.float32).cpu()
 
         return OmniOutput(
