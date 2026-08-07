@@ -91,8 +91,17 @@ with any ASR model.
 #### Notes
 
 - Memory usage: the shipped yaml runs all three stages on one GPU
-  (`gpu_memory_utilization` 0.62 / 0.15 / 0.10); peak usage is dominated by the
-  fp32 thinker.
+  (`gpu_memory_utilization` 0.62 / 0.12 / 0.06); peak usage is dominated by the
+  fp32 thinker. The fp32 default has a hard floor of roughly 43 GB of thinker
+  weights alone (9B backbone + 587M `embed_tokens` + 587M `function_head` +
+  0.6B Conformer), so 48 GB cards cannot run it — use the bf16 thinker option
+  documented in the deploy yaml on anything smaller than an 80 GB part.
+- Input sizing: the timeline is frame-locked, so the reply budget IS the input
+  duration. The acoustic channel trails the text channel; if the WAV does not
+  carry enough trailing silence for the reply to finish, the spoken answer is
+  truncated silently. Leave generous trailing silence (a question ending at
+  ~4.5 s truncated in an 8 s WAV but completed cleanly in 16 s); the offline
+  example warns when the text channel is still speaking near the last frame.
 - Key flags: sampling is greedy end to end. The thinker is frame-locked —
   `max_tokens` equals the acoustic frame count with `ignore_eos=True`. Do NOT
   set `min_tokens` on the thinker: the tokenizer's EOS token is also the

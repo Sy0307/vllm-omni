@@ -104,7 +104,8 @@ def test_code2wav_distinguishes_empty_payload_from_missing_info() -> None:
     # decode.
     empty = extract(None, {"codes": {"audio": torch.empty(0, dtype=torch.long)}})
     assert isinstance(empty, torch.Tensor) and empty.numel() == 0
-    # Missing codes info entirely -> None (fallback territory).
+    # Missing codes info entirely -> None (forward raises: placeholder
+    # input_ids are never decoded).
     assert extract(None, {"meta": {}}) is None
     assert extract(None, None) is None
     # Normal payload passes through (nested and flattened key forms).

@@ -147,10 +147,15 @@ class NemotronVoiceChatCode2Wav(nn.Module):
                 continue
             codes = self._codes_from_runtime_info(runtime_info)
             if codes is None:
-                if input_ids is not None and input_ids.numel() > 0 and num_req == 1:
-                    codes = input_ids.reshape(-1)
-                else:
-                    continue
+                # No input_ids fallback (unlike PersonaPlexCode2Wav): this
+                # pipeline's scheduler-side prompt is all-zero placeholders, so
+                # decoding it would produce plausible-sounding garbage whenever
+                # n_frames % num_quantizers == 0. A missing payload is a bug.
+                raise ValueError(
+                    "NemotronVoiceChat code2wav request carries no 'codes' payload in its "
+                    "runtime info; the talker stage must ship the [frames, num_quantizers] "
+                    "code stack (placeholder input_ids are never decoded)."
+                )
             codes = validate_code_stack(codes, self._num_quantizers, self._codebook_size).to(device=device)
             frames = codes.shape[0]
             if frames == 0:

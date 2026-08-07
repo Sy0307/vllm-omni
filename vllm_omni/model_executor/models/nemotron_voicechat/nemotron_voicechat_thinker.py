@@ -36,6 +36,7 @@ Timeline contract (verified against NeMo ``_init_inference``/``_step_zero``/
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -109,12 +110,22 @@ def compute_acoustic_frame_count(nemo_stt_cfg: dict[str, Any], num_samples: int)
     mel_len = (num_samples + pad_amount - n_fft) // hop + 1
     subsampling_factor = int(encoder.get("subsampling", "dw_striding") and encoder.get("subsampling_factor", 8))
     conv_kernel = int(encoder.get("subsampling_conv_kernel_size", 3) or 3)
+    stride = 2
     repeat = int(np.log2(subsampling_factor))
+    # Mirror the vendored ConvSubsampling padding exactly: causal downsampling
+    # (this checkpoint sets encoder.causal_downsampling=true) pads
+    # left=kernel-1 plus right=stride-1, i.e. one more column than the
+    # non-causal symmetric 2*(kernel//2) — which shifts the output length by
+    # one for roughly half of all input durations.
+    if bool(encoder.get("causal_downsampling", False)):
+        all_paddings = (conv_kernel - 1) + (stride - 1)
+    else:
+        all_paddings = 2 * (conv_kernel // 2)
     out = calc_length(
         torch.tensor([mel_len]),
-        all_paddings=2 * (conv_kernel // 2),
+        all_paddings=all_paddings,
         kernel_size=conv_kernel,
-        stride=2,
+        stride=stride,
         ceil_mode=False,
         repeat_num=repeat,
     )
@@ -247,14 +258,12 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     def _resolve_special_ids(self) -> dict[str, int]:
         if self._special_ids is not None:
             return self._special_ids
-        import os
-
         from transformers import AutoTokenizer
 
         ref = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or self.stt_cfg.get(
             "pretrained_llm", "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
         )
-        tok = AutoTokenizer.from_pretrained(ref, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(ref, trust_remote_code=False)
         ids = {
             "bos": tok.convert_tokens_to_ids(self.stt_cfg.get("bos_token", "<s>")),
             "eos": tok.convert_tokens_to_ids(self.stt_cfg.get("eos_token", "</s>")),
@@ -436,9 +445,26 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 token = int(prev_func.reshape(-1)[0]) if isinstance(prev_func, torch.Tensor) else int(prev_func)
                 session["func_token"] = token
 
-        session["decode_step"] = int(session["decode_step"]) + 1
-        frame_idx = session["decode_step"]  # decode step k consumes frame k
+        # Position-addressed frame index: decode of vLLM position P+k consumes
+        # acoustic frame k (frame 0 was the last prefill position). Deriving it
+        # from _omni_num_computed_tokens keeps preprocess idempotent — if the
+        # runner ever re-enters the same decode position (preemption or
+        # recompute), the audio pointer stays aligned with the text channel
+        # instead of silently advancing. Falls back to a call counter only if
+        # the runner did not inject the key.
+        computed = info.get("_omni_num_computed_tokens")
+        if computed is not None:
+            frame_idx = int(computed) - int(session["prompt_len"])
+        else:
+            frame_idx = int(session["decode_step"]) + 1
+        session["decode_step"] = frame_idx
         n_frames = int(session["n_frames"])
+        if frame_idx < 1:
+            raise ValueError(
+                f"NemotronVoiceChat thinker derived decode frame index {frame_idx} "
+                f"(computed_tokens={computed}, prompt_len={session['prompt_len']}); "
+                "decode must start at acoustic frame 1."
+            )
         if frame_idx >= n_frames:
             raise ValueError(
                 f"NemotronVoiceChat thinker was asked for decode step {frame_idx} but only "
@@ -460,9 +486,11 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         Runs after EVERY forward (prefill and each decode step), so the final
         acoustic frame's token is covered too — NeMo produces gen_function for
-        every non-prompt position. Owns the cumulative debug timeline: appends
-        the new token to the ``nvc_function_tokens`` carried in the request
-        info, giving exactly ``acoustic_frame_count`` entries at request end.
+        every non-prompt position. ``nvc_prev_function_token`` is load-bearing
+        (it feeds the next step's fusion at weight 2.0). The cumulative debug
+        timeline (``nvc_function_tokens``, one entry per acoustic frame) costs
+        a host sync plus a growing concat per step, so it is only accumulated
+        when ``NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE=1``.
         On multi-chunk prefill, only the final chunk (whose forward covers the
         last prefill position, acoustic frame 0) contributes a token.
         """
@@ -476,12 +504,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         with torch.inference_mode():
             func_logits = self.function_head(hidden_states[-1, :].reshape(1, -1).to(self._dtype))
         token = func_logits.argmax(dim=-1).reshape(()).detach()
-        existing = kwargs.get("nvc_function_tokens")
-        if isinstance(existing, torch.Tensor) and existing.numel() > 0:
-            timeline = torch.cat([existing.reshape(-1).cpu(), token.reshape(1).cpu()])
-        else:
-            timeline = token.reshape(1).cpu()
-        return {"nvc_prev_function_token": token, "nvc_function_tokens": timeline}
+        update: dict[str, Any] = {"nvc_prev_function_token": token}
+        if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
+            existing = kwargs.get("nvc_function_tokens")
+            if isinstance(existing, torch.Tensor) and existing.numel() > 0:
+                update["nvc_function_tokens"] = torch.cat([existing.reshape(-1).cpu(), token.reshape(1).cpu()])
+            else:
+                update["nvc_function_tokens"] = token.reshape(1).cpu()
+        return update
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:

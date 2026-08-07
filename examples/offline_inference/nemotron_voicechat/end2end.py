@@ -15,6 +15,14 @@ Usage:
 The system prompt defaults to the NeMo reference default. The text tokenizer
 resolves from the ``nvidia/NVIDIA-Nemotron-Nano-9B-v2`` HF id (or the
 ``NEMOTRON_VOICECHAT_LLM_PATH`` env var for air-gapped runs).
+
+Sizing the input WAV: the timeline is frame-locked, so the reply budget IS the
+input duration — the acoustic channel trails the text channel, and a reply
+that has not finished when the frames run out is truncated SILENTLY (no error;
+ASR of the WAV will just disagree with the emitted text). Leave generous
+trailing silence after the question (a question ending at ~4.5 s truncated in
+an 8 s WAV but completed cleanly in a 16 s one). The script warns when the
+text channel is still emitting non-PAD tokens near the last frame.
 """
 
 from __future__ import annotations
@@ -26,6 +34,10 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+# Warn if the text channel is still speaking within this many final frames
+# (12 frames = ~1 s) — the frame-locked reply likely got cut off.
+TRUNCATION_GUARD_FRAMES = 12
 
 # The NeMo reference offline script's default system prompt.
 DEFAULT_SYSTEM_PROMPT = (
@@ -73,7 +85,7 @@ def main() -> None:
     tok_ref = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or stt_cfg.get(
         "pretrained_llm", "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
     )
-    tokenizer = AutoTokenizer.from_pretrained(tok_ref, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(tok_ref, trust_remote_code=False)
     bos_id = tokenizer.convert_tokens_to_ids(stt_cfg.get("bos_token", "<s>"))
     eos_id = tokenizer.convert_tokens_to_ids(stt_cfg.get("eos_token", "</s>"))
     pad_id = tokenizer.convert_tokens_to_ids(stt_cfg.get("pad_token", "<SPECIAL_12>"))
@@ -137,6 +149,17 @@ def main() -> None:
             token_ids = getattr(completion, "token_ids", None)
             if token_ids:
                 (out_dir / f"{stem}_text_tokens.json").write_text(json.dumps(list(map(int, token_ids))))
+                # Frame lock: the reply budget IS the input length. If the text
+                # channel is still mid-sentence when the frames run out, the
+                # spoken answer is silently truncated — warn instead.
+                tail = list(map(int, token_ids))[-TRUNCATION_GUARD_FRAMES:]
+                if any(t != pad_id for t in tail):
+                    print(
+                        f"WARNING: the text channel emits non-PAD tokens within the last "
+                        f"{TRUNCATION_GUARD_FRAMES} frames ({TRUNCATION_GUARD_FRAMES * 80} ms) — the reply "
+                        "likely ran out of acoustic frames and is cut off mid-sentence. "
+                        "Pad the input WAV with more trailing silence and rerun."
+                    )
             # Best-effort: dump the function-channel debug timeline if the
             # engine surfaced the request info on this output.
             info = getattr(output, "additional_information", None)

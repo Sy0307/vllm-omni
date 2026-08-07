@@ -4,9 +4,11 @@
 
 Pins the exact prefill/off-by-one arithmetic against values verified with the
 NeMo reference run on sample_general.wav (fp32, greedy): perception produced
-196 acoustic frames for a 250,760-sample 16 kHz input; the system prompt
-tokenized to 56 ids ([bos] + 54 + [eos]); NeMo's timeline T = 252 = 56 + 196;
-and our fp32 pipeline matched the reference text channel 196/196 tokens.
+196 acoustic frames for the 249,734-sample 16 kHz fixture (the NeMo dump's
+250,760 was the loader's padded batch width; perception consumed the true
+length); the system prompt tokenized to 56 ids ([bos] + 54 + [eos]); NeMo's
+timeline T = 252 = 56 + 196; and our fp32 pipeline matched the reference text
+channel 196/196 tokens.
 """
 
 import pytest
@@ -18,19 +20,32 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # Perception config subset matching the checkpoint (mel 10 ms hop, n_fft 512,
-# dw-striding 8x subsampling, conv kernel 3).
+# dw-striding 8x CAUSAL subsampling, conv kernel 3). causal_downsampling is
+# what the real checkpoint sets; omitting it here is exactly what let the
+# non-causal padding formula pass review round 0 (helper vs itself).
 _STT_CFG = {
     "perception": {
         "preprocessor": {"sample_rate": 16000, "window_stride": 0.01, "window_size": 0.025, "n_fft": 512},
-        "encoder": {"subsampling": "dw_striding", "subsampling_factor": 8, "subsampling_conv_kernel_size": 3},
+        "encoder": {
+            "subsampling": "dw_striding",
+            "subsampling_factor": 8,
+            "subsampling_conv_kernel_size": 3,
+            "causal_downsampling": True,
+        },
     }
 }
 
-# (num_16k_samples, expected 12.5 Hz frames). The first row is the
-# sample_general.wav acceptance fixture, verified against the NeMo reference
-# (T=252 timeline with a 56-token prompt => 196 acoustic frames).
+# (num_16k_samples, expected 12.5 Hz frames), all verified against the REAL
+# vendored AudioPerceptionModule built from the checkpoint config. The first
+# row is the sample_general.wav acceptance fixture (196 frames -> the NeMo
+# T=252 timeline). 71271 is the reviewer's 4.45 s repro that the non-causal
+# formula undersized by one; 250760 is the NeMo loader's padded width, which
+# genuinely yields 197 (not the fixture's 196).
 _GOLDEN = [
-    (250760, 196),
+    (249734, 196),
+    (250760, 197),
+    (71271, 57),
+    (16000, 14),
     (16000 * 2, 26),
     (16000 * 4, 51),
     (16000 * 8, 101),
@@ -40,6 +55,61 @@ _GOLDEN = [
 @pytest.mark.parametrize(("num_samples", "expected_frames"), _GOLDEN)
 def test_acoustic_frame_count_golden(num_samples: int, expected_frames: int) -> None:
     assert compute_acoustic_frame_count(_STT_CFG, num_samples) == expected_frames
+
+
+def test_frame_count_matches_vendored_subsampling_geometry() -> None:
+    """Pin the helper against the real ConvSubsampling, not against itself.
+
+    Builds the vendored subsampling module with the checkpoint geometry (both
+    causal and non-causal) and checks the helper's padding arithmetic against
+    the module's actual ``_left_padding + _right_padding`` and its
+    ``calc_length`` output over a spread of mel lengths.
+    """
+    import torch
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.asr.subsampling import (
+        ConvSubsampling,
+        calc_length,
+    )
+
+    for causal in (True, False):
+        sub = ConvSubsampling(
+            subsampling="dw_striding",
+            subsampling_factor=8,
+            feat_in=128,
+            feat_out=8,
+            conv_channels=8,
+            is_causal=causal,
+        )
+        expected_paddings = sub._left_padding + sub._right_padding
+        cfg = {
+            "perception": {
+                "preprocessor": _STT_CFG["perception"]["preprocessor"],
+                "encoder": {
+                    "subsampling": "dw_striding",
+                    "subsampling_factor": 8,
+                    "subsampling_conv_kernel_size": 3,
+                    "causal_downsampling": causal,
+                },
+            }
+        }
+        for num_samples in (16000, 71271, 249734, 250760):
+            # Recompute the helper's mel length, then ask the module's own
+            # calc_length what the subsampled length should be.
+            mel_len = (num_samples + 512 - 512) // 160 + 1
+            module_frames = int(
+                calc_length(
+                    torch.tensor([mel_len]),
+                    all_paddings=expected_paddings,
+                    kernel_size=3,
+                    stride=2,
+                    ceil_mode=False,
+                    repeat_num=3,
+                )[0]
+            )
+            assert compute_acoustic_frame_count(cfg, num_samples) == module_frames, (
+                f"helper diverged from vendored geometry (causal={causal}, samples={num_samples})"
+            )
 
 
 def test_timeline_max_model_len_validation() -> None:
@@ -83,27 +153,33 @@ def _bare_thinker():
     return thinker
 
 
-def test_postprocess_appends_function_token_to_timeline() -> None:
+def test_postprocess_appends_function_token_to_timeline(monkeypatch: pytest.MonkeyPatch) -> None:
     import torch
 
     thinker = _bare_thinker()
     hidden = torch.randn(3, 8)
     expected = int(thinker.function_head(hidden[-1:]).argmax(dim=-1))
 
-    # No existing timeline: starts one.
+    # Default: only the load-bearing prev-token; the cumulative debug timeline
+    # (a per-step host sync + growing concat) stays off.
     update = thinker.postprocess(hidden)
     assert int(update["nvc_prev_function_token"]) == expected
-    assert update["nvc_function_tokens"].tolist() == [expected]
+    assert "nvc_function_tokens" not in update
 
+    monkeypatch.setenv("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "1")
+    # No existing timeline: starts one.
+    update = thinker.postprocess(hidden)
+    assert update["nvc_function_tokens"].tolist() == [expected]
     # Existing timeline: appended, not replaced.
     existing = torch.tensor([7, 8, 9], dtype=torch.long)
     update = thinker.postprocess(hidden, nvc_function_tokens=existing)
     assert update["nvc_function_tokens"].tolist() == [7, 8, 9, expected]
 
 
-def test_postprocess_skips_intermediate_prefill_chunks() -> None:
+def test_postprocess_skips_intermediate_prefill_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     import torch
 
+    monkeypatch.setenv("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "1")
     thinker = _bare_thinker()
     hidden = torch.randn(4, 8)
     # Intermediate chunk: 0 computed + 4 rows < prompt_len 10 -> no token.
@@ -119,7 +195,7 @@ def test_prefill_contract_arithmetic() -> None:
     # frame 0); decode steps == acoustic_frame_count; NeMo timeline
     # T == prompt + frames. Values from the verified sample_general.wav run.
     logical_prompt_len = 56
-    frames = compute_acoustic_frame_count(_STT_CFG, 250760)
+    frames = compute_acoustic_frame_count(_STT_CFG, 249734)
     vllm_prefill_len = logical_prompt_len + 1
     assert vllm_prefill_len == 57
     assert logical_prompt_len + frames == 252  # NeMo reference T

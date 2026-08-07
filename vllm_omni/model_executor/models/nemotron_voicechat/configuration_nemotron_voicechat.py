@@ -195,7 +195,10 @@ class NemotronVoiceChatConfig(PretrainedConfig):
             return PretrainedConfig()
         llm_ref = os.environ.get(_LLM_PATH_ENV) or self.stt_cfg.get("pretrained_llm") or _DEFAULT_LLM_ID
         try:
-            return AutoConfig.from_pretrained(llm_ref, trust_remote_code=True)
+            # nemotron_h is a native transformers model type; trust_remote_code=True
+            # would chase the auto_map .py modules and break air-gapped dirs that
+            # ship only config.json.
+            return AutoConfig.from_pretrained(llm_ref, trust_remote_code=False)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load the NemotronVoiceChat thinker backbone config from {llm_ref!r}. "
