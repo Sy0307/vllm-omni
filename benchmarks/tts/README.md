@@ -139,6 +139,30 @@ python benchmarks/tts/bench_tts.py \
     --output-dir ./results
 ```
 
+#### Fixed IndexTTS 2.5 performance sweep
+
+IndexTTS 2.5 has a dedicated driver because its native checkpoint bundle uses
+the bundled emotion-model tokenizer while serving accepts IndexTTS-specific
+`extra_params`. The defaults reproduce the H20 acceptance workload:
+Seed-TTS Eval EN, `n=500`, concurrency `4/8/16/32`, and dataset seed 0.
+Production-performance runs intentionally omit a request seed so vLLM can use
+its FlashInfer sampler.
+
+```bash
+python benchmarks/tts/benchmark_indextts2_5.py \
+    --model /path/to/indextts-2.5 \
+    --dataset-path /path/to/seedtts_testset \
+    --host 127.0.0.1 --port 8092 \
+    --label baseline \
+    --output-dir ./results/indextts2_5
+```
+
+The script benchmarks an already-running server. Use distinct labels when
+comparing server configurations. For reproducible quality comparisons, add
+`--request-seed 42`; this selects deterministic per-request sampling and is a
+separate mode from production performance. `--dataset-seed` only controls
+which Seed-TTS rows are selected.
+
 ### 4. Plot a sweep
 
 ```bash
@@ -232,6 +256,7 @@ sentinel for regressions in this area.
 ```
 benchmarks/tts/
 ├── README.md                  (this file)
+├── benchmark_indextts2_5.py   Fixed Seed-TTS n=500 concurrency sweep
 ├── bench_tts.py               CLI — serve-mode benchmark driver
 ├── plot_results.py            Generate per-task / per-concurrency curves
 └── model_configs.yaml         Model registry (supported tasks + extra body)

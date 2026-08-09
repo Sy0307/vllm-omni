@@ -138,6 +138,10 @@ class IndexTTS2Config(PretrainedConfig):
         "emo_num": [3, 17, 2, 8, 4, 5, 10, 24],
         "qwen_emo_path": "qwen0.6bemo4-merge/",
         "vocoder": {"type": "bigvgan", "name": "nvidia/bigvgan_v2_22khz_80band_256x"},
+        "tokenizer_file": "bpe.model",
+        "semantic_codec_checkpoint": "semantic_codec.pth",
+        "semantic_codec_type": "repcodec",
+        "use_gpt_latent": True,
         "version": 2.0,
         # Default-off performance tracing for IndexTTS2 overhead analysis.
     }
@@ -154,3 +158,40 @@ class IndexTTS2Config(PretrainedConfig):
         self.output_sample_rate = int(
             self.s2mel["preprocess_params"].get("sr", 22050) if isinstance(self.s2mel, dict) else 22050
         )
+
+
+class IndexTTS25Config(IndexTTS2Config):
+    """Configuration for the official IndexTTS 2.5 checkpoint.
+
+    IndexTTS 2.5 keeps the GPT/S2Mel backbone shapes used by IndexTTS 2,
+    but switches text tokenization and speaker conditioning, and decodes
+    semantic codes with EnhancedCodec. GPT latent conditioning is disabled by
+    default upstream; the opt-in path is an experimental vLLM-Omni-specific
+    latent variant with no official runnable reference output.
+    """
+
+    model_type = "indextts2_5"
+    _DEFAULTS = copy.deepcopy(IndexTTS2Config._DEFAULTS)
+    _DEFAULTS["gpt"] = {
+        **_DEFAULTS["gpt"],
+        "number_text_tokens": 60509,
+    }
+    _DEFAULTS.update(
+        {
+            "tokenizer_file": "multilingual_zh_ja_yue_char_del.tiktoken",
+            "semantic_codec_checkpoint": "codec.pth",
+            "semantic_codec_type": "enhanced",
+            "use_gpt_latent": False,
+            "version": 2.5,
+        }
+    )
+
+    def __init__(self, **kwargs):
+        # HF overrides are sometimes intentionally partial. Merge nested GPT
+        # values with the 2.5 defaults so dimensions needed by the shared
+        # implementation remain present while explicit values still win.
+        explicit_gpt = kwargs.pop("gpt", None)
+        merged_gpt = copy.deepcopy(self._DEFAULTS["gpt"])
+        if explicit_gpt is not None:
+            merged_gpt.update(explicit_gpt)
+        super().__init__(gpt=merged_gpt, **kwargs)
