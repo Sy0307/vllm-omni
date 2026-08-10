@@ -283,3 +283,140 @@ def test_talker2code2wav_async_chunk_requires_prompt_len() -> None:
     req = _streaming_request(prompt_len=3, generated=[], info=None)
     with pytest.raises(ValueError, match="logical prompt length"):
         talker2code2wav_async_chunk(tm, {"codes": {"audio": torch.zeros(5, 31, dtype=torch.long)}}, req)
+
+
+# =========================
+# Talker drain-per-wake (async scheduling review P1/P2)
+# =========================
+
+
+class _FakeTTSModelOutput:
+    past_key_values = None
+
+
+class _FakeTTS:
+    """Stub DuplexEARTTS: infer_codes_one_step returns a constant code row."""
+
+    def __init__(self, q: int = 31):
+        self.q = q
+        self.steps = 0
+
+    def set_init_inputs(self, speaker_name: str) -> None:
+        del speaker_name
+
+    def get_init_inputs(self, B: int) -> dict:  # noqa: N803 — mirrors the vendored DuplexEARTTS signature
+        return {
+            "code": torch.zeros((B, 2, self.q), dtype=torch.long),
+            "subword_ids": torch.zeros((B, 3), dtype=torch.long),
+        }
+
+    def _get_generation_config(self, guidance_enabled: bool):
+        del guidance_enabled
+        return {}
+
+    def tts_model(self, **kwargs):
+        del kwargs
+        return _FakeTTSModelOutput()
+
+    def infer_codes_one_step(self, **kwargs):
+        del kwargs
+        self.steps += 1
+        return torch.full((1, 1, self.q), self.steps, dtype=torch.long), None
+
+
+def _bare_talker():
+    from torch import nn
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_talker import (
+        NemotronVoiceChatTalkerForConditionalGeneration,
+    )
+
+    talker = NemotronVoiceChatTalkerForConditionalGeneration.__new__(NemotronVoiceChatTalkerForConditionalGeneration)
+    nn.Module.__init__(talker)
+    talker.tts = _FakeTTS()
+    talker._sessions = {}
+    talker._hidden = 8
+    talker._dtype = torch.float32
+    talker._speaker_name = "Aria"
+    talker.config = SimpleNamespace(tts_cfg={"inference_guidance_enabled": False})
+    return talker
+
+
+def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id: str = "req-0") -> dict:
+    return {
+        "request_id": request_id,
+        "additional_information": {
+            "ids": {"all": list(timeline)},
+            "meta": {
+                "num_processed_tokens": prompt_len,
+                "finished": torch.tensor(finished),
+                "request_id": request_id,
+            },
+        },
+    }
+
+
+def test_talker_drains_all_received_positions_per_wake() -> None:
+    """P2: chunk 0's PAD prompt region must not cost one upstream chunk per step,
+    and P1: a coalesced chunk (2+ new positions, 1 wake) must be fully drained."""
+    talker = _bare_talker()
+    pad, prompt_len = 12, 4
+    ids = torch.zeros(1, dtype=torch.long)
+
+    # Prefill wake: chunk 0 carries only the PAD prompt region.
+    info = _async_info([pad] * prompt_len, prompt_len, finished=False)
+    talker.preprocess(ids, None, _omni_is_prefill=True, **info)
+    session = talker._sessions["req-0"]
+    assert session["step"] == 1 and not session["sync_mode"]
+
+    # First decode wake: drains ALL prompt-region steps (t=1..P-1) at once.
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+    assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
+    assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
+    assert float(embeds[0, 0]) == 0.0  # not finished
+
+    # Coalesced chunk: TWO new frame tokens arrive in ONE wake (delayed save
+    # thread merged two thinker steps). Both must be consumed by this wake.
+    info2 = _async_info([pad] * prompt_len + [7, 8], prompt_len, finished=False)
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
+    assert session["step"] == prompt_len + 2
+    assert update["codes"]["audio"].shape == (prompt_len + 1, 31)
+    assert float(embeds[0, 0]) == 0.0
+
+    # Zero-progress wake (no new positions, not finished): plain CONTINUE, no
+    # fabricated frames, no codes update.
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
+    assert session["step"] == prompt_len + 2
+    assert update == {}
+    assert float(embeds[0, 0]) == 0.0
+
+    # Final chunk: one more token + finished marker -> drain + stop flag.
+    info3 = _async_info([pad] * prompt_len + [7, 8, 9], prompt_len, finished=True)
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info3)
+    assert session["step"] == prompt_len + 3
+    assert update["codes"]["audio"].shape == (prompt_len + 2, 31)
+    assert float(embeds[0, 0]) == 1.0  # stop
+
+
+def test_talker_sync_mode_steps_once_per_wake() -> None:
+    """The verified sync parity path keeps its one-TTS-step-per-engine-step cadence."""
+    talker = _bare_talker()
+    pad, prompt_len = 12, 3
+    ids = torch.zeros(1, dtype=torch.long)
+    info = {
+        "request_id": "req-1",
+        "additional_information": {
+            "nvc_text_timeline": [pad] * prompt_len + [7, 8],
+            "nvc_logical_prompt_len": prompt_len,
+        },
+    }
+    talker.preprocess(ids, None, _omni_is_prefill=True, **info)
+    session = talker._sessions["req-1"]
+    assert session["sync_mode"] and session["upstream_finished"]
+    for expected_step in (2, 3, 4):
+        _, embeds, _ = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+        assert session["step"] == expected_step
+    # Last position -> stop flag on the final step.
+    _, embeds, _ = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+    assert session["step"] == 5
+    assert float(embeds[0, 0]) == 1.0

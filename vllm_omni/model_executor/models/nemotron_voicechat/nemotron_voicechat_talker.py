@@ -291,9 +291,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             "tts_initialized": False,
             "generation_config": generation_config,
             "codes_rows": [],
-            # Async-chunk mode: the timeline grows across chunks and the last
-            # chunk sets meta.finished; sync mode ships the whole timeline up
-            # front (upstream_finished starts True and never matters).
+            # Sync mode ships the whole timeline up front via
+            # nvc_text_timeline; async-chunk mode grows it across chunks and
+            # the last chunk sets meta.finished.
+            "sync_mode": info.get("nvc_text_timeline") is not None,
             "upstream_finished": self._upstream_finished(info) or info.get("nvc_text_timeline") is not None,
         }
         self._sessions[request_id] = session
@@ -317,15 +318,14 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         t = int(session["step"])
         total = int(timeline.numel())
         if t >= total:
-            # Only reachable in async-chunk mode: the scheduler woke this
-            # request before the next thinker chunk delivered timeline[t].
-            # Hard-fail rather than fabricating a frame — a repeated/guessed
-            # subword would silently desync the audio from the text channel.
+            # The drain loop in preprocess never enters here; a direct call
+            # past the received timeline is a programming error. Hard-fail
+            # rather than fabricating a frame — a repeated/guessed subword
+            # would silently desync the audio from the text channel.
             raise RuntimeError(
-                f"NemotronVoiceChat talker outpaced the thinker stream: step {t} needs "
-                f"timeline position {t} but only {total} positions have arrived "
-                f"(upstream_finished={session['upstream_finished']}). The async-chunk "
-                "scheduler should have parked this request until the next chunk."
+                f"NemotronVoiceChat talker stepped past the received timeline: step {t} "
+                f"needs timeline position {t} but only {total} positions have arrived "
+                f"(upstream_finished={session['upstream_finished']})."
             )
         current_subword_id = timeline[t].reshape(1, 1)
         if not session["tts_initialized"]:
@@ -376,8 +376,33 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
 
         session = self._sessions[request_id]
         self._refresh_session_timeline(session, info, device)
-        codes_row, finished = self._step_session(session)
-        session["codes_rows"].append(codes_row.cpu())
+        # Sync mode: one NeMo TTS step per engine step (the verified parity
+        # path, unchanged). Async-chunk mode: DRAIN every received timeline
+        # position on each wake. The engine tokens are placeholders
+        # (CONTINUE/STOP) and the codes ride the cumulative payload, so
+        # multiple TTS steps per engine step are safe — and necessary:
+        #   * the save_async background thread can coalesce thinker steps into
+        #     one chunk (fewer wakes than new positions), and
+        #   * the prompt-region PAD steps (logical_prompt_len - 1 of them) all
+        #     become available with chunk 0 and must not cost one upstream
+        #     chunk each.
+        finished = False
+        steps_run = 0
+        while int(session["step"]) < int(session["timeline"].numel()):
+            codes_row, finished = self._step_session(session)
+            session["codes_rows"].append(codes_row.cpu())
+            steps_run += 1
+            if session["sync_mode"]:
+                break
+        if steps_run == 0:
+            # Zero-progress wake (duplicate/terminal-marker chunk): no TTS step
+            # was run, so emit a plain CONTINUE placeholder — never a
+            # fabricated frame. The request finishes only when the upstream is
+            # exhausted AND the timeline is fully consumed.
+            finished = bool(session["upstream_finished"])
+            if finished:
+                embeds[:, 0] = 1.0
+            return input_ids, embeds, {}
         cumulative = torch.cat(session["codes_rows"], dim=0)
         if finished:
             embeds[:, 0] = 1.0  # stop flag -> compute_logits emits the stop token
