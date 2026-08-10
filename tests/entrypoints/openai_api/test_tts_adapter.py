@@ -14,6 +14,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     ARTTSAdapter,
     DiffusionTTSAdapter,
     all_tts_model_types,
+    detect_tts_model_type,
     resolve_adapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
@@ -102,6 +103,7 @@ def test_indextts_adapters_are_versioned():
     assert resolve_adapter("indextts2") is IndexTTS2Adapter
     assert resolve_adapter("indextts2_5") is IndexTTS25Adapter
     assert IndexTTS25Adapter.stage_keys == frozenset({"indextts2_5_talker"})
+    assert detect_tts_model_type("indextts2_5_talker", None) == "indextts2_5"
 
 
 def test_indextts25_validates_explicit_language():
