@@ -2220,17 +2220,17 @@ class TestStreamingProtocolValidation:
         assert req.is_streaming() is False
 
     def test_stream_validation_errors(self):
-        """stream=True requires response_format in ('pcm', 'wav') and speed=1.0."""
+        """The request schema validates formats; model-aware speed checks happen in serving."""
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
-        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+        request = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+        assert request.speed == 2.0
 
     def test_stream_format_audio_validation_errors(self):
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="mp3")
-        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
-            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
+        request = OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
+        assert request.speed == 2.0
 
     def test_stream_valid(self):
         """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted as SSE."""
@@ -2313,6 +2313,18 @@ class TestStreamingResponse:
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        speech_server._tts_model_type = None
+        speech_server._adapter = None
+        speech_server._diffusion_mode = False
+        mocker.patch.object(speech_server, "_uses_native_speed_control", return_value=False)
+        mocker.patch.object(
+            speech_server,
+            "create_error_response",
+            side_effect=lambda message, **_: JSONResponse(
+                status_code=400,
+                content={"error": {"message": message}},
+            ),
+        )
 
         original_create_speech = speech_server.create_speech
         sig = signature(original_create_speech)
@@ -2327,6 +2339,7 @@ class TestStreamingResponse:
 
         app = FastAPI()
         app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        app.state.speech_server = speech_server
         return app
 
     @staticmethod
@@ -2434,6 +2447,39 @@ class TestStreamingResponse:
 
         assert response.status_code in (400, 422)
         assert "audio/" not in response.headers.get("content-type", "")
+
+    @pytest.mark.parametrize("stream_format", ["sse", "audio"])
+    def test_native_speed_control_accepts_streaming_speed(
+        self,
+        streaming_app,
+        mocker: MockerFixture,
+        stream_format: str,
+    ):
+        speech_server = streaming_app.state.speech_server
+        speech_server._tts_model_type = "indextts2_5"
+        speech_server._uses_native_speed_control.return_value = True
+
+        async def prepare(request, request_id=None, **kwargs):
+            del kwargs
+            generator = speech_server.engine_client.generate(prompt={}, request_id=request_id)
+            return request_id, generator, {"duration_factor": [1.0 / request.speed]}
+
+        mocker.patch.object(speech_server, "_prepare_speech_generation", side_effect=prepare)
+
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "input": "Hello",
+                "stream_format": stream_format,
+                "response_format": "pcm",
+                "speed": 2.0,
+            },
+        )
+
+        assert response.status_code == 200
+        expected_media_type = "text/event-stream" if stream_format == "sse" else "audio/pcm"
+        assert expected_media_type in response.headers["content-type"]
 
     @pytest.fixture
     def erroring_streaming_app(self, mocker: MockerFixture):

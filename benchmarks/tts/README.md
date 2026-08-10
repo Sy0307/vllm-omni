@@ -141,27 +141,31 @@ python benchmarks/tts/bench_tts.py \
 
 #### Fixed IndexTTS 2.5 performance sweep
 
-IndexTTS 2.5 has a dedicated driver because its native checkpoint bundle uses
-the bundled emotion-model tokenizer while serving accepts IndexTTS-specific
-`extra_params`. The defaults reproduce the H20 acceptance workload:
-Seed-TTS Eval EN, `n=500`, concurrency `4/8/16/32`, and dataset seed 0.
-Production-performance runs intentionally omit a request seed so vLLM can use
-its FlashInfer sampler.
+IndexTTS 2.5 is registered in `model_configs.yaml` like the other TTS models.
+Use `--served-model-name` when the server was launched from a local native
+bundle instead of the registry key. The command below reproduces the acceptance
+workload: Seed-TTS Eval EN, `n=500`, concurrency `4/8/16/32`, five warmups, and
+dataset seed 0.
 
 ```bash
-python benchmarks/tts/benchmark_indextts2_5.py \
-    --model /path/to/indextts-2.5 \
+python benchmarks/tts/bench_tts.py \
+    --model IndexTeam/IndexTTS-2.5 \
+    --served-model-name /path/to/indextts-2.5 \
+    --task voice_clone --locale en \
     --dataset-path /path/to/seedtts_testset \
     --host 127.0.0.1 --port 8092 \
-    --label baseline \
-    --output-dir ./results/indextts2_5
+    --concurrency 4 8 16 32 \
+    --num-prompts 500 --num-warmups 5 \
+    --output-dir ./results/indextts2_5 \
+    -- \
+    --tokenizer /path/to/indextts-2.5/qwen0.6bemo4-merge \
+    --seed 0 --metric-percentiles 50,95,99 --disable-tqdm --save-detailed
 ```
 
-The script benchmarks an already-running server. Use distinct labels when
-comparing server configurations. For reproducible quality comparisons, add
-`--request-seed 42`; this selects deterministic per-request sampling and is a
-separate mode from production performance. `--dataset-seed` only controls
-which Seed-TTS rows are selected.
+The wrapper benchmarks an already-running server. For reproducible quality
+comparisons, add `--request-seed 42`; production-performance runs should omit
+it. The trailing `--seed 0` controls Seed-TTS row selection rather than model
+sampling.
 
 ### 4. Plot a sweep
 
@@ -256,7 +260,6 @@ sentinel for regressions in this area.
 ```
 benchmarks/tts/
 ├── README.md                  (this file)
-├── benchmark_indextts2_5.py   Fixed Seed-TTS n=500 concurrency sweep
 ├── bench_tts.py               CLI — serve-mode benchmark driver
 ├── plot_results.py            Generate per-task / per-concurrency curves
 └── model_configs.yaml         Model registry (supported tasks + extra body)

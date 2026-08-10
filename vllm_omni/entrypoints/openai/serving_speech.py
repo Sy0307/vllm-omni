@@ -3639,7 +3639,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return response_format, self.create_error_response(
                 f"{mode_label} is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
             )
-        if request.speed is not None and request.speed != 1.0:
+        if request.speed is not None and request.speed != 1.0 and not self._uses_native_speed_control():
             return response_format, self.create_error_response(
                 f"{mode_label} is not supported with speed adjustment. "
                 "Use a non-streaming request or remove the speed parameter."

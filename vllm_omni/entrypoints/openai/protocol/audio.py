@@ -82,7 +82,7 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=(
             "Streaming switch; defaults to OpenAI speech.audio.* SSE events. "
             "Set stream_format='audio' to opt into raw pcm/wav byte streaming. "
-            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
+            "Requires response_format='pcm' or 'wav'. Models with native speed control may accept speed adjustment."
         ),
     )
 
@@ -317,8 +317,6 @@ class OpenAICreateSpeechRequest(BaseModel):
                 )
             if self.speed is None:
                 self.speed = 1.0
-            elif self.speed != 1.0:
-                raise ValueError("Speed adjustment is not supported when streaming. Set speed=1.0 or omit it.")
         return self
 
 
