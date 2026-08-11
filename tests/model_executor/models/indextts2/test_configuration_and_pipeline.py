@@ -22,6 +22,7 @@ def test_indextts25_defaults_are_distinct_from_v2():
     assert v2.gpt["condition_num_latent"] == 32
     assert v2.use_gpt_latent is True
     assert v2.semantic_codec_type == "repcodec"
+    assert v2.vocab_size == v2.gpt["number_mel_codes"]
 
     assert v25.model_type == "indextts2_5"
     assert v25.gpt["number_text_tokens"] == 60509
@@ -30,6 +31,7 @@ def test_indextts25_defaults_are_distinct_from_v2():
     assert v25.semantic_codec_type == "enhanced"
     assert v25.semantic_codec_checkpoint == "codec.pth"
     assert v25.tokenizer_file == "multilingual_zh_ja_yue_char_del.tiktoken"
+    assert v25.vocab_size == v25.gpt["number_mel_codes"]
 
 
 def test_indextts25_explicit_overrides_win_over_defaults():
@@ -39,12 +41,14 @@ def test_indextts25_explicit_overrides_win_over_defaults():
             "number_text_tokens": 70000,
             "condition_num_latent": 2,
         },
+        vocab_size=9000,
     )
 
     assert config.use_gpt_latent is True
     assert config.gpt["number_text_tokens"] == 70000
     assert config.gpt["condition_num_latent"] == 2
     assert config.gpt["model_dim"] == config.hidden_size
+    assert config.vocab_size == 9000
 
 
 def test_indextts25_pipeline_is_registered_with_two_distinct_stages():

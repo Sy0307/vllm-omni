@@ -152,6 +152,9 @@ class IndexTTS2Config(PretrainedConfig):
         for attr, default in defaults.items():
             if not hasattr(self, attr):
                 setattr(self, attr, default)
+        # vLLM kernel warmup reads the top-level vocabulary size even when
+        # tokenizer initialization is skipped for the audio-code model.
+        self.vocab_size = int(getattr(self, "vocab_size", 0) or self.gpt["number_mel_codes"])
         # Keep gpt.model_dim in sync with top-level hidden_size.
         if isinstance(self.gpt, dict) and self.gpt.get("model_dim") != self.hidden_size:
             self.gpt["model_dim"] = self.hidden_size
