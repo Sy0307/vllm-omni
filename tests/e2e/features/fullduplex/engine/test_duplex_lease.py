@@ -201,6 +201,7 @@ def test_completed_append_cache_is_bounded() -> None:
             fence=fence,
             mode=DuplexInputMode.TURN_COMMIT_ONLY,
             final=True,
+            input_seq=index + 1,
             stage_results=[{"index": index}],
         )
 

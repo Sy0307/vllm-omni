@@ -12,6 +12,7 @@ Categories under ``OmniPayload``:
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
@@ -353,17 +354,35 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
 
     t_cpu = t.detach().to("cpu").contiguous()
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=t_cpu.reshape(-1).view(torch.uint8).numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
-    arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-    arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    dtype_name = entry.tensor_dtype or "float32"
+    torch_dtype = getattr(torch, dtype_name, None)
+    if not isinstance(torch_dtype, torch.dtype):
+        raise ValueError(f"Unsupported tensor dtype: {dtype_name}")
+
+    shape = entry.tensor_shape or []
+    tensor_data = entry.tensor_data or b""
+    if any(type(dim) is not int or dim < 0 for dim in shape):
+        raise ValueError(f"Invalid tensor shape: {shape}")
+    expected_bytes = math.prod(shape) * torch.empty((), dtype=torch_dtype).element_size()
+    actual_bytes = len(tensor_data)
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            "tensor byte length mismatch: "
+            f"dtype={dtype_name}, shape={shape}, expected={expected_bytes}, "
+            f"actual={actual_bytes}"
+        )
+    if expected_bytes == 0:
+        return torch.empty(shape, dtype=torch_dtype)
+
+    storage = torch.frombuffer(bytearray(tensor_data), dtype=torch.uint8)
+    return storage.view(torch_dtype).reshape(shape).clone()
 
 
 def serialize_payload(

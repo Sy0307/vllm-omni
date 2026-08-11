@@ -20,6 +20,7 @@ from vllm_omni.experimental.fullduplex.engine.lease import (
     DuplexSessionExpiry,
 )
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.engine.model_events import DuplexOutputLedger
 
 
 def _default_capabilities() -> DuplexRuntimeCapabilities:
@@ -49,9 +50,7 @@ class DuplexRequestResource:
 
 @dataclass
 class DuplexInputAppend:
-    seq: int
-    turn_seq: int
-    turn_id: int
+    input_seq: int
 
 
 @dataclass(frozen=True)
@@ -60,8 +59,6 @@ class DuplexAppendReservation:
     mode: DuplexInputMode
     base_fence: DuplexFence
     base_input_seq: int
-    base_input_turn_seq: int
-    base_append_turn_key: tuple[int, int, int] | None
     update: DuplexInputAppend
 
 
@@ -70,6 +67,7 @@ class DuplexCompletedAppend:
     fence: DuplexFence
     mode: DuplexInputMode
     final: bool
+    input_seq: int
     stage_results: tuple[dict[str, object], ...]
 
 
@@ -87,14 +85,17 @@ class DuplexSessionRuntimeState:
     stage_bindings: dict[int, DuplexStageBinding] = field(default_factory=dict)
     request_resources: dict[tuple[int, str], DuplexRequestResource] = field(default_factory=dict)
     input_seq: int = 0
-    input_turn_seq: int = 0
-    _append_turn_key: tuple[int, int, int] | None = None
     completed_append_limit: int = 256
     completed_appends: OrderedDict[str, DuplexCompletedAppend] = field(default_factory=OrderedDict)
+    output_ledger: DuplexOutputLedger = field(init=False)
 
     def __post_init__(self) -> None:
         if self.completed_append_limit <= 0:
             raise ValueError("completed_append_limit must be positive")
+        self.output_ledger = DuplexOutputLedger(
+            self.fence,
+            completed_output_limit=self.completed_append_limit,
+        )
 
     @property
     def session_id(self) -> str:
@@ -104,27 +105,19 @@ class DuplexSessionRuntimeState:
     def epoch(self) -> int:
         return self.fence.epoch
 
-    @property
-    def turn_id(self) -> int:
-        return self.fence.turn_id
-
     def _validate_fence(self, fence: DuplexFence) -> None:
         if fence.session_id != self.session_id or fence.incarnation != self.fence.incarnation:
             raise DuplexFenceMismatchError(self.fence, fence)
         current = self.fence
-        if fence.epoch < current.epoch or (
-            fence.epoch == current.epoch
-            and (fence.turn_id < current.turn_id or fence.response_seq < current.response_seq)
-        ):
+        if fence.epoch < current.epoch:
             raise DuplexFenceMismatchError(current, fence)
 
     def accept_fence(self, fence: DuplexFence) -> None:
         self._validate_fence(fence)
         if fence.epoch != self.fence.epoch:
             self.input_seq = 0
-            self.input_turn_seq = 0
-            self._append_turn_key = None
             self.completed_appends.clear()
+            self.output_ledger.advance_epoch(fence)
         self.fence = fence
 
     def touch(self, fence: DuplexFence, activity: DuplexLeaseActivity) -> None:
@@ -236,40 +229,19 @@ class DuplexSessionRuntimeState:
             raise ValueError(f"Duplex input mode {mode.value!r} is not supported by session {self.session_id}")
         self._validate_fence(fence)
         input_seq = 0 if fence.epoch != self.fence.epoch else self.input_seq
-        input_turn_seq = 0 if fence.epoch != self.fence.epoch else self.input_turn_seq
-        append_turn_key = None if fence.epoch != self.fence.epoch else self._append_turn_key
-        turn_key = (fence.epoch, fence.turn_id, fence.response_seq)
-        turn_seq = input_turn_seq + 1 if turn_key == append_turn_key else 1
         return DuplexAppendReservation(
             fence=fence,
             mode=mode,
             base_fence=self.fence,
             base_input_seq=self.input_seq,
-            base_input_turn_seq=self.input_turn_seq,
-            base_append_turn_key=self._append_turn_key,
-            update=DuplexInputAppend(
-                seq=input_seq + 1,
-                turn_seq=turn_seq,
-                turn_id=fence.turn_id,
-            ),
+            update=DuplexInputAppend(input_seq=input_seq + 1),
         )
 
     def commit_append(self, reservation: DuplexAppendReservation) -> DuplexInputAppend:
-        if (
-            self.fence != reservation.base_fence
-            or self.input_seq != reservation.base_input_seq
-            or self.input_turn_seq != reservation.base_input_turn_seq
-            or self._append_turn_key != reservation.base_append_turn_key
-        ):
+        if self.fence != reservation.base_fence or self.input_seq != reservation.base_input_seq:
             raise RuntimeError("duplex append reservation is stale")
         self.accept_fence(reservation.fence)
-        self.input_seq = reservation.update.seq
-        self.input_turn_seq = reservation.update.turn_seq
-        self._append_turn_key = (
-            reservation.fence.epoch,
-            reservation.fence.turn_id,
-            reservation.fence.response_seq,
-        )
+        self.input_seq = reservation.update.input_seq
         return reservation.update
 
     def completed_append(
@@ -279,14 +251,14 @@ class DuplexSessionRuntimeState:
         fence: DuplexFence,
         mode: DuplexInputMode,
         final: bool,
-    ) -> list[dict[str, object]] | None:
+    ) -> DuplexCompletedAppend | None:
         self._validate_fence(fence)
         completed = self.completed_appends.get(operation_id)
         if completed is None:
             return None
         if completed.fence != fence or completed.mode != mode or completed.final != final:
             raise ValueError(f"duplex append operation {operation_id!r} was reused with different metadata")
-        return [dict(result) for result in completed.stage_results]
+        return completed
 
     def record_completed_append(
         self,
@@ -295,12 +267,14 @@ class DuplexSessionRuntimeState:
         fence: DuplexFence,
         mode: DuplexInputMode,
         final: bool,
+        input_seq: int,
         stage_results: list[dict[str, object]],
     ) -> None:
         self.completed_appends[operation_id] = DuplexCompletedAppend(
             fence=fence,
             mode=mode,
             final=final,
+            input_seq=input_seq,
             stage_results=tuple(dict(result) for result in stage_results),
         )
         self.completed_appends.move_to_end(operation_id)
@@ -337,12 +311,9 @@ class DuplexSessionRuntimeState:
             or next_fence.epoch <= cancelled_fence.epoch
         ):
             raise DuplexFenceMismatchError(cancelled_fence, next_fence)
-        current_key = (self.fence.epoch, self.fence.turn_id, self.fence.response_seq)
-        cancelled_key = (cancelled_fence.epoch, cancelled_fence.turn_id, cancelled_fence.response_seq)
-        next_key = (next_fence.epoch, next_fence.turn_id, next_fence.response_seq)
-        if cancelled_key > current_key:
+        if cancelled_fence.epoch > self.fence.epoch:
             raise DuplexFenceMismatchError(self.fence, cancelled_fence)
-        if next_key > current_key:
+        if next_fence.epoch > self.fence.epoch:
             self.accept_fence(next_fence)
         return self.resource_request_ids(cancelled_fence)
 

@@ -40,6 +40,8 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
     NativeRealtimeSessionProtocol,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexInputClearCommand,
+    DuplexInputFlushCommand,
     ServingRuntimeAdapter,
     ServingRuntimeConfigError,
     ServingRuntimeSessionState,
@@ -293,6 +295,7 @@ class OmniDuplexSessionHandler(
             payload_type == "response.listen" and session.active_response_id is not None
         )
         can_promote_overlap = response_terminal and terminal_status not in {"cancelled", "failed"}
+        input_controller = self._serving_runtime_adapter.input_controller
         deferred_overlap_payload: dict[str, object] | None = None
         continuous_input_crosses_terminal = (
             can_promote_overlap
@@ -323,7 +326,8 @@ class OmniDuplexSessionHandler(
             session.reset_overlap_speech()
             return True, None
         if can_promote_overlap and session.overlap_speech_ms > 0:
-            has_deferred_overlap = native.audio_buffer.has_pending() or native.committed_audio_payload is not None
+            input_state = input_controller.snapshot(native.input_state)
+            has_deferred_overlap = input_state.has_pending or native.committed_audio_payload is not None
             should_promote_overlap = (
                 session.state == DuplexSessionState.OPEN
                 and self._uses_native_input_append(session)
@@ -331,10 +335,14 @@ class OmniDuplexSessionHandler(
                 and session.overlap_speech_ms > session.config.overlap_short_ack_ms
             )
             if should_promote_overlap:
-                flushed_reserved_bytes = native.audio_buffer.pending_byte_count
-                deferred_overlap_payload = native.audio_buffer.flush(
-                    chunk_period_ms=session.capabilities.chunk_period_ms or 1000
+                flushed_reserved_bytes = input_state.pending_byte_count
+                flush_effect = input_controller.flush(
+                    native.input_state,
+                    DuplexInputFlushCommand(chunk_period_ms=(session.capabilities.chunk_period_ms or 1000)),
                 )
+                if len(flush_effect.append_payloads) > 1:
+                    raise RuntimeError("Duplex overlap promotion cannot collapse multiple ordered model inputs")
+                deferred_overlap_payload = flush_effect.append_payloads[0] if flush_effect.append_payloads else None
                 if native.committed_audio_payload is not None:
                     if deferred_overlap_payload is not None:
                         deferred_overlap_payload = self._merge_native_audio_payloads(
@@ -358,8 +366,12 @@ class OmniDuplexSessionHandler(
                     native.deferred_precreate_response = False
                     deferred_overlap_payload = None
             else:
-                had_pending_overlap_audio = native.audio_buffer.has_pending()
-                native.audio_buffer.clear()
+                had_pending_overlap_audio = input_state.has_pending
+                clear_effect = input_controller.clear(
+                    native.input_state,
+                    DuplexInputClearCommand(reason="overlap_discard"),
+                )
+                session.release_input_bytes(input_state.pending_byte_count + clear_effect.released_bytes)
                 native.input_since_commit = False
                 native.speech_since_commit = False
                 if had_pending_overlap_audio and realtime_protocol is not None:
@@ -1024,7 +1036,6 @@ class OmniDuplexSessionHandler(
                 fence=DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=session.turn_id,
                     incarnation=session.incarnation,
                 ),
                 expected_lease_generation=expected_generation,
@@ -1149,34 +1160,12 @@ class OmniDuplexSessionHandler(
             dict(session.runtime_config),
         )
 
-    def _runtime_session_candidate_update_error(
-        self,
-        session: DuplexSession,
-        candidate_config: DuplexSessionConfig,
-    ) -> dict[str, object] | None:
-        if not self._uses_native_input_append(session):
-            return None
-        if not self._config_requests_audio_output(candidate_config):
-            return None
-        if "ref_audio_data" in session.runtime_config:
-            return None
-        return {
-            "type": "error",
-            "session_id": session.session_id,
-            "code": "ref_audio_required",
-            "error": "MiniCPM-o native duplex audio output requires ref_audio",
-        }
-
     @staticmethod
     def _uses_native_input_append(session: DuplexSession) -> bool:
         return (
             session.capabilities.implementation_level == "model_native_duplex"
             and session.capabilities.supports_input_append
         )
-
-    @staticmethod
-    def _config_requests_audio_output(config: DuplexSessionConfig) -> bool:
-        return any(str(modality).lower() == "audio" for modality in config.modalities)
 
     @staticmethod
     def _native_stage0_request_id(session: DuplexSession, epoch: int) -> str:

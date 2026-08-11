@@ -281,6 +281,47 @@ def test_resolve_pooler_payload_req_ids_text_terminal_stage_drops_payload():
     assert payload_req_ids == []
 
 
+def test_terminal_text_stage_drops_client_multimodal_outputs_by_default():
+    runner = _make_runner(engine_output_type="text", downstream_req_ids=set())
+
+    payloads = GPUARModelRunner._build_multimodal_outputs(
+        runner,
+        [
+            {"function_tokens": torch.tensor([11])},
+            {"function_tokens": torch.tensor([22])},
+        ],
+    )
+
+    assert payloads is None
+
+
+def test_terminal_text_model_can_retain_payload_request_ids():
+    runner = _make_runner(engine_output_type="text", downstream_req_ids=set())
+    runner.model = SimpleNamespace(omni_client_multimodal_output_keys=("function_tokens",))
+
+    engine_output_type, payload_req_ids = GPUARModelRunner._resolve_pooler_payload_req_ids(runner, ["r1", "r2"])
+
+    assert engine_output_type == "text"
+    assert payload_req_ids == ["r1", "r2"]
+
+
+def test_terminal_text_model_can_emit_per_request_client_multimodal_outputs():
+    runner = _make_runner(engine_output_type="text", downstream_req_ids=set())
+    runner.model = SimpleNamespace(omni_client_multimodal_output_keys=("function_tokens",))
+
+    payloads = GPUARModelRunner._build_multimodal_outputs(
+        runner,
+        [
+            {"function_tokens": torch.tensor([11])},
+            {"function_tokens": torch.tensor([22])},
+        ],
+    )
+
+    assert payloads is not None
+    assert payloads[0]["function_tokens"].tolist() == [11]
+    assert payloads[1]["function_tokens"].tolist() == [22]
+
+
 def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests():
     runner = _make_runner(engine_output_type="latent", downstream_req_ids={"r2"})
 
@@ -1052,6 +1093,62 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
     assert output.inter_stage_outputs is not None
     assert "hidden" in output.inter_stage_outputs[0]
     assert "audio" not in output.inter_stage_outputs[0]
+
+
+def test_terminal_text_model_opt_in_keeps_nonstandard_client_payload(monkeypatch):
+    """A model-owned terminal side channel must not be discarded merely
+    because its key is not one of the built-in audio/image client roots."""
+    runner = _make_async_output_runner(engine_output_type="text")
+    runner.model = SimpleNamespace(
+        has_postprocess=False,
+        omni_client_multimodal_output_keys=("function_tokens",),
+        omni_pooler_payload_include_hidden=False,
+    )
+    runner._request_needs_downstream_stage_payload = lambda _rid: False
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_should_accumulate_full_payload_output",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "get_omni_connector_output",
+        lambda self: None,
+    )
+
+    function_tokens = torch.tensor([11, 22], dtype=torch.long)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"r1": 1, "r2": 1},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={
+            "function_tokens": function_tokens,
+            "private_state": torch.tensor([31, 32], dtype=torch.long),
+        },
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101], [102]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    assert output.multimodal_outputs is not None
+    assert output.multimodal_outputs[0]["function_tokens"].tolist() == [11]
+    assert output.multimodal_outputs[1]["function_tokens"].tolist() == [22]
+    assert "private_state" not in output.multimodal_outputs[0]
+    assert "private_state" not in output.multimodal_outputs[1]
 
 
 def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkeypatch):

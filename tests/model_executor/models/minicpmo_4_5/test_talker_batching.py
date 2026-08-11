@@ -145,9 +145,9 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
         {
             "request_id": "req-a",
             "native_duplex": True,
-            "duplex": {"epoch": 3, "turn_id": 7},
             "ids": {"tts": [41]},
             "meta": {
+                "duplex_execution_id": 7,
                 "native_duplex_segment_text": "first",
                 "turn_eos_token_id": 99,
             },
@@ -156,9 +156,9 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
         {
             "request_id": "req-b",
             "native_duplex": True,
-            "duplex": {"epoch": 4, "turn_id": 8},
             "ids": {"tts": [42, 99]},
             "meta": {
+                "duplex_execution_id": 8,
                 "native_duplex_segment_text": "second",
                 "turn_eos_token_id": 99,
             },
@@ -174,17 +174,18 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
 
     meta = output.multimodal_outputs["meta"]
     assert [value.item() for value in meta["native_duplex"]] == [True, True]
-    assert [value.item() for value in meta["duplex_epoch"]] == [3, 4]
-    assert [value.item() for value in meta["duplex_turn_id"]] == [7, 8]
+    assert [value.item() for value in meta["duplex_execution_id"]] == [7, 8]
+    assert "duplex_epoch" not in meta
+    assert "duplex_turn_id" not in meta
     assert "native_duplex_segment_text" not in meta
     assert [bytes(value.tolist()).decode("utf-8") for value in meta["llm_output_text_utf8"]] == [
         "first",
         "second",
     ]
-    assert [value.item() for value in meta["turn_end"]] == [False, True]
+    assert [value.item() for value in meta["duplex_speech_end"]] == [False, True]
 
 
-def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:
+def test_talker_rejects_native_duplex_without_execution_identity(mocker) -> None:
     talker = _make_talker()
     mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(2))
     info = {
@@ -193,7 +194,7 @@ def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:
         "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
     }
 
-    with pytest.raises(RuntimeError, match="requires non-negative integer epoch and turn_id"):
+    with pytest.raises(RuntimeError, match="requires non-negative integer duplex_execution_id"):
         talker.make_omni_output(
             torch.ones(1, 2),
             model_intermediate_buffer=[info],
@@ -382,7 +383,7 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
     [
         ({"turn_start": True}, 0),
         ({}, 26),
-        ({"turn_end": True}, 0),
+        ({"duplex_speech_end": True}, 0),
     ],
 )
 def test_native_duplex_prefill_uses_official_chunk_limits(

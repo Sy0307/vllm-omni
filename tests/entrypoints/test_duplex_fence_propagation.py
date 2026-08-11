@@ -53,7 +53,7 @@ async def test_async_omni_forwards_fence_for_all_runtime_operations():
     app.engine = engine
     app.request_states = {}
     app._final_output_handler = lambda: None
-    fence = DuplexFence("sid", epoch=1, turn_id=2)
+    fence = DuplexFence("sid", epoch=1)
 
     await app.open_duplex_session_async("sid", fence=fence)
     await app.append_duplex_input_async(
@@ -76,7 +76,7 @@ async def test_openai_handler_passes_current_session_fence_for_runtime_controls(
         turn_id=2,
     )
     ws = TimedWebSocket()
-    fence = DuplexFence("sid", epoch=1, turn_id=2)
+    fence = DuplexFence("sid", epoch=1)
 
     await handler._open_runtime_session(session, ws.send_json)
     await handler._signal_runtime_session(session, "turn.end", send_json=ws.send_json)
@@ -86,11 +86,11 @@ async def test_openai_handler_passes_current_session_fence_for_runtime_controls(
 
 
 @pytest.mark.asyncio
-async def test_runtime_signal_uses_fence_captured_before_session_turn_advances():
+async def test_runtime_signal_uses_fence_captured_before_output_progress():
     engine = FenceRecordingEngine()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     session = DuplexSession(session_id="sid", config=DuplexSessionConfig())
-    captured_fence = DuplexFence("sid", epoch=0, turn_id=0)
+    captured_fence = DuplexFence("sid", epoch=0)
     session.turn_id = 1
 
     await handler._signal_runtime_session(
@@ -109,8 +109,8 @@ async def test_openai_handler_forwards_cancel_fence_through_async_omni_facade():
     app.engine = engine
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(app))
     session = DuplexSession(session_id="sid-cancel", config=DuplexSessionConfig())
-    cancelled_fence = DuplexFence("sid-cancel", epoch=2, turn_id=3)
-    next_fence = DuplexFence("sid-cancel", epoch=3, turn_id=3)
+    cancelled_fence = DuplexFence("sid-cancel", epoch=2)
+    next_fence = DuplexFence("sid-cancel", epoch=3)
 
     assert await handler._signal_runtime_session(
         session,

@@ -16,10 +16,18 @@ class DuplexFence:
     """Identity fence carried by experimental duplex control messages."""
 
     session_id: str
-    epoch: int = 0
-    turn_id: int = 0
-    response_seq: int = 0
     incarnation: int = 0
+    epoch: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        for name in ("incarnation", "epoch"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be a plain integer")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
 
 
 class OpenDuplexSessionMessage(EngineQueueMessage, kw_only=True):

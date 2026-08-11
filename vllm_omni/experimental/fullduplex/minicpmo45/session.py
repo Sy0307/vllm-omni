@@ -7,6 +7,12 @@ from dataclasses import dataclass, field
 from vllm_omni.experimental.fullduplex.minicpmo45.input import (
     MiniCPMO45PcmAppendBuffer,
 )
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexActiveOutputContinuation as ActiveOutputContinuation,
+)
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexPendingInputContinuation as PendingInputContinuation,
+)
 
 
 @dataclass(slots=True)
@@ -23,10 +29,10 @@ class MiniCPMO45ServingSessionState:
     deferred_precreate_response: bool = False
     data_plane_task: asyncio.Task[None] | None = None
     data_plane_restart_requested: bool = False
-    continuation_owner_id: str | None = None
+    pending_input_continuation: PendingInputContinuation | None = None
+    active_output_continuation: ActiveOutputContinuation | None = None
     continuation_units: int = 0
     pending_silence_task: asyncio.Task[bool] | None = None
-    pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
 
     def retain_committed_audio(
@@ -50,7 +56,7 @@ class MiniCPMO45ServingSessionState:
         return reserved_bytes
 
     def clear_continuation(self) -> None:
-        self.continuation_owner_id = None
+        self.pending_input_continuation = None
+        self.active_output_continuation = None
         self.continuation_units = 0
         self.pending_silence_task = None
-        self.pending_silence_owner_id = None

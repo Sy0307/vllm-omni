@@ -19,7 +19,7 @@ from vllm_omni.data_entry_keys import (
     to_struct,
     unflatten_payload,
 )
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -372,12 +372,61 @@ class TestSerializeDeserializePayload:
         assert torch.equal(restored["hidden_states"]["layers"][24], torch.tensor([3.0]))
 
     def test_tensor_dtype_preserved(self):
-        # bfloat16 excluded: numpy() doesn't support it; callers must cast before serializing.
-        for dtype in [torch.float16, torch.float32, torch.int64, torch.int32, torch.bool]:
+        for dtype in [
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.int64,
+            torch.int32,
+            torch.bool,
+        ]:
             original: OmniPayload = {"codes": {"audio": torch.tensor([1], dtype=dtype)}}
             wire = serialize_payload(original)
             restored = deserialize_payload(wire)
             assert restored["codes"]["audio"].dtype == dtype, f"dtype mismatch for {dtype}"
+            assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.int64,
+        ],
+    )
+    def test_rank_zero_tensor_round_trip(self, dtype: torch.dtype):
+        original: OmniPayload = {"hidden_states": {"output": torch.tensor(1, dtype=dtype)}}
+
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+
+        output = restored["hidden_states"]["output"]
+        assert output.shape == torch.Size([])
+        assert output.dtype == dtype
+        assert torch.equal(output, original["hidden_states"]["output"])
+
+    def test_deserialize_rejects_tensor_byte_length_mismatch(self):
+        wire = AdditionalInformationPayload(
+            entries={
+                "hidden_states.output": AdditionalInformationEntry(
+                    tensor_data=b"",
+                    tensor_shape=[4],
+                    tensor_dtype="float32",
+                )
+            }
+        )
+
+        with pytest.raises(ValueError, match="tensor byte length mismatch"):
+            deserialize_payload(wire)
+
+    def test_empty_bfloat16_tensor_preserved(self):
+        original: OmniPayload = {"hidden_states": {"output": torch.empty((0, 4), dtype=torch.bfloat16)}}
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+        output = restored["hidden_states"]["output"]
+        assert output.shape == (0, 4)
+        assert output.dtype == torch.bfloat16
 
     def test_tensor_shape_preserved(self):
         t = torch.randn(3, 4, 5)

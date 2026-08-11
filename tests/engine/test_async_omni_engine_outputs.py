@@ -242,8 +242,8 @@ def test_open_duplex_session_waits_for_control_ack(mocker: MockerFixture):
 def test_signal_duplex_turn_message_carries_next_fence(mocker: MockerFixture):
     request_q = queue.Queue()
     rpc_q = queue.Queue()
-    cancelled_fence = DuplexFence("sid-cancel", epoch=4, turn_id=2)
-    next_fence = DuplexFence("sid-cancel", epoch=5, turn_id=2)
+    cancelled_fence = DuplexFence("sid-cancel", epoch=4)
+    next_fence = DuplexFence("sid-cancel", epoch=5)
     control_result = DuplexControlResultMessage(
         control_id="ctrl-signal",
         fence=cancelled_fence,

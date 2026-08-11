@@ -5,6 +5,8 @@ from uuid import uuid4
 
 from vllm_omni.experimental.fullduplex.openai.audio import convert_output_audio
 from vllm_omni.experimental.fullduplex.openai.realtime_state import (
+    _RealtimeFunctionCallState,
+    _RealtimeInputTranscriptionState,
     _RealtimeResponseState,
 )
 
@@ -226,6 +228,14 @@ class RealtimeOutputProjector:
                 payloads.append(transcription_event)
             payloads.append(self._conversation_item_done_event(item))
             return payloads
+        if event_type == "input.transcript.delta":
+            return self._model_input_transcription_events(event)
+        if event_type == "function_call.start":
+            return self._model_function_call_start_events(event)
+        if event_type == "function_call.delta":
+            return self._model_function_call_delta_events(event)
+        if event_type == "function_call.done":
+            return self._model_function_call_done_events(event)
         if event_type == "input.cancelled":
             return [{"type": "input_audio_buffer.cleared"}]
         if event_type == "input_audio_buffer.cleared":
@@ -356,6 +366,198 @@ class RealtimeOutputProjector:
         if event_type == "session.closed":
             return [{"type": "session.closed", "event": event}]
         return [{"type": f"duplex.{event_type}", "event": event}]
+
+    def _model_input_transcription_events(
+        self,
+        event: dict[str, Any],
+    ) -> list[dict[str, object]]:
+        session_id = event.get("session_id")
+        epoch = event.get("epoch")
+        source_input_seq = event.get("source_input_seq")
+        if not isinstance(session_id, str) or not isinstance(epoch, int) or not isinstance(source_input_seq, int):
+            return [{"type": "duplex.input.transcript.delta", "event": event}]
+        key = (session_id, epoch, source_input_seq)
+        state = self._model_input_transcriptions.get(key)
+        payloads: list[dict[str, object]] = []
+        if state is None:
+            state = _RealtimeInputTranscriptionState(
+                item_id=f"item_{uuid4().hex}",
+            )
+            self._model_input_transcriptions[key] = state
+            item = {
+                "id": state.item_id,
+                "object": "realtime.item",
+                "type": "message",
+                "role": "user",
+                "status": "in_progress",
+                "content": [{"type": "input_audio", "transcript": ""}],
+            }
+            self._conversation_items[state.item_id] = item
+            payloads.extend(self._conversation_item_added_events(item))
+        if state.completed:
+            return payloads
+
+        delta = event.get("delta")
+        if isinstance(delta, str) and delta:
+            state.transcript_parts.append(delta)
+            payloads.append(
+                {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": state.item_id,
+                    "content_index": 0,
+                    "delta": delta,
+                }
+            )
+        item = self._conversation_items[state.item_id]
+        content = item["content"]
+        assert isinstance(content, list) and isinstance(content[0], dict)
+        content[0]["transcript"] = state.transcript
+        if event.get("final") is True:
+            state.completed = True
+            item["status"] = "completed"
+            payloads.append(
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": state.item_id,
+                    "content_index": 0,
+                    "transcript": state.transcript,
+                }
+            )
+            payloads.append(self._conversation_item_done_event(item))
+        return payloads
+
+    @staticmethod
+    def _model_function_call_key(
+        event: dict[str, Any],
+    ) -> tuple[str, int, str] | None:
+        session_id = event.get("session_id")
+        epoch = event.get("epoch")
+        call_id = event.get("call_id")
+        if not isinstance(session_id, str) or not isinstance(epoch, int) or not isinstance(call_id, str) or not call_id:
+            return None
+        return session_id, epoch, call_id
+
+    def _model_function_call_start_events(
+        self,
+        event: dict[str, Any],
+    ) -> list[dict[str, object]]:
+        key = self._model_function_call_key(event)
+        name = event.get("name")
+        if key is None or not isinstance(name, str) or not name:
+            return [{"type": "duplex.function_call.start", "event": event}]
+        existing = self._model_function_calls.get(key)
+        if existing is not None:
+            return []
+        state = _RealtimeFunctionCallState(
+            response_id=f"resp_{uuid4().hex}",
+            item_id=f"item_{uuid4().hex}",
+            call_id=key[2],
+            name=name,
+        )
+        self._model_function_calls[key] = state
+        item = self._function_call_item(state, status="in_progress")
+        self._conversation_items[state.item_id] = item
+        response = {
+            "id": state.response_id,
+            "object": "realtime.response",
+            "status": "in_progress",
+            "status_details": None,
+            "output": [],
+            "metadata": {
+                "source_input_seq": event.get("source_input_seq"),
+            },
+        }
+        return [
+            {"type": "response.created", "response": response},
+            *self._conversation_item_added_events(item),
+            {
+                "type": "response.output_item.added",
+                "response_id": state.response_id,
+                "output_index": 0,
+                "item": dict(item),
+            },
+        ]
+
+    def _model_function_call_delta_events(
+        self,
+        event: dict[str, Any],
+    ) -> list[dict[str, object]]:
+        key = self._model_function_call_key(event)
+        state = self._model_function_calls.get(key) if key is not None else None
+        delta = event.get("delta")
+        if state is None or state.completed or not isinstance(delta, str):
+            return []
+        state.argument_parts.append(delta)
+        item = self._conversation_items.get(state.item_id)
+        if item is not None:
+            item["arguments"] = state.arguments
+        return [
+            {
+                "type": "response.function_call_arguments.delta",
+                "response_id": state.response_id,
+                "item_id": state.item_id,
+                "output_index": 0,
+                "call_id": state.call_id,
+                "delta": delta,
+            }
+        ]
+
+    def _model_function_call_done_events(
+        self,
+        event: dict[str, Any],
+    ) -> list[dict[str, object]]:
+        key = self._model_function_call_key(event)
+        state = self._model_function_calls.get(key) if key is not None else None
+        if state is None or state.completed:
+            return []
+        state.completed = True
+        item = self._function_call_item(state, status="completed")
+        self._conversation_items[state.item_id] = item
+        response = {
+            "id": state.response_id,
+            "object": "realtime.response",
+            "status": "completed",
+            "status_details": {
+                "type": "completed",
+                "reason": event.get("reason") or "completed",
+            },
+            "output": [dict(item)],
+            "metadata": {},
+        }
+        return [
+            {
+                "type": "response.function_call_arguments.done",
+                "response_id": state.response_id,
+                "item_id": state.item_id,
+                "output_index": 0,
+                "call_id": state.call_id,
+                "arguments": state.arguments,
+            },
+            {
+                "type": "response.output_item.done",
+                "response_id": state.response_id,
+                "output_index": 0,
+                "item": dict(item),
+            },
+            self._conversation_item_done_event(item),
+            {"type": "response.done", "response": response},
+        ]
+
+    @staticmethod
+    def _function_call_item(
+        state: _RealtimeFunctionCallState,
+        *,
+        status: str,
+    ) -> dict[str, object]:
+        return {
+            "id": state.item_id,
+            "object": "realtime.item",
+            "type": "function_call",
+            "status": status,
+            "name": state.name,
+            "call_id": state.call_id,
+            "arguments": state.arguments,
+        }
 
     @staticmethod
     def _user_item_content_from_duplex_message(message: object) -> list[dict[str, object]]:

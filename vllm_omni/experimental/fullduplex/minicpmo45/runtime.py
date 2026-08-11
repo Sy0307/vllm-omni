@@ -102,14 +102,13 @@ def build_duplex_data_plane_prompt(
     fence: DuplexFence,
     session_config: dict[str, Any],
     runtime_config: dict[str, Any],
-    seq: int,
-    turn_seq: int,
+    input_seq: int,
     mode: DuplexInputMode,
     payload: object,
     final: bool,
 ) -> dict[str, Any]:
     token_budget = duplex_scheduler_token_budget(payload)
-    if seq <= 1:
+    if input_seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
@@ -117,7 +116,7 @@ def build_duplex_data_plane_prompt(
             token_budget = (
                 context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
             )
-    if seq > 1 and duplex_payload_is_exact_chunks(payload):
+    if input_seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
     if final and duplex_payload_is_exact_chunks(payload):
         token_budget += 12
@@ -130,7 +129,7 @@ def build_duplex_data_plane_prompt(
     force_listen_count = _duplex_force_listen_count(extra_body)
     if (
         force_listen_count > 0
-        and turn_seq <= force_listen_count
+        and input_seq <= force_listen_count
         and isinstance(payload, dict)
         and payload.get("force_listen") is not True
     ):
@@ -145,10 +144,7 @@ def build_duplex_data_plane_prompt(
                 "session_id": fence.session_id,
                 "incarnation": fence.incarnation,
                 "epoch": fence.epoch,
-                "seq": seq,
-                "turn_id": fence.turn_id,
-                "response_seq": fence.response_seq,
-                "turn_seq": turn_seq,
+                "input_seq": input_seq,
                 "mode": mode.value,
                 "payload": payload,
                 "final": final,
@@ -279,8 +275,7 @@ class MiniCPMO45DuplexRuntimeExtension:
         fence: DuplexFence,
         session_config: dict[str, Any],
         runtime_config: dict[str, Any],
-        seq: int,
-        turn_seq: int,
+        input_seq: int,
         mode: DuplexInputMode,
         payload: object,
         final: bool,
@@ -293,8 +288,7 @@ class MiniCPMO45DuplexRuntimeExtension:
                 fence=fence,
                 session_config=session_config,
                 runtime_config=runtime_config,
-                seq=seq,
-                turn_seq=turn_seq,
+                input_seq=input_seq,
                 mode=mode,
                 payload=payload,
                 final=final,

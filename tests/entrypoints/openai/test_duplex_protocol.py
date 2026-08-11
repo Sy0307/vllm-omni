@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 
 import pytest
@@ -319,6 +320,28 @@ def test_native_input_commit_does_not_advance_model_turn_identity():
     assert first.turn_id == second.turn_id == session.turn_id == 0
 
 
+def test_duplex_response_lifecycle_is_output_owned_not_model_turn_owned():
+    session = DuplexSession(
+        session_id="sid-output-owned-response",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+
+    response_id = session.begin_response(output_id="o7")
+    session.commit_native_audio_input(transcript="input committed while output is active")
+
+    assert session.response_for_output("o7") == response_id
+    assert session.active_response_id == response_id
+    assert session.active_output_id == "o7"
+    assert "turn_id" not in inspect.signature(session.begin_response).parameters
+    for obsolete_model_turn_api in (
+        "active_response_turn_id",
+        "bind_response_turn",
+        "active_response_accepts_model_turn",
+        "complete_model_turn",
+    ):
+        assert not hasattr(session, obsolete_model_turn_api)
+
+
 def test_duplex_session_owns_response_and_overlap_identity():
     session = DuplexSession(session_id="sid-state-owner", config=DuplexSessionConfig())
 
@@ -339,7 +362,7 @@ def test_duplex_session_composes_single_owner_ledgers():
 
     session.append_text("hello")
     session.bind_request("req-1")
-    response_id = session.begin_response(turn_id=3)
+    response_id = session.begin_response()
     session.mark_audio_sent(duration_ms=240)
 
     assert not hasattr(session, "input")
@@ -349,7 +372,6 @@ def test_duplex_session_composes_single_owner_ledgers():
     assert session.pending_text == ("hello",)
     assert session.active_request_id == "req-1"
     assert session.active_response_id == response_id
-    assert session.active_response_turn_id == 3
     assert session.playback.sent_ms == 240
 
     try:

@@ -11,6 +11,7 @@ serving remain in sibling experimental modules.
 from __future__ import annotations
 
 import base64
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -45,6 +46,29 @@ class DuplexRuntimeCapabilities:
     implementation_level: str = "serving_session_adapter"
 
 
+@dataclass(frozen=True, slots=True)
+class DuplexExecutionProfile:
+    """Optional observability and prewarm hints for one duplex model."""
+
+    prewarm_batch_sizes: tuple[int, ...] = ()
+    step_latency_budget_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prewarm_batch_sizes, tuple):
+            raise TypeError("prewarm_batch_sizes must be a tuple")
+        if any(type(size) is not int or size <= 0 for size in self.prewarm_batch_sizes):
+            raise ValueError("prewarm_batch_sizes must contain positive integers")
+        if len(self.prewarm_batch_sizes) != len(set(self.prewarm_batch_sizes)):
+            raise ValueError("prewarm_batch_sizes must not contain duplicates")
+        if self.step_latency_budget_ms is not None and (
+            not isinstance(self.step_latency_budget_ms, int | float)
+            or isinstance(self.step_latency_budget_ms, bool)
+            or not math.isfinite(float(self.step_latency_budget_ms))
+            or self.step_latency_budget_ms <= 0
+        ):
+            raise ValueError("step_latency_budget_ms must be a positive finite number or null")
+
+
 @dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, Any]
@@ -77,8 +101,7 @@ class DuplexRuntimeExtension(Protocol):
         fence: DuplexFence,
         session_config: dict[str, Any],
         runtime_config: dict[str, Any],
-        seq: int,
-        turn_seq: int,
+        input_seq: int,
         mode: DuplexInputMode,
         payload: object,
         final: bool,
@@ -130,9 +153,12 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, Any]
     already_submitted: bool
+    source_input_seq: int
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
+        if type(self.source_input_seq) is not int or self.source_input_seq < 0:
+            raise ValueError("source_input_seq must be a non-negative plain integer")
 
 
 @dataclass(frozen=True)
@@ -147,10 +173,13 @@ class DuplexOutputContext:
     identity: DuplexRequestIdentity
     final_stage_id: int
     segment_finished: bool
+    source_input_seq: int
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if type(self.source_input_seq) is not int or self.source_input_seq < 0:
+            raise ValueError("source_input_seq must be a non-negative plain integer")
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
         object.__setattr__(
             self,
@@ -258,6 +287,7 @@ __all__ = [
     "CorrelatedRpcTransport",
     "DuplexAppendPlan",
     "DuplexControlPlanePort",
+    "DuplexExecutionProfile",
     "DuplexInputMode",
     "DuplexOutputAction",
     "DuplexOutputContext",

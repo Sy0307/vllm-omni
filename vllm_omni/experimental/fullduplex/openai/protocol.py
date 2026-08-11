@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -384,7 +385,10 @@ class InputBufferState:
 class ResponseState:
     active_request_id: str | None = None
     active_response_id: str | None = None
-    active_response_turn_id: int | None = None
+    active_output_id: str | None = None
+    active_output_next_seq: int = 0
+    output_to_response: dict[str, str] = field(default_factory=dict)
+    completed_output_next_seq: OrderedDict[str, int] = field(default_factory=OrderedDict)
     last_response_id: str | None = None
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
@@ -472,8 +476,8 @@ class DuplexSession:
         return self._response.active_response_id
 
     @property
-    def active_response_turn_id(self) -> int | None:
-        return self._response.active_response_turn_id
+    def active_output_id(self) -> str | None:
+        return self._response.active_output_id
 
     @property
     def last_response_id(self) -> str | None:
@@ -540,17 +544,6 @@ class DuplexSession:
             return False
         self._response.active_request_id = None
         return True
-
-    def bind_response_turn(self, turn_id: int | None) -> None:
-        self._response.active_response_turn_id = turn_id
-
-    def active_response_accepts_model_turn(self, turn_id: int | None) -> bool:
-        if self._response.active_response_id is None:
-            return False
-        if turn_id is None:
-            return True
-        active_turn_id = self._response.active_response_turn_id
-        return active_turn_id is None or int(turn_id) == active_turn_id
 
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
@@ -686,12 +679,6 @@ class DuplexSession:
             input_commit_seq=self._input.commit_seq,
         )
 
-    def complete_model_turn(self, turn_id: int) -> None:
-        """Advance the model-owned output identity after its terminal signal."""
-        completed_turn_id = int(turn_id)
-        if completed_turn_id >= self.turn_id:
-            self.turn_id = completed_turn_id + 1
-
     def reserve_response_options(self, options: ResponseCreateOptions) -> None:
         if self._response.active_response_id is not None:
             raise RuntimeError("response options cannot be reserved while a response is active")
@@ -715,11 +702,23 @@ class DuplexSession:
         self._response.active_options = None
         self._response.pending_options = None
 
-    def begin_response(self, *, turn_id: int | None = None) -> str:
+    def begin_response(
+        self,
+        *,
+        output_id: str | None = None,
+    ) -> str:
+        if output_id is not None:
+            if not isinstance(output_id, str) or not output_id.strip():
+                raise ValueError("output_id must be a non-empty string")
+            if self._response.active_output_id is not None:
+                raise RuntimeError(f"duplex output {self._response.active_output_id!r} is already active")
         self._activate_response_options()
         response_id = f"resp-{self.session_id}-{self.epoch}-{uuid4().hex[:8]}"
         self._response.active_response_id = response_id
-        self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
+        self._response.active_output_id = output_id
+        self._response.active_output_next_seq = 0
+        if output_id is not None:
+            self._response.output_to_response[output_id] = response_id
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
@@ -730,6 +729,28 @@ class DuplexSession:
         self._playback.by_response[response_id] = self._playback.current
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
         return response_id
+
+    def response_for_output(self, output_id: str) -> str | None:
+        return self._response.output_to_response.get(output_id)
+
+    def output_is_completed(self, output_id: str) -> bool:
+        return output_id in self._response.completed_output_next_seq
+
+    def accept_output_chunk(self, output_id: str, output_seq: int) -> bool:
+        completed_next_seq = self._response.completed_output_next_seq.get(output_id)
+        if completed_next_seq is not None:
+            if output_seq < completed_next_seq:
+                return False
+            raise RuntimeError(f"duplex output chunk arrived after end: output_id={output_id!r}")
+        if self._response.active_output_id != output_id:
+            raise RuntimeError(f"duplex chunk references unknown output: output_id={output_id!r}")
+        expected = self._response.active_output_next_seq
+        if output_seq < expected:
+            return False
+        if output_seq > expected:
+            raise RuntimeError(f"duplex output chunk sequence gap: expected={expected}, actual={output_seq}")
+        self._response.active_output_next_seq += 1
+        return True
 
     def _clear_response_metrics(self) -> None:
         self._response.stage_metrics.clear()
@@ -934,8 +955,16 @@ class DuplexSession:
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
             self._response.active_request_id = None
+        active_output_id = self._response.active_output_id
+        if active_output_id is not None:
+            self._response.completed_output_next_seq[active_output_id] = self._response.active_output_next_seq
+            self._response.completed_output_next_seq.move_to_end(active_output_id)
+            while len(self._response.completed_output_next_seq) > 256:
+                stale_output_id, _ = self._response.completed_output_next_seq.popitem(last=False)
+                self._response.output_to_response.pop(stale_output_id, None)
         self._response.active_response_id = None
-        self._response.active_response_turn_id = None
+        self._response.active_output_id = None
+        self._response.active_output_next_seq = 0
         self._clear_response_metrics()
         self.turn_state = DuplexTurnState.IDLE
         self._restore_response_config()
@@ -1192,7 +1221,10 @@ class DuplexSession:
         self._response.assistant_audio_text_marks.clear()
         self._response.active_request_id = None
         self._response.active_response_id = None
-        self._response.active_response_turn_id = None
+        self._response.active_output_id = None
+        self._response.active_output_next_seq = 0
+        self._response.output_to_response.clear()
+        self._response.completed_output_next_seq.clear()
         self._clear_response_metrics()
         self._restore_response_config()
         self.turn_state = DuplexTurnState.BARGE_IN
@@ -1205,7 +1237,10 @@ class DuplexSession:
     def close(self) -> None:
         self.state = DuplexSessionState.CLOSED
         self.turn_state = DuplexTurnState.IDLE
-        self._response.active_response_turn_id = None
+        self._response.active_output_id = None
+        self._response.active_output_next_seq = 0
+        self._response.output_to_response.clear()
+        self._response.completed_output_next_seq.clear()
         self._clear_response_metrics()
         self._restore_response_config()
 
@@ -1215,10 +1250,9 @@ class DuplexSession:
             "state": self.state.value,
             "turn_state": self.turn_state.value,
             "epoch": self.epoch,
-            "turn_id": self.turn_id,
             "active_request_id": self.active_request_id,
             "active_response_id": self.active_response_id,
-            "active_response_turn_id": self.active_response_turn_id,
+            "active_output_id": self.active_output_id,
             "model": self.config.model,
             "modalities": list(self.config.modalities),
             "instructions": self.config.instructions,

@@ -65,6 +65,14 @@ class MiniCPMO45NativeDuplexServingAdapter:
         current: object,
     ) -> dict[str, object]:
         runtime_config = deepcopy(dict(current)) if isinstance(current, dict) else {}
+        if (
+            any(str(modality).lower() == "audio" for modality in config.modalities)
+            and "ref_audio_data" not in runtime_config
+        ):
+            raise MiniCPMO45ClientRuntimeConfigError(
+                "MiniCPM-o native duplex audio output requires ref_audio",
+                code="ref_audio_required",
+            )
         runtime_config["instructions"] = config.instructions
         stage_max_tokens = runtime_config.get("duplex_stage_max_tokens")
         stage_max_tokens = deepcopy(stage_max_tokens) if isinstance(stage_max_tokens, dict) else {}

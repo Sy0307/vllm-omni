@@ -106,6 +106,16 @@ def _build_terminal_empty_output(
     )
 
 
+def _llm_terminal_error(output: Any) -> str | None:
+    """Return the error carried by a processed LLM completion."""
+    for completion in getattr(output, "outputs", ()) or ():
+        if getattr(completion, "finish_reason", None) != "error":
+            continue
+        stop_reason = getattr(completion, "stop_reason", None)
+        return str(stop_reason) if stop_reason is not None else "Stage request finished with error"
+    return None
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -247,17 +257,12 @@ class _OrchestratorDuplexStagePort:
         if not isinstance(duplex_state, dict):
             duplex_state = {}
             request_state.streaming.bridge_states["duplex"] = duplex_state
-        previous_epoch = duplex_state.get("epoch")
-        if not isinstance(duplex_state.get("model_turn_id"), int) or previous_epoch != context.fence.epoch:
-            duplex_state["model_turn_id"] = context.fence.turn_id
         duplex_state.update(
             {
                 "session_id": context.session_id,
                 "fence": context.fence,
                 "incarnation": context.fence.incarnation,
                 "epoch": context.fence.epoch,
-                "turn_id": context.fence.turn_id,
-                "response_seq": context.fence.response_seq,
                 "session_config": dict(context.session_config),
                 "runtime_config": dict(context.runtime_config),
             }
@@ -293,6 +298,9 @@ class _OrchestratorDuplexStagePort:
         request_state = self._request_states.get(context.request_id)
         if request_state is None:
             raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+        duplex_state = request_state.streaming.bridge_states.setdefault("duplex", {})
+        if isinstance(duplex_state, dict):
+            duplex_state["source_input_seq"] = submission.source_input_seq
         request = build_engine_core_request_from_tokens(
             request_id=context.request_id,
             prompt=dict(submission.prompt),
@@ -1052,8 +1060,15 @@ class Orchestrator:
                 )
                 continue
 
-            if getattr(output, "error", None) is not None:
-                await self._handle_stage_error(stage_id, output)
+            stage_error = getattr(output, "error", None)
+            if stage_error is None:
+                stage_error = _llm_terminal_error(output)
+            if stage_error is not None:
+                await self._handle_stage_error(
+                    stage_id,
+                    output,
+                    error=stage_error,
+                )
                 continue
 
             stage_metrics = None
@@ -1070,7 +1085,13 @@ class Orchestrator:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
+    async def _handle_stage_error(
+        self,
+        stage_id: int,
+        output: Any,
+        *,
+        error: str | None = None,
+    ) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
@@ -1080,7 +1101,7 @@ class Orchestrator:
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
-                error=output.error,
+                error=error if error is not None else output.error,
                 status_code=getattr(output, "error_status_code", None),
                 error_type=getattr(output, "error_type", None),
             )
@@ -1282,6 +1303,15 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
+            if self._is_duplex_session_request(req_state):
+                from vllm_omni.experimental.fullduplex.output import (
+                    attach_duplex_output_context,
+                )
+
+                attach_duplex_output_context(
+                    output,
+                    self._duplex_output_context(req_state, stage_id=stage_id),
+                )
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
@@ -1320,6 +1350,7 @@ class Orchestrator:
                 req_id,
                 output,
                 duplex_output_decision,
+                self._duplex_output_context(req_state, stage_id=stage_id),
                 stage_metrics,
                 submit_ts,
             )
@@ -1475,6 +1506,15 @@ class Orchestrator:
             ),
             final_stage_id=req_state.final_stage_id,
             segment_finished=req_state.streaming.enabled and req_state.streaming.segment_finished,
+            source_input_seq=(
+                int(duplex_state["source_input_seq"])
+                if isinstance(
+                    (duplex_state := req_state.streaming.bridge_states.get("duplex")),
+                    dict,
+                )
+                and type(duplex_state.get("source_input_seq")) is int
+                else 0
+            ),
             segment_token_ids=tuple(req_state.streaming.segment_token_ids),
             segment_output_metadata=req_state.streaming.segment_output_metadata,
         )
@@ -1514,13 +1554,17 @@ class Orchestrator:
         req_id: str,
         output: Any,
         decision: DuplexOutputDecision,
+        context: DuplexOutputContext | None,
         stage_metrics: Any,
         submit_ts: float | None,
     ) -> None:
         action = getattr(decision.action, "value", decision.action)
         if action != "direct_response":
             raise ValueError(f"Unsupported duplex output action: {action}")
-        from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
+        from vllm_omni.experimental.fullduplex.output import (
+            attach_duplex_output_context,
+            attach_duplex_output_decision,
+        )
 
         engine_output = attach_duplex_output_decision(
             OmniRequestOutput(
@@ -1532,6 +1576,8 @@ class Orchestrator:
             ),
             decision,
         )
+        if context is not None:
+            attach_duplex_output_context(engine_output, context)
         await self.output_async_queue.put(
             OutputMessage(
                 request_id=req_id,
