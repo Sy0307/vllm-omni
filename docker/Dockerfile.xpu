@@ -135,6 +135,17 @@ ENTRYPOINT []
 
 FROM ${VLLM_BASE} AS vllm-omni
 
+# The upstream vLLM XPU image does not bundle the oneCCL runtime required by
+# torch-ccl on the Intel CI workers.
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+RUN wget "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    bash "${ONECCL_INSTALLER}" -a --silent --eula accept && \
+    rm "${ONECCL_INSTALLER}" && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest
+
+ENV LD_LIBRARY_PATH="/opt/intel/oneapi/ccl/2021.15/lib:${LD_LIBRARY_PATH}"
+
 RUN apt-get update && \
     apt-get install -y espeak-ng ffmpeg git jq && \
     apt-get clean && \
