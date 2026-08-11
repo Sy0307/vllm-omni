@@ -53,7 +53,10 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     ResponseCreateOptions,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import NativeRealtimeSessionProtocol
-from vllm_omni.experimental.fullduplex.openai.runtime_adapter import ServingRuntimeConfigError
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexInputAppendCommand,
+    ServingRuntimeConfigError,
+)
 from vllm_omni.experimental.fullduplex.openai.serving import (
     OmniDuplexSessionHandler,
     should_enable_duplex_endpoint,
@@ -1956,7 +1959,7 @@ async def test_current_terminal_event_resets_session_owned_overlap():
     handler, session = _auto_response_context("sid-current-terminal")
     session.accumulate_overlap_speech(320)
     actor = DuplexWebSocketActor(TimedWebSocket(), current_epoch=lambda: session.epoch)
-    native = MiniCPMO45ServingSessionState()
+    native = handler._runtime_session_state(session)
 
     accepted, deferred = await handler._apply_outbound_session_event(
         {"type": "response.done", "epoch": session.epoch},
@@ -2032,13 +2035,17 @@ async def test_auto_response_terminal_advances_open_realtime_input_without_commi
     native.input_since_commit = True
     native.speech_since_commit = True
     session.accumulate_overlap_speech(800)
-    assert (
-        native.audio_buffer.append(
+    input_controller = handler._serving_runtime_adapter.input_controller
+    effect = input_controller.append(
+        native.input_state,
+        DuplexInputAppendCommand(
             _native_audio_payload(samples=8000),
+            operation_id="test-partial-input",
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
-        )
-        is None
+            allow_emit=True,
+        ),
     )
+    assert effect.append_payloads == ()
     session.end_response(commit_text=False, preserve_request=True)
 
     allowed, promoted = await handler._apply_outbound_session_event(
@@ -2056,7 +2063,7 @@ async def test_auto_response_terminal_advances_open_realtime_input_without_commi
 
     assert allowed is True
     assert promoted is None
-    assert native.audio_buffer.has_pending()
+    assert input_controller.snapshot(native.input_state).has_pending
     assert native.committed_audio_payload is None
     assert native.deferred_response_create is False
     assert native.input_since_commit is True
