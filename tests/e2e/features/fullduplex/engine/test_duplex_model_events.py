@@ -52,6 +52,7 @@ def test_model_events_are_immutable_and_accept_valid_fields() -> None:
         text_delta="hello",
         audio_data="YQ==",
         audio_format="pcm16",
+        sample_rate_hz=22_050,
         audio_duration_ms=20,
         audio_text_marks=((0, 5),),
     )
@@ -59,6 +60,7 @@ def test_model_events_are_immutable_and_accept_valid_fields() -> None:
 
     assert listen.source_input_seq == start.source_input_seq == 3
     assert chunk.output_seq == 0
+    assert chunk.sample_rate_hz == 22_050
     assert end.reason == "completed"
     with pytest.raises(FrozenInstanceError):
         chunk.output_seq = 1  # type: ignore[misc]
@@ -91,6 +93,16 @@ def test_model_events_are_immutable_and_accept_valid_fields() -> None:
                 audio_duration_ms=-1,
             ),
             "audio_duration_ms",
+        ),
+        (
+            lambda f: DuplexSpeakChunk(
+                fence=f,
+                output_id="output",
+                output_seq=0,
+                audio_data="YQ==",
+                sample_rate_hz=0,
+            ),
+            "sample_rate_hz",
         ),
         (
             lambda f: DuplexSpeakChunk(

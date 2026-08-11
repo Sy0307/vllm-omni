@@ -1354,6 +1354,7 @@ class NativeRuntimeBridgeMixin:
                 "text": event.text_delta,
                 "audio": event.audio_data,
                 "format": event.audio_format,
+                "sample_rate_hz": event.sample_rate_hz,
                 "end_of_turn": False,
                 "model_speak": True,
                 "playback": session.playback.as_dict(),

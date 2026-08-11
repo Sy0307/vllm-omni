@@ -64,6 +64,7 @@ class DuplexSpeakChunk:
     text_delta: str = ""
     audio_data: str = ""
     audio_format: str = "wav"
+    sample_rate_hz: int | None = None
     audio_duration_ms: int | None = None
     audio_text_marks: tuple[tuple[int, int], ...] = ()
 
@@ -78,6 +79,10 @@ class DuplexSpeakChunk:
         if not self.text_delta and not self.audio_data:
             raise ValueError("DuplexSpeakChunk must contain text or audio")
         _validate_non_empty_string("audio_format", self.audio_format)
+        if self.sample_rate_hz is not None:
+            _validate_non_negative_int("sample_rate_hz", self.sample_rate_hz)
+            if self.sample_rate_hz == 0:
+                raise ValueError("sample_rate_hz must be positive")
         if self.audio_duration_ms is not None:
             _validate_non_negative_int("audio_duration_ms", self.audio_duration_ms)
         if not isinstance(self.audio_text_marks, tuple):
@@ -338,6 +343,7 @@ class DuplexOutputLedger:
         text_delta: str = "",
         audio_data: str = "",
         audio_format: str = "wav",
+        sample_rate_hz: int | None = None,
         audio_duration_ms: int | None = None,
         audio_text_marks: tuple[tuple[int, int], ...] = (),
     ) -> tuple[DuplexModelEvent, ...]:
@@ -355,6 +361,7 @@ class DuplexOutputLedger:
             text_delta=text_delta,
             audio_data=audio_data,
             audio_format=audio_format,
+            sample_rate_hz=sample_rate_hz,
             audio_duration_ms=audio_duration_ms,
             audio_text_marks=audio_text_marks,
         )

@@ -452,6 +452,7 @@ async def test_typed_model_events_bind_one_output_to_one_realtime_response():
         text_delta="hello",
         audio_data="audio-0",
         audio_format="pcm16",
+        sample_rate_hz=22_050,
         audio_duration_ms=100,
     )
     end = DuplexSpeakEnd(fence=fence, output_id="output-7")
@@ -472,6 +473,7 @@ async def test_typed_model_events_bind_one_output_to_one_realtime_response():
     ]
     response_ids = {payload["response_id"] for payload in ws.sent}
     assert len(response_ids) == 1
+    assert ws.sent[2]["sample_rate_hz"] == 22_050
     assert session.active_response_id is None
     assert session.active_output_id is None
 
