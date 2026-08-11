@@ -2704,6 +2704,18 @@ def test_streaming_speech_session_config_accepts_non_streaming_mode():
     assert config.non_streaming_mode is True
 
 
+def test_streaming_speech_session_config_scopes_native_speed_to_http():
+    with pytest.raises(
+        ValidationError,
+        match="native speed control is only available through HTTP streaming",
+    ):
+        StreamingSpeechSessionConfig(
+            stream_audio=True,
+            response_format="pcm",
+            speed=1.5,
+        )
+
+
 class TestAsyncOmniSupportedTasks:
     """Test that AsyncOmni reports correct supported tasks based on output modalities."""
 

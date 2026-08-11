@@ -309,6 +309,13 @@ def test_s2mel_duration_factors_default_missing_request_value_to_one():
     ) == [1.0, 0.5]
 
 
+def test_s2mel_duration_factors_accept_supported_bounds():
+    assert IndexTTS2S2MelDecoder._duration_factors(
+        [{"duration_factor": 0.5}, {"duration_factor": 2.0}],
+        batch_size=2,
+    ) == [0.5, 2.0]
+
+
 def test_s2mel_duration_factor_count_must_match_batch_size():
     with pytest.raises(ValueError) as exc_info:
         IndexTTS2S2MelDecoder._duration_factors(
@@ -331,15 +338,15 @@ def test_s2mel_target_length_count_must_match_duration_factors():
     assert str(exc_info.value) == "IndexTTS target-length batch mismatch: codes=2 factors=1"
 
 
-@pytest.mark.parametrize("duration_factor", [float("nan"), float("inf"), 0.0, -0.5])
-def test_s2mel_duration_factors_must_be_finite_and_positive(duration_factor):
+@pytest.mark.parametrize("duration_factor", [float("nan"), float("inf"), float("-inf"), 0.0, -0.5, 0.49, 2.01])
+def test_s2mel_duration_factors_must_be_finite_and_in_supported_range(duration_factor):
     with pytest.raises(ValueError) as exc_info:
         IndexTTS2S2MelDecoder._duration_factors(
             [{"duration_factor": duration_factor}],
             batch_size=1,
         )
 
-    assert str(exc_info.value) == "IndexTTS duration_factor values must be finite and positive"
+    assert str(exc_info.value) == "IndexTTS duration_factor values must be finite and between 0.5 and 2.0"
 
 
 def test_cfm_unpad_data_builder_accounts_for_token_offsets_and_cfg_row_order():
