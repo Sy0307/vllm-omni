@@ -26,7 +26,11 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.model_loader.hub_prefetch import _repo_prefetch_lock
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .configuration_indextts2 import IndexTTS2Config
+from .configuration_indextts2 import (
+    INDEXTTS25_MAX_DURATION_FACTOR,
+    INDEXTTS25_MIN_DURATION_FACTOR,
+    IndexTTS2Config,
+)
 from .preprocess_utils import (
     load_semantic_codec,
     resolve_model_directory,
@@ -667,8 +671,11 @@ class IndexTTS2S2MelDecoder(nn.Module):
         factors = [float(info.get("duration_factor", 1.0)) for info in infos] if infos else [1.0] * batch_size
         if len(factors) != batch_size:
             raise ValueError(f"IndexTTS duration-factor batch mismatch: factors={len(factors)} batch={batch_size}")
-        if any(not math.isfinite(factor) or factor <= 0 for factor in factors):
-            raise ValueError("IndexTTS duration_factor values must be finite and positive")
+        if any(
+            not math.isfinite(factor) or not INDEXTTS25_MIN_DURATION_FACTOR <= factor <= INDEXTTS25_MAX_DURATION_FACTOR
+            for factor in factors
+        ):
+            raise ValueError("IndexTTS duration_factor values must be finite and between 0.5 and 2.0")
         return factors
 
     @staticmethod

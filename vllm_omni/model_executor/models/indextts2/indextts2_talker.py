@@ -39,7 +39,11 @@ from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
-from .configuration_indextts2 import IndexTTS2Config
+from .configuration_indextts2 import (
+    INDEXTTS25_MAX_DURATION_FACTOR,
+    INDEXTTS25_MIN_DURATION_FACTOR,
+    IndexTTS2Config,
+)
 from .gpt.conformer_encoder import ConformerEncoder
 from .gpt.embeddings import LearnedPositionEmbeddings
 from .gpt.perceiver import PerceiverResampler
@@ -559,7 +563,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             return v[0] if isinstance(v, list) and v else default
 
         duration_factor = float(_first("duration_factor", 1.0))
-        if not 0.5 <= duration_factor <= 2.0:
+        # Direct Omni callers bypass the serving adapter, so retain the
+        # model-side guard as the final fail-fast validation layer.
+        if not (INDEXTTS25_MIN_DURATION_FACTOR <= duration_factor <= INDEXTTS25_MAX_DURATION_FACTOR):
             raise ValueError("IndexTTS 2.5 duration_factor must be between 0.5 and 2.0")
 
         text = _first("text")

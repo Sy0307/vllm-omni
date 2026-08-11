@@ -5,6 +5,9 @@ import copy
 
 from transformers import PretrainedConfig
 
+INDEXTTS25_MIN_DURATION_FACTOR = 0.5
+INDEXTTS25_MAX_DURATION_FACTOR = 2.0
+
 
 class IndexTTS2Config(PretrainedConfig):
     model_type = "indextts2"

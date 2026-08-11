@@ -15,6 +15,10 @@ from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
+    INDEXTTS25_MAX_DURATION_FACTOR,
+    INDEXTTS25_MIN_DURATION_FACTOR,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -276,7 +280,7 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
         if error is not None:
             return error
         speed = request.speed if request.speed is not None else 1.0
-        if speed < 0.5 or speed > 2.0:
+        if speed < INDEXTTS25_MIN_DURATION_FACTOR or speed > INDEXTTS25_MAX_DURATION_FACTOR:
             return "IndexTTS 2.5 speed must be between 0.5 and 2.0"
         return None
 
