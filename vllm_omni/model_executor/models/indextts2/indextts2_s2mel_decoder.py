@@ -156,8 +156,14 @@ def _precast_cfm_estimator_bf16(
     return parameter_count
 
 
-def _load_bigvgan(vocoder_name: str, device: torch.device, dtype: torch.dtype = torch.float32):
-    cache_key = (vocoder_name, str(device), str(dtype))
+def _load_bigvgan(
+    vocoder_name: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    *,
+    use_cuda_kernel: bool = False,
+):
+    cache_key = (vocoder_name, str(device), str(dtype), bool(use_cuda_kernel))
     if cache_key in _bigvgan_models:
         return _bigvgan_models[cache_key]
 
@@ -170,7 +176,8 @@ def _load_bigvgan(vocoder_name: str, device: torch.device, dtype: torch.dtype = 
                 from .s2mel.modules import bigvgan as bigvgan_mod
 
                 _patch_bigvgan_compat(bigvgan_mod.BigVGAN)
-                bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name)
+                load_kwargs = {"use_cuda_kernel": True} if use_cuda_kernel else {}
+                bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name, **load_kwargs)
             except (ImportError, ModuleNotFoundError):
                 import bigvgan
 
@@ -271,6 +278,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         )
         self._vocoder_graph: Any = None
         self._compiled_vocoder: Any = None
+        self.s2mel_vocoder_fused_activation = bool(getattr(self.config, "s2mel_vocoder_fused_activation", False))
         # Capture the DiT transformer core into per-shape CUDA graphs.
         # Enable via `s2mel_dit_cuda_graph: true`.
         self.s2mel_dit_cuda_graph: bool = getattr(self.config, "s2mel_dit_cuda_graph", False)
@@ -292,7 +300,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         self.s2mel_vocoder_compile_shapes: list[int] | None = getattr(self.config, "s2mel_vocoder_compile_shapes", None)
         logger.info(
             "[S2Mel] dit_bf16=%s, vocoder_bf16=%s, "
-            "vocoder_cuda_graph=%s, vocoder_torch_compile=%s, "
+            "vocoder_cuda_graph=%s, vocoder_torch_compile=%s, fused_activation=%s, "
             "dit_cuda_graph=%s, dit_torch_compile=%s, dit_compile_mode=%s, "
             "dit_graph_lru=%d, cfm_batch_size=%d, continuous_batching=%s, vocoder_buckets=%s, "
             "vocoder_compile_shapes=%s",
@@ -300,6 +308,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             self.s2mel_vocoder_bf16,
             self.s2mel_vocoder_cuda_graph,
             self.s2mel_vocoder_torch_compile,
+            self.s2mel_vocoder_fused_activation,
             self.s2mel_dit_cuda_graph,
             self.s2mel_dit_torch_compile,
             self.s2mel_dit_torch_compile_mode,
@@ -643,7 +652,12 @@ class IndexTTS2S2MelDecoder(nn.Module):
         # 6. BigVGAN vocoding
         vocoder_name = self._get_resolved_vocoder_source()
         voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
-        bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
+        bigvgan = _load_bigvgan(
+            vocoder_name,
+            device,
+            voc_dtype,
+            use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
+        )
         vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
         with torch.no_grad():
             wavs = self._vocode_mels(
@@ -1153,7 +1167,12 @@ class IndexTTS2S2MelDecoder(nn.Module):
 
             vocoder_name = self._get_resolved_vocoder_source()
             voc_dtype = torch.bfloat16 if self.s2mel_vocoder_bf16 and device.type == "cuda" else torch.float32
-            bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
+            bigvgan = _load_bigvgan(
+                vocoder_name,
+                device,
+                voc_dtype,
+                use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
+            )
             vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
             wavs = self._vocode_mels(
                 mels=finished_mels,
@@ -1612,7 +1631,21 @@ class IndexTTS2S2MelDecoder(nn.Module):
         try:
             vocoder_name = self._get_resolved_vocoder_source()
             voc_dtype = torch.bfloat16 if (self.s2mel_vocoder_bf16 and device.type == "cuda") else torch.float32
-            bigvgan = _load_bigvgan(vocoder_name, device, voc_dtype)
+            bigvgan = _load_bigvgan(
+                vocoder_name,
+                device,
+                voc_dtype,
+                use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
+            )
+            if getattr(self, "s2mel_vocoder_fused_activation", False) and device.type == "cuda":
+                from vllm_omni.model_executor.models.common.alias_free_activation import (
+                    OfficialFusedAliasFreeActivation1d,
+                )
+
+                if OfficialFusedAliasFreeActivation1d.preload_extension():
+                    logger.info("IndexTTS fused BigVGAN activation preloaded")
+                else:
+                    logger.warning("IndexTTS fused BigVGAN activation unavailable; using eager activation")
             load_semantic_codec(
                 self.model_path,
                 self.config.semantic_codec,

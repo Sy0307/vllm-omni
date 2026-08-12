@@ -32,6 +32,9 @@ def test_indextts25_defaults_are_distinct_from_v2():
     assert v25.semantic_codec_checkpoint == "codec.pth"
     assert v25.tokenizer_file == "multilingual_zh_ja_yue_char_del.tiktoken"
     assert v25.vocab_size == v25.gpt["number_mel_codes"]
+    assert v25.stage0_conditioning_prefix_cache is False
+    assert v25.stage0_conditioning_prefix_cache_max_bytes == 64 * 1024**2
+    assert v25.s2mel_vocoder_fused_activation is False
 
 
 def test_indextts25_explicit_overrides_win_over_defaults():

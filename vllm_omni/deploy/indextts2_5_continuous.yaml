@@ -25,6 +25,10 @@ stages:
       to_stage_1: connector_of_shared_memory
     hf_overrides:
       use_gpt_latent: false
+      # Reuse exact Stage 0 artifacts for repeated reference audio. The GPU
+      # prefix is bounded by this LRU; custom emotion controls bypass it.
+      stage0_conditioning_prefix_cache: true
+      stage0_conditioning_prefix_cache_max_bytes: 67108864
     # Stage 0 uses plain vLLM sampling, not the upstream default
     # num_beams=3 beam search. Use upstream num_beams=1 for parity comparisons.
     default_sampling_params:
@@ -58,6 +62,8 @@ stages:
       s2mel_dit_cuda_graph: false
       s2mel_dit_torch_compile: true
       s2mel_dit_torch_compile_mode: default
+      # Built during Stage 1 warmup; unsupported systems fall back to eager.
+      s2mel_vocoder_fused_activation: true
       s2mel_vocoder_torch_compile: false
     default_sampling_params:
       temperature: 0.0
