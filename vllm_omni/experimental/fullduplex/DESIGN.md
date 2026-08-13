@@ -63,8 +63,7 @@ The checkpoint keeps these verified contracts:
 The checkpoint does not claim:
 
 - scheduler-native KV append;
-- deterministic VAD-triggered interruption (the browser intentionally does not
-  run VAD; MiniCPM owns listen/speak decisions at model-unit boundaries);
+- OpenAI `server_vad` turn detection or a measured barge-in latency target;
 - production multi-session admission, fairness, capacity, or failure recovery;
 - bounded long-session KV;
 - video input or audio/video synchronization.
@@ -640,9 +639,12 @@ multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM. This is an input
-ownership correction. It does not add a VAD policy: overlap is admitted to
-Stage0 and the model decides whether to listen or speak.
+item". Silent overlap no longer discards earlier user PCM. With the default
+`listen_only` policy, overlap is admitted to Stage0 and the model decides
+whether to listen or speak. When `barge_in_on_speech` is configured, the
+serving-side speech detector fences the active epoch, aborts its stage work,
+and retains the confirming audio chunk as pre-roll for the next epoch. This is
+separate from OpenAI `turn_detection.type=server_vad`, which remains unsupported.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS
@@ -1024,6 +1026,6 @@ Passing this checkpoint supports the statement:
 > Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
 > validated H20 configuration.
 
-It does not support claims for deterministic VAD-triggered interruption,
-multi-session production concurrency, bounded long-session KV,
-scheduler-native append, or video input.
+It does not support claims for OpenAI `server_vad` turn detection, a measured
+barge-in latency target, multi-session production concurrency, bounded
+long-session KV, scheduler-native append, or video input.
