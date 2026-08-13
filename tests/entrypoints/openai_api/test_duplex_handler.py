@@ -1560,6 +1560,35 @@ def test_auto_response_playback_overlap_admits_model_units_and_tracks_speech():
     assert session.overlap_speech_ms == 540
 
 
+def test_native_duplex_auto_response_speech_policy_interrupts_active_response():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-native-auto-barge",
+        config=DuplexSessionConfig(
+            overlap_policy=DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value,
+            extra_body={"auto_response": True, "minicpmo45_native_duplex": True},
+        ),
+        capabilities=DuplexCapabilities.minicpmo45_native(),
+    )
+    session.begin_response()
+
+    decision = handler._overlap_decision(
+        session,
+        {"is_speech": True},
+        _native_audio_payload(samples=3200, is_speech=True),
+    )
+
+    assert decision["action"] == "barge_in"
+    assert decision["reason"] == "barge_in_on_speech"
+    assert decision["buffer_audio"] is True
+    assert decision["duration_ms"] == 200
+    assert session.overlap_speech_ms == 200
+
+
 @pytest.mark.asyncio
 async def test_auto_response_overlap_exact_unit_commit_does_not_block_or_replay_next_unit():
     class ModelUnitEngine(FakeEngineClient):
@@ -5674,7 +5703,7 @@ async def test_minicpmo_native_duplex_rejects_ref_audio_path():
     assert engine.opened == []
 
 
-def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen():
+def test_minicpmo_native_duplex_explicit_barge_in_request_triggers_barge_in():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -5682,7 +5711,7 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
         idle_timeout_s=1,
     )
     session = DuplexSession(
-        session_id="sid-native-explicit-barge-disabled",
+        session_id="sid-native-explicit-barge-enabled",
         config=DuplexSessionConfig(overlap_policy=DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value),
         capabilities=DuplexCapabilities.minicpmo45_native(),
     )
@@ -5701,12 +5730,10 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
     )
 
     assert decision == {
-        "action": "listen",
-        "reason": "barge_in_unsupported",
+        "action": "barge_in",
+        "reason": "client_force_barge_in",
         "duration_ms": 1000,
-        "overlap_speech_ms": 1000,
         "buffer_audio": True,
-        "defer_runtime_append": True,
     }
 
 
@@ -5718,7 +5745,7 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
         {"type": "turn.signal", "event": "barge_in"},
     ],
 )
-async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
+async def test_minicpmo_native_duplex_accepts_advertised_barge_in_control(
     barge_in_event: dict[str, object],
 ):
     engine = FakeEngineClient()
@@ -5728,15 +5755,14 @@ async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
         idle_timeout_s=1,
     )
     ws = TimedWebSocket()
-    ws.put(_native_session_create("sid-native-barge-control-disabled"))
+    ws.put(_native_session_create("sid-native-barge-control-enabled"))
     ws.put(barge_in_event)
     ws.put({"type": "session.close"})
 
     await handler.handle_session(ws)
 
-    error = next(message for message in ws.sent if message.get("code") == "barge_in_unsupported")
-    assert error["session_id"] == "sid-native-barge-control-disabled"
-    assert ("sid-native-barge-control-disabled", "barge_in") not in engine.signals
+    assert all(message.get("code") != "barge_in_unsupported" for message in ws.sent)
+    assert ("sid-native-barge-control-enabled", "barge_in") in engine.signals
 
 
 @pytest.mark.asyncio
@@ -7153,6 +7179,124 @@ async def test_minicpmo_native_duplex_cancel_interrupts_background_data_plane_st
     assert "response.output_audio.delta" not in ws.sent_types()
     assert engine.signals == [("sid-native-cancel-stream", "barge_in")]
     assert engine.signal_fences == [DuplexFence("sid-native-cancel-stream")]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_duplex_speech_interrupt_fences_active_response_and_keeps_preroll():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session_id = "sid-native-speech-barge"
+    ws: TimedWebSocket
+
+    def interrupt_after_response_created(socket: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "response.created":
+            return
+        socket.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(3200, value=0.07),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+            }
+        )
+        socket.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(12800, value=0.02),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+            }
+        )
+        socket.put({"type": "session.close"})
+
+    ws = TimedWebSocket(on_send=interrupt_after_response_created)
+    create = _native_session_create(session_id)
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+
+    response_id = f"duplex-{session_id}-e0-stage0-s1"
+    first_append_result = {
+        "operation": "append",
+        "session_id": session_id,
+        "ok": True,
+        "unsupported_count": 0,
+        "error_count": 0,
+        "stage_results": [
+            {
+                "stage_id": 0,
+                "replica_id": 0,
+                "result": {
+                    "supported": True,
+                    "implementation_level": "model_native_duplex",
+                    "data_plane_append": True,
+                    "request_id": response_id,
+                    "response_stage_id": 1,
+                },
+            }
+        ],
+        "data_plane_outputs": [
+            SimpleNamespace(
+                request_id=response_id,
+                finished=False,
+                outputs=[
+                    SimpleNamespace(
+                        text="answer",
+                        token_ids=[],
+                        multimodal_output={
+                            "audio": np.zeros(2400, dtype=np.float32),
+                            "sr": 24000,
+                            "meta": {"duplex_epoch": 0, "duplex_turn_id": 0},
+                        },
+                    )
+                ],
+            )
+        ],
+    }
+    engine.append_results = [
+        first_append_result,
+        {
+            "operation": "append",
+            "session_id": session_id,
+            "ok": True,
+            "unsupported_count": 0,
+            "error_count": 0,
+        },
+    ]
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16000),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "is_speech": False,
+        }
+    )
+
+    await handler.handle_session(ws)
+
+    cancelled = [event for event in ws.sent if event.get("type") == "audio.cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0]["cancelled_epoch"] == 0
+    assert cancelled[0]["epoch"] == 1
+    assert (session_id, "barge_in") in engine.signals
+    assert DuplexFence(session_id, epoch=0) in engine.signal_fences
+    assert DuplexFence(session_id, epoch=1) in engine.signal_next_fences
+    # The 200 ms interrupting pre-roll is retained ahead of the following
+    # 800 ms and submitted as one model unit in the new epoch.
+    next_epoch_idx = next(i for i, fence in enumerate(engine.appended_fences) if fence is not None and fence.epoch == 1)
+    next_payload = engine.appended[next_epoch_idx][2]
+    assert isinstance(next_payload, dict)
+    next_samples = np.frombuffer(base64.b64decode(next_payload["audio"]), dtype=np.float32)
+    assert next_samples.size == 16000
+    assert next_samples[0] == pytest.approx(0.07)
+    assert next_samples[3199] == pytest.approx(0.07)
+    assert next_samples[3200] == pytest.approx(0.02)
+    assert len([event for event in ws.sent if event.get("type") == "response.output_audio.delta"]) == 1
 
 
 @pytest.mark.asyncio

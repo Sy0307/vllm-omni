@@ -15,7 +15,7 @@ def _output(
     *,
     prompt_ids: list[int],
     output_ids: list[int],
-    latent: torch.Tensor,
+    latent: torch.Tensor | None,
     multimodal_output: dict | None = None,
     token_list: list[int] | None = None,
 ):
@@ -258,6 +258,72 @@ def test_native_duplex_requires_tokenizer_boundary_metadata() -> None:
 
     with pytest.raises(ValueError, match="tokenizer-derived.*metadata"):
         llm2tts([source], prompt=[{}], _streaming_context=SimpleNamespace(bridge_states={}))
+
+
+_NATIVE_DUPLEX_TOKEN_IDS = {
+    "tts_bos_token_id": 9301,
+    "tts_eos_token_id": 9302,
+    "listen_token_id": 9303,
+    "speak_token_id": 9304,
+    "chunk_eos_token_id": 9308,
+    "chunk_tts_eos_token_id": 9309,
+    "turn_eos_token_id": 9310,
+}
+
+
+@pytest.mark.parametrize(
+    "output_ids",
+    [
+        pytest.param([_NATIVE_DUPLEX_TOKEN_IDS["listen_token_id"]], id="listen"),
+        pytest.param([_NATIVE_DUPLEX_TOKEN_IDS["turn_eos_token_id"]], id="terminal"),
+        pytest.param([], id="empty-delta"),
+    ],
+)
+def test_native_duplex_no_speech_handoff_without_latent_is_skipped(output_ids: list[int]) -> None:
+    # A native-duplex control/listen output has no speech-conditioning payload
+    # (no ``latent`` and no ``hidden_states``). It must be skipped, not raised,
+    # so one listen decision cannot terminate the shared orchestrator.
+    prompt_ids = [101, 102]
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=None,
+        multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": _NATIVE_DUPLEX_TOKEN_IDS},
+    )
+
+    converted = llm2tts(
+        [source],
+        prompt=[{}],
+        _streaming_context=SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 1}}),
+    )
+
+    assert converted == []
+
+
+@pytest.mark.parametrize(
+    "output_ids",
+    [
+        pytest.param([_NATIVE_DUPLEX_TOKEN_IDS["speak_token_id"], 21, 22], id="explicit-speak"),
+        pytest.param([21, 22], id="direct-text"),
+    ],
+)
+def test_native_duplex_speech_handoff_missing_hidden_states_raises(output_ids: list[int]) -> None:
+    # A speech handoff that unexpectedly lacks latent/hidden_states is malformed.
+    # The orchestrator converts this processor error into a request-scoped error.
+    prompt_ids = [101, 102]
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=None,
+        multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": _NATIVE_DUPLEX_TOKEN_IDS},
+    )
+
+    with pytest.raises(ValueError, match="No latent or hidden_states"):
+        llm2tts(
+            [source],
+            prompt=[{}],
+            _streaming_context=SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 1}}),
+        )
 
 
 def test_llm2tts_does_not_alias_live_thinker_token_list() -> None:

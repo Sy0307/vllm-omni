@@ -18,6 +18,7 @@ from vllm_omni.experimental.fullduplex.openai.commit_policy import (
     decide_commit_action,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
+    DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionState,
@@ -1249,7 +1250,16 @@ class DuplexSessionRunnerMixin:
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
                         mark_pending_silence_superseded()
-                        overlap_active = not self._session_auto_responds(session) and native_response_in_progress()
+                        overlap_active = native_response_in_progress() and (
+                            not self._session_auto_responds(session)
+                            or (
+                                session.capabilities.supports_barge_in
+                                and (
+                                    session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+                                    or self._event_requests_barge_in(event)
+                                )
+                            )
+                        )
                         if overlap_active:
                             decision = self._overlap_decision(session, event, payload)
                             await self._emit_overlap_decision(emit_event, session, decision)

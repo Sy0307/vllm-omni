@@ -494,6 +494,23 @@ class OmniDuplexSessionHandler(
             # playback only controls history ACKs, not model admission.
             if is_speech:
                 session.accumulate_overlap_speech(duration_ms)
+            if (
+                self._uses_native_input_append(session)
+                and session.capabilities.supports_barge_in
+                and is_speech
+                and session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+            ):
+                # The configured server overlap detector classified this chunk
+                # as speech while the assistant is still generating/playing.
+                # Fence the active response so the same interrupting chunk is
+                # retained as the start of the next turn.
+                return {
+                    "action": "barge_in",
+                    "reason": "barge_in_on_speech",
+                    "duration_ms": duration_ms,
+                    "overlap_speech_ms": session.overlap_speech_ms,
+                    "buffer_audio": True,
+                }
             return {
                 "action": "listen",
                 "reason": "auto_response_continuous",
