@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -245,6 +246,7 @@ class _FakeDecoderState:
         self.target_length = int(cfm_state.x.shape[-1])
         self.ref_length = 0
         self.output_emitted = False
+        self.cfm_admit_after = 0.0
 
 
 class _RecordingCFM:
@@ -266,12 +268,61 @@ def _make_decoder_for_state_tests(cfm: _RecordingCFM | None = None) -> IndexTTS2
     torch.nn.Module.__init__(decoder)
     decoder.s2mel_cfm_batch_size = 4
     decoder.s2mel_continuous_max_padding_ratio = 1.0
+    decoder.s2mel_continuous_singleton_wait_ms = 0.0
     decoder._continuous_cfm_states = {}
     decoder._last_finished_request_ids = set()
     decoder._deferred_cleanup_ids = set()
+    decoder.s2mel_async_vocoder = False
+    decoder.s2mel_async_vocoder_max_pending_batches = 2
+    decoder._async_vocoder_stream = None
+    decoder._pending_vocoder_batches = deque()
+    decoder._ready_vocoder_outputs = {}
     if cfm is not None:
         decoder.s2mel = SimpleNamespace(models={"cfm": cfm})
     return decoder
+
+
+class _QueryEvent:
+    def __init__(self, ready: bool) -> None:
+        self.ready = ready
+
+    def query(self) -> bool:
+        return self.ready
+
+    def synchronize(self) -> None:
+        self.ready = True
+
+
+def test_async_vocoder_collects_only_ready_live_requests() -> None:
+    decoder = _make_decoder_for_state_tests()
+    live = _FakeDecoderState(_FakeEulerState("live", 8))
+    cancelled = _FakeDecoderState(_FakeEulerState("cancelled", 8))
+    pending = _FakeDecoderState(_FakeEulerState("pending", 8))
+    decoder._continuous_cfm_states = {"live": live, "pending": pending}
+    decoder._pending_vocoder_batches.extend(
+        [
+            indextts2_s2mel_decoder._PendingVocoderBatch(
+                ("live", "cancelled"),
+                (live, cancelled),
+                (torch.ones(4), torch.full((4,), 3.0)),
+                _QueryEvent(True),
+            ),
+            indextts2_s2mel_decoder._PendingVocoderBatch(
+                ("pending",),
+                (pending,),
+                (torch.full((4,), 2.0),),
+                _QueryEvent(False),
+            ),
+        ]
+    )
+
+    outputs = decoder._collect_ready_vocoder_outputs({"live", "cancelled"})
+
+    torch.testing.assert_close(outputs["live"], torch.ones(4))
+    assert "cancelled" not in outputs
+    assert live.output_emitted is True
+    assert pending.output_emitted is False
+    assert len(decoder._pending_vocoder_batches) == 1
 
 
 def test_continuous_decoder_initializes_each_request_once() -> None:
@@ -338,6 +389,56 @@ def test_continuous_decoder_groups_compatible_length_ratios() -> None:
     decoder._advance_continuous_cfm(["a", "b", "c"])
 
     assert cfm.calls == [[("a", 0), ("b", 0)], [("c", 0)]]
+
+
+def test_continuous_decoder_waits_once_for_new_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfm = _RecordingCFM()
+    decoder = _make_decoder_for_state_tests(cfm)
+    decoder.s2mel_continuous_singleton_wait_ms = 1.0
+    state = _FakeDecoderState(_FakeEulerState("a", 8))
+    decoder._continuous_cfm_states = {"a": state}
+    now = [10.0]
+    monkeypatch.setattr(
+        indextts2_s2mel_decoder.time,
+        "monotonic",
+        lambda: now[0],
+    )
+
+    decoder._advance_continuous_cfm(["a"])
+    assert cfm.calls == []
+    assert state.cfm_admit_after == pytest.approx(10.001)
+
+    now[0] = 10.002
+    decoder._advance_continuous_cfm(["a"])
+    decoder._advance_continuous_cfm(["a"])
+
+    assert cfm.calls == [[("a", 0)], [("a", 1)]]
+
+
+def test_continuous_decoder_batches_compatible_request_before_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfm = _RecordingCFM()
+    decoder = _make_decoder_for_state_tests(cfm)
+    decoder.s2mel_continuous_singleton_wait_ms = 1.0
+    state_a = _FakeDecoderState(_FakeEulerState("a", 8))
+    decoder._continuous_cfm_states = {"a": state_a}
+    now = [10.0]
+    monkeypatch.setattr(
+        indextts2_s2mel_decoder.time,
+        "monotonic",
+        lambda: now[0],
+    )
+
+    decoder._advance_continuous_cfm(["a"])
+    state_b = _FakeDecoderState(_FakeEulerState("b", 8))
+    decoder._continuous_cfm_states["b"] = state_b
+    now[0] = 10.0005
+    decoder._advance_continuous_cfm(["a", "b"])
+
+    assert cfm.calls == [[("a", 0), ("b", 0)]]
 
 
 def test_continuous_decoder_routes_variable_group_through_padding_aware_attention() -> None:
