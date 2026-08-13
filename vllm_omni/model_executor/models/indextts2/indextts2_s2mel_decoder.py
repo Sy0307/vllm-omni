@@ -270,18 +270,14 @@ class IndexTTS2S2MelDecoder(nn.Module):
         )
         if self.s2mel_continuous_max_padding_ratio < 1.0:
             raise ValueError("s2mel_continuous_max_padding_ratio must be at least 1.0")
-        self.s2mel_continuous_singleton_wait_ms = float(
-            getattr(self.config, "s2mel_continuous_singleton_wait_ms", 0.0)
-        )
+        self.s2mel_continuous_singleton_wait_ms = float(getattr(self.config, "s2mel_continuous_singleton_wait_ms", 0.0))
         if self.s2mel_continuous_singleton_wait_ms < 0:
             raise ValueError("s2mel_continuous_singleton_wait_ms must be non-negative")
         self.requires_request_ids = self.stepwise_generation
         self._continuous_cfm_states: dict[str, _ContinuousDecoderRequestState] = {}
         self._last_finished_request_ids: set[str] = set()
         self._deferred_cleanup_ids: set[str] = set()
-        self.s2mel_async_vocoder: bool = bool(
-            getattr(self.config, "s2mel_async_vocoder", False)
-        )
+        self.s2mel_async_vocoder: bool = bool(getattr(self.config, "s2mel_async_vocoder", False))
         self.s2mel_async_vocoder_max_pending_batches = int(
             getattr(self.config, "s2mel_async_vocoder_max_pending_batches", 2)
         )
@@ -289,9 +285,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             raise ValueError("s2mel_async_vocoder_max_pending_batches must be at least 1")
         self._async_vocoder_stream: torch.cuda.Stream | None = None
         self._pending_vocoder_batches: deque[_PendingVocoderBatch] = deque()
-        self._ready_vocoder_outputs: dict[
-            str, tuple[_ContinuousDecoderRequestState, torch.Tensor]
-        ] = {}
+        self._ready_vocoder_outputs: dict[str, tuple[_ContinuousDecoderRequestState, torch.Tensor]] = {}
 
         # Run the DiT estimator under bf16 autocast (flash attention + faster
         # GEMMs); the CFM Euler solver stays float32. Disable via deploy YAML
@@ -1215,9 +1209,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         for mel in mels:
             mel.record_stream(stream)
         with torch.cuda.stream(stream):
-            wavs = self._vocode_mels(
-                mels=mels, vocode=vocode, voc_dtype=voc_dtype
-            )
+            wavs = self._vocode_mels(mels=mels, vocode=vocode, voc_dtype=voc_dtype)
             event = torch.cuda.Event()
             event.record(stream)
         for wav in wavs:
@@ -1225,9 +1217,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         for state in states:
             state.vocoder_queued = True
         self._pending_vocoder_batches.append(
-            _PendingVocoderBatch(
-                tuple(request_ids), tuple(states), tuple(wavs), event
-            )
+            _PendingVocoderBatch(tuple(request_ids), tuple(states), tuple(wavs), event)
         )
 
     def _collect_ready_vocoder_outputs(
@@ -1269,14 +1259,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Bound retained GPU batches, blocking only when the queue is full."""
         audio_by_request: dict[str, torch.Tensor] = {}
-        while (
-            len(self._pending_vocoder_batches)
-            >= self.s2mel_async_vocoder_max_pending_batches
-        ):
+        while len(self._pending_vocoder_batches) >= self.s2mel_async_vocoder_max_pending_batches:
             self._pending_vocoder_batches[0].event.synchronize()
-            audio_by_request.update(
-                self._collect_ready_vocoder_outputs(request_ids)
-            )
+            audio_by_request.update(self._collect_ready_vocoder_outputs(request_ids))
         return audio_by_request
 
     def _reap_cancelled_vocoder_batches(self) -> None:
@@ -1305,9 +1290,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         model_dtype: torch.dtype,
     ) -> OmniOutput:
         self._last_finished_request_ids = set()
-        audio_by_request = self._collect_ready_vocoder_outputs(
-            set(request_ids)
-        )
+        audio_by_request = self._collect_ready_vocoder_outputs(set(request_ids))
         for request_id, info in zip(request_ids, request_infos, strict=True):
             self._get_or_initialize_continuous_request(
                 request_id=request_id,
@@ -1337,9 +1320,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             )
             vocode = self._get_vocoder_runner(bigvgan, device, voc_dtype)
             if self._async_vocoder_enabled(device):
-                audio_by_request.update(
-                    self._make_async_vocoder_room(set(request_ids))
-                )
+                audio_by_request.update(self._make_async_vocoder_room(set(request_ids)))
                 self._enqueue_async_vocoder(
                     states=finished_states,
                     request_ids=finished_ids,
