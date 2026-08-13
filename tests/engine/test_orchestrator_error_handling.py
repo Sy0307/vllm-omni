@@ -292,6 +292,48 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
 
 
 @pytest.mark.asyncio
+async def test_stage_input_processor_failure_fails_request_not_orchestrator(orchestrator_factory) -> None:
+    """A malformed inter-stage payload is request-scoped, not process-fatal."""
+
+    class _FailingInputProcessorStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            del source_outputs, prompt, streaming_context
+            raise ValueError("No latent or hidden_states found in thinker output")
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = _FailingInputProcessorStage(stage_type="llm", final_output=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-bad-handoff", finished=True)]),
+        FakeOutputProcessor(),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-bad-handoff",
+            prompt=SimpleNamespace(request_id="req-bad-handoff", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("s0-raw", 1.0))
+
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-bad-handoff")
+        assert error_msg.fatal is False
+        assert error_msg.stage_id == 1
+        assert error_msg.error_type == "ValueError"
+        assert "No latent or hidden_states" in error_msg.error
+        assert orchestrator_fixture.thread.is_alive()
+        assert "req-bad-handoff" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory) -> None:
     """A new request entering a stage that already lost all replicas fails that
     request instead of raising out of the request handler and tearing the server
