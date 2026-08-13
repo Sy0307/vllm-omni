@@ -10,8 +10,9 @@ from typing import Any
 import numpy as np
 import pytest
 from starlette.websockets import WebSocketDisconnect
-
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.outputs import OmniRequestOutput
+
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
@@ -46,7 +47,6 @@ from vllm_omni.experimental.fullduplex.openai.serving import (
 )
 from vllm_omni.experimental.fullduplex.openai.websocket import DuplexWebSocketActor
 from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
-from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
