@@ -658,9 +658,7 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
             if state.pending_stop:
                 token_ids[cond_row, 0] = _HOLD_TOKEN
                 token_ids[uncond_row, 0] = _HOLD_TOKEN
-        for _, cond_row, uncond_row in zip(
-            drain_rows[0::3], drain_rows[1::3], drain_rows[2::3], strict=True
-        ):
+        for _, cond_row, uncond_row in zip(drain_rows[0::3], drain_rows[1::3], drain_rows[2::3], strict=True):
             token_ids[cond_row, 0] = _STOP_TOKEN
             token_ids[uncond_row, 0] = _STOP_TOKEN
         return SamplerOutput(sampled_token_ids=token_ids, logprobs_tensors=None)
