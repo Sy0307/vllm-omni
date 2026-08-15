@@ -926,6 +926,7 @@ class Orchestrator:
 
                     # Shared catch so a dead replica on either poll path is
                     # evicted rather than tearing down every stage (#4285).
+                    raw_terminal_req_ids: list[str] = []
                     try:
                         if pool.stage_type == "diffusion":
                             diffusion_output = pool.poll_diffusion_output(replica_id)
@@ -942,29 +943,43 @@ class Orchestrator:
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
-                                if req_state is None or not req_state.streaming.enabled:
+                                if req_state is None:
                                     continue
-                                req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-                                req_state.streaming.segment_token_ids = (
-                                    self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                                    if req_state.streaming.segment_finished
-                                    else []
-                                )
-                                raw_mm = self._completion_multimodal_output(eco, None)
-                                req_state.streaming.segment_output_metadata = (
-                                    dict(raw_mm)
-                                    if req_state.streaming.segment_finished and isinstance(raw_mm, dict)
-                                    else {}
-                                )
-                                req_state.streaming.new_prompt_len_snapshot = getattr(
-                                    eco,
-                                    "new_prompt_len_snapshot",
-                                    None,
-                                )
                                 if req_state.streaming.enabled:
-                                    await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state)
+                                    req_state.streaming.segment_finished = bool(
+                                        getattr(eco, "is_segment_finished", False)
+                                    )
+                                    req_state.streaming.segment_token_ids = (
+                                        self._coerce_int_list(getattr(eco, "new_token_ids", None))
+                                        if req_state.streaming.segment_finished
+                                        else []
+                                    )
+                                    raw_mm = self._completion_multimodal_output(eco, None)
+                                    req_state.streaming.segment_output_metadata = (
+                                        dict(raw_mm)
+                                        if req_state.streaming.segment_finished and isinstance(raw_mm, dict)
+                                        else {}
+                                    )
+                                    req_state.streaming.new_prompt_len_snapshot = getattr(
+                                        eco,
+                                        "new_prompt_len_snapshot",
+                                        None,
+                                    )
+                                if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
+                                    raw_terminal_req_ids.append(req_state.request_id)
+                            # OmniSchedulerMixin.make_stats() already throttles
+                            # per-scheduler at 1 Hz, so raw_outputs.scheduler_stats
+                            # being non-None means this replica passed its own gate.
+                            # A second global throttle here would drop stats for
+                            # other (stage, replica) pairs in the same 1s window.
+                            # IterationStats carries token/request observations
+                            # produced while processing model outputs. It must
+                            # not depend on SchedulerStats, which is independently
+                            # throttled by each scheduler and can be None on an
+                            # otherwise productive tick. Conversely, a stats-only
+                            # tick has no output observations to accumulate.
                             iteration_stats = (
-                                IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
+                                IterationStats() if self._stat_logger is not None and raw_outputs.outputs else None
                             )
                             processed = await pool.process_llm_raw_outputs(
                                 replica_id,
@@ -995,6 +1010,11 @@ class Orchestrator:
                         raise
 
                     await self._handle_processed_outputs(stage_id, replica_id, processed)
+                    await self._finalize_swallowed_raw_terminals(
+                        stage_id,
+                        replica_id,
+                        raw_terminal_req_ids,
+                    )
                     idle = False
 
             self._orch_monitor.note_loop(idle=idle)
@@ -1276,7 +1296,7 @@ class Orchestrator:
         stage_id: int,
         eco: Any,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
         """Record session-level finish markers dropped by the streaming output processor.
 
         Streaming segment stops set ``is_segment_finished=True`` and are handled
@@ -1285,19 +1305,64 @@ class Orchestrator:
         ``is_segment_finished=False``, but vLLM's output processor may remove the
         request state before that EngineCoreOutput is processed.
 
-        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
-        in ``_route_output`` so downstream async-chunk stages can still deliver
-        outputs after stage-0 session end.
+        Only update ``finished_final_output_stage_ids`` here. Completion is
+        resolved after this raw batch passes through the output processor, so a
+        real processed output wins over the swallowed-terminal fallback.
         """
         if getattr(eco, "finish_reason", None) is None:
-            return
+            return False
         if getattr(eco, "is_segment_finished", False):
-            return
+            return False
 
         final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
         if stage_id not in final_output_stage_ids:
-            return
+            return False
         req_state.finished_final_output_stage_ids.add(stage_id)
+        return True
+
+    async def _finalize_swallowed_raw_terminals(
+        self,
+        stage_id: int,
+        replica_id: int,
+        request_ids: list[str],
+    ) -> None:
+        """Finish requests whose last final output was a swallowed raw terminal.
+
+        Run only after the output processor has handled the same raw batch. If
+        it produced a normal finished output, ``_route_output`` has already
+        emitted and cleaned the request; otherwise emit an empty terminal for
+        the final-output stage represented by the raw marker.
+        """
+        if not request_ids:
+            return
+
+        pool = self.stage_pools[stage_id]
+        final_output_type = getattr(pool.stage_client, "final_output_type", None)
+        for req_id in dict.fromkeys(request_ids):
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                continue
+            final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+            if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
+                continue
+
+            terminal_output = _build_terminal_empty_output(
+                req_id,
+                final_output_type=final_output_type,
+                audio_sample_rate=pool._infer_audio_sample_rate(),
+            )
+            await self.output_async_queue.put(
+                OutputMessage(
+                    request_id=req_id,
+                    stage_id=stage_id,
+                    replica_id=replica_id,
+                    engine_outputs=terminal_output,
+                    metrics=None,
+                    finished=True,
+                    stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
+                )
+            )
+            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""

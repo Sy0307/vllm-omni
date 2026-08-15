@@ -502,6 +502,7 @@ def _make_mm_only_output_processor(monkeypatch):
     processor = object.__new__(MultimodalOutputProcessor)
     processor.output_modality = OutputModality.AUDIO
     processor.request_states = {"r": _make_no_detok_state(RequestOutputKind.DELTA)}
+    processor.tracing_enabled = False
     monkeypatch.setattr(
         VLLMOutputProcessor,
         "process_outputs",
