@@ -33,7 +33,7 @@ TEXT_EOS = 151645
 
 @pytest.fixture(autouse=True)
 def _disable_vllm_pin_memory_for_cpu(monkeypatch: pytest.MonkeyPatch):
-    """Keep vLLM 0.26's module-level H2D helper in CPU-only mode."""
+    """Keep the module-level H2D helper in CPU-only mode."""
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
 
 

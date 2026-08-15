@@ -70,10 +70,10 @@ def _make_text_omni_output(
         ],
         finished=finish_reason is not None,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        res,
         request_id=request_id,
         final_output_type="text",
-        request_output=res,
         finished=finish_reason is not None,
     )
 
@@ -109,12 +109,12 @@ def _make_audio_omni_output(
         outputs=[completion],
         finished=True,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        res,
         request_id=request_id,
         stage_id=stage_id,
         replica_id=replica_id,
         final_output_type="audio",
-        request_output=res,
         finished=True,
     )
 
@@ -152,7 +152,7 @@ def _build_serving_chat():
     )
     instance._create_audio_choice = MagicMock(
         side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
-            index=omni_res.request_output.outputs[0].index,
+            index=omni_res.outputs[0].index,
             role=role,
         )
     )
@@ -191,17 +191,15 @@ def _parse_sse_chunks(lines: list[str]) -> list[dict]:
 def test_streaming_audio_choice_emits_empty_delta_for_metadata_only_chunk() -> None:
     serving_chat = object.__new__(OmniOpenAIServingChat)
     omni_output = SimpleNamespace(
-        request_output=SimpleNamespace(
-            outputs=[
-                SimpleNamespace(
-                    index=0,
-                    finish_reason="stop",
-                    stop_reason=None,
-                    token_ids=[],
-                    multimodal_output={},
-                )
-            ]
-        )
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                stop_reason=None,
+                token_ids=[],
+                multimodal_output={},
+            )
+        ]
     )
 
     choices = serving_chat._create_audio_choice(
@@ -519,7 +517,7 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     request = _make_request(modalities=["text", "audio"])
 
     empty_audio = _make_audio_omni_output()
-    empty_audio.request_output.outputs[0].multimodal_output = {"audio": []}
+    empty_audio.outputs[0].multimodal_output = {"audio": []}
 
     def create_audio_choice(omni_res, role, request, stream=False):
         return OmniOpenAIServingChat._create_audio_choice(serving_chat, omni_res, role, request, stream=stream)

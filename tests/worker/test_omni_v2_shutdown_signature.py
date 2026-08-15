@@ -10,13 +10,13 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_v2_model_runners_have_shutdown_for_vllm_020_worker_exit():
+def test_v2_model_runners_have_shutdown_for_current_worker_exit():
     for runner_cls in (OmniARModelRunner, OmniGenerationModelRunner, OmniGPUModelRunner):
         assert hasattr(runner_cls, "shutdown")
 
 
 if __name__ == "__main__":
-    test_v2_model_runners_have_shutdown_for_vllm_020_worker_exit()
+    test_v2_model_runners_have_shutdown_for_current_worker_exit()
 
 
 def test_load_model_uses_class_patch_lock():

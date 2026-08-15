@@ -353,7 +353,7 @@ def test_native_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatc
         _waiting_for_chunk_running=[parked],
         restore_queues=lambda _waiting, _running: None,
     )
-    sched._consume_pending_connector_output = lambda *, model_mode: None
+    sched._consume_pending_connector_output = lambda model_mode: None
     sched._process_pending_input_timeouts = lambda: None
     sched._should_defer_waiting_admission = lambda: False
     sched.get_finished_requests_needing_kv_transfer = lambda: {}
@@ -387,9 +387,10 @@ def test_mrv1_async_chunk_does_not_reserve_parked_slots_during_ar_admission(monk
         _held_non_active=[],
         process_pending_chunks=lambda *_args, **_kwargs: None,
         restore_queues=lambda *_args, **_kwargs: None,
+        postprocess_scheduler_output=lambda *_args, **_kwargs: None,
     )
     sched.input_coordinator = None
-    sched._consume_pending_connector_output = lambda *, model_mode: None
+    sched._consume_pending_connector_output = lambda model_mode: None
     sched._process_pending_input_timeouts = lambda: None
     sched._should_defer_waiting_admission = lambda: False
     sched.get_finished_requests_needing_kv_transfer = lambda: {}

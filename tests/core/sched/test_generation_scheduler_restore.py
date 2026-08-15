@@ -149,10 +149,6 @@ def _scheduler_with_parked_generation_request(
         "vllm_omni.core.sched.omni_generation_scheduler.create_request_queue",
         lambda policy: _FakeQueue([]),
     )
-    monkeypatch.setattr(
-        "vllm_omni.core.sched.omni_generation_scheduler.OmniNewRequestData.from_request",
-        lambda *args, **kwargs: SimpleNamespace(req_id="waiting"),
-    )
     return scheduler, waiting
 
 

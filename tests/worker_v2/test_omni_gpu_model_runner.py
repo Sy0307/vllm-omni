@@ -628,6 +628,19 @@ def test_mrv2_rejects_pipeline_parallel_at_runner_startup():
         runner._validate_parallel_support()
 
 
+def test_mrv2_rejects_prefill_context_parallel_at_runner_startup():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=2,
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="prefill context parallelism"):
+        runner._validate_parallel_support()
+
+
 def test_mtp_descriptor_dispatch_is_local_and_uses_captured_bucket():
     runner = object.__new__(OmniGPUModelRunner)
     runner.scheduler_config = SimpleNamespace(max_num_seqs=6)

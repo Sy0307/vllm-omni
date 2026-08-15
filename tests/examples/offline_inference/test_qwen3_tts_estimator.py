@@ -49,7 +49,6 @@ def test_parse_args_accepts_structured_deploy_config(monkeypatch):
     args = parse_args()
 
     assert args.deploy_config == "qwen3_tts_mrv2.yaml"
-    assert args.stage_configs_path is None
 
 
 def test_streaming_audio_accumulator_keeps_every_delta():

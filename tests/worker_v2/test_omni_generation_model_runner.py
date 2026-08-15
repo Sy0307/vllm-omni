@@ -83,16 +83,26 @@ def test_execute_model_propagates_make_omni_output_failure(monkeypatch):
         generation_runner.OmniGenerationModelRunner.execute_model(runner, scheduler_output)
 
 
-def test_vllm_025_add_requests_accepts_released_chunk_projection():
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+def test_released_chunk_uses_typed_scheduler_output_with_inherited_add_requests():
+    from vllm.v1.core.sched.output import SchedulerOutput
 
-    runner = object.__new__(GPUModelRunner)
+    from vllm_omni.core.sched.output import OmniCachedRequestData
+    from vllm_omni.worker_v2.omni_generation_model_runner import (
+        OmniGenerationModelRunner,
+    )
+
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.model = SimpleNamespace(logits_processor=None)
     runner._remove_request = MagicMock()
+    req_id_to_index = MagicMock()
+    req_id_to_index.get.return_value = None
+    req_id_to_index.__getitem__.return_value = 0
     runner.req_states = SimpleNamespace(
         add_request=MagicMock(),
-        req_id_to_index={"req": 0},
+        req_id_to_index=req_id_to_index,
         apply_staged_writes=MagicMock(),
     )
+    runner.pooling_runner = None
     runner.encoder_cache = None
     runner.model_state = SimpleNamespace(
         add_request=MagicMock(),
@@ -102,24 +112,36 @@ def test_vllm_025_add_requests_accepts_released_chunk_projection():
     runner.lora_state = SimpleNamespace(add_request=MagicMock())
     runner.is_last_pp_rank = False
     runner.sampler = None
-    request = SimpleNamespace(
-        req_id="req",
-        prompt_token_ids=[1],
-        prefill_token_ids=[1],
-        sampling_params=None,
-        num_computed_tokens=0,
-        mm_features=[],
-        block_ids=(),
-        lora_request=None,
+    cached = OmniCachedRequestData(
+        req_ids=["req"],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={"req": [1]},
+        new_block_ids=[()],
+        num_computed_tokens=[0],
+        num_output_tokens=[0],
+        prompt_token_ids={"req": [1]},
+        additional_information={"req": None},
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=cached,
+        num_scheduled_tokens={"req": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
     )
 
-    GPUModelRunner.add_requests(
-        runner,
-        SimpleNamespace(scheduled_new_reqs=[request]),
-    )
+    runner._handle_async_chunk_updates(scheduler_output)
 
     runner.req_states.add_request.assert_called_once()
-    runner.model_state.add_request.assert_called_once_with(0, request)
+    added_request = runner.model_state.add_request.call_args.args[1]
+    assert added_request.req_id == "req"
+    assert added_request.prompt_token_ids == [1]
+    assert added_request.prefill_token_ids == [1]
 
 
 def test_execute_model_does_not_reference_removed_perf_hook():
@@ -205,8 +227,9 @@ def _make_runner(
     input_batch = _FakeInputBatch(num_reqs)
     runner._gen_model_output = model_output
     runner._gen_input_batch = input_batch
-    runner._gen_kv_connector_output = None
-    runner.execute_model_state = None
+    runner.execute_model_state = SimpleNamespace(finished_req_ids={"finished"})
+    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(return_value=None))
+    runner.check_ep_fault = False
 
     req_states = MagicMock()
     req_states.prompt_len = _FakeNpField(
@@ -349,8 +372,29 @@ class TestReqStatesUpdate(unittest.TestCase):
         for i in range(2):
             assert runner.req_states.num_computed_tokens.np[i] == prompt_len
 
+    def test_connector_runs_after_computed_token_state_is_applied(self):
+        from vllm_omni.worker_v2.omni_generation_model_runner import (
+            OmniGenerationModelRunner,
+        )
 
-def test_sample_tokens_uses_async_output_for_cuda_async_scheduler(monkeypatch):
+        prompt_len = 15
+        output = _make_omni_output({"model_outputs": torch.randn(2, 4)})
+        runner = _make_runner(output, num_reqs=2, prompt_len=prompt_len)
+
+        def post_forward(_finished_req_ids):
+            assert runner.req_states.num_computed_tokens.np.tolist() == [
+                prompt_len,
+                prompt_len,
+            ]
+
+        runner.kv_connector.post_forward.side_effect = post_forward
+
+        OmniGenerationModelRunner.sample_tokens(runner)
+
+        runner.kv_connector.post_forward.assert_called_once_with({"finished"})
+
+
+def test_sample_tokens_uses_async_output_for_cuda(monkeypatch):
     from vllm_omni.worker_v2 import omni_generation_model_runner as generation_runner
 
     output = _make_omni_output({"model_outputs": [torch.randn(4)]})
@@ -368,7 +412,6 @@ def test_sample_tokens_uses_async_output_for_cuda_async_scheduler(monkeypatch):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(generation_runner, "_uses_async_output", lambda _runner: True)
     monkeypatch.setattr(generation_runner, "OmniGenerationAsyncOutput", _FakeAsyncOutput)
 
     result = generation_runner.OmniGenerationModelRunner.sample_tokens(runner)
@@ -401,7 +444,6 @@ def test_sample_tokens_snapshots_request_ids_before_async_finalize(monkeypatch):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(generation_runner, "_uses_async_output", lambda _runner: True)
     monkeypatch.setattr(generation_runner, "OmniGenerationAsyncOutput", _FakeAsyncOutput)
 
     input_batch = runner._gen_input_batch
@@ -420,8 +462,6 @@ def test_sample_tokens_keeps_sync_output_for_cpu(monkeypatch):
 
     output = _make_omni_output({"model_outputs": [torch.randn(4)]})
     runner = _make_runner(output, num_reqs=1)
-    monkeypatch.setattr(generation_runner, "_uses_async_output", lambda _runner: True)
-
     result = generation_runner.OmniGenerationModelRunner.sample_tokens(runner)
 
     assert isinstance(result, OmniModelRunnerOutput)
@@ -435,8 +475,6 @@ def test_sample_tokens_reserves_native_output_before_sync_finalize(monkeypatch):
     runner = _make_runner(output, num_reqs=1)
     runner._reserve_native_data_plane_outputs = MagicMock()
     runner._finalize_native_data_plane_output = MagicMock(side_effect=lambda value: value)
-    monkeypatch.setattr(generation_runner, "_uses_async_output", lambda _runner: False)
-
     generation_runner.OmniGenerationModelRunner.sample_tokens(runner)
 
     runner._reserve_native_data_plane_outputs.assert_called_once_with(["req-0"])

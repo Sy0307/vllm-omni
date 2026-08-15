@@ -92,34 +92,6 @@ def test_async_chunk_update_clears_stale_intermediate_buffer():
     assert runner.req_states.applied is True
 
 
-def test_async_chunk_update_readds_released_cached_request():
-    runner = object.__new__(OmniGenerationModelRunner)
-    runner.req_states = _ReqStates(has_request=False)
-    runner.model_state = SimpleNamespace(intermediate_buffer=_IntermediateBuffer())
-    added = []
-    runner.add_requests = lambda scheduler_output: added.extend(scheduler_output.scheduled_new_reqs)
-    cached = OmniCachedRequestData(
-        req_ids=["r1"],
-        resumed_req_ids=set(),
-        new_token_ids=[],
-        all_token_ids={"r1": [1, 2, 3]},
-        new_block_ids=[([7],)],
-        num_computed_tokens=[0],
-        num_output_tokens=[0],
-        prompt_token_ids={"r1": [1, 2, 3]},
-        additional_information={"r1": {"fresh": "value"}},
-    )
-
-    runner._handle_async_chunk_updates(SimpleNamespace(scheduled_cached_reqs=cached))
-
-    assert len(added) == 1
-    assert added[0].req_id == "r1"
-    assert added[0].prompt_token_ids == [1, 2, 3]
-    assert added[0].prefill_token_ids == [1, 2, 3]
-    assert added[0].block_ids == ([7],)
-    assert added[0].additional_information == {"fresh": "value"}
-
-
 def _make_runner_for_sample(async_chunk):
     runner = object.__new__(OmniGenerationModelRunner)
     runner._gen_model_output = OmniOutput(
@@ -131,8 +103,9 @@ def _make_runner_for_sample(async_chunk):
         idx_mapping_np=[0],
         req_ids=["r1"],
     )
-    runner._gen_kv_connector_output = None
-    runner.execute_model_state = object()
+    runner.execute_model_state = SimpleNamespace(finished_req_ids=set())
+    runner.kv_connector = SimpleNamespace(post_forward=lambda _finished: None)
+    runner.check_ep_fault = False
     runner.model_config = SimpleNamespace(async_chunk=async_chunk)
     runner.req_states = _ReqStates()
     runner.model_state = SimpleNamespace(
@@ -166,6 +139,5 @@ def test_generation_sample_releases_runner_slot_after_chunk_output():
 
 if __name__ == "__main__":
     test_async_chunk_update_clears_stale_intermediate_buffer()
-    test_async_chunk_update_readds_released_cached_request()
     test_generation_sample_keeps_runner_slot_without_async_chunk()
     test_generation_sample_releases_runner_slot_after_chunk_output()

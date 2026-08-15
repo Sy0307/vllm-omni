@@ -8,10 +8,12 @@ from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.gpu_worker import (
+    CompilationTimes,
+    init_worker_distributed_environment,
+)
 from vllm.v1.worker.workspace import init_workspace_manager
 
-from vllm_omni.compat import make_filtered_namedtuple
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
@@ -25,17 +27,8 @@ def _supports_generation_device_type(device_type: str) -> bool:
     return device_type in ("cuda", "musa")
 
 
-def _make_compilation_times(language_model_time: float, **kwargs):
-    try:
-        from vllm.v1.worker.gpu_worker import CompilationTimes
-    except ImportError:
-        return language_model_time
-
-    values = {"language_model": language_model_time, "encoder": 0.0, **kwargs}
-    result, unknown = make_filtered_namedtuple(CompilationTimes, **values)
-    if unknown:
-        logger.warning("Unknown fields passed to CompilationTimes: %s", sorted(unknown))
-    return result
+def _make_compilation_times(language_model_time: float) -> CompilationTimes:
+    return CompilationTimes(language_model=language_model_time, encoder=0.0)
 
 
 class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):

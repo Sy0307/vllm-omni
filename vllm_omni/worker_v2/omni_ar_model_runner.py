@@ -15,6 +15,9 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    get_ep_all2all_manager,
+)
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
@@ -61,17 +64,6 @@ def _has_cuda_tensor(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_has_cuda_tensor(item) for item in value)
     return False
-
-
-def _uses_async_output(runner: Any) -> bool:
-    # Older runners expose the resolved scheduler mode directly. vLLM 0.24
-    # removed that attribute, so fall back to the scheduler config instead of
-    # silently forcing async output for a synchronous scheduler.
-    legacy_flag = getattr(runner, "use_async_scheduling", None)
-    if legacy_flag is not None:
-        return bool(legacy_flag)
-    scheduler_config = getattr(runner, "scheduler_config", None)
-    return bool(getattr(scheduler_config, "async_scheduling", True))
 
 
 def _guard_graph_replay_for_pooler_copy(
@@ -142,6 +134,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
     # ------------------------------------------------------------------
 
+    @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -154,29 +147,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
-        # kv_connector_output is no longer a field on vLLM 0.23.0's ExecuteModelState;
-        # the base execute_model stashes it here after post_forward().
-        kv_connector_output = self._last_kv_connector_output
-        self._last_kv_connector_output = None
+        finished_req_ids = self.execute_model_state.finished_req_ids
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
-            from vllm.v1.worker.gpu.pp_utils import pp_receive
-
-            sampled, num_sampled, num_rejected = pp_receive(
-                input_batch.num_reqs,
-                max_sample_len=self.num_speculative_steps + 1,
-            )
-            # vLLM 0.23.0 renamed postprocess() -> postprocess_sampled() and now
-            # takes idx_mapping (+ query_start_loc) instead of the InputBatch.
-            self.postprocess_sampled(
-                input_batch.idx_mapping,
-                sampled,
-                num_sampled,
-                num_rejected,
-                input_batch.query_start_loc,
-            )
-            return None
+            assert self.pp_handler is not None
+            all_decode_next = self.pp_handler.receive(input_batch)
+            self.postprocess_num_computed_tokens(input_batch)
+            if not all_decode_next:
+                self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # --- Omni: reconstruct raw model output and post-process ---
         aux = self._last_aux_output
@@ -204,17 +185,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
             input_batch,
             grammar_output,
         )
-        if self.use_pp:
-            from vllm.v1.worker.gpu.pp_utils import pp_broadcast
-
-            pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
+        if self.pp_handler is not None:
+            self.pp_handler.broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch,
+            )
 
         # --- Omni: prompt logprobs ---
         assert self.prompt_logprobs_worker is not None
-        # vLLM 0.23.0 dropped the prefill_len / num_computed_prefill_tokens args;
-        # compute_prompt_logprobs now reads prefill_len_np /
-        # num_computed_prefill_tokens_np from input_batch instead. Mirror the
-        # parent GPUModelRunner's 6-arg call exactly.
+        # Mirror the current parent GPUModelRunner call exactly.
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             text_hidden,
@@ -234,7 +215,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             req_id_to_index={rid: i for i, rid in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,
-            kv_connector_output=kv_connector_output,
+            kv_connector_output=None,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
@@ -251,6 +232,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             input_batch=input_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
             finalize_output=self._finalize_native_data_plane_output,
+            check_ep_fault=self.check_ep_fault,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -269,11 +251,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_rejected,
             input_batch.query_start_loc,
         )
+        model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
 
         self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))
-        if _uses_async_output(self):
-            return async_output
-        return async_output.get_output()
+        return async_output
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:
@@ -620,6 +601,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         input_batch: Any | None = None,
         async_chunk: bool = False,
         finalize_output: Any | None = None,
+        check_ep_fault: bool = False,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -628,6 +610,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
         self._mm_gpu_sources = multimodal_outputs if self._async_chunk else None
+        self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
         self._need_pooler = text_hidden is not None or (self._async_chunk and bool(multimodal_outputs))
@@ -690,6 +673,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
+            if check_ep_fault:
+                has_fault = get_ep_all2all_manager().query_fault()
+                self._has_fault = has_fault.to("cpu", non_blocking=True)
 
             # Pooler output (hidden + multimodal) — async D2H
             self._hidden_cpu: torch.Tensor | None = None
@@ -741,6 +727,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+
+        if self._has_fault is not None and self._has_fault.item():
+            mask = get_ep_all2all_manager().query_active_mask()
+            raise RuntimeError(
+                "Fault detected in EP all2all communication: one or more ranks "
+                f"timed out during dispatch/combine. Mask: {mask.cpu().tolist()}"
+            )
 
         # Pooler output. Populate two channels from the same per-request payloads,
         # mirroring the V1 runner:

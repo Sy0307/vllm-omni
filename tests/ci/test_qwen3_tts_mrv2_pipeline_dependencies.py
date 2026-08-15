@@ -28,6 +28,7 @@ def _labels(steps):
 @pytest.mark.parametrize(
     "changed_file",
     [
+        "vllm_omni/config/omni_config.py",
         "vllm_omni/core/sched/omni_ar_scheduler.py",
         "vllm_omni/engine/orchestrator.py",
         "vllm_omni/outputs/output_processor.py",
