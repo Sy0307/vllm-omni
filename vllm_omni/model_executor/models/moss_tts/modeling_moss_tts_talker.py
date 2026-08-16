@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Sequence
+import os
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -1268,6 +1269,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     has_preprocess: bool = True
     has_postprocess: bool = True
 
+    _DEFAULT_MAX_AUDIO_FRAMES = 512
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.vllm_config = vllm_config
@@ -1283,6 +1286,25 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
 
         self.audio_assistant_slot_token_id: int = int(self.config.audio_assistant_slot_token_id)
         self.im_end_token_id: int = int(self.config.im_end_token_id)
+
+        max_audio_frames_raw = os.getenv(
+            "MOSS_TTS_LOCAL_MAX_AUDIO_FRAMES",
+            str(self._DEFAULT_MAX_AUDIO_FRAMES),
+        ).strip()
+        try:
+            self.max_audio_frames = int(max_audio_frames_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"MOSS_TTS_LOCAL_MAX_AUDIO_FRAMES must be a non-negative integer, got {max_audio_frames_raw!r}"
+            ) from exc
+        if self.max_audio_frames < 0:
+            raise ValueError(
+                "MOSS_TTS_LOCAL_MAX_AUDIO_FRAMES must be non-negative; use 0 to disable the server-side safety cap"
+            )
+        logger.info(
+            "MOSS-TTS Local server-side audio-frame safety cap: %s",
+            self.max_audio_frames or "disabled",
+        )
 
         # Qwen3 backbone. get_text_config() is sufficient for vLLM to size
         # KV cache / heads correctly, as long as AutoConfig resolves to the
@@ -1323,7 +1345,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self.mtp_hidden_size = hidden_size
         self.talker_mtp_graph_safe = True
         self.talker_mtp_output_key = ("audio_codes", "current")
-        self.use_async_omni_output = False
+        # ``make_omni_output`` keeps code rows fixed-shape and performs all
+        # state updates eagerly, so the runner can safely pack/snapshot them
+        # before CUDA-graph buffers are reused.  This moves the pinned D2H and
+        # output materialization off the Stage-0 execution thread.
+        self.use_async_omni_output = True
         self.eager_omni_postprocess_before_async_output = True
         self.omni_pooler_payload_include_hidden = False
         self.postprocess_uses_multimodal_outputs = False
@@ -1339,6 +1365,57 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     # ------------------------------------------------------------------
     # vLLM hooks
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_max_new_frames(value: object) -> int:
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if value is None:
+            return 0
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, value)
+
+    def _new_audio_state(self, info_dict: Mapping[str, object]) -> dict[str, object]:
+        """Create Local-v1.5 decode state with an effective frame budget.
+
+        The HTTP speech endpoint forwards ``max_new_tokens`` as
+        ``max_new_frames`` for MOSS-TTS, but Local-v1.5 previously ignored
+        that field and could therefore run until the generic 4096-token
+        Stage-0 limit (~328 seconds at 12.5 Hz).  Clamp the request budget by
+        a service-side guard so a missing or excessively large request limit
+        cannot monopolize a decode slot indefinitely.
+        """
+        request_limit = self._coerce_max_new_frames(info_dict.get("max_new_frames"))
+        limits = [limit for limit in (request_limit, self.max_audio_frames) if limit > 0]
+        effective_limit = min(limits) if limits else 0
+        return {
+            "is_stopping": False,
+            "step": 0,
+            "max_new_frames": effective_limit,
+        }
+
+    @staticmethod
+    def _advance_audio_frame_budget(state: dict[str, Any]) -> bool:
+        """Reserve one output frame, or mark the request for forced EOS."""
+        if bool(state.get("is_stopping")):
+            return False
+        step = max(0, int(state.get("step", 0)))
+        max_new_frames = max(0, int(state.get("max_new_frames", 0)))
+        if max_new_frames > 0 and step >= max_new_frames:
+            state["is_stopping"] = True
+            state["stop_reason"] = "max_new_frames"
+            if not bool(state.get("_max_new_frames_warned")):
+                logger.warning(
+                    "MOSS-TTS Local reached the %d-frame safety limit; forcing im_end_token_id",
+                    max_new_frames,
+                )
+                state["_max_new_frames_warned"] = True
+            return False
+        state["step"] = step + 1
+        return True
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -1474,8 +1551,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         audio_state = info_dict.get("audio_state")
         is_first_call = not isinstance(audio_state, dict)
+        is_prefill = bool(info_dict.get("_omni_is_prefill", False))
 
-        if span_len > 1 or is_first_call:
+        if span_len > 1 or is_first_call or is_prefill:
             embeds = self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
@@ -1491,7 +1569,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                         embeds = embeds + self._audio_embed(codes)
 
             info_update: dict[str, Any] = {
-                "audio_state": {"is_stopping": False},
+                "audio_state": self._new_audio_state(info_dict),
                 "ref_offset": ref_offset + span_len,
             }
             return input_ids, embeds, info_update
@@ -1508,10 +1586,17 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         else:
             mtp_hidden = torch.zeros((1, self.hidden_size), device=device, dtype=text_embed.dtype)
         state = info_dict.get("audio_state", {}) or {}
-        active = isinstance(state, dict) and not bool(state.get("is_stopping"))
+        active = isinstance(state, dict) and self._advance_audio_frame_budget(state)
         mtp_control = torch.zeros_like(mtp_hidden)
         mtp_control[:, :1] = 1.0 if active else 0.0
-        return input_ids, text_embed, {"mtp_inputs": (mtp_hidden, mtp_control)}
+        return (
+            input_ids,
+            text_embed,
+            {
+                "mtp_inputs": (mtp_hidden, mtp_control),
+                "audio_state": state,
+            },
+        )
 
     def preprocess_decode_batch(
         self,
@@ -1549,7 +1634,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 hidden_rows.append(text_embeds.new_zeros((1, self.hidden_size)))
 
             state = info.get("audio_state", {}) or {}
-            active_rows.append(isinstance(state, dict) and not bool(state.get("is_stopping")))
+            active_rows.append(isinstance(state, dict) and self._advance_audio_frame_budget(state))
 
         last_talker_hidden = torch.cat(hidden_rows, dim=0)
         text_step = torch.zeros_like(last_talker_hidden)
@@ -1563,7 +1648,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             text_embeds,
             last_talker_hidden,
             text_step,
-            [{} for _ in range(batch_size)],
+            [{"audio_state": info.get("audio_state", {}) or {}} for info in req_infos],
         )
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
@@ -1650,7 +1735,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
 
         for info in info_dicts:
             if isinstance(info, dict) and not isinstance(info.get("audio_state"), dict):
-                info["audio_state"] = {"is_stopping": False}
+                info["audio_state"] = self._new_audio_state(info)
 
         self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
         self._batch_state_spans = kwargs.get("request_token_spans")
@@ -1668,9 +1753,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 should_continue = codes.ne(self.audio_pad_token_id).any(dim=-1)
                 should_values.append(should_continue.reshape(-1)[:1])
                 have_mtp_output = True
-                emitted_codes = codes[should_continue]
-                per_req_codes.append(emitted_codes)
-                have_codes = have_codes or emitted_codes.numel() > 0
+                # Do not boolean-index a CUDA tensor here.  Even for the
+                # common single-row case, ``codes[should_continue]`` must
+                # discover a dynamic output size on the host and therefore
+                # synchronizes the CUDA stream once per request.  Keep the
+                # fixed-shape row (including an all-pad stop row); the async
+                # chunk processor already filters all-pad rows on CPU.
+                per_req_codes.append(codes)
+                have_codes = True
             else:
                 should_values.append(torch.ones((1,), device=hidden.device, dtype=torch.bool))
                 per_req_codes.append(hidden.new_empty((0, self.n_vq), dtype=torch.long))

@@ -41,3 +41,75 @@ def test_moss_tts_delay_compute_logits_does_not_forward_sampling_metadata() -> N
     assert logits.shape == (1, 4)
     assert model.logits_processor.args == (model.text_lm_head, hidden_states)
     assert model.logits_processor.kwargs == {}
+
+
+def test_moss_tts_local_keeps_fixed_shape_pad_rows_for_cpu_filtering() -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSLocalTalkerForGeneration,
+    )
+
+    model = MossTTSLocalTalkerForGeneration.__new__(MossTTSLocalTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.audio_pad_token_id = 1024
+    model.n_vq = 4
+    model._batch_state = None
+    model._batch_state_spans = None
+    model._batch_should_continue = None
+
+    valid = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    stopped = torch.full((1, 4), model.audio_pad_token_id, dtype=torch.long)
+    infos = [
+        {"audio_state": {}, "audio_codes": {"current": valid}},
+        {"audio_state": {}, "audio_codes": {"current": stopped}},
+    ]
+
+    output = model.make_omni_output(
+        torch.randn(2, 8),
+        model_intermediate_buffer=infos,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    audio = output.multimodal_outputs["codes"]["audio"]
+    assert len(audio) == 2
+    torch.testing.assert_close(audio[0], valid)
+    # Keeping this row avoids CUDA boolean-index shape discovery; the
+    # talker2codec raw async-chunk processor drops all-pad rows on CPU.
+    torch.testing.assert_close(audio[1], stopped)
+    assert model._batch_should_continue.tolist() == [True, False]
+
+
+def test_moss_tts_local_audio_frame_budget_clamps_request_and_forces_stop() -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSLocalTalkerForGeneration,
+    )
+
+    model = MossTTSLocalTalkerForGeneration.__new__(MossTTSLocalTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.max_audio_frames = 3
+
+    state = model._new_audio_state({"max_new_frames": [4096]})
+    assert state == {
+        "is_stopping": False,
+        "step": 0,
+        "max_new_frames": 3,
+    }
+    assert [model._advance_audio_frame_budget(state) for _ in range(4)] == [True, True, True, False]
+    assert state["step"] == 3
+    assert state["is_stopping"] is True
+    assert state["stop_reason"] == "max_new_frames"
+
+
+def test_moss_tts_local_audio_frame_budget_honors_smaller_request_limit() -> None:
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSLocalTalkerForGeneration,
+    )
+
+    model = MossTTSLocalTalkerForGeneration.__new__(MossTTSLocalTalkerForGeneration)
+    nn.Module.__init__(model)
+    model.max_audio_frames = 512
+
+    assert model._new_audio_state({"max_new_frames": [128]})["max_new_frames"] == 128
+    assert model._new_audio_state({})["max_new_frames"] == 512
+
+    model.max_audio_frames = 0
+    assert model._new_audio_state({})["max_new_frames"] == 0
