@@ -320,9 +320,67 @@ def test_async_vocoder_collects_only_ready_live_requests() -> None:
 
     torch.testing.assert_close(outputs["live"], torch.ones(4))
     assert "cancelled" not in outputs
+    assert decoder._ready_vocoder_outputs["live"][0] is live
+    assert live.output_emitted is False
+
+    decoder._commit_ready_vocoder_outputs(set(outputs))
+
     assert live.output_emitted is True
     assert pending.output_emitted is False
+    assert "live" not in decoder._ready_vocoder_outputs
     assert len(decoder._pending_vocoder_batches) == 1
+
+
+def test_ready_async_vocoder_output_survives_batch_init_failure() -> None:
+    cfm = _RecordingCFM()
+    decoder = _make_decoder_for_state_tests(cfm)
+    ready = _FakeDecoderState(_FakeEulerState("ready", 8))
+    ready.vocoder_queued = True
+    decoder._continuous_cfm_states = {"ready": ready}
+    decoder._ready_vocoder_outputs = {
+        "ready": (ready, torch.ones(4)),
+    }
+
+    def initialize(
+        self: IndexTTS2S2MelDecoder,
+        *,
+        request_id: str,
+        info: dict[str, object],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> _FakeDecoderState:
+        del self, info, device, model_dtype
+        raise RuntimeError(f"cannot initialize {request_id}")
+
+    decoder._initialize_continuous_request = MethodType(initialize, decoder)
+
+    with pytest.raises(RuntimeError, match="cannot initialize bad"):
+        decoder._forward_continuous(
+            request_ids=["ready", "bad"],
+            request_infos=[{}, {}],
+            device=torch.device("cpu"),
+            model_dtype=torch.float32,
+        )
+
+    assert decoder._ready_vocoder_outputs["ready"][0] is ready
+    assert ready.output_emitted is False
+    assert decoder.take_finished_request_ids() == set()
+
+    output = decoder._forward_continuous(
+        request_ids=["ready"],
+        request_infos=[{}],
+        device=torch.device("cpu"),
+        model_dtype=torch.float32,
+    )
+
+    assert output.multimodal_outputs is not None
+    torch.testing.assert_close(
+        output.multimodal_outputs["audio"][0],
+        torch.ones(4),
+    )
+    assert ready.output_emitted is True
+    assert decoder._ready_vocoder_outputs == {}
+    assert decoder.take_finished_request_ids() == {"ready"}
 
 
 def test_continuous_decoder_initializes_each_request_once() -> None:
@@ -359,6 +417,83 @@ def test_continuous_decoder_initializes_each_request_once() -> None:
 
     assert first is second
     assert initialized == [("request-a", payload)]
+
+
+def test_continuous_decoder_rolls_back_new_batch_states_after_init_failure() -> None:
+    cfm = _RecordingCFM()
+    decoder = _make_decoder_for_state_tests(cfm)
+    existing = _FakeDecoderState(_FakeEulerState("existing", 8))
+    decoder._continuous_cfm_states = {"existing": existing}
+    initialized: list[str] = []
+
+    def initialize(
+        self: IndexTTS2S2MelDecoder,
+        *,
+        request_id: str,
+        info: dict[str, object],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> _FakeDecoderState:
+        del self, info, device, model_dtype
+        initialized.append(request_id)
+        if request_id == "new-bad":
+            raise RuntimeError("bad request")
+        return _FakeDecoderState(_FakeEulerState(request_id, 8))
+
+    decoder._initialize_continuous_request = MethodType(initialize, decoder)
+
+    with pytest.raises(RuntimeError, match="bad request"):
+        decoder._forward_continuous(
+            request_ids=["existing", "new-good", "new-bad"],
+            request_infos=[{}, {}, {}],
+            device=torch.device("cpu"),
+            model_dtype=torch.float32,
+        )
+
+    assert initialized == ["new-good", "new-bad"]
+    assert decoder._continuous_cfm_states == {"existing": existing}
+    assert cfm.discard_calls == [{"new-good"}]
+
+
+def test_continuous_decoder_discards_new_state_after_advance_failure() -> None:
+    cfm = _RecordingCFM()
+    decoder = _make_decoder_for_state_tests(cfm)
+    existing = _FakeDecoderState(_FakeEulerState("existing", 8))
+    decoder._continuous_cfm_states = {"existing": existing}
+
+    def initialize(
+        self: IndexTTS2S2MelDecoder,
+        *,
+        request_id: str,
+        info: dict[str, object],
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> _FakeDecoderState:
+        del self, info, device, model_dtype
+        return _FakeDecoderState(_FakeEulerState(request_id, 8))
+
+    def fail_after_advance(
+        self: IndexTTS2S2MelDecoder,
+        request_ids: list[str],
+    ) -> list[_FakeDecoderState]:
+        for request_id in request_ids:
+            self._continuous_cfm_states[request_id].cfm_state.step_index += 1
+        raise RuntimeError("advance failed")
+
+    decoder._initialize_continuous_request = MethodType(initialize, decoder)
+    decoder._advance_continuous_cfm = MethodType(fail_after_advance, decoder)
+
+    with pytest.raises(RuntimeError, match="advance failed"):
+        decoder._forward_continuous(
+            request_ids=["existing", "new"],
+            request_infos=[{}, {}],
+            device=torch.device("cpu"),
+            model_dtype=torch.float32,
+        )
+
+    assert decoder._continuous_cfm_states == {"existing": existing}
+    assert existing.cfm_state.step_index == 1
+    assert cfm.discard_calls == [{"new"}]
 
 
 def test_continuous_decoder_groups_exact_shapes_and_keeps_mixed_steps() -> None:

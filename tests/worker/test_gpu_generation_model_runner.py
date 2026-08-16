@@ -7,6 +7,7 @@ from vllm.config import CacheConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
+from vllm_omni.model_executor.models.indextts2 import runner as indextts_runner_module
 from vllm_omni.model_executor.models.indextts2.runner import (
     IndexTTS2GenerationModelRunner,
 )
@@ -198,6 +199,70 @@ def test_execute_model_runs_stepwise_without_input_prep(
     assert captured["input_ids"].numel() == 0
     assert runner._generation_finished_req_ids == {"req-b"}
     assert runner._stepwise_output_req_ids == ["req-a", "req-b"]
+
+
+def test_stepwise_forward_preserves_native_kv_connector_lifecycle(monkeypatch):
+    lifecycle = []
+    kv_connector_output = object()
+
+    @contextlib.contextmanager
+    def tracked_context(name, value=None):
+        lifecycle.append(f"{name}:enter")
+        try:
+            yield value
+        finally:
+            lifecycle.append(f"{name}:exit")
+
+    monkeypatch.setattr(
+        indextts_runner_module,
+        "has_kv_transfer_group",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        indextts_runner_module,
+        "set_forward_context",
+        lambda *_args, **_kwargs: tracked_context("forward-context"),
+    )
+    runner = _make_guard_runner(IndexTTS2GenerationModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.model_intermediate_buffer = {"req-a": {"value": "a"}}
+    runner._active_stepwise_req_ids = None
+    runner._sync_local_stage_payloads = lambda: None
+    runner.maybe_get_kv_connector_output = lambda scheduler_output, defer_finalize: tracked_context(
+        "kv-connector",
+        kv_connector_output,
+    )
+    runner.model = SimpleNamespace(
+        take_finished_request_ids=lambda: set(),
+    )
+    runner._model_forward = lambda **_kwargs: lifecycle.append("model-forward") or None
+    runner.extract_multimodal_outputs = lambda outputs: (None, outputs)
+    sampled_output = object()
+
+    def sample_tokens():
+        assert runner.kv_connector_output is kv_connector_output
+        lifecycle.append("sample-tokens")
+        return sampled_output
+
+    runner.sample_tokens = sample_tokens
+    scheduler_output = _StubSchedulerOutput(0)
+
+    output = runner._execute_stepwise_generation(
+        scheduler_output,
+        ["req-a"],
+        None,
+    )
+
+    assert output is sampled_output
+    assert lifecycle == [
+        "forward-context:enter",
+        "kv-connector:enter",
+        "model-forward",
+        "kv-connector:exit",
+        "forward-context:exit",
+        "sample-tokens",
+    ]
 
 
 def test_execute_model_flushes_finished_state_without_stepwise_work(monkeypatch):

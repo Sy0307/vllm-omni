@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 
 import torch
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.forward_context import set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput
@@ -96,7 +99,16 @@ class IndexTTS2GenerationModelRunner(GPUGenerationModelRunner):
             empty_input_ids = torch.empty(0, dtype=torch.long, device=self.device)
             self._stepwise_empty_input_ids = empty_input_ids
 
-        with record_function_or_nullcontext("Forward"):
+        has_kv_transfer = has_kv_transfer_group()
+        forward_context = set_forward_context(None, self.vllm_config) if has_kv_transfer else nullcontext()
+        with (
+            record_function_or_nullcontext("Forward"),
+            forward_context,
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                defer_finalize=self.speculative_config is not None,
+            ) as kv_connector_output,
+        ):
             self._active_stepwise_req_ids = request_ids
             try:
                 outputs = self._model_forward(
@@ -126,7 +138,7 @@ class IndexTTS2GenerationModelRunner(GPUGenerationModelRunner):
             multimodal_outputs,
             None,
         )
-        self.kv_connector_output = None
+        self.kv_connector_output = kv_connector_output
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
         if scheduler_output.total_num_scheduled_tokens == 0:

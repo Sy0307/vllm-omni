@@ -925,17 +925,22 @@ class IndexTTS2S2MelDecoder(nn.Module):
         """Defer cleanup because the runner invokes this hook before forward."""
         self._deferred_cleanup_ids.update(str(request_id) for request_id in request_ids)
 
+    def _discard_continuous_requests(self, request_ids: set[str]) -> None:
+        if not request_ids:
+            return
+        cfm = self.s2mel.models["cfm"]
+        cfm.discard_euler_group_cache(request_ids)
+        for request_id in request_ids:
+            self._continuous_cfm_states.pop(request_id, None)
+            self._ready_vocoder_outputs.pop(request_id, None)
+        self._reap_cancelled_vocoder_batches()
+
     def _flush_deferred_cleanup(self) -> None:
         if not self._deferred_cleanup_ids:
             return
         cleanup_ids = self._deferred_cleanup_ids
-        cfm = self.s2mel.models["cfm"]
-        cfm.discard_euler_group_cache(cleanup_ids)
-        for request_id in cleanup_ids:
-            self._continuous_cfm_states.pop(request_id, None)
-            self._ready_vocoder_outputs.pop(request_id, None)
+        self._discard_continuous_requests(cleanup_ids)
         self._deferred_cleanup_ids = set()
-        self._reap_cancelled_vocoder_batches()
 
     def flush_finished_requests(self) -> None:
         """Release deferred state when the runner has no in-flight stepwise work."""
@@ -1171,6 +1176,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         device: torch.device,
         model_dtype: torch.dtype,
     ) -> OmniOutput:
+        existing_request_ids = set(self._continuous_cfm_states)
         try:
             return self._forward_continuous_impl(
                 request_ids=request_ids,
@@ -1178,6 +1184,10 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 device=device,
                 model_dtype=model_dtype,
             )
+        except Exception:
+            initialized_request_ids = set(self._continuous_cfm_states).difference(existing_request_ids)
+            self._discard_continuous_requests(initialized_request_ids)
+            raise
         finally:
             self._flush_deferred_cleanup()
 
@@ -1214,17 +1224,17 @@ class IndexTTS2S2MelDecoder(nn.Module):
             event.record(stream)
         for wav in wavs:
             wav.record_stream(stream)
-        for state in states:
-            state.vocoder_queued = True
         self._pending_vocoder_batches.append(
             _PendingVocoderBatch(tuple(request_ids), tuple(states), tuple(wavs), event)
         )
+        for state in states:
+            state.vocoder_queued = True
 
     def _collect_ready_vocoder_outputs(
         self,
         request_ids: set[str],
     ) -> dict[str, torch.Tensor]:
-        """Poll CUDA work and emit only requests scheduled in this tick."""
+        """Poll CUDA work and stage outputs scheduled in this tick."""
         remaining: deque[_PendingVocoderBatch] = deque()
         while self._pending_vocoder_batches:
             batch = self._pending_vocoder_batches.popleft()
@@ -1244,14 +1254,25 @@ class IndexTTS2S2MelDecoder(nn.Module):
 
         audio_by_request: dict[str, torch.Tensor] = {}
         for request_id in request_ids:
-            ready = self._ready_vocoder_outputs.pop(request_id, None)
+            ready = self._ready_vocoder_outputs.get(request_id)
             if ready is None:
                 continue
             state, wav = ready
             if self._continuous_cfm_states.get(request_id) is state:
                 audio_by_request[request_id] = wav.cpu()
-                state.output_emitted = True
+            else:
+                self._ready_vocoder_outputs.pop(request_id, None)
         return audio_by_request
+
+    def _commit_ready_vocoder_outputs(self, request_ids: set[str]) -> None:
+        """Consume staged async outputs after the tick output is materialized."""
+        for request_id in request_ids:
+            ready = self._ready_vocoder_outputs.pop(request_id, None)
+            if ready is None:
+                continue
+            state, _ = ready
+            if self._continuous_cfm_states.get(request_id) is state:
+                state.output_emitted = True
 
     def _make_async_vocoder_room(
         self,
@@ -1300,6 +1321,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
             )
 
         finished_states = self._advance_continuous_cfm(request_ids)
+        sync_output_states: dict[str, _ContinuousDecoderRequestState] = {}
         if finished_states:
             cfm = self.s2mel.models["cfm"]
             finished_mels: list[torch.Tensor] = []
@@ -1342,21 +1364,26 @@ class IndexTTS2S2MelDecoder(nn.Module):
                     strict=True,
                 ):
                     audio_by_request[request_id] = wav.cpu()
-                    state.output_emitted = True
-
-        self._last_finished_request_ids = set(audio_by_request)
+                    sync_output_states[request_id] = state
 
         if not audio_by_request:
             return OmniOutput(text_hidden_states=None, multimodal_outputs=None)
 
+        finished_request_ids = set(audio_by_request)
         sample_rate = torch.tensor(22050, dtype=torch.int32)
-        return OmniOutput(
+        output = OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
                 "audio": [audio_by_request.get(request_id) for request_id in request_ids],
                 "sr": [sample_rate if request_id in audio_by_request else None for request_id in request_ids],
             },
         )
+        self._commit_ready_vocoder_outputs(finished_request_ids)
+        for request_id, state in sync_output_states.items():
+            if self._continuous_cfm_states.get(request_id) is state:
+                state.output_emitted = True
+        self._last_finished_request_ids = finished_request_ids
+        return output
 
     @staticmethod
     def _cfm_group_indices(
