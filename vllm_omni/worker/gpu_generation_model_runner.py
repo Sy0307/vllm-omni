@@ -56,9 +56,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        self._generation_finished_req_ids: set[str] = set()
-        self._stepwise_output_req_ids: list[str] | None = None
-        self._stepwise_empty_input_ids: torch.Tensor | None = None
         # Mirrors the init allowlist in gpu_ar_model_runner.py.
         _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
@@ -110,73 +107,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
                 self._init_mrope_positions(req_state)
-
-    def _execute_stepwise_generation(
-        self,
-        scheduler_output: SchedulerOutput,
-        request_ids: list[str],
-        deferred_state_corrections_fn,
-    ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | None:
-        """Advance a stateful non-AR model without token/KV input prep."""
-        sync_local_payloads = getattr(self, "_sync_local_stage_payloads", None)
-        if callable(sync_local_payloads):
-            sync_local_payloads()
-
-        missing_payloads = [
-            request_id for request_id in request_ids if request_id not in self.model_intermediate_buffer
-        ]
-        if missing_payloads:
-            raise RuntimeError(f"Zero-token stepwise requests have no resident payload: {missing_payloads}")
-        request_infos = [self.model_intermediate_buffer[request_id] for request_id in request_ids]
-
-        empty_input_ids = getattr(self, "_stepwise_empty_input_ids", None)
-        if empty_input_ids is None or empty_input_ids.device != self.device:
-            empty_input_ids = torch.empty(
-                0,
-                dtype=torch.long,
-                device=self.device,
-            )
-            self._stepwise_empty_input_ids = empty_input_ids
-
-        with record_function_or_nullcontext("Forward"):
-            outputs = self._model_forward(
-                input_ids=empty_input_ids,
-                positions=None,
-                intermediate_tensors=None,
-                inputs_embeds=None,
-                model_intermediate_buffer=request_infos,
-                request_ids=request_ids,
-            )
-            take_finished = getattr(
-                self.model,
-                "take_finished_request_ids",
-                None,
-            )
-            if callable(take_finished):
-                self._generation_finished_req_ids = set(take_finished())
-
-        _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
-        self._stepwise_output_req_ids = list(request_ids)
-        self.execute_model_state = ExecuteModelState(
-            scheduler_output,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            multimodal_outputs,
-            None,
-        )
-        self.kv_connector_output = None
-        if deferred_state_corrections_fn:
-            deferred_state_corrections_fn()
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            return self.sample_tokens()
-        return None
 
     @torch.inference_mode()
     def execute_model(
@@ -232,40 +162,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
             # Notify stateful models of finished requests before the
-            # zero-token early return. A request ID may be finished and
-            # resubmitted in the same tick; clear the old model state before
-            # allowing that new request to initialize below.
-            finished_req_ids = set(scheduler_output.finished_req_ids)
-            if finished_req_ids and hasattr(self.model, "on_requests_finished"):
-                self.model.on_requests_finished(finished_req_ids)
+            # zero-token early return. Request cleanup is a model lifecycle
+            # concern and does not depend on the inter-stage transfer mode.
+            if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
+                self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
-            new_req_ids = {request.req_id for request in scheduler_output.scheduled_new_reqs}
-            stepwise_req_ids = list(getattr(scheduler_output, "stepwise_req_ids", ()))
-            if finished_req_ids:
-                stepwise_req_ids = [
-                    request_id
-                    for request_id in stepwise_req_ids
-                    if request_id not in finished_req_ids or request_id in new_req_ids
-                ]
-            if stepwise_req_ids:
-                flush_finished_requests = getattr(
-                    self.model,
-                    "flush_finished_requests",
-                    None,
-                )
-                if finished_req_ids and callable(flush_finished_requests):
-                    # Same-ID resubmissions must not inherit the old CFM state.
-                    flush_finished_requests()
-                if not getattr(self.model, "requires_request_ids", False):
-                    raise RuntimeError("Stepwise scheduler output requires a stateful model that consumes request_ids")
-                return self._execute_stepwise_generation(
-                    scheduler_output,
-                    stepwise_req_ids,
-                    deferred_state_corrections_fn,
-                )
-            flush_finished_requests = getattr(self.model, "flush_finished_requests", None)
-            if callable(flush_finished_requests):
-                flush_finished_requests()
+            model_work_fn = getattr(self, "_execute_scheduled_model_work", None)
+            if model_work_fn is not None:
+                model_work_output = model_work_fn(scheduler_output, deferred_state_corrections_fn)
+                if model_work_output is not NotImplemented:
+                    return model_work_output
 
             # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
             if scheduler_output.total_num_scheduled_tokens <= 0:
@@ -466,13 +372,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 model_kwargs=model_kwargs,
                 logits_indices=logits_indices,
             )
-            take_finished = getattr(
-                self.model,
-                "take_finished_request_ids",
-                None,
-            )
-            if callable(take_finished):
-                self._generation_finished_req_ids = set(take_finished())
 
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
         self.execute_model_state = ExecuteModelState(
@@ -542,31 +441,26 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
-        stepwise_req_ids = getattr(self, "_stepwise_output_req_ids", None)
-        if stepwise_req_ids is None:
-            output_req_ids = list(self.input_batch.req_ids)
-        else:
-            output_req_ids = list(stepwise_req_ids)
-        output_num_reqs = len(output_req_ids)
-
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
-        per_req_payloads: list[dict[str, object] | None] = []
+        per_req_payloads: list[dict[str, object]] = []
         if isinstance(multimodal_outputs_raw, torch.Tensor):
             assert multimodal_outputs_raw.shape[0] == 1, (
                 "model should return a single tensor, to return multiple tensors, use a dict"
             )
-            assert multimodal_outputs_raw.shape[0] == output_num_reqs
-            for i in range(output_num_reqs):
+            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
+            for i in range(self.input_batch.num_reqs):
                 per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
             assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
             for out in multimodal_outputs_raw:
-                per_req_payloads.append(None if out is None else {"model_outputs": out.detach().to("cpu").contiguous()})
+                per_req_payloads.append(
+                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
+                )
         elif isinstance(multimodal_outputs_raw, Mapping):
-            num_reqs = output_num_reqs
+            num_reqs = self.input_batch.num_reqs
             for i in range(num_reqs):
                 mm_payload = {}
                 for key, out in multimodal_outputs_raw.items():
@@ -576,36 +470,25 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                                 f"Multimodal output list for key '{key}' has length {len(out)} "
                                 f"but expected {num_reqs} (one entry per request)."
                             )
-                        item = out[i]
-                        if item is not None:
-                            mm_payload[key] = item.detach().to("cpu").contiguous()
+                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                per_req_payloads.append(_ensure_tensor_values(mm_payload) if mm_payload else None)
-        elif multimodal_outputs_raw is None:
-            per_req_payloads = [None] * output_num_reqs
+                per_req_payloads.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
 
         if self._async_chunk:
-            inter_stage_outputs, multimodal_outputs = partition_payload_list(
-                [payload or {} for payload in per_req_payloads]
-            )
+            inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
         else:
             # See gpu_ar_model_runner: non-async-chunk ships the full payload to the next
             # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
-            if all(payload is None for payload in per_req_payloads):
-                inter_stage_outputs = None
-                multimodal_outputs = None
-            else:
-                inter_stage_outputs = per_req_payloads
-                multimodal_outputs = per_req_payloads
+            inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
 
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
-        req_ids_output_copy = output_req_ids
-        req_id_to_index_output_copy = {req_id: index for index, req_id in enumerate(req_ids_output_copy)}
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         routed_experts_lists = None
         if self.routed_experts_initialized:
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
@@ -628,10 +511,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
-            generation_finished_req_ids=set(self._generation_finished_req_ids),
         )
-        self._generation_finished_req_ids.clear()
-        self._stepwise_output_req_ids = None
         output.omni_connector_output = self.get_omni_connector_output()
         output.routed_experts = routed_experts_lists
 

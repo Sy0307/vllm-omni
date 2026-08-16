@@ -11,9 +11,11 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 import vllm_omni.core.sched.omni_generation_scheduler as generation_scheduler_module
+from vllm_omni.model_executor.models.indextts2.scheduler import (
+    IndexTTS2GenerationScheduler,
+)
 
 # isort: on
 
@@ -42,8 +44,8 @@ def _make_request(request_id: str, prompt_token_ids: list[int] | None = None) ->
     )
 
 
-def _make_scheduler(running: list[Request]) -> OmniGenerationScheduler:
-    scheduler = object.__new__(OmniGenerationScheduler)
+def _make_scheduler(running: list[Request]) -> IndexTTS2GenerationScheduler:
+    scheduler = object.__new__(IndexTTS2GenerationScheduler)
     scheduler.max_num_scheduled_tokens = 16
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.kv_cache_manager = MagicMock()
@@ -91,6 +93,9 @@ def _make_scheduler(running: list[Request]) -> OmniGenerationScheduler:
 def _make_update_scheduler(session: Request) -> MagicMock:
     scheduler = MagicMock()
     scheduler._stepwise_generation = True
+    scheduler._should_finish_generation_request = (
+        IndexTTS2GenerationScheduler._should_finish_generation_request.__get__(scheduler)
+    )
     scheduler.requests = {session.request_id: session}
     scheduler.perf_metrics = None
     scheduler.chunk_transfer_adapter = None
@@ -125,7 +130,7 @@ def _model_output(request_id: str, *, finished: bool) -> SimpleNamespace:
 def test_cached_stepwise_generation_does_not_resend_payload() -> None:
     payload = {"mel_codes": [1, 2, 3]}
     request = SimpleNamespace(additional_information=payload)
-    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler = object.__new__(IndexTTS2GenerationScheduler)
 
     scheduler._stepwise_generation = True
     assert scheduler._cached_additional_information(request) is None
@@ -203,7 +208,7 @@ def test_stepwise_request_waits_for_model_completion() -> None:
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
-    OmniGenerationScheduler.update_from_output(
+    IndexTTS2GenerationScheduler.update_from_output(
         scheduler,
         scheduler_output,
         _model_output(session.request_id, finished=False),
@@ -212,7 +217,7 @@ def test_stepwise_request_waits_for_model_completion() -> None:
     assert session.status == RequestStatus.RUNNING
     scheduler._handle_stopped_request.assert_not_called()
 
-    OmniGenerationScheduler.update_from_output(
+    IndexTTS2GenerationScheduler.update_from_output(
         scheduler,
         scheduler_output,
         _model_output(session.request_id, finished=True),
@@ -232,7 +237,7 @@ def test_zero_token_stepwise_completion_is_consumed() -> None:
         num_invalid_spec_tokens=0,
     )
 
-    OmniGenerationScheduler.update_from_output(
+    IndexTTS2GenerationScheduler.update_from_output(
         scheduler,
         scheduler_output,
         _model_output(session.request_id, finished=True),
@@ -254,7 +259,7 @@ def test_zero_token_stepwise_output_does_not_consume_stale_tokens() -> None:
         num_invalid_spec_tokens=0,
     )
 
-    OmniGenerationScheduler.update_from_output(
+    IndexTTS2GenerationScheduler.update_from_output(
         scheduler,
         scheduler_output,
         _model_output(session.request_id, finished=False),

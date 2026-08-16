@@ -30,12 +30,12 @@ logger = init_logger(__name__)
 
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+    _stepwise_generation = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
         self._init_omni_io_scheduling_state()
-        hf_config = getattr(model_config, "hf_config", model_config)
-        self._stepwise_generation = bool(getattr(hf_config, "stepwise_generation", False))
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
 
@@ -59,9 +59,28 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _cached_additional_information(self, request: Request) -> dict | None:
         """Return only metadata that a cached generation tick still needs."""
-        if getattr(self, "_stepwise_generation", False):
-            return None
         return getattr(request, "additional_information", None)
+
+    def _should_finish_generation_request(
+        self,
+        request: Request,
+        model_finished_req_ids: set[str],
+    ) -> bool:
+        """Return whether a scheduled generation request is complete."""
+        del model_finished_req_ids
+        return (
+            request.status
+            in (
+                RequestStatus.FINISHED_ERROR,
+                RequestStatus.FINISHED_STOPPED,
+            )
+            or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
+            or (
+                self.chunk_transfer_adapter is not None
+                and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
+                and request.num_computed_tokens >= len(request.prompt_token_ids)
+            )
+        )
 
     def _handle_stopped_request(self, request: Request) -> bool:
         if (
@@ -505,33 +524,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.stop_reason = f"pooling output decode failed: {exc}"
                 request.resumable = False
 
-            # One-shot generation request: finish after its current input unit
-            # has been fully processed.
-            if getattr(self, "_stepwise_generation", False) is True:
-                should_stop = (
-                    request.status
-                    in (
-                        RequestStatus.FINISHED_ERROR,
-                        RequestStatus.FINISHED_STOPPED,
-                    )
-                    or req_id in generation_finished_req_ids
-                )
-            else:
-                should_stop = (
-                    request.status
-                    in (
-                        RequestStatus.FINISHED_ERROR,
-                        RequestStatus.FINISHED_STOPPED,
-                    )
-                    or (
-                        self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens
-                    )
-                    or (
-                        self.chunk_transfer_adapter is not None
-                        and self.chunk_transfer_adapter.is_done_receiving_chunks(request.request_id)
-                        and request.num_computed_tokens >= len(request.prompt_token_ids)
-                    )
-                )
+            should_stop = self._should_finish_generation_request(
+                request,
+                generation_finished_req_ids,
+            )
             if should_stop:
                 if request.status != RequestStatus.FINISHED_ERROR:
                     request.status = RequestStatus.FINISHED_STOPPED

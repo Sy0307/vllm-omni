@@ -7,6 +7,9 @@ from vllm.config import CacheConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
+from vllm_omni.model_executor.models.indextts2.runner import (
+    IndexTTS2GenerationModelRunner,
+)
 from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
@@ -23,8 +26,8 @@ class _DummyInputBatch:
         self.vocab_size = 10
 
 
-def _make_runner(multimodal_outputs, *, req_ids=("req-1",)):
-    runner = object.__new__(GPUGenerationModelRunner)
+def _make_runner(multimodal_outputs, *, req_ids=("req-1",), runner_cls=GPUGenerationModelRunner):
+    runner = object.__new__(runner_cls)
     runner.execute_model_state = ExecuteModelState(
         None,
         None,
@@ -77,8 +80,8 @@ def test_sample_tokens_list_allows_none_output():
 
     output = GPUGenerationModelRunner.sample_tokens(runner)
 
-    assert output.multimodal_outputs is None
-    assert output.inter_stage_outputs is None
+    assert len(output.multimodal_outputs) == 1
+    assert output.multimodal_outputs[0]["model_outputs"] is None
 
 
 def test_sample_tokens_dict_maps_only_completed_rows():
@@ -90,14 +93,18 @@ def test_sample_tokens_dict_maps_only_completed_rows():
             "sr": [sample_rate, None],
         },
         req_ids=("done", "pending"),
+        runner_cls=IndexTTS2GenerationModelRunner,
     )
+    runner._stepwise_output_req_ids = ["done", "pending"]
+    runner._generation_finished_req_ids = {"done"}
 
-    output = GPUGenerationModelRunner.sample_tokens(runner)
+    output = IndexTTS2GenerationModelRunner.sample_tokens(runner)
 
     assert output.multimodal_outputs is not None
     assert output.multimodal_outputs[1] is None
     torch.testing.assert_close(output.multimodal_outputs[0]["audio"], completed_audio)
     torch.testing.assert_close(output.multimodal_outputs[0]["sr"], sample_rate)
+    assert output.generation_finished_req_ids == {"done"}
 
 
 def test_sample_tokens_dict_output():
@@ -121,10 +128,10 @@ class _StubSchedulerOutput:
         self.scheduled_new_reqs = []
 
 
-def _make_guard_runner():
+def _make_guard_runner(runner_cls=GPUGenerationModelRunner):
     # Stubbed far enough that a span escaping the guard reaches the real
     # `_prepare_inputs`, i.e. fails the way the reported crash does.
-    runner = object.__new__(GPUGenerationModelRunner)
+    runner = object.__new__(runner_cls)
     runner.execute_model_state = None
     runner.routed_experts_initialized = False
     runner.speculative_config = None
@@ -144,12 +151,13 @@ def test_execute_model_runs_stepwise_without_input_prep(
     total_num_scheduled_tokens,
 ):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
-    runner = _make_guard_runner()
+    runner = _make_guard_runner(IndexTTS2GenerationModelRunner)
     runner.device = torch.device("cpu")
     runner.model_intermediate_buffer = {
         "req-a": {"value": "a"},
         "req-b": {"value": "b"},
     }
+    runner._active_stepwise_req_ids = None
     runner.model = SimpleNamespace(
         requires_request_ids=True,
         take_finished_request_ids=lambda: {"req-b"},
@@ -157,6 +165,9 @@ def test_execute_model_runs_stepwise_without_input_prep(
     captured = {}
 
     def model_forward(**kwargs):
+        kwargs["model_intermediate_buffer"] = [
+            runner.model_intermediate_buffer[request_id] for request_id in runner._active_stepwise_req_ids
+        ]
         captured.update(kwargs)
         return {"audio": [None, torch.ones(4)]}
 
@@ -171,7 +182,7 @@ def test_execute_model_runs_stepwise_without_input_prep(
     scheduler_output = _StubSchedulerOutput(total_num_scheduled_tokens)
     scheduler_output.stepwise_req_ids = ["req-a", "req-b"]
 
-    output = GPUGenerationModelRunner.execute_model(runner, scheduler_output)
+    output = IndexTTS2GenerationModelRunner.execute_model(runner, scheduler_output)
 
     if total_num_scheduled_tokens == 0:
         assert output is sampled_output
@@ -191,7 +202,7 @@ def test_execute_model_runs_stepwise_without_input_prep(
 
 def test_execute_model_flushes_finished_state_without_stepwise_work(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
-    runner = _make_guard_runner()
+    runner = _make_guard_runner(IndexTTS2GenerationModelRunner)
     flush_calls = []
     runner.model = SimpleNamespace(
         flush_finished_requests=lambda: flush_calls.append(True),
@@ -202,14 +213,14 @@ def test_execute_model_flushes_finished_state_without_stepwise_work(monkeypatch)
     scheduler_output.finished_req_ids = {"done"}
     runner.model.on_requests_finished = lambda request_ids: None
 
-    GPUGenerationModelRunner.execute_model(runner, scheduler_output)
+    IndexTTS2GenerationModelRunner.execute_model(runner, scheduler_output)
 
     assert flush_calls == [True]
 
 
 def test_execute_model_drops_cancelled_request_from_stepwise_work(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
-    runner = _make_guard_runner()
+    runner = _make_guard_runner(IndexTTS2GenerationModelRunner)
     lifecycle_calls = []
     runner.model = SimpleNamespace(
         requires_request_ids=True,
@@ -225,7 +236,7 @@ def test_execute_model_drops_cancelled_request_from_stepwise_work(monkeypatch):
     scheduler_output.stepwise_req_ids = ["cancelled"]
     scheduler_output.finished_req_ids = {"cancelled"}
 
-    output = GPUGenerationModelRunner.execute_model(runner, scheduler_output)
+    output = IndexTTS2GenerationModelRunner.execute_model(runner, scheduler_output)
 
     assert output is EMPTY_MODEL_RUNNER_OUTPUT
     assert lifecycle_calls == [
@@ -236,7 +247,7 @@ def test_execute_model_drops_cancelled_request_from_stepwise_work(monkeypatch):
 
 def test_execute_model_reinitializes_resubmitted_stepwise_request(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
-    runner = _make_guard_runner()
+    runner = _make_guard_runner(IndexTTS2GenerationModelRunner)
     lifecycle_calls = []
     runner.model = SimpleNamespace(
         requires_request_ids=True,
@@ -254,7 +265,7 @@ def test_execute_model_reinitializes_resubmitted_stepwise_request(monkeypatch):
     scheduler_output.finished_req_ids = {"same-id"}
     scheduler_output.scheduled_new_reqs = [SimpleNamespace(req_id="same-id")]
 
-    output = GPUGenerationModelRunner.execute_model(runner, scheduler_output)
+    output = IndexTTS2GenerationModelRunner.execute_model(runner, scheduler_output)
 
     assert output is None
     assert captured_request_ids == ["same-id"]
@@ -268,10 +279,11 @@ def test_sample_tokens_uses_explicit_stepwise_output_order():
     runner = _make_runner(
         {"audio": [torch.ones(2), None]},
         req_ids=("stale-input-batch",),
+        runner_cls=IndexTTS2GenerationModelRunner,
     )
     runner._stepwise_output_req_ids = ["done", "pending"]
 
-    output = GPUGenerationModelRunner.sample_tokens(runner)
+    output = IndexTTS2GenerationModelRunner.sample_tokens(runner)
 
     assert output.req_ids == ["done", "pending"]
     assert output.req_id_to_index == {"done": 0, "pending": 1}

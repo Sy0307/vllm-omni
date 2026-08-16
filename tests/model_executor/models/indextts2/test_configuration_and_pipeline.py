@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     IndexTTS2Config,
     IndexTTS25Config,
@@ -66,6 +67,22 @@ def test_indextts25_pipeline_is_registered_with_two_distinct_stages():
         "IndexTTS25S2MelDecoder",
     ]
     assert all("tokenizer" not in stage.extras for stage in INDEXTTS25_PIPELINE.stages)
+    assert INDEXTTS25_PIPELINE.stages[1].scheduler_cls == (
+        "vllm_omni.model_executor.models.indextts2.scheduler.IndexTTS2GenerationScheduler"
+    )
+
+
+def test_indextts25_continuous_deploy_selects_model_owned_worker():
+    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "indextts2_5_continuous.yaml"
+    stages = merge_pipeline_deploy(
+        INDEXTTS25_PIPELINE,
+        load_deploy_config(deploy_path),
+    )
+    stage1 = next(stage for stage in stages if stage.stage_id == 1)
+
+    assert stage1.yaml_engine_args["worker_cls"] == (
+        "vllm_omni.model_executor.models.indextts2.runner.IndexTTS2GenerationWorker"
+    )
 
 
 def test_indextts25_default_deploy_selects_validated_triton_backend():

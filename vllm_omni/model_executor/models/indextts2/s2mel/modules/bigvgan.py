@@ -13,11 +13,11 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm, weight_norm
 
-from vllm_omni.model_executor.models.common.alias_free_activation import (
-    AliasFreeActivation1d,
+from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
+from vllm_omni.model_executor.models.common.snake_activation import Snake, SnakeBeta
+from vllm_omni.model_executor.models.indextts2.s2mel.modules.alias_free_cuda.activation import (
     OfficialFusedAliasFreeActivation1d,
 )
-from vllm_omni.model_executor.models.common.snake_activation import Snake, SnakeBeta
 from vllm_omni.model_executor.models.indextts2.s2mel.modules.commons import AttrDict
 
 # ---------------------------------------------------------------------------

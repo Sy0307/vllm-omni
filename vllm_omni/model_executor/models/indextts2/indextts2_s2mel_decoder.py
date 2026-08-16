@@ -1795,7 +1795,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 use_cuda_kernel=getattr(self, "s2mel_vocoder_fused_activation", False),
             )
             if getattr(self, "s2mel_vocoder_fused_activation", False) and device.type == "cuda":
-                from vllm_omni.model_executor.models.common.alias_free_activation import (
+                from vllm_omni.model_executor.models.indextts2.s2mel.modules.alias_free_cuda.activation import (
                     OfficialFusedAliasFreeActivation1d,
                 )
 

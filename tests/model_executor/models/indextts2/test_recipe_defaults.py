@@ -24,6 +24,7 @@ def test_indextts25_continuous_recipe_enables_stepwise_cfm():
 
     assert stage0["max_num_seqs"] == 32
     assert stage1["max_num_seqs"] == 32
+    assert stage1["worker_cls"] == ("vllm_omni.model_executor.models.indextts2.runner.IndexTTS2GenerationWorker")
     assert overrides["s2mel_cfm_batch_size"] == 32
     assert overrides["stepwise_generation"] is True
     assert overrides["s2mel_continuous_max_padding_ratio"] == 1.15
