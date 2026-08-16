@@ -103,6 +103,35 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
 
 
 @pytest.mark.asyncio
+async def test_realtime_client_configure_derives_hard_barge_in_from_server_vad():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+    turn_detection = {
+        "type": "server_vad",
+        "threshold": 0.6,
+        "interrupt_response": True,
+    }
+
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        turn_detection=turn_detection,
+        timeout_s=1,
+    )
+
+    session = client.sent[0]["session"]
+    assert session["turn_detection"] == turn_detection
+    assert session["overlap_policy"] == "barge_in_on_speech"
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_seed_tts_text_condition():
     class Client(RealtimeDuplexClient):
         def __init__(self):

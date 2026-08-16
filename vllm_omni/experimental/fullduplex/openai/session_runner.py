@@ -876,7 +876,11 @@ class DuplexSessionRunnerMixin:
 
                 if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
                     cancel_reason = (
-                        "output_audio_buffer_clear" if event_type == "output_audio_buffer.clear" else "barge_in"
+                        "output_audio_buffer_clear"
+                        if event_type == "output_audio_buffer.clear"
+                        else "client_cancelled"
+                        if event_type == "response.cancel"
+                        else "barge_in"
                     )
                     cancelled_fence = DuplexFence(
                         session.session_id,
@@ -1300,11 +1304,12 @@ class DuplexSessionRunnerMixin:
                                 native.speech_since_commit = False
                                 await actor.cancel_append_tasks()
                                 had_native_stream = native.data_plane_task is not None
+                                cancel_reason = str(decision.get("cancel_reason") or "barge_in")
                                 cancelled = await self._cancel_active_response(
                                     session,
                                     actor.active_response_task,
                                     emit_event,
-                                    reason="barge_in",
+                                    reason=cancel_reason,
                                 )
                                 had_native_stream = (
                                     await self._cancel_native_data_plane_stream(session) or had_native_stream
@@ -1320,7 +1325,7 @@ class DuplexSessionRunnerMixin:
                                             "type": "audio.cancelled",
                                             "session_id": session.session_id,
                                             "response_id": old_response_id,
-                                            "reason": "barge_in",
+                                            "reason": cancel_reason,
                                             "cancelled_epoch": old_epoch,
                                             "epoch": new_epoch,
                                             "committed_ms": committed_ms,
@@ -1340,7 +1345,7 @@ class DuplexSessionRunnerMixin:
                                             "type": "audio.cancelled",
                                             "session_id": session.session_id,
                                             "response_id": session.last_response_id,
-                                            "reason": "barge_in",
+                                            "reason": cancel_reason,
                                             "cancelled_epoch": old_epoch,
                                             "epoch": new_epoch,
                                             "committed_ms": committed_ms,
