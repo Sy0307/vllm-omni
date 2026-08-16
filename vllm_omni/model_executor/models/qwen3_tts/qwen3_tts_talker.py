@@ -54,6 +54,7 @@ def _qwen3_tts_gpu_resident_buffer_keys(
             {
                 ("codes", "ref"),
                 ("embed", "prefill"),
+                ("meta", "codec_frame_valid"),
             }
         )
     return keys

@@ -311,6 +311,7 @@ class TestReqStatesUpdate(unittest.TestCase):
         for i in range(2):
             assert runner.req_states.num_computed_tokens.np[i] == prompt_len
 
+
 def test_sample_tokens_uses_async_output_for_cuda(monkeypatch):
     from vllm_omni.worker_v2 import omni_generation_model_runner as generation_runner
 

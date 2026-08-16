@@ -33,8 +33,10 @@ def test_large_tts_prefill_artifacts_stay_gpu_resident_only_on_mrv2() -> None:
 
     assert ("embed", "prefill") not in v1_keys
     assert ("codes", "ref") not in v1_keys
+    assert ("meta", "codec_frame_valid") not in v1_keys
     assert ("embed", "prefill") in v2_keys
     assert ("codes", "ref") in v2_keys
+    assert ("meta", "codec_frame_valid") in v2_keys
 
 
 def _make_talker() -> Qwen3TTSTalkerForConditionalGeneration:

@@ -12,6 +12,7 @@ def test_qwen3_tts_talker_declares_prefill_and_ref_gpu_resident() -> None:
     source = Path("vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py").read_text()
     assert '("embed", "prefill")' in source
     assert '("codes", "ref")' in source
+    assert '("meta", "codec_frame_valid")' in source
 
 
 def test_intermediate_buffer_keeps_nested_gpu_resident_tensor_on_device() -> None:
