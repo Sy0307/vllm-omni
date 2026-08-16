@@ -32,12 +32,26 @@ connectors:
       # covers stage-0 prefill of both CFG rows.
       connector_get_max_wait_first_chunk: 30000
       connector_get_max_wait: 10000
+      # H200 profile: cuDNN cuts the fixed-shape vocoder time by about half.
+      # The DiT remains on the validated float32/native path.
+      vocoder_cudnn: true
+      # SGLang-Omni-style dynamic block compilation. Warmed at stage startup
+      # with the full 200-frame window so the first request stays eager-free.
+      compile_dit: true
+      # Keep condition/noise and Euler accumulation in float32, but run the
+      # velocity network with FP16 Tensor Core kernels. H200 profiling measured
+      # a 2.19x DiT speedup with 35.3 dB waveform SNR versus FP32.
+      dit_autocast_dtype: float16
+      # Keep only the 148 Transformer Linear weights resident in FP16. This
+      # saves another 3.1% of B8 DiT time while norms and solver state remain
+      # FP32; waveform SNR versus the FP32-weight autocast path is 54.3 dB.
+      dit_fp16_linear_weights: true
 
 stages:
   - stage_id: 0
-    # 16 rows = 8 concurrent guided requests, since CFG doubles every request.
-    max_num_seqs: 16
-    # ~16 GB of bf16 Qwen3-8B weights plus KV for 16 full-length rows
+    # 32 rows = 16 concurrent guided requests, since CFG doubles every request.
+    max_num_seqs: 32
+    # ~16 GB of bf16 Qwen3-8B weights plus KV for 32 full-length rows
     # (36 layers x 8 KV heads x 128 head_dim ~= 144 KB/token, so ~1.4 GB per
     # 10240-token row) fits comfortably inside 0.6 of a 140 GB card.
     gpu_memory_utilization: 0.6
@@ -75,8 +89,8 @@ stages:
       # codes off the eager trajectory by frame 4. Graph capture is
       # independent of this and still happens.
       mode: 0
-      # 16 rows is the stage ceiling, i.e. 8 guided requests.
-      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      # 32 rows is the stage ceiling, i.e. 16 guided requests.
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
       cudagraph_mode: FULL_DECODE_ONLY
       cudagraph_num_of_warmups: 1
       # Belt and braces on the same point: the non-eager default is "none",
@@ -105,12 +119,13 @@ stages:
   - stage_id: 1
     # One row per user request: the uncond companion is stage-0-final and
     # never reaches the acoustic stage.
-    max_num_seqs: 8
+    max_num_seqs: 16
     # No KV cache on this stage; the budget only covers the DiT and DAV
     # weights plus per-window latents and activations.
     gpu_memory_utilization: 0.2
-    # The flow-matching solver degrades measurably in bfloat16
-    # (SUPPORTED_ACOUSTIC_DTYPES in models/minimax_music3/constants.py).
+    # The model and solver state stay float32. Only the velocity-network
+    # forward uses the connector's FP16 autocast optimization above; a fully
+    # bfloat16 solver degrades measurably.
     dtype: float32
     enforce_eager: true
     # Async scheduling builds per-request payloads against the NEXT step's

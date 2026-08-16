@@ -28,6 +28,7 @@ choice made once when the blocks are built and never inside ``forward``.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import Tensor, nn
@@ -242,11 +243,20 @@ class MiniMaxMusic3Transformer1DModel(nn.Module):
         inv_freq = 1.0 / (_ROTARY_BASE ** (torch.arange(0, _ROTARY_DIM, 2).float() / _ROTARY_DIM))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._rope_cache: dict[tuple[int, torch.dtype, torch.device], tuple[Tensor, Tensor]] = {}
+        self._latent_zeros_cache: dict[
+            tuple[tuple[int, ...], torch.dtype, torch.device], Tensor
+        ] = {}
 
     @property
     def attention_backend_name(self) -> str:
         """The attention path the blocks actually run, for startup logging."""
         return self.transformer_blocks[0].attn.backend_name
+
+    def force_torch_sdpa(self) -> None:
+        """Use PyTorch SDPA in every block instead of diffusion attention."""
+        for block in self.transformer_blocks:
+            block.attn.backend = None
+            block.attn.backend_name = "TORCH_SDPA"
 
     def _rope(self, seq_len: int, *, dtype: torch.dtype, device: torch.device) -> tuple[Tensor, Tensor]:
         """Return cached ``(cos, sin)`` shaped ``[seq_len, 1, 32]``.
@@ -264,6 +274,14 @@ class MiniMaxMusic3Transformer1DModel(nn.Module):
             self._rope_cache[key] = cached
         return cached
 
+    def _latent_zeros(self, x: Tensor) -> Tensor:
+        key = (tuple(x.shape), x.dtype, x.device)
+        zeros = self._latent_zeros_cache.get(key)
+        if zeros is None:
+            zeros = torch.zeros_like(x)
+            self._latent_zeros_cache[key] = zeros
+        return zeros
+
     def forward(self, x: Tensor, t: Tensor, condition: Tensor) -> Tensor:
         """Predict the flow velocity at latent ``x`` and time ``t``.
 
@@ -275,7 +293,7 @@ class MiniMaxMusic3Transformer1DModel(nn.Module):
         Returns:
             The velocity, ``[B, 128, T_mel]``.
         """
-        full = torch.cat((x, torch.zeros_like(x), condition), dim=1)
+        full = torch.cat((x, self._latent_zeros(x), condition), dim=1)
         full = self.preprocess_conv(full) + full
         timestep_embed = self.time_embed(self.time_proj(t[:, None]))
         h = self.proj_in(full.transpose(1, 2))
@@ -384,10 +402,21 @@ class MiniMaxMusic3ConditionEncoder(nn.Module):
 class MiniMaxMusic3FlowMatchingDiT(nn.Module):
     """Condition encoder plus velocity field, with the Euler solver on top."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
         super().__init__()
+        self.compute_dtype = compute_dtype
         self.condition_encoder = MiniMaxMusic3ConditionEncoder()
         self.transformer = MiniMaxMusic3Transformer1DModel()
+        if compute_dtype == torch.float16:
+            # The Hopper FA3 wheel used by vLLM does not implement FP16. SDPA
+            # still dispatches an FP16 fused kernel and is numerically close to
+            # the validated FP32 path.
+            self.transformer.force_torch_sdpa()
+
+    def _compute_context(self, device: torch.device):
+        if self.compute_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, dtype=self.compute_dtype)
 
     def aligned_mel_length(self, frames: int) -> int:
         return self.condition_encoder.aligned_mel_length(frames)
@@ -403,13 +432,14 @@ class MiniMaxMusic3FlowMatchingDiT(nn.Module):
         self,
         align: Tensor,
         *,
-        generator: torch.Generator,
+        generator: torch.Generator | None = None,
+        noise: Tensor | None = None,
         initial_latent: Tensor | None = None,
         initial_condition: Tensor | None = None,
         num_steps: int = DEFAULT_DIT_STEPS,
         cfg_scale: float = DEFAULT_DIT_CFG_SCALE,
     ) -> Tensor:
-        """Solve an aligned condition into a vocoder latent ``[1, 128, T_mel]``.
+        """Solve aligned conditions into vocoder latents ``[B, 128, T_mel]``.
 
         The previous window's latent is re-imposed at every step rather than
         only at the start: the leading ``left`` frames are pinned to the exact
@@ -417,18 +447,23 @@ class MiniMaxMusic3FlowMatchingDiT(nn.Module):
         generated them, so the two windows join without a seam.
 
         Args:
-            align: Aligned condition, ``[1, 2048, T_mel]``. Overwritten in
+            align: Aligned condition, ``[B, 2048, T_mel]``. Overwritten in
                 place over the prompt span when ``initial_condition`` is
                 given, which the caller relies on when it saves the condition
                 for the next window.
-            generator: Seeded generator for the initial noise draw.
+            generator: Seeded generator for the initial noise draw when
+                ``noise`` is not supplied.
+            noise: Optional initial noise, shaped like the returned latent.
+                Supplying a batch of per-request noise tensors lets the solver
+                run several windows in one transformer batch while retaining
+                each request's independent seed.
             initial_latent: Previous window's tail latent, or ``None``.
             initial_condition: Previous window's tail condition, or ``None``.
             num_steps: Euler steps.
             cfg_scale: Classifier-free guidance weight.
 
         Returns:
-            The solved latent, ``[1, 128, T_mel]``.
+            The solved latent, ``[B, 128, T_mel]``.
 
         Raises:
             ValueError: If ``num_steps`` is not positive.
@@ -436,12 +471,23 @@ class MiniMaxMusic3FlowMatchingDiT(nn.Module):
         if num_steps < 1:
             raise ValueError("MiniMax Music 3 DiT num_steps must be positive")
         mel_len = align.shape[-1]
-        x = torch.randn(
-            (align.shape[0], DIT_LATENT_CHANNELS, mel_len),
-            device=align.device,
-            dtype=align.dtype,
-            generator=generator,
-        )
+        if noise is None:
+            if generator is None:
+                raise ValueError("MiniMax Music 3 DiT needs a generator or explicit noise")
+            x = torch.randn(
+                (align.shape[0], DIT_LATENT_CHANNELS, mel_len),
+                device=align.device,
+                dtype=align.dtype,
+                generator=generator,
+            )
+        else:
+            # The solver owns and mutates its state.  ``Tensor.to`` returns
+            # the original tensor when device and dtype already match, which
+            # would otherwise let the low-precision in-place Euler update (or
+            # prompt pinning below) overwrite a caller-provided noise tensor.
+            # Besides violating the explicit-noise contract, that makes a
+            # warmup followed by a measured solve start from different noise.
+            x = noise.to(device=align.device, dtype=align.dtype).clone()
 
         left = 0
         latent_prompt: Tensor | None = None
@@ -457,10 +503,10 @@ class MiniMaxMusic3FlowMatchingDiT(nn.Module):
                     align[..., :left] = initial_condition[..., :left].to(align)
 
         dt = 1.0 / num_steps
-        # Row 0 carries the condition, row 1 stays zero: one batched forward
-        # evaluates both guidance branches.
-        cond_cfg = torch.zeros((2, *align.shape[1:]), device=align.device, dtype=align.dtype)
-        cond_cfg[0].copy_(align[0])
+        # Even rows carry the condition and odd rows stay zero: one batched
+        # forward evaluates both guidance branches for every request.
+        cond_cfg = torch.zeros((align.shape[0] * 2, *align.shape[1:]), device=align.device, dtype=align.dtype)
+        cond_cfg[0::2].copy_(align)
         # Every timestep in one host-to-device copy. Built from the same
         # Python divisions the per-step construction would have used, so the
         # values are identical, but the solver loop then touches the host only
@@ -470,14 +516,45 @@ class MiniMaxMusic3FlowMatchingDiT(nn.Module):
             device=align.device,
             dtype=align.dtype,
         )
+        # The guidance input repeats each request's latent for the conditioned
+        # and unconditioned branches. Reusing this storage avoids allocating a
+        # large interleaved tensor on every Euler step without changing values.
+        cfg_x = (
+            torch.empty(
+                (x.shape[0] * 2, DIT_LATENT_CHANNELS, mel_len),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            if x.shape[0] > 1
+            else None
+        )
 
-        for step in range(num_steps):
-            t = schedule[step].expand(x.shape[0])
-            if left and latent_prompt is not None and noise_prompt is not None:
-                x[..., :left] = (1.0 - (1.0 - _SIGMA_FLOOR) * t[0]) * noise_prompt + t[0] * latent_prompt
-            d = self.transformer(x.expand(2, -1, -1), t.expand(2), cond_cfg)
-            d = cfg_scale * d[:1] + (1.0 - cfg_scale) * d[1:2]
-            x = x + dt * d
+        with self._compute_context(align.device):
+            for step in range(num_steps):
+                t = schedule[step].expand(x.shape[0])
+                if left and latent_prompt is not None and noise_prompt is not None:
+                    t_view = t.view(-1, 1, 1)
+                    x[..., :left] = (1.0 - (1.0 - _SIGMA_FLOOR) * t_view) * noise_prompt + t_view * latent_prompt
+                if x.shape[0] == 1:
+                    d = self.transformer(x.expand(2, -1, -1), t.expand(2), cond_cfg)
+                    d = cfg_scale * d[:1] + (1.0 - cfg_scale) * d[1:2]
+                else:
+                    # Interleave cond/uncond rows so each request keeps its own
+                    # condition and initial noise while the DiT still sees one
+                    # large GEMM/attention batch.
+                    assert cfg_x is not None
+                    cfg_x[0::2].copy_(x)
+                    cfg_x[1::2].copy_(x)
+                    d = self.transformer(
+                        cfg_x,
+                        t.repeat_interleave(2),
+                        cond_cfg,
+                    )
+                    d = cfg_scale * d[0::2] + (1.0 - cfg_scale) * d[1::2]
+                if self.compute_dtype is None:
+                    x = x + dt * d
+                else:
+                    x.add_(d.float(), alpha=dt)
 
         if left and latent_prompt is not None:
             x[..., :left] = latent_prompt

@@ -13,8 +13,9 @@ span's global frame range, so the streaming path (one window per engine step)
 and the non-streaming path (the whole song in one payload) produce identical
 audio for the same seed.
 
-The stage runs in float32. TF32 keeps that affordable, and bfloat16 measurably
-degrades a 30-step solve.
+Conditioning, noise and Euler state stay in float32. The velocity network may
+run under FP16 autocast, with an optional FP16-only Linear-weight residency
+mode for deployments that have validated the small extra rounding difference.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from types import MethodType
 from typing import Any
 
 import torch
@@ -33,6 +35,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .chunking import ChunkWindow, chunk_windows, crop_sample_bounds, overlap_mel_length
 from .constants import (
+    AR_CHUNK_FRAMES,
     AR_CHUNK_HOP_FRAMES,
     AR_HIDDEN_SIZE,
     DEFAULT_DIT_CFG_SCALE,
@@ -100,6 +103,29 @@ def _meta_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _dit_compute_dtype(value: Any) -> torch.dtype | None:
+    """Resolve the optional low-precision DiT velocity-network dtype."""
+    name = (_meta_str(value) or "float32").lower()
+    if name in {"float32", "fp32"}:
+        return None
+    if name in {"float16", "fp16"}:
+        return torch.float16
+    raise ValueError(
+        "MiniMax Music 3 dit_autocast_dtype must be float32 or float16, "
+        f"got {value!r}"
+    )
+
+
+def _cast_linear_weights(module: nn.Module, dtype: torch.dtype) -> int:
+    """Cast only Linear parameters, leaving norms and non-Linear state alone."""
+    count = 0
+    for child in module.modules():
+        if isinstance(child, nn.Linear):
+            child.to(dtype=dtype)
+            count += 1
+    return count
+
+
 @dataclass
 class _RequestState:
     """Cross-window streaming state, keyed by request id and never by row."""
@@ -133,14 +159,23 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
 
-        self._configure_backends()
+        extra = self._connector_extra_config()
+        self.vocoder_cudnn = _meta_bool(extra.get("vocoder_cudnn"))
+        self.compile_dit = _meta_bool(extra.get("compile_dit"))
+        self.dit_compute_dtype = _dit_compute_dtype(extra.get("dit_autocast_dtype"))
+        self.dit_fp16_linear_weights = _meta_bool(extra.get("dit_fp16_linear_weights"))
+        if self.dit_fp16_linear_weights and self.dit_compute_dtype is not torch.float16:
+            raise ValueError(
+                "MiniMax Music 3 dit_fp16_linear_weights requires "
+                "dit_autocast_dtype: float16"
+            )
+        self._configure_backends(use_cudnn=self.vocoder_cudnn)
 
         # Skeleton only. vLLM's memory profiler walks the module tree at
         # startup, before any weight loader has run.
-        self.dit = MiniMaxMusic3FlowMatchingDiT()
+        self.dit = MiniMaxMusic3FlowMatchingDiT(compute_dtype=self.dit_compute_dtype)
         self.vocoder = MiniMaxMusic3Vocoder()
 
-        extra = self._connector_extra_config()
         self.dit_steps = max(1, _meta_int(extra.get("dit_steps"), DEFAULT_DIT_STEPS))
         cfg_scale = extra.get("dit_cfg_scale")
         self.dit_cfg_scale = (
@@ -153,7 +188,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         self._loaded = False
 
     @staticmethod
-    def _configure_backends() -> None:
+    def _configure_backends(*, use_cudnn: bool = False) -> None:
         """Pin the numeric backends this checkpoint was validated against.
 
         These are process-global switches, which is safe here only because a
@@ -163,16 +198,21 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         the backbone makes the same seed produce a different song depending on
         which stage loaded first.
 
-        cuDNN itself is off because its 1-D convolution paths are slower than
-        the native ones for the vocoder's dilated stacks, and its SDPA backend
-        is not needed because the DiT runs the flash path. TF32 keeps
-        float32's range with a 10-bit mantissa, which is what makes a float32
-        solve affordable.
+        cuDNN is off by default to preserve the validated native numerical
+        path. On H200, the vocoder's fixed-shape convolution stack is faster
+        with cuDNN, so deployments can opt into it through the stage connector
+        ``extra.vocoder_cudnn`` flag. The heuristic algorithm chooser stays on
+        to avoid a multi-second ``benchmark=True`` search for every new batch
+        or terminal-window shape. Its SDPA backend remains disabled because
+        the DiT's validated float32 path uses the native diffusion dispatch.
+        TF32 keeps float32's range with a 10-bit mantissa, which is what makes
+        a float32 solve affordable.
         """
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
         if torch.cuda.is_available():
-            torch.backends.cudnn.enabled = False
+            torch.backends.cudnn.enabled = use_cudnn
+            torch.backends.cudnn.benchmark = False
             torch.backends.cuda.enable_cudnn_sdp(False)
 
     def _connector_extra_config(self) -> dict[str, Any]:
@@ -245,23 +285,54 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         device = self.vllm_config.device_config.device
         self.dit.to(device=device, dtype=torch.float32).eval()
         self.vocoder.to(device=device, dtype=torch.float32).eval()
+        packed_linears = (
+            _cast_linear_weights(self.dit.transformer, torch.float16)
+            if self.dit_fp16_linear_weights
+            else 0
+        )
         folded = remove_weight_norm(self.vocoder)
+        if self.compile_dit:
+            self._compile_dit_blocks()
         self._loaded = True
 
         loaded = {f"dit.{name}" for name, _ in self.dit.named_parameters()}
         loaded |= {f"vocoder.{name}" for name, _ in self.vocoder.named_parameters()}
         logger.info(
             "MiniMax Music 3 acoustic loaded from %s device=%s dit_steps=%d "
-            "dit_cfg_scale=%.3f attention=%s folded_weight_norms=%d parameters=%d",
+            "dit_cfg_scale=%.3f dit_compute_dtype=%s attention=%s "
+            "vocoder_cudnn=%s compile_dit=%s fp16_linear_weights=%d "
+            "folded_weight_norms=%d parameters=%d",
             root,
             device,
             self.dit_steps,
             self.dit_cfg_scale,
+            str(self.dit_compute_dtype or torch.float32),
             self.dit.transformer.attention_backend_name,
+            self.vocoder_cudnn,
+            self.compile_dit,
+            packed_linears,
             folded,
             sum(p.numel() for p in self.parameters()),
         )
         return loaded
+
+    def _compile_dit_blocks(self) -> None:
+        """Compile shared fixed-shape block graphs and warm the dynamic batch."""
+        layers = self.dit.transformer.transformer_blocks
+        compiled = torch.compile(type(layers[0]).forward, dynamic=True)
+        for layer in layers:
+            layer.forward = MethodType(compiled, layer)
+
+        device = self.vllm_config.device_config.device
+        dtype = next(self.dit.parameters()).dtype
+        mel_len = self.dit.aligned_mel_length(AR_CHUNK_FRAMES)
+        with torch.inference_mode():
+            self.dit(
+                torch.zeros((1, 2048, mel_len), device=device, dtype=dtype),
+                noise=torch.zeros((1, 128, mel_len), device=device, dtype=dtype),
+                num_steps=1,
+                cfg_scale=self.dit_cfg_scale,
+            )
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
         """Drop the streaming state of finished or aborted requests."""
@@ -329,6 +400,173 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         left, right = crop_sample_bounds(window)
         stop = wave.shape[-1] - right if right else wave.shape[-1]
         return wave[:, left:stop]
+
+    def _decode_windows_batched(
+        self,
+        tasks: list[tuple[_RequestState, Tensor, ChunkWindow, int]],
+    ) -> list[Tensor]:
+        """Decode independent requests together when their windows arrive together.
+
+        Window-to-window state is still request-local, so this batches only a
+        single window per request. The caller handles terminal multi-window
+        spans in order. Grouping by frame count and prompt presence keeps all
+        tensors stackable without changing the single-request path.
+        """
+        device = self.vllm_config.device_config.device
+        pieces: list[Tensor | None] = [None] * len(tasks)
+        groups: dict[tuple[int, bool], list[int]] = {}
+        for index, (state, hidden, _window, _seed) in enumerate(tasks):
+            groups.setdefault((int(hidden.shape[0]), state.last_latent is not None), []).append(index)
+
+        for indexes in groups.values():
+            hidden = torch.stack([tasks[index][1] for index in indexes], dim=0).to(
+                device=device,
+                dtype=torch.float32,
+            )
+            align = self.dit.aligned_condition(hidden)
+            generators = [
+                torch.Generator(device=device).manual_seed(
+                    _derive_seed(tasks[index][3], "dit", tasks[index][2].index)
+                )
+                for index in indexes
+            ]
+            noise = torch.cat(
+                [
+                    torch.randn(
+                        (1, 128, align.shape[-1]),
+                        device=device,
+                        dtype=align.dtype,
+                        generator=generator,
+                    )
+                    for generator in generators
+                ],
+                dim=0,
+            )
+            states = [tasks[index][0] for index in indexes]
+            initial_latent = None
+            initial_condition = None
+            if states[0].last_latent is not None:
+                if any(state.last_latent is None or state.last_condition is None for state in states):
+                    raise RuntimeError("MiniMax Music 3 request state has an incomplete overlap prompt")
+                initial_latent = torch.cat([state.last_latent for state in states], dim=0)
+                initial_condition = torch.cat(
+                    [state.last_condition for state in states],
+                    dim=0,
+                )
+            latent = self.dit(
+                align,
+                noise=noise,
+                initial_latent=initial_latent,
+                initial_condition=initial_condition,
+                num_steps=self.dit_steps,
+                cfg_scale=self.dit_cfg_scale,
+            )
+            waveform = self.vocoder(latent)
+
+            overlap = overlap_mel_length()
+            for batch_index, task_index in enumerate(indexes):
+                state, _hidden, window, _seed = tasks[task_index]
+                sample = latent[batch_index : batch_index + 1]
+                start = max(0, sample.shape[-1] - 2 * overlap)
+                end = max(start, sample.shape[-1] - overlap)
+                state.last_latent = sample[..., start:end].clone()
+                state.last_condition = align[batch_index : batch_index + 1, ..., start:end].clone()
+
+                wave = waveform[batch_index].clamp(-1.0, 1.0).float()
+                left, right = crop_sample_bounds(window)
+                stop = wave.shape[-1] - right if right else wave.shape[-1]
+                pieces[task_index] = wave[:, left:stop]
+
+        if any(piece is None for piece in pieces):
+            raise RuntimeError("MiniMax Music 3 batched acoustic decoding produced an empty task result")
+        return [piece for piece in pieces if piece is not None]
+
+    def _decode_spans_batched(
+        self,
+        entries: list[tuple[int, str, Tensor, dict[str, Any]]],
+    ) -> dict[int, Tensor]:
+        """Decode ready spans in window rounds while preserving request state.
+
+        Terminal and non-streaming spans can carry more than one overlapping
+        window. Processing those spans one request at a time defeats the batch
+        path for the common short-song case. A round contains at most one
+        window per request, so every request's overlap state is updated before
+        its next window enters a later round.
+        """
+        plans: list[
+            tuple[
+                int,
+                str,
+                Tensor,
+                int,
+                _RequestState,
+                list[ChunkWindow],
+                bool,
+                int,
+            ]
+        ] = []
+        for output_index, req_id, span, meta in entries:
+            span_start = _meta_int(meta.get("num_processed_tokens"), 0)
+            windows = chunk_windows(int(span.shape[0]))
+            state = self._states.setdefault(req_id, _RequestState())
+            is_terminal = _meta_bool(meta.get("last_chunk")) or _meta_bool(meta.get("stream_finished"))
+            if not windows:
+                continue
+            for local in windows:
+                index = (span_start + local.start) // AR_CHUNK_HOP_FRAMES
+                expected = state.next_window_index + local.start // AR_CHUNK_HOP_FRAMES
+                if index != expected:
+                    raise ValueError(
+                        f"MiniMax Music 3 acoustic request {req_id} expected window "
+                        f"{expected} but received window {index}"
+                    )
+            plans.append(
+                (
+                    output_index,
+                    req_id,
+                    span,
+                    span_start,
+                    state,
+                    windows,
+                    is_terminal,
+                    _meta_int(meta.get("audio_seed"), 0),
+                )
+            )
+
+        pieces_by_output: dict[int, list[Tensor]] = {
+            plan[0]: [] for plan in plans
+        }
+        for round_index in range(max((len(plan[5]) for plan in plans), default=0)):
+            tasks: list[tuple[_RequestState, Tensor, ChunkWindow, int]] = []
+            metadata: list[tuple[int, _RequestState]] = []
+            for output_index, _req_id, span, span_start, state, windows, _is_terminal, seed in plans:
+                if round_index >= len(windows):
+                    continue
+                local = windows[round_index]
+                index = (span_start + local.start) // AR_CHUNK_HOP_FRAMES
+                window = ChunkWindow(
+                    index=index,
+                    start=span_start + local.start,
+                    end=span_start + local.end,
+                    is_first=span_start + local.start == 0,
+                    is_last=local.is_last and _is_terminal,
+                )
+                tasks.append((state, span[local.start : local.end], window, seed))
+                metadata.append((output_index, state))
+
+            pieces = self._decode_windows_batched(tasks)
+            for piece, (output_index, state) in zip(pieces, metadata, strict=True):
+                state.next_window_index += 1
+                state.decoded_windows += 1
+                pieces_by_output[output_index].append(piece)
+
+        outputs: dict[int, Tensor] = {}
+        for output_index, _req_id, _span, _span_start, state, _windows, is_terminal, _seed in plans:
+            outputs[output_index] = state.resampler.push(
+                pieces_by_output[output_index],
+                flush=is_terminal,
+            ).cpu()
+        return outputs
 
     def _decode_span(self, req_id: str, span: Tensor | None, meta: dict[str, Any]) -> Tensor:
         """Decode every window a span covers and return this step's audio.
@@ -403,6 +641,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
             )
         return latent
 
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: Tensor | None = None,
@@ -435,7 +674,25 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
 
         audios: list[Tensor] = []
         sr_tensor = torch.tensor(OUTPUT_SAMPLE_RATE, dtype=torch.int32)
+        batched_entries: list[tuple[int, str, Tensor, dict[str, Any]]] = []
         for index in range(num_reqs):
+            info = infos[index] if index < len(infos) else {}
+            info = info if isinstance(info, dict) else {}
+            meta = info.get("meta")
+            meta = meta if isinstance(meta, dict) else {}
+            req_id = _meta_str(meta.get("req_id")) or _meta_str(info.get("req_id"))
+            if req_id is None:
+                continue
+            span = self._span_from_info(info, req_id)
+            if span is not None and chunk_windows(int(span.shape[0])):
+                batched_entries.append((index, req_id, span, meta))
+        batched_outputs = (
+            self._decode_spans_batched(batched_entries) if len(batched_entries) > 1 else {}
+        )
+        for index in range(num_reqs):
+            if index in batched_outputs:
+                audios.append(batched_outputs[index])
+                continue
             info = infos[index] if index < len(infos) else {}
             info = info if isinstance(info, dict) else {}
             meta = info.get("meta")

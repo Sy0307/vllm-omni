@@ -10,7 +10,12 @@ that a well-meaning cleanup would otherwise "fix".
 from __future__ import annotations
 
 import pytest
+import torch
+from torch import nn
 
+from vllm_omni.model_executor.models.minimax_music3.acoustic import (
+    _cast_linear_weights,
+)
 from vllm_omni.model_executor.models.minimax_music3.chunking import (
     chunk_windows,
     crop_sample_bounds,
@@ -22,6 +27,9 @@ from vllm_omni.model_executor.models.minimax_music3.constants import (
     BLEND_MEL_FRAMES,
     DAV_HOP_SAMPLES,
     HOP_MEL_FRAMES,
+)
+from vllm_omni.model_executor.models.minimax_music3.dit import (
+    MiniMaxMusic3FlowMatchingDiT,
 )
 from vllm_omni.model_executor.models.minimax_music3.prompt import (
     SPECIAL_TOKEN_IDS,
@@ -201,3 +209,51 @@ class TestCropBounds:
 
     def test_overlap_is_half_a_window(self) -> None:
         assert overlap_mel_length() == HOP_MEL_FRAMES // 2
+
+
+class _ZeroVelocity(nn.Module):
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        condition: torch.Tensor,
+    ) -> torch.Tensor:
+        del timestep, condition
+        return torch.zeros_like(x)
+
+
+class TestFlowMatchingSolver:
+    def test_explicit_noise_is_not_mutated_by_prompt_pinning(self) -> None:
+        # Avoid constructing the real 2.5B-parameter transformer; this test
+        # exercises only solver ownership of its explicit-noise input.
+        solver = MiniMaxMusic3FlowMatchingDiT.__new__(MiniMaxMusic3FlowMatchingDiT)
+        nn.Module.__init__(solver)
+        solver.compute_dtype = None
+        solver.transformer = _ZeroVelocity()
+
+        align = torch.zeros((1, 2048, 4), dtype=torch.float32)
+        noise = torch.arange(128 * 4, dtype=torch.float32).reshape(1, 128, 4)
+        original = noise.clone()
+        prompt = torch.ones((1, 128, 2), dtype=torch.float32)
+
+        result = solver(
+            align,
+            noise=noise,
+            initial_latent=prompt,
+            initial_condition=torch.zeros((1, 2048, 2), dtype=torch.float32),
+            num_steps=1,
+        )
+
+        assert torch.equal(noise, original)
+        assert torch.equal(result[..., :2], prompt)
+
+
+def test_cast_linear_weights_leaves_norms_in_float32() -> None:
+    module = nn.Sequential(nn.Linear(4, 8), nn.LayerNorm(8), nn.Linear(8, 4))
+
+    assert _cast_linear_weights(module, torch.float16) == 2
+    assert module[0].weight.dtype is torch.float16
+    assert module[0].bias.dtype is torch.float16
+    assert module[1].weight.dtype is torch.float32
+    assert module[1].bias.dtype is torch.float32
+    assert module[2].weight.dtype is torch.float16
