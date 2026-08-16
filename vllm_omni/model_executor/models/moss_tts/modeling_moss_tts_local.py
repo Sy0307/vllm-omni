@@ -23,6 +23,8 @@ previous KV-cache loop -- causal attention, only the last position is read.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +35,8 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalTransformerConfig,
 )
+
+_USE_COMPACT_TOPK = os.getenv("MOSS_TTS_LOCAL_DEPTH_COMPACT_TOPK", "0") == "1"
 
 
 class MossTTSRealtimeLocalTransformer(nn.Module):
@@ -128,20 +132,36 @@ def _sample_token(
     do_sample: bool,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Top-k + top-p sampling (matches upstream's ``sample_token`` for the
-    inference branch).
+    """Top-k + top-p sampling for the upstream inference branch.
+
+    The compact path evaluates nucleus filtering and multinomial sampling only
+    on the retained top-k candidates, then maps the result back to the original
+    vocabulary. It preserves the categorical distribution when the top-k
+    boundary has no ties, but it is not seed/bit equivalent to multinomial over
+    a full-vocabulary tensor because random-number mapping depends on width.
     """
     if not do_sample or temperature <= 0:
         return logits.argmax(dim=-1)
 
     logits = logits / max(temperature, 1e-6)
+    compact_indices = None
     if top_k and top_k > 0 and top_k < logits.shape[-1]:
-        top_vals, _ = torch.topk(logits, top_k, dim=-1)
-        thresh = top_vals[..., -1:].expand_as(logits)
-        logits = torch.where(logits < thresh, torch.full_like(logits, float("-inf")), logits)
+        top_vals, top_indices = torch.topk(logits, top_k, dim=-1, sorted=True)
+        if _USE_COMPACT_TOPK:
+            # topk is already descending: keep the following nucleus filter,
+            # softmax, and multinomial at width k instead of the full vocab.
+            logits = top_vals
+            compact_indices = top_indices
+        else:
+            thresh = top_vals[..., -1:].expand_as(logits)
+            logits = torch.where(logits < thresh, torch.full_like(logits, float("-inf")), logits)
 
     if 0.0 < top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        if compact_indices is None:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        else:
+            sorted_logits = logits
+            sorted_idx = None
         probs = F.softmax(sorted_logits, dim=-1)
         cum = probs.cumsum(dim=-1)
         # Drop tail beyond top_p (keep at least one token).
@@ -149,11 +169,16 @@ def _sample_token(
         drop[..., 1:] = drop[..., :-1].clone()
         drop[..., 0] = False
         sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
-        logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_idx, sorted_logits)
+        if sorted_idx is None:
+            logits = sorted_logits
+        else:
+            logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_idx, sorted_logits)
 
     probs = F.softmax(logits, dim=-1)
     flat = probs.reshape(-1, probs.shape[-1])
     sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+    if compact_indices is not None:
+        return compact_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
     return sampled
 
 
