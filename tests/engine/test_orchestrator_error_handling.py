@@ -292,8 +292,8 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
 
 
 @pytest.mark.asyncio
-async def test_stage_input_processor_failure_fails_request_not_orchestrator(orchestrator_factory) -> None:
-    """A malformed inter-stage payload is request-scoped, not process-fatal."""
+async def test_duplex_stage_input_processor_failure_fails_request_not_orchestrator(orchestrator_factory) -> None:
+    """A malformed duplex handoff is request-scoped, not process-fatal."""
 
     class _FailingInputProcessorStage(FakeStageClient):
         def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
@@ -318,6 +318,7 @@ async def test_stage_input_processor_failure_fails_request_not_orchestrator(orch
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        orchestrator_fixture.orchestrator.request_states["req-bad-handoff"].duplex_identity = SimpleNamespace()
         stage0.push_engine_core_outputs(_engine_core_outputs("s0-raw", 1.0))
 
         error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-bad-handoff")
@@ -331,6 +332,34 @@ async def test_stage_input_processor_failure_fails_request_not_orchestrator(orch
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
             orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_non_duplex_stage_input_processor_failure_preserves_existing_exception(orchestrator_factory) -> None:
+    """Duplex recovery must not change ordinary pipeline failure semantics."""
+
+    class _FailingInputProcessorStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            del source_outputs, prompt, streaming_context
+            raise ValueError("ordinary pipeline input failure")
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = _FailingInputProcessorStage(stage_type="llm", final_output=True)
+    fixture = orchestrator_factory([stage0, stage1])
+    req_state = OrchestratorRequestState(
+        request_id="req-ordinary-handoff",
+        prompt=SimpleNamespace(request_id="req-ordinary-handoff", prompt_token_ids=[1, 2]),
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+
+    with pytest.raises(ValueError, match="ordinary pipeline input failure"):
+        await fixture.orchestrator._forward_to_next_stage_unguarded(
+            "req-ordinary-handoff",
+            0,
+            _build_request_output("req-ordinary-handoff", finished=True),
+            req_state,
+        )
 
 
 @pytest.mark.asyncio
