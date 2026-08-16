@@ -243,9 +243,7 @@ class MiniMaxMusic3Transformer1DModel(nn.Module):
         inv_freq = 1.0 / (_ROTARY_BASE ** (torch.arange(0, _ROTARY_DIM, 2).float() / _ROTARY_DIM))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._rope_cache: dict[tuple[int, torch.dtype, torch.device], tuple[Tensor, Tensor]] = {}
-        self._latent_zeros_cache: dict[
-            tuple[tuple[int, ...], torch.dtype, torch.device], Tensor
-        ] = {}
+        self._latent_zeros_cache: dict[tuple[tuple[int, ...], torch.dtype, torch.device], Tensor] = {}
 
     @property
     def attention_backend_name(self) -> str:

@@ -110,10 +110,7 @@ def _dit_compute_dtype(value: Any) -> torch.dtype | None:
         return None
     if name in {"float16", "fp16"}:
         return torch.float16
-    raise ValueError(
-        "MiniMax Music 3 dit_autocast_dtype must be float32 or float16, "
-        f"got {value!r}"
-    )
+    raise ValueError(f"MiniMax Music 3 dit_autocast_dtype must be float32 or float16, got {value!r}")
 
 
 def _cast_linear_weights(module: nn.Module, dtype: torch.dtype) -> int:
@@ -165,10 +162,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         self.dit_compute_dtype = _dit_compute_dtype(extra.get("dit_autocast_dtype"))
         self.dit_fp16_linear_weights = _meta_bool(extra.get("dit_fp16_linear_weights"))
         if self.dit_fp16_linear_weights and self.dit_compute_dtype is not torch.float16:
-            raise ValueError(
-                "MiniMax Music 3 dit_fp16_linear_weights requires "
-                "dit_autocast_dtype: float16"
-            )
+            raise ValueError("MiniMax Music 3 dit_fp16_linear_weights requires dit_autocast_dtype: float16")
         self._configure_backends(use_cudnn=self.vocoder_cudnn)
 
         # Skeleton only. vLLM's memory profiler walks the module tree at
@@ -286,9 +280,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         self.dit.to(device=device, dtype=torch.float32).eval()
         self.vocoder.to(device=device, dtype=torch.float32).eval()
         packed_linears = (
-            _cast_linear_weights(self.dit.transformer, torch.float16)
-            if self.dit_fp16_linear_weights
-            else 0
+            _cast_linear_weights(self.dit.transformer, torch.float16) if self.dit_fp16_linear_weights else 0
         )
         folded = remove_weight_norm(self.vocoder)
         if self.compile_dit:
@@ -425,9 +417,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
             )
             align = self.dit.aligned_condition(hidden)
             generators = [
-                torch.Generator(device=device).manual_seed(
-                    _derive_seed(tasks[index][3], "dit", tasks[index][2].index)
-                )
+                torch.Generator(device=device).manual_seed(_derive_seed(tasks[index][3], "dit", tasks[index][2].index))
                 for index in indexes
             ]
             noise = torch.cat(
@@ -533,9 +523,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
                 )
             )
 
-        pieces_by_output: dict[int, list[Tensor]] = {
-            plan[0]: [] for plan in plans
-        }
+        pieces_by_output: dict[int, list[Tensor]] = {plan[0]: [] for plan in plans}
         for round_index in range(max((len(plan[5]) for plan in plans), default=0)):
             tasks: list[tuple[_RequestState, Tensor, ChunkWindow, int]] = []
             metadata: list[tuple[int, _RequestState]] = []
@@ -686,9 +674,7 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
             span = self._span_from_info(info, req_id)
             if span is not None and chunk_windows(int(span.shape[0])):
                 batched_entries.append((index, req_id, span, meta))
-        batched_outputs = (
-            self._decode_spans_batched(batched_entries) if len(batched_entries) > 1 else {}
-        )
+        batched_outputs = self._decode_spans_batched(batched_entries) if len(batched_entries) > 1 else {}
         for index in range(num_reqs):
             if index in batched_outputs:
                 audios.append(batched_outputs[index])
