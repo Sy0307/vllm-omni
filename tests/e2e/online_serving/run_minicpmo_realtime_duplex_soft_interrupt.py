@@ -311,18 +311,12 @@ def summarize_artifacts(
     )
     error_events = [event for event in events if event.get("type") == "error"]
     completed_response_count = sum(
-        1
-        for event in events
-        if event.get("type") == "response.done" and _response_status(event) in {None, "completed"}
+        1 for event in events if event.get("type") == "response.done" and _response_status(event) in {None, "completed"}
     )
     cancelled_count = sum(
-        1
-        for event in events
-        if event.get("type") == "response.done" and _response_status(event) == "cancelled"
+        1 for event in events if event.get("type") == "response.done" and _response_status(event) == "cancelled"
     )
-    truncated_count = sum(
-        1 for event in events if str(event.get("type") or "").endswith(".truncated")
-    )
+    truncated_count = sum(1 for event in events if str(event.get("type") or "").endswith(".truncated"))
     result_ok = result.get("ok") is True
     # Keep the older event-order diagnostics for model-policy mode. The native
     # resume gate below intentionally uses only the collaborator's four counters.
@@ -345,9 +339,7 @@ def summarize_artifacts(
         and response_before_final_commit
         and commit_listen_contract_ok
     )
-    mode_contract_ok = (
-        native_resume_contract_ok if validation_mode == "response-required" else model_policy_contract_ok
-    )
+    mode_contract_ok = native_resume_contract_ok if validation_mode == "response-required" else model_policy_contract_ok
     ok = bool(result_ok and not error_events and mode_contract_ok)
     return {
         "ok": ok,
