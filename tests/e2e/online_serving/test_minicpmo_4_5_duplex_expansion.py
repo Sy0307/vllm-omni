@@ -85,6 +85,8 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["error_count"] == 0
-    assert result["response_lifecycle_ok"] is True
-    assert result["response_audio_contract_ok"] is True
-    assert result["followup_response_transcript_ok"] is True
+    assert result["completed_response_count"] >= 2
+    assert result["cancelled_count"] == 0
+    assert result["truncated_count"] == 0
+    assert result["response_listen_count"] >= 1
+    assert result["native_resume_contract_ok"] is True

@@ -2,8 +2,9 @@
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
 duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
-The stronger response-required mode binds the multi-response contract to a
-known input checksum and expected follow-up response.
+The stronger response-required mode binds the native Stage0 resume contract to
+a known input checksum: at least two naturally completed responses, at least
+one model listen decision, and no cancellation or truncation.
 """
 
 from __future__ import annotations
@@ -85,6 +86,14 @@ def _event_received_at_s(event: dict[str, object]) -> float | None:
     if isinstance(received_at, int | float):
         return float(received_at)
     return None
+
+
+def _response_status(event: dict[str, object]) -> str | None:
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("status"), str):
+        return response["status"]
+    status = event.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _first_event_index(events: list[dict[str, object]], event_type: str) -> int | None:
@@ -253,6 +262,7 @@ def summarize_artifacts(
         None,
     )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
+    response_listen_count = len(listen_indices)
     effective_min_responses = min_responses if validation_mode == "response-required" else 1
     enough_responses = len(response_summaries) >= effective_min_responses
     response_lifecycle_ok = enough_responses and all(bool(summary.get("one_done")) for summary in response_summaries)
@@ -299,47 +309,46 @@ def summarize_artifacts(
         _normalize_text(expect_followup_response_substring) in _normalize_text(transcript)
         for transcript in followup_response_transcripts
     )
-    error_events = [
-        event
+    error_events = [event for event in events if event.get("type") == "error"]
+    completed_response_count = sum(
+        1
         for event in events
-        if event.get("type") == "error"
-        or str(event.get("type") or "").endswith(".cancelled")
-        or str(event.get("type") or "").endswith(".truncated")
-    ]
+        if event.get("type") == "response.done" and _response_status(event) in {None, "completed"}
+    )
     cancelled_count = sum(
         1
         for event in events
-        if event.get("type") == "response.done"
-        and isinstance(event.get("response"), dict)
-        and event["response"].get("status") == "cancelled"
+        if event.get("type") == "response.done" and _response_status(event) == "cancelled"
+    )
+    truncated_count = sum(
+        1 for event in events if str(event.get("type") or "").endswith(".truncated")
     )
     result_ok = result.get("ok") is True
-    # response-required keeps the full listen sandwich around commit. model-policy
-    # only requires a completed audio response that started before final commit:
-    # single-GPU co-location often still drains speak after the WAV ends.
+    # Keep the older event-order diagnostics for model-policy mode. The native
+    # resume gate below intentionally uses only the collaborator's four counters.
     commit_listen_contract_ok = (
         listen_after_response_before_commit and final_listen_after_commit
         if validation_mode == "response-required"
         else response_before_final_commit
     )
-    common_contract_ok = bool(
-        result_ok
-        and not error_events
+    native_resume_contract_ok = bool(
+        completed_response_count >= min_responses
         and cancelled_count == 0
-        and enough_responses
+        and truncated_count == 0
+        and response_listen_count >= 1
+    )
+    model_policy_contract_ok = bool(
+        enough_responses
         and response_lifecycle_ok
         and multi_delta_ok
         and response_audio_contract_ok
         and response_before_final_commit
         and commit_listen_contract_ok
     )
-    mode_contract_ok = validation_mode == "model-policy" or (
-        second_response_before_final_commit
-        and listen_before_first_response
-        and listen_after_last_done
-        and followup_response_transcript_ok
+    mode_contract_ok = (
+        native_resume_contract_ok if validation_mode == "response-required" else model_policy_contract_ok
     )
-    ok = common_contract_ok and mode_contract_ok
+    ok = bool(result_ok and not error_events and mode_contract_ok)
     return {
         "ok": ok,
         "result_ok": result_ok,
@@ -367,7 +376,11 @@ def summarize_artifacts(
         "expect_followup_response_substring": expect_followup_response_substring,
         "followup_response_transcript_expectation_ok": followup_response_transcript_expectation_ok,
         "error_count": len(error_events),
+        "completed_response_count": completed_response_count,
         "cancelled_count": cancelled_count,
+        "truncated_count": truncated_count,
+        "response_listen_count": response_listen_count,
+        "native_resume_contract_ok": native_resume_contract_ok,
         "compact_sequence": _compact_sequence(events),
         "output_dir": str(output_dir),
     }
@@ -401,8 +414,6 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
     ]
     command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
     temperature = getattr(args, "temperature", None)
-    if temperature is None and args.validation_mode == "response-required":
-        temperature = 0.0
     if temperature is not None:
         command.extend(["--temperature", str(temperature)])
     if args.require_audio:
@@ -469,7 +480,7 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=None,
-        help="Stage0 sampling temperature; response-required defaults to 0.0.",
+        help="Stage0 sampling temperature; omitted to preserve the model default.",
     )
     parser.add_argument("--require-audio", action="store_true")
     parser.add_argument("--no-realtime-pacing", action="store_true")

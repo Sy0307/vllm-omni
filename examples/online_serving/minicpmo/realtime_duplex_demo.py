@@ -388,7 +388,7 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=None,
-        help="Stage0 sampling temperature; response-required soft-interrupt uses 0.0.",
+        help="Stage0 sampling temperature; omitted to preserve the model default.",
     )
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument("--require-audio", action="store_true")
