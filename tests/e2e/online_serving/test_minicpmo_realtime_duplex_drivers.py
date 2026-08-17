@@ -337,7 +337,7 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
     assert args.temperature is None
 
 
-def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(tmp_path, monkeypatch):
+def test_realtime_duplex_soft_interrupt_preserves_model_sampling_defaults(tmp_path, monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     input_wav = tmp_path / "input.wav"
     with wave.open(str(input_wav), "wb") as wav_file:
@@ -396,8 +396,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
 
     command = captured["command"]
     assert isinstance(command, list)
-    assert "--temperature" in command
-    assert command[command.index("--temperature") + 1] == "0.0"
+    assert "--temperature" not in command
     assert result["ok"] is True
 
 
@@ -516,6 +515,11 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     )
 
     assert summary["ok"] is True
+    assert summary["completed_response_count"] == 2
+    assert summary["cancelled_count"] == 0
+    assert summary["truncated_count"] == 0
+    assert summary["response_listen_count"] == 3
+    assert summary["native_resume_contract_ok"] is True
     assert summary["listen_between_responses"] is False
     assert summary["second_response_before_final_commit"] is True
     assert summary["final_listen_after_commit"] is True
@@ -634,6 +638,41 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
 
     assert summary["ok"] is False
     assert summary["enough_responses"] is False
+    assert summary["completed_response_count"] == 1
+    assert summary["native_resume_contract_ok"] is False
+
+
+def test_realtime_duplex_soft_interrupt_native_resume_rejects_cancel_and_truncate(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "native_resume_cancel_truncate"
+    output.mkdir()
+    events = [
+        {"type": "response.listen"},
+        {"type": "response.done", "response": {"status": "completed"}},
+        {"type": "response.done", "response": {"status": "completed"}},
+        {"type": "response.done", "response": {"status": "cancelled"}},
+        {"type": "conversation.item.truncated"},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(demo.json.dumps({"ok": True}), encoding="utf-8")
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="response-required",
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["completed_response_count"] == 2
+    assert summary["cancelled_count"] == 1
+    assert summary["truncated_count"] == 1
+    assert summary["response_listen_count"] == 1
+    assert summary["native_resume_contract_ok"] is False
+    assert summary["ok"] is False
 
 
 def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):
@@ -727,8 +766,9 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
         expect_followup_response_substring="一加一等于二",
     )
 
-    assert missing_transcript_summary["ok"] is False
+    assert missing_transcript_summary["ok"] is True
     assert missing_transcript_summary["followup_response_transcript_ok"] is False
+    assert missing_transcript_summary["followup_response_transcript_expectation_ok"] is False
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():

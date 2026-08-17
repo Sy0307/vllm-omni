@@ -108,6 +108,10 @@ class RealtimeSessionState:
     _overlap_silence_rms: float = 0.003
     _turn_detection: dict[str, object] | None = None
     _server_vad: object | None = None
+    _turn_detection_update_pending: bool = False
+    _pending_turn_detection: dict[str, object] | None = None
+    _pending_server_vad: object | None = None
+    _turn_detection_update_resolved: asyncio.Event | None = None
     _send_realtime_json: Any = None
     _initial_session_update: bool = False
     _input_speech_started: bool = False
@@ -185,6 +189,10 @@ class RealtimeStateOwner:
     _overlap_silence_rms: float = _RealtimeStateField()
     _turn_detection: dict[str, object] | None = _RealtimeStateField()
     _server_vad: object | None = _RealtimeStateField()
+    _turn_detection_update_pending: bool = _RealtimeStateField()
+    _pending_turn_detection: dict[str, object] | None = _RealtimeStateField()
+    _pending_server_vad: object | None = _RealtimeStateField()
+    _turn_detection_update_resolved: asyncio.Event | None = _RealtimeStateField()
     _send_realtime_json: Any = _RealtimeStateField()
     _initial_session_update: bool = _RealtimeStateField()
     _input_speech_started: bool = _RealtimeStateField()

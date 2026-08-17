@@ -681,6 +681,34 @@ async def test_native_realtime_protocol_accepts_server_vad_as_hard_barge_in_mode
     config = translated["session"]["extra_body"]["realtime_session_payload"]["turn_detection"]
     assert config["type"] == "server_vad"
     assert config["threshold"] == 0.4
+    assert protocol._server_vad is None
+
+    protocol.encode_outbound_event({"type": "session.updated", "session": {}})
+
+    assert isinstance(protocol._server_vad, SileroStreamingVAD)
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_protocol_rejects_non_interrupting_server_vad():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    translated = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "model": "test-model",
+            "turn_detection": {
+                "type": "server_vad",
+                "interrupt_response": False,
+            },
+        }
+    )
+
+    assert translated is None
+    assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
+    assert "interrupt_response=false" in ws.sent[-1]["error"]["message"]
+    assert protocol._server_vad is None
 
 
 @pytest.mark.asyncio
@@ -788,6 +816,7 @@ async def test_native_realtime_server_vad_emits_one_start_and_holds_listen_until
         }
     )
     assert translated is not None
+    protocol.commit_realtime_turn_detection_update()
     probabilities = iter([0.9, 0.9, 0.9, 0.1, 0.1])
     protocol._server_vad = SileroStreamingVAD(
         SileroVADConfig(
@@ -842,6 +871,7 @@ async def test_native_realtime_server_vad_resets_candidate_after_non_speech_comm
         }
     )
     assert translated is not None
+    protocol.commit_realtime_turn_detection_update()
     protocol._server_vad = SileroStreamingVAD(
         SileroVADConfig(min_speech_duration_ms=64),
         frame_scorer=lambda _: 0.9,
@@ -1098,6 +1128,86 @@ async def test_native_session_update_rejects_client_runtime_config():
     error = next(message for message in ws.sent if message.get("type") == "error")
     assert error["code"] == "invalid_duplex_runtime_config"
     assert ("sid-runtime-update-reject", "session.update") not in engine.signals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_turn_detection", "candidate_turn_detection"),
+    [
+        pytest.param(
+            None,
+            {"type": "server_vad", "interrupt_response": True},
+            id="enable-vad",
+        ),
+        pytest.param(
+            {"type": "server_vad", "interrupt_response": True},
+            None,
+            id="disable-vad",
+        ),
+    ],
+)
+async def test_realtime_session_update_runtime_rejection_discards_vad_candidate(
+    initial_turn_detection,
+    candidate_turn_detection,
+):
+    session_id = "sid-vad-update-reject"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    create = _native_realtime_session_update(session_id)
+    create["session"]["turn_detection"] = initial_turn_detection
+    ws.put(create)
+    ws.put(
+        {
+            "type": "session.update",
+            "session": {
+                "turn_detection": candidate_turn_detection,
+                "extra_body": {"duplex_stage_max_tokens": {"0": 999}},
+            },
+        }
+    )
+
+    handler_task = asyncio.create_task(handler.handle_session(ws, realtime_protocol=protocol))
+    try:
+        for _ in range(100):
+            errors = [message for message in ws.sent if message.get("type") == "error"]
+            if errors:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail(f"rejected VAD update did not emit an error: {ws.sent}")
+
+        assert errors[-1]["error"]["code"] == "invalid_duplex_runtime_config"
+        if initial_turn_detection is None:
+            assert protocol._turn_detection is None
+            assert protocol._server_vad is None
+        else:
+            assert isinstance(protocol._turn_detection, dict)
+            assert protocol._turn_detection["type"] == "server_vad"
+            assert protocol._turn_detection["interrupt_response"] is True
+            assert isinstance(protocol._server_vad, SileroStreamingVAD)
+        live_session = handler._registry.get(session_id)
+        assert live_session is not None
+        expected_policy = (
+            DuplexOverlapPolicy.LISTEN_ONLY.value
+            if initial_turn_detection is None
+            else DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+        )
+        assert live_session.config.overlap_policy == expected_policy
+        public_turn_detection = live_session.as_public_dict()["turn_detection"]
+        if initial_turn_detection is None:
+            assert public_turn_detection is None
+        else:
+            assert public_turn_detection["type"] == "server_vad"
+            assert public_turn_detection["interrupt_response"] is True
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
 
 
 @pytest.mark.asyncio

@@ -654,6 +654,9 @@ The public Realtime endpoint has two overlap modes:
    pre-roll for the next epoch. Audio remains forced to model-listen until VAD
    observes the configured trailing silence.
 
+`server_vad` with `interrupt_response=false` is rejected. The endpoint does
+not expose a third VAD-notification-only overlap mode.
+
 `response.cancel` is not a third overlap mode. It is a manual command that
 enters the same cancellation machinery. Public cancellation terminates with
 exactly one `response.done(status=cancelled)`: server VAD uses reason

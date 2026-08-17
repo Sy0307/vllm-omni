@@ -95,7 +95,7 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            self._configure_realtime_turn_detection(session_payload)
+            self._prepare_realtime_turn_detection_update(session_payload)
             self._apply_realtime_session_defaults(session_payload)
             session_payload.update(self._realtime_overlap_fields(session_payload))
             if not self._opened:
@@ -1097,6 +1097,11 @@ class RealtimeInputTranslator:
             interrupt_response = turn_detection.get("interrupt_response", True)
             if not isinstance(interrupt_response, bool):
                 return f"{field_path}.interrupt_response must be a boolean"
+            if interrupt_response is not True:
+                return (
+                    f"{field_path}.interrupt_response=false is unsupported; "
+                    "use turn_detection=null for model-owned listen/speak"
+                )
 
         present, turn_detection = cls._configured_realtime_turn_detection(session_payload)
         if not present:
@@ -1130,29 +1135,73 @@ class RealtimeInputTranslator:
                 selected = audio_input.get("turn_detection")
         return present, dict(selected) if isinstance(selected, dict) else None
 
-    def _configure_realtime_turn_detection(self, session_payload: dict[str, object]) -> None:
+    def _prepare_realtime_turn_detection_update(self, session_payload: dict[str, object]) -> None:
+        """Stage a VAD replacement until the Session/runtime update commits."""
         present, turn_detection = self._configured_realtime_turn_detection(session_payload)
         if not present:
             return
-        self._reset_server_vad()
-        self._turn_detection = turn_detection
+        if self._turn_detection_update_pending:
+            raise RuntimeError("A Realtime turn-detection update is already pending")
+
+        pending_turn_detection: dict[str, object] | None = None
+        pending_server_vad: SileroStreamingVAD | None = None
         if turn_detection is None:
-            self._server_vad = None
             session_payload["overlap_policy"] = "listen_only"
+        else:
+            normalized = dict(turn_detection)
+            normalized.setdefault("type", "server_vad")
+            normalized.setdefault("interrupt_response", True)
+            normalized.setdefault("threshold", 0.5)
+            normalized.setdefault("prefix_padding_ms", 300)
+            normalized.setdefault("silence_duration_ms", 500)
+            normalized.setdefault("min_speech_duration_ms", 96)
+            pending_turn_detection = normalized
+            pending_server_vad = SileroStreamingVAD(SileroVADConfig.from_turn_detection(normalized))
+            session_payload["turn_detection"] = dict(normalized)
+            session_payload["overlap_policy"] = "barge_in_on_speech"
+
+        self._pending_turn_detection = pending_turn_detection
+        self._pending_server_vad = pending_server_vad
+        self._turn_detection_update_pending = True
+        self._turn_detection_update_resolved = asyncio.Event()
+
+    async def wait_for_realtime_turn_detection_update(self) -> None:
+        """Preserve wire order while the runner accepts or rejects a candidate."""
+        resolved = self._turn_detection_update_resolved
+        if self._turn_detection_update_pending and resolved is not None:
+            await resolved.wait()
+
+    def commit_realtime_turn_detection_update(self) -> None:
+        """Publish the staged VAD only after the Session/runtime transaction ACKs."""
+        if not self._turn_detection_update_pending:
             return
-        normalized = dict(turn_detection)
-        normalized.setdefault("type", "server_vad")
-        normalized.setdefault("interrupt_response", True)
-        normalized.setdefault("threshold", 0.5)
-        normalized.setdefault("prefix_padding_ms", 300)
-        normalized.setdefault("silence_duration_ms", 500)
-        normalized.setdefault("min_speech_duration_ms", 96)
-        self._turn_detection = normalized
-        self._server_vad = SileroStreamingVAD(SileroVADConfig.from_turn_detection(normalized))
-        session_payload["turn_detection"] = dict(normalized)
-        session_payload["overlap_policy"] = (
-            "barge_in_on_speech" if normalized["interrupt_response"] is True else "listen_only"
+        previous_server_vad = self._server_vad
+        self._turn_detection = (
+            dict(self._pending_turn_detection) if isinstance(self._pending_turn_detection, dict) else None
         )
+        self._server_vad = self._pending_server_vad
+        self._clear_pending_realtime_turn_detection_update()
+        reset = getattr(previous_server_vad, "reset", None)
+        if callable(reset):
+            reset()
+
+    def reject_realtime_turn_detection_update(self) -> None:
+        """Discard a staged VAD after any rejected Session/runtime update."""
+        if not self._turn_detection_update_pending:
+            return
+        reset = getattr(self._pending_server_vad, "reset", None)
+        if callable(reset):
+            reset()
+        self._clear_pending_realtime_turn_detection_update()
+
+    def _clear_pending_realtime_turn_detection_update(self) -> None:
+        resolved = self._turn_detection_update_resolved
+        self._turn_detection_update_pending = False
+        self._pending_turn_detection = None
+        self._pending_server_vad = None
+        self._turn_detection_update_resolved = None
+        if resolved is not None:
+            resolved.set()
 
     def _server_vad_interrupts_response(self) -> bool:
         return isinstance(self._turn_detection, dict) and self._turn_detection.get("interrupt_response", True) is True
