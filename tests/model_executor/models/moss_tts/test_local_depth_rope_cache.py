@@ -42,17 +42,3 @@ def test_rope_cache_matches_reference_and_reuses_storage() -> None:
     # Smaller slices retain the fixed allocation used by CUDA Graph.
     attn.prepare_rope_cache(6, device, torch.float32)
     assert attn._rope_cos_cache.data_ptr() == cache_ptr
-
-
-def test_rope_cache_disabled_matches_uncached_values(monkeypatch) -> None:
-    monkeypatch.setenv("MOSS_TTS_LOCAL_DEPTH_ROPE_CACHE", "0")
-    model = MossTTSLocalDepthTransformer(_test_config()).eval()
-    attn = model.h[0].attn
-
-    cos, sin = attn._rope_cos_sin(4, torch.device("cpu"), torch.float32)
-    positions = torch.arange(4, dtype=torch.float32)
-    freqs = torch.einsum("s,d->sd", positions, attn.inv_freq.float())
-
-    assert attn._rope_cos_cache.numel() == 0
-    torch.testing.assert_close(cos[0, :, 0], freqs.cos().repeat_interleave(2, dim=-1))
-    torch.testing.assert_close(sin[0, :, 0], freqs.sin().repeat_interleave(2, dim=-1))

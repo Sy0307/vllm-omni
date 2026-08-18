@@ -19,8 +19,6 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,7 +54,6 @@ class _MossTTSLocalAttention(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("_rope_cos_cache", torch.empty(0), persistent=False)
         self.register_buffer("_rope_sin_cache", torch.empty(0), persistent=False)
-        self.use_rope_cache = os.getenv("MOSS_TTS_LOCAL_DEPTH_ROPE_CACHE", "1") != "0"
 
     def prepare_rope_cache(
         self,
@@ -72,7 +69,7 @@ class _MossTTSLocalAttention(nn.Module):
         many tiny kernels and also bloats the enclosing talker CUDA graph.
         Keep one non-persistent cache and slice it for prefix execution.
         """
-        if not self.use_rope_cache or max_seq_len <= 0:
+        if max_seq_len <= 0:
             return
         cache = self._rope_cos_cache
         if cache.numel() > 0 and cache.device == device and cache.dtype == dtype and int(cache.shape[1]) >= max_seq_len:
@@ -92,18 +89,11 @@ class _MossTTSLocalAttention(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.use_rope_cache:
-            self.prepare_rope_cache(seq_len, device, dtype)
-            return (
-                self._rope_cos_cache[:, :seq_len],
-                self._rope_sin_cache[:, :seq_len],
-            )
-
-        position_ids = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.einsum("s,d->sd", position_ids, self.inv_freq.to(device=device))
-        cos = freqs.cos().repeat_interleave(2, dim=-1).to(dtype)
-        sin = freqs.sin().repeat_interleave(2, dim=-1).to(dtype)
-        return cos.view(1, seq_len, 1, self.head_dim), sin.view(1, seq_len, 1, self.head_dim)
+        self.prepare_rope_cache(seq_len, device, dtype)
+        return (
+            self._rope_cos_cache[:, :seq_len],
+            self._rope_sin_cache[:, :seq_len],
+        )
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:

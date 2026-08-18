@@ -3,11 +3,6 @@
 # Codec: OpenMOSS-Team/MOSS-Audio-Tokenizer-v2 (48 kHz, stereo, channel-interleaved RVQ)
 # Uses a 1-layer GPT2-style local depth transformer (no delay warm-up), reset every
 # frame — same per-frame timing (80 ms/frame, 12.5 fps) as MOSS-TTS-Realtime.
-# Optional process-level tuning:
-# - MOSS_TTS_LOCAL_DEPTH_COMPACT_TOPK=1 keeps top-p/softmax/multinomial at width
-#   top_k. It improves high-concurrency throughput but is not seed/bit equivalent.
-# - MOSS_TTS_LOCAL_DEPTH_ROPE_CACHE=0 disables the exact, default-on RoPE cache.
-# - MOSS_TTS_LOCAL_MAX_AUDIO_FRAMES=0 disables the default 512-frame safety cap.
 async_chunk: true
 
 connectors:
