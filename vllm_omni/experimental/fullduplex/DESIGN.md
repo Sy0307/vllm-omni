@@ -666,11 +666,14 @@ cancellation does not synthesize `conversation.item.truncated` (that event is
 reserved for an explicit item-truncate request).
 
 Silero is optional because the default mode does not need server VAD. Install
-the `server-vad` extra before selecting this mode. The 2026-08-16 H200 live
-gate used 200 ms browser chunks and a 96 ms onset debounce. It observed one
-speech-start and one cancelled terminal for one continuous interrupt, with
-2.502 ms from the server `speech_started` event to `response.done`; this is a
-server reaction measurement, not a claim about total acoustic-onset latency.
+the `server-vad` extra before selecting this mode. The 2026-08-20 H200
+real-model gate used 200 ms browser chunks and a 96 ms onset debounce. It
+observed exactly one speech-start and one cancelled terminal, no stale delta
+after the cancelled fence, a committed interrupting utterance, and one
+completed follow-up response whose transcript addressed the interrupt's
+"四大发明" topic (101 audio deltas). The measured 2.495 ms from the server
+`speech_started` event to `response.done` is a server reaction measurement,
+not a claim about total acoustic-onset latency.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS
