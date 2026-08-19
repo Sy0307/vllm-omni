@@ -729,6 +729,7 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
 
     assert translated["type"] == "session.create"
     assert translated["session"]["extra_body"]["realtime_session_payload"]["turn_detection"] is None
+    assert protocol._server_vad is None
 
 
 @pytest.mark.asyncio
