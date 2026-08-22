@@ -578,6 +578,17 @@ async def test_native_realtime_protocol_accepts_output_only_for_known_function_c
     assert accepted["event"] == "conversation.item.create"
     assert accepted["payload"]["item"]["call_id"] == "call-1"
 
+    duplicate = await protocol._to_duplex_event(
+        {
+            "type": "conversation.item.create",
+            "event_id": "duplicate-output",
+            "item": {"type": "function_call_output", "call_id": "call-1", "output": "sunny"},
+        }
+    )
+
+    assert duplicate is None
+    assert ws.sent[-1]["error"]["code"] == "invalid_function_call_output"
+
 
 @pytest.mark.asyncio
 async def test_native_realtime_protocol_audio_commit_requires_non_empty_buffer():
