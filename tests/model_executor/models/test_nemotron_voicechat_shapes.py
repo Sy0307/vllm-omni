@@ -227,37 +227,37 @@ def test_torchaudio_mel_filterbank_matches_librosa() -> None:
     assert abs(ta - reference).max() < 1e-6
 
 
-def test_duplex_tool_response_forces_function_tokens_and_text_pad() -> None:
+def test_code2wav_reuses_and_clears_per_request_streaming_cache() -> None:
     import torch
+    from torch import nn
 
-    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
-
-    thinker = _bare_thinker()
-    thinker._sessions = {
-        "req-tool": {
-            "nvc_text_pad_id": 12,
-            "function_response_generation": 0,
-            "forced_function_tokens": [],
-        }
-    }
-    thinker._duplex_previous_text_tokens = {}
-    session = thinker._sessions["req-tool"]
-    thinker._sync_forced_function_response(
-        session,
-        {
-            "nvc_function_response_generation": 1,
-            "nvc_function_response_token_ids": [7, 8],
-        },
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        NemotronVoiceChatCode2Wav,
     )
 
-    hidden = torch.randn(1, 8)
-    output = thinker.make_omni_output(hidden, model_intermediate_buffer=[{"request_id": "req-tool"}])
-    assert output.multimodal_outputs["nvc_function_token"].tolist() == [7]
+    class Codec(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(()))
+            self.caches = []
 
-    row = DuplexSamplingRow(0, "req-tool", "sid", 0, 1, {}, 1)
-    thinker.prepare_duplex_sampling(torch.zeros((1, 16)), None, (row,))
-    sampled = thinker.sample(torch.arange(16, dtype=torch.float32).reshape(1, -1), None)
-    assert sampled.sampled_token_ids.tolist() == [[12]]
-    thinker.postprocess(hidden, request_id="req-tool", multimodal_outputs=output.multimodal_outputs)
-    assert session["forced_function_tokens"] == [8]
-    assert "forced_function_token" not in session
+        def decode(self, codes, lengths, *, cache):
+            self.caches.append(cache)
+            wav = torch.zeros((1, int(codes.shape[1]) * 1764), device=codes.device)
+            return wav, lengths * 1764
+
+    model = NemotronVoiceChatCode2Wav.__new__(NemotronVoiceChatCode2Wav)
+    nn.Module.__init__(model)
+    model._sample_rate, model._num_quantizers, model._codebook_size, model._wav_per_frame = 22050, 31, 1024, 1764
+    model._duplex_codec_caches = {}
+    model.audio_codec = Codec()
+
+    def info(codes):
+        return [{"meta": {"codec_streaming": True, "request_id": "req"}, "codes": {"audio": codes}}]
+
+    model.forward(runtime_additional_information=info(torch.zeros((1, 31), dtype=torch.long)))
+    model.forward(runtime_additional_information=info(torch.zeros((2, 31), dtype=torch.long)))
+    assert model.audio_codec.caches[0] is model.audio_codec.caches[1]
+    assert "req" in model._duplex_codec_caches
+    model.on_requests_finished({"req"})
+    assert "req" not in model._duplex_codec_caches

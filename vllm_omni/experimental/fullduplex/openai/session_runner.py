@@ -345,6 +345,13 @@ class DuplexSessionRunnerMixin:
                 )
             precreated_response_id = session.active_response_id if precreate_response else None
 
+            def _discard_retained_committed_audio() -> None:
+                if (
+                    retained_committed_payload is not None
+                    and native.committed_audio_payload is retained_committed_payload
+                ):
+                    session.release_input_bytes(native.clear_committed_audio())
+
             async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
@@ -366,8 +373,10 @@ class DuplexSessionRunnerMixin:
                             and native.committed_audio_payload is retained_committed_payload
                         ):
                             session.release_input_bytes(native.clear_committed_audio())
-                    elif pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    else:
+                        if pcm_reservation is not None:
+                            pcm_reservation.rollback()
+                        _discard_retained_committed_audio()
                     if (
                         not append_ok
                         and precreated_response_id is not None
@@ -405,6 +414,7 @@ class DuplexSessionRunnerMixin:
                 except Exception as exc:
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
+                    _discard_retained_committed_audio()
                     logger.exception("Native duplex append task failed: %s", exc)
                     await self._send_runtime_error(emit_event, "runtime_append_task_failed", exc, session=session)
                     if session.state != DuplexSessionState.CLOSED:
@@ -439,25 +449,33 @@ class DuplexSessionRunnerMixin:
                     if not predecessor_ok:
                         if pcm_reservation is not None:
                             pcm_reservation.rollback()
+                        _discard_retained_committed_audio()
                         return False
                 if actor.closing or runtime_closed or session.state != DuplexSessionState.OPEN:
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
+                    _discard_retained_committed_audio()
                     return False
                 if before_append is not None and not before_append():
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
+                    _discard_retained_committed_audio()
                     return True
                 if pcm_reservation is not None and not pcm_reservation.active:
+                    _discard_retained_committed_audio()
                     return False
                 return await _run()
 
             def _release_cancelled_retained_audio(done: asyncio.Task[bool]) -> None:
-                if done.cancelled() and (
-                    retained_committed_payload is not None
-                    and native.committed_audio_payload is retained_committed_payload
-                ):
-                    session.release_input_bytes(native.clear_committed_audio())
+                if done.cancelled():
+                    _discard_retained_committed_audio()
+                    return
+                try:
+                    append_ok = done.result()
+                except Exception:
+                    append_ok = False
+                if not append_ok:
+                    _discard_retained_committed_audio()
 
             predecessor = actor.native_append_tail
             if predecessor is not None and predecessor.done():
@@ -936,6 +954,8 @@ class DuplexSessionRunnerMixin:
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
+                    if event_type == "response.cancel":
+                        session.release_input_bytes(native.clear_committed_audio())
                     had_native_stream = native.data_plane_task is not None
                     cancelled = await self._cancel_active_response(
                         session,

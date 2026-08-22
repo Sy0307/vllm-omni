@@ -41,3 +41,29 @@ def test_irregular_browser_packets_emit_exact_ordered_80ms_frame() -> None:
     decoded = np.frombuffer(base64.b64decode(reservation.payload["audio"]), dtype=np.float32)
     np.testing.assert_array_equal(decoded, np.arange(1280, dtype=np.float32))
     assert buffer.pending_byte_count == 0
+
+
+def test_append_rejects_invalid_frame_contract() -> None:
+    cases = (
+        (1281, 16000, "pcm_f32le", 0.0, "at most 1280"),
+        (1, 8000, "pcm_f32le", 0.0, "sample_rate_hz"),
+        (1, 16000, "audio/pcm", 0.0, "format"),
+        (1, 16000, "pcm_f32le", np.nan, "finite"),
+    )
+    for samples, sample_rate_hz, fmt, value, message in cases:
+        with pytest.raises(ValueError, match=message):
+            NemotronVoiceChatPcmAppendBuffer().prepare_append(
+                _payload(np.full(samples, value, dtype=np.float32), sample_rate_hz=sample_rate_hz, fmt=fmt),
+                operation_id="invalid",
+                chunk_period_ms=80,
+                allow_emit=True,
+            )
+
+
+def test_terminal_commit_rejects_more_than_one_frame_tail() -> None:
+    buffer = NemotronVoiceChatPcmAppendBuffer()
+    buffer.prepare_append(
+        _payload(np.zeros(1281, dtype=np.float32)), operation_id="tail", chunk_period_ms=80, allow_emit=False
+    )
+    with pytest.raises(ValueError, match="more than one 80 ms frame"):
+        buffer.prepare_commit(operation_id="commit", chunk_period_ms=80)

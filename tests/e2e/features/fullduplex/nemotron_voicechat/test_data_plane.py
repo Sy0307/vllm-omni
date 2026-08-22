@@ -39,19 +39,6 @@ def _stage0_output(token_id: int) -> object:
     )
 
 
-def _stage2_output(audio: np.ndarray, *, finished: bool = False) -> object:
-    completion = SimpleNamespace(
-        multimodal_output={
-            "model_outputs": [audio],
-            "sr": [22050],
-        }
-    )
-    return SimpleNamespace(
-        stage_id=2,
-        request_output=SimpleNamespace(request_id="req-0", outputs=[completion], finished=finished),
-    )
-
-
 def test_function_channel_projects_completed_call_without_ending_speech() -> None:
     projector = _projector()
     projector._decode = lambda token_ids: (
@@ -76,6 +63,12 @@ def test_function_channel_projects_completed_call_without_ending_speech() -> Non
     assert len(function) == 1
     assert function[0]["name"] == "weather"
     assert function[0]["arguments"] == '{"city":"Shanghai"}'
+
+    projector._decode = lambda _token_ids: "not-json"
+    bad_events = []
+    for function_token in (20, 98, 21):
+        bad_events.extend(projector.project_output(_stage0_output(function_token)))
+    assert any(event.get("error_code") == "nemotron_function_call_parse_error" for event in bad_events)
 
 
 def test_new_epoch_request_does_not_inherit_partial_function_or_frame_state() -> None:

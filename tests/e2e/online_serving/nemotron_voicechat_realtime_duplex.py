@@ -9,7 +9,6 @@ import asyncio
 import base64
 import json
 import math
-import time
 import uuid
 import wave
 from collections.abc import Sequence
@@ -219,7 +218,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         tools = DEFAULT_FUNCTION_TOOLS
     session_id = f"nemotron-voicechat-{uuid.uuid4().hex}"
     client = RealtimeDuplexClient(_url(args.url, args.model, session_id))
-    started_at = time.monotonic()
     async with (
         client,
         _close_and_capture_failures(
@@ -272,7 +270,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         if not isinstance(capabilities, dict) or any(capabilities.get(key) != value for key, value in expected.items()):
             raise AssertionError(f"unexpected capabilities: {capabilities}")
 
-        stream_started_at_s = time.monotonic()
         function_output_task = (
             asyncio.create_task(
                 _return_function_output_when_ready(
@@ -290,7 +287,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             max_frames=args.max_frames,
             realtime=not args.no_realtime,
         )
-        input_committed_at_s = time.monotonic()
         completed_responses_at_commit = client.events.count("response.done")
         await client.send({"type": "input_audio_buffer.commit", "final": True})
         await wait_for(
@@ -429,30 +425,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 f"model output RMS {audio_rms:.6f} is below {args.minimum_audio_rms:.6f}; "
                 "received packets contain only silence"
             )
-        response_id = next(
-            (candidate for candidate in client.events.response_ids if client.events.audio_bytes(candidate)),
-            None,
-        )
-        timing = client.events.timing_summary(
-            after_s=started_at,
-            # Native duplex can emit before commit, so the first input frame
-            # (rather than the terminal commit) is the meaningful latency
-            # origin for TTFT/TTFP/RTF.
-            input_committed_at_s=stream_started_at_s,
-            response_id=response_id,
-            measurement_origin={
-                "ttft": "first input frame send to first non-empty text delta",
-                "ttfp": "first input frame send to first audio packet",
-                "rtf": "stream-start-to-last-audio receive time divided by emitted audio duration",
-            },
-        )
-        audio_timing = timing.get("audio_output")
-        if isinstance(audio_timing, dict):
-            audio_timing["stream_start_to_first_audio_ms"] = audio_timing.pop(
-                "commit_to_first_audio_ms",
-                None,
-            )
-
     _write_events(output_dir / "events.jsonl", client)
     if audio:
         write_pcm16_wav(output_dir / "output.wav", audio, sample_rate_hz=OUTPUT_SAMPLE_RATE_HZ)
@@ -460,9 +432,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         "ok": True,
         "session_id": session_id,
         "input_frames": frame_count,
-        "input_channel": args.input_channel,
-        "input_stream_s": round(input_committed_at_s - stream_started_at_s, 3),
-        "elapsed_s": round(time.monotonic() - started_at, 3),
         "capabilities": capabilities,
         "event_counts": {
             event_type: client.events.count(event_type)
@@ -470,8 +439,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         },
         "audio_bytes": len(audio),
         "audio_rms": audio_rms,
-        "audio_packet_durations_ms": packet_durations_ms,
-        "timing": timing,
         "function_events": function_events,
         "function_items": function_items,
         "output_dir": str(output_dir),

@@ -52,6 +52,11 @@ def _plan(extension, *, input_seq: int):
 def test_first_append_prefills_prompt_then_each_append_consumes_one_frame() -> None:
     extension = NemotronVoiceChatDuplexRuntimeExtension()
 
+    params = extension.configure_sampling_params(
+        runtime_config={}, defaults=(SamplingParams(temperature=0.7, max_tokens=4),)
+    )[0]
+    assert params.temperature == 0.0 and params.max_tokens == 1 and params.top_p == 1.0 and params.top_k == 0
+
     first = _plan(extension, input_seq=1)
     later = _plan(extension, input_seq=2)
 
@@ -59,6 +64,11 @@ def test_first_append_prefills_prompt_then_each_append_consumes_one_frame() -> N
     assert later.prompt["prompt_token_ids"] == [12]
     assert first.prompt["model_intermediate_buffer"]["duplex"]["source_input_seq"] == 1
     assert later.prompt["model_intermediate_buffer"]["duplex"]["source_input_seq"] == 2
+
+
+def test_append_rejects_stage0_context_overflow() -> None:
+    with pytest.raises(ValueError, match="max_model_len"):
+        _plan(NemotronVoiceChatDuplexRuntimeExtension(), input_seq=8190)
 
 
 def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
