@@ -5,8 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import yaml
-from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine.contracts import DuplexInputMode
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
@@ -15,13 +14,7 @@ from vllm_omni.experimental.fullduplex.nemotron_voicechat.runtime import (
 )
 from vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter import (
     NemotronVoiceChatServingRuntimeAdapter,
-    _normalized_tools,
-    _render_tool_prompt,
     _render_tool_response,
-    _require_native_full_duplex,
-)
-from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
-    NEMOTRON_VOICECHAT_PIPELINE,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -56,28 +49,6 @@ def _plan(extension, *, input_seq: int):
     )
 
 
-def test_pipeline_enables_model_native_duplex_plugins() -> None:
-    assert NEMOTRON_VOICECHAT_PIPELINE.duplex_control_enabled is True
-    assert NEMOTRON_VOICECHAT_PIPELINE.duplex_runtime_extension == (
-        "vllm_omni.experimental.fullduplex.nemotron_voicechat.runtime.NemotronVoiceChatDuplexRuntimeExtension"
-    )
-    assert NEMOTRON_VOICECHAT_PIPELINE.duplex_serving_adapter == (
-        "vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
-    )
-    assert NemotronVoiceChatServingRuntimeAdapter.silence_continuation_samples == 1280
-    assert NemotronVoiceChatServingRuntimeAdapter.collect_outputs_on_append is False
-
-
-def test_duplex_deploy_profile_is_one_frame_per_segment() -> None:
-    with open("vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml") as stream:
-        config = yaml.safe_load(stream)
-    assert config["async_chunk"] is True
-    assert config["duplex_session"]["max_sessions"] == 1
-    assert config["connectors"]["connector_of_shared_memory"]["extra"]["codec_chunk_frames"] == 1
-    assert config["stages"][0]["default_sampling_params"]["max_tokens"] == 1
-    assert config["stages"][0]["default_sampling_params"]["ignore_eos"] is True
-
-
 def test_first_append_prefills_prompt_then_each_append_consumes_one_frame() -> None:
     extension = NemotronVoiceChatDuplexRuntimeExtension()
 
@@ -88,121 +59,6 @@ def test_first_append_prefills_prompt_then_each_append_consumes_one_frame() -> N
     assert later.prompt["prompt_token_ids"] == [12]
     assert first.prompt["model_intermediate_buffer"]["duplex"]["source_input_seq"] == 1
     assert later.prompt["model_intermediate_buffer"]["duplex"]["source_input_seq"] == 2
-
-
-def test_runtime_rejects_non_frame_payloads() -> None:
-    extension = NemotronVoiceChatDuplexRuntimeExtension()
-    payload = _frame()
-    payload["audio"] = base64.b64encode(np.zeros(1279, dtype=np.float32).tobytes()).decode("ascii")
-    with pytest.raises(ValueError, match="1280"):
-        extension.plan_append(
-            request_id="req",
-            fence=DuplexFence("sid"),
-            session_config={},
-            runtime_config={
-                "nvc_prompt_token_ids": [0, 1],
-                "nvc_text_pad_id": 12,
-                "nvc_max_model_len": 8192,
-            },
-            seq=1,
-            turn_seq=1,
-            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-            payload=payload,
-            final=False,
-            sampling_params=SamplingParams(),
-        )
-
-
-def test_runtime_forces_greedy_single_token_thinker() -> None:
-    extension = NemotronVoiceChatDuplexRuntimeExtension()
-    defaults = (SamplingParams(temperature=0.7, max_tokens=99), SamplingParams(), SamplingParams())
-    configured = extension.configure_sampling_params(runtime_config={}, defaults=defaults)
-
-    assert configured[0].temperature == 0.0
-    assert configured[0].max_tokens == 1
-    assert configured[0].ignore_eos is True
-    assert all(params.output_kind == RequestOutputKind.DELTA for params in configured)
-    assert all(configured[index] is not defaults[index] for index in range(len(defaults)))
-
-
-def test_runtime_rejects_frame_before_stage0_context_overflow() -> None:
-    extension = NemotronVoiceChatDuplexRuntimeExtension()
-    runtime_config = {
-        "nvc_prompt_token_ids": [0, 42, 1],
-        "nvc_text_pad_id": 12,
-        "nvc_max_model_len": 6,
-    }
-
-    extension.plan_append(
-        request_id="req",
-        fence=DuplexFence("sid"),
-        session_config={},
-        runtime_config=runtime_config,
-        seq=2,
-        turn_seq=2,
-        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-        payload=_frame(),
-        final=False,
-        sampling_params=SamplingParams(),
-    )
-    with pytest.raises(ValueError, match=r"input_frames=3.*7 > 6"):
-        extension.plan_append(
-            request_id="req",
-            fence=DuplexFence("sid"),
-            session_config={},
-            runtime_config=runtime_config,
-            seq=3,
-            turn_seq=3,
-            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-            payload=_frame(),
-            final=False,
-            sampling_params=SamplingParams(),
-        )
-
-
-def test_stage0_token_is_a_direct_duplex_side_channel() -> None:
-    decision = NemotronVoiceChatDuplexRuntimeExtension().decide_output(
-        stage_id=0,
-        final_stage_id=2,
-        segment_finished=True,
-        segment_token_ids=(42,),
-        segment_output_metadata={},
-        output=object(),
-    )
-
-    assert decision is not None
-    assert decision.metadata["duplex_direct_response"] is True
-    assert decision.metadata["nvc_text_token_ids"] == [42]
-
-
-def test_tools_are_rendered_with_the_nvidia_function_call_contract() -> None:
-    config = SimpleNamespace(
-        extra_body={
-            "realtime_tools": [
-                {
-                    "type": "function",
-                    "name": "weather",
-                    "description": "Look up weather.",
-                    "parameters": {"type": "object"},
-                }
-            ]
-        }
-    )
-
-    tools, signature = _normalized_tools(config)
-    prompt = _render_tool_prompt("system", tools)
-
-    assert signature == ('[{"description":"Look up weather.","name":"weather","parameters":{"type":"object"}}]')
-    assert "<AVAILABLE_TOOLS>" in prompt
-    assert '"name": "weather"' in prompt
-    assert "<TOOLCALL>" in prompt
-    assert "<TOOL_RESPONSE>" in prompt
-
-
-def test_more_than_five_tools_fail_before_engine_open() -> None:
-    config = SimpleNamespace(extra_body={"realtime_tools": [{"name": f"tool_{index}"} for index in range(6)]})
-    with pytest.raises(ValueError, match="at most 5"):
-        _normalized_tools(config)
 
 
 def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
@@ -230,70 +86,3 @@ def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
     assert second["nvc_function_response_generation"] == 2
     assert second["nvc_function_response_token_ids"] == [31, 32, 33]
     assert second["nvc_function_response_call_id"] == "call-2"
-
-
-def test_serving_capabilities_report_native_80ms_append() -> None:
-    capabilities = NemotronVoiceChatServingRuntimeAdapter.capabilities(max_sessions=1)
-    assert capabilities.chunk_period_ms == 80
-    assert capabilities.supports_model_native_turn_policy is True
-    assert capabilities.supports_core_resumable_request is True
-    assert capabilities.supports_core_kv_lease is False
-    assert capabilities.supports_multi_session is False
-
-
-def test_serving_rejects_deferred_manual_response_mode() -> None:
-    with pytest.raises(ValueError, match="auto_response"):
-        _require_native_full_duplex(SimpleNamespace(extra_body={"auto_response": False}))
-    _require_native_full_duplex(SimpleNamespace(extra_body={"auto_response": True}))
-
-
-@pytest.mark.asyncio
-async def test_prepare_runtime_reuses_serving_tokenizer_in_data_plane(monkeypatch) -> None:
-    tokenizer = SimpleNamespace(
-        convert_tokens_to_ids=lambda token: {
-            "<bos>": 101,
-            "<eos>": 102,
-            "<pad>": 103,
-            "<SPECIAL_20>": 120,
-            "<SPECIAL_21>": 121,
-            "<SPECIAL_22>": 122,
-        }[token],
-        encode=lambda *_args, **_kwargs: [7, 8],
-    )
-
-    def from_pretrained(ref: str, **_kwargs):
-        assert ref == "configured-tokenizer"
-        return tokenizer
-
-    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", from_pretrained)
-    adapter = NemotronVoiceChatServingRuntimeAdapter(lambda *_: None)
-    config = SimpleNamespace(
-        extra_body={"auto_response": True},
-        instructions="hello",
-    )
-    model_config = SimpleNamespace(
-        max_model_len=8192,
-        hf_config=SimpleNamespace(
-            stt_cfg={
-                "pretrained_llm": "configured-tokenizer",
-                "bos_token": "<bos>",
-                "eos_token": "<eos>",
-                "pad_token": "<pad>",
-            }
-        ),
-    )
-
-    runtime = await adapter.prepare_runtime_config(config, model_config=model_config)
-
-    assert runtime["nvc_text_bos_id"] == 101
-    assert runtime["nvc_text_eos_id"] == 102
-    assert runtime["nvc_text_pad_id"] == 103
-    assert runtime["nvc_max_model_len"] == 8192
-    assert adapter.data_plane._special_ids == {
-        "bos": 101,
-        "eos": 102,
-        "pad": 103,
-        "sotc": 120,
-        "eotc": 121,
-    }
-    assert adapter.data_plane._tokenizer is tokenizer

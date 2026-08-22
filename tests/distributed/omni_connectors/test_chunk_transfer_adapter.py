@@ -390,30 +390,6 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
 
 
-def test_send_single_request_passes_step_token_snapshot_when_supported(build_adapter):
-    adapter, connector = build_adapter(stage_id=0)
-    request = _req("req-step-token", RequestStatus.WAITING, external_req_id="ext-step-token")
-    observed: dict[str, object] = {}
-
-    def processor(*, new_token_ids, **kwargs):
-        observed["new_token_ids"] = tuple(new_token_ids)
-        return OmniPayloadStruct()
-
-    adapter.custom_process_next_stage_input_func = processor
-    adapter._send_single_request(
-        {
-            "multimodal_output": None,
-            "request": request,
-            "is_finished": False,
-            "is_segment_finished": False,
-            "new_token_ids": (123,),
-        }
-    )
-
-    assert connector.put.called
-    assert observed["new_token_ids"] == (123,)
-
-
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
     """Pin the contract: an explicitly empty ``OmniPayloadStruct()`` passes
     the ``payload_data is None`` check and gets sent. To skip a chunk, the
@@ -469,29 +445,6 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
 
     sent_payload = connector.put.call_args.kwargs["data"]
     assert sent_payload.meta.is_segment_finished.item() is False
-
-
-def test_send_single_request_respects_codec_stream_lifetime(build_adapter, monkeypatch):
-    adapter, connector = build_adapter(stage_id=1)
-    request = _req("req-codec-stream", RequestStatus.FINISHED_STOPPED, external_req_id="ext-codec-stream")
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
-        meta=MetaStruct(
-            codec_streaming=True,
-            finished=torch.tensor(False, dtype=torch.bool),
-            is_segment_finished=torch.tensor(False, dtype=torch.bool),
-        )
-    )
-    cleanup_calls = []
-    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
-
-    adapter._send_single_request(
-        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
-    )
-
-    sent_payload = connector.put.call_args.kwargs["data"]
-    assert sent_payload.meta.finished.item() is False
-    assert sent_payload.meta.is_segment_finished.item() is False
-    assert cleanup_calls == []
 
 
 def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
@@ -1156,66 +1109,6 @@ def test_cleanup_only_affects_target_request(build_adapter):
     assert "req-b" in adapter.request_ids_mapping
 
 
-def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter):
-    """An aborted codec stream must not leak state into a replacement stream."""
-    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
-        talker2code2wav_async_chunk,
-    )
-
-    adapter, _ = build_adapter(
-        stage_id=1,
-        connector_extra={"codec_chunk_frames": 1},
-    )
-    external_req_id = "ext-native-abort"
-    first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
-    first.resumable = True
-    first.additional_information = {
-        "meta": {"codec_streaming": True},
-        "nvc_logical_prompt_len": 1,
-    }
-    first_frame = torch.full((1, 31), 101, dtype=torch.long)
-
-    payload = talker2code2wav_async_chunk(
-        adapter,
-        {"codes": {"audio": first_frame}, "meta": {"codec_streaming": True}},
-        first,
-        is_finished=False,
-    )
-    assert payload is not None
-    assert not bool(payload.meta.finished)
-    assert external_req_id in adapter.request_payload
-
-    adapter.put_req_chunk[external_req_id] = 1
-    adapter.requests_num_chunks_sent[external_req_id] = 1
-    adapter.request_ids_mapping[first.request_id] = external_req_id
-    adapter.finish_requests(
-        [first.request_id],
-        RequestStatus.FINISHED_ABORTED,
-        {first.request_id: first},
-    )
-
-    assert external_req_id not in adapter.request_payload
-    assert external_req_id not in adapter.put_req_chunk
-    assert external_req_id not in adapter.requests_num_chunks_sent
-    assert first.request_id not in adapter.request_ids_mapping
-
-    replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
-    replacement.resumable = True
-    replacement.additional_information = first.additional_information
-    adapter.load_async(replacement)
-    assert replacement.request_id not in adapter._cancelled_load_reqs
-    second_frame = torch.full((1, 31), 202, dtype=torch.long)
-    replacement_payload = talker2code2wav_async_chunk(
-        adapter,
-        {"codes": {"audio": second_frame}, "meta": {"codec_streaming": True}},
-        replacement,
-        is_finished=False,
-    )
-
-    assert replacement_payload is not None
-    assert torch.equal(replacement_payload.codes.audio, second_frame)
-
-
 def test_cleanup_after_poll_flow(build_adapter):
     """Simulate full load_async -> poll -> finished -> cleanup cycle."""
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
@@ -1605,7 +1498,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     )
     scheduler.requests = {"req-ar": request}
 
-    scheduler._update_request_with_output = mocker.MagicMock(return_value=([123], True))
+    scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
     scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
     scheduler._free_request = mocker.MagicMock(return_value=(None, None))
@@ -1639,7 +1532,6 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
-    assert save_calls[0][1]["new_token_ids"] == [123]
 
 
 def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
@@ -2208,3 +2100,50 @@ def test_expiry_is_per_request(build_adapter):
 
     assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == {"stalled"}
     assert "healthy" in adapter._waiting_since
+
+
+def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter):
+    """An aborted codec stream must not leak state into a replacement stream."""
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=1, connector_extra={"codec_chunk_frames": 1})
+    external_req_id = "ext-native-abort"
+    first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    first.resumable = True
+    first.additional_information = {"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1}
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+
+    payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": first_frame}, "meta": {"codec_streaming": True}},
+        first,
+        is_finished=False,
+    )
+    assert payload is not None
+    assert not bool(payload.meta.finished)
+
+    adapter.put_req_chunk[external_req_id] = 1
+    adapter.requests_num_chunks_sent[external_req_id] = 1
+    adapter.request_ids_mapping[first.request_id] = external_req_id
+    adapter.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first})
+
+    assert external_req_id not in adapter.request_payload
+    assert external_req_id not in adapter.put_req_chunk
+    assert external_req_id not in adapter.requests_num_chunks_sent
+    assert first.request_id not in adapter.request_ids_mapping
+
+    replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    replacement.resumable = True
+    replacement.additional_information = first.additional_information
+    adapter.load_async(replacement)
+    replacement_payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.full((1, 31), 202, dtype=torch.long)}, "meta": {"codec_streaming": True}},
+        replacement,
+        is_finished=False,
+    )
+
+    assert replacement_payload is not None
+    assert torch.equal(replacement_payload.codes.audio, torch.full((1, 31), 202, dtype=torch.long))

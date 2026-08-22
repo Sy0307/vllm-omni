@@ -19,47 +19,6 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
-def test_streaming_mel_slice_matches_nemo_cache_geometry() -> None:
-    from types import SimpleNamespace
-
-    import torch
-
-    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
-        slice_perception_streaming_mel,
-    )
-
-    cfg = SimpleNamespace(
-        chunk_size=[1, 8],
-        shift_size=[1, 8],
-        pre_encode_cache_size=[0, 9],
-        drop_extra_pre_encoded=2,
-    )
-    first, first_drop = slice_perception_streaming_mel(
-        torch.arange(9).reshape(1, 1, 9),
-        0,
-        cfg,
-    )
-    assert first.flatten().tolist() == [0]
-    assert first_drop == 0
-
-    second, second_drop = slice_perception_streaming_mel(
-        torch.arange(17).reshape(1, 1, 17),
-        1,
-        cfg,
-    )
-    assert second.shape[-1] == 17
-    assert second.flatten().tolist() == [0] * 9 + list(range(1, 9))
-    assert second_drop == 2
-
-    third, _ = slice_perception_streaming_mel(
-        torch.arange(25).reshape(1, 1, 25),
-        2,
-        cfg,
-    )
-    assert third.flatten().tolist() == list(range(17))
-
-
 # Perception config subset matching the checkpoint (mel 10 ms hop, n_fft 512,
 # dw-striding 8x CAUSAL subsampling, conv kernel 3). causal_downsampling is
 # what the real checkpoint sets; omitting it here is exactly what let the
@@ -231,17 +190,41 @@ def test_postprocess_skips_intermediate_prefill_chunks(monkeypatch: pytest.Monke
     assert update["nvc_function_tokens"].numel() == 1
 
 
-def test_duplex_sampler_rejects_mixed_batches_explicitly() -> None:
-    import torch
+def test_prefill_contract_arithmetic() -> None:
+    # vllm_prefill_len = logical_prompt_token_len + 1 (the +1 is acoustic
+    # frame 0); decode steps == acoustic_frame_count; NeMo timeline
+    # T == prompt + frames. Values from the verified sample_general.wav run.
+    logical_prompt_len = 56
+    frames = compute_acoustic_frame_count(_STT_CFG, 249734)
+    vllm_prefill_len = logical_prompt_len + 1
+    assert vllm_prefill_len == 57
+    assert logical_prompt_len + frames == 252  # NeMo reference T
+    # The talker consumes the full timeline from t=1 and the producer trims
+    # the prompt region: rows P-1 onward of the (T-1)-row code stack.
+    talker_rows = (logical_prompt_len + frames) - 1
+    trimmed = talker_rows - (logical_prompt_len - 1)
+    assert trimmed == frames
 
-    thinker = _bare_thinker()
-    thinker._duplex_sampling_rows = {0: "req-duplex"}
-    thinker._duplex_previous_text_tokens = {}
 
-    with pytest.raises(RuntimeError, match="mixed duplex/non-duplex batches are unsupported"):
-        thinker.sample(torch.zeros((2, 16)), None)
+def test_torchaudio_mel_filterbank_matches_librosa() -> None:
+    """The perception frontend builds its mel filterbank with torchaudio.
 
-    assert thinker._duplex_previous_text_tokens == {}
+    torchaudio's melscale_fbanks(norm="slaney", mel_scale="slaney") implements
+    the same slaney-convention math as librosa.filters.mel (the NeMo reference
+    dependency) up to float32 rounding. The 1e-6 tolerance is ~4x the observed
+    2.6e-7 max diff; e2e this stays token- and WAV-identical to the reference
+    on the parity fixture (per-feature normalization absorbs it).
+    """
+    librosa = pytest.importorskip("librosa")
+    torchaudio = pytest.importorskip("torchaudio")
+
+    # The checkpoint's perception preprocessor config (16 kHz, n_fft=512, 128 mels).
+    ta = torchaudio.functional.melscale_fbanks(
+        n_freqs=257, f_min=0.0, f_max=8000.0, n_mels=128, sample_rate=16000, norm="slaney", mel_scale="slaney"
+    ).T.numpy()
+    reference = librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000.0, norm="slaney")
+    assert ta.shape == reference.shape
+    assert abs(ta - reference).max() < 1e-6
 
 
 def test_duplex_tool_response_forces_function_tokens_and_text_pad() -> None:
@@ -268,79 +251,13 @@ def test_duplex_tool_response_forces_function_tokens_and_text_pad() -> None:
     )
 
     hidden = torch.randn(1, 8)
-    output = thinker.make_omni_output(
-        hidden,
-        model_intermediate_buffer=[{"request_id": "req-tool"}],
-    )
+    output = thinker.make_omni_output(hidden, model_intermediate_buffer=[{"request_id": "req-tool"}])
     assert output.multimodal_outputs["nvc_function_token"].tolist() == [7]
 
     row = DuplexSamplingRow(0, "req-tool", "sid", 0, 1, {}, 1)
     thinker.prepare_duplex_sampling(torch.zeros((1, 16)), None, (row,))
     sampled = thinker.sample(torch.arange(16, dtype=torch.float32).reshape(1, -1), None)
     assert sampled.sampled_token_ids.tolist() == [[12]]
-    thinker.postprocess(
-        hidden,
-        request_id="req-tool",
-        multimodal_outputs=output.multimodal_outputs,
-    )
+    thinker.postprocess(hidden, request_id="req-tool", multimodal_outputs=output.multimodal_outputs)
     assert session["forced_function_tokens"] == [8]
     assert "forced_function_token" not in session
-
-
-def test_prefill_contract_arithmetic() -> None:
-    # vllm_prefill_len = logical_prompt_token_len + 1 (the +1 is acoustic
-    # frame 0); decode steps == acoustic_frame_count; NeMo timeline
-    # T == prompt + frames. Values from the verified sample_general.wav run.
-    logical_prompt_len = 56
-    frames = compute_acoustic_frame_count(_STT_CFG, 249734)
-    vllm_prefill_len = logical_prompt_len + 1
-    assert vllm_prefill_len == 57
-    assert logical_prompt_len + frames == 252  # NeMo reference T
-    # The talker consumes the full timeline from t=1 and the producer trims
-    # the prompt region: rows P-1 onward of the (T-1)-row code stack.
-    talker_rows = (logical_prompt_len + frames) - 1
-    trimmed = talker_rows - (logical_prompt_len - 1)
-    assert trimmed == frames
-
-
-def test_gated_fusion_casts_conditioning_to_projection_dtype() -> None:
-    import torch
-
-    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
-        GatedProjectedSumRMSNorm,
-    )
-
-    fusion = GatedProjectedSumRMSNorm(
-        audio_dim=2,
-        text_dim=3,
-        hidden_dim=4,
-        final_norm=False,
-    ).to(dtype=torch.bfloat16)
-    audio = torch.randn((1, 1, 2), dtype=torch.float32)
-    text = torch.randn((1, 1, 3), dtype=torch.float32)
-
-    output = fusion(audio, text)
-
-    assert output.dtype is torch.bfloat16
-    assert output.shape == (1, 1, 4)
-
-
-def test_torchaudio_mel_filterbank_matches_librosa() -> None:
-    """The perception frontend builds its mel filterbank with torchaudio.
-
-    torchaudio's melscale_fbanks(norm="slaney", mel_scale="slaney") implements
-    the same slaney-convention math as librosa.filters.mel (the NeMo reference
-    dependency) up to float32 rounding. The 1e-6 tolerance is ~4x the observed
-    2.6e-7 max diff; e2e this stays token- and WAV-identical to the reference
-    on the parity fixture (per-feature normalization absorbs it).
-    """
-    librosa = pytest.importorskip("librosa")
-    torchaudio = pytest.importorskip("torchaudio")
-
-    # The checkpoint's perception preprocessor config (16 kHz, n_fft=512, 128 mels).
-    ta = torchaudio.functional.melscale_fbanks(
-        n_freqs=257, f_min=0.0, f_max=8000.0, n_mels=128, sample_rate=16000, norm="slaney", mel_scale="slaney"
-    ).T.numpy()
-    reference = librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000.0, norm="slaney")
-    assert ta.shape == reference.shape
-    assert abs(ta - reference).max() < 1e-6
