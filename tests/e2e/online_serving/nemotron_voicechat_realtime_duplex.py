@@ -121,6 +121,38 @@ def _events(client: RealtimeDuplexClient, event_type: str) -> list[dict[str, obj
     return [event for event in client.events.events if event.get("type") == event_type]
 
 
+async def _return_function_output_when_ready(
+    client: RealtimeDuplexClient,
+    *,
+    output: str,
+    timeout_s: float,
+) -> tuple[str, int]:
+    """Return the tool result immediately, while microphone streaming continues."""
+    await wait_for(
+        lambda: bool(client.events.errors()) or client.events.count("response.function_call_arguments.done") > 0,
+        timeout_s=timeout_s,
+        label="function call to execute",
+    )
+    if client.events.errors():
+        raise AssertionError(f"function call failed before tool execution: {client.events.errors()}")
+    function_done = _events(client, "response.function_call_arguments.done")[-1]
+    call_id = function_done.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        raise AssertionError(f"completed function call has no call_id: {function_done}")
+    event_count_before_output = len(client.events.events)
+    await client.send(
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            },
+        }
+    )
+    return call_id, event_count_before_output
+
+
 def _audio_packet_durations_ms(events: Sequence[dict[str, object]]) -> list[float]:
     """Measure each PCM16 delta independently, without trusting metadata."""
     durations = []
@@ -241,6 +273,17 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"unexpected capabilities: {capabilities}")
 
         stream_started_at_s = time.monotonic()
+        function_output_task = (
+            asyncio.create_task(
+                _return_function_output_when_ready(
+                    client,
+                    output=args.function_output,
+                    timeout_s=args.timeout_s,
+                )
+            )
+            if args.function_output is not None
+            else None
+        )
         frame_count = await _stream(
             client,
             _read_wav(Path(args.input_wav), input_channel=args.input_channel),
@@ -292,16 +335,77 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"no completed function call: {function_events}")
         if args.expect_function_call:
             matching_items = [
-                event["item"] for event in function_items if event["item"].get("name") == args.expected_function_name
+                event for event in function_items if event["item"].get("name") == args.expected_function_name
             ]
             if not matching_items:
                 raise AssertionError(f"expected function {args.expected_function_name!r}, got {function_items}")
+            function_item_event = matching_items[-1]
+            function_item = function_item_event["item"]
             try:
-                function_arguments = json.loads(str(matching_items[-1].get("arguments", "")))
+                function_arguments = json.loads(str(function_item.get("arguments", "")))
             except json.JSONDecodeError as exc:
-                raise AssertionError(f"function arguments are not JSON: {matching_items[-1]}") from exc
+                raise AssertionError(f"function arguments are not JSON: {function_item}") from exc
             if not isinstance(function_arguments, dict):
                 raise AssertionError(f"function arguments are not an object: {function_arguments!r}")
+            function_done = [
+                event for event in function_events if event.get("type") == "response.function_call_arguments.done"
+            ][-1]
+            if function_done.get("call_id") != function_item.get("call_id") or function_done.get(
+                "response_id"
+            ) != function_item_event.get("response_id"):
+                raise AssertionError(
+                    f"function call identity changed across events: done={function_done}, item={function_item_event}"
+                )
+            if args.expected_function_arguments is not None:
+                expected_arguments = json.loads(args.expected_function_arguments)
+                if function_arguments != expected_arguments:
+                    raise AssertionError(
+                        f"function arguments differ: expected={expected_arguments!r}, actual={function_arguments!r}"
+                    )
+
+            if args.function_output is not None:
+                call_id = function_item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise AssertionError(f"function item has no call_id: {function_item}")
+                assert function_output_task is not None
+                returned_call_id, event_count_before_output = await function_output_task
+                if returned_call_id != call_id:
+                    raise AssertionError(f"returned output for {returned_call_id}, but completed item used {call_id}")
+
+                def tool_result_completed() -> bool:
+                    later_events = client.events.events[event_count_before_output:]
+                    has_audio = any(event.get("type") == "response.audio.delta" for event in later_events)
+                    completed = any(
+                        event.get("type") == "response.done"
+                        and isinstance(event.get("response"), dict)
+                        and event["response"].get("status") == "completed"
+                        for event in later_events
+                    )
+                    transcript = "".join(
+                        str(event.get("delta", ""))
+                        for event in later_events
+                        if event.get("type") == "response.audio_transcript.delta"
+                    ).lower()
+                    expected_text = args.expected_post_tool_text
+                    return has_audio and completed and (expected_text is None or expected_text.lower() in transcript)
+
+                await wait_for(
+                    lambda: bool(client.events.errors()) or tool_result_completed(),
+                    timeout_s=args.timeout_s,
+                    label="completed response after function output",
+                )
+                if client.events.errors():
+                    raise AssertionError(f"function output failed: {client.events.errors()}")
+                created_outputs = [
+                    event
+                    for event in _events(client, "conversation.item.created")
+                    if isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "function_call_output"
+                    and event["item"].get("call_id") == call_id
+                ]
+                if not created_outputs:
+                    raise AssertionError("server did not acknowledge the function_call_output item")
+                await asyncio.sleep(args.drain_s)
 
         audio = client.events.audio_bytes()
         audio_events = _events(client, "response.audio.delta")
@@ -400,6 +504,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--minimum-audio-rms", type=float, default=1e-4)
     parser.add_argument("--expect-function-call", action="store_true")
     parser.add_argument("--expected-function-name", default="generate_random_number")
+    parser.add_argument(
+        "--expected-function-arguments",
+        help='Exact JSON arguments expected from the model (for example \'{"min":1,"max":50}\').',
+    )
+    parser.add_argument(
+        "--function-output",
+        help="Return this string as function_call_output and require a completed post-tool audio response.",
+    )
+    parser.add_argument(
+        "--expected-post-tool-text",
+        help="Case-insensitive transcript substring required after returning function output.",
+    )
     parser.add_argument(
         "--allow-incomplete-response",
         action="store_true",

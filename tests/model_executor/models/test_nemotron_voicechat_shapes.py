@@ -244,6 +244,49 @@ def test_duplex_sampler_rejects_mixed_batches_explicitly() -> None:
     assert thinker._duplex_previous_text_tokens == {}
 
 
+def test_duplex_tool_response_forces_function_tokens_and_text_pad() -> None:
+    import torch
+
+    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+
+    thinker = _bare_thinker()
+    thinker._sessions = {
+        "req-tool": {
+            "nvc_text_pad_id": 12,
+            "function_response_generation": 0,
+            "forced_function_tokens": [],
+        }
+    }
+    thinker._duplex_previous_text_tokens = {}
+    session = thinker._sessions["req-tool"]
+    thinker._sync_forced_function_response(
+        session,
+        {
+            "nvc_function_response_generation": 1,
+            "nvc_function_response_token_ids": [7, 8],
+        },
+    )
+
+    hidden = torch.randn(1, 8)
+    output = thinker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": "req-tool"}],
+    )
+    assert output.multimodal_outputs["nvc_function_token"].tolist() == [7]
+
+    row = DuplexSamplingRow(0, "req-tool", "sid", 0, 1, {}, 1)
+    thinker.prepare_duplex_sampling(torch.zeros((1, 16)), None, (row,))
+    sampled = thinker.sample(torch.arange(16, dtype=torch.float32).reshape(1, -1), None)
+    assert sampled.sampled_token_ids.tolist() == [[12]]
+    thinker.postprocess(
+        hidden,
+        request_id="req-tool",
+        multimodal_outputs=output.multimodal_outputs,
+    )
+    assert session["forced_function_tokens"] == [8]
+    assert "forced_function_token" not in session
+
+
 def test_prefill_contract_arithmetic() -> None:
     # vllm_prefill_len = logical_prompt_token_len + 1 (the +1 is acoustic
     # frame 0); decode steps == acoustic_frame_count; NeMo timeline

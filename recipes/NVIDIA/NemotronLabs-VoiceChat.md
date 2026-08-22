@@ -124,7 +124,21 @@ python tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py \
 
 The probe requires a completed response, non-silent 22.05 kHz output, and the
 advertised native 80 ms append capabilities. Add `--expect-function-call` and
-use `tool_call.wav` to validate the function-call channel.
+use `tool_call.wav` to validate the function-call channel. To validate the
+Realtime tool round trip, also provide the expected arguments and return a
+tool result:
+
+```bash
+python tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py \
+  --model nemotron-voicechat \
+  --input-wav /path/to/NVIDIA-NemotronLabs-VoiceChat-11B/tool_call.wav \
+  --output-dir results/nemotron_voicechat_tool_call \
+  --expect-function-call \
+  --expected-function-name generate_random_number \
+  --expected-function-arguments '{"min":1,"max":50}' \
+  --function-output 20 \
+  --expected-post-tool-text "random number"
+```
 
 #### Notes
 
@@ -154,6 +168,7 @@ use `tool_call.wav` to validate the function-call channel.
   The current native duplex path is functionally streaming but not wall-clock
   realtime.
 - Known limitations: batch=1 only. The native duplex deployment allows one
-  active session, does not support barge-in, and emits function-call events but
-  does not execute tools or append tool results back into the live model
-  request.
+  active session and does not support barge-in. Tool execution remains
+  client-owned: the server emits function-call events, accepts a validated
+  `function_call_output`, and resumes the live model with the returned result;
+  it does not execute arbitrary tools itself.

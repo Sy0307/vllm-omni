@@ -546,6 +546,40 @@ async def test_native_realtime_protocol_conversation_item_create_commits_user_te
 
 
 @pytest.mark.asyncio
+async def test_native_realtime_protocol_accepts_output_only_for_known_function_call():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+    protocol._conversation_items["item-call"] = {
+        "id": "item-call",
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "weather",
+        "arguments": "{}",
+    }
+
+    rejected = await protocol._to_duplex_event(
+        {
+            "type": "conversation.item.create",
+            "event_id": "bad-output",
+            "item": {"type": "function_call_output", "call_id": "unknown", "output": "sunny"},
+        }
+    )
+    accepted = await protocol._to_duplex_event(
+        {
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": "call-1", "output": "sunny"},
+        }
+    )
+
+    assert rejected is None
+    assert ws.sent[-1]["error"]["code"] == "invalid_function_call_output"
+    assert accepted["type"] == "turn.signal"
+    assert accepted["event"] == "conversation.item.create"
+    assert accepted["payload"]["item"]["call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
 async def test_native_realtime_protocol_audio_commit_requires_non_empty_buffer():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]

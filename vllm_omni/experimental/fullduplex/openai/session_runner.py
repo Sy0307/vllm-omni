@@ -28,6 +28,7 @@ from vllm_omni.experimental.fullduplex.openai.realtime_session import (
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     PcmAppendReservation,
+    ServingRuntimeConfigError,
     ServingRuntimeSessionState,
     payload_turn_id,
 )
@@ -1104,6 +1105,53 @@ class DuplexSessionRunnerMixin:
                         if turn_event == "conversation.item.create":
                             payload = event.get("payload")
                             item = payload.get("item") if isinstance(payload, dict) else None
+                            item_type = item.get("type") if isinstance(item, dict) else None
+                            prepare_function_output = getattr(
+                                self._serving_runtime_adapter,
+                                "runtime_config_for_function_output",
+                                None,
+                            )
+                            if item_type == "function_call_output" and callable(prepare_function_output):
+                                if not await wait_for_native_append_tail():
+                                    continue
+                                try:
+                                    candidate_runtime_config = prepare_function_output(
+                                        item,
+                                        dict(session.runtime_config),
+                                    )
+                                except ServingRuntimeConfigError as exc:
+                                    await emit_event(
+                                        {
+                                            "type": "error",
+                                            "session_id": session.session_id,
+                                            "code": exc.code,
+                                            "error": str(exc),
+                                        }
+                                    )
+                                    continue
+                                if not await self._signal_runtime_session(
+                                    session,
+                                    "session.update",
+                                    emit_event,
+                                    runtime_config=candidate_runtime_config,
+                                ):
+                                    continue
+                                session.replace_runtime_config(candidate_runtime_config)
+                                await emit_event(
+                                    {
+                                        "type": "conversation.item.created",
+                                        "session_id": session.session_id,
+                                        "item": item,
+                                        "created": True,
+                                    }
+                                )
+                                await self._maybe_continue_native_response(
+                                    emit_event,
+                                    session=session,
+                                    expected_epoch=session.epoch,
+                                    expected_model_turn_id=session.turn_id,
+                                )
+                                continue
                             message = self._realtime_item_to_history_message(item)
                             item_id = item.get("id") if isinstance(item, dict) else None
                             if message is not None:

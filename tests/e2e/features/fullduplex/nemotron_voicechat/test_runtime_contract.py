@@ -17,6 +17,7 @@ from vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter import
     NemotronVoiceChatServingRuntimeAdapter,
     _normalized_tools,
     _render_tool_prompt,
+    _render_tool_response,
     _require_native_full_duplex,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
@@ -202,6 +203,33 @@ def test_more_than_five_tools_fail_before_engine_open() -> None:
     config = SimpleNamespace(extra_body={"realtime_tools": [{"name": f"tool_{index}"} for index in range(6)]})
     with pytest.raises(ValueError, match="at most 5"):
         _normalized_tools(config)
+
+
+def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
+    encoded: list[str] = []
+    adapter = NemotronVoiceChatServingRuntimeAdapter(lambda *_: None)
+    adapter._tokenizer = SimpleNamespace(
+        encode=lambda text, **_kwargs: encoded.append(text) or [31, 32, 33],
+    )
+
+    first = adapter.runtime_config_for_function_output(
+        {"type": "function_call_output", "call_id": "call-1", "output": '{"result":20}'},
+        {},
+    )
+    second = adapter.runtime_config_for_function_output(
+        {"type": "function_call_output", "call_id": "call-2", "output": "plain text"},
+        first,
+    )
+
+    assert _render_tool_response('{"result":20}') == '<TOOL_RESPONSE>[{"result":20}]</TOOL_RESPONSE>'
+    assert encoded == [
+        '<TOOL_RESPONSE>[{"result":20}]</TOOL_RESPONSE>',
+        '<TOOL_RESPONSE>["plain text"]</TOOL_RESPONSE>',
+    ]
+    assert first["nvc_function_response_generation"] == 1
+    assert second["nvc_function_response_generation"] == 2
+    assert second["nvc_function_response_token_ids"] == [31, 32, 33]
+    assert second["nvc_function_response_call_id"] == "call-2"
 
 
 def test_serving_capabilities_report_native_80ms_append() -> None:

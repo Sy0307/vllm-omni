@@ -46,6 +46,9 @@ _PRIVATE_KEYS = frozenset(
         "nvc_max_model_len",
         "nvc_tokenizer_ref",
         "nvc_tools_signature",
+        "nvc_function_response_generation",
+        "nvc_function_response_token_ids",
+        "nvc_function_response_call_id",
     }
 )
 
@@ -99,6 +102,16 @@ def _render_tool_prompt(instructions: str, tools: list[dict[str, object]]) -> st
         "Based on the tool responses, you can call additional tools if needed, correct tool calls if any "
         "errors are found, or just respond to the user."
     )
+
+
+def _render_tool_response(output: str) -> str:
+    """Serialize one Realtime function result using NVIDIA's function channel."""
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError:
+        value = output
+    payload = json.dumps([value], ensure_ascii=True, separators=(",", ":"))
+    return f"<TOOL_RESPONSE>{payload}</TOOL_RESPONSE>"
 
 
 def _require_native_full_duplex(config: object) -> None:
@@ -161,6 +174,7 @@ class NemotronVoiceChatServingRuntimeAdapter:
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self.session_states: dict[str, MiniCPMO45ServingSessionState] = {}
         self.data_plane = NemotronVoiceChatDataPlaneSession(encode_audio)
+        self._tokenizer: Any | None = None
 
     def create_session_state(self) -> MiniCPMO45ServingSessionState:
         return MiniCPMO45ServingSessionState(
@@ -249,6 +263,47 @@ class NemotronVoiceChatServingRuntimeAdapter:
         runtime["instructions"] = instructions
         runtime["nvc_tools_signature"] = tools_signature
         self.data_plane.configure_runtime(runtime, tokenizer=tokenizer)
+        self._tokenizer = tokenizer
+        return runtime
+
+    def runtime_config_for_function_output(
+        self,
+        item: Mapping[str, object],
+        current: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Queue a client tool result for frame-locked function-channel injection."""
+        call_id = item.get("call_id")
+        output = item.get("output")
+        if not isinstance(call_id, str) or not call_id:
+            raise ServingRuntimeConfigError(
+                "function_call_output requires call_id",
+                code="invalid_function_call_output",
+            )
+        if not isinstance(output, str):
+            raise ServingRuntimeConfigError(
+                "function_call_output requires a string output",
+                code="invalid_function_call_output",
+            )
+        if self._tokenizer is None:
+            raise ServingRuntimeConfigError(
+                "Nemotron VoiceChat tokenizer is unavailable for function output",
+                code="invalid_function_call_output",
+            )
+        response_token_ids = list(
+            self._tokenizer.encode(
+                _render_tool_response(output),
+                add_special_tokens=False,
+            )
+        )
+        if not response_token_ids:
+            raise ServingRuntimeConfigError(
+                "function_call_output tokenized to an empty response",
+                code="invalid_function_call_output",
+            )
+        runtime = deepcopy(dict(current))
+        runtime["nvc_function_response_generation"] = int(runtime.get("nvc_function_response_generation", 0)) + 1
+        runtime["nvc_function_response_token_ids"] = [int(token_id) for token_id in response_token_ids]
+        runtime["nvc_function_response_call_id"] = call_id
         return runtime
 
     @staticmethod

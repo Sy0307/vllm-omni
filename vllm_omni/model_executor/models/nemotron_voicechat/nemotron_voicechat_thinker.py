@@ -12,7 +12,8 @@
 * the NemotronH (hybrid Mamba) backbone on vLLM paged execution via
   ``init_vllm_registered_model`` — this is where vLLM earns its keep;
 * the separate ``lm_head`` (text channel, sampled by the vLLM engine) and
-  ``function_head`` (greedy, maintained internally per request).
+  ``function_head`` (greedy, maintained internally per request, with client
+  tool results injected into the function channel).
 
 Timeline contract (verified against NeMo ``_init_inference``/``_step_zero``/
 ``_step_inference``; the golden shape test guards it):
@@ -29,9 +30,9 @@ Timeline contract (verified against NeMo ``_init_inference``/``_step_zero``/
   example sets ``max_tokens = acoustic_frame_count``. Never set ``min_tokens``:
   the tokenizer's eos_token is <SPECIAL_12> — the frame-locked PAD/silence
   token — and min_tokens masks "EOS" to -inf, forbidding silence entirely.
-* The function channel exists for numerical correctness (fusion weight 2.0)
-  even though tool calling is out of scope; the greedy token timeline is
-  exposed for debugging via the request info.
+* The function channel is load-bearing for numerical correctness (fusion
+  weight 2.0), emits tool calls, and accepts client tool results while keeping
+  the text channel padded during forced response injection.
 """
 
 from __future__ import annotations
@@ -369,6 +370,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         if self._use_function_head and model_outputs.numel():
             with torch.inference_mode():
                 function_token = self.function_head(model_outputs[-1:, :].to(self._dtype)).argmax(dim=-1)
+            info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information")
+            info = info_dicts[0] if isinstance(info_dicts, list) and len(info_dicts) == 1 else None
+            request_id = info.get("request_id") if isinstance(info, dict) else None
+            session = self._sessions.get(request_id) if isinstance(request_id, str) else None
+            forced_token = session.get("forced_function_token") if isinstance(session, dict) else None
+            if isinstance(forced_token, int):
+                function_token = torch.full_like(function_token, forced_token)
             multimodal_outputs["nvc_function_token"] = function_token
         return OmniOutput(
             text_hidden_states=model_outputs,
@@ -401,6 +409,9 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             )
         sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
         for row_idx, request_id in rows.items():
+            session = self._sessions.get(request_id)
+            if isinstance(session, dict) and isinstance(session.get("forced_function_token"), int):
+                sampled[row_idx] = int(session["nvc_text_pad_id"])
             self._duplex_previous_text_tokens[request_id] = int(sampled[row_idx].item())
         return SamplerOutput(
             sampled_token_ids=sampled.unsqueeze(-1),
@@ -566,6 +577,9 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 "prompt_len": int(prompt_ids.numel()),
                 "func_token": pad_id,
                 "last_input_seq": 0,
+                "nvc_text_pad_id": pad_id,
+                "function_response_generation": 0,
+                "forced_function_tokens": [],
             }
             self._sessions[request_id] = session
             frame = self._duplex_stable_frame(session, duplex, device)
@@ -582,6 +596,8 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             session["prefill_embeds"] = self._fuse(pad_ids, timeline, pad_ids)
         else:
             frame = self._duplex_stable_frame(session, duplex, device)
+
+        self._sync_forced_function_response(session, runtime_config)
 
         if source_input_seq <= 1:
             offset = max(0, int(info.get("_omni_num_computed_tokens", 0) or 0))
@@ -622,6 +638,30 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 "nvc_text_pad_id": pad_id,
             },
         )
+
+    @staticmethod
+    def _sync_forced_function_response(
+        session: dict[str, Any],
+        runtime_config: dict[str, Any],
+    ) -> None:
+        try:
+            generation = int(runtime_config.get("nvc_function_response_generation", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Nemotron VoiceChat function-response generation must be an integer") from exc
+        seen = int(session.get("function_response_generation", 0))
+        if generation < seen:
+            raise ValueError("Nemotron VoiceChat function-response generation moved backwards")
+        if generation > seen:
+            if session.get("forced_function_token") is not None or session.get("forced_function_tokens"):
+                raise ValueError("Nemotron VoiceChat received overlapping function responses")
+            raw_tokens = runtime_config.get("nvc_function_response_token_ids")
+            if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
+                raise ValueError("Nemotron VoiceChat function response requires token ids")
+            session["forced_function_tokens"] = [int(token_id) for token_id in raw_tokens]
+            session["function_response_generation"] = generation
+        queue = session.get("forced_function_tokens")
+        if session.get("forced_function_token") is None and isinstance(queue, list) and queue:
+            session["forced_function_token"] = int(queue[0])
 
     # ------------------------------------------------------------------
     # Per-request session.
@@ -822,6 +862,11 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 # StreamingUpdate replaces the runner payload at each append;
                 # retain the function channel in model-owned session state.
                 session["func_token"] = int(token.item())
+                forced = session.pop("forced_function_token", None)
+                if isinstance(forced, int):
+                    queue = session.get("forced_function_tokens")
+                    if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
+                        raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
         update: dict[str, Any] = {"nvc_prev_function_token": token}
         if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
             existing = kwargs.get("nvc_function_tokens")
