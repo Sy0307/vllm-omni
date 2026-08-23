@@ -241,14 +241,14 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
 
     def fake_schedule(self, throttle_prefills=False):
         seen["counter"] = self.num_waiting_for_streaming_input
-        raise _StopSchedule
+        raise _StopScheduleError
 
-    class _StopSchedule(Exception):
+    class _StopScheduleError(Exception):
         pass
 
     monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "schedule", fake_schedule)
 
-    with pytest.raises(_StopSchedule):
+    with pytest.raises(_StopScheduleError):
         OmniARScheduler.schedule(scheduler)
 
     assert seen["counter"] == 0
