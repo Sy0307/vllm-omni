@@ -703,6 +703,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             kept_output_len = max(0, computed_tokens - current_prompt_len)
             next_prompt_len = len(update.prompt_token_ids or ())
             candidate_len = current_prompt_len + kept_output_len + next_prompt_len
+            # Keep one context position available for the next sampled codec token.
             if max_model_len > 0 and candidate_len >= max_model_len:
                 logger.info(
                     "Resetting native duplex Stage-1 prompt before context overflow: "
