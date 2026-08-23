@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import base64
 import binascii
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+import pybase64 as base64
 
 SILERO_VAD_MIN_THRESHOLD = 0.15
 
