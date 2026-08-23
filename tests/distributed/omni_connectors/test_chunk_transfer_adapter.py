@@ -546,7 +546,7 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
     assert second.codes is None
 
 
-def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
+def test_save_async_skips_stale_resumable_chunk_within_segment(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
     request.resumable = True
@@ -563,6 +563,32 @@ def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapt
 
     assert len(adapter._pending_save_reqs) == 1
     assert adapter.requests_num_chunks_sent["ext-stream"] == 0
+
+
+def test_save_async_drops_late_previous_segment_after_boundary_reset(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request._omni_segment_generation = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 111
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+
+    late = _req("req-stream-late", RequestStatus.WAITING, external_req_id="ext-stream")
+    late.resumable = True
+    late.num_computed_tokens = 111
+    late._omni_segment_generation = 0
+    adapter.save_async(multimodal_output=None, request=late, is_segment_finished=False)
+
+    next_segment = _req("req-stream-next", RequestStatus.WAITING, external_req_id="ext-stream")
+    next_segment.resumable = True
+    next_segment.num_computed_tokens = 3
+    next_segment._omni_segment_generation = 1
+    adapter.save_async(multimodal_output=None, request=next_segment, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 2
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+    assert adapter._pending_save_reqs[-1]["request"] is next_segment
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):

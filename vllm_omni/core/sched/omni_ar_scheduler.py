@@ -218,16 +218,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    def _drop_aborted_queued_requests(self) -> None:
+        for queue in (self.waiting, self.skipped_waiting):
+            aborted = [req for req in queue if req.status == RequestStatus.FINISHED_ABORTED]
+            if aborted:
+                queue.remove_requests(aborted)
+        self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
-            for req in list(queue):
-                if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
-                    queue.remove(req)
+        self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
+        self._resync_streaming_input_counter()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -354,6 +359,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+
+            if generated_token_ids and getattr(request, "async_tokens_to_discard", 0) > 0:
+                self._update_request_with_output(request, generated_token_ids)
+                continue
+
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False
@@ -651,6 +661,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter and self.chunk_transfer_adapter.receives_chunks:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if stage_id != 0:
+                session._omni_segment_generation = int(
+                    getattr(session, "_omni_segment_generation", 0) or 0
+                ) + 1
                 # Downstream async-chunk stages receive real payloads from the
                 # connector. This update only resumes polling for the next segment.
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
@@ -682,6 +695,30 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+        native_duplex_update = any(
+            isinstance(info, dict) and info.get("native_duplex") is True
+            for info in update_infos
+        )
+        if native_duplex_update:
+            max_model_len = int(getattr(self.vllm_config.model_config, "max_model_len", 0) or 0)
+            current_prompt_len = len(getattr(session, "prompt_token_ids", None) or ())
+            computed_tokens = int(getattr(session, "num_computed_tokens", 0) or 0)
+            kept_output_len = max(0, computed_tokens - current_prompt_len)
+            next_prompt_len = len(update.prompt_token_ids or ())
+            candidate_len = current_prompt_len + kept_output_len + next_prompt_len
+            if max_model_len > 0 and candidate_len >= max_model_len:
+                logger.info(
+                    "Resetting native duplex Stage-1 prompt before context overflow: "
+                    "req=%s current=%s kept_output=%s next=%s max_model_len=%s",
+                    session.request_id,
+                    current_prompt_len,
+                    kept_output_len,
+                    next_prompt_len,
+                    max_model_len,
+                )
+                self._replace_streaming_session(session, update)
+                return
+        session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer

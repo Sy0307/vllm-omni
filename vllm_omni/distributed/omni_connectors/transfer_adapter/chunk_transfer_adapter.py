@@ -95,6 +95,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         #   been read").
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
+        # Boundary tasks advance this before the background sender runs, so a
+        # late old-segment frame cannot restore the previous watermark.
+        self._segment_generation: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
         # Monotonic timestamp of when each request last began waiting for a
         # chunk, refreshed every time one arrives.  Read by
@@ -188,11 +191,31 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             is_segment_finished: whether the segment of request is finished
         """
         is_finished = request.is_finished() and not request.resumable
+        if not hasattr(self, "_segment_generation"):
+            self._segment_generation = defaultdict(int)
+        external_req_id = request.external_req_id
+        raw_generation = getattr(request, "_omni_segment_generation", 0)
+        try:
+            generation = int(raw_generation)
+        except (TypeError, ValueError):
+            generation = 0
+        expected_generation = self._segment_generation.get(external_req_id, generation)
+        if generation < expected_generation:
+            logger.warning(
+                "Skip late save_async for request %s, segment_generation=%s, expected=%s",
+                external_req_id,
+                generation,
+                expected_generation,
+            )
+            return
+        self._segment_generation[external_req_id] = generation
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
         # If the request is preempted, skip the already saved chunks.
-        if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
+        if not is_segment_finished and confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(
+            request.external_req_id, 0
+        ):
             logger.warning(
                 f"Enqueue save_async for request {request.external_req_id}, "
                 f"request.num_computed_tokens={request.num_computed_tokens}, "
@@ -201,13 +224,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             return
 
-        self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
+            "segment_generation": generation,
         }
+        if is_segment_finished:
+            self._segment_generation[external_req_id] = generation + 1
+            self.requests_num_chunks_sent.pop(external_req_id, None)
+        else:
+            self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
@@ -425,7 +453,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
-            self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
@@ -501,6 +528,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
+        self._segment_generation.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
