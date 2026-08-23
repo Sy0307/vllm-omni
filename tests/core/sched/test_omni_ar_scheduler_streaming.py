@@ -227,7 +227,8 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.should_advance.return_value = False
-    def discard_stale_output(request: Request, token_ids: list[int]):
+
+    def discard_stale_output(request: Request, token_ids: list[int]) -> tuple[list[int], bool]:
         request.async_tokens_to_discard = 0
         return token_ids, False
 

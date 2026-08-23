@@ -661,9 +661,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter and self.chunk_transfer_adapter.receives_chunks:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if stage_id != 0:
-                session._omni_segment_generation = int(
-                    getattr(session, "_omni_segment_generation", 0) or 0
-                ) + 1
+                session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
                 # Downstream async-chunk stages receive real payloads from the
                 # connector. This update only resumes polling for the next segment.
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
@@ -696,8 +694,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._replace_streaming_session(session, update)
             return
         native_duplex_update = any(
-            isinstance(info, dict) and info.get("native_duplex") is True
-            for info in update_infos
+            isinstance(info, dict) and info.get("native_duplex") is True for info in update_infos
         )
         if native_duplex_update:
             max_model_len = int(getattr(self.vllm_config.model_config, "max_model_len", 0) or 0)
