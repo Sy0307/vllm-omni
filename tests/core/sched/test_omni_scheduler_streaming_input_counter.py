@@ -62,9 +62,7 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting, counter, skipp
 
 def _upstream_num_unfinished(scheduler) -> int:
     """Mirror of ``Scheduler.get_num_unfinished_requests`` arithmetic."""
-    num_waiting = (
-        len(scheduler.waiting) + len(scheduler.skipped_waiting) - scheduler.num_waiting_for_streaming_input
-    )
+    num_waiting = len(scheduler.waiting) + len(scheduler.skipped_waiting) - scheduler.num_waiting_for_streaming_input
     return num_waiting + len(scheduler.running)
 
 
@@ -235,7 +233,9 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
 
     seen: dict[str, int] = {}
 
-    monkeypatch.setattr(ar_sched_mod.OmniSchedulerMixin, "_consume_pending_connector_output", lambda self, model_mode: None)
+    monkeypatch.setattr(
+        ar_sched_mod.OmniSchedulerMixin, "_consume_pending_connector_output", lambda self, model_mode: None
+    )
     monkeypatch.setattr(ar_sched_mod.OmniSchedulerMixin, "_process_pending_input_timeouts", lambda self: None)
     monkeypatch.setattr(OmniARScheduler, "_should_defer_waiting_admission", lambda self: False)
 
