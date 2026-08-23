@@ -640,40 +640,8 @@ multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM.
-
-The public Realtime endpoint has two overlap modes:
-
-1. `listen_only` is the default. Browser audio is admitted to Stage0 and the
-   MiniCPM model decides whether to listen or speak. `turn_detection` is null.
-2. `barge_in_on_speech` is explicit opt-in through
-   `turn_detection.type=server_vad` with `interrupt_response=true`. A
-   per-session Silero VAD scores 512-sample 16 kHz windows, debounces speech
-   onset, and latches one interrupt for the utterance. The onset fences the
-   active epoch, aborts its stage work, and retains the confirming audio as
-   pre-roll for the next epoch. Audio remains forced to model-listen until VAD
-   observes the configured trailing silence.
-
-`server_vad` with `interrupt_response=false` is rejected. The endpoint does
-not expose a third VAD-notification-only overlap mode.
-
-`response.cancel` is not a third overlap mode. It is a manual command that
-enters the same cancellation machinery. Public cancellation terminates with
-exactly one `response.done(status=cancelled)`: server VAD uses reason
-`turn_detected`, while explicit `response.cancel` uses `client_cancelled`.
-Internal `audio.cancelled` is never projected as a public event, and automatic
-cancellation does not synthesize `conversation.item.truncated` (that event is
-reserved for an explicit item-truncate request).
-
-Silero is optional because the default mode does not need server VAD. Install
-the `server-vad` extra before selecting this mode. The 2026-08-20 H200
-real-model gate used 200 ms browser chunks and a 96 ms onset debounce. It
-observed exactly one speech-start and one cancelled terminal, no stale delta
-after the cancelled fence, a committed interrupting utterance, and one
-completed follow-up response whose transcript addressed the interrupt's
-"四大发明" topic (101 audio deltas). The measured 2.495 ms from the server
-`speech_started` event to `response.done` is a server reaction measurement,
-not a claim about total acoustic-onset latency.
+item". Silent overlap no longer discards earlier user PCM. A separate explicit
+`server_vad` policy is documented in the Realtime contract above.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS

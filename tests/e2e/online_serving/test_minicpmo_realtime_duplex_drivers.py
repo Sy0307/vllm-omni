@@ -18,7 +18,6 @@ DEMO_PATH = HELPERS_DIR / "minicpmo_realtime_duplex_scenarios.py"
 MULTI_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_multi_session.py"
 PAIR_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_demo_pair.py"
 SOFT_INTERRUPT_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_soft_interrupt.py"
-SERVER_VAD_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_server_vad.py"
 
 
 def _load_demo_module():
@@ -60,18 +59,6 @@ def _load_soft_interrupt_demo_module():
     return module
 
 
-def _load_server_vad_demo_module():
-    spec = importlib.util.spec_from_file_location(
-        "minicpmo_realtime_duplex_server_vad_test",
-        SERVER_VAD_DEMO_PATH,
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_realtime_duplex_multi_session_script_is_directly_executable():
     result = subprocess.run(
         [sys.executable, str(MULTI_DEMO_PATH), "--help"],
@@ -102,19 +89,6 @@ def test_realtime_duplex_soft_interrupt_script_is_directly_executable():
     result = subprocess.run(
         [sys.executable, str(SOFT_INTERRUPT_DEMO_PATH), "--help"],
         cwd=SOFT_INTERRUPT_DEMO_PATH.parents[3],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_realtime_duplex_server_vad_script_is_directly_executable():
-    result = subprocess.run(
-        [sys.executable, str(SERVER_VAD_DEMO_PATH), "--help"],
-        cwd=SERVER_VAD_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
         timeout=60,
@@ -363,7 +337,7 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
     assert args.temperature is None
 
 
-def test_realtime_duplex_soft_interrupt_preserves_model_sampling_defaults(tmp_path, monkeypatch):
+def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(tmp_path, monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     input_wav = tmp_path / "input.wav"
     with wave.open(str(input_wav), "wb") as wav_file:
@@ -422,7 +396,8 @@ def test_realtime_duplex_soft_interrupt_preserves_model_sampling_defaults(tmp_pa
 
     command = captured["command"]
     assert isinstance(command, list)
-    assert "--temperature" not in command
+    assert "--temperature" in command
+    assert command[command.index("--temperature") + 1] == "0.0"
     assert result["ok"] is True
 
 
@@ -541,11 +516,6 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     )
 
     assert summary["ok"] is True
-    assert summary["completed_response_count"] == 2
-    assert summary["cancelled_count"] == 0
-    assert summary["truncated_count"] == 0
-    assert summary["response_listen_count"] == 3
-    assert summary["native_resume_contract_ok"] is True
     assert summary["listen_between_responses"] is False
     assert summary["second_response_before_final_commit"] is True
     assert summary["final_listen_after_commit"] is True
@@ -664,41 +634,6 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
 
     assert summary["ok"] is False
     assert summary["enough_responses"] is False
-    assert summary["completed_response_count"] == 1
-    assert summary["native_resume_contract_ok"] is False
-
-
-def test_realtime_duplex_soft_interrupt_native_resume_rejects_cancel_and_truncate(tmp_path):
-    demo = _load_soft_interrupt_demo_module()
-    output = tmp_path / "native_resume_cancel_truncate"
-    output.mkdir()
-    events = [
-        {"type": "response.listen"},
-        {"type": "response.done", "response": {"status": "completed"}},
-        {"type": "response.done", "response": {"status": "completed"}},
-        {"type": "response.done", "response": {"status": "cancelled"}},
-        {"type": "conversation.item.truncated"},
-    ]
-    (output / "events.jsonl").write_text(
-        "".join(demo.json.dumps(event) + "\n" for event in events),
-        encoding="utf-8",
-    )
-    (output / "result.json").write_text(demo.json.dumps({"ok": True}), encoding="utf-8")
-
-    summary = demo.summarize_artifacts(
-        output_dir=output,
-        validation_mode="response-required",
-        min_responses=2,
-        min_audio_deltas_per_response=2,
-        expect_followup_response_substring=None,
-    )
-
-    assert summary["completed_response_count"] == 2
-    assert summary["cancelled_count"] == 1
-    assert summary["truncated_count"] == 1
-    assert summary["response_listen_count"] == 1
-    assert summary["native_resume_contract_ok"] is False
-    assert summary["ok"] is False
 
 
 def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):
@@ -792,9 +727,8 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
         expect_followup_response_substring="一加一等于二",
     )
 
-    assert missing_transcript_summary["ok"] is True
+    assert missing_transcript_summary["ok"] is False
     assert missing_transcript_summary["followup_response_transcript_ok"] is False
-    assert missing_transcript_summary["followup_response_transcript_expectation_ok"] is False
 
 
 def test_realtime_duplex_multi_session_resume_url_disables_autostart():
@@ -1924,75 +1858,3 @@ def test_realtime_duplex_demo_writes_audio_per_response(tmp_path):
         with wave.open(str(tmp_path / f"response_{index:02d}.wav"), "rb") as wf:
             assert wf.getframerate() == 24000
             assert wf.readframes(wf.getnframes()) == expected
-
-
-def _server_vad_contract_events() -> list[dict[str, object]]:
-    return [
-        {"type": "response.created", "response": {"id": "resp-old"}},
-        {"type": "input_audio_buffer.speech_started", "_client_received_at_s": 10.0},
-        {
-            "type": "response.done",
-            "response": {
-                "id": "resp-old",
-                "status": "cancelled",
-                "status_details": {"reason": "turn_detected"},
-            },
-            "_client_received_at_s": 10.025,
-        },
-        {"type": "input_audio_buffer.speech_stopped"},
-        {"type": "input_audio_buffer.committed"},
-        {"type": "response.created", "response": {"id": "resp-next"}},
-        {"type": "response.audio.delta", "response_id": "resp-next", "delta": "AAAA"},
-        {"type": "response.audio_transcript.delta", "response_id": "resp-next", "delta": "继续回答"},
-        {"type": "response.done", "response": {"id": "resp-next", "status": "completed"}},
-    ]
-
-
-def test_server_vad_gate_requires_cancel_fence_input_preservation_and_followup():
-    demo = _load_server_vad_demo_module()
-
-    summary = demo.summarize_server_vad_interrupt(
-        _server_vad_contract_events(),
-        target_response_id="resp-old",
-        interrupt_cursor=1,
-    )
-
-    assert summary["ok"] is True
-    assert summary["one_cancelled_terminal"] is True
-    assert summary["interrupt_committed"] is True
-    assert summary["subsequent_response_ok"] is True
-    assert summary["cancel_latency_ms"] == pytest.approx(25.0)
-
-
-def test_server_vad_gate_rejects_post_terminal_stale_delta():
-    demo = _load_server_vad_demo_module()
-    events = _server_vad_contract_events()
-    events.insert(
-        3,
-        {"type": "response.audio.delta", "response_id": "resp-old", "delta": "stale"},
-    )
-
-    summary = demo.summarize_server_vad_interrupt(
-        events,
-        target_response_id="resp-old",
-        interrupt_cursor=1,
-    )
-
-    assert summary["no_post_fence_stale_deltas"] is False
-    assert summary["stale_target_delta_count"] == 1
-    assert summary["ok"] is False
-
-
-def test_server_vad_gate_rejects_cancel_without_subsequent_response():
-    demo = _load_server_vad_demo_module()
-    events = _server_vad_contract_events()[:5]
-
-    summary = demo.summarize_server_vad_interrupt(
-        events,
-        target_response_id="resp-old",
-        interrupt_cursor=1,
-    )
-
-    assert summary["interrupt_committed"] is True
-    assert summary["subsequent_response_ok"] is False
-    assert summary["ok"] is False

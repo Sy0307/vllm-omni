@@ -16,6 +16,7 @@ from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_OUTPUT_AUDIO_FORMATS,
 )
 from vllm_omni.experimental.fullduplex.openai.vad import (
+    SILERO_VAD_MIN_THRESHOLD,
     ServerVADUnavailableError,
     SileroStreamingVAD,
     SileroVADConfig,
@@ -1078,9 +1079,9 @@ class RealtimeInputTranslator:
                 not isinstance(threshold, int | float)
                 or isinstance(threshold, bool)
                 or not np.isfinite(float(threshold))
-                or not 0.0 <= float(threshold) <= 1.0
+                or not SILERO_VAD_MIN_THRESHOLD < float(threshold) <= 1.0
             ):
-                return f"{field_path}.threshold must be between 0 and 1"
+                return f"{field_path}.threshold must be greater than {SILERO_VAD_MIN_THRESHOLD} and at most 1"
             for name in (
                 "prefix_padding_ms",
                 "silence_duration_ms",
