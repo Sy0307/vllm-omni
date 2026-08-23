@@ -706,7 +706,7 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_rejects_unimplemented_server_vad():
+async def test_native_realtime_protocol_rejects_server_vad_without_interrupt():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -729,7 +729,10 @@ async def test_native_realtime_protocol_rejects_unimplemented_server_vad():
     error = ws.sent[-1]
     assert error["type"] == "error"
     assert error["error"]["code"] == "unsupported_turn_detection"
-    assert "server_vad" in error["error"]["message"]
+    assert "interrupt_response=false" in error["error"]["message"]
+    assert "greater than 0.15" in str(
+        protocol._validate_realtime_turn_detection({"turn_detection": {"type": "server_vad", "threshold": 0.15}})
+    )
 
 
 @pytest.mark.asyncio
@@ -753,7 +756,7 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_rejects_nested_vad_even_when_top_level_is_disabled():
+async def test_native_realtime_protocol_prefers_nested_vad_over_top_level():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -773,8 +776,18 @@ async def test_native_realtime_protocol_rejects_nested_vad_even_when_top_level_i
         }
     )
 
-    assert translated is None
-    assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
+    assert translated["session"]["extra_body"]["realtime_session_payload"]["overlap_policy"] == "barge_in_on_speech"
+
+
+@pytest.mark.asyncio
+async def test_realtime_vad_candidate_waits_for_session_ack():
+    protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
+    event = {"type": "session.update", "model": "test-model", "turn_detection": {"type": "server_vad"}}
+
+    for outbound, enabled in (({"type": "error"}, False), ({"type": "session.updated", "session": {}}, True)):
+        await protocol._to_duplex_event(event)
+        protocol.encode_outbound_event(outbound)
+        assert (protocol._server_vad is not None) is enabled
 
 
 def test_native_duplex_handler_has_no_fixed_session_admission_cap():
@@ -5999,7 +6012,7 @@ async def test_minicpmo_native_duplex_rejects_ref_audio_path():
     assert engine.opened == []
 
 
-def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen():
+def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -6026,12 +6039,10 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
     )
 
     assert decision == {
-        "action": "listen",
-        "reason": "barge_in_unsupported",
+        "action": "barge_in",
+        "reason": "client_force_barge_in",
         "duration_ms": 1000,
-        "overlap_speech_ms": 1000,
         "buffer_audio": True,
-        "defer_runtime_append": True,
     }
 
 
@@ -6043,7 +6054,7 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
         {"type": "turn.signal", "event": "barge_in"},
     ],
 )
-async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
+async def test_minicpmo_native_duplex_accepts_explicit_barge_in_control(
     barge_in_event: dict[str, object],
 ):
     engine = FakeEngineClient()
@@ -6059,9 +6070,8 @@ async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
 
     await handler.handle_session(ws)
 
-    error = next(message for message in ws.sent if message.get("code") == "barge_in_unsupported")
-    assert error["session_id"] == "sid-native-barge-control-disabled"
-    assert ("sid-native-barge-control-disabled", "barge_in") not in engine.signals
+    assert not any(message.get("code") == "barge_in_unsupported" for message in ws.sent)
+    assert ("sid-native-barge-control-disabled", "barge_in") in engine.signals
 
 
 @pytest.mark.asyncio

@@ -114,6 +114,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         #   been read").
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
+        # Boundary tasks advance this before the background sender runs, so a
+        # late old-segment frame cannot restore the previous watermark.
+        self._segment_generation: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
         # Monotonic timestamp of when each request last began waiting for a
         # chunk, refreshed every time one arrives.  Read by
@@ -261,7 +264,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 before a streaming transition can mutate ``request``
         """
         is_finished = request.is_finished() and not request.resumable
+        if not hasattr(self, "_segment_generation"):
+            self._segment_generation = defaultdict(int)
         external_req_id = request.external_req_id
+        raw_generation = getattr(request, "_omni_segment_generation", 0)
+        try:
+            generation = int(raw_generation)
+        except (TypeError, ValueError):
+            generation = 0
+        expected_generation = self._segment_generation.get(external_req_id, generation)
+        if generation < expected_generation:
+            logger.warning(
+                "Skip late save_async for request %s, segment_generation=%s, expected=%s",
+                external_req_id,
+                generation,
+                expected_generation,
+            )
+            return
+        self._segment_generation[external_req_id] = generation
+
         if confirmed_num_computed_tokens is None:
             confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
         processor_request = (
@@ -273,6 +294,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
             "new_token_ids": tuple(int(token_id) for token_id in (new_token_ids or ())),
+            "segment_generation": generation,
         }
 
         reject_reason = None
@@ -676,6 +698,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
+        self._segment_generation.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 

@@ -262,15 +262,10 @@ class RealtimeOutputProjector:
                         content_index=0,
                         audio_end_ms=committed_audio_ms,
                     )
-                payloads.append(
-                    {
-                        "type": "conversation.item.truncated",
-                        "item_id": item_id,
-                        "content_index": 0,
-                        "audio_end_ms": committed_audio_ms,
-                        "event": event,
-                    }
-                )
+                # Keep server-side conversation history aligned with the
+                # acknowledged playback cursor. ``conversation.item.truncated``
+                # is reserved for an explicit client item-truncate request;
+                # cancellation itself terminates through ``response.done``.
             payloads.extend(self._realtime_audio_done_events(event, response_id))
             payloads.extend(
                 self._realtime_response_terminal_events(

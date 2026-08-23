@@ -28,7 +28,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
-    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode))
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode, max_model_len=None),
+    )
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
@@ -284,6 +286,79 @@ def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
     # Exactly the one unreported decode, so the drain reaches zero before the
     # new segment's first frame arrives.
     assert session.num_stale_output_tokens == session.num_in_flight_tokens == 1
+def test_stale_async_frame_is_dropped_before_output_processing() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.num_in_flight_tokens = 2
+    session.num_computed_tokens = session.num_tokens + 1
+    session.num_output_placeholders = 1
+    session.async_tokens_to_discard = 1
+    session.sampling_params = SimpleNamespace(num_logprobs=1)
+    num_computed_tokens = session.num_computed_tokens
+    num_output_placeholders = session.num_output_placeholders
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.structured_output_manager.should_advance.return_value = False
+
+    def discard_stale_output(request: Request, token_ids: list[int]) -> tuple[list[int], bool]:
+        request.async_tokens_to_discard = 0
+        return token_ids, False
+
+    sched._update_request_with_output.side_effect = discard_stale_output
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.chunk_transfer_adapter = MagicMock()
+    sched.running = [session]
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.multimodal_outputs = None
+    model_runner_output.inter_stage_outputs = [{"hidden": object()}]
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert session.async_tokens_to_discard == 0
+    assert session.status == RequestStatus.RUNNING
+    assert session.num_computed_tokens == num_computed_tokens
+    assert session.num_output_placeholders == num_output_placeholders
+    sched.chunk_transfer_adapter.save_async.assert_not_called()
+
+    session.sampling_params = SamplingParams(max_tokens=8)
+    next_payload = {"hidden": object()}
+    sched._update_request_with_output.side_effect = None
+    sched._update_request_with_output.return_value = ([43], False)
+    model_runner_output.sampled_token_ids = [[43]]
+    model_runner_output.inter_stage_outputs = [next_payload]
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+        next_payload,
+        session,
+        False,
+    )
 
 
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:
@@ -498,3 +573,32 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.skipped_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()
+def test_native_duplex_prompt_reset_prevents_stage1_context_overflow() -> None:
+    sched = _make_scheduler(stage_id=1)
+    sched.vllm_config.model_config.max_model_len = 4096
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=False,
+        segment_finished_requests=set(),
+    )
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.resumable = True
+    session.prompt_token_ids = [0] * 3
+    session._all_token_ids.clear()
+    session._all_token_ids.extend([0] * 4095)
+    session._output_token_ids.extend([1] * 4080)
+    session.num_prompt_tokens = 3
+    session.num_computed_tokens = 4095
+
+    update = _make_update([0] * 16)
+    update.model_intermediate_buffer = {"native_duplex": True}
+
+    sched._update_request_as_session(session, update)
+
+    assert session.prompt_token_ids == [0] * 16
+    assert list(session._all_token_ids) == [0] * 16
+    assert session._output_token_ids == []
+    assert session.num_prompt_tokens == 16
+    assert session.num_computed_tokens == 0
+    assert session.model_intermediate_buffer == update.model_intermediate_buffer
+    assert session.status == RequestStatus.WAITING
