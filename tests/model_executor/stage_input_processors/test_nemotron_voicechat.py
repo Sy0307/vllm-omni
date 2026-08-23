@@ -415,7 +415,7 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
     assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
     assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
-    assert float(embeds[0, 0]) == 0.0  # not finished
+    assert float(embeds[0, 0]) == 1.0  # current scheduler segment is drained
 
     # Coalesced chunk: TWO new frame tokens arrive in ONE wake (delayed save
     # thread merged two thinker steps). Both must be consumed by this wake.
@@ -423,14 +423,14 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update["codes"]["audio"].shape == (prompt_len + 1, 31)
-    assert float(embeds[0, 0]) == 0.0
+    assert float(embeds[0, 0]) == 1.0
 
-    # Zero-progress wake (no new positions, not finished): plain CONTINUE, no
-    # fabricated frames, no codes update.
+    # Zero-progress wake: never fabricate frames. The stop flag parks this
+    # resumable scheduler request until another connector chunk arrives.
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update == {}
-    assert float(embeds[0, 0]) == 0.0
+    assert float(embeds[0, 0]) == 1.0
 
     # Final chunk: one more token + finished marker -> drain + stop flag.
     info3 = _async_info([pad] * prompt_len + [7, 8, 9], prompt_len, finished=True)

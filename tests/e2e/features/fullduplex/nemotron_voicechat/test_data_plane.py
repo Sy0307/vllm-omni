@@ -31,11 +31,14 @@ def _projector(encode_audio=lambda *_: None) -> NemotronVoiceChatDataPlaneSessio
     return projector
 
 
-def _stage0_output(token_id: int) -> object:
-    completion = SimpleNamespace(multimodal_output={"nvc_text_token_ids": [token_id]})
+def _stage0_output(request_id: str = "req-0", *, text_token: int = 12, function_token: int | None = None) -> object:
+    metadata: dict[str, object] = {"nvc_text_token_ids": [text_token]}
+    if function_token is not None:
+        metadata["nvc_function_token"] = [function_token]
+    completion = SimpleNamespace(multimodal_output=metadata)
     return SimpleNamespace(
         stage_id=0,
-        request_output=SimpleNamespace(request_id="req-0", outputs=[completion]),
+        request_output=SimpleNamespace(request_id=request_id, outputs=[completion]),
     )
 
 
@@ -48,14 +51,7 @@ def test_function_channel_projects_completed_call_without_ending_speech() -> Non
 
     events = []
     for function_token in (20, 99, 21):
-        completion = SimpleNamespace(
-            multimodal_output={"nvc_text_token_ids": [12], "nvc_function_token": [function_token]}
-        )
-        output = SimpleNamespace(
-            stage_id=0,
-            request_output=SimpleNamespace(request_id="req-fc", outputs=[completion]),
-        )
-        events.extend(projector.project_output(output, context=context))
+        events.extend(projector.project_output(_stage0_output(function_token=function_token), context=context))
 
     listen = [event for event in events if event.get("is_listen") is True]
     function = [event for event in events if event.get("function_call") is True]
@@ -67,7 +63,7 @@ def test_function_channel_projects_completed_call_without_ending_speech() -> Non
     projector._decode = lambda _token_ids: "not-json"
     bad_events = []
     for function_token in (20, 98, 21):
-        bad_events.extend(projector.project_output(_stage0_output(function_token)))
+        bad_events.extend(projector.project_output(_stage0_output(function_token=function_token)))
     assert any(event.get("error_code") == "nemotron_function_call_parse_error" for event in bad_events)
 
 
@@ -76,22 +72,12 @@ def test_new_epoch_request_does_not_inherit_partial_function_or_frame_state() ->
     old_request = duplex_resource_request_id(DuplexFence("sid", epoch=1), "stage0")
     new_request = duplex_resource_request_id(DuplexFence("sid", epoch=2), "stage0")
 
-    def stage0(request_id: str, *, text_token: int, function_token: int | None = None) -> object:
-        metadata: dict[str, object] = {"nvc_text_token_ids": [text_token]}
-        if function_token is not None:
-            metadata["nvc_function_token"] = [function_token]
-        completion = SimpleNamespace(multimodal_output=metadata)
-        return SimpleNamespace(
-            stage_id=0,
-            request_output=SimpleNamespace(request_id=request_id, outputs=[completion]),
-        )
-
     projector.begin_request(old_request)
-    list(projector.project_output(stage0(old_request, text_token=42, function_token=20)))
+    list(projector.project_output(_stage0_output(old_request, text_token=42, function_token=20)))
     projector.begin_request(new_request)
 
     # EOTC in the new epoch must not close the old epoch's partial function.
-    new_events = list(projector.project_output(stage0(new_request, text_token=1, function_token=21)))
+    new_events = list(projector.project_output(_stage0_output(new_request, text_token=1, function_token=21)))
     assert not [event for event in new_events if event.get("function_call") is True]
     assert not [event for event in new_events if event.get("end_of_turn") is True]
 

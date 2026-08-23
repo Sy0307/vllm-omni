@@ -2112,6 +2112,7 @@ def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter)
     external_req_id = "ext-native-abort"
     first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
     first.resumable = True
+    first.model_intermediate_buffer = None
     first.additional_information = {"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1}
     first_frame = torch.full((1, 31), 101, dtype=torch.long)
 
@@ -2136,6 +2137,7 @@ def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter)
 
     replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
     replacement.resumable = True
+    replacement.model_intermediate_buffer = None
     replacement.additional_information = first.additional_information
     adapter.load_async(replacement)
     replacement_payload = talker2code2wav_async_chunk(

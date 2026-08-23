@@ -62,8 +62,12 @@ def test_append_rejects_invalid_frame_contract() -> None:
 
 def test_terminal_commit_rejects_more_than_one_frame_tail() -> None:
     buffer = NemotronVoiceChatPcmAppendBuffer()
-    buffer.prepare_append(
-        _payload(np.zeros(1281, dtype=np.float32)), operation_id="tail", chunk_period_ms=80, allow_emit=False
-    )
+    for index, samples in enumerate((1000, 281)):
+        buffer.prepare_append(
+            _payload(np.zeros(samples, dtype=np.float32)),
+            operation_id=f"tail-{index}",
+            chunk_period_ms=80,
+            allow_emit=False,
+        )
     with pytest.raises(ValueError, match="more than one 80 ms frame"):
         buffer.prepare_commit(operation_id="commit", chunk_period_ms=80)

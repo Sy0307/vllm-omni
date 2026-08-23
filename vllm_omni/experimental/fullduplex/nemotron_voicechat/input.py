@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-import base64
 import binascii
 
 import numpy as np
+import pybase64 as base64
 
 NEMOTRON_VOICECHAT_SAMPLE_RATE = 16000
 NEMOTRON_VOICECHAT_FRAME_SAMPLES = 1280
