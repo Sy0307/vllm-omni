@@ -898,8 +898,8 @@ async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_fac
         duplex_identity=SimpleNamespace(),
     )
 
-    async def no_cleanup(*args, **kwargs):
-        del args, kwargs
+    async def no_cleanup(*_args: object, **_kwargs: object) -> None:
+        return None
 
     monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
     try:
