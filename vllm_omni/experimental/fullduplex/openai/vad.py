@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+SILERO_VAD_MIN_THRESHOLD = 0.15
+
 
 class ServerVADUnavailableError(RuntimeError):
     """Raised when the optional server VAD runtime is not installed."""
@@ -75,7 +77,7 @@ class SileroStreamingVAD:
 
     _SAMPLE_RATE_HZ = 16_000
     _WINDOW_SAMPLES = 512
-    _NEGATIVE_THRESHOLD_GAP = 0.15
+    _NEGATIVE_THRESHOLD_GAP = SILERO_VAD_MIN_THRESHOLD
 
     def __init__(
         self,

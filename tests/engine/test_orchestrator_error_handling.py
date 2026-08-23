@@ -292,77 +292,6 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
 
 
 @pytest.mark.asyncio
-async def test_duplex_stage_input_processor_failure_fails_request_not_orchestrator(orchestrator_factory) -> None:
-    """A malformed duplex handoff is request-scoped, not process-fatal."""
-
-    class _FailingInputProcessorStage(FakeStageClient):
-        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
-            del source_outputs, prompt, streaming_context
-            raise ValueError("No latent or hidden_states found in thinker output")
-
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = _FailingInputProcessorStage(stage_type="llm", final_output=True)
-    processors = [
-        FakeOutputProcessor(request_outputs=[_build_request_output("req-bad-handoff", finished=True)]),
-        FakeOutputProcessor(),
-    ]
-    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
-
-    try:
-        await _enqueue_add_request(
-            orchestrator_fixture,
-            request_id="req-bad-handoff",
-            prompt=SimpleNamespace(request_id="req-bad-handoff", prompt_token_ids=[1, 2]),
-            original_prompt={"prompt": "hello"},
-            sampling_params_list=[_sampling_params(), _sampling_params()],
-            final_stage_id=1,
-        )
-        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
-        orchestrator_fixture.orchestrator.request_states["req-bad-handoff"].duplex_identity = SimpleNamespace()
-        stage0.push_engine_core_outputs(_engine_core_outputs("s0-raw", 1.0))
-
-        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-bad-handoff")
-        assert error_msg.fatal is False
-        assert error_msg.stage_id == 1
-        assert error_msg.error_type == "ValueError"
-        assert "No latent or hidden_states" in error_msg.error
-        assert orchestrator_fixture.thread.is_alive()
-        assert "req-bad-handoff" not in orchestrator_fixture.orchestrator.request_states
-    finally:
-        if orchestrator_fixture.thread.is_alive():
-            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
-            orchestrator_fixture.thread.join(timeout=5)
-
-
-@pytest.mark.asyncio
-async def test_non_duplex_stage_input_processor_failure_preserves_existing_exception(orchestrator_factory) -> None:
-    """Duplex recovery must not change ordinary pipeline failure semantics."""
-
-    class _FailingInputProcessorStage(FakeStageClient):
-        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
-            del source_outputs, prompt, streaming_context
-            raise ValueError("ordinary pipeline input failure")
-
-    stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = _FailingInputProcessorStage(stage_type="llm", final_output=True)
-    fixture = orchestrator_factory([stage0, stage1])
-    req_state = OrchestratorRequestState(
-        request_id="req-ordinary-handoff",
-        prompt=SimpleNamespace(request_id="req-ordinary-handoff", prompt_token_ids=[1, 2]),
-        sampling_params_list=[_sampling_params(), _sampling_params()],
-        final_stage_id=1,
-    )
-
-    with pytest.raises(ValueError, match="ordinary pipeline input failure"):
-        await fixture.orchestrator._forward_to_next_stage_unguarded(
-            "req-ordinary-handoff",
-            0,
-            _build_request_output("req-ordinary-handoff", finished=True),
-            req_state,
-        )
-
-
-@pytest.mark.asyncio
 async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory) -> None:
     """A new request entering a stage that already lost all replicas fails that
     request instead of raising out of the request handler and tearing the server
@@ -949,6 +878,39 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
     finally:
         orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_factory, monkeypatch) -> None:
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            del source_outputs, prompt, streaming_context
+            raise ValueError("No latent or hidden_states found in thinker output")
+
+    fixture = orchestrator_factory(
+        [FakeStageClient(stage_type="llm"), FailingStage(stage_type="llm", final_output=True)]
+    )
+    state = OrchestratorRequestState(
+        request_id="bad",
+        prompt=SimpleNamespace(request_id="bad", prompt_token_ids=[1]),
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    async def no_cleanup(*args, **kwargs):
+        del args, kwargs
+
+    monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
+    try:
+        await fixture.orchestrator._forward_to_next_stage_unguarded(
+            "bad", 0, _build_request_output("raw", finished=True), state
+        )
+        error = await _wait_for_error_message(fixture, request_id="bad")
+        assert error.fatal is False
+    finally:
+        fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        fixture.thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

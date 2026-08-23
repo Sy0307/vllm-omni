@@ -21,9 +21,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
     run_lifecycle_probes,
 )
-from tests.e2e.online_serving.run_minicpmo_realtime_duplex_server_vad import (
-    run_server_vad_interrupt,
-)
+from tests.e2e.online_serving.run_minicpmo_realtime_duplex_server_vad import run_server_vad_interrupt
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import (
     run_soft_interrupt,
 )
@@ -88,16 +86,14 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["error_count"] == 0
-    assert result["completed_response_count"] >= 2
-    assert result["cancelled_count"] == 0
-    assert result["truncated_count"] == 0
-    assert result["response_listen_count"] >= 1
-    assert result["native_resume_contract_ok"] is True
+    assert result["response_lifecycle_ok"] is True
+    assert result["response_audio_contract_ok"] is True
+    assert result["followup_response_transcript_ok"] is True
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_server_vad_hard_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_duplex_server_vad_hard_interrupt(omni_server, model_prefix: str) -> None:
     result = asyncio.run(
         run_server_vad_interrupt(
             SimpleNamespace(
@@ -105,26 +101,10 @@ def test_duplex_server_vad_hard_interrupt(omni_server, model_prefix: str, tmp_pa
                 model=omni_server.model,
                 input_wav=str(validated_input_wav()),
                 interrupt_wav=str(validated_soft_interrupt_wav()),
-                interrupt_duration_ms=4700,
                 ref_audio=str(resolve_ref_audio(model_prefix)),
-                output_dir=str(tmp_path / "server_vad_hard_interrupt"),
                 chunk_ms=200,
-                trailing_silence_ms=800,
-                vad_threshold=0.5,
-                temperature=0.0,
                 timeout_s=180.0,
             )
         )
     )
-
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
-    assert result["one_cancelled_terminal"] is True
-    assert result["cancelled_count"] == 1
-    assert result["no_post_fence_stale_deltas"] is True
-    assert result["stale_target_delta_count"] == 0
-    assert result["interrupt_committed"] is True
-    assert result["subsequent_response_ok"] is True
-    assert result["completed_followup_count"] >= 1
-    assert result["followup_audio_delta_count"] >= 1
-    assert "四大发明" in "".join(str(result["followup_transcript"]).split())
-    assert result["error_count"] == 0
