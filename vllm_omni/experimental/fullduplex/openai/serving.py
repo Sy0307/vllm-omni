@@ -970,10 +970,7 @@ class OmniDuplexSessionHandler(
                 await send_json(
                     {
                         "type": "error",
-                        "error": (
-                            "server_vad with interrupt_response=true requires a runtime "
-                            "that supports barge-in"
-                        ),
+                        "error": ("server_vad with interrupt_response=true requires a runtime that supports barge-in"),
                         "code": "unsupported_turn_detection",
                     }
                 )
