@@ -707,6 +707,25 @@ def test_save_async_drops_late_previous_segment_after_boundary_reset(build_adapt
     assert adapter._pending_save_reqs[-1]["request"] is next_segment
 
 
+def test_send_single_request_drops_queued_old_segment_after_boundary(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(meta=MetaStruct())
+    request = _req("req-queued-old", RequestStatus.WAITING, external_req_id="ext-queued-old")
+    request.resumable = True
+    request._omni_segment_generation = 0
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=False)
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+
+    old_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(old_task)
+    connector.put.assert_not_called()
+
+    boundary_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(boundary_task)
+    connector.put.assert_called_once()
+
+
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")
