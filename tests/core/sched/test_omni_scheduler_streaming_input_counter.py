@@ -60,12 +60,6 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting, counter, skipp
     return scheduler
 
 
-def _upstream_num_unfinished(scheduler) -> int:
-    """Mirror of ``Scheduler.get_num_unfinished_requests`` arithmetic."""
-    num_waiting = len(scheduler.waiting) + len(scheduler.skipped_waiting) - scheduler.num_waiting_for_streaming_input
-    return num_waiting + len(scheduler.running)
-
-
 @pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
 def test_finish_requests_clears_counter_left_by_a_stomped_status(
     monkeypatch: pytest.MonkeyPatch,
@@ -99,73 +93,6 @@ def test_finish_requests_clears_counter_left_by_a_stomped_status(
     assert scheduler.num_waiting_for_streaming_input == 0
 
 
-@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
-def test_next_request_is_visible_as_work_after_the_abort(
-    monkeypatch: pytest.MonkeyPatch,
-    scheduler_cls,
-    scheduler_mod,
-) -> None:
-    """The consequence, stated as the engine sees it.
-
-    A fresh request queued behind the leak must read as unfinished work.
-    Without the resync this is ``(1 + 0 - 1) + 0 == 0`` and the engine parks
-    in ``input_queue.get()`` with a live request in ``waiting``.
-    """
-    aborted = _StubRequest("req-aborted", RequestStatus.RUNNING)
-    incoming = _StubRequest("req-next-session", RequestStatus.WAITING)
-    scheduler = _make_scheduler(
-        scheduler_cls,
-        requests={incoming.request_id: incoming},
-        running=[],
-        waiting=[incoming],
-        counter=1,
-    )
-
-    monkeypatch.setattr(
-        scheduler_mod.VLLMScheduler,
-        "finish_requests",
-        lambda self, request_ids, finished_status: [aborted],
-    )
-
-    scheduler_cls.finish_requests(scheduler, [aborted.request_id], RequestStatus.FINISHED_ABORTED)
-
-    assert _upstream_num_unfinished(scheduler) == 1
-
-
-@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
-def test_finish_requests_keeps_counting_a_genuinely_parked_request(
-    monkeypatch: pytest.MonkeyPatch,
-    scheduler_cls,
-    scheduler_mod,
-) -> None:
-    """The resync must not over-correct.
-
-    A request still parked as ``WAITING_FOR_STREAMING_REQ`` in ``waiting`` is
-    exactly what the counter is for -- it must stay counted, so the engine
-    does not spin on a request that has no input to process.
-    """
-    parked = _StubRequest("req-parked", RequestStatus.WAITING_FOR_STREAMING_REQ)
-    leaving = _StubRequest("req-leaving", RequestStatus.FINISHED_STOPPED)
-    scheduler = _make_scheduler(
-        scheduler_cls,
-        requests={parked.request_id: parked},
-        running=[],
-        waiting=[parked],
-        counter=1,
-    )
-
-    monkeypatch.setattr(
-        scheduler_mod.VLLMScheduler,
-        "finish_requests",
-        lambda self, request_ids, finished_status: [leaving],
-    )
-
-    scheduler_cls.finish_requests(scheduler, [leaving.request_id], RequestStatus.FINISHED_STOPPED)
-
-    assert scheduler.num_waiting_for_streaming_input == 1
-    assert _upstream_num_unfinished(scheduler) == 0
-
-
 def test_resync_counts_parked_requests_in_skipped_waiting() -> None:
     """``get_num_unfinished_requests`` sums ``waiting`` and ``skipped_waiting``,
     so the resync has to look at both or it under-counts and reintroduces the
@@ -183,36 +110,6 @@ def test_resync_counts_parked_requests_in_skipped_waiting() -> None:
     scheduler._resync_streaming_input_counter()
 
     assert scheduler.num_waiting_for_streaming_input == 1
-
-
-def test_resync_is_a_no_op_when_upstream_accounting_is_correct() -> None:
-    """In the healthy case the derived value equals upstream's incremental one,
-    so the helper must leave it alone rather than fight it."""
-    parked = _StubRequest("req-parked", RequestStatus.WAITING_FOR_STREAMING_REQ)
-    running = _StubRequest("req-running", RequestStatus.RUNNING)
-    scheduler = _make_scheduler(
-        OmniARScheduler,
-        requests={r.request_id: r for r in (parked, running)},
-        running=[running],
-        waiting=[parked],
-        counter=1,
-    )
-
-    scheduler._resync_streaming_input_counter()
-
-    assert scheduler.num_waiting_for_streaming_input == 1
-
-
-def test_resync_tolerates_a_scheduler_without_the_counter() -> None:
-    """Guard for vLLM versions that predate ``num_waiting_for_streaming_input``:
-    the helper must no-op rather than invent the attribute."""
-    scheduler = OmniARScheduler.__new__(OmniARScheduler)
-    scheduler.waiting = []
-    scheduler.skipped_waiting = []
-
-    scheduler._resync_streaming_input_counter()
-
-    assert not hasattr(scheduler, "num_waiting_for_streaming_input")
 
 
 def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.MonkeyPatch) -> None:

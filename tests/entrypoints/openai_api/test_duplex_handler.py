@@ -706,7 +706,7 @@ async def test_native_realtime_protocol_preserves_input_turn_policy_hints():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_rejects_server_vad_without_interrupt():
+async def test_native_realtime_protocol_rejects_unimplemented_server_vad():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -729,10 +729,7 @@ async def test_native_realtime_protocol_rejects_server_vad_without_interrupt():
     error = ws.sent[-1]
     assert error["type"] == "error"
     assert error["error"]["code"] == "unsupported_turn_detection"
-    assert "interrupt_response=false" in error["error"]["message"]
-    assert "greater than 0.15" in str(
-        protocol._validate_realtime_turn_detection({"turn_detection": {"type": "server_vad", "threshold": 0.15}})
-    )
+    assert "server_vad" in error["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -756,7 +753,7 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
 
 
 @pytest.mark.asyncio
-async def test_native_realtime_protocol_prefers_nested_vad_over_top_level():
+async def test_native_realtime_protocol_rejects_nested_vad_even_when_top_level_is_disabled():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     protocol.bind_sender(ws.send_json)
@@ -776,18 +773,8 @@ async def test_native_realtime_protocol_prefers_nested_vad_over_top_level():
         }
     )
 
-    assert translated["session"]["extra_body"]["realtime_session_payload"]["overlap_policy"] == "barge_in_on_speech"
-
-
-@pytest.mark.asyncio
-async def test_realtime_vad_candidate_waits_for_session_ack():
-    protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
-    event = {"type": "session.update", "model": "test-model", "turn_detection": {"type": "server_vad"}}
-
-    for outbound, enabled in (({"type": "error"}, False), ({"type": "session.updated", "session": {}}, True)):
-        await protocol._to_duplex_event(event)
-        protocol.encode_outbound_event(outbound)
-        assert (protocol._server_vad is not None) is enabled
+    assert translated is None
+    assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
 
 
 def test_native_duplex_handler_has_no_fixed_session_admission_cap():
@@ -5759,33 +5746,6 @@ async def test_minicpmo_native_duplex_open_unsupported_fails_session_create():
     assert ws.sent_types() == ["error"]
     assert ws.sent[0]["code"] == "runtime_open_unsupported"
     assert ws.sent[0]["runtime_control"]["unsupported_count"] == 1
-
-
-@pytest.mark.asyncio
-async def test_native_runtime_rejects_server_vad_without_barge_in(monkeypatch: pytest.MonkeyPatch):
-    engine = FakeEngineClient()
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(engine),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
-    capabilities = DuplexCapabilities.minicpmo45_native()
-    capabilities.supports_barge_in = False
-    monkeypatch.setattr(
-        handler._serving_runtime_adapter,
-        "capabilities",
-        lambda *, max_sessions: capabilities,
-    )
-    event = _native_session_create("sid-native-no-barge-in")
-    event["session"]["overlap_policy"] = "barge_in_on_speech"
-    ws = TimedWebSocket()
-    ws.put(event)
-
-    await handler.handle_session(ws)
-
-    assert ws.sent_types() == ["error"]
-    assert ws.sent[0]["code"] == "unsupported_turn_detection"
-    assert engine.opened == []
 
 
 @pytest.mark.asyncio

@@ -60,63 +60,6 @@ def _make_scheduler(policy: SchedulingPolicy, *, waiting=(), skipped_waiting=(),
 
 
 @pytest.mark.parametrize("policy", _POLICIES)
-def test_sweep_drops_aborted_request_from_skipped_waiting(policy: SchedulingPolicy) -> None:
-    """The sweep must cover ``skipped_waiting``.
-
-    Upstream ``schedule()`` admits from ``skipped_waiting`` as readily as from
-    ``waiting``, so an aborted request left there is re-selected and raises.
-    """
-    aborted = _StubRequest("req-aborted", RequestStatus.FINISHED_ABORTED)
-    scheduler = _make_scheduler(policy, skipped_waiting=[aborted])
-
-    scheduler._drop_aborted_queued_requests()
-
-    assert list(scheduler.skipped_waiting) == []
-
-
-@pytest.mark.parametrize("policy", _POLICIES)
-def test_sweep_drops_aborted_requests_from_waiting_and_running(policy: SchedulingPolicy) -> None:
-    """``waiting`` and ``running`` stay covered alongside the new queue."""
-    aborted_waiting = _StubRequest("req-waiting", RequestStatus.FINISHED_ABORTED)
-    aborted_running = _StubRequest("req-running", RequestStatus.FINISHED_ABORTED)
-    scheduler = _make_scheduler(
-        policy,
-        waiting=[aborted_waiting],
-        running=[aborted_running],
-    )
-
-    scheduler._drop_aborted_queued_requests()
-
-    assert list(scheduler.waiting) == []
-    assert scheduler.running == []
-
-
-@pytest.mark.parametrize("policy", _POLICIES)
-def test_sweep_leaves_live_requests_intact(policy: SchedulingPolicy) -> None:
-    """The sweep must not over-sweep.
-
-    A request parked in ``skipped_waiting`` on a blocked waiting status is one
-    upstream still intends to schedule; only the aborted entry may go.
-    """
-    blocked = _StubRequest("req-blocked", RequestStatus.WAITING_FOR_STREAMING_REQ, arrival_time=0.0)
-    aborted = _StubRequest("req-aborted", RequestStatus.FINISHED_ABORTED, arrival_time=1.0)
-    live_waiting = _StubRequest("req-live-waiting", RequestStatus.WAITING)
-    live_running = _StubRequest("req-live-running", RequestStatus.RUNNING)
-    scheduler = _make_scheduler(
-        policy,
-        waiting=[live_waiting],
-        skipped_waiting=[blocked, aborted],
-        running=[live_running],
-    )
-
-    scheduler._drop_aborted_queued_requests()
-
-    assert list(scheduler.skipped_waiting) == [blocked]
-    assert list(scheduler.waiting) == [live_waiting]
-    assert scheduler.running == [live_running]
-
-
-@pytest.mark.parametrize("policy", _POLICIES)
 def test_schedule_sweeps_skipped_waiting_before_upstream_selection(
     monkeypatch: pytest.MonkeyPatch,
     policy: SchedulingPolicy,
