@@ -5762,6 +5762,33 @@ async def test_minicpmo_native_duplex_open_unsupported_fails_session_create():
 
 
 @pytest.mark.asyncio
+async def test_native_runtime_rejects_server_vad_without_barge_in(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    capabilities = DuplexCapabilities.minicpmo45_native()
+    capabilities.supports_barge_in = False
+    monkeypatch.setattr(
+        handler._serving_runtime_adapter,
+        "capabilities",
+        lambda *, max_sessions: capabilities,
+    )
+    event = _native_session_create("sid-native-no-barge-in")
+    event["session"]["overlap_policy"] = "barge_in_on_speech"
+    ws = TimedWebSocket()
+    ws.put(event)
+
+    await handler.handle_session(ws)
+
+    assert ws.sent_types() == ["error"]
+    assert ws.sent[0]["code"] == "unsupported_turn_detection"
+    assert engine.opened == []
+
+
+@pytest.mark.asyncio
 async def test_minicpmo_native_duplex_rejects_engine_without_fence_contract():
     class LegacyEngineClient(FakeEngineClient):
         async def open_duplex_session_async(  # type: ignore[override]

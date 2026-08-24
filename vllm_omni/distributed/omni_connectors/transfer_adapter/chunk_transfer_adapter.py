@@ -498,21 +498,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
-        task_generation = task.get("segment_generation")
-        expected_generation = self._segment_generation.get(external_req_id, task_generation)
-        if (
-            isinstance(task_generation, int)
-            and isinstance(expected_generation, int)
-            and task_generation < expected_generation
-            and not is_segment_finished
-        ):
-            logger.warning(
-                "Skip queued late chunk for request %s, segment_generation=%s, expected=%s",
-                external_req_id,
-                task_generation,
-                expected_generation,
-            )
-            return
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread

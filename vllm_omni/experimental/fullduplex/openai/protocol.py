@@ -9,6 +9,7 @@ from uuid import uuid4
 
 
 class DuplexOverlapPolicy(str, Enum):
+    AUTO = "auto"
     LISTEN_ONLY = "listen_only"
     BARGE_IN_ON_SPEECH = "barge_in_on_speech"
 

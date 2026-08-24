@@ -961,6 +961,23 @@ class OmniDuplexSessionHandler(
                     max_sessions=self._duplex_session_config.max_sessions,
                 )
             )
+            if (
+                config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+                and not session.capabilities.supports_barge_in
+            ):
+                if realtime_protocol is not None:
+                    realtime_protocol.reject_realtime_turn_detection_update()
+                await send_json(
+                    {
+                        "type": "error",
+                        "error": (
+                            "server_vad with interrupt_response=true requires a runtime "
+                            "that supports barge-in"
+                        ),
+                        "code": "unsupported_turn_detection",
+                    }
+                )
+                return None
             session.replace_runtime_config(runtime_config)
         return _DuplexSessionHandshake(session=session)
 

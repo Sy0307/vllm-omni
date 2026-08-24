@@ -707,7 +707,7 @@ def test_save_async_drops_late_previous_segment_after_boundary_reset(build_adapt
     assert adapter._pending_save_reqs[-1]["request"] is next_segment
 
 
-def test_send_single_request_drops_queued_old_segment_after_boundary(build_adapter):
+def test_send_single_request_preserves_queued_preboundary_chunk(build_adapter):
     adapter, connector = build_adapter(stage_id=1)
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(meta=MetaStruct())
     request = _req("req-queued-old", RequestStatus.WAITING, external_req_id="ext-queued-old")
@@ -719,11 +719,11 @@ def test_send_single_request_drops_queued_old_segment_after_boundary(build_adapt
 
     old_task = adapter._pending_save_reqs.popleft()
     adapter._send_single_request(old_task)
-    connector.put.assert_not_called()
+    connector.put.assert_called_once()
 
     boundary_task = adapter._pending_save_reqs.popleft()
     adapter._send_single_request(boundary_task)
-    connector.put.assert_called_once()
+    assert connector.put.call_count == 2
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
