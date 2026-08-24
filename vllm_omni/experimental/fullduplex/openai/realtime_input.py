@@ -1103,7 +1103,7 @@ class RealtimeInputTranslator:
                 return f"{field_path}.interrupt_response must be a boolean"
             if interrupt_response is not True:
                 return (
-                    f"{field_path}.interrupt_response=false is unsupported; "
+                    f"{field_path}=server_vad with interrupt_response=false is unsupported; "
                     "use turn_detection=null for model-owned listen/speak"
                 )
 
