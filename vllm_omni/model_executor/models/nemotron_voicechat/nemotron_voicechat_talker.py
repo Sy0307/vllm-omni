@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-1 talker for NemotronVoiceChat: frame-locked text -> 31-quantizer codes.
 
 ``LLM_AR`` stage driven per frame by the vLLM engine, with the vendored NeMo
@@ -374,10 +374,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         session["code"] = code
         session["past_key_values"] = past_key_values
         session["step"] = t + 1
-        # Exhausting the currently received timeline ends this scheduler
-        # segment. A resumable async-chunk request is then parked with its
-        # model-side TTS state intact until the next thinker frame arrives.
-        finished = (t + 1) >= int(session["timeline"].numel())
+        # Native codec streaming uses one resumable scheduler segment per
+        # received timeline suffix. The pre-existing offline async-chunk path,
+        # however, must stay alive until the thinker sends its terminal marker;
+        # stopping at an intermediate cumulative snapshot starves Stage 2.
+        finished = (t + 1) >= int(session["timeline"].numel()) and (
+            bool(session["codec_streaming"]) or bool(session["upstream_finished"])
+        )
         return code.reshape(1, -1).to(torch.long), finished
 
     def preprocess(
@@ -429,9 +432,11 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         if steps_run == 0:
             # Zero-progress wake (duplicate/terminal-marker chunk): no TTS step
             # was run, so never fabricate a frame. Stop the current scheduler
-            # segment when its timeline is already consumed; a resumable
-            # request will wake again when the connector provides more input.
-            finished = int(session["step"]) >= int(session["timeline"].numel())
+            # segment only for native codec streaming, or once the ordinary
+            # offline async producer has sent its terminal marker.
+            finished = int(session["step"]) >= int(session["timeline"].numel()) and (
+                bool(session["codec_streaming"]) or bool(session["upstream_finished"])
+            )
             if finished:
                 embeds[:, 0] = 1.0
             return input_ids, embeds, {}

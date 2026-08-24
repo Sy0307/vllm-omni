@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Realtime serving adapter for Nemotron VoiceChat native duplex."""
 
@@ -49,6 +49,7 @@ _PRIVATE_KEYS = frozenset(
         "nvc_function_response_generation",
         "nvc_function_response_token_ids",
         "nvc_function_response_call_id",
+        "nvc_function_response_batches",
     }
 )
 
@@ -301,9 +302,16 @@ class NemotronVoiceChatServingRuntimeAdapter:
                 code="invalid_function_call_output",
             )
         runtime = deepcopy(dict(current))
-        runtime["nvc_function_response_generation"] = int(runtime.get("nvc_function_response_generation", 0)) + 1
-        runtime["nvc_function_response_token_ids"] = [int(token_id) for token_id in response_token_ids]
+        generation = int(runtime.get("nvc_function_response_generation", 0)) + 1
+        token_ids = [int(token_id) for token_id in response_token_ids]
+        batches = runtime.get("nvc_function_response_batches")
+        if not isinstance(batches, list):
+            batches = []
+        batches = [*batches, {"generation": generation, "call_id": call_id, "token_ids": token_ids}]
+        runtime["nvc_function_response_generation"] = generation
+        runtime["nvc_function_response_token_ids"] = token_ids
         runtime["nvc_function_response_call_id"] = call_id
+        runtime["nvc_function_response_batches"] = batches
         return runtime
 
     @staticmethod

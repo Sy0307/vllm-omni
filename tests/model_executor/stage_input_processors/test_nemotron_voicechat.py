@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -327,11 +327,6 @@ def test_talker2code2wav_duplex_keeps_cumulative_history_across_wakes() -> None:
     assert tm.request_payload["req-0"]["nvc_frames_seen"] == 2
 
 
-# =========================
-# Talker drain-per-wake (async scheduling review P1/P2)
-# =========================
-
-
 class _FakeTTSModelOutput:
     past_key_values = None
 
@@ -384,7 +379,14 @@ def _bare_talker():
     return talker
 
 
-def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id: str = "req-0") -> dict:
+def _async_info(
+    timeline: list[int],
+    prompt_len: int,
+    finished: bool,
+    request_id: str = "req-0",
+    *,
+    codec_streaming: bool = False,
+) -> dict:
     return {
         "request_id": request_id,
         "additional_information": {
@@ -393,6 +395,7 @@ def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id
                 "num_processed_tokens": prompt_len,
                 "finished": torch.tensor(finished),
                 "request_id": request_id,
+                "codec_streaming": codec_streaming,
             },
         },
     }
@@ -415,7 +418,7 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
     assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
     assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
-    assert float(embeds[0, 0]) == 1.0  # current scheduler segment is drained
+    assert float(embeds[0, 0]) == 0.0  # offline stream waits for upstream terminal
 
     # Coalesced chunk: TWO new frame tokens arrive in ONE wake (delayed save
     # thread merged two thinker steps). Both must be consumed by this wake.
@@ -423,21 +426,32 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update["codes"]["audio"].shape == (prompt_len + 1, 31)
-    assert float(embeds[0, 0]) == 1.0
+    assert float(embeds[0, 0]) == 0.0
 
-    # Zero-progress wake: never fabricate frames. The stop flag parks this
-    # resumable scheduler request until another connector chunk arrives.
+    # Zero-progress wake: never fabricate frames or end the offline stream
+    # before the thinker sends its terminal marker.
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update == {}
-    assert float(embeds[0, 0]) == 1.0
+    assert float(embeds[0, 0]) == 0.0
 
-    # Final chunk: one more token + finished marker -> drain + stop flag.
     info3 = _async_info([pad] * prompt_len + [7, 8, 9], prompt_len, finished=True)
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info3)
     assert session["step"] == prompt_len + 3
     assert update["codes"]["audio"].shape == (prompt_len + 2, 31)
     assert float(embeds[0, 0]) == 1.0  # stop
+
+
+def test_talker_native_codec_stream_ends_each_received_segment() -> None:
+    talker = _bare_talker()
+    ids = torch.zeros(1, dtype=torch.long)
+    info = _async_info([12, 12, 7], 2, finished=False, codec_streaming=True)
+    talker.preprocess(ids, None, _omni_is_prefill=True, **info)
+
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+
+    assert update["codes"]["audio"].shape == (2, 31)
+    assert float(embeds[0, 0]) == 1.0
 
 
 def test_talker_sync_mode_steps_once_per_wake() -> None:

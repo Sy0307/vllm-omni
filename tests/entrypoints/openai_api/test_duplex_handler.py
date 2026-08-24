@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -543,6 +546,54 @@ async def test_native_realtime_protocol_conversation_item_create_commits_user_te
             }
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_function_output_is_recorded_only_after_runtime_delivery():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+    protocol.encode_outbound_event(
+        {
+            "type": "conversation.item.created",
+            "item": {
+                "id": "item-call",
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "weather",
+                "arguments": "{}",
+                "status": "completed",
+            },
+        }
+    )
+    event = {
+        "type": "conversation.item.create",
+        "item": {
+            "id": "item-output",
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"temperature":20}',
+        },
+    }
+
+    first = await protocol._to_duplex_event(event)
+    retry = await protocol._to_duplex_event(event)
+
+    assert first is not None
+    assert retry is not None
+    assert "item-output" not in protocol._conversation_items
+
+    delivered_item = first["payload"]["item"]
+    protocol.encode_outbound_event(
+        {
+            "type": "conversation.item.created",
+            "item": delivered_item,
+        }
+    )
+
+    assert protocol._conversation_items["item-output"] == delivered_item
+    assert await protocol._to_duplex_event(event) is None
+    assert ws.sent[-1]["error"]["code"] == "invalid_function_call_output"
 
 
 @pytest.mark.asyncio

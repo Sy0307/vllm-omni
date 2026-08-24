@@ -1,4 +1,5 @@
-"""Nightly model-level coverage for Nemotron VoiceChat native duplex serving."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, model_prefix
         (
             f"--url ws://{omni_server.host}:{omni_server.port}/v1/realtime --model {omni_server.model} "
             f"--input-wav {root / 'turn_taking.wav'} --input-channel 0 --max-frames 190 "
-            f"--minimum-audio-chunks 10 --minimum-audio-rms 0.00001 --no-realtime --timeout-s 300 "
+            f"--minimum-audio-chunks 48 --minimum-audio-rms 0.001 --no-realtime --timeout-s 300 "
             f"--output-dir {tmp_path / 'native_duplex'}"
         ).split()
     )
@@ -54,3 +55,4 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, model_prefix
     assert result["event_counts"]["response.speak"] > 0
     assert result["event_counts"]["response.audio.delta"] >= 10
     assert result["event_counts"]["response.done"] > 0
+    assert result["audio_bytes"] >= result["input_frames"] * 1764 * 2 // 4

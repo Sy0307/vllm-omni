@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -15,6 +18,9 @@ from vllm_omni.experimental.fullduplex.nemotron_voicechat.runtime import (
 from vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter import (
     NemotronVoiceChatServingRuntimeAdapter,
     _render_tool_response,
+)
+from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
+    NemotronVoiceChatThinkerForConditionalGeneration,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -96,3 +102,14 @@ def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
     assert second["nvc_function_response_generation"] == 2
     assert second["nvc_function_response_token_ids"] == [31, 32, 33]
     assert second["nvc_function_response_call_id"] == "call-2"
+    assert second["nvc_function_response_batches"] == [
+        {"generation": 1, "call_id": "call-1", "token_ids": [31, 32, 33]},
+        {"generation": 2, "call_id": "call-2", "token_ids": [31, 32, 33]},
+    ]
+
+    session = {"function_response_generation": 0, "forced_function_tokens": []}
+    NemotronVoiceChatThinkerForConditionalGeneration._sync_forced_function_response(session, second)
+
+    assert session["function_response_generation"] == 2
+    assert session["forced_function_token"] == 31
+    assert session["forced_function_tokens"] == [31, 32, 33, 31, 32, 33]

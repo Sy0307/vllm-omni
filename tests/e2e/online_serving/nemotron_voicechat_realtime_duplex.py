@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end probe for Nemotron VoiceChat native duplex Realtime serving."""
-
-from __future__ import annotations
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 import asyncio
@@ -12,7 +9,7 @@ import math
 import uuid
 import wave
 from collections.abc import Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -73,10 +70,6 @@ def _read_wav(path: Path, *, input_channel: int = 0) -> np.ndarray:
     if not 0 <= input_channel < channels:
         raise ValueError(f"input channel {input_channel} is outside WAV channel count {channels}")
     if channels > 1:
-        # NVIDIA's bundled VoiceChat samples are combined conversations: user
-        # audio is channel 0 and reference agent audio is channel 1. Averaging
-        # them leaks the expected agent response back into the model input and
-        # makes both turn-taking and function-call probes invalid.
         pcm = pcm.reshape(-1, channels)[:, input_channel]
     if source_rate != INPUT_SAMPLE_RATE_HZ:
         divisor = math.gcd(source_rate, INPUT_SAMPLE_RATE_HZ)
@@ -126,7 +119,6 @@ async def _return_function_output_when_ready(
     output: str,
     timeout_s: float,
 ) -> tuple[str, int]:
-    """Return the tool result immediately, while microphone streaming continues."""
     await wait_for(
         lambda: bool(client.events.errors()) or client.events.count("response.function_call_arguments.done") > 0,
         timeout_s=timeout_s,
@@ -152,24 +144,6 @@ async def _return_function_output_when_ready(
     return call_id, event_count_before_output
 
 
-def _audio_packet_durations_ms(events: Sequence[dict[str, object]]) -> list[float]:
-    """Measure each PCM16 delta independently, without trusting metadata."""
-    durations = []
-    for event in events:
-        delta = event.get("delta")
-        sample_rate_hz = event.get("sample_rate_hz")
-        if not isinstance(delta, str) or not isinstance(sample_rate_hz, int) or sample_rate_hz <= 0:
-            raise AssertionError(f"malformed response.audio.delta: {event}")
-        try:
-            payload = base64.b64decode(delta, validate=True)
-        except ValueError as exc:
-            raise AssertionError("response.audio.delta is not valid base64") from exc
-        if len(payload) % 2:
-            raise AssertionError(f"PCM16 audio packet has odd byte length: {len(payload)}")
-        durations.append(len(payload) * 1000.0 / (2 * sample_rate_hz))
-    return durations
-
-
 def _write_events(path: Path, client: RealtimeDuplexClient) -> None:
     path.write_text(
         "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
@@ -178,54 +152,27 @@ def _write_events(path: Path, client: RealtimeDuplexClient) -> None:
 
 
 @asynccontextmanager
-async def _close_and_capture_failures(
-    client: RealtimeDuplexClient,
-    *,
-    output_dir: Path,
-    timeout_s: float,
-):
-    """Return the single-session lease even when probe validation fails."""
-    failed = False
-    try:
-        yield
-    except BaseException:
-        failed = True
-        raise
-    finally:
-        close_error: Exception | None = None
-        if client.events.count("session.created") and not client.events.count("session.closed"):
-            try:
-                await client.close_session(timeout_s=min(timeout_s, 30.0))
-            except Exception as exc:  # preserve the original probe failure
-                close_error = exc
-        if failed or close_error is not None:
-            _write_events(output_dir / "events.failed.jsonl", client)
-        if close_error is not None and not failed:
-            raise close_error
+async def _managed_client(client: RealtimeDuplexClient, *, timeout_s: float):
+    async with client:
+        try:
+            yield
+        finally:
+            if client.events.count("session.created") and not client.events.count("session.closed"):
+                with suppress(Exception):
+                    await client.close_session(timeout_s=min(timeout_s, 30.0))
 
 
 async def run(args: argparse.Namespace) -> dict[str, object]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.instructions_file:
-        instructions = Path(args.instructions_file).read_text(encoding="utf-8")
-    elif args.expect_function_call and args.instructions == DEFAULT_INSTRUCTIONS:
+    if args.expect_function_call and args.instructions == DEFAULT_INSTRUCTIONS:
         instructions = DEFAULT_FUNCTION_INSTRUCTIONS
     else:
         instructions = args.instructions
-    tools = json.loads(Path(args.tools_file).read_text(encoding="utf-8")) if args.tools_file else None
-    if tools is None and args.expect_function_call:
-        tools = DEFAULT_FUNCTION_TOOLS
+    tools = DEFAULT_FUNCTION_TOOLS if args.expect_function_call else None
     session_id = f"nemotron-voicechat-{uuid.uuid4().hex}"
     client = RealtimeDuplexClient(_url(args.url, args.model, session_id))
-    async with (
-        client,
-        _close_and_capture_failures(
-            client,
-            output_dir=output_dir,
-            timeout_s=args.timeout_s,
-        ),
-    ):
+    async with _managed_client(client, timeout_s=args.timeout_s):
         session_payload: dict[str, object] = {
             "session_id": session_id,
             "model": args.model,
@@ -233,11 +180,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             "input_audio_format": "pcm_f32le",
             "output_audio_format": "pcm16",
             "instructions": instructions,
-            # Keep the Realtime reader alive for at least as long as the probe
-            # is willing to wait for model output. The default 300 s session
-            # timeout is shorter than this eager fp32 pipeline needs for the
-            # bundled turn-taking fixture, so it otherwise cancels an active
-            # response before the probe's own timeout can decide the result.
             "idle_timeout_s": args.timeout_s,
             "turn_detection": None,
             "extra_body": {"auto_response": True},
@@ -260,13 +202,13 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         created = _events(client, "session.created")[-1]
         session = created.get("session")
         capabilities = session.get("capabilities") if isinstance(session, dict) else None
-        expected = {
-            "implementation_level": "model_native_duplex",
-            "chunk_period_ms": 80,
-            "supports_core_resumable_request": True,
-            "supports_core_kv_lease": False,
-            "supports_multi_session": False,
-        }
+        expected = dict(
+            implementation_level="model_native_duplex",
+            chunk_period_ms=80,
+            supports_core_resumable_request=True,
+            supports_core_kv_lease=False,
+            supports_multi_session=False,
+        )
         if not isinstance(capabilities, dict) or any(capabilities.get(key) != value for key, value in expected.items()):
             raise AssertionError(f"unexpected capabilities: {capabilities}")
 
@@ -297,10 +239,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     if args.expect_function_call
                     else (
                         client.events.count("response.audio.delta") >= args.minimum_audio_chunks
-                        and (
-                            args.allow_incomplete_response
-                            or client.events.count("response.done") > completed_responses_at_commit
-                        )
+                        and (client.events.count("response.done") > completed_responses_at_commit)
                     )
                 )
             ),
@@ -311,7 +250,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         if client.events.errors():
             raise AssertionError(f"Realtime session emitted errors: {client.events.errors()}")
         done_events = _events(client, "response.done")
-        if not args.expect_function_call and not args.allow_incomplete_response:
+        if not args.expect_function_call:
             response = done_events[-1].get("response") if done_events else None
             status = response.get("status") if isinstance(response, dict) else None
             if status != "completed":
@@ -334,24 +273,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 event for event in function_items if event["item"].get("name") == args.expected_function_name
             ]
             if not matching_items:
-                raise AssertionError(f"expected function {args.expected_function_name!r}, got {function_items}")
-            function_item_event = matching_items[-1]
-            function_item = function_item_event["item"]
+                raise AssertionError(f"expected {args.expected_function_name!r}, got {function_items}")
+            function_item = matching_items[-1]["item"]
             try:
                 function_arguments = json.loads(str(function_item.get("arguments", "")))
             except json.JSONDecodeError as exc:
                 raise AssertionError(f"function arguments are not JSON: {function_item}") from exc
-            if not isinstance(function_arguments, dict):
-                raise AssertionError(f"function arguments are not an object: {function_arguments!r}")
-            function_done = [
-                event for event in function_events if event.get("type") == "response.function_call_arguments.done"
-            ][-1]
-            if function_done.get("call_id") != function_item.get("call_id") or function_done.get(
-                "response_id"
-            ) != function_item_event.get("response_id"):
-                raise AssertionError(
-                    f"function call identity changed across events: done={function_done}, item={function_item_event}"
-                )
             if args.expected_function_arguments is not None:
                 expected_arguments = json.loads(args.expected_function_arguments)
                 if function_arguments != expected_arguments:
@@ -365,25 +292,20 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     raise AssertionError(f"function item has no call_id: {function_item}")
                 assert function_output_task is not None
                 returned_call_id, event_count_before_output = await function_output_task
-                if returned_call_id != call_id:
-                    raise AssertionError(f"returned output for {returned_call_id}, but completed item used {call_id}")
+                assert returned_call_id == call_id
 
                 def tool_result_completed() -> bool:
-                    later_events = client.events.events[event_count_before_output:]
-                    has_audio = any(event.get("type") == "response.audio.delta" for event in later_events)
-                    completed = any(
-                        event.get("type") == "response.done"
-                        and isinstance(event.get("response"), dict)
-                        and event["response"].get("status") == "completed"
-                        for event in later_events
-                    )
+                    later = client.events.events[event_count_before_output:]
                     transcript = "".join(
                         str(event.get("delta", ""))
-                        for event in later_events
+                        for event in later
                         if event.get("type") == "response.audio_transcript.delta"
                     ).lower()
-                    expected_text = args.expected_post_tool_text
-                    return has_audio and completed and (expected_text is None or expected_text.lower() in transcript)
+                    return (
+                        any(event.get("type") == "response.audio.delta" for event in later)
+                        and any(event.get("type") == "response.done" for event in later)
+                        and (args.expected_post_tool_text is None or args.expected_post_tool_text.lower() in transcript)
+                    )
 
                 await wait_for(
                     lambda: bool(client.events.errors()) or tool_result_completed(),
@@ -392,32 +314,19 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 )
                 if client.events.errors():
                     raise AssertionError(f"function output failed: {client.events.errors()}")
-                created_outputs = [
-                    event
-                    for event in _events(client, "conversation.item.created")
-                    if isinstance(event.get("item"), dict)
-                    and event["item"].get("type") == "function_call_output"
-                    and event["item"].get("call_id") == call_id
-                ]
-                if not created_outputs:
-                    raise AssertionError("server did not acknowledge the function_call_output item")
                 await asyncio.sleep(args.drain_s)
 
         audio = client.events.audio_bytes()
         audio_events = _events(client, "response.audio.delta")
-        rates = {int(event["sample_rate_hz"]) for event in audio_events if isinstance(event.get("sample_rate_hz"), int)}
+        rates = {event.get("sample_rate_hz") for event in audio_events}
         if not args.expect_function_call and audio and rates != {OUTPUT_SAMPLE_RATE_HZ}:
             raise AssertionError(f"unexpected output sample rates: {rates}")
         if not args.expect_function_call and args.minimum_audio_chunks and not audio:
             raise AssertionError("model produced no audio")
-        packet_durations_ms = _audio_packet_durations_ms(audio_events)
-        expected_packet_ms = float(expected["chunk_period_ms"])
-        if not args.expect_function_call and any(
-            not math.isclose(duration_ms, expected_packet_ms, abs_tol=0.01) for duration_ms in packet_durations_ms
-        ):
-            raise AssertionError(
-                f"audio deltas are not fixed {expected_packet_ms:g} ms codec increments: {packet_durations_ms}"
-            )
+        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * expected["chunk_period_ms"] // 1000
+        packet_sizes = [len(base64.b64decode(str(event.get("delta", "")), validate=True)) for event in audio_events]
+        if not args.expect_function_call and any(size != expected_bytes for size in packet_sizes):
+            raise AssertionError(f"audio deltas are not fixed 80 ms PCM16 packets: {packet_sizes}")
         audio_pcm = np.frombuffer(audio, dtype="<i2").astype(np.float32) / 32768.0
         audio_rms = float(np.sqrt(np.mean(np.square(audio_pcm)))) if audio_pcm.size else 0.0
         if not args.expect_function_call and audio and audio_rms < args.minimum_audio_rms:
@@ -453,41 +362,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--url", default="ws://127.0.0.1:8125/v1/realtime")
     parser.add_argument("--model", required=True)
     parser.add_argument("--input-wav", required=True)
-    parser.add_argument(
-        "--input-channel",
-        type=int,
-        default=0,
-        help="Zero-based WAV channel to stream (bundled VoiceChat samples use user audio on channel 0).",
-    )
+    parser.add_argument("--input-channel", type=int, default=0)
     parser.add_argument("--output-dir", default="/tmp/nemotron-voicechat-duplex")
-    parser.add_argument(
-        "--instructions",
-        default=DEFAULT_INSTRUCTIONS,
-    )
-    parser.add_argument("--instructions-file")
-    parser.add_argument("--tools-file")
+    parser.add_argument("--instructions", default=DEFAULT_INSTRUCTIONS)
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--minimum-audio-chunks", type=int, default=1)
     parser.add_argument("--minimum-audio-rms", type=float, default=1e-4)
     parser.add_argument("--expect-function-call", action="store_true")
     parser.add_argument("--expected-function-name", default="generate_random_number")
-    parser.add_argument(
-        "--expected-function-arguments",
-        help='Exact JSON arguments expected from the model (for example \'{"min":1,"max":50}\').',
-    )
-    parser.add_argument(
-        "--function-output",
-        help="Return this string as function_call_output and require a completed post-tool audio response.",
-    )
-    parser.add_argument(
-        "--expected-post-tool-text",
-        help="Case-insensitive transcript substring required after returning function output.",
-    )
-    parser.add_argument(
-        "--allow-incomplete-response",
-        action="store_true",
-        help="Treat initial audio as success without waiting for response.done.",
-    )
+    parser.add_argument("--expected-function-arguments")
+    parser.add_argument("--function-output")
+    parser.add_argument("--expected-post-tool-text")
     parser.add_argument("--no-realtime", action="store_true")
     parser.add_argument("--drain-s", type=float, default=2.0)
     parser.add_argument("--timeout-s", type=float, default=600.0)

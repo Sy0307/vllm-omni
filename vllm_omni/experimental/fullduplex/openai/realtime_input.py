@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -1087,10 +1090,11 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
-            # ``function_call_output`` is a non-message item and returns below
-            # before the normal history path; retain it here so the same
-            # call_id cannot be submitted twice.
-            self._conversation_items[item_id] = item
+            # Do not retain the result until SessionRunner has delivered its
+            # runtime update. On success, the resulting
+            # ``conversation.item.created`` event records it in the shared
+            # input/output protocol state; on failure the client may retry the
+            # same call_id instead of being rejected by provisional history.
         if item_type != "message" or role in {"assistant", "system"}:
             return {
                 "type": "turn.signal",

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-0 thinker for NemotronVoiceChat: 16 kHz speech -> frame-locked text.
 
 ``LLM_AR`` stage combining:
@@ -652,12 +652,40 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         if generation < seen:
             raise ValueError("Nemotron VoiceChat function-response generation moved backwards")
         if generation > seen:
-            if session.get("forced_function_token") is not None or session.get("forced_function_tokens"):
-                raise ValueError("Nemotron VoiceChat received overlapping function responses")
-            raw_tokens = runtime_config.get("nvc_function_response_token_ids")
-            if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
-                raise ValueError("Nemotron VoiceChat function response requires token ids")
-            session["forced_function_tokens"] = [int(token_id) for token_id in raw_tokens]
+            raw_batches = runtime_config.get("nvc_function_response_batches")
+            batches = raw_batches if isinstance(raw_batches, list) else []
+            unseen: list[tuple[int, list[int]]] = []
+            for raw_batch in batches:
+                if not isinstance(raw_batch, dict):
+                    raise ValueError("Nemotron VoiceChat function response batch must be an object")
+                try:
+                    batch_generation = int(raw_batch["generation"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("Nemotron VoiceChat function response batch requires a generation") from exc
+                if batch_generation <= seen:
+                    continue
+                raw_tokens = raw_batch.get("token_ids")
+                if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
+                    raise ValueError("Nemotron VoiceChat function response requires token ids")
+                unseen.append((batch_generation, [int(token_id) for token_id in raw_tokens]))
+            if not unseen:
+                # Backward-compatible single-response payload used by older
+                # serving adapters and serialized test fixtures.
+                raw_tokens = runtime_config.get("nvc_function_response_token_ids")
+                if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
+                    raise ValueError("Nemotron VoiceChat function response requires token ids")
+                unseen = [(generation, [int(token_id) for token_id in raw_tokens])]
+            expected = seen + 1
+            queue = session.setdefault("forced_function_tokens", [])
+            if not isinstance(queue, list):
+                raise ValueError("Nemotron VoiceChat forced function-token queue is invalid")
+            for batch_generation, token_ids in unseen:
+                if batch_generation != expected:
+                    raise ValueError("Nemotron VoiceChat function-response generations are not contiguous")
+                queue.extend(token_ids)
+                expected += 1
+            if expected - 1 != generation:
+                raise ValueError("Nemotron VoiceChat function-response batches are incomplete")
             session["function_response_generation"] = generation
         queue = session.get("forced_function_tokens")
         if session.get("forced_function_token") is None and isinstance(queue, list) and queue:

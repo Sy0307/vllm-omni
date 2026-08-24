@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -1091,6 +1091,30 @@ def test_cleanup_preserves_pending_save(build_adapter):
     adapter.cleanup(req_id, ext_id)
 
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_abort_invalidates_queued_sender_task_before_external_id_reuse(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-old", RequestStatus.WAITING, external_req_id="ext-reused")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+    stale_task = adapter._pending_save_reqs.popleft()
+    adapter.cleanup(request.request_id, request.external_req_id)
+    adapter._send_single_request(stale_task)
+
+    connector.put.assert_not_called()
+    assert request.external_req_id not in adapter.put_req_chunk
+
+    replacement = _req("req-new", RequestStatus.WAITING, external_req_id=request.external_req_id)
+    adapter.save_async(multimodal_output=None, request=replacement)
+    current_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(current_task)
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0"
 
 
 def test_cleanup_only_affects_target_request(build_adapter):
