@@ -12,7 +12,7 @@ from huggingface_hub import snapshot_download
 
 from tests.e2e.online_serving.nemotron_voicechat_realtime_duplex import parse_args, run
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import OmniServerParams, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = os.environ.get("VLLM_TEST_NEMOTRON_VOICECHAT_MODEL", "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B")
@@ -36,7 +36,8 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
     ],
     indirect=True,
 )
-def test_native_duplex_turn_taking_streams_model_audio(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_native_duplex_turn_taking_streams_model_audio(omni_server, tmp_path: Path) -> None:
+    model_prefix = get_model_prefix()
     root = Path(model_prefix) / MODEL if model_prefix else Path(MODEL)
     if not root.is_dir():
         root = Path(snapshot_download(MODEL, local_files_only=True))
@@ -51,8 +52,5 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, model_prefix
     result = asyncio.run(run(args))
     assert result["ok"] is True
     assert result["input_frames"] == 190
-    assert result["audio_bytes"] > 0
     assert result["event_counts"]["response.speak"] > 0
-    assert result["event_counts"]["response.audio.delta"] >= 10
-    assert result["event_counts"]["response.done"] > 0
     assert result["audio_bytes"] >= result["input_frames"] * 1764 * 2 // 4

@@ -16,11 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import numpy as np
 from scipy.signal import resample_poly
 
-from vllm_omni.experimental.fullduplex.client import (
-    RealtimeDuplexClient,
-    wait_for,
-    write_pcm16_wav,
-)
+from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, wait_for, write_pcm16_wav
 
 INPUT_SAMPLE_RATE_HZ = 16_000
 OUTPUT_SAMPLE_RATE_HZ = 22_050
@@ -73,21 +69,11 @@ def _read_wav(path: Path, *, input_channel: int = 0) -> np.ndarray:
         pcm = pcm.reshape(-1, channels)[:, input_channel]
     if source_rate != INPUT_SAMPLE_RATE_HZ:
         divisor = math.gcd(source_rate, INPUT_SAMPLE_RATE_HZ)
-        pcm = resample_poly(
-            pcm,
-            up=INPUT_SAMPLE_RATE_HZ // divisor,
-            down=source_rate // divisor,
-        )
+        pcm = resample_poly(pcm, up=INPUT_SAMPLE_RATE_HZ // divisor, down=source_rate // divisor)
     return np.ascontiguousarray(pcm, dtype="<f4")
 
 
-async def _stream(
-    client: RealtimeDuplexClient,
-    pcm: np.ndarray,
-    *,
-    max_frames: int | None,
-    realtime: bool,
-) -> int:
+async def _stream(client: RealtimeDuplexClient, pcm: np.ndarray, *, max_frames: int | None, realtime: bool) -> int:
     count = math.ceil(pcm.size / FRAME_SAMPLES)
     if max_frames is not None:
         count = min(count, max_frames)
@@ -186,12 +172,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         }
         if tools is not None:
             session_payload["tools"] = tools
-        await client.send(
-            {
-                "type": "session.update",
-                "session": session_payload,
-            }
-        )
+        await client.send({"type": "session.update", "session": session_payload})
         await wait_for(
             lambda: client.events.count("session.created") > 0 or bool(client.events.errors()),
             timeout_s=args.timeout_s,
@@ -223,12 +204,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             if args.function_output is not None
             else None
         )
-        frame_count = await _stream(
-            client,
-            _read_wav(Path(args.input_wav), input_channel=args.input_channel),
-            max_frames=args.max_frames,
-            realtime=not args.no_realtime,
-        )
+        pcm = _read_wav(Path(args.input_wav), input_channel=args.input_channel)
+        frame_count = await _stream(client, pcm, max_frames=args.max_frames, realtime=not args.no_realtime)
         completed_responses_at_commit = client.events.count("response.done")
         await client.send({"type": "input_audio_buffer.commit", "final": True})
         await wait_for(
