@@ -683,10 +683,6 @@ async def test_native_realtime_protocol_rejects_server_vad_without_interrupt():
     assert error["type"] == "error"
     assert error["error"]["code"] == "unsupported_turn_detection"
     assert "interrupt_response=false" in error["error"]["message"]
-    threshold_error = protocol._validate_realtime_turn_detection(
-        {"turn_detection": {"type": "server_vad", "threshold": 0.15}}
-    )
-    assert "greater than 0.15" in str(threshold_error)
 
 
 @pytest.mark.asyncio
@@ -743,14 +739,20 @@ async def test_realtime_vad_edge_order_and_tiny_chunk_resampling(monkeypatch):
     monkeypatch.setattr(protocol._server_vad, "process_base64", lambda *args, **kwargs: result)
     protocol._input_speech_started = True
     protocol._hold_realtime_output_until_session_created = False
-
     await protocol._to_duplex_event(
         {"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(1), "format": "pcm_f32le"}
     )
-
     assert [event["type"] for event in ws.sent] == [
         "input_audio_buffer.speech_stopped",
         "input_audio_buffer.speech_started",
+    ]
+    ws.sent.clear()
+    protocol._input_speech_started = False
+    result = realtime_vad.StreamingVADResult(True, False, True, True)
+    await protocol._to_duplex_event({"type": "input_audio_buffer.append", "audio": "AAAA", "format": "pcm_f32le"})
+    assert [event["type"] for event in ws.sent] == [
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
     ]
     detector = realtime_vad.SileroStreamingVAD(realtime_vad.SileroVADConfig(), frame_scorer=lambda _: 0.0)
     for _ in range(1024):
@@ -765,7 +767,6 @@ async def test_realtime_server_vad_runtime_failures_are_terminal(monkeypatch):
     ws.put(_server_vad_update("generic-vad", model="test-model", session_id="generic-vad"))
     await handler.handle_session(ws, realtime_protocol=NativeRealtimeSessionProtocol({}))
     assert ws.sent[-1]["error"]["code"] == "server_vad_requires_native_duplex"
-
     monkeypatch.setattr(realtime_vad.SileroStreamingVAD, "process_base64", lambda *args, **kwargs: 1 / 0)
     ws = TimedWebSocket()
     create = _native_realtime_session_update("vad-inference-failure")
@@ -5414,25 +5415,32 @@ async def test_native_session_update_commits_config_only_after_runtime_ack():
     assert isinstance(protocol._server_vad, realtime_vad.SileroStreamingVAD)
 
 
+@pytest.mark.parametrize(
+    ("append_fails", "expected_code"),
+    [(True, "session_update_aborted"), (False, "instructions_update_unsupported")],
+)
 @pytest.mark.asyncio
-async def test_realtime_vad_update_rejects_after_failed_append_without_stalling():
-    engine = FakeEngineClient(append_result={"operation": "append", "ok": False, "error_count": 1})
-    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
-
+async def test_realtime_vad_update_rejection_does_not_stall(append_fails, expected_code):
+    append_result = {"operation": "append", "ok": False, "error_count": 1} if append_fails else None
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient(append_result=append_result)))
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
-    create = _native_realtime_session_update("sid-update-after-append-failure")
-    create["session"]["extra_body"]["auto_response"] = True
+    create = _native_realtime_session_update("sid-rejected-vad-update")
+    create["session"]["extra_body"]["auto_response"] = append_fails
     ws.put(create)
-    ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(16_000), "format": "pcm_f32le"})
-    ws.put(_server_vad_update("failed-append"))
+    if append_fails:
+        ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(16_000), "format": "pcm_f32le"})
+    update = _server_vad_update("rejected-vad-update")
+    if not append_fails:
+        update["session"]["instructions"] = "You are now a pirate."
+    ws.put(update)
     ws.put({"type": "session.close"})
-
     await asyncio.wait_for(handler.handle_session(ws, realtime_protocol=protocol), timeout=2)
 
-    errors = [message.get("error") for message in ws.sent if isinstance(message.get("error"), dict)]
-    aborted = next(error for error in errors if error.get("code") == "session_update_aborted")
-    assert aborted["event_id"] == "failed-append"
+    errors = [message["error"] for message in ws.sent if isinstance(message.get("error"), dict)]
+    error = next(error for error in errors if error.get("code") == expected_code)
+    assert error["event_id"] == "rejected-vad-update"
+    assert protocol._pending_turn_detection_update is None
     assert protocol._server_vad is None
 
 

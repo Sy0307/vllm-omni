@@ -1118,7 +1118,7 @@ class DuplexSessionRunnerMixin:
                                     candidate_config,
                                 )
                             except ServingRuntimeConfigError as exc:
-                                await emit_event(
+                                await emit_update_event(
                                     {
                                         "type": "error",
                                         "session_id": session.session_id,
@@ -1126,6 +1126,7 @@ class DuplexSessionRunnerMixin:
                                         "error": str(exc),
                                     }
                                 )
+                                reject_update()
                                 continue
                             if not await self._signal_runtime_session(
                                 session,

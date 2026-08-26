@@ -311,10 +311,12 @@ class RealtimeInputTranslator:
             self._input_audio_buffer_had_non_speech = self._input_audio_buffer_had_non_speech or (
                 not looks_like_speech and isinstance(audio, str) and bool(audio)
             )
+            stopped_event: dict[str, object] | None = None
             if vad_result is not None and vad_result.speech_stopped:
                 stopped_event = dict(event)
                 if vad_result.speech_end_ms is not None:
                     stopped_event["audio_end_ms"] = vad_result.speech_end_ms
+            if stopped_event is not None and vad_result is not None and vad_result.speech_active:
                 await self._emit_input_speech_stopped(
                     stopped_event,
                     item_id=self._active_input_item_id or f"item_{uuid4().hex}",
@@ -326,6 +328,11 @@ class RealtimeInputTranslator:
                 await self._emit_input_speech_started(started_event)
             elif vad_result is None and looks_like_speech:
                 await self._emit_input_speech_started(event)
+            if stopped_event is not None and vad_result is not None and not vad_result.speech_active:
+                await self._emit_input_speech_stopped(
+                    stopped_event,
+                    item_id=self._active_input_item_id or f"item_{uuid4().hex}",
+                )
             if looks_like_speech:
                 self._remember_input_transcript_hint(event)
             payload = {
