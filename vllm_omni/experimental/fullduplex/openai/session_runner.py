@@ -18,7 +18,6 @@ from vllm_omni.experimental.fullduplex.openai.commit_policy import (
     decide_commit_action,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
-    DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionState,
@@ -904,11 +903,7 @@ class DuplexSessionRunnerMixin:
 
                 if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
                     cancel_reason = (
-                        "output_audio_buffer_clear"
-                        if event_type == "output_audio_buffer.clear"
-                        else "client_cancelled"
-                        if event_type == "response.cancel"
-                        else "barge_in"
+                        "output_audio_buffer_clear" if event_type == "output_audio_buffer.clear" else "barge_in"
                     )
                     cancelled_fence = DuplexFence(
                         session.session_id,
@@ -1342,16 +1337,7 @@ class DuplexSessionRunnerMixin:
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
                         mark_pending_silence_superseded()
-                        overlap_active = native_response_in_progress() and (
-                            not self._session_auto_responds(session)
-                            or (
-                                session.capabilities.supports_barge_in
-                                and (
-                                    session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
-                                    or self._event_requests_barge_in(event)
-                                )
-                            )
-                        )
+                        overlap_active = not self._session_auto_responds(session) and native_response_in_progress()
                         if overlap_active:
                             decision = self._overlap_decision(session, event, payload)
                             await self._emit_overlap_decision(emit_event, session, decision)
@@ -1392,12 +1378,11 @@ class DuplexSessionRunnerMixin:
                                 native.speech_since_commit = False
                                 await actor.cancel_append_tasks()
                                 had_native_stream = native.data_plane_task is not None
-                                cancel_reason = str(decision.get("cancel_reason") or "barge_in")
                                 cancelled = await self._cancel_active_response(
                                     session,
                                     actor.active_response_task,
                                     emit_event,
-                                    reason=cancel_reason,
+                                    reason="barge_in",
                                 )
                                 had_native_stream = (
                                     await self._cancel_native_data_plane_stream(session) or had_native_stream
@@ -1413,7 +1398,7 @@ class DuplexSessionRunnerMixin:
                                             "type": "audio.cancelled",
                                             "session_id": session.session_id,
                                             "response_id": old_response_id,
-                                            "reason": cancel_reason,
+                                            "reason": "barge_in",
                                             "cancelled_epoch": old_epoch,
                                             "epoch": new_epoch,
                                             "committed_ms": committed_ms,
@@ -1433,7 +1418,7 @@ class DuplexSessionRunnerMixin:
                                             "type": "audio.cancelled",
                                             "session_id": session.session_id,
                                             "response_id": session.last_response_id,
-                                            "reason": cancel_reason,
+                                            "reason": "barge_in",
                                             "cancelled_epoch": old_epoch,
                                             "epoch": new_epoch,
                                             "committed_ms": committed_ms,

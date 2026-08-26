@@ -2658,32 +2658,13 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
                 req_id,
                 next_logical,
             )
-            if not self._is_duplex_session_request(req_state):
-                # Preserve the established failure semantics for ordinary
-                # pipelines.  This request-scoped recovery exists specifically
-                # for resumable full-duplex handoffs, where one malformed unit
-                # must not terminate the shared session orchestrator.
-                raise
-            await self.output_async_queue.put(
-                ErrorMessage(
-                    request_id=req_id,
-                    stage_id=next_logical,
-                    error=(f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}"),
-                    error_type=type(exc).__name__,
-                )
-            )
-            await self._cleanup_request_ids(
-                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                abort=True,
-                close_duplex_sessions=True,
-            )
-            return
+            raise
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
 

@@ -5999,7 +5999,7 @@ async def test_minicpmo_native_duplex_rejects_ref_audio_path():
     assert engine.opened == []
 
 
-def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
+def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -6026,10 +6026,12 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
     )
 
     assert decision == {
-        "action": "barge_in",
-        "reason": "client_force_barge_in",
+        "action": "listen",
+        "reason": "barge_in_unsupported",
         "duration_ms": 1000,
+        "overlap_speech_ms": 1000,
         "buffer_audio": True,
+        "defer_runtime_append": True,
     }
 
 
@@ -6041,7 +6043,7 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_interrupts():
         {"type": "turn.signal", "event": "barge_in"},
     ],
 )
-async def test_minicpmo_native_duplex_accepts_explicit_barge_in_control(
+async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
     barge_in_event: dict[str, object],
 ):
     engine = FakeEngineClient()
@@ -6057,8 +6059,9 @@ async def test_minicpmo_native_duplex_accepts_explicit_barge_in_control(
 
     await handler.handle_session(ws)
 
-    assert not any(message.get("code") == "barge_in_unsupported" for message in ws.sent)
-    assert ("sid-native-barge-control-disabled", "barge_in") in engine.signals
+    error = next(message for message in ws.sent if message.get("code") == "barge_in_unsupported")
+    assert error["session_id"] == "sid-native-barge-control-disabled"
+    assert ("sid-native-barge-control-disabled", "barge_in") not in engine.signals
 
 
 @pytest.mark.asyncio

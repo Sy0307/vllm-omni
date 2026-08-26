@@ -501,7 +501,7 @@ class OmniDuplexSessionHandler(
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": True,
                 "defer_runtime_append": False,
-                "force_listen": event.get("force_listen") is True or payload.get("force_listen") is True,
+                "force_listen": False,
                 "preserve_realtime_input": True,
             }
         if bool(event.get("force_listen", False)):
