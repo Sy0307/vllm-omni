@@ -5392,13 +5392,13 @@ async def test_native_session_update_commits_config_only_after_runtime_ack():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     ws.put(_native_realtime_session_update("sid-update-two-phase"))
-    ws.put(_server_vad_update("update-two-phase", instructions="candidate instructions"))
+    ws.put(_server_vad_update("update-two-phase"))
 
     handler_task = asyncio.create_task(handler.handle_session(ws, realtime_protocol=protocol))
     await asyncio.wait_for(engine.update_started.wait(), timeout=1)
     live_session = handler._registry.get("sid-update-two-phase")
     assert live_session is not None
-    assert live_session.config.instructions != "candidate instructions"
+    assert live_session.config.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
     assert protocol._pending_turn_detection_update is not None
     assert protocol._server_vad is None
 
@@ -5410,7 +5410,7 @@ async def test_native_session_update_commits_config_only_after_runtime_ack():
     await asyncio.wait_for(handler_task, timeout=2)
 
     updated = next(message for message in reversed(ws.sent) if message.get("type") == "session.updated")
-    assert updated["session"]["instructions"] == "candidate instructions"
+    assert updated["session"]["overlap_policy"] == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     assert isinstance(protocol._server_vad, realtime_vad.SileroStreamingVAD)
 
 
