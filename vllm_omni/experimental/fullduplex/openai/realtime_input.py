@@ -107,6 +107,7 @@ class RealtimeInputTranslator:
                 "type": "turn.signal",
                 "event": "session.update",
                 "payload": session_payload,
+                "realtime_event_id": event.get("event_id"),
             }
         if event_type == "conversation.item.create":
             item = event.get("item")
@@ -283,31 +284,19 @@ class RealtimeInputTranslator:
                     )
                 )
                 return None
+            detector = self._server_vad
             vad_result: StreamingVADResult | None = None
-            if isinstance(self._server_vad, SileroStreamingVAD):
+            if isinstance(detector, SileroStreamingVAD):
                 try:
-                    vad_result = self._server_vad.process_base64(
-                        audio,
-                        fmt=fmt,
-                        sample_rate_hz=sample_rate_hz,
-                    )
-                except ServerVADUnavailableError as exc:
+                    vad_result = detector.process_base64(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+                except (ServerVADUnavailableError, ValueError) as exc:
+                    unavailable = isinstance(exc, ServerVADUnavailableError)
                     await self._send_realtime_payload(
                         self._realtime_error_payload(
-                            "server_vad_unavailable",
+                            "server_vad_unavailable" if unavailable else "bad_audio",
                             str(exc),
                             event_id=event.get("event_id"),
-                            param="turn_detection",
-                        )
-                    )
-                    return None
-                except ValueError as exc:
-                    await self._send_realtime_payload(
-                        self._realtime_error_payload(
-                            "bad_audio",
-                            str(exc),
-                            event_id=event.get("event_id"),
-                            param="audio",
+                            param="turn_detection" if unavailable else "audio",
                         )
                     )
                     return None
@@ -322,6 +311,14 @@ class RealtimeInputTranslator:
             self._input_audio_buffer_had_non_speech = self._input_audio_buffer_had_non_speech or (
                 not looks_like_speech and isinstance(audio, str) and bool(audio)
             )
+            if vad_result is not None and vad_result.speech_stopped:
+                stopped_event = dict(event)
+                if vad_result.speech_end_ms is not None:
+                    stopped_event["audio_end_ms"] = vad_result.speech_end_ms
+                await self._emit_input_speech_stopped(
+                    stopped_event,
+                    item_id=self._active_input_item_id or f"item_{uuid4().hex}",
+                )
             if vad_result is not None and vad_result.speech_started:
                 started_event = dict(event)
                 if vad_result.speech_start_ms is not None:
@@ -331,14 +328,6 @@ class RealtimeInputTranslator:
                 await self._emit_input_speech_started(event)
             if looks_like_speech:
                 self._remember_input_transcript_hint(event)
-            if vad_result is not None and vad_result.speech_stopped:
-                stopped_event = dict(event)
-                if vad_result.speech_end_ms is not None:
-                    stopped_event["audio_end_ms"] = vad_result.speech_end_ms
-                await self._emit_input_speech_stopped(
-                    stopped_event,
-                    item_id=self._active_input_item_id or f"item_{uuid4().hex}",
-                )
             payload = {
                 "type": "input_audio_buffer.append",
                 "audio": audio,
@@ -362,10 +351,15 @@ class RealtimeInputTranslator:
             self._copy_realtime_input_hints(event, payload)
             payload["is_speech"] = looks_like_speech
             if vad_result is not None:
-                payload["vad"] = vad_result.as_hint()
-                if self._server_vad_interrupts_response() and (vad_result.speech_active or vad_result.speech_started):
-                    # Hold the MiniCPM stream in listen mode for the remainder
-                    # of this utterance after the one-shot onset cancellation.
+                payload["vad"] = {
+                    "backend": "silero",
+                    "is_speech": vad_result.is_speech,
+                    "speech_active": vad_result.speech_active,
+                    "speech_started": vad_result.speech_started,
+                    "speech_stopped": vad_result.speech_stopped,
+                    "speech_probability": vad_result.speech_probability,
+                }
+                if vad_result.speech_active:
                     payload["force_listen"] = True
             return payload
         if event_type == "input_audio_buffer.commit":
@@ -1053,159 +1047,119 @@ class RealtimeInputTranslator:
                 return "video_frames entries must be JPEG or PNG images"
         return None
 
-    @classmethod
-    def _validate_realtime_turn_detection(cls, session_payload: dict[str, object]) -> str | None:
-        configured_values: list[tuple[str, object]] = []
-        if "turn_detection" in session_payload:
-            configured_values.append(("turn_detection", session_payload["turn_detection"]))
+    @staticmethod
+    def _configured_realtime_turn_detection(session_payload: dict[str, object]) -> tuple[str | None, object]:
+        field = "turn_detection" if "turn_detection" in session_payload else None
+        selected = session_payload.get("turn_detection")
         audio_config = session_payload.get("audio")
         if isinstance(audio_config, dict):
             audio_input = audio_config.get("input")
             if isinstance(audio_input, dict) and "turn_detection" in audio_input:
-                configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
-        for field_path, turn_detection in configured_values:
-            if turn_detection is None:
-                continue
-            if not isinstance(turn_detection, dict):
-                return f"{field_path} must be null or an object with type='server_vad'"
-            turn_detection_type = turn_detection.get("type")
-            if turn_detection_type != "server_vad":
-                return (
-                    f"{field_path}={turn_detection_type!r} is unsupported; "
-                    "use null for model-owned listen/speak or type='server_vad' for hard barge-in"
-                )
-            threshold = turn_detection.get("threshold", 0.5)
-            if (
-                not isinstance(threshold, int | float)
-                or isinstance(threshold, bool)
-                or not np.isfinite(float(threshold))
-                or not SILERO_VAD_MIN_THRESHOLD < float(threshold) <= 1.0
-            ):
-                return f"{field_path}.threshold must be greater than {SILERO_VAD_MIN_THRESHOLD} and at most 1"
-            for name in (
-                "prefix_padding_ms",
-                "silence_duration_ms",
-                "min_speech_duration_ms",
-            ):
-                value = turn_detection.get(name)
-                if value is not None and (
-                    not isinstance(value, int | float)
-                    or isinstance(value, bool)
-                    or not np.isfinite(float(value))
-                    or float(value) < 0
-                ):
-                    return f"{field_path}.{name} must be a non-negative number"
-            interrupt_response = turn_detection.get("interrupt_response", True)
-            if not isinstance(interrupt_response, bool):
-                return f"{field_path}.interrupt_response must be a boolean"
-            if interrupt_response is not True:
-                return (
-                    f"{field_path}.interrupt_response=false is unsupported; "
-                    "use turn_detection=null for model-owned listen/speak"
-                )
+                field, selected = "audio.input.turn_detection", audio_input["turn_detection"]
+        return field, selected
 
-        present, turn_detection = cls._configured_realtime_turn_detection(session_payload)
-        if not present:
+    @classmethod
+    def _validate_realtime_turn_detection(cls, session_payload: dict[str, object]) -> str | None:
+        field, turn_detection = cls._configured_realtime_turn_detection(session_payload)
+        if field is None:
             if session_payload.get("overlap_policy") == "barge_in_on_speech":
                 return (
                     "overlap_policy='barge_in_on_speech' requires "
                     "turn_detection.type='server_vad' on the Realtime endpoint"
                 )
             return None
-        desired_policy = (
-            "barge_in_on_speech"
-            if isinstance(turn_detection, dict) and turn_detection.get("interrupt_response", True) is True
-            else "listen_only"
-        )
+        if turn_detection is not None and not isinstance(turn_detection, dict):
+            return f"{field} must be null or an object with type='server_vad'"
+        if isinstance(turn_detection, dict):
+            if turn_detection.get("type") != "server_vad":
+                return f"{field}.type must be 'server_vad'"
+            threshold = turn_detection.get("threshold", 0.5)
+            if not cls._valid_vad_number(threshold, minimum=SILERO_VAD_MIN_THRESHOLD, strict=True, maximum=1):
+                return f"{field}.threshold must be greater than {SILERO_VAD_MIN_THRESHOLD} and at most 1"
+            for name in ("prefix_padding_ms", "silence_duration_ms", "min_speech_duration_ms"):
+                value = turn_detection.get(name)
+                if value is not None and not cls._valid_vad_number(value, minimum=0):
+                    return f"{field}.{name} must be a non-negative number"
+            if turn_detection.get("interrupt_response", True) is not True:
+                return (
+                    f"{field}.interrupt_response=false is unsupported; "
+                    "use turn_detection=null for model-owned listen/speak"
+                )
+        desired_policy = "barge_in_on_speech" if turn_detection is not None else "listen_only"
         overlap_policy = session_payload.get("overlap_policy")
         if isinstance(overlap_policy, str) and overlap_policy != desired_policy:
             return f"overlap_policy={overlap_policy!r} conflicts with turn_detection; expected {desired_policy!r}"
         return None
 
     @staticmethod
-    def _configured_realtime_turn_detection(
-        session_payload: dict[str, object],
-    ) -> tuple[bool, dict[str, object] | None]:
-        present = "turn_detection" in session_payload
-        selected = session_payload.get("turn_detection")
-        audio_config = session_payload.get("audio")
-        if isinstance(audio_config, dict):
-            audio_input = audio_config.get("input")
-            if isinstance(audio_input, dict) and "turn_detection" in audio_input:
-                present = True
-                selected = audio_input.get("turn_detection")
-        return present, dict(selected) if isinstance(selected, dict) else None
+    def _valid_vad_number(value: object, *, minimum: float, maximum: float | None = None, strict: bool = False) -> bool:
+        return (
+            isinstance(value, int | float)
+            and not isinstance(value, bool)
+            and np.isfinite(float(value))
+            and (float(value) > minimum if strict else float(value) >= minimum)
+            and (maximum is None or float(value) <= maximum)
+        )
 
     def _prepare_realtime_turn_detection_update(self, session_payload: dict[str, object]) -> None:
-        """Stage a VAD replacement until the Session/runtime update commits."""
-        present, turn_detection = self._configured_realtime_turn_detection(session_payload)
-        if not present:
+        field, configured = self._configured_realtime_turn_detection(session_payload)
+        if field is None:
             return
-        if self._turn_detection_update_pending:
+        if self._pending_turn_detection_update is not None:
             raise RuntimeError("A Realtime turn-detection update is already pending")
 
-        pending_turn_detection: dict[str, object] | None = None
-        pending_server_vad: SileroStreamingVAD | None = None
-        if turn_detection is None:
+        turn_detection: dict[str, object] | None = None
+        detector: SileroStreamingVAD | None = None
+        if configured is None:
             session_payload["overlap_policy"] = "listen_only"
         else:
-            normalized = dict(turn_detection)
-            normalized.setdefault("type", "server_vad")
-            normalized.setdefault("interrupt_response", True)
-            normalized.setdefault("threshold", 0.5)
-            normalized.setdefault("prefix_padding_ms", 300)
-            normalized.setdefault("silence_duration_ms", 500)
-            normalized.setdefault("min_speech_duration_ms", 96)
-            pending_turn_detection = normalized
-            pending_server_vad = SileroStreamingVAD(SileroVADConfig.from_turn_detection(normalized))
-            session_payload["turn_detection"] = dict(normalized)
+            assert isinstance(configured, dict)
+            turn_detection = {
+                "type": "server_vad",
+                "interrupt_response": True,
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
+                "min_speech_duration_ms": 96,
+                **configured,
+            }
+            detector = SileroStreamingVAD(
+                SileroVADConfig(
+                    threshold=float(turn_detection["threshold"]),
+                    prefix_padding_ms=int(turn_detection["prefix_padding_ms"]),
+                    silence_duration_ms=int(turn_detection["silence_duration_ms"]),
+                    min_speech_duration_ms=max(32, int(turn_detection["min_speech_duration_ms"])),
+                )
+            )
+            session_payload["turn_detection"] = dict(turn_detection)
             session_payload["overlap_policy"] = "barge_in_on_speech"
 
-        self._pending_turn_detection = pending_turn_detection
-        self._pending_server_vad = pending_server_vad
-        self._turn_detection_update_pending = True
-        self._turn_detection_update_resolved = asyncio.Event()
+        self._pending_turn_detection_update = (turn_detection, detector, asyncio.Event())
 
     async def wait_for_realtime_turn_detection_update(self) -> None:
-        """Preserve wire order while the runner accepts or rejects a candidate."""
-        resolved = self._turn_detection_update_resolved
-        if self._turn_detection_update_pending and resolved is not None:
-            await resolved.wait()
+        candidate = self._pending_turn_detection_update
+        if candidate is not None:
+            await candidate[2].wait()
 
     def commit_realtime_turn_detection_update(self) -> None:
-        """Publish the staged VAD only after the Session/runtime transaction ACKs."""
-        if not self._turn_detection_update_pending:
-            return
-        previous_server_vad = self._server_vad
-        self._turn_detection = (
-            dict(self._pending_turn_detection) if isinstance(self._pending_turn_detection, dict) else None
-        )
-        self._server_vad = self._pending_server_vad
-        self._clear_pending_realtime_turn_detection_update()
-        reset = getattr(previous_server_vad, "reset", None)
-        if callable(reset):
-            reset()
+        self._resolve_realtime_turn_detection_update(commit=True)
 
     def reject_realtime_turn_detection_update(self) -> None:
-        """Discard a staged VAD after any rejected Session/runtime update."""
-        if not self._turn_detection_update_pending:
+        self._resolve_realtime_turn_detection_update(commit=False)
+
+    def _resolve_realtime_turn_detection_update(self, *, commit: bool) -> None:
+        candidate = self._pending_turn_detection_update
+        if candidate is None:
             return
-        reset = getattr(self._pending_server_vad, "reset", None)
+        turn_detection, detector, resolved = candidate
+        discarded = self._server_vad if commit else detector
+        if commit:
+            self._turn_detection, self._server_vad = turn_detection, detector
+        self._pending_turn_detection_update = None
+        resolved.set()
+        reset = getattr(discarded, "reset", None)
         if callable(reset):
             reset()
-        self._clear_pending_realtime_turn_detection_update()
-
-    def _clear_pending_realtime_turn_detection_update(self) -> None:
-        resolved = self._turn_detection_update_resolved
-        self._turn_detection_update_pending = False
-        self._pending_turn_detection = None
-        self._pending_server_vad = None
-        self._turn_detection_update_resolved = None
-        if resolved is not None:
-            resolved.set()
-
-    def _server_vad_interrupts_response(self) -> bool:
-        return isinstance(self._turn_detection, dict) and self._turn_detection.get("interrupt_response", True) is True
 
     def _reset_server_vad(self) -> None:
         reset = getattr(self._server_vad, "reset", None)

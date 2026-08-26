@@ -248,6 +248,9 @@ class DuplexSessionRunnerMixin:
                     await actor.enqueue_event(event)
             except WebSocketDisconnect:
                 await actor.enqueue_event({"type": "__disconnect__"})
+            except Exception as exc:
+                await emit_event({"type": "error", "error": str(exc), "code": "realtime_input_failed"})
+                await actor.enqueue_event({"type": "__disconnect__"})
 
         async def next_actor_event() -> dict[str, object]:
             nonlocal pending_turn_reservations, transport_detached
@@ -643,6 +646,9 @@ class DuplexSessionRunnerMixin:
             if handshake is None:
                 return
             session = handshake.session
+            if initial_update_error := self._runtime_session_candidate_update_error(session, session.config):
+                await emit_event(initial_update_error)
+                return
             if handshake.resumed:
                 native = self._serving_runtime_adapter.session_states[session.session_id]
                 actor.tasks = self._session_tasks[session.session_id]
@@ -694,6 +700,8 @@ class DuplexSessionRunnerMixin:
                     )
                 if isinstance(open_result, dict):
                     created_payload["runtime_control"] = self._redact_runtime_control_result(open_result)
+                if realtime_protocol is not None:
+                    realtime_protocol.commit_realtime_turn_detection_update()
                 await emit_event(created_payload)
                 resume_credential_delivered = session.capabilities.supports_session_resume
                 reader_task = asyncio.create_task(read_event_loop(), name="duplex-session-reader")
@@ -1043,9 +1051,20 @@ class DuplexSessionRunnerMixin:
                             await emit_event(self._barge_in_unsupported_error(session))
                             continue
                         if turn_event == "session.update":
+                            realtime_event_id = event.get("realtime_event_id")
+
+                            async def emit_update_event(update_event: dict[str, object]) -> None:
+                                if isinstance(realtime_event_id, str) and realtime_event_id:
+                                    update_event = {**update_event, "realtime_event_id": realtime_event_id}
+                                await emit_event(update_event)
+
+                            def reject_update() -> None:
+                                if realtime_protocol is not None:
+                                    realtime_protocol.reject_realtime_turn_detection_update()
+
                             payload = event.get("payload")
                             if not isinstance(payload, dict):
-                                await emit_event(
+                                await emit_update_event(
                                     {
                                         "type": "error",
                                         "session_id": session.session_id,
@@ -1053,12 +1072,22 @@ class DuplexSessionRunnerMixin:
                                         "error": "session.update requires a session payload",
                                     }
                                 )
+                                reject_update()
                                 continue
                             if not await wait_for_native_append_tail():
+                                await emit_update_event(
+                                    {
+                                        "type": "error",
+                                        "code": "session_update_aborted",
+                                        "error": "session.update was not applied because the preceding append failed",
+                                    }
+                                )
+                                reject_update()
                                 continue
                             runtime_update_error = self._runtime_session_update_error(session, payload)
                             if runtime_update_error is not None:
-                                await emit_event(runtime_update_error)
+                                await emit_update_event(runtime_update_error)
+                                reject_update()
                                 continue
                             previous_config = session.config
                             candidate_config = deepcopy(previous_config)
@@ -1068,14 +1097,16 @@ class DuplexSessionRunnerMixin:
                             finally:
                                 session.replace_config(previous_config)
                             if update_error is not None:
-                                await emit_event(update_error)
+                                await emit_update_event(update_error)
+                                reject_update()
                                 continue
                             runtime_update_error = self._runtime_session_candidate_update_error(
                                 session,
                                 candidate_config,
                             )
                             if runtime_update_error is not None:
-                                await emit_event(runtime_update_error)
+                                await emit_update_event(runtime_update_error)
+                                reject_update()
                                 continue
                             candidate_runtime_config = self._runtime_config_for_session_update(
                                 session,
@@ -1084,14 +1115,17 @@ class DuplexSessionRunnerMixin:
                             if not await self._signal_runtime_session(
                                 session,
                                 turn_event,
-                                emit_event,
+                                emit_update_event,
                                 session_config=candidate_config.as_dict(),
                                 runtime_config=candidate_runtime_config,
                             ):
+                                reject_update()
                                 continue
                             session.replace_config(candidate_config)
                             session.replace_runtime_config(candidate_runtime_config)
-                            await emit_event(
+                            if realtime_protocol is not None:
+                                realtime_protocol.commit_realtime_turn_detection_update()
+                            await emit_update_event(
                                 {
                                     "type": "session.updated",
                                     "session": session.as_public_dict(),
@@ -1877,6 +1911,8 @@ class DuplexSessionRunnerMixin:
             with suppress(Exception):
                 await emit_event({"type": "error", "error": str(exc), "code": "internal_error"})
         finally:
+            if realtime_protocol is not None:
+                realtime_protocol.reject_realtime_turn_detection_update()
             if session is not None:
                 if reader_task is not None and not reader_task.done():
                     reader_task.cancel()

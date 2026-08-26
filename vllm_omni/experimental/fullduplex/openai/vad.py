@@ -11,7 +11,7 @@ SILERO_VAD_MIN_THRESHOLD = 0.15
 
 
 class ServerVADUnavailableError(RuntimeError):
-    """Raised when the optional server VAD runtime is not installed."""
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,24 +20,6 @@ class SileroVADConfig:
     prefix_padding_ms: int = 300
     silence_duration_ms: int = 500
     min_speech_duration_ms: int = 96
-
-    @classmethod
-    def from_turn_detection(cls, turn_detection: dict[str, object]) -> SileroVADConfig:
-        defaults = cls()
-
-        def number(name: str, default: int | float) -> int | float:
-            value = turn_detection.get(name, default)
-            return value if isinstance(value, int | float) and not isinstance(value, bool) else default
-
-        return cls(
-            threshold=float(number("threshold", defaults.threshold)),
-            prefix_padding_ms=max(0, int(number("prefix_padding_ms", defaults.prefix_padding_ms))),
-            silence_duration_ms=max(0, int(number("silence_duration_ms", defaults.silence_duration_ms))),
-            min_speech_duration_ms=max(
-                32,
-                int(number("min_speech_duration_ms", defaults.min_speech_duration_ms)),
-            ),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,34 +32,10 @@ class StreamingVADResult:
     speech_start_ms: int | None = None
     speech_end_ms: int | None = None
 
-    def as_hint(self) -> dict[str, object]:
-        hint: dict[str, object] = {
-            "backend": "silero",
-            "is_speech": self.is_speech,
-            "speech_active": self.speech_active,
-            "speech_started": self.speech_started,
-            "speech_stopped": self.speech_stopped,
-            "speech_probability": self.speech_probability,
-        }
-        if self.speech_start_ms is not None:
-            hint["speech_start_ms"] = self.speech_start_ms
-        if self.speech_end_ms is not None:
-            hint["speech_end_ms"] = self.speech_end_ms
-        return hint
-
 
 class SileroStreamingVAD:
-    """Per-session streaming Silero VAD with onset debounce and utterance latch.
-
-    Silero's model is stateful, so an instance must never be shared across
-    Realtime sessions. Audio is normalized to 16 kHz and scored in the model's
-    512-sample (32 ms) windows. Loading is lazy so deployments which use the
-    default model-owned mode do not need the optional ``silero-vad`` package.
-    """
-
     _SAMPLE_RATE_HZ = 16_000
     _WINDOW_SAMPLES = 512
-    _NEGATIVE_THRESHOLD_GAP = SILERO_VAD_MIN_THRESHOLD
 
     def __init__(
         self,
@@ -88,20 +46,20 @@ class SileroStreamingVAD:
         self.config = config
         self._frame_scorer = frame_scorer
         self._model: object | None = None
+        self._clear_stream_state()
+
+    def _clear_stream_state(self) -> None:
         self._pending = np.empty(0, dtype=np.float32)
         self._speech_active = False
         self._candidate_samples = 0
         self._candidate_start_sample: int | None = None
         self._silence_samples = 0
         self._processed_samples = 0
+        self._resample_rate_hz: int | None = None
+        self._resample_remainder = 0
 
     def reset(self) -> None:
-        self._pending = np.empty(0, dtype=np.float32)
-        self._speech_active = False
-        self._candidate_samples = 0
-        self._candidate_start_sample = None
-        self._silence_samples = 0
-        self._processed_samples = 0
+        self._clear_stream_state()
         reset_states = getattr(self._model, "reset_states", None)
         if callable(reset_states):
             reset_states()
@@ -125,11 +83,23 @@ class SileroStreamingVAD:
         rate = int(sample_rate_hz) if isinstance(sample_rate_hz, int | float) else self._SAMPLE_RATE_HZ
         if rate <= 0:
             raise ValueError("Silero server VAD requires a positive sample rate")
-        if rate != self._SAMPLE_RATE_HZ and samples.size > 1:
-            target_size = max(1, int(round(samples.size * self._SAMPLE_RATE_HZ / rate)))
-            source_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
-            target_x = np.linspace(0.0, 1.0, num=target_size, endpoint=True)
-            samples = np.interp(target_x, source_x, samples).astype(np.float32)
+        if rate != self._SAMPLE_RATE_HZ:
+            if self._resample_rate_hz != rate:
+                self._resample_rate_hz = rate
+                self._resample_remainder = 0
+            numerator = samples.size * self._SAMPLE_RATE_HZ + self._resample_remainder
+            target_size, self._resample_remainder = divmod(numerator, rate)
+            if target_size == 0:
+                samples = np.empty(0, dtype=np.float32)
+            elif samples.size == 1:
+                samples = np.full(target_size, samples[0], dtype=np.float32)
+            else:
+                source_x = np.linspace(0.0, 1.0, num=samples.size, endpoint=True)
+                target_x = np.linspace(0.0, 1.0, num=target_size, endpoint=True)
+                samples = np.interp(target_x, source_x, samples).astype(np.float32)
+        else:
+            self._resample_rate_hz = None
+            self._resample_remainder = 0
         return self.process(samples)
 
     def process(self, samples: np.ndarray) -> StreamingVADResult:
@@ -143,9 +113,9 @@ class SileroStreamingVAD:
         end_ms: int | None = None
         max_probability = 0.0
         contained_speech = self._speech_active
-        min_speech_samples = int(self.config.min_speech_duration_ms * self._SAMPLE_RATE_HZ / 1000)
-        min_silence_samples = int(self.config.silence_duration_ms * self._SAMPLE_RATE_HZ / 1000)
-        negative_threshold = max(0.0, self.config.threshold - self._NEGATIVE_THRESHOLD_GAP)
+        min_speech_samples = self.config.min_speech_duration_ms * 16
+        min_silence_samples = self.config.silence_duration_ms * 16
+        negative_threshold = max(0.0, self.config.threshold - SILERO_VAD_MIN_THRESHOLD)
 
         while self._pending.size >= self._WINDOW_SAMPLES:
             frame = self._pending[: self._WINDOW_SAMPLES]
@@ -164,7 +134,7 @@ class SileroStreamingVAD:
                         self._speech_active = False
                         self._silence_samples = 0
                         stopped = True
-                        end_ms = max(0, int(round(speech_end_sample * 1000 / self._SAMPLE_RATE_HZ)))
+                        end_ms = max(0, int(round(speech_end_sample / 16)))
                 else:
                     self._silence_samples = 0
                 continue
@@ -175,29 +145,19 @@ class SileroStreamingVAD:
                 self._candidate_samples += self._WINDOW_SAMPLES
                 if self._candidate_samples >= min_speech_samples:
                     candidate_start = self._candidate_start_sample or 0
-                    prefix_samples = int(self.config.prefix_padding_ms * self._SAMPLE_RATE_HZ / 1000)
+                    prefix_samples = self.config.prefix_padding_ms * 16
                     self._speech_active = True
-                    self._candidate_samples = 0
+                    self._candidate_samples = self._silence_samples = 0
                     self._candidate_start_sample = None
-                    self._silence_samples = 0
                     contained_speech = True
                     started = True
-                    start_ms = max(
-                        0,
-                        int(round((candidate_start - prefix_samples) * 1000 / self._SAMPLE_RATE_HZ)),
-                    )
+                    start_ms = max(0, int(round((candidate_start - prefix_samples) / 16)))
             else:
                 self._candidate_samples = 0
                 self._candidate_start_sample = None
 
         return StreamingVADResult(
-            is_speech=contained_speech,
-            speech_active=self._speech_active,
-            speech_started=started,
-            speech_stopped=stopped,
-            speech_probability=max_probability,
-            speech_start_ms=start_ms,
-            speech_end_ms=end_ms,
+            contained_speech, self._speech_active, started, stopped, max_probability, start_ms, end_ms
         )
 
     def _score_frame(self, frame: np.ndarray) -> float:

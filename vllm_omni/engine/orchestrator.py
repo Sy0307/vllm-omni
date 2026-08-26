@@ -2151,16 +2151,12 @@ class Orchestrator:
                 next_logical,
             )
             if not self._is_duplex_session_request(req_state):
-                # Preserve the established failure semantics for ordinary
-                # pipelines.  This request-scoped recovery exists specifically
-                # for resumable full-duplex handoffs, where one malformed unit
-                # must not terminate the shared session orchestrator.
                 raise
             await self.output_async_queue.put(
                 ErrorMessage(
                     request_id=req_id,
                     stage_id=next_logical,
-                    error=(f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}"),
+                    error=f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}",
                     error_type=type(exc).__name__,
                 )
             )

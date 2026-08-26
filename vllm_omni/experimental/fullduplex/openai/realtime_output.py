@@ -347,7 +347,7 @@ class RealtimeOutputProjector:
                 return [event]
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
-            return [self._realtime_error_payload(code, message)]
+            return [self._realtime_error_payload(code, message, event_id=event.get("realtime_event_id"))]
         if event_type == "session.closed":
             return [{"type": "session.closed", "event": event}]
         return [{"type": f"duplex.{event_type}", "event": event}]

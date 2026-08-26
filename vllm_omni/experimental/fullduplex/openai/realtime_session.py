@@ -98,21 +98,10 @@ class NativeRealtimeSessionProtocol(
             return json.dumps(translated)
 
     def encode_outbound_event(self, data: dict[str, Any]) -> list[dict[str, object]]:
-        self._resolve_realtime_turn_detection_update(data)
         payloads = self._from_duplex_event(data)
         for payload in payloads:
             self._attach_event_id(payload)
         return payloads
-
-    def _resolve_realtime_turn_detection_update(self, data: dict[str, Any]) -> None:
-        """Publish or discard a staged VAD with the Realtime session ACK."""
-        if not self._turn_detection_update_pending:
-            return
-        event_type = data.get("type")
-        if event_type in {"session.created", "session.updated"}:
-            self.commit_realtime_turn_detection_update()
-        elif event_type == "error":
-            self.reject_realtime_turn_detection_update()
 
     @staticmethod
     def _attach_event_id(payload: dict[str, object]) -> None:

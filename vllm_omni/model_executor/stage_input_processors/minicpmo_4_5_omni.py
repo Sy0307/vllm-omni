@@ -554,12 +554,6 @@ def _native_duplex_output_is_control_only(
     output_ids: Sequence[int],
     special_token_ids: Mapping[str, int],
 ) -> bool:
-    """Whether a native output is a confirmed no-speech handoff.
-
-    Empty and control/terminal-only deltas intentionally have no Talker
-    conditioning. Any ordinary text or explicit speech boundary is not a
-    confirmed no-op and must retain the missing-hidden-state error path.
-    """
     if not output_ids:
         return True
     control_ids = {
@@ -795,9 +789,6 @@ def llm2tts(
                 if is_native_duplex_handoff and _native_duplex_output_is_control_only(
                     llm_output_ids, special_token_ids
                 ):
-                    # Listen/control/terminal outputs have no Talker payload by
-                    # design. They are a successful no-op handoff, not a stage
-                    # failure, so do not let one such unit stop the orchestrator.
                     logger.debug(
                         "Skipping no-speech MiniCPM-o native duplex handoff for request_id=%s",
                         llm_output.request_id,

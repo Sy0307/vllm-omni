@@ -502,10 +502,6 @@ class OmniDuplexSessionHandler(
                 and session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
                 and vad_speech_started is not False
             ):
-                # The configured server overlap detector classified this chunk
-                # as speech while the assistant is still generating/playing.
-                # Fence the active response so the same interrupting chunk is
-                # retained as the start of the next turn.
                 return {
                     "action": "barge_in",
                     "reason": ("server_vad_speech_started" if vad_speech_started is True else "barge_in_on_speech"),
@@ -637,7 +633,6 @@ class OmniDuplexSessionHandler(
         event: Mapping[str, object],
         payload: Mapping[str, object],
     ) -> bool | None:
-        """Return an onset edge, or None for legacy non-server-VAD input."""
         for source in (event, payload):
             vad = source.get("vad")
             if isinstance(vad, Mapping) and isinstance(vad.get("speech_started"), bool):
@@ -1200,7 +1195,13 @@ class OmniDuplexSessionHandler(
         candidate_config: DuplexSessionConfig,
     ) -> dict[str, object] | None:
         if not self._uses_native_input_append(session):
-            return None
+            if candidate_config.overlap_policy != DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value:
+                return None
+            return {
+                "type": "error",
+                "code": "server_vad_requires_native_duplex",
+                "error": "Realtime server_vad requires a model-native duplex runtime",
+            }
         if not self._config_requests_audio_output(candidate_config):
             return None
         if "ref_audio_data" in session.runtime_config:

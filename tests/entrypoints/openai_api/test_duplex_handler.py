@@ -30,6 +30,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     MiniCPMO45ServingSessionState,
 )
+from vllm_omni.experimental.fullduplex.openai import vad as realtime_vad
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexCapabilities,
     DuplexOverlapPolicy,
@@ -676,9 +677,10 @@ async def test_native_realtime_protocol_rejects_server_vad_without_interrupt():
     assert error["type"] == "error"
     assert error["error"]["code"] == "unsupported_turn_detection"
     assert "interrupt_response=false" in error["error"]["message"]
-    assert "greater than 0.15" in str(
-        protocol._validate_realtime_turn_detection({"turn_detection": {"type": "server_vad", "threshold": 0.15}})
+    threshold_error = protocol._validate_realtime_turn_detection(
+        {"turn_detection": {"type": "server_vad", "threshold": 0.15}}
     )
+    assert "greater than 0.15" in str(threshold_error)
 
 
 @pytest.mark.asyncio
@@ -726,14 +728,47 @@ async def test_native_realtime_protocol_prefers_nested_vad_over_top_level():
 
 
 @pytest.mark.asyncio
-async def test_realtime_vad_candidate_waits_for_session_ack():
-    protocol = NativeRealtimeSessionProtocol(TimedWebSocket())  # type: ignore[arg-type]
-    event = {"type": "session.update", "model": "test-model", "turn_detection": {"type": "server_vad"}}
+async def test_realtime_vad_edge_order_and_tiny_chunk_resampling(monkeypatch):
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+    protocol._server_vad = realtime_vad.SileroStreamingVAD(realtime_vad.SileroVADConfig())
+    result = realtime_vad.StreamingVADResult(True, True, True, True)
+    monkeypatch.setattr(protocol._server_vad, "process_base64", lambda *args, **kwargs: result)
+    protocol._input_speech_started = True
+    protocol._hold_realtime_output_until_session_created = False
 
-    for outbound, enabled in (({"type": "error"}, False), ({"type": "session.updated", "session": {}}, True)):
-        await protocol._to_duplex_event(event)
-        protocol.encode_outbound_event(outbound)
-        assert (protocol._server_vad is not None) is enabled
+    await protocol._to_duplex_event(
+        {"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(1), "format": "pcm_f32le"}
+    )
+
+    assert [event["type"] for event in ws.sent] == [
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.speech_started",
+    ]
+    detector = realtime_vad.SileroStreamingVAD(realtime_vad.SileroVADConfig(), frame_scorer=lambda _: 0.0)
+    one_sample = _pcm_f32_b64(1)
+    for _ in range(1024):
+        detector.process_base64(one_sample, fmt="pcm_f32le", sample_rate_hz=48_000)
+    assert detector._processed_samples + detector._pending.size == 341
+
+
+@pytest.mark.asyncio
+async def test_realtime_server_vad_runtime_failures_are_terminal(monkeypatch):
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    ws = TimedWebSocket()
+    ws.put(_server_vad_update("generic-vad", model="test-model", session_id="generic-vad"))
+    await handler.handle_session(ws, realtime_protocol=NativeRealtimeSessionProtocol({}))
+    assert ws.sent[-1]["error"]["code"] == "server_vad_requires_native_duplex"
+
+    monkeypatch.setattr(realtime_vad.SileroStreamingVAD, "process_base64", lambda *args, **kwargs: 1 / 0)
+    ws = TimedWebSocket()
+    create = _native_realtime_session_update("vad-inference-failure")
+    create["session"]["turn_detection"] = {"type": "server_vad"}
+    ws.put(create)
+    ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(1), "format": "pcm_f32le"})
+    await asyncio.wait_for(handler.handle_session(ws, realtime_protocol=NativeRealtimeSessionProtocol({})), timeout=2)
+    assert any(e.get("error", {}).get("code") == "realtime_input_failed" for e in ws.sent)
 
 
 def test_native_duplex_handler_has_no_fixed_session_admission_cap():
@@ -1335,6 +1370,14 @@ def _native_realtime_session_update(
             "idle_timeout_s": 1,
             "extra_body": {"minicpmo45_native_duplex": True},
         },
+    }
+
+
+def _server_vad_update(event_id: str, **session: object) -> dict[str, object]:
+    return {
+        "type": "session.update",
+        "event_id": event_id,
+        "session": {"turn_detection": {"type": "server_vad"}, **session},
     }
 
 
@@ -5159,33 +5202,52 @@ async def test_native_session_update_commits_config_only_after_runtime_ack():
             return await super().signal_duplex_turn_async(session_id, **kwargs)
 
     engine = BlockingUpdateEngine()
-    handler = OmniDuplexSessionHandler(
-        chat_service=FakeChatService(engine),
-        config_timeout_s=0.1,
-        idle_timeout_s=1,
-    )
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
     ws = TimedWebSocket()
-    ws.put(_session_create("sid-update-two-phase"))
-    ws.put(
-        {
-            "type": "turn.signal",
-            "event": "session.update",
-            "payload": {"instructions": "candidate instructions"},
-        }
-    )
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    ws.put(_native_realtime_session_update("sid-update-two-phase"))
+    ws.put(_server_vad_update("update-two-phase", instructions="candidate instructions"))
 
-    handler_task = asyncio.create_task(handler.handle_session(ws))
+    handler_task = asyncio.create_task(handler.handle_session(ws, realtime_protocol=protocol))
     await asyncio.wait_for(engine.update_started.wait(), timeout=1)
     live_session = handler._registry.get("sid-update-two-phase")
     assert live_session is not None
     assert live_session.config.instructions != "candidate instructions"
+    assert protocol._pending_turn_detection_update is not None
+    assert protocol._server_vad is None
+
+    protocol.encode_outbound_event({"type": "error", "code": "unrelated", "error": "unrelated"})
+    assert protocol._pending_turn_detection_update is not None
 
     engine.release_update.set()
     ws.put({"type": "session.close"})
     await asyncio.wait_for(handler_task, timeout=2)
 
-    updated = next(message for message in ws.sent if message.get("type") == "session.updated")
+    updated = next(message for message in reversed(ws.sent) if message.get("type") == "session.updated")
     assert updated["session"]["instructions"] == "candidate instructions"
+    assert isinstance(protocol._server_vad, realtime_vad.SileroStreamingVAD)
+
+
+@pytest.mark.asyncio
+async def test_realtime_vad_update_rejects_after_failed_append_without_stalling():
+    engine = FakeEngineClient(append_result={"operation": "append", "ok": False, "error_count": 1})
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    create = _native_realtime_session_update("sid-update-after-append-failure")
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(16_000), "format": "pcm_f32le"})
+    ws.put(_server_vad_update("failed-append"))
+    ws.put({"type": "session.close"})
+
+    await asyncio.wait_for(handler.handle_session(ws, realtime_protocol=protocol), timeout=2)
+
+    errors = [message.get("error") for message in ws.sent if isinstance(message.get("error"), dict)]
+    aborted = next(error for error in errors if error.get("code") == "session_update_aborted")
+    assert aborted["event_id"] == "failed-append"
+    assert protocol._server_vad is None
 
 
 @pytest.mark.asyncio
