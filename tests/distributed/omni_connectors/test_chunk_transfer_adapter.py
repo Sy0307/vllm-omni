@@ -362,6 +362,7 @@ def test_segment_boundary_starts_new_send_watermark_before_background_flush(buil
     assert "ext-stream" not in adapter.requests_num_chunks_sent
 
     request.num_computed_tokens = 3
+    request._omni_segment_generation = 1
     adapter.save_async(
         multimodal_output=None,
         request=request,
@@ -414,6 +415,7 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
     request.additional_information["meta"]["segment"] = "next"
     request.prompt_token_ids.append(3)
     request.append_output_token_ids([8])
+    request._omni_segment_generation = 1
     adapter.save_async(
         multimodal_output=None,
         request=request,
