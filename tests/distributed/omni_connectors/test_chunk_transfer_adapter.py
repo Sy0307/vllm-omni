@@ -1233,10 +1233,9 @@ def test_abort_invalidates_queued_sender_task_before_external_id_reuse(build_ada
     assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0"
 
 
-def test_inflight_send_does_not_block_other_request_enqueue(build_adapter):
+def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
     adapter, connector = build_adapter(stage_id=1)
     first = _req("req-first", RequestStatus.WAITING, external_req_id="ext-first")
-    second = _req("req-second", RequestStatus.WAITING, external_req_id="ext-second")
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
     put_started = threading.Event()
     release_put = threading.Event()
@@ -1248,19 +1247,27 @@ def test_inflight_send_does_not_block_other_request_enqueue(build_adapter):
 
     connector.put.side_effect = blocking_put
     adapter.save_async(multimodal_output=None, request=first)
-    sender = threading.Thread(target=adapter._send_single_request, args=(adapter._pending_save_reqs.popleft(),))
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
     sender.start()
     assert put_started.wait(timeout=1)
-    enqueuer = threading.Thread(target=adapter.save_async, kwargs={"request": second})
-    enqueuer.start()
+    cleaner = threading.Thread(
+        target=adapter.finish_requests,
+        args=([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first}),
+    )
+    cleaner.start()
     try:
-        enqueuer.join(timeout=0.5)
-        assert not enqueuer.is_alive()
+        cleaner.join(timeout=0.5)
+        assert not cleaner.is_alive()
+        assert task["sender_token"].cancelled
+        assert first.external_req_id in adapter._sender_tokens
     finally:
         release_put.set()
         sender.join(timeout=1)
-        enqueuer.join(timeout=1)
+        cleaner.join(timeout=1)
     assert not sender.is_alive()
+    assert first.external_req_id not in adapter._sender_tokens
+    assert first.external_req_id not in adapter.put_req_chunk
 
 
 def test_cleanup_only_affects_target_request(build_adapter):

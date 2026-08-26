@@ -27,10 +27,11 @@ logger = get_connector_logger(__name__)
 
 
 class _SenderGeneration:
-    """Serialize send and cleanup for one external request generation."""
+    """Fence one external request generation without blocking cleanup."""
 
     def __init__(self) -> None:
-        self.lock = threading.RLock()
+        self.in_flight = False
+        self.cancelled = False
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -55,8 +56,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         model_config = vllm_config.model_config
         # The base constructor starts the save thread, so sender-generation
         # state must exist before it can observe an enqueued task. The global
-        # lock only protects this map and enqueue-time counters; slow payload
-        # construction and connector writes use the per-generation lock.
+        # lock only protects this map and short state transitions. Slow payload
+        # construction and connector writes never hold it.
         self._sender_state_lock = threading.Lock()
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -274,9 +275,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "new_token_ids": tuple(int(token_id) for token_id in (new_token_ids or ())),
         }
 
+        reject_reason = None
         with self._sender_state_lock:
+            sender_token = self._sender_tokens.get(external_req_id)
+            if sender_token is not None and sender_token.cancelled:
+                reject_reason = "previous sender generation is still draining"
             # If the request is preempted, skip the already saved chunks.
-            if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(external_req_id, 0):
+            elif confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(external_req_id, 0):
                 logger.warning(
                     f"Enqueue save_async for request {external_req_id}, "
                     f"request.num_computed_tokens={request.num_computed_tokens}, "
@@ -285,13 +290,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
                 return
 
-            self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
-            task["sender_token"] = self._sender_tokens.setdefault(external_req_id, _SenderGeneration())
-            self._pending_save_reqs.append(task)
-            if is_segment_finished:
-                # The queued FIFO item now owns the old segment. Start the next
-                # segment's deduplication watermark before the worker sends it.
-                self.requests_num_chunks_sent.pop(external_req_id, None)
+            else:
+                self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
+                if sender_token is None:
+                    sender_token = _SenderGeneration()
+                    self._sender_tokens[external_req_id] = sender_token
+                task["sender_token"] = sender_token
+                self._pending_save_reqs.append(task)
+                if is_segment_finished:
+                    # The queued FIFO item now owns the old segment. Start the next
+                    # segment's deduplication watermark before the worker sends it.
+                    self.requests_num_chunks_sent.pop(external_req_id, None)
+        if reject_reason is not None:
+            logger.error("Cannot enqueue %s: %s", external_req_id, reject_reason)
+            self.record_send_failure(request.request_id, reject_reason)
+            return
         with self._save_cond:
             self._save_cond.notify()
 
@@ -423,15 +436,38 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if sender_token is None:
             self._send_single_request_for_generation(task)
             return
-        with sender_token.lock:
+        with self._sender_state_lock:
+            is_current = self._sender_tokens.get(external_req_id) is sender_token
+            if is_current and not sender_token.cancelled:
+                sender_token.in_flight = True
+            else:
+                is_current = False
+        if not is_current:
+            logger.debug("Discarding stale queued chunk for aborted request %s", external_req_id)
+            return
+        try:
+            self._send_single_request_for_generation(task, sender_token)
+        finally:
             with self._sender_state_lock:
-                is_current = self._sender_tokens.get(external_req_id) is sender_token
-            if not is_current:
-                logger.debug("Discarding stale queued chunk for aborted request %s", external_req_id)
-                return
-            self._send_single_request_for_generation(task)
+                if self._sender_tokens.get(external_req_id) is sender_token:
+                    sender_token.in_flight = False
+                    if sender_token.cancelled:
+                        self._sender_tokens.pop(external_req_id, None)
+                        self._clear_sender_state_locked(external_req_id)
 
-    def _send_single_request_for_generation(self, task: dict):
+    def _sender_generation_is_active(
+        self,
+        external_req_id: str,
+        sender_token: _SenderGeneration,
+    ) -> bool:
+        with self._sender_state_lock:
+            return self._sender_tokens.get(external_req_id) is sender_token and not sender_token.cancelled
+
+    def _send_single_request_for_generation(
+        self,
+        task: dict,
+        sender_token: _SenderGeneration | None = None,
+    ):
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
@@ -488,12 +524,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
+        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+            logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
+            return
+
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+
+        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+            logger.debug("Ignoring completed put for cancelled request %s", external_req_id)
+            return
 
         if success:
             self.put_req_chunk[external_req_id] += 1
@@ -603,8 +647,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Reclaim sender-side per-request state (keyed by external id).
 
         Called after a terminal chunk is sent or when the scheduler aborts the
-        request before a terminal chunk can be produced. The abort path must
-        reclaim the state so a later request can reuse the external id.
+        request before a terminal chunk can be produced. In-flight sends are
+        cancelled here and reclaim their own state in ``finally``; cleanup
+        never waits for connector I/O on the scheduler thread.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
@@ -613,16 +658,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if sender_token is None:
                 self._clear_sender_state_locked(external_req_id)
                 return
-
-        # Wait only for this request's in-flight put. Keeping the generation
-        # mapped until the wait completes prevents external-id reuse from
-        # overtaking an old transport write.
-        with sender_token.lock:
-            with self._sender_state_lock:
-                if self._sender_tokens.get(external_req_id) is not sender_token:
-                    return
-                self._sender_tokens.pop(external_req_id, None)
-                self._clear_sender_state_locked(external_req_id)
+            sender_token.cancelled = True
+            if sender_token.in_flight:
+                return
+            self._sender_tokens.pop(external_req_id, None)
+            self._clear_sender_state_locked(external_req_id)
 
     def _clear_sender_state_locked(self, external_req_id: str) -> None:
         """Clear sender state while ``_sender_state_lock`` is held."""
