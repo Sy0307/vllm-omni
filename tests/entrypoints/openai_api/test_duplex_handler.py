@@ -747,9 +747,8 @@ async def test_realtime_vad_edge_order_and_tiny_chunk_resampling(monkeypatch):
         "input_audio_buffer.speech_started",
     ]
     detector = realtime_vad.SileroStreamingVAD(realtime_vad.SileroVADConfig(), frame_scorer=lambda _: 0.0)
-    one_sample = _pcm_f32_b64(1)
     for _ in range(1024):
-        detector.process_base64(one_sample, fmt="pcm_f32le", sample_rate_hz=48_000)
+        detector.process_base64(_pcm_f32_b64(1), fmt="pcm_f32le", sample_rate_hz=48_000)
     assert detector._processed_samples + detector._pending.size == 341
 
 
@@ -5044,7 +5043,7 @@ async def test_audio_clear_preserves_later_wire_order_append():
 
 
 @pytest.mark.asyncio
-async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
+async def test_native_append_is_cancelled_by_later_wire_order_input_cancel(mocker):
     class SlowAppendEngine(FakeEngineClient):
         def __init__(self) -> None:
             super().__init__()
@@ -5079,6 +5078,7 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
                 fence=fence,
             )
 
+    rollback = mocker.spy(MiniCPMO45PcmAppendBuffer, "_rollback_reservation")
     engine = SlowAppendEngine()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -5109,6 +5109,7 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
     await asyncio.wait_for(handler_task, timeout=1)
 
     assert engine.append_cancelled.is_set()
+    rollback.assert_called_once()
     assert engine.signal_fences[-1] == DuplexFence("sid-cancel-slow-append")
     assert engine.signal_next_fences[-1] == DuplexFence("sid-cancel-slow-append", epoch=1)
 

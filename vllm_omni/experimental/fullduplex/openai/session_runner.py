@@ -404,6 +404,8 @@ class DuplexSessionRunnerMixin:
                             )
                     return append_ok
                 except asyncio.CancelledError:
+                    if pcm_reservation is not None:
+                        pcm_reservation.rollback()
                     raise
                 except Exception as exc:
                     if pcm_reservation is not None:

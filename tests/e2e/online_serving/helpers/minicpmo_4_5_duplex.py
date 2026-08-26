@@ -21,9 +21,7 @@ DEPLOY_CONFIG = modify_stage_config(
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
         # Talker context is 4096 (tts_config.max_position_embeddings); KV sizing
         # is left automatic so duplex matches the simplex deploy profiles.
-        "stages": {
-            1: {"max_model_len": 4096},
-        },
+        "stages": {0: {"max_num_batched_tokens": 2048}, 1: {"max_model_len": 4096}},
     },
 )
 ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"

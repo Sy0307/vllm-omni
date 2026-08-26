@@ -789,10 +789,6 @@ def llm2tts(
                 if is_native_duplex_handoff and _native_duplex_output_is_control_only(
                     llm_output_ids, special_token_ids
                 ):
-                    logger.debug(
-                        "Skipping no-speech MiniCPM-o native duplex handoff for request_id=%s",
-                        llm_output.request_id,
-                    )
                     continue
                 raise ValueError("No latent or hidden_states found in thinker output")
 

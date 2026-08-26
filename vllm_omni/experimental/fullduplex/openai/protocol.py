@@ -128,9 +128,8 @@ class DuplexCapabilities:
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
-            # Barge-in is now supported, but the wire chunk duration is
-            # client-controlled and no hardware E2E latency has been recorded.
-            # Do not advertise an invented target until that measurement exists.
+            # Barge-in latency depends on client chunking and lacks hardware E2E
+            # measurement, so do not advertise an invented target.
             target_barge_in_latency_ms=None,
         )
 
