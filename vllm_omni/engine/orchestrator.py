@@ -1053,15 +1053,16 @@ class Orchestrator:
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None or not req_state.streaming.enabled:
                 continue
-            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            req_state.streaming.segment_token_ids = (
-                self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                if req_state.streaming.segment_finished
-                else []
-            )
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
             raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segment_output_metadata = (
-                dict(raw_mm) if req_state.streaming.segment_finished and isinstance(raw_mm, dict) else {}
+            req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                finished=segment_finished,
+                token_ids=(
+                    self._coerce_int_list(getattr(eco, "new_token_ids", None))
+                    if segment_finished
+                    else []
+                ),
+                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
             )
             req_state.streaming.new_prompt_len_snapshot = getattr(
                 eco,
