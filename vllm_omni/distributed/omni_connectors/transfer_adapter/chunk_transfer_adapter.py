@@ -537,8 +537,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
             # cleanup_sender() may cancel this generation while put() is
-            # blocked. Do not let that stale completion advance counters or
-            # clean state belonging to a later request.
+            # blocked. Do not let that stale completion recreate state for a
+            # request whose cleanup is already in progress.
             logger.debug("Ignoring completed put for cancelled request %s", external_req_id)
             return
 
@@ -663,9 +663,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 return
             sender_token.cancelled = True
             if sender_token.in_flight:
-                # Keep the cancelled token mapped until the sender's finally
-                # block runs. This fences external-id reuse behind the old
-                # put() without making the scheduler wait for connector I/O.
+                # The sender's finally block is the first point where no
+                # in-flight code can mutate this request's state. Let it own
+                # cleanup without making the scheduler wait for connector I/O.
                 return
             self._sender_tokens.pop(external_req_id, None)
             self._clear_sender_state_locked(external_req_id)
