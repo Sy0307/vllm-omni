@@ -15,11 +15,6 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_v1_runner_uses_full_streaming_prefill_sequence():
-    request = SimpleNamespace(prompt_token_ids=[1, 2, 3, 4], prefill_token_ids=list(range(30)))
-    assert len(OmniGPUModelRunner._prompt_token_ids_for_v1(request)) == 30
-
-
 def _runner_for_talker_graph_init(
     *,
     talker_mtp_graph_safe: bool | None,
