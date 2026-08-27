@@ -15,6 +15,7 @@ import pytest
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
+    deploy_max_sessions,
     multi_session_args,
     realtime_url,
     resolve_ref_audio,
@@ -35,23 +36,26 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_expiry_reaper(omni_server, tmp_path: Path) -> None:
+def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None:
     args = multi_session_args(
         omni_server=omni_server,
         input_wav=validated_input_wav(),
         ref_audio=resolve_ref_audio(),
-        output_dir=tmp_path / "expiry",
+        output_dir=tmp_path / "admission_expiry",
         response_required=False,
     )
     args.sessions = 1
     args.disconnect_session_index = None
     args.takeover_session_index = None
     args.expire_session_index = 0
+    args.verify_admission_limit = deploy_max_sessions()
     result = asyncio.run(run_lifecycle_probes(args))
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["expiry"]["ok"] is True
     assert result["expiry"]["error_code"] == "session_resume_expired"
+    assert result["admission"]["ok"] is True
+    assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
 
 # CUDA-only for now: this contract asserts the model speaks while the user is
