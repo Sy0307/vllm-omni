@@ -450,7 +450,10 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.waiting = queue()
     sched.skipped_waiting = queue(session)
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(segment_finished_requests={session.request_id})
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        segment_finished_requests={session.request_id},
+    )
 
     sched._resume_downstream_chunk_receiver(session)
     sched._remove_stopped_requests_from_queues(set(), {session})
@@ -460,3 +463,24 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     assert session not in sched.skipped_waiting.requests
     assert sched.num_waiting_for_streaming_input == 0
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+
+
+def test_chunk_segment_cleanup_does_not_resume_sender() -> None:
+    """A sender-only stage must wait for its orchestrated streaming update."""
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    segment_finished_requests = {session.request_id}
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=False,
+        segment_finished_requests=segment_finished_requests,
+    )
+
+    sched._resume_downstream_chunk_receiver(session)
+
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert sched.num_waiting_for_streaming_input == 1
+    assert segment_finished_requests == {session.request_id}

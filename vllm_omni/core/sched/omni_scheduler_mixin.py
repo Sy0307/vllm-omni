@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import math
@@ -590,6 +593,10 @@ class OmniSchedulerMixin:
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
         """Resume connector polling without waiting for an external update."""
         adapter = self.chunk_transfer_adapter
+        # Sender-only stages receive the next segment from the orchestrator;
+        # requeueing them here would run without a new connector payload.
+        if adapter is None or not adapter.receives_chunks:
+            return
         adapter.segment_finished_requests.discard(request.request_id)
         if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
             return
