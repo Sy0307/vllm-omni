@@ -783,6 +783,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_output_placeholders = 0
             session.spec_token_ids = []
         stage_id = self.vllm_config.model_config.stage_id
+
+        update_infos = (
+            getattr(update, "model_intermediate_buffer", None),
+            getattr(update, "additional_information", None),
+        )
+        native_duplex_update = stage_id == 1 and any(
+            isinstance(info, dict) and info.get("native_duplex") is True for info in update_infos
+        )
+        if native_duplex_update:
+            max_model_len = int(getattr(self.vllm_config.model_config, "max_model_len", 0) or 0)
+            current_prompt_len = len(getattr(session, "prompt_token_ids", None) or ())
+            computed_tokens = int(getattr(session, "num_computed_tokens", 0) or 0)
+            kept_output_len = max(0, computed_tokens - current_prompt_len)
+            next_prompt_len = len(update.prompt_token_ids or ())
+            candidate_len = current_prompt_len + kept_output_len + next_prompt_len
+            # Keep one context position available for the next sampled codec token.
+            if max_model_len > 0 and candidate_len >= max_model_len:
+                logger.info(
+                    "Resetting native duplex Stage-1 prompt before context overflow: "
+                    "req=%s current=%s kept_output=%s next=%s max_model_len=%s",
+                    session.request_id,
+                    current_prompt_len,
+                    kept_output_len,
+                    next_prompt_len,
+                    max_model_len,
+                )
+                self._release_replaced_streaming_prompt_cache(session)
+                self._replace_streaming_session(session, update)
+                return
+
         if self.chunk_transfer_adapter and self.chunk_transfer_adapter.receives_chunks:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if stage_id != 0:
@@ -804,10 +834,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
-        update_infos = (
-            getattr(update, "model_intermediate_buffer", None),
-            getattr(update, "additional_information", None),
-        )
         replace_streaming_prompt = any(
             isinstance(info, dict)
             and isinstance(info.get("meta"), dict)
@@ -818,29 +844,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
-        native_duplex_update = any(
-            isinstance(info, dict) and info.get("native_duplex") is True for info in update_infos
-        )
-        if native_duplex_update:
-            max_model_len = int(getattr(self.vllm_config.model_config, "max_model_len", 0) or 0)
-            current_prompt_len = len(getattr(session, "prompt_token_ids", None) or ())
-            computed_tokens = int(getattr(session, "num_computed_tokens", 0) or 0)
-            kept_output_len = max(0, computed_tokens - current_prompt_len)
-            next_prompt_len = len(update.prompt_token_ids or ())
-            candidate_len = current_prompt_len + kept_output_len + next_prompt_len
-            # Keep one context position available for the next sampled codec token.
-            if max_model_len > 0 and candidate_len >= max_model_len:
-                logger.info(
-                    "Resetting native duplex Stage-1 prompt before context overflow: "
-                    "req=%s current=%s kept_output=%s next=%s max_model_len=%s",
-                    session.request_id,
-                    current_prompt_len,
-                    kept_output_len,
-                    next_prompt_len,
-                    max_model_len,
-                )
-                self._replace_streaming_session(session, update)
-                return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):

@@ -578,7 +578,7 @@ def test_native_duplex_prompt_reset_prevents_stage1_context_overflow() -> None:
     sched = _make_scheduler(stage_id=1)
     sched.vllm_config.model_config.max_model_len = 4096
     sched.chunk_transfer_adapter = SimpleNamespace(
-        receives_chunks=False,
+        receives_chunks=True,
         segment_finished_requests=set(),
     )
     session = _make_request()
@@ -603,3 +603,5 @@ def test_native_duplex_prompt_reset_prevents_stage1_context_overflow() -> None:
     assert session.num_computed_tokens == 0
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
