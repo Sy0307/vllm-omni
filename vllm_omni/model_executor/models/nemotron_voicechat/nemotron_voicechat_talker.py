@@ -35,7 +35,6 @@ via ``on_requests_finished``.
 
 from __future__ import annotations
 
-import faulthandler
 from collections.abc import Iterable
 from typing import Any
 
@@ -291,13 +290,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         guidance_enabled = self._guidance_enabled()
         generation_config = self.tts._get_generation_config(guidance_enabled)
         init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
-        logger.warning("Nemotron VoiceChat: tracing a slow first EAR-TTS forward after 30 seconds")
-        faulthandler.dump_traceback_later(30, repeat=True)
-        try:
-            with torch.inference_mode():
-                outputs = self.tts.tts_model(**init_inputs)
-        finally:
-            faulthandler.cancel_dump_traceback_later()
+        with torch.inference_mode():
+            outputs = self.tts.tts_model(**init_inputs)
         prompt_len = self._logical_prompt_len(info)
         if prompt_len is None:
             raise ValueError(
@@ -398,14 +392,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         info = merge_runtime_info(info_dict)
         device = input_ids.device
         span = int(input_ids.shape[0])
-        is_prefill_raw = info.get("_omni_is_prefill")
-        is_prefill = bool(is_prefill_raw) if isinstance(is_prefill_raw, bool) else span > 1
         request_id = require_request_id(info, "talker")
 
         embeds = torch.zeros((span, self._hidden), device=device, dtype=self._dtype)
-        if is_prefill or request_id not in self._sessions:
-            # The 1-token vLLM prefill is the session boundary: run the vendored
-            # warmup here so the first decode step is a pure NeMo t=1 step.
+        if request_id not in self._sessions:
+            # The request id, not vLLM's per-segment prefill flag, is the
+            # session boundary. Resumable updates are prefill again in v0.28
+            # and must preserve the existing EAR-TTS cache and step.
             self._init_session(request_id, info, device)
             return input_ids, embeds, {}
 
