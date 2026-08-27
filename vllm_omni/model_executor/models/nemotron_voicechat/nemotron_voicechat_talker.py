@@ -35,6 +35,7 @@ via ``on_requests_finished``.
 
 from __future__ import annotations
 
+import faulthandler
 from collections.abc import Iterable
 from typing import Any
 
@@ -290,8 +291,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         guidance_enabled = self._guidance_enabled()
         generation_config = self.tts._get_generation_config(guidance_enabled)
         init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
-        with torch.inference_mode():
-            outputs = self.tts.tts_model(**init_inputs)
+        logger.warning("Nemotron VoiceChat: tracing a slow first EAR-TTS forward after 30 seconds")
+        faulthandler.dump_traceback_later(30, repeat=True)
+        try:
+            with torch.inference_mode():
+                outputs = self.tts.tts_model(**init_inputs)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
         prompt_len = self._logical_prompt_len(info)
         if prompt_len is None:
             raise ValueError(
