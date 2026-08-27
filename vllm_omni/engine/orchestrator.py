@@ -1057,11 +1057,7 @@ class Orchestrator:
             raw_mm = self._completion_multimodal_output(eco, None)
             req_state.streaming.segments[stage_id] = StreamingSegmentState(
                 finished=segment_finished,
-                token_ids=(
-                    self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                    if segment_finished
-                    else []
-                ),
+                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
                 output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
             )
             req_state.streaming.new_prompt_len_snapshot = getattr(

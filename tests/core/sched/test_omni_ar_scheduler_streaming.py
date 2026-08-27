@@ -286,6 +286,8 @@ def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
     # Exactly the one unreported decode, so the drain reaches zero before the
     # new segment's first frame arrives.
     assert session.num_stale_output_tokens == session.num_in_flight_tokens == 1
+
+
 def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     session = _make_request()
     session.status = RequestStatus.RUNNING
@@ -574,6 +576,8 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.skipped_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()
+
+
 def test_native_duplex_prompt_reset_prevents_stage1_context_overflow() -> None:
     sched = _make_scheduler(stage_id=1)
     sched.vllm_config.model_config.max_model_len = 4096
