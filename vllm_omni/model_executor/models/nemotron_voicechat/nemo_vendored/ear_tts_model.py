@@ -108,10 +108,13 @@ try:
 except ImportError:
     TRITON_IMPORTED = False
 
-USE_TRITON = TRITON_IMPORTED and torch.cuda.is_available()
+# vLLM may import model modules before a worker initializes CUDA. Binding the
+# implementation to torch.cuda.is_available() here would permanently select
+# the slower fallback even when inference tensors later arrive on a GPU.
+USE_TRITON = TRITON_IMPORTED
 
 if USE_TRITON:
-    logging.info("Triton available & CUDA detected. Using Triton kernel for batch_matmul.")
+    logging.info("Triton available. Using its batch_matmul kernel for CUDA tensors.")
 
     @triton.jit
     def batch_matmul_kernel(
@@ -160,6 +163,8 @@ if USE_TRITON:
         tl.store(result_offset, result_block, mask=dout_mask)
 
     def batch_matmul_triton(x, w, y, BLOCK_SIZE_DIN: int = 16, BLOCK_SIZE_DOUT: int = 64):
+        if not x.is_cuda:
+            return torch.bmm(w[y], x.unsqueeze(2)).squeeze(2)
         assert x.is_contiguous() and w.is_contiguous() and y.is_contiguous()
 
         b, d_in = x.shape
