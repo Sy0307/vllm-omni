@@ -408,6 +408,12 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         self._fixup_precomputed_mrope_decode_positions(scheduler_output)
 
+    @staticmethod
+    def _prompt_token_ids_for_v1(new_req_data) -> list[int]:
+        """Use the v2 prefill sequence when Omni forces the v1 runner."""
+        prefill_token_ids = getattr(new_req_data, "prefill_token_ids", None)
+        return new_req_data.prompt_token_ids if prefill_token_ids is None else prefill_token_ids
+
     def _fixup_precomputed_mrope_decode_positions(self, scheduler_output: "SchedulerOutput") -> None:
         """Overwrite linear decode M-RoPE positions with pre-computed ones.
 
@@ -540,6 +546,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         deferred_spec_decode_corrections = []
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
+            prompt_token_ids = self._prompt_token_ids_for_v1(new_req_data)
+            if prompt_token_ids is not new_req_data.prompt_token_ids:
+                new_req_data = replace(new_req_data, prompt_token_ids=prompt_token_ids)
             req_id = new_req_data.req_id
             if req_id in self.requests:
                 self._update_streaming_input_additional_info(new_req_data, req_id)

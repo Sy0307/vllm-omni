@@ -731,6 +731,10 @@ async def test_native_realtime_protocol_rejects_server_vad_without_interrupt():
     assert error["type"] == "error"
     assert error["error"]["code"] == "unsupported_turn_detection"
     assert "interrupt_response=false" in error["error"]["message"]
+    threshold_error = protocol._validate_realtime_turn_detection(
+        {"turn_detection": {"type": "server_vad", "threshold": 0.15}}
+    )
+    assert threshold_error == "turn_detection.threshold must be greater than 0.15 and at most 1"
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,3 @@
-"""MiniCPM-o server-VAD hard-interruption acceptance driver."""
-
-from __future__ import annotations
-
 import base64
 from pathlib import Path
 
@@ -17,11 +13,7 @@ from vllm_omni.experimental.fullduplex.client import (
 
 
 def _events(events: list[dict[str, object]], response_id: str, kind: str) -> list[dict[str, object]]:
-    return [
-        event
-        for event in events
-        if event.get("type") == kind and RealtimeEventCollector.response_id(event) == response_id
-    ]
+    return [e for e in events if e.get("type") == kind and RealtimeEventCollector.response_id(e) == response_id]
 
 
 async def run_server_vad_interrupt(args) -> dict[str, object]:
