@@ -322,6 +322,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if is_segment_finished:
                     # The queued FIFO item now owns the old segment. Start the next
                     # segment's deduplication watermark before the worker sends it.
+                    self._segment_generation[external_req_id] = generation + 1
                     self.requests_num_chunks_sent.pop(external_req_id, None)
         if reject_reason is not None:
             logger.error("Cannot enqueue %s: %s", external_req_id, reject_reason)

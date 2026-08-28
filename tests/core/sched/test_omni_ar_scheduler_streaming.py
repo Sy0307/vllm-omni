@@ -318,6 +318,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched.pending_stop_after_extraction = set()
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 
