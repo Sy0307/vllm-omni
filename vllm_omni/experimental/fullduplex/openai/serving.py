@@ -1690,6 +1690,16 @@ class OmniDuplexSessionHandler(
             )
         committed_history = False
         if isinstance(item_id, str) and item_id:
+            expected_item_id = f"item_{response_id}" if response_id is not None else None
+            if (
+                expected_item_id == item_id
+                and item_id not in session.history_item_ids
+                and item_id not in session.pending_history_item_ids
+            ):
+                # ACK_ONLY responses are normally registered as pending when
+                # the response ends. Recover the response-local item if that
+                # registration was lost across the response/ack boundary.
+                session.register_history_item(item_id, None)
             committed_history = session.truncate_history_item(
                 item_id,
                 audio_end_ms=committed_cursor,

@@ -4221,6 +4221,43 @@ async def test_playback_ack_response_id_selects_matching_pending_history_item():
 
 
 @pytest.mark.asyncio
+async def test_playback_ack_recovers_missing_response_history_registration():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-playback-missing-registration",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    response_id = session.begin_response()
+    session.append_assistant_text("response text")
+    session.mark_audio_sent(1000, text_chars=len("response text"))
+    session.end_response(commit_text=True, preserve_request=True)
+    assert not session.history_item_ids
+    assert not session.pending_history_item_ids
+
+    ws = TimedWebSocket()
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    ack = next(message for message in ws.sent if message.get("type") == "playback.acknowledged")
+    assert ack["history_committed"] is True
+    assert f"item_{response_id}" in session.history_item_ids
+    assert session.history[-1] == {"role": "assistant", "content": "response text"}
+
+
+@pytest.mark.asyncio
 async def test_late_playback_ack_does_not_advance_new_response_cursor():
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(FakeEngineClient()),
