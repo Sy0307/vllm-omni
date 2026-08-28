@@ -304,7 +304,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if sender_token is not None and sender_token.cancelled:
                 reject_reason = "previous sender generation is still draining"
             # If the request is preempted, skip the already saved chunks.
-            elif confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(external_req_id, 0):
+            elif not is_segment_finished and confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(
+                external_req_id, 0
+            ):
                 logger.warning(
                     f"Enqueue save_async for request {external_req_id}, "
                     f"request.num_computed_tokens={request.num_computed_tokens}, "

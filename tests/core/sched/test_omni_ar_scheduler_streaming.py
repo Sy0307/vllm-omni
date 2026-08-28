@@ -361,6 +361,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
         next_payload,
         session,
         False,
+        new_token_ids=[43],
         confirmed_num_computed_tokens=None,
     )
 
