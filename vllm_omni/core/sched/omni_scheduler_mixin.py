@@ -848,6 +848,13 @@ class OmniSchedulerMixin:
 
         self.running[:] = [req for req in self.running if keep_running(req)]
 
+    def _drop_aborted_queued_requests(self) -> None:
+        for queue in (self.waiting, self.skipped_waiting):
+            aborted = [req for req in queue if req.status == RequestStatus.FINISHED_ABORTED]
+            if aborted:
+                queue.remove_requests(aborted)
+        self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
+
     def _resync_streaming_input_counter(self) -> None:
         counter = getattr(self, "num_waiting_for_streaming_input", None)
         if counter is None:

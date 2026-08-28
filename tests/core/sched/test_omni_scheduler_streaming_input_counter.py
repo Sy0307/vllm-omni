@@ -23,6 +23,7 @@ second on while still reporting healthy.
 from __future__ import annotations
 
 import pytest
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import RequestStatus
 
 import vllm_omni.core.sched.omni_ar_scheduler as ar_sched_mod
@@ -149,3 +150,19 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
         OmniARScheduler.schedule(scheduler)
 
     assert seen["counter"] == 0
+
+
+def test_generation_scheduler_sweep_removes_aborted_requests_from_all_queues() -> None:
+    aborted = _StubRequest("req-generation-aborted", RequestStatus.FINISHED_ABORTED)
+    scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.waiting.add_request(aborted)
+    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.skipped_waiting.add_request(aborted)
+    scheduler.running = [aborted]
+
+    scheduler._drop_aborted_queued_requests()
+
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.skipped_waiting) == []
+    assert scheduler.running == []

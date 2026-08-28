@@ -290,13 +290,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
-    def _drop_aborted_queued_requests(self) -> None:
-        for queue in (self.waiting, self.skipped_waiting):
-            aborted = [req for req in queue if req.status == RequestStatus.FINISHED_ABORTED]
-            if aborted:
-                queue.remove_requests(aborted)
-        self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
-
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -305,6 +298,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         waiting = getattr(self, "waiting")
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
+        self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
 
         original_waiting = None
@@ -455,8 +449,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
-            if generated_token_ids and getattr(request, "async_tokens_to_discard", 0) > 0:
-                self._update_request_with_output(request, generated_token_ids)
+            stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
+            if generated_token_ids and stale_async_tokens > 0:
+                # This marker is retained for compatibility with older Omni
+                # request state. vLLM's async scheduler would otherwise apply
+                # normal placeholder accounting to an already-fenced token.
+                request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
                 continue
 
             status_before_stop = request.status
