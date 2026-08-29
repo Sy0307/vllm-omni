@@ -414,6 +414,9 @@ class ConversationHistory:
     pending_truncations_ms: dict[str, int] = field(default_factory=dict)
     last_assistant_full_message: dict[str, object] | None = None
     last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
+    assistant_response_snapshots: dict[
+        str, tuple[dict[str, object], tuple[DuplexAssistantAudioTextMark, ...]]
+    ] = field(default_factory=dict)
 
 
 @dataclass
@@ -501,6 +504,16 @@ class DuplexSession:
     @property
     def last_assistant_audio_text_marks(self) -> tuple[DuplexAssistantAudioTextMark, ...]:
         return tuple(self._conversation.last_assistant_audio_text_marks)
+
+    def has_assistant_response_item(self, response_id: str, item_id: str) -> bool:
+        if item_id != f"item_{response_id}":
+            return False
+        if self.active_response_id == response_id:
+            return True
+        message = self._conversation.item_ids.get(item_id) or self._conversation.pending_item_ids.get(item_id)
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return True
+        return response_id in self._conversation.assistant_response_snapshots
 
     @property
     def playback(self) -> DuplexPlaybackView:
@@ -918,11 +931,17 @@ class DuplexSession:
         playback_commit_policy: str | None = None,
         preserve_request: bool = False,
     ) -> dict[str, object] | None:
+        response_id = self._response.active_response_id
         assistant_text = "".join(self._response.assistant_text_buffer).strip()
         message = None
         if assistant_text:
             self._conversation.last_assistant_full_message = {"role": "assistant", "content": assistant_text}
             self._conversation.last_assistant_audio_text_marks = list(self._response.assistant_audio_text_marks)
+            if response_id is not None:
+                self._conversation.assistant_response_snapshots[response_id] = (
+                    copy.deepcopy(self._conversation.last_assistant_full_message),
+                    tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+                )
         if commit_text and assistant_text:
             committed_text = self._playback_committed_text(
                 assistant_text,
@@ -946,14 +965,21 @@ class DuplexSession:
     def register_history_item(self, item_id: str | None, message: dict[str, object] | None) -> None:
         if not item_id:
             return
+        response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
+        response_snapshot = (
+            self._conversation.assistant_response_snapshots.get(response_id)
+            if response_id is not None
+            else None
+        )
+        response_audio_text_marks = list(response_snapshot[1]) if response_snapshot is not None else None
         if message is None:
-            last_message = self._conversation.last_assistant_full_message
-            if last_message is None:
+            if response_snapshot is None:
                 return
-            self._conversation.pending_item_ids[item_id] = dict(last_message)
-            if self._conversation.last_assistant_audio_text_marks:
+            last_message, audio_text_marks = response_snapshot
+            self._conversation.pending_item_ids[item_id] = copy.deepcopy(last_message)
+            if audio_text_marks:
                 self._conversation.pending_item_audio_text_marks[item_id] = list(
-                    self._conversation.last_assistant_audio_text_marks
+                    copy.deepcopy(audio_text_marks)
                 )
             pending_audio_ms = self._conversation.pending_truncations_ms.pop(item_id, None)
             if pending_audio_ms is not None:
@@ -968,7 +994,12 @@ class DuplexSession:
             self._truncate_message_to_audio_ms(
                 message,
                 audio_end_ms=pending_audio_ms,
-                marks=self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks,
+                marks=(
+                    response_audio_text_marks
+                    if response_audio_text_marks is not None
+                    else self._response.assistant_audio_text_marks
+                    or self._conversation.last_assistant_audio_text_marks
+                ),
                 playback=self._playback_cursor_for_item_id(item_id),
             )
             if self._message_text_len(message) <= 0:
@@ -980,17 +1011,27 @@ class DuplexSession:
         self._conversation.item_ids[item_id] = message
         self._conversation.pending_item_ids.pop(item_id, None)
         self._conversation.pending_item_audio_text_marks.pop(item_id, None)
+        if response_id is not None:
+            self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message.get("role") == "assistant":
-            marks = self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
+            marks = (
+                response_audio_text_marks
+                if response_audio_text_marks is not None
+                else self._response.assistant_audio_text_marks
+                or self._conversation.last_assistant_audio_text_marks
+            )
             if marks:
                 self._conversation.item_audio_text_marks[item_id] = list(marks)
 
     def delete_history_item(self, item_id: str) -> bool:
+        response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)
         pending = self._conversation.pending_item_ids.pop(item_id, None)
         self._conversation.pending_item_audio_text_marks.pop(item_id, None)
         self._conversation.pending_truncations_ms.pop(item_id, None)
+        if response_id is not None:
+            self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message is None:
             return pending is not None
         try:
@@ -1025,6 +1066,8 @@ class DuplexSession:
                     self._conversation.pending_item_ids.pop(item_id, None)
                     self._conversation.pending_item_audio_text_marks.pop(item_id, None)
                     self._conversation.pending_truncations_ms.pop(item_id, None)
+                    if item_id.startswith("item_"):
+                        self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
                 return changed
             self._conversation.messages.append(message)
             self._conversation.item_ids[item_id] = message
@@ -1035,6 +1078,8 @@ class DuplexSession:
             self._conversation.pending_item_ids.pop(item_id, None)
             self._conversation.pending_item_audio_text_marks.pop(item_id, None)
             self._conversation.pending_truncations_ms.pop(item_id, None)
+            if item_id.startswith("item_"):
+                self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
             return True
         changed = self._truncate_message_to_audio_ms(
             message,
@@ -1049,6 +1094,10 @@ class DuplexSession:
                 self._conversation.messages.remove(message)
             except ValueError:
                 pass
+            if item_id.startswith("item_"):
+                self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
+        elif changed and item_id.startswith("item_"):
+            self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
         return changed
 
     def _truncate_message_to_audio_ms(

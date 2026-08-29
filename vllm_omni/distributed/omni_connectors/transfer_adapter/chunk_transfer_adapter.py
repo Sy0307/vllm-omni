@@ -242,6 +242,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_segment_finished: bool = False,
         new_token_ids: Iterable[int] | None = None,
         confirmed_num_computed_tokens: int | None = None,
+        segment_generation: int | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -263,16 +264,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 scheduler step, before resumable cleanup mutates the request
             confirmed_num_computed_tokens: committed token count captured
                 before a streaming transition can mutate ``request``
+            segment_generation: generation captured before a resumable stop
+                can apply a queued update to the mutable request
         """
         is_finished = request.is_finished() and not request.resumable
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
         external_req_id = request.external_req_id
-        raw_generation = getattr(request, "_omni_segment_generation", 0)
-        try:
-            generation = int(raw_generation)
-        except (TypeError, ValueError):
-            generation = 0
+        if segment_generation is None:
+            raw_generation = getattr(request, "_omni_segment_generation", 0)
+            try:
+                generation = int(raw_generation)
+            except (TypeError, ValueError):
+                generation = 0
+        else:
+            generation = int(segment_generation)
         expected_generation = self._segment_generation.get(external_req_id, generation)
         if generation < expected_generation:
             logger.warning(

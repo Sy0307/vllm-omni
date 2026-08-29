@@ -439,22 +439,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or async scheduling).
                 continue
-            if output_is_stale:
-                # Output of a step scheduled before the request's in-flight
-                # tokens were discarded (segment stop / session replacement).
-                # num_computed_tokens was rolled back at the discard site, so
-                # this output must not be appended or emitted.
-                continue
-
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
-            if generated_token_ids and stale_async_tokens > 0:
-                # This marker is retained for compatibility with older Omni
-                # request state. vLLM's async scheduler would otherwise apply
-                # normal placeholder accounting to an already-fenced token.
+            async_output_is_stale = bool(generated_token_ids and stale_async_tokens > 0)
+            if async_output_is_stale:
+                # Drain this marker even when the same frame also belongs to
+                # the scheduled-token stale window below. Both accounting
+                # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
+
+            if output_is_stale or async_output_is_stale:
+                # Output of a step scheduled before the request's in-flight
+                # tokens were discarded (segment stop / session replacement).
+                # num_computed_tokens was rolled back at the discard site, so
+                # this output must not be appended or emitted.
                 continue
 
             status_before_stop = request.status
@@ -579,6 +579,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
 
             confirmed_num_computed_tokens = None
+            boundary_generation = None
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -588,6 +589,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                if self.chunk_transfer_adapter is not None:
+                    try:
+                        boundary_generation = int(getattr(request, "_omni_segment_generation", 0) or 0)
+                    except (TypeError, ValueError):
+                        boundary_generation = 0
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
                 if finished:
@@ -675,12 +681,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter is not None and (
                 inter_stage_output is not None or is_segment_finished or finished
             ):
+                save_kwargs = {
+                    "new_token_ids": new_token_ids,
+                    "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
+                }
+                if is_segment_finished:
+                    save_kwargs["segment_generation"] = boundary_generation
                 self.chunk_transfer_adapter.save_async(
                     inter_stage_output,
                     request,
                     is_segment_finished,
-                    new_token_ids=new_token_ids,
-                    confirmed_num_computed_tokens=confirmed_num_computed_tokens,
+                    **save_kwargs,
                 )
 
         self._remove_stopped_requests_from_queues(

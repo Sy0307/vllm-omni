@@ -347,6 +347,7 @@ def test_segment_boundary_starts_new_send_watermark_before_background_flush(buil
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
     request.resumable = True
+    request._omni_segment_generation = 1
     request.num_computed_tokens = 0
     adapter.requests_num_chunks_sent["ext-stream"] = 26
 
@@ -355,10 +356,12 @@ def test_segment_boundary_starts_new_send_watermark_before_background_flush(buil
         request=request,
         is_segment_finished=True,
         confirmed_num_computed_tokens=26,
+        segment_generation=0,
     )
 
     assert len(adapter._pending_save_reqs) == 1
     boundary_task = adapter._pending_save_reqs.popleft()
+    assert boundary_task["segment_generation"] == 0
     assert "ext-stream" not in adapter.requests_num_chunks_sent
 
     request.num_computed_tokens = 3

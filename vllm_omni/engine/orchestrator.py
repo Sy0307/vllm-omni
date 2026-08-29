@@ -318,7 +318,15 @@ class _OrchestratorDuplexStagePort:
             duplex_state = {}
             request_state.streaming.bridge_states["duplex"] = duplex_state
         previous_epoch = duplex_state.get("epoch")
-        if not isinstance(duplex_state.get("model_turn_id"), int) or previous_epoch != context.fence.epoch:
+        current_model_turn_id = duplex_state.get("model_turn_id")
+        if (
+            not isinstance(current_model_turn_id, int)
+            or previous_epoch != context.fence.epoch
+            or current_model_turn_id < context.fence.turn_id
+        ):
+            # A serving-side safety boundary can close a Realtime response
+            # before the model emits its normal turn_eos. Catch up the
+            # engine-owned identity when the next fenced append starts.
             duplex_state["model_turn_id"] = context.fence.turn_id
         duplex_state.update(
             {

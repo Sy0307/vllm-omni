@@ -1672,6 +1672,43 @@ class OmniDuplexSessionHandler(
         if response_id is None and item_id is None and session.active_response_id is not None:
             response_id = session.active_response_id
             item_id = f"item_{response_id}"
+        if response_id is not None:
+            expected_item_id = f"item_{response_id}"
+            if item_id is None:
+                item_id = expected_item_id
+            elif item_id != expected_item_id:
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_item_mismatch",
+                        "error": "playback.ack item_id must match item_<response_id>.",
+                    }
+                )
+                return
+            if not session.has_assistant_response_item(response_id, item_id):
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_item_not_found",
+                        "error": f"No assistant response item is registered for {response_id}.",
+                    }
+                )
+                return
+        elif item_id is not None:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "code": "playback_item_not_found",
+                    "error": "playback.ack requires a response-owned assistant item.",
+                }
+            )
+            return
         if event.get("truncate") is True:
             playback = session.acknowledge_playback(
                 int(played_ms),

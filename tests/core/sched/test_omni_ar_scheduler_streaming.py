@@ -187,6 +187,7 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
 
     def replace_with_next_segment(request: Request) -> bool:
         request.num_computed_tokens = 0
+        request._omni_segment_generation = 1
         request.status = RequestStatus.WAITING
         return False
 
@@ -203,6 +204,7 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
         True,
         new_token_ids=[42],
         confirmed_num_computed_tokens=26,
+        segment_generation=0,
     )
 
 

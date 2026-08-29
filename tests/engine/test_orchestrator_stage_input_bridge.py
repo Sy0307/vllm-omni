@@ -161,6 +161,26 @@ def _duplex_stage_port_submission():
     return port, stage_pools, request_states, prewarm, submission
 
 
+def test_duplex_bridge_state_catches_up_after_serving_turn_boundary() -> None:
+    port, _, request_states, _, submission = _duplex_stage_port_submission()
+    request_state = request_states[submission.context.request_id]
+    bridge_state = request_state.streaming.bridge_states["duplex"]
+    bridge_state["model_turn_id"] = 0
+
+    next_context = DuplexStageRequestContext(
+        request_id=submission.context.request_id,
+        session_id=submission.context.session_id,
+        fence=DuplexFence(submission.context.session_id, turn_id=1),
+        stage_id=submission.context.stage_id,
+        final_stage_id=submission.context.final_stage_id,
+        config_generation=submission.context.config_generation,
+        sampling_params=submission.context.sampling_params,
+    )
+    port.ensure_request(next_context)
+
+    assert bridge_state["model_turn_id"] == 1
+
+
 def _request_output(request_id: str) -> RequestOutput:
     completion = CompletionOutput(
         index=0,
