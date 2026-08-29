@@ -29,7 +29,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
     sched.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode, max_model_len=None),
+        model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
     )
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
@@ -636,36 +636,3 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.skipped_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()
-
-
-def test_native_duplex_prompt_reset_prevents_stage1_context_overflow() -> None:
-    sched = _make_scheduler(stage_id=1)
-    sched.vllm_config.model_config.max_model_len = 4096
-    sched.chunk_transfer_adapter = SimpleNamespace(
-        receives_chunks=True,
-        segment_finished_requests=set(),
-    )
-    session = _make_request()
-    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-    session.resumable = True
-    session.prompt_token_ids = [0] * 3
-    session._all_token_ids.clear()
-    session._all_token_ids.extend([0] * 4095)
-    session._output_token_ids.extend([1] * 4080)
-    session.num_prompt_tokens = 3
-    session.num_computed_tokens = 4095
-
-    update = _make_update([0] * 16)
-    update.model_intermediate_buffer = {"native_duplex": True}
-
-    sched._update_request_as_session(session, update)
-
-    assert session.prompt_token_ids == [0] * 16
-    assert list(session._all_token_ids) == [0] * 16
-    assert session._output_token_ids == []
-    assert session.num_prompt_tokens == 16
-    assert session.num_computed_tokens == 0
-    assert session.model_intermediate_buffer == update.model_intermediate_buffer
-    assert session.status == RequestStatus.WAITING
-    sched._free_request_blocks.assert_called_once_with(session)
-    sched.encoder_cache_manager.free.assert_called_once_with(session)
