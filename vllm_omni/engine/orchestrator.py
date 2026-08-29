@@ -423,6 +423,7 @@ class Orchestrator:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when transfer / counter emit paths access them.
     _running_counter: OmniRequestCounter | None = None
+    _engines_waiting_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
@@ -439,6 +440,7 @@ class Orchestrator:
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
@@ -475,7 +477,13 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+        self._init_metrics_state(
+            stage_pools,
+            running_counter,
+            transfer_emitter,
+            engines_waiting_counter=engines_waiting_counter,
+            log_stats=log_stats,
+        )
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
@@ -521,6 +529,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         running_counter: OmniRequestCounter | None,
         transfer_emitter: Any,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         log_stats: bool = False,
     ) -> None:
         """Wire up all metric-related orchestrator state.
@@ -546,6 +555,7 @@ class Orchestrator:
         from iteration_stats independently of scheduler gauges.
         """
         self._running_counter = running_counter
+        self._engines_waiting_counter = engines_waiting_counter
         self._transfer_emitter = transfer_emitter
 
         # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
@@ -897,14 +907,19 @@ class Orchestrator:
         When ``msg.rpc_id`` is set, emit :class:`AbortResultMessage` after
         stage aborts, binding release, and request cleanup complete so the
         caller can await acknowledgment. Fire-and-forget aborts omit rpc_id.
+
+        AR final-stage abort outputs (partial tokens) are attached to the
+        result message when ``rpc_id`` is set, or enqueued on
+        ``output_async_queue`` for fire-and-forget aborts.
         """
         request_ids = msg.request_ids
         error: str | None = None
+        abort_outputs: list[OutputMessage] = []
         try:
             # _cleanup_request_ids is CFG-aware: it expands aborted parents to
             # their companions and fails a deferred parent whose companion is
             # aborted before its output arrived.
-            await self._cleanup_request_ids(list(request_ids), abort=True)
+            abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True)
             logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
         except Exception as exc:
             error = str(exc)
@@ -919,8 +934,12 @@ class Orchestrator:
                     rpc_id=msg.rpc_id,
                     success=error is None,
                     error=error,
+                    abort_outputs=abort_outputs or None,
                 )
             )
+        elif abort_outputs:
+            for output_msg in abort_outputs:
+                await self.output_async_queue.put(output_msg)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""
@@ -960,13 +979,53 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+        """Forward abort requests to all stage pools.
+
+        Collects final-stage AR abort outputs (partial tokens) while request
+        state is still available for stage-id filtering. Diffusion pools do
+        not contribute abort outputs.
+        """
         if not request_ids:
-            return
+            return []
+        abort_outputs: list[OutputMessage] = []
         for pool in self.stage_pools:
-            await pool.abort_requests(request_ids)
+            stage_outputs = await pool.abort_requests(request_ids) or []
+            if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
+                final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
+                for orch_req_id, request_output in stage_outputs:
+                    req_state = self.request_states.get(orch_req_id)
+                    if req_state is None:
+                        continue
+                    final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+                    if pool.stage_id not in final_stage_ids:
+                        continue
+                    engine_output = OmniRequestOutput.from_stage_output(
+                        request_output,
+                        request_id=orch_req_id,
+                        finished=True,
+                        stage_id=pool.stage_id,
+                        replica_id=pool.get_bound_replica_id(orch_req_id),
+                        final_output_type=final_output_type,
+                    )
+                    abort_outputs.append(
+                        OutputMessage(
+                            request_id=orch_req_id,
+                            stage_id=pool.stage_id,
+                            replica_id=pool.get_bound_replica_id(orch_req_id),
+                            engine_outputs=engine_output,
+                            metrics=None,
+                            finished=False,
+                            stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
+                        )
+                    )
             pool.release_bindings(request_ids)
+        last_index_by_req: dict[str, int] = {}
+        for index, output_msg in enumerate(abort_outputs):
+            last_index_by_req[output_msg.request_id] = index
+        for index, output_msg in enumerate(abort_outputs):
+            output_msg.finished = index == last_index_by_req[output_msg.request_id]
+        return abort_outputs
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -1491,11 +1550,20 @@ class Orchestrator:
         """Update one replica snapshot and expose the stage-wide total."""
         self._stage_replica_waiting[(stage_id, replica_id)] = max(int(n_waiting), 0)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
 
     def _remove_stage_replica_waiting(self, stage_id: int, replica_id: int) -> None:
         """Drop a dead replica's snapshot and refresh the stage total."""
         self._stage_replica_waiting.pop((stage_id, replica_id), None)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
+
+    def _sync_engines_waiting_counter(self) -> None:
+        """Aggregate per-replica waiting into the counter shared with the
+        frontend so engine-queued requests show as waiting, not running."""
+        counter = self._engines_waiting_counter
+        if counter is not None:
+            counter.value = sum(self._stage_replica_waiting.values())
 
     def _set_stage_waiting_total(self, stage_id: int) -> None:
         if self._prom_metrics is None:
@@ -1702,7 +1770,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
-    ) -> None:
+    ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
         CFG-aware: cleaning a parent releases its tracker state and pulls its
@@ -1711,9 +1779,13 @@ class Orchestrator:
         can never complete). Every teardown path (stage error, abort, replica
         loss, membership unregister) funnels through here, so tracker state
         cannot outlive its requests.
+
+        Returns:
+            Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
+            otherwise an empty list.
         """
         if not request_ids:
-            return
+            return []
 
         cleanup_ids = list(dict.fromkeys(request_ids))
         batch = set(cleanup_ids)
@@ -1755,9 +1827,10 @@ class Orchestrator:
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
 
+        abort_outputs: list[OutputMessage] = []
         try:
             if abort:
-                await self._abort_request_ids(cleanup_ids)
+                abort_outputs = await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
@@ -1773,6 +1846,7 @@ class Orchestrator:
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
+        return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
         self,
