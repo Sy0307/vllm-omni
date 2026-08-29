@@ -414,9 +414,9 @@ class ConversationHistory:
     pending_truncations_ms: dict[str, int] = field(default_factory=dict)
     last_assistant_full_message: dict[str, object] | None = None
     last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
-    assistant_response_snapshots: dict[
-        str, tuple[dict[str, object], tuple[DuplexAssistantAudioTextMark, ...]]
-    ] = field(default_factory=dict)
+    assistant_response_snapshots: dict[str, tuple[dict[str, object], tuple[DuplexAssistantAudioTextMark, ...]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -967,9 +967,7 @@ class DuplexSession:
             return
         response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
         response_snapshot = (
-            self._conversation.assistant_response_snapshots.get(response_id)
-            if response_id is not None
-            else None
+            self._conversation.assistant_response_snapshots.get(response_id) if response_id is not None else None
         )
         response_audio_text_marks = list(response_snapshot[1]) if response_snapshot is not None else None
         if message is None:
@@ -978,9 +976,7 @@ class DuplexSession:
             last_message, audio_text_marks = response_snapshot
             self._conversation.pending_item_ids[item_id] = copy.deepcopy(last_message)
             if audio_text_marks:
-                self._conversation.pending_item_audio_text_marks[item_id] = list(
-                    copy.deepcopy(audio_text_marks)
-                )
+                self._conversation.pending_item_audio_text_marks[item_id] = list(copy.deepcopy(audio_text_marks))
             pending_audio_ms = self._conversation.pending_truncations_ms.pop(item_id, None)
             if pending_audio_ms is not None:
                 self.truncate_history_item(
@@ -997,8 +993,7 @@ class DuplexSession:
                 marks=(
                     response_audio_text_marks
                     if response_audio_text_marks is not None
-                    else self._response.assistant_audio_text_marks
-                    or self._conversation.last_assistant_audio_text_marks
+                    else self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
                 ),
                 playback=self._playback_cursor_for_item_id(item_id),
             )
@@ -1017,8 +1012,7 @@ class DuplexSession:
             marks = (
                 response_audio_text_marks
                 if response_audio_text_marks is not None
-                else self._response.assistant_audio_text_marks
-                or self._conversation.last_assistant_audio_text_marks
+                else self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
             )
             if marks:
                 self._conversation.item_audio_text_marks[item_id] = list(marks)
