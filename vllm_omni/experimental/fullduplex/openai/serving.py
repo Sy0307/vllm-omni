@@ -1698,6 +1698,17 @@ class OmniDuplexSessionHandler(
                     }
                 )
                 return
+            if session.playback_ack_is_too_late(response_id, item_id):
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_ack_too_late",
+                        "error": "playback.ack arrived after a later user input was committed.",
+                    }
+                )
+                return
         elif item_id is not None:
             await send_json(
                 {
@@ -1817,7 +1828,7 @@ class OmniDuplexSessionHandler(
             item_id = f"item_{old_response_id}"
             if committed_message is not None:
                 session.register_history_item(item_id, committed_message)
-            elif committed_ms > 0:
+            elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
         if old_request_id is not None:

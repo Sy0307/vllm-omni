@@ -1811,6 +1811,27 @@ def test_auto_response_playback_overlap_keeps_model_owned_listen_speak_decision(
     assert handler._should_force_listen_for_auto_response_overlap(session, {}, speech_payload) is False
 
 
+def test_legacy_auto_overlap_policy_falls_back_to_listen_only():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-auto-policy-fallback",
+        config=DuplexSessionConfig(
+            overlap_policy=DuplexSessionConfig._normalize_overlap_policy("auto"),
+        ),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+
+    decision = handler._overlap_decision(
+        session,
+        {"duration_ms": session.config.overlap_barge_in_ms, "is_speech": True},
+        _native_audio_payload(is_speech=True),
+    )
+
+    assert session.config.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
+    assert decision["action"] == "listen"
+    assert decision["reason"] == "policy_listen_only"
+
+
 def test_auto_response_overlap_silence_advances_model_unit_and_preserves_realtime_input():
     handler, session = _auto_response_context(
         "sid-auto-silent-wire-buffer",
@@ -4293,7 +4314,7 @@ async def test_playback_ack_recovers_missing_response_history_registration():
     session.mark_audio_sent(1000, text_chars=len("response text"))
     session.end_response(commit_text=True, preserve_request=True)
     assert not session.history_item_ids
-    assert not session.pending_history_item_ids
+    assert f"item_{response_id}" in session.pending_history_item_ids
 
     ws = TimedWebSocket()
     await handler._handle_playback_ack(
@@ -4312,6 +4333,77 @@ async def test_playback_ack_recovers_missing_response_history_registration():
     assert ack["history_committed"] is True
     assert f"item_{response_id}" in session.history_item_ids
     assert session.history[-1] == {"role": "assistant", "content": "response text"}
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_rejects_response_after_followup_user_commit():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-playback-after-followup-user",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    session.append_text("user A")
+    session.commit_user_input()
+    response_id = session.begin_response()
+    session.append_assistant_text("assistant A")
+    session.mark_audio_sent(1000, text_chars=len("assistant A"))
+    session.end_response(commit_text=False, preserve_request=True)
+    session.append_text("user B")
+    session.commit_user_input()
+    ws = TimedWebSocket()
+
+    await handler._handle_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 1000,
+            "committed_ms": 1000,
+        },
+        ws.send_json,
+    )
+
+    assert ws.sent_types() == ["error"]
+    assert ws.sent[0]["code"] == "playback_ack_too_late"
+    assert session.history == (
+        {"role": "user", "content": "user A"},
+        {"role": "user", "content": "user B"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_append_old_assistant_after_followup_user():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-cancel-after-followup-user",
+        config=DuplexSessionConfig(playback_commit_policy="ack_only"),
+    )
+    session.append_text("user A")
+    session.commit_user_input()
+    session.begin_response()
+    session.append_assistant_text("assistant A")
+    session.mark_audio_sent(1000, text_chars=len("assistant A"))
+    session.acknowledge_playback(500, 500)
+    session.append_text("user B")
+    session.commit_user_input()
+    ws = TimedWebSocket()
+
+    cancelled = await handler._cancel_active_response(session, None, ws.send_json, reason="new_response")
+
+    assert cancelled is True
+    assert session.history == (
+        {"role": "user", "content": "user A"},
+        {"role": "user", "content": "user B"},
+    )
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,7 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "item_not_found": "invalid_request_error",
     "playback_item_mismatch": "invalid_request_error",
     "playback_item_not_found": "invalid_request_error",
+    "playback_ack_too_late": "invalid_request_error",
     "unsupported_audio_format": "invalid_request_error",
     "unsupported_ref_audio_path": "invalid_request_error",
     "ref_audio_required": "invalid_request_error",
