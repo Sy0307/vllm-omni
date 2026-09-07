@@ -78,6 +78,21 @@ depends on the installed kernels and model path.
 
 ### Serving and runtime
 
+Native MRv2 chunk-wakeup experiments (both default off):
+
+- `VLLM_OMNI_CHUNK_RECV_EVENTS=1` uses Linux SHM publication notifications for
+  TP1 downstream generation receivers. Other transports/runners retain polling.
+  Registration and consumption rearm the next key; overflow and a one-second
+  reconciliation retain key-addressed recovery. Watch failures fall back to polling.
+- `VLLM_OMNI_CHUNK_ENGINE_WAKEUP=1` lets local TP1/PP1/DP1 native generation
+  EngineCore wait for chunk readiness on its input queue. It retains a 100ms
+  maintenance tick while requests are parked, and does not apply when external
+  KV/EC connectors are present. Control messages and in-flight batches continue
+  to advance. This is independent of `VLLM_OMNI_EVENT_DRIVEN_ORCH`.
+
+Both switches are read at worker initialization and enable only for the exact
+value `1`. They do not enable CUDA IPC or change payload ownership.
+
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `SPEAKER_SAMPLES_DIR` | Filesystem path; default `~/.cache/vllm-omni/speakers` | Speech server; read when speaker storage initializes | Environment-only setting. The directory is created; filesystem errors propagate. | Stable |

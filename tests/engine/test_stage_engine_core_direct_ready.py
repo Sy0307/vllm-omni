@@ -1,4 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,3 +46,20 @@ def test_uniproc_tp2_keeps_output_carried_ready_fallback(phase_locked: bool) -> 
 
     assert not core_proc_module._bind_native_data_plane_ready_sink(executor, scheduler)
     plane.set_omni_connector_output_sink.assert_not_called()
+
+
+def test_ready_is_published_before_engine_input_queue_wakeup() -> None:
+    callbacks: list[Callable[[Any], None]] = []
+    plane = SimpleNamespace(set_omni_connector_output_sink=callbacks.append)
+    executor = object.__new__(UniProcExecutor)
+    executor.driver_worker = SimpleNamespace(
+        worker=SimpleNamespace(model_runner=SimpleNamespace(_omni_data_plane=plane))
+    )
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1)
+    )
+    events = []
+    scheduler = SimpleNamespace(enqueue_omni_connector_output=lambda output: events.append(output))
+    assert core_proc_module._bind_native_data_plane_ready_sink(executor, scheduler, lambda: events.append("wake"))
+    callbacks[0]("ready")
+    assert events == ["ready", "wake"]
