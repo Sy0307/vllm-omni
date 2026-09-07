@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from pathlib import Path
 
+import pytest
 import yaml
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_indextts25_default_recipe_enables_validated_cfm_batching():

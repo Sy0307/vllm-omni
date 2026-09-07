@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 Stage 1: S2Mel decoder + BigVGAN vocoder.
 
 Receives mel_codes + latent from Stage 0 (GPT AR talker), runs flow matching
@@ -106,8 +106,6 @@ def _resolve_bigvgan_source(model_path: str, vocoder_name: str) -> str:
     )
     if local_dir is not None:
         return local_dir
-    if os.path.isdir(model_path):
-        raise FileNotFoundError(f"IndexTTS BigVGAN assets are missing from local bundle {model_path!r}")
     return vocoder_name
 
 

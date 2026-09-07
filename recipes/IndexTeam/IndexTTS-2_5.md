@@ -107,6 +107,14 @@ that guard, but should only be used when the operator owns every workload on
 the device. Benchmark the intended workload before relying on the measured
 throughput gain; MPS remains workload and GPU dependent.
 
+The continuous deploy config also exposes two experimental options, both
+disabled by default: `s2mel_async_vocoder` overlaps completed vocoder work
+with later CFM steps, and `s2mel_continuous_singleton_wait_ms` delays a newly
+admitted singleton to wait for a compatible batch. Enable these only after
+measuring warmed throughput, tail latency, and cancellation behavior on the
+target hardware. Kernel parity testing requires a CUDA toolkit with `nvcc`;
+the serving path falls back to eager activation when the extension cannot load.
+
 #### Verification
 
 Send a multilingual voice-cloning request with the bundled client. Local audio

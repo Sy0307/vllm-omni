@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections import deque
@@ -11,6 +14,8 @@ from vllm_omni.model_executor.models.indextts2.indextts2_s2mel_decoder import (
     IndexTTS2S2MelDecoder,
 )
 from vllm_omni.model_executor.models.indextts2.s2mel.modules.flow_matching import BASECFM
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _RecordingEstimator(torch.nn.Module):
@@ -31,7 +36,7 @@ class _RecordingEstimator(torch.nn.Module):
         cond: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        pre_mask = kwargs.get("pre_mask")
+        pre_mask = kwargs["pre_mask"]
         unpad_data = kwargs.get("unpad_data")
         self.timesteps.append(t.detach().clone())
         self.input_shapes.append(tuple(x.shape))
@@ -246,13 +251,21 @@ class _FakeDecoderState:
         self.target_length = int(cfm_state.x.shape[-1])
         self.ref_length = 0
         self.output_emitted = False
+        self.vocoder_queued = False
         self.cfm_admit_after = 0.0
 
 
 class _RecordingCFM:
+    estimator: object
+
     def __init__(self) -> None:
         self.calls: list[list[tuple[str, int]]] = []
         self.discard_calls: list[set[str]] = []
+        self.finalize_calls = 0
+
+    def finalize_euler_state(self, state: _FakeEulerState) -> torch.Tensor:
+        self.finalize_calls += 1
+        return torch.zeros_like(state.x)
 
     def run_euler_step(self, states: list[_FakeEulerState]) -> None:
         self.calls.append([(state.request_id, state.step_index) for state in states])
@@ -394,7 +407,7 @@ def test_continuous_decoder_initializes_each_request_once() -> None:
         info: dict[str, object],
         device: torch.device,
         model_dtype: torch.dtype,
-    ) -> SimpleNamespace:
+    ) -> _FakeDecoderState:
         del self, device, model_dtype
         initialized.append((request_id, info))
         return _FakeDecoderState(_FakeEulerState(request_id, 8))
@@ -631,14 +644,6 @@ def test_completed_request_is_not_reinitialized_before_scheduler_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfm = _RecordingCFM()
-    cfm.finalize_calls = 0
-
-    def finalize(state: _FakeEulerState) -> torch.Tensor:
-        del state
-        cfm.finalize_calls += 1
-        return torch.zeros(1, 80, 8)
-
-    cfm.finalize_euler_state = finalize
     decoder = _make_decoder_for_state_tests(cfm)
     decoder.s2mel_vocoder_bf16 = False
     initialize_calls: list[str] = []
@@ -729,7 +734,6 @@ def test_continuous_decoder_emits_payload_only_for_completed_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfm = _RecordingCFM()
-    cfm.finalize_euler_state = lambda state: torch.zeros(1, 80, 8)
     decoder = _make_decoder_for_state_tests(cfm)
     decoder.s2mel_vocoder_bf16 = False
     decoder._continuous_cfm_states = {

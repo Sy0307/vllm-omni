@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 Stage 0: GPT-2 AR Talker with vLLM-native PagedAttention.
 
 Predicts mel codes autoregressively and collects hidden_states as latent

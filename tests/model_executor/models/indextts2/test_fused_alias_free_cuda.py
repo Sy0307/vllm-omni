@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
+import os
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.utils import cpp_extension
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
@@ -16,6 +19,7 @@ from vllm_omni.model_executor.models.indextts2.s2mel.modules.alias_free_cuda.act
 pytestmark = pytest.mark.core_model
 
 
+@pytest.mark.cpu
 def test_official_fused_alias_free_falls_back_on_cpu():
     torch.manual_seed(37)
     activation = SnakeBeta(3, alpha_logscale=True)
@@ -31,6 +35,7 @@ def test_official_fused_alias_free_falls_back_on_cpu():
     assert fused.fused_activation_active is False
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("error", "fatal"),
     [
@@ -93,6 +98,9 @@ def test_official_fused_alias_free_oom_propagates_from_cuda_forward(monkeypatch)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.cuda
 def test_official_fused_alias_free_extension_matches_eager():
+    cuda_home = cpp_extension.CUDA_HOME
+    if cuda_home is None or not os.access(Path(cuda_home) / "bin" / "nvcc", os.X_OK):
+        pytest.skip("CUDA toolkit with nvcc is required to build the fused activation")
     torch.manual_seed(131)
     device = torch.device("cuda")
     activation = SnakeBeta(3, alpha_logscale=True)

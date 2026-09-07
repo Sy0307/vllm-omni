@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024 NVIDIA CORPORATION.
 
 """Lazy builder for the IndexTTS 2.5 BigVGAN fused activation."""

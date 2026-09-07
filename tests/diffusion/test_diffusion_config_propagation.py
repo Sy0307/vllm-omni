@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -92,6 +92,30 @@ class TestParallelConfigPropagation:
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.num_gpus == 2
 
+    def test_dp_is_inferred_from_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, ulysses_degree=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=8)
+        assert od.parallel_config.data_parallel_size == 2
+        assert od.parallel_config.world_size == 8
+
+    def test_explicit_dp_is_validated_against_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 2
+
+        with pytest.raises(ValueError, match="does not match WORLD-derived value"):
+            OmniDiffusionConfig.from_kwargs(
+                model="x",
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2),
+                num_gpus=8,
+            )
+
+    def test_hsdp_does_not_infer_ordinary_dp(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 1
+        assert od.parallel_config.world_size == 4
+
 
 class TestCreateDefaultDiffusion:
     """Verify engine_args structure from create_default_diffusion."""
@@ -113,6 +137,15 @@ class TestCreateDefaultDiffusion:
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["engine_args"]["cache_backend"] == "none"
 
+    def test_explicit_none_cache_backend_canonicalizes_to_none(self):
+        """Regression for #7032: ``cache_backend=None`` (e.g. an example CLI default)
+        must reach the pipeline as the canonical ``"none"`` string."""
+        od = _roundtrip_diffusion_config(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
+
+        od = OmniDiffusionConfig.from_kwargs(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
+
     def test_single_gpu_default_devices(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["runtime"]["devices"] == "0"
@@ -125,10 +158,33 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
-    def test_diffusion_kv_mode_roundtrip(self):
-        od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")
+    def test_diffusion_kv_mode_roundtrip(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+        )
 
         assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+        assert od.diffusion_kv_max_rows_per_request == 2
+
+    def test_diffusion_kv_sizing_fields_roundtrip(self, monkeypatch):
+        monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            kv_cache_memory_bytes=4096,
+            gpu_memory_utilization=0.75,
+            max_num_batched_tokens=2048,
+            max_model_len=4096,
+        )
+
+        assert od.kv_cache_memory_bytes == 4096
+        assert od.gpu_memory_utilization == 0.75
+        assert od.max_num_batched_tokens == 2048
+        assert od.max_model_len == 4096
 
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():

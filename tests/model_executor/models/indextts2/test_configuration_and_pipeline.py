@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
@@ -12,6 +13,8 @@ from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     IndexTTS25Config,
 )
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS25_PIPELINE
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_indextts25_defaults_are_distinct_from_v2():
