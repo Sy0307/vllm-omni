@@ -32,6 +32,9 @@ class _EmptyRequestQueue:
     def __len__(self) -> int:
         return 0
 
+    def __iter__(self):
+        return iter(())
+
     def prepend_requests(self, _requests) -> None:
         return None
 
@@ -59,6 +62,7 @@ def _make_scheduler(running: list[Request]) -> IndexTTS2GenerationScheduler:
     scheduler.running = running
     scheduler.requests = {request.request_id: request for request in running}
     scheduler.waiting = _EmptyRequestQueue()
+    scheduler.skipped_waiting = _EmptyRequestQueue()
     scheduler.policy = MagicMock()
     scheduler.chunk_transfer_adapter = None
     scheduler._retains_state_across_chunks = False
@@ -109,6 +113,7 @@ def _make_update_scheduler(session: Request) -> MagicMock:
     scheduler.recompute_kv_load_failures = False
     scheduler.connector = None
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.finished_req_ids_dict = {}
     scheduler.make_stats.return_value = None
     return scheduler
