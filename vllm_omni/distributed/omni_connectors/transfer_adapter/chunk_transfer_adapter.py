@@ -776,6 +776,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
+            getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
             emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
             if emitted_frames is not None:
                 emitted_frames.pop(external_req_id, None)
@@ -881,6 +882,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+        getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self._segment_generation.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)

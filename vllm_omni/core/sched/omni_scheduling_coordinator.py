@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Scheduling-side coordination for chunk and full-payload input waiting.
 
 Manages WAITING_FOR_CHUNK and WAITING_FOR_INPUT state transitions based on
@@ -411,7 +411,11 @@ class OmniSchedulingCoordinator:
                             )
 
             if model_mode != "ar":
-                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
+                new_ids = (
+                    ([0] if metadata.get("payload_ready") else [])
+                    if getattr(self, "payload_native", False)
+                    else self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
+                )
                 runtime_seed = None
                 if "left_context_size" in metadata:
                     runtime_seed = {

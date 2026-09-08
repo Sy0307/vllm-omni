@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for OmniGenerationModelRunner.sample_tokens (V2).
 
 Covers the core multimodal_outputs construction paths via _build_pooler_output:
@@ -24,6 +27,36 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_control_only_step_keeps_lifecycle_and_skips_input_construction():
+    from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+    runner = object.__new__(OmniGenerationModelRunner)
+    order = []
+    for name in (
+        "_prepare_native_data_plane",
+        "finish_requests",
+        "free_states",
+        "_apply_block_table_staged_writes_if_available",
+    ):
+        setattr(runner, name, lambda *args, name=name: order.append(name))
+    for name in ("_handle_async_chunk_updates", "add_requests", "update_requests", "_sync_native_data_plane_payloads"):
+        setattr(runner, name, MagicMock(side_effect=AssertionError("control step built model inputs")))
+    output = object()
+    runner.kv_connector = SimpleNamespace(no_forward=lambda _: output)
+    runner._merge_ec_connector_no_forward = lambda _scheduler, value: value
+    runner._attach_native_data_plane_signals = lambda value: value
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=0, scheduled_new_reqs=[], scheduled_cached_reqs=SimpleNamespace(req_ids=[])
+    )
+    assert runner.execute_model(scheduler_output) is output
+    assert order == [
+        "_prepare_native_data_plane",
+        "finish_requests",
+        "free_states",
+        "_apply_block_table_staged_writes_if_available",
+    ]
 
 
 def test_execute_model_propagates_make_omni_output_failure(monkeypatch):

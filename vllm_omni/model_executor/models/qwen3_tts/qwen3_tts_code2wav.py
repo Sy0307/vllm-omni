@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -60,6 +63,9 @@ class Qwen3TTSCode2Wav(nn.Module):
     # decoder caches must use the same IDs delivered by on_requests_finished;
     # payload metadata carries an external ID which may differ.
     requires_request_ids = True
+    # A nonempty native codes.audio payload is authoritative; token IDs may
+    # serve only as per-request control slots for the generation scheduler.
+    supports_native_payload_input = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

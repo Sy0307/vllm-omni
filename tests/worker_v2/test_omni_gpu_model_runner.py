@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for OmniGPUModelRunner v2 overrides."""
 
 from contextlib import nullcontext
@@ -682,3 +685,15 @@ def test_mtp_descriptor_falls_back_to_eager_when_no_bucket_was_captured():
     assert result.num_reqs == 6
     assert result.num_tokens == 6
     runner.cudagraph_manager.dispatch.assert_not_called()
+
+
+def test_finish_notifies_model_after_chunk_slot_was_released(monkeypatch):
+    runner = _make_runner()
+    calls = []
+    runner.model = SimpleNamespace(on_requests_finished=lambda ids: calls.append(set(ids)))
+    runner.model_state = SimpleNamespace(remove_request=lambda idx: None)
+    monkeypatch.setattr(type(runner).__bases__[0], "finish_requests", lambda *args: None)
+    runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
+    assert calls == [{"released"}]
+    runner.finish_requests(SimpleNamespace(finished_req_ids=set(), preempted_req_ids={"r2"}))
+    assert calls == [{"released"}]

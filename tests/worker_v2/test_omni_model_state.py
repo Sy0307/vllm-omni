@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for OmniModelState core methods and plugin dispatch."""
 
 from contextlib import nullcontext
@@ -83,6 +86,7 @@ def _make_state(
     model.requires_native_model_intermediate_buffer = False
     model.preprocess_batch_mrv2 = None
     model.preprocess_decode_batch_mrv2 = None
+    model.preprocess_decode_batch = None
     model.postprocess_batch_mrv2 = None
     model.get_omni_plugins = MagicMock(return_value=[])
     state.model = model
@@ -630,7 +634,8 @@ def test_run_preprocess_batches_deferred_talker_text_projection_once():
     assert torch.equal(seen_batches[1][2][1], torch.tensor([[121.0, 122.0]]))
 
 
-def test_run_preprocess_dispatches_decode_cohort_to_model_batch_hook():
+@pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
+def test_run_preprocess_dispatches_decode_cohort_to_model_batch_hook(hook_name):
     state = _make_state(max_num_reqs=2, has_preprocess=True)
     state.intermediate_buffer.buffers[0] = {"req_id": "r1", "meta": {"step": 1}}
     state.intermediate_buffer.buffers[1] = {"req_id": "r2", "meta": {"step": 2}}
@@ -649,7 +654,16 @@ def test_run_preprocess_dispatches_decode_cohort_to_model_batch_hook():
             ],
         )
 
-    state.model.preprocess_decode_batch_mrv2 = preprocess_decode_batch
+    if hook_name == "legacy":
+
+        def legacy(*, input_ids, req_infos):
+            return preprocess_decode_batch(
+                input_ids=input_ids, input_embeds=model_inputs["inputs_embeds"], req_infos=req_infos
+            )
+
+        state.model.preprocess_decode_batch = legacy
+    else:
+        setattr(state.model, hook_name, preprocess_decode_batch)
     state.model.preprocess = MagicMock(side_effect=AssertionError("decode requests must use the batch hook"))
     seen_mtp_batches = []
     seen_prepacked_mtp = []
@@ -1292,3 +1306,42 @@ def test_postprocess_model_output_propagates_make_output_failure():
 
     with pytest.raises(RuntimeError, match="broken payload"):
         state.postprocess_model_output((torch.zeros(1, 2), []), input_batch, object())
+
+
+def test_decode_hook_reuses_v1_signature_and_propagates_errors():
+    ids, infos = object(), [dict(request_id="r1")]
+
+    def legacy(*, input_ids, req_infos):
+        assert input_ids is ids and req_infos is infos
+        raise ValueError("model hook failure")
+
+    hook = OmniModelState._resolve_decode_preprocess(SimpleNamespace(preprocess_decode_batch=legacy))
+    with pytest.raises(ValueError, match="model hook failure"):
+        hook(input_ids=ids, input_embeds=object(), req_infos=infos)
+
+
+def test_v2_decode_hook_keeps_precedence():
+    def optimized(*, input_ids, input_embeds, req_infos):
+        return input_embeds
+
+    model = SimpleNamespace(preprocess_decode_batch_mrv2=optimized, preprocess_decode_batch=lambda: None)
+    assert OmniModelState._resolve_decode_preprocess(model) is optimized
+
+
+def test_output_spans_follow_reordered_mixed_batch():
+    state = _make_state(have_multimodal_outputs=True)
+    batch = _DummyInputBatch([2, 0])
+    batch.num_scheduled_tokens = [3, 1]
+    batch.query_start_loc_np = [0, 3]
+    state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
+    state.intermediate_buffer.buffers[0] = {"req_id": "decode"}
+    seen = {}
+
+    def make_output(hidden, **kwargs):
+        seen.update(kwargs)
+        return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+
+    state.model.make_omni_output = make_output
+    state.postprocess_model_output(torch.zeros(4, 2), batch, _DummyReqState())
+    assert seen["request_token_spans"] == [(0, 3), (3, 4)]
+    assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]

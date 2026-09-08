@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Omni v2 GPU model runner hooks."""
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from vllm.v1.worker.gpu.model_runner import (
     IntermediateTensors,
     build_slot_mappings_by_layer,
 )
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
@@ -203,6 +207,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # The upstream Sampler stages static parameters only in add_request.
+        # With no new requests, its UVA snapshots remain valid and immutable.
+        # Keep the upstream path for custom/speculative samplers, whose staged
+        # writes may have a different lifecycle.
+        if not scheduler_output.scheduled_new_reqs and type(getattr(self, "sampler", None)) is Sampler:
+            return
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
         if isinstance(logits_vocab, int) and logits_vocab > 0:
@@ -704,6 +714,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        on_finished = getattr(self.model, "on_requests_finished", None)
+        if finished and callable(on_finished):
+            # Request-owned state outlives generation slots and chunk boundaries.
+            # Notify even if the last chunk already released its runner slot.
+            on_finished(finished)
         preempted = scheduler_output.preempted_req_ids
         all_done = finished | preempted if preempted else finished
         for req_id in all_done:

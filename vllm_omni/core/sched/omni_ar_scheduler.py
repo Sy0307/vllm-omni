@@ -602,6 +602,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             confirmed_num_computed_tokens = None
             boundary_generation = None
+            # Capture before resumable stop handling can clear token history.
+            num_generation_tokens = len(request.output_token_ids)
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -708,6 +710,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
                     new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
+                    num_generation_tokens=num_generation_tokens,
                 )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.

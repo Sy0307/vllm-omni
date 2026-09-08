@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Connector progress must not depend on scheduling a model forward."""
 
 from types import SimpleNamespace
@@ -34,7 +37,9 @@ def test_empty_scheduler_step_pumps_kv_and_ec_connectors(runner_cls):
     idle_output = ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[], kv_connector_output=kv_output)
     runner.kv_connector = SimpleNamespace(no_forward=Mock(return_value=idle_output))
     runner.ec_connector = SimpleNamespace(no_forward=Mock(return_value=SimpleNamespace(ec_connector_output=ec_output)))
-    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=0, scheduled_new_reqs=[], scheduled_cached_reqs=SimpleNamespace(req_ids=[])
+    )
 
     output = runner.execute_model(scheduler_output)
 

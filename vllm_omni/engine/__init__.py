@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Engine components for vLLM-Omni.
 """
@@ -140,6 +143,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Authoritative segment count when the native plane suppresses token IPC.
+    num_generation_tokens: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

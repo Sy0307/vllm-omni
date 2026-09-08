@@ -803,6 +803,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             None,
         )
 
+        reported_count = getattr(engine_core_output, "num_generation_tokens", None)
+        if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count >= 0:
+            self._native_text_metric_record(req_state.external_req_id)["num_generation_tokens"] = reported_count
+
         if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
             return
 
@@ -815,7 +819,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state.lora_name,
         )
         record = self._native_text_metric_record(req_state.external_req_id)
-        record["num_generation_tokens"] = int(native_stats.num_generation_tokens)
+        record["num_generation_tokens"] = (
+            reported_count
+            if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count >= 0
+            else int(native_stats.num_generation_tokens)
+        )
         if was_prefilling:
             record["vllm_ttft_ms"] = max(float(native_stats.first_token_latency) * 1000.0, 0.0)
             return

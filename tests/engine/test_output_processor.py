@@ -130,6 +130,17 @@ def test_native_text_metrics_include_segment_generation_token_count(monkeypatch)
     assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 27
 
 
+def test_suppressed_native_tokens_use_authoritative_count_even_without_stats(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    processor._update_stats_from_output(
+        state, SimpleNamespace(new_token_ids=[2150], num_generation_tokens=2048), None, None
+    )
+    assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 2048
+
+
 def test_delta_drains_output_modality_per_step():
     """DELTA drains the mm_type key (output modality) but preserves hidden-state keys."""
     s = _make_state(RequestOutputKind.DELTA)
