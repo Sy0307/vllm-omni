@@ -11,8 +11,6 @@ import pytest
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import DuplexFence, DuplexSessionLifecycleMessage
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter import MiniCPMO45ServingRuntimeAdapter
-from vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter import NemotronVoiceChatServingRuntimeAdapter
 from vllm_omni.entrypoints.duplex.protocol import DuplexSessionConfig
 from vllm_omni.entrypoints.duplex.realtime_session import NativeRealtimeSessionProtocol
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -20,6 +18,10 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexEventJournal,
     DuplexSessionAttachmentRegistry,
     InvalidResumeTokenError,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter import MiniCPMO45ServingRuntimeAdapter
+from vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter import (
+    NemotronVoiceChatServingRuntimeAdapter,
 )
 from vllm_omni.model_executor.models.personaplex.duplex.serving_adapter import PersonaPlexServingRuntimeAdapter
 

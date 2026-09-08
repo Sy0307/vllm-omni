@@ -3,7 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -224,8 +224,9 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
         else:
             request_payload.pop(request_id, None)
     code_accumulators = getattr(transfer_manager, "code_prompt_token_ids", None)
-    if hasattr(code_accumulators, "pop"):
-        code_accumulators.pop(request_id, None)
+    pop_code_state = getattr(code_accumulators, "pop", None)
+    if callable(pop_code_state):
+        pop_code_state(request_id, None)
 
 
 def _is_aborted(request: Any) -> bool:
@@ -626,7 +627,7 @@ def _decode_native_duplex_token_ids(
     request_id: str,
 ) -> str | None:
     decode_token_ids = getattr(streaming_context, "source_token_decoder", None)
-    if not isinstance(decode_token_ids, Callable):
+    if not callable(decode_token_ids):
         return None
     decode_ids = [int(token_id) for token_id in token_ids]
     try:
@@ -1043,6 +1044,8 @@ def llm2tts(
                     continue
                 raise ValueError("No latent or hidden_states found in thinker output")
 
+        if not isinstance(latent, torch.Tensor):
+            raise ValueError("MiniCPM-o thinker latent must be a tensor")
         thinker_hidden_states = latent.detach()
         if thinker_hidden_states.ndim == 3 and thinker_hidden_states.shape[0] == 1:
             thinker_hidden_states = thinker_hidden_states.squeeze(0)
@@ -1198,7 +1201,10 @@ def llm2tts(
             if data_plane_metadata is not None:
                 model_intermediate_buffer["duplex"] = data_plane_metadata
             meta["native_duplex_segment_text"] = thinker_text
-            meta.setdefault("override_keys", []).extend(
+            override_keys = meta.setdefault("override_keys", [])
+            if not isinstance(override_keys, list):
+                raise ValueError("MiniCPM-o override_keys must be a list")
+            override_keys.extend(
                 [
                     "llm_output_text",
                     ["meta", "native_duplex_segment_text"],

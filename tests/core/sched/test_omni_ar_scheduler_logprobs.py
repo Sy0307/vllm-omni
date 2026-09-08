@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the AR sampled-token logprob contract."""
 
 from __future__ import annotations
@@ -85,6 +88,8 @@ def test_rejects_non_finite_sampled_logprob() -> None:
 
 
 class _Request:
+    streaming_prompt_continuous: bool
+
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
         self.client_index = 0
@@ -97,7 +102,7 @@ class _Request:
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
         self.has_encoder_inputs = False
-        self.pooling_params = None
+        self.pooling_params: SimpleNamespace | None = None
         self.resumable = True
         self.stop_reason = None
         self.trace_headers = None

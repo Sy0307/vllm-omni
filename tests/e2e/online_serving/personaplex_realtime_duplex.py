@@ -50,7 +50,7 @@ class RawRealtimeProbe:
         self.url = url
         self.max_size = max_size
         self.events = EventCollector()
-        self._ws = None
+        self._ws: websockets.ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> RawRealtimeProbe:
@@ -69,6 +69,7 @@ class RawRealtimeProbe:
                 pass
 
     async def _read_events(self) -> None:
+        assert self._ws is not None
         try:
             while True:
                 raw = await self._ws.recv()
@@ -81,6 +82,7 @@ class RawRealtimeProbe:
             return
 
     async def send(self, event: dict[str, object]) -> None:
+        assert self._ws is not None
         await self._ws.send(json.dumps(event))
 
 
@@ -187,12 +189,16 @@ async def _close_session(client: RawRealtimeProbe, *, timeout_s: float) -> None:
     if len(completed) != 1:
         raise AssertionError(f"expected one completed continuous response: {completed}")
     response = completed[0].get("response", {})
-    if response.get("status") != "completed" or response.get("status_details", {}).get("reason") != "stream_drained":
+    assert isinstance(response, dict)
+    status_details = response.get("status_details", {})
+    assert isinstance(status_details, dict)
+    if response.get("status") != "completed" or status_details.get("reason") != "stream_drained":
         raise AssertionError(f"close did not drain the stream: {completed}")
     ends = _events(client, "session.end")
-    if len(ends) != 1 or ends[0].get("stats", {}).get("drained") is not True:
+    if len(ends) != 1:
         raise AssertionError(f"close omitted delivery accounting: {ends}")
     stats = ends[0]["stats"]
+    assert isinstance(stats, dict) and stats.get("drained") is True
     actual_frames = len(client.events.audio_bytes()) // (2 * FRAME_SAMPLES)
     if (
         stats.get("audio_frames") != actual_frames
@@ -285,9 +291,9 @@ def _session_result(
     if not np.isfinite(pcm).all() or rms <= 1e-5:
         raise AssertionError(f"output audio is non-finite or silent: samples={pcm.size}, rms={rms}")
     rates = {
-        int(event["sample_rate_hz"])
+        rate
         for event in _events(client, "response.audio.delta")
-        if isinstance(event.get("sample_rate_hz"), int)
+        if isinstance((rate := event.get("sample_rate_hz")), int)
     }
     if rates != {SAMPLE_RATE_HZ}:
         raise AssertionError(f"unexpected output sample rates: {sorted(rates)}")

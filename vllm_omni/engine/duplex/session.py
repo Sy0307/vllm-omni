@@ -242,9 +242,9 @@ def _fingerprint_value(hasher: Any, value: object) -> None:
         for item in fields(value):
             framed(b"a", item.name.encode())
             _fingerprint_value(hasher, getattr(value, item.name))
-    elif isinstance(getattr(value, "__struct_fields__", None), tuple):
+    elif isinstance(struct_fields := getattr(value, "__struct_fields__", None), tuple):
         framed(b"u", f"{type(value).__module__}.{type(value).__qualname__}".encode())
-        for name in value.__struct_fields__:
+        for name in struct_fields:
             framed(b"a", str(name).encode())
             _fingerprint_value(hasher, getattr(value, name))
     else:

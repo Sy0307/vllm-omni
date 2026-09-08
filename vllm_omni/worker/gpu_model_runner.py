@@ -78,6 +78,8 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
 
 
 class OmniGPUModelRunner(GPUModelRunner):
+    intermediate_tensors: IntermediateTensors | None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
@@ -871,7 +873,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             return None
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
+    def extract_multimodal_outputs(
+        self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput
+    ) -> tuple[torch.Tensor, object]:
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs
@@ -1440,12 +1444,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         scheduler_output: "SchedulerOutput",
         combined_hidden_states: dict[str, torch.Tensor] | None = None,
-        combined_multimodal_outputs: dict[str, object] | None = None,
+        combined_multimodal_outputs: dict[str, dict[str, object]] | None = None,
         req_ids_filter: set[str] | None = None,
         req_ids: list[str] | None = None,
-        query_start_loc_cpu: object | None = None,
+        query_start_loc_cpu: torch.Tensor | np.ndarray | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
+        mm_out: object
         req_ids = req_ids if req_ids is not None else self.input_batch.req_ids
         if query_start_loc_cpu is None:
             query_start_loc_cpu = self.query_start_loc.cpu
@@ -1505,7 +1510,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _collect_additional_information_for_prefill(
         self,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
+    ) -> None:
         """Overlay per-request prompt_embeds for the prefill portion and collect
         additional_information slices for this step. Returns a map req_id -> dict."""
         for req_index, req_id in enumerate(self.input_batch.req_ids):
@@ -1625,7 +1630,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _preprocess_request(self, req_id, input_ids, input_embeds, req_infos, errors):
         failures = getattr(self, "_omni_failed_input_requests", None)
         if failures is None:
-            failures = self._omni_failed_input_requests = {}
+            failures = self._omni_failed_input_requests = dict[str, str]()
         try:
             if req_id in failures:
                 raise ModelInputError(failures[req_id])
@@ -1791,15 +1796,16 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
-            decode_req_ids = []
+            decode_req_ids: list[str] = []
             decode_start_offsets = []
-            decode_batch_items = []
+            decode_batch_items: list[tuple[str, int, dict[str, Any]]] = []
             batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
                 if not decode_batch_items:
                     return
+                assert callable(batch_decode_preprocess)
 
                 req_ids_b = [item[0] for item in decode_batch_items]
                 start_offsets_b = [item[1] for item in decode_batch_items]
@@ -1845,7 +1851,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # mimo-audio check
                 req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                attached_req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                assert attached_req_infos is not None
+                req_infos = attached_req_infos
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])

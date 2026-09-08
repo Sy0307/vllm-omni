@@ -121,7 +121,9 @@ def test_native_duplex_kv_preemption_recomputes_history_and_finishes(
         for event in result["events"]
         if (append := _native_append_result(event)) is not None
     ]
-    assert any(item and item.get("omni_num_preemptions", 0) >= 1 for item in observations)
+    assert any(
+        item and isinstance((count := item.get("omni_num_preemptions", 0)), int) and count >= 1 for item in observations
+    )
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -809,10 +811,14 @@ def test_native_duplex_committed_kv_recovers_on_surviving_replica(
         )
     )
 
+    assert isinstance(result["failure_latency_s"], int | float)
+    assert isinstance(result["metrics"], str)
+    assert isinstance(result["events"], list)
     assert result["failure_latency_s"] < 91
     assert result["errors"] == []
     assert result["connection_closed"] is False
     append_results = result["append_results"]
+    assert isinstance(append_results, list)
     assert len(append_results) >= 2
     first_append, recovered_append = append_results[0], append_results[-1]
     first_request_id = _native_append_request_id(first_append)
@@ -849,6 +855,7 @@ def test_native_duplex_context_rollover_bounds_kv_growth_and_continues(
     )
 
     events = result["events"]
+    assert isinstance(events, list)
     append_observations = [
         (_native_append_request_id(append_result), metrics)
         for event in events
@@ -862,16 +869,18 @@ def test_native_duplex_context_rollover_bounds_kv_growth_and_continues(
     assert len(set(request_ids)) >= 2, "the reduced Stage0 context limit did not trigger a new KV generation"
     assert any("stage0g" in request_id for request_id in request_ids if request_id is not None)
     for request_id in dict.fromkeys(request_ids):
-        generation_tokens = [
-            metrics["omni_context_tokens"]
-            for observed_request_id, metrics in append_observations
-            if observed_request_id == request_id
-        ]
+        generation_tokens: list[int] = []
+        for observed_request_id, metrics in append_observations:
+            if observed_request_id == request_id:
+                tokens = metrics["omni_context_tokens"]
+                assert isinstance(tokens, int)
+                generation_tokens.append(tokens)
         assert generation_tokens == sorted(generation_tokens)
         assert generation_tokens[-1] <= _CONTEXT_LIMIT
     assert all(metrics["omni_context_limit"] == _CONTEXT_LIMIT for _, metrics in append_observations)
 
     scraped_metrics = result["metrics"]
+    assert isinstance(scraped_metrics, str)
     assert (
         _metric_values(
             scraped_metrics,
@@ -916,6 +925,9 @@ def test_native_duplex_committed_append_lost_reply_retries_exactly_once(
     metrics = [_native_append_metrics(result) for result in append_results]
     assert all(isinstance(item, dict) for item in metrics)
     first_metrics, retry_metrics, recovered_metrics = metrics
+    assert first_metrics is not None and retry_metrics is not None and recovered_metrics is not None
+    assert isinstance(first_metrics["omni_context_tokens"], int)
+    assert isinstance(retry_metrics["omni_context_tokens"], int)
     # Initial admission reports context metrics before any scheduler receipt
     # exists, so older matching vLLM builds legitimately omit this optional
     # flag. Only the retried scheduler append must state deduplication.
@@ -975,6 +987,9 @@ def test_native_duplex_pending_append_cancel_and_close_preempt_bounded(
         return results
 
     for result in asyncio.run(run_cases()):
+        assert isinstance(result["pending_window_events"], list)
+        assert isinstance(result["events"], list)
+        assert isinstance(result["terminal_latency_s"], int | float)
         assert not any(_native_append_result(event) is not None for event in result["pending_window_events"]), (
             "the append unexpectedly completed while its EngineCore was stopped"
         )

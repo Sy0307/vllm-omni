@@ -12,7 +12,7 @@ clients via an injected factory and mutating StagePool membership.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,12 +68,10 @@ class MembershipController:
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
         self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
-        self._cleanup_callback: (
-            Callable[[int, list[str]], Awaitable[ReplicaLossCleanupResult | None]] | None
-        ) = None
+        self._cleanup_callback: Callable[[int, list[str]], Awaitable[ReplicaLossCleanupResult | None]] | None = None
         self._replica_removed_callback: Callable[[int, int], None] | None = None
 
-        self._hub = OmniCoordClientForHub(coordinator_pub_address)
+        self._hub: OmniCoordClientForHub | None = OmniCoordClientForHub(coordinator_pub_address)
         factory = load_balancer_factory
         for pool in self._stage_pools:
             pool.attach_hub(self._hub)
@@ -122,9 +120,7 @@ class MembershipController:
         stage_id: int,
         input_addr: str,
         output_queue: asyncio.Queue[EngineQueueMessage] | None = None,
-        cleanup_callback: (
-            Callable[[int, list[str]], Awaitable[ReplicaLossCleanupResult | None]] | None
-        ) = None,
+        cleanup_callback: (Callable[[int, list[str]], Awaitable[ReplicaLossCleanupResult | None]] | None) = None,
     ) -> None:
         """Handle an unregister_remote_replica message."""
         pool = self._pool_for_stage_id(stage_id)
@@ -176,7 +172,7 @@ class MembershipController:
 
     # ---- Internal ----
 
-    def _spawn_task(self, coro: Awaitable[None], *, label: str) -> None:
+    def _spawn_task(self, coro: Coroutine[object, object, None], *, label: str) -> None:
         task = asyncio.create_task(coro, name=f"membership-{label}")
         self._membership_tasks.add(task)
 
@@ -195,6 +191,8 @@ class MembershipController:
         last_up: set[tuple[int, str]] = set()
         while not self._shutdown_event.is_set():
             try:
+                if self._hub is None:
+                    return
                 snap = self._hub.get_replica_list()
                 self._watch_generation += 1
                 current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}

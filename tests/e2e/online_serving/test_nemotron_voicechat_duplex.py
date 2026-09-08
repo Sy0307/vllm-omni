@@ -65,5 +65,7 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, tmp_path: Pa
     assert result["source_frames"] == 190
     assert result["trailing_silence_frames"] == 250
     assert result["input_frames"] == 440
+    assert isinstance(result["event_counts"], dict)
+    assert isinstance(result["input_frames"], int)
     assert result["event_counts"]["response.speak"] > 0
     assert result["audio_bytes"] == result["input_frames"] * 1764 * 2

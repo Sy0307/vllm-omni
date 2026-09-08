@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for StagePool.collective_rpc EngineCore control dispatch."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,7 +17,9 @@ from vllm_omni.engine.stage_pool import StagePool
 pytestmark = [pytest.mark.core_model]
 
 
-def _make_pool(*, stage_type: str = "llm", **client_methods: AsyncMock) -> tuple[StagePool, SimpleNamespace]:
+def _make_pool(
+    *, stage_type: str = "llm", **client_methods: Callable[..., Awaitable[object]]
+) -> tuple[StagePool, SimpleNamespace]:
     client = SimpleNamespace(stage_type=stage_type, **client_methods)
     if "collective_rpc_async" not in client_methods:
         client.collective_rpc_async = AsyncMock(return_value={"via": "collective"})

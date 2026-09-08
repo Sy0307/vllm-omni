@@ -18,6 +18,7 @@ from vllm.v1.utils import ConstantList
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.base import OmniConnectorBase
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.logging import get_connector_logger
@@ -149,7 +150,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        self.connector: OmniConnectorBase = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -171,15 +172,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, object] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Persistent FIFO independent of scheduler queue placement. A yielding
         # stream rejoins the tail, behind every peer already waiting for a slot.
@@ -359,6 +360,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             segment_generation: generation captured before a resumable stop
                 can apply a queued update to the mutable request
         """
+        if request is None:
+            raise ValueError("saving a connector chunk requires a request")
         is_finished = request.is_finished() and not request.resumable
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -742,7 +745,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = (
+            unflatten_payload(raw_mm if isinstance(raw_mm, dict) else dict(raw_mm))
+            if isinstance(raw_mm, Mapping)
+            else raw_mm
+        )
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1566,7 +1573,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
-            request_ids = requests.keys()
+            request_ids = requests.keys() if requests is not None else ()
 
         connector_owned_ids = {
             request.request_id

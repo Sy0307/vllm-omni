@@ -197,6 +197,7 @@ class _MiniDiT(nn.Module):
                 x += att_b.sum(dim=(1, 2), keepdim=False).unsqueeze(1)
             x = self.blocks[b_idx](x)
             x = x + t
+            assert cnn_cache_buffer is not None and att_cache_buffer is not None
             cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
             dt = x.shape[1]
             att_cache_buffer[b_idx][:, :, :dt, :] = x.unsqueeze(1)

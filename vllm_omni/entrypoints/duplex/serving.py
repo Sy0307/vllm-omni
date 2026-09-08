@@ -18,14 +18,12 @@ from fastapi import WebSocket
 from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
 from vllm_omni.entrypoints.duplex.capability import (
     should_enable_duplex_endpoint,
 )
-from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
-from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
-from vllm_omni.engine.duplex.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.entrypoints.duplex.chat_fallback import (
     ChatFallbackProjectorMixin,
 )
@@ -1082,7 +1080,7 @@ class OmniDuplexSessionHandler(
                 attachment_send_text=attachment_send_text,
             )
 
-        if lock is None:
+        if lock is None or not isinstance(session_id, str):
             return await activate()
         async with lock:
             pending = self._pending_resume_controls.get(session_id)
@@ -1685,8 +1683,8 @@ class OmniDuplexSessionHandler(
                     "code": "native_duplex_mode_update_unsupported",
                     "error": "session.update cannot change native_duplex after the session is created",
                 }
-        if isinstance(payload.get("instructions"), str):
-            session.config.instructions = str(payload["instructions"])
+        if isinstance((checked_instructions := payload.get("instructions")), str):
+            session.config.instructions = str(checked_instructions)
         elif "instructions" in payload and payload.get("instructions") is None:
             session.config.instructions = None
         if isinstance(voice, str):
@@ -1700,8 +1698,8 @@ class OmniDuplexSessionHandler(
         response_format, _ = NativeRealtimeSessionProtocol._parse_realtime_audio_format(response_format)
         if isinstance(response_format, str) and response_format.lower() in REALTIME_OUTPUT_AUDIO_FORMATS:
             session.config.response_format = NativeRealtimeSessionProtocol._duplex_response_format(response_format)
-        if isinstance(payload.get("temperature"), int | float):
-            session.config.temperature = float(payload["temperature"])
+        if isinstance((checked_temperature := payload.get("temperature")), int | float):
+            session.config.temperature = float(checked_temperature)
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
@@ -1716,52 +1714,50 @@ class OmniDuplexSessionHandler(
         )
         if "max_response_output_tokens" in payload or "max_output_tokens" in payload or "max_tokens" in payload:
             session.config.max_tokens = NativeRealtimeSessionProtocol.realtime_max_output_tokens(max_tokens)
-        if isinstance(payload.get("overlap_policy"), str):
-            session.config.overlap_policy = DuplexSessionConfig._normalize_overlap_policy(
-                str(payload["overlap_policy"])
-            )
-        if isinstance(payload.get("overlap_short_ack_ms"), int | float):
-            session.config.overlap_short_ack_ms = max(0, int(payload["overlap_short_ack_ms"]))
-        if isinstance(payload.get("overlap_barge_in_ms"), int | float):
-            session.config.overlap_barge_in_ms = max(0, int(payload["overlap_barge_in_ms"]))
-        if isinstance(payload.get("overlap_silence_rms"), int | float):
-            session.config.overlap_silence_rms = max(0.0, float(payload["overlap_silence_rms"]))
-        if isinstance(payload.get("playback_commit_policy"), str):
+        if isinstance((checked_overlap_policy := payload.get("overlap_policy")), str):
+            session.config.overlap_policy = DuplexSessionConfig._normalize_overlap_policy(str(checked_overlap_policy))
+        if isinstance((checked_overlap_short_ack_ms := payload.get("overlap_short_ack_ms")), int | float):
+            session.config.overlap_short_ack_ms = max(0, int(checked_overlap_short_ack_ms))
+        if isinstance((checked_overlap_barge_in_ms := payload.get("overlap_barge_in_ms")), int | float):
+            session.config.overlap_barge_in_ms = max(0, int(checked_overlap_barge_in_ms))
+        if isinstance((checked_overlap_silence_rms := payload.get("overlap_silence_rms")), int | float):
+            session.config.overlap_silence_rms = max(0.0, float(checked_overlap_silence_rms))
+        if isinstance((checked_playback_commit_policy := payload.get("playback_commit_policy")), str):
             session.config.playback_commit_policy = DuplexSessionConfig._normalize_playback_commit_policy(
-                str(payload["playback_commit_policy"])
+                str(checked_playback_commit_policy)
             )
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             session.config.modalities = list(modalities)
-        if isinstance(payload.get("extra_body"), dict):
-            session.config.extra_body.update(payload["extra_body"])
-            extra = payload["extra_body"]
-            if isinstance(extra.get("overlap_policy"), str):
+        if isinstance((checked_extra_body := payload.get("extra_body")), dict):
+            session.config.extra_body.update(checked_extra_body)
+            extra = checked_extra_body
+            if isinstance((checked_overlap_policy := extra.get("overlap_policy")), str):
                 session.config.overlap_policy = DuplexSessionConfig._normalize_overlap_policy(
-                    str(extra["overlap_policy"])
+                    str(checked_overlap_policy)
                 )
-            if isinstance(extra.get("playback_commit_policy"), str):
+            if isinstance((checked_playback_commit_policy := extra.get("playback_commit_policy")), str):
                 session.config.playback_commit_policy = DuplexSessionConfig._normalize_playback_commit_policy(
-                    str(extra["playback_commit_policy"])
+                    str(checked_playback_commit_policy)
                 )
-        if isinstance(payload.get("tools"), list):
-            session.config.extra_body["realtime_tools"] = payload["tools"]
+        if isinstance((checked_tools := payload.get("tools")), list):
+            session.config.extra_body["realtime_tools"] = checked_tools
         elif "tools" in payload and payload.get("tools") is None:
             session.config.extra_body.pop("realtime_tools", None)
-        if isinstance(payload.get("tool_choice"), str | dict):
-            session.config.extra_body["realtime_tool_choice"] = payload["tool_choice"]
+        if isinstance((checked_tool_choice := payload.get("tool_choice")), str | dict):
+            session.config.extra_body["realtime_tool_choice"] = checked_tool_choice
         elif "tool_choice" in payload and payload.get("tool_choice") is None:
             session.config.extra_body.pop("realtime_tool_choice", None)
-        if isinstance(payload.get("metadata"), dict):
-            session.config.extra_body["realtime_metadata"] = dict(payload["metadata"])
+        if isinstance((checked_metadata := payload.get("metadata")), dict):
+            session.config.extra_body["realtime_metadata"] = dict(checked_metadata)
         elif "metadata" in payload and payload.get("metadata") is None:
             session.config.extra_body.pop("realtime_metadata", None)
-        if isinstance(payload.get("include"), list):
-            session.config.extra_body["realtime_include"] = list(payload["include"])
+        if isinstance((checked_include := payload.get("include")), list):
+            session.config.extra_body["realtime_include"] = list(checked_include)
         elif "include" in payload and payload.get("include") is None:
             session.config.extra_body.pop("realtime_include", None)
-        if isinstance(payload.get("prompt"), dict):
-            session.config.extra_body["realtime_prompt"] = dict(payload["prompt"])
+        if isinstance((checked_prompt := payload.get("prompt")), dict):
+            session.config.extra_body["realtime_prompt"] = dict(checked_prompt)
         elif "prompt" in payload and payload.get("prompt") is None:
             session.config.extra_body.pop("realtime_prompt", None)
         input_audio_transcription = NativeRealtimeSessionProtocol._input_audio_transcription_config(payload)
@@ -1769,9 +1765,9 @@ class OmniDuplexSessionHandler(
             session.config.extra_body["realtime_input_audio_transcription"] = dict(input_audio_transcription)
         elif "input_audio_transcription" in payload and payload.get("input_audio_transcription") is None:
             session.config.extra_body.pop("realtime_input_audio_transcription", None)
-        if isinstance(payload.get("input_audio_noise_reduction"), dict):
+        if isinstance((checked_input_audio_noise_reduction := payload.get("input_audio_noise_reduction")), dict):
             session.config.extra_body["realtime_input_audio_noise_reduction"] = dict(
-                payload["input_audio_noise_reduction"]
+                checked_input_audio_noise_reduction
             )
         elif "input_audio_noise_reduction" in payload and payload.get("input_audio_noise_reduction") is None:
             session.config.extra_body.pop("realtime_input_audio_noise_reduction", None)
@@ -1779,12 +1775,12 @@ class OmniDuplexSessionHandler(
             session.config.extra_body["realtime_input_audio_noise_reduction"] = dict(audio_input["noise_reduction"])
         elif isinstance(audio_input, dict) and audio_input.get("noise_reduction") is None:
             session.config.extra_body.pop("realtime_input_audio_noise_reduction", None)
-        if isinstance(payload.get("audio"), dict):
-            session.config.extra_body["realtime_audio"] = dict(payload["audio"])
+        if isinstance((checked_audio := payload.get("audio")), dict):
+            session.config.extra_body["realtime_audio"] = dict(checked_audio)
         elif "audio" in payload and payload.get("audio") is None:
             session.config.extra_body.pop("realtime_audio", None)
-        if isinstance(payload.get("tracing"), str | dict):
-            session.config.extra_body["realtime_tracing"] = payload["tracing"]
+        if isinstance((checked_tracing := payload.get("tracing")), str | dict):
+            session.config.extra_body["realtime_tracing"] = checked_tracing
         elif "tracing" in payload and payload.get("tracing") is None:
             session.config.extra_body.pop("realtime_tracing", None)
         session.config.extra_body["realtime_session_payload"] = (
@@ -1892,7 +1888,8 @@ class OmniDuplexSessionHandler(
             response_format = NativeRealtimeSessionProtocol._duplex_response_format(response_format)
         else:
             response_format = None
-        temperature = float(payload["temperature"]) if isinstance(payload.get("temperature"), int | float) else None
+        raw_temperature = payload.get("temperature")
+        temperature = float(raw_temperature) if isinstance(raw_temperature, int | float) else None
         speed = payload.get("speed")
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
@@ -1923,10 +1920,10 @@ class OmniDuplexSessionHandler(
         prompt = payload.get("prompt")
         if isinstance(prompt, dict):
             response_extra["realtime_response_prompt"] = dict(prompt)
-        if isinstance(payload.get("tools"), list):
-            response_extra["realtime_response_tools"] = payload["tools"]
-        if isinstance(payload.get("tool_choice"), str | dict):
-            response_extra["realtime_response_tool_choice"] = payload["tool_choice"]
+        if isinstance((checked_tools := payload.get("tools")), list):
+            response_extra["realtime_response_tools"] = checked_tools
+        if isinstance((checked_tool_choice := payload.get("tool_choice")), str | dict):
+            response_extra["realtime_response_tool_choice"] = checked_tool_choice
         extra_body = payload.get("extra_body")
         if isinstance(extra_body, dict):
             if session.capabilities.implementation_level == "model_native_duplex":
@@ -2001,6 +1998,7 @@ class OmniDuplexSessionHandler(
         return None
 
     async def _handle_playback_ack(self, session: DuplexSession, event: dict[str, object], send_json) -> None:
+        expected_item_id: str | None
         played_ms = event.get("played_ms", event.get("audio_ms", 0))
         committed_ms = event.get("committed_ms")
         if not isinstance(played_ms, int | float):

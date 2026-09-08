@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import base64
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,7 +57,7 @@ def _audio_client(
     frame_count: int = 10,
     *,
     voiced_frames: int = 0,
-) -> SimpleNamespace:
+) -> e2e_driver.RawRealtimeProbe:
     frames = np.full((frame_count, e2e_driver.FRAME_SAMPLES), 7, dtype="<i2")
     frames[:voiced_frames] = 1000
     raw = frames.tobytes()
@@ -72,12 +73,10 @@ def _audio_client(
             }
         },
     }
-    events = SimpleNamespace(
-        events=[event],
-        response_audio={"response-1": [raw]},
-        audio_bytes=lambda: raw,
-    )
-    return SimpleNamespace(events=events)
+    client = e2e_driver.RawRealtimeProbe("ws://unused")
+    client.events.add({"type": "response.created", "response": {"id": "response-1"}})
+    client.events.add({**event, "delta": base64.b64encode(raw).decode("ascii")})
+    return client
 
 
 def test_realtime_audio_frame_stats_separate_voiced_and_silent_frames() -> None:
@@ -112,7 +111,7 @@ def test_realtime_audio_frame_stats_reject_partial_codec_frame() -> None:
 
 @pytest.mark.parametrize("frame_count", [10, 40])
 def test_e2e_driver_rejects_inaudible_sessions(frame_count: int) -> None:
-    args = SimpleNamespace(
+    args = Namespace(
         max_frame_deficit=4,
         voiced_frame_rms_threshold=1e-3,
         min_voiced_frames=5,
@@ -128,7 +127,7 @@ def test_e2e_driver_rejects_inaudible_sessions(frame_count: int) -> None:
 
 
 def test_e2e_driver_uses_absolute_audible_floor() -> None:
-    args = SimpleNamespace(
+    args = Namespace(
         max_frame_deficit=4,
         voiced_frame_rms_threshold=1e-3,
         min_voiced_frames=5,

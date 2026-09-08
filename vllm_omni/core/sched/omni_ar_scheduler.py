@@ -172,9 +172,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and discard any incomplete KV-wait timing."""
+        cleanup_ids: tuple[str, ...]
+        finish_request_ids: str | Iterable[str] | None
         if isinstance(request_ids, str):
             cleanup_ids = (request_ids,)
-            finish_request_ids: str | tuple[str, ...] | None = request_ids
+            finish_request_ids = request_ids
         elif request_ids is None:
             cleanup_ids = ()
             finish_request_ids = None
@@ -869,6 +871,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
+                assert self.chunk_transfer_adapter is not None
                 self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
                 return
             if replaced is not None:

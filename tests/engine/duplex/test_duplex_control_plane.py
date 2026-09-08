@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import minicpmo45_native_capabilities
-
 import asyncio
 import logging
 from dataclasses import FrozenInstanceError
@@ -20,16 +18,11 @@ from vllm_omni.engine.duplex.control_plane import (
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
 )
-from vllm_omni.engine.duplex.runtime import (
-    DUPLEX_CONTRACT_VERSION,
-    DuplexAppendPlan,
-    DuplexInputMode,
-    DuplexRuntimeCapabilities,
-)
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.engine.duplex.messages import (
     AppendDuplexInputMessage,
     CloseDuplexSessionMessage,
+    DuplexControlResultMessage,
     DuplexFence,
     DuplexSessionLifecycleMessage,
     OpenDuplexSessionMessage,
@@ -38,10 +31,13 @@ from vllm_omni.engine.duplex.messages import (
     TouchDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.runtime import (
+    DUPLEX_CONTRACT_VERSION,
     DuplexAppendPlan,
     DuplexInputMode,
     DuplexRuntimeCapabilities,
 )
+from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import minicpmo45_native_capabilities
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1864,8 +1860,6 @@ def test_prompt_replay_capability_defaults_off_and_round_trips_when_opted_in() -
 
 @pytest.mark.parametrize("available", [False, True])
 def test_minicpmo_replay_capability_requires_the_native_append_contract(monkeypatch, available) -> None:
-    from vllm_omni.entrypoints.duplex.protocol import DuplexCapabilities
-
     monkeypatch.setattr("vllm_omni.engine.kv_append.scheduler_native_append_available", lambda: available)
     public = minicpmo45_native_capabilities()
     assert public.supports_scheduler_native_append is available
@@ -1875,7 +1869,7 @@ def test_minicpmo_replay_capability_requires_the_native_append_contract(monkeypa
 @pytest.mark.asyncio
 async def test_native_append_without_replay_does_not_journal_rollover_or_recover() -> None:
     port = _NativeStagePort()
-    sink = asyncio.Queue()
+    sink: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
     plane = DuplexControlPlane(
         extension=_Extension(),
         stage_port=port,
@@ -1916,7 +1910,7 @@ async def test_expired_operation_is_rejected_across_physical_kv_rollover(receipt
             return DuplexAppendPlan(prompt={"prompt_token_ids": [1, 2]})
 
     port = _NativeStagePort()
-    sink = asyncio.Queue()
+    sink: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
     plane = DuplexControlPlane(
         extension=Extension(),
         stage_port=port,
@@ -1948,7 +1942,7 @@ async def test_session_tombstone_capacity_rejects_before_submit_and_resets_on_ca
 
     monkeypatch.setattr(duplex_session, "_APPEND_TOMBSTONE_LIMIT", 1)
     port = _NativeStagePort()
-    sink = asyncio.Queue()
+    sink: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
     plane = DuplexControlPlane(extension=_Extension(), stage_port=port, result_sink=sink, completed_append_limit=1)
     fence = DuplexFence("receipt-capacity")
     session = _native_session(plane, fence)
@@ -2155,7 +2149,7 @@ async def test_context_rollover_keeps_recent_complete_units_and_rebases_first_re
 
         def prepare_recovery_prompt(self, *, prompt, request_id, initial):
             self.recovery_initial.append(initial)
-            copied = {
+            copied: OmniTokensPrompt = {
                 "prompt_token_ids": list(prompt["prompt_token_ids"]),
                 "model_intermediate_buffer": {
                     "request_id": request_id,
@@ -2209,7 +2203,7 @@ async def test_context_rollover_accounts_for_rebased_prefix_and_can_make_live_ap
             )
 
         def prepare_recovery_prompt(self, *, prompt, request_id, initial):
-            copied = {
+            copied: OmniTokensPrompt = {
                 "prompt_token_ids": list(prompt["prompt_token_ids"]),
                 "model_intermediate_buffer": {
                     "request_id": request_id,
@@ -2267,7 +2261,7 @@ async def test_context_rollover_rejects_oversized_rebased_candidate_before_destr
             )
 
         def prepare_recovery_prompt(self, *, prompt, request_id, initial):
-            copied = {
+            copied: OmniTokensPrompt = {
                 "prompt_token_ids": list(prompt["prompt_token_ids"]),
                 "model_intermediate_buffer": {
                     "request_id": request_id,

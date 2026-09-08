@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def test_saturated_submission_unblocks_on_deadline_or_router_shutdown(stop):
 
     request_queue = ObservedQueue(maxsize=1)
     request_queue.put("occupied")
-    result_queue = queue.Queue()
+    result_queue: queue.Queue[object] = queue.Queue()
     client = CorrelatedRpcClient(request_queue, result_queue)
     executor = ThreadPoolExecutor(max_workers=1)
     pending = executor.submit(

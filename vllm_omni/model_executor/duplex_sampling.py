@@ -60,14 +60,14 @@ class DuplexSamplingHelper:
         else:
             self.active_request_ids.discard(req_id)
 
-    def update_states(self, runner: object, scheduler_output: object) -> None:
+    def update_states(self, runner: object, scheduler_output: SchedulerOutput) -> None:
         self.active_request_ids.difference_update(str(req_id) for req_id in scheduler_output.finished_req_ids)
         for request in scheduler_output.scheduled_new_reqs:
             self.refresh_active_request(runner, str(request.req_id))
 
     def rows(self, runner: object) -> tuple[DuplexSamplingRow, ...]:
         rows: list[DuplexSamplingRow] = []
-        req_ids = [str(req_id) for req_id in getattr(runner.input_batch, "req_ids", [])]
+        req_ids = [str(req_id) for req_id in getattr(getattr(runner, "input_batch", None), "req_ids", [])]
         requests = getattr(runner, "requests", {})
         discard_mask = getattr(getattr(runner, "discard_request_mask", None), "np", None)
         input_failures = getattr(runner, "_omni_failed_input_requests", {})
@@ -86,7 +86,8 @@ class DuplexSamplingHelper:
             except (TypeError, ValueError):
                 incarnation = 0
             try:
-                seq = int(duplex.get("seq"))
+                raw_seq = duplex.get("seq")
+                seq = int(raw_seq) if raw_seq is not None else None
             except (TypeError, ValueError):
                 seq = None
             payload = duplex.get("payload")

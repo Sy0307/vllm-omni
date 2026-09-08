@@ -7,18 +7,16 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from vllm_omni.engine.duplex.runtime import DuplexInputMode
-from vllm_omni.engine.duplex.session import (
-    DuplexSessionRuntimeManager,
-    duplex_append_fingerprint,
-)
 from vllm_omni.engine.duplex.lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
 )
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.runtime import DuplexInputMode
-from vllm_omni.engine.duplex.session import DuplexSessionRuntimeManager
+from vllm_omni.engine.duplex.session import (
+    DuplexSessionRuntimeManager,
+    duplex_append_fingerprint,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -376,6 +374,8 @@ def test_recovery_journal_is_snapshot_bounded_and_cleared_by_epoch_change() -> N
         operation_fingerprint=b"fingerprint",
         prompt=source_prompt,
     )
+    assert isinstance(source_prompt["prompt_token_ids"], list)
+    assert isinstance(source_prompt["model_intermediate_buffer"], dict)
     source_prompt["prompt_token_ids"].append(99)
     source_prompt["model_intermediate_buffer"]["duplex"]["payload"]["audio"] = b"changed"
     session.record_replay_append(append)

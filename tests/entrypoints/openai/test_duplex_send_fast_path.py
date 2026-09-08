@@ -45,6 +45,7 @@ async def test_encoded_delivery_and_resume_reuse_the_immutable_snapshot(registry
     created = await registry.create("s", incarnation=0, send=dict_send, close=_noop, send_text=text_send)
     payload = {"type": "response.text.delta", "nested": [{"text": "中文😀"}]}
     entry = await registry.send_event("s", payload)
+    assert isinstance(payload["nested"], list)
     payload["nested"][0]["text"] = "mutated"
     assert initial == [entry.encoded_payload.decode("utf-8")]
     assert not control

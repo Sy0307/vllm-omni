@@ -9,7 +9,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator
 from hashlib import sha256
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -46,6 +46,14 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine import OmniEngineCoreOutput
 
 logger = init_logger(__name__)
+
+# Both concrete schedulers compose this mixin before vLLM's Scheduler. Expose
+# that required host to the type checker without changing cooperative MRO or
+# making optional scheduler methods appear on standalone test doubles.
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerHost
+else:
+    _SchedulerHost = object
 
 _STATS_INTERVAL_S = 1.0
 _NATIVE_APPEND_RECEIPT_LIMIT = 256
@@ -103,8 +111,10 @@ elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
     )
 
 
-class OmniSchedulerMixin:
+class OmniSchedulerMixin(_SchedulerHost):
     """Shared scheduler helpers for omni-specific request handling."""
+
+    running: list[Request]
 
     @staticmethod
     def _streaming_segment_input_metadata(request: Request) -> dict[str, Any] | None:
@@ -154,7 +164,7 @@ class OmniSchedulerMixin:
     def _record_native_model_input_error(self, request_id: str, error: str) -> None:
         errors = getattr(self, "_omni_native_model_input_errors", None)
         if errors is None:
-            errors = self._omni_native_model_input_errors = OrderedDict()
+            errors = self._omni_native_model_input_errors = OrderedDict[str, str]()
         errors[request_id] = str(error)[:1024]
         errors.move_to_end(request_id)
         while len(errors) > 256:
@@ -288,11 +298,11 @@ class OmniSchedulerMixin:
             raise ValueError("scheduler-native streaming prompt append requires at least one token")
         token_digest = sha256(",".join(str(token_id) for token_id in token_signature).encode()).digest()
         receipt_digest = sha256(operation_fingerprint + token_digest).digest()
-        receipts: OrderedDict[str, tuple[bytes, dict[str, int | bool | str | float]]] = getattr(
-            request,
-            "_omni_native_append_receipts",
-            OrderedDict(),
-        )
+        receipts = getattr(request, "_omni_native_append_receipts", None)
+        if receipts is None:
+            receipts = OrderedDict[str, tuple[bytes, dict[str, int | bool | str | float]]]()
+        if not isinstance(receipts, OrderedDict):
+            raise TypeError("native append receipts must preserve LRU ordering")
         operation_digest = sha256(operation_id.encode()).digest()
         evicted_receipts: set[bytes] = getattr(request, "_omni_native_append_evicted_receipts", set())
 
@@ -415,7 +425,7 @@ class OmniSchedulerMixin:
         if not getattr(request, "streaming_prompt_continuous", False):
             raise RuntimeError("request is not an Omni continuous streaming-prompt request")
         duplex = model_intermediate_buffer.get("duplex") if isinstance(model_intermediate_buffer, dict) else None
-        if isinstance(duplex, dict) and duplex.get("data_plane") is True:
+        if model_intermediate_buffer is not None and isinstance(duplex, dict) and duplex.get("data_plane") is True:
             # Engine-owned immutable unit boundary, also valid after preemption
             # resets the worker's current computed offset. Do not mutate the
             # caller's fingerprinted/replay-journal payload.
@@ -1040,6 +1050,7 @@ class OmniSchedulerMixin:
         ready_chunks = getattr(adapter, "requests_with_ready_chunks", None)
         if ready_chunks is not None:
             ready_chunks.discard(request.request_id)
+        assert adapter is not None
         adapter.segment_finished_requests.discard(request.request_id)
         if (
             not adapter.receives_chunks
@@ -1286,6 +1297,7 @@ class OmniSchedulerMixin:
         target_request_ids = target_request_ids or set()
 
         def keep_running(req: Request) -> bool:
+            assert target_request_ids is not None
             if req.request_id not in self.requests:
                 return False
             if not req.is_finished():

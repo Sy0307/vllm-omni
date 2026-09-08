@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import copy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+if TYPE_CHECKING:
+    from torch_npu.npu import Event as NPUEvent
 
 import numpy as np
 import torch
@@ -110,6 +113,10 @@ class ExecuteModelState(NamedTuple):
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
+
+    execute_model_state: ExecuteModelState | None
+    kv_extracted_req_ids: list[str] | None
+    sampling_done_event: NPUEvent | None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -309,7 +316,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def _build_multimodal_outputs(
         self,
-        per_req_payloads: list[dict[str, object] | None] | None,
+        per_req_payloads: Sequence[dict[str, object] | None] | None,
     ) -> list[dict[str, torch.Tensor] | None] | None:
         if self.vllm_config.model_config.engine_output_type == "text":
             return None
@@ -335,7 +342,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return None
         val = info.get("omni_final_stage_id")
         try:
-            return int(val)
+            return int(val) if val is not None else None
         except (TypeError, ValueError):
             return None
 
@@ -929,7 +936,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.kv_extracted_req_ids = None
         combined_hidden_states = None
         combined_multimodal_outputs = None
-        mm_cpu = {}
+        mm_cpu: dict[str, object] | None = {}
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1226,6 +1233,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         for mm_key in combined_multimodal_outputs.keys():
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
                     else:
+                        assert mm_cpu is not None
                         for mm_key, mm_val in mm_cpu.items():
                             if mm_key in {"meta.req_id", "meta.sparse_audio"}:
                                 continue
@@ -1259,6 +1267,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
+        pooler_inter: Sequence[dict[str, object] | None] | None
+        pooler_client: Sequence[dict[str, object] | None] | None
         if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:

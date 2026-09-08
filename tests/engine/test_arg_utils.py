@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for Omni config utils. For stability, these tests should largely be
 invariant to the specific attributes of vLLM config except in cases where we
@@ -26,6 +29,13 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def keep_model_paths_local_to_arg_tests(monkeypatch):
+    # vLLM 0.28 resolves remote repositories in EngineArgs.__post_init__.
+    # These tests exercise Omni argument/config plumbing, not hub downloads.
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, *_args, **_kwargs: model)
 
 
 def test_sync_config_is_omni():
@@ -63,7 +73,7 @@ def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
     class ConnectorWorker:
         model_runner_cls = ConnectorRunner
 
-    worker_module.ConnectorWorker = ConnectorWorker
+    monkeypatch.setattr(worker_module, "ConnectorWorker", ConnectorWorker, raising=False)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
     monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda _self: None)
@@ -95,7 +105,7 @@ def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch)
     class WorkerWithoutConnector:
         model_runner_cls = object
 
-    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    monkeypatch.setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector, raising=False)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
     args = OmniEngineArgs(
@@ -113,7 +123,7 @@ def test_full_payload_capability_requires_selected_worker_connector(monkeypatch)
     class WorkerWithoutConnector:
         model_runner_cls = object
 
-    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    monkeypatch.setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector, raising=False)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
     with pytest.raises(ValueError, match="does not provide an Omni connector model runner"):
@@ -130,7 +140,7 @@ def test_full_payload_capability_validates_platform_selected_worker(monkeypatch)
     class WorkerWithoutConnector:
         model_runner_cls = object
 
-    worker_module.WorkerWithoutConnector = WorkerWithoutConnector
+    monkeypatch.setattr(worker_module, "WorkerWithoutConnector", WorkerWithoutConnector, raising=False)
     monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
     monkeypatch.setattr(
         current_omni_platform,
@@ -338,6 +348,7 @@ def test_patch_missing_local_hf_config(tmp_path):
 )
 def test_non_missing_local_hf_config_error_reaches_parent_loader(tmp_path, monkeypatch, config_entry):
     """Non-missing config errors must reach vLLM's normal loader."""
+    loader_error: OSError | json.JSONDecodeError
     config_path = tmp_path / "config.json"
     if config_entry == "malformed":
         config_path.write_text("{not valid json", encoding="utf-8")

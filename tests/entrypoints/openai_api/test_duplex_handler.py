@@ -312,7 +312,7 @@ class FakeEngineClient:
 
 
 class FakeChatService:
-    duplex_serving_adapter_path = (
+    duplex_serving_adapter_path: str | None = (
         "vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
     )
 
@@ -465,6 +465,7 @@ class FakeServerVADBackend:
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
         del frame
         self.calls += 1
+        assert isinstance(state, int)
         index = int(state)
         probability = self.probabilities[index] if index < len(self.probabilities) else 0.0
         return probability, index + 1
@@ -493,6 +494,7 @@ class FailOnceServerVADBackend(FakeServerVADBackend):
         self._failed = False
 
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
+        assert isinstance(state, int)
         if not self._failed and int(state) == 2:
             self._failed = True
             raise RuntimeError("server VAD inference failed")
@@ -1300,7 +1302,7 @@ async def test_realtime_invalid_server_vad_audio_is_correlated_and_unbuffered(
 ):
     ws = TimedWebSocket()
     ws.put(_server_vad_session_update(_server_vad_turn_detection(create_response=False)))
-    event = {"type": event_type, "event_id": "event-invalid-server-vad-audio"}
+    event: dict[str, object] = {"type": event_type, "event_id": "event-invalid-server-vad-audio"}
     if event_type == "input_audio_buffer.append":
         event["audio"] = audio
     else:
@@ -7187,11 +7189,14 @@ async def test_native_server_vad_update_rejection_does_not_stall(append_fails, e
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
     create = _native_realtime_session_update("sid-rejected-vad-update")
+    assert isinstance(create["session"], dict)
+    assert isinstance(create["session"]["extra_body"], dict)
     create["session"]["extra_body"]["auto_response"] = append_fails
     ws.put(create)
     if append_fails:
         ws.put({"type": "input_audio_buffer.append", "audio": _pcm_f32_b64(16_000), "format": "pcm_f32le"})
     update = _native_server_vad_update("rejected-vad-update")
+    assert isinstance(update["session"], dict)
     if not append_fails:
         update["session"]["instructions"] = "You are now a pirate."
     ws.put(update)
@@ -8035,7 +8040,7 @@ async def test_minicpmo_auto_response_replaces_drain_for_new_physical_generation
 
     assert await handler._start_native_data_plane_stream_task(None, result(old_request_id), session=session)
     await asyncio.wait_for(started[old_request_id].wait(), timeout=1)
-    old_task = handler._minicpmo_session_state(session).data_plane_task
+    old_task = handler._runtime_session_state(session).data_plane_task
 
     # _append_runtime_input publishes the engine-returned identity before it
     # asks the stream owner to switch drains.
@@ -8043,7 +8048,7 @@ async def test_minicpmo_auto_response_replaces_drain_for_new_physical_generation
     assert await handler._start_native_data_plane_stream_task(None, result(new_request_id), session=session)
     await asyncio.wait_for(started[new_request_id].wait(), timeout=1)
 
-    native = handler._minicpmo_session_state(session)
+    native = handler._runtime_session_state(session)
     assert cancelled == [old_request_id]
     assert old_task is not native.data_plane_task
     assert native.data_plane_request_id == new_request_id
@@ -8319,7 +8324,7 @@ async def test_minicpmo_auto_response_drains_after_finished_append_placeholder(
         )
         is True
     )
-    task = handler._minicpmo_session_state(session).data_plane_task
+    task = handler._runtime_session_state(session).data_plane_task
     assert task is not None
     await asyncio.wait_for(projected.wait(), timeout=1)
     await asyncio.wait_for(task, timeout=1)
@@ -8902,6 +8907,7 @@ async def test_minicpmo_native_auto_response_real_input_waits_for_submitted_sile
             )
             self.silence_append_started = asyncio.Event()
             self.release_silence_append = asyncio.Event()
+            self.real_append_resumed = asyncio.Event()
             self.append_sequence: list[str] = []
             self.real_append_count = 0
 
@@ -8927,6 +8933,8 @@ async def test_minicpmo_native_auto_response_real_input_waits_for_submitted_sile
             ):
                 self.real_append_count += 1
                 self.append_sequence.append(f"real-{self.real_append_count}")
+                if self.real_append_count == 2:
+                    self.real_append_resumed.set()
             return result
 
     engine = SubmittedSilenceEngine()
@@ -8972,6 +8980,8 @@ async def test_minicpmo_native_auto_response_real_input_waits_for_submitted_sile
     assert engine.append_sequence == ["real-1", "silence-started"]
 
     engine.release_silence_append.set()
+    # Observe the ordered handoff before issuing a separate aborting close.
+    await asyncio.wait_for(engine.real_append_resumed.wait(), timeout=1)
     ws.put({"type": "session.close"})
     await asyncio.wait_for(handler_task, timeout=2)
 

@@ -51,7 +51,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
-        self._engine_core_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[object] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)

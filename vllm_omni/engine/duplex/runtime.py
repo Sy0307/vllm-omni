@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import cast
 
 from vllm_omni.engine.duplex.contracts import (
     DUPLEX_CONTRACT_VERSION,
@@ -14,9 +15,9 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputAction,
     DuplexOutputDecision,
     DuplexPluginDescriptor,
-    DuplexTraceEnvelope,
     DuplexRuntimeCapabilities,
     DuplexRuntimeExtension,
+    DuplexTraceEnvelope,
     SessionMode,
     duplex_data_plane_request_info,
     duplex_resource_request_belongs_to_session,
@@ -48,7 +49,7 @@ def validate_duplex_runtime_extension(
     missing = [name for name in required_methods if not callable(getattr(extension, name, None))]
     if missing:
         raise TypeError(f"Duplex runtime extension is missing callable method(s): {', '.join(missing)}")
-    typed_extension = extension  # type: ignore[assignment]
+    typed_extension = cast(DuplexRuntimeExtension, extension)
     if sampling_defaults is not None:
         configured = typed_extension.configure_sampling_params(
             runtime_config={},

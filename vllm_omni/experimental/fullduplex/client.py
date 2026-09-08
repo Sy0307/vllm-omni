@@ -517,11 +517,7 @@ class RealtimeDuplexClient:
         event.setdefault("_media_clock_ms", self._media_clock_ms)
         self.events.add(event)
         response_id = self.events.response_id(event)
-        if (
-            self.reserve_response_history
-            and event.get("type") == "response.created"
-            and response_id is not None
-        ):
+        if self.reserve_response_history and event.get("type") == "response.created" and response_id is not None:
             await self.reserve_playback_history(response_id)
 
     async def send(self, event: dict[str, object]) -> None:

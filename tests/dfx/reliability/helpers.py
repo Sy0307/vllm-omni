@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared reliability fault-injection helpers.
 
 This module keeps fault injection callable from tests directly:
@@ -26,7 +29,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import psutil
 import pytest
@@ -743,6 +746,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     snapshot = getattr(server, "reliability_fault_snapshot", None)
     if not isinstance(snapshot, dict):
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    assert isinstance(snapshot, dict)
     tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
     if not tree_pids:
         pytest.skip(f"[{scenario}] no server process tree PIDs captured for this run")
@@ -756,6 +760,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
         gpu_map = query_gpu_compute_pid_used_memory_mb()
         if gpu_map is None:
             pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
+        assert gpu_map is not None
         last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
         if not last_alive and not last_gpu_leaks:
             return
@@ -781,11 +786,18 @@ def assert_no_worker_residual_and_gpu_release(
     )
 
 
+class _FaultSnapshot(TypedDict):
+    root_pids: list[int]
+    tree_pids: list[int]
+    worker_pids: list[int]
+    worker_markers: list[str]
+
+
 def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int]]:
+) -> _FaultSnapshot:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -801,7 +813,7 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot = {
+    snapshot: _FaultSnapshot = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,

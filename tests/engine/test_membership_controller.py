@@ -42,13 +42,13 @@ async def _wait_until(predicate, timeout=1):
 class FakePool:
     def __init__(self, stage_id: int):
         self.stage_id = stage_id
-        self.clients = []
-        self.added = []
-        self.removed = []
-        self.invalidated = []
+        self.clients: list[SimpleNamespace] = []
+        self.added: list[tuple[str, SimpleNamespace, int | None]] = []
+        self.removed: list[str] = []
+        self.invalidated: list[str] = []
         self.hub = None
         self.lb = None
-        self.replica_ids = {}
+        self.replica_ids: dict[str, int] = {}
 
     def attach_hub(self, hub):
         self.hub = hub
@@ -247,7 +247,7 @@ async def test_unregister_reports_typed_terminal_error_for_native_kv_request(mon
     pool = FakePool(stage_id=0)
     pool.replica_ids["tcp://lost-native"] = 0
     controller = _controller(monkeypatch, pool, FakeHub())
-    output_queue = asyncio.Queue()
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
     cleanup_calls = []
 
     async def cleanup(stage_id, request_ids):
@@ -276,7 +276,7 @@ async def test_unregister_suppresses_terminal_error_for_replay_safe_native_reque
     pool = FakePool(stage_id=0)
     pool.replica_ids["tcp://lost-native"] = 0
     controller = _controller(monkeypatch, pool, FakeHub())
-    output_queue = asyncio.Queue()
+    output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
 
     async def cleanup(stage_id, request_ids):
         assert stage_id == 0
@@ -559,7 +559,7 @@ async def test_up_observed_before_attach_does_not_qualify_attachment(monkeypatch
         ]
     )
     shutdown_calls = []
-    sleep_gates = asyncio.Queue()
+    sleep_gates: asyncio.Queue[asyncio.Event] = asyncio.Queue()
 
     async def _controlled_sleep(_delay):
         gate = asyncio.Event()

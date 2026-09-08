@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
 import runpy
@@ -13,8 +13,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input_history import DuplexPromptHistory
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input_history import DuplexPromptHistory
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.output_templates import ModelInputError
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -141,7 +141,7 @@ def test_failed_preprocess_uses_v028_embedding_interface_without_a_template():
     model = Model()
     runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
     runner.model = model
-    errors = {}
+    errors: dict[str, str] = {}
     for _ in range(2):
         _, embeddings, payload = runner._preprocess_request(
             "bad", torch.tensor([1]), None, {"request_id": "bad"}, errors
@@ -225,7 +225,7 @@ def test_runner_latches_preparation_failure_without_failing_peer():
 
     runner = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
     runner.model = SimpleNamespace(preprocess=prepare)
-    errors = {}
+    errors: dict[str, str] = {}
     for _ in range(2):
         _, embeds, _ = runner._preprocess_request(
             "bad", torch.tensor([1]), torch.ones(1, 2), {"request_id": "bad"}, errors

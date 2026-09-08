@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
+from argparse import Namespace
 from collections import deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -79,7 +80,7 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
         num_prompt_tokens=2,
         update_block_hashes=mocker.Mock(),
     )
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1, 2, 3]},
         "meta": {
             "replace_streaming_prompt": True,
@@ -99,7 +100,7 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
 
 def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4064)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "replace_streaming_prompt": True,
@@ -130,7 +131,7 @@ def test_streaming_prompt_rejects_invalid_generation_reserve(
     reserve: object,
 ) -> None:
     request = _streaming_request(mocker, num_computed_tokens=10)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 10,
@@ -144,7 +145,7 @@ def test_streaming_prompt_rejects_invalid_generation_reserve(
 
 def test_capacity_managed_streaming_window_at_limit_still_appends(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4060)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 10,
@@ -172,7 +173,7 @@ def test_capacity_managed_streaming_prompt_appends_from_declared_length_without_
     mocker: MockerFixture,
 ) -> None:
     request = _streaming_request(mocker, num_computed_tokens=20)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"tts": [1, 2, 3]},
         "hidden_states": {"tts": [[0.1], [0.2], [0.3]]},
         "meta": {
@@ -211,7 +212,7 @@ def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixtur
         num_output_placeholders=1,
         update_block_hashes=mocker.Mock(),
     )
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 10,
@@ -247,7 +248,7 @@ def test_capacity_policy_turn_start_replacement_does_not_require_generation_rese
     mocker: MockerFixture,
 ) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4064)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "replace_streaming_prompt": True,
@@ -281,7 +282,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
         num_output_placeholders=0,
         update_block_hashes=mocker.Mock(),
     )
-    second = {
+    second: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 12,
@@ -307,7 +308,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
     request._all_token_ids.extend([201, 202, 203])
     request._output_token_ids.extend([201, 202, 203])
     request.num_computed_tokens = 4017
-    third = {
+    third: dict[str, dict[str, object]] = {
         "ids": {"prompt": [2]},
         "meta": {
             "next_stage_prompt_len": 60,
@@ -333,7 +334,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
     request._all_token_ids.extend([301])
     request._output_token_ids.extend([301])
     request.num_computed_tokens = 76
-    fourth = {
+    fourth: dict[str, dict[str, object]] = {
         "ids": {"prompt": [3]},
         "meta": {
             "next_stage_prompt_len": 8,
@@ -359,7 +360,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
 
 def test_capacity_rollover_requires_explicit_window_contract(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4064)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 10,
@@ -383,7 +384,7 @@ def test_capacity_managed_streaming_prompt_rejects_nonpositive_length(
     mocker: MockerFixture, next_stage_prompt_len: int
 ) -> None:
     request = _streaming_request(mocker, num_computed_tokens=0)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": next_stage_prompt_len,
@@ -397,7 +398,7 @@ def test_capacity_managed_streaming_prompt_rejects_nonpositive_length(
 
 def test_capacity_managed_streaming_prompt_rejects_fresh_overflow(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=0)
-    payload = {
+    payload: dict[str, dict[str, object]] = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 4071,
@@ -1736,7 +1737,7 @@ def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):
     request = _req("req-1", RequestStatus.WAITING)
     request.additional_information = {"tts_token_ids": torch.tensor([1])}
     waiting_queue = DummyWaitingQueue([request])
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
 
     adapter.load_async(request)
     adapter.process_pending_chunks(
@@ -1776,7 +1777,7 @@ def test_fifo_promotion(build_adapter):
     adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
@@ -1806,7 +1807,7 @@ def test_non_active_waiting_request_is_held_off_scheduler(build_adapter):
     active = _req("req-active", RequestStatus.WAITING)
     non_active = _req("req-non-active", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([active, non_active])
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
@@ -1841,7 +1842,7 @@ def test_finished_releases_slot(build_adapter):
     req_1 = _req("req-1", RequestStatus.WAITING)
     req_2 = _req("req-2", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([req_1, req_2])
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1"]
@@ -1934,7 +1935,7 @@ def test_cleanup_receiver_releases_multiple_slots_in_sequence(build_adapter):
     adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1", "req-2"]
@@ -1956,7 +1957,7 @@ def test_resumable_segment_boundary_yields_active_slot_without_losing_state(buil
     adapter, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1", "req-2"]
@@ -2412,7 +2413,7 @@ def test_finish_requests_releases_active_stream_slot(build_adapter):
     aborted = _req("req-aborted", RequestStatus.RUNNING)
     waiting = _req("req-waiting", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([waiting])
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
     adapter._active_streams[aborted.request_id] = aborted
     adapter._held_non_active.append(aborted)
 
@@ -2536,7 +2537,7 @@ def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_ada
     zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)
     live = _req("req-live", RequestStatus.WAITING_FOR_CHUNK)
     waiting_queue = DummyWaitingQueue()
-    running_queue = []
+    running_queue: list[SimpleNamespace] = []
     adapter.waiting_for_chunk_waiting_requests = deque([zombie, live])
     adapter.waiting_for_chunk_running_requests = deque([zombie, live])
 
@@ -2557,7 +2558,7 @@ def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_ada
 # ---------------------------------------------------------------
 
 
-class _HashableRequest(SimpleNamespace):
+class _HashableRequest(Namespace):
     """SimpleNamespace that can be added to a set (needed by scheduler internals)."""
 
     # vLLM 0.26: update_from_output settles this counter for every scheduled

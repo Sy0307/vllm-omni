@@ -20,7 +20,7 @@ import time as _time
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 from vllm.logger import init_logger
 
@@ -42,15 +42,6 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_data_plane_request_info,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.session import (
-    DuplexAppendReservation,
-    DuplexFenceMismatchError,
-    DuplexReplayAppend,
-    DuplexSessionExpiry,
-    DuplexSessionRuntimeManager,
-    DuplexSessionRuntimeState,
-    duplex_append_fingerprint,
-)
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.engine.duplex.messages import (
     AppendDuplexInputMessage,
@@ -67,12 +58,23 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.duplex.session import (
     DuplexAppendReservation,
     DuplexFenceMismatchError,
+    DuplexReplayAppend,
     DuplexSessionExpiry,
     DuplexSessionRuntimeManager,
     DuplexSessionRuntimeState,
+    duplex_append_fingerprint,
 )
 
 logger = init_logger(__name__)
+
+DuplexCommand = (
+    OpenDuplexSessionMessage
+    | AppendDuplexInputMessage
+    | SignalDuplexTurnMessage
+    | CloseDuplexSessionMessage
+    | TouchDuplexSessionMessage
+    | ResumeDuplexSessionMessage
+)
 
 
 class DuplexControlPreemptedError(RuntimeError):
@@ -233,7 +235,7 @@ class DuplexControlPlane:
     def pending_submission_cleanup_count(self) -> int:
         return len(self._pending_submission_cleanups)
 
-    def accepts(self, message: object) -> bool:
+    def accepts(self, message: object) -> TypeGuard[DuplexCommand]:
         return isinstance(message, self._MESSAGE_TYPES)
 
     async def handle(self, message: object) -> None:
@@ -376,7 +378,7 @@ class DuplexControlPlane:
     def _register_control_task(
         self,
         task: asyncio.Task[None],
-        message: object,
+        message: DuplexCommand,
         *,
         count_append: bool,
         update_tail: bool,
@@ -1697,15 +1699,15 @@ class DuplexControlPlane:
                     pending.session_id,
                     exc,
                 )
-        for key, pending in list(self._pending_request_cleanups.items()):
-            if key in self._request_cleanups_in_progress:
+        for request_key, pending_request in list(self._pending_request_cleanups.items()):
+            if request_key in self._request_cleanups_in_progress:
                 continue
             try:
-                await self._complete_request_cleanup(key, pending)
+                await self._complete_request_cleanup(request_key, pending_request)
             except Exception as exc:
                 logger.warning(
                     "duplex request cleanup remains pending for session %s: %s",
-                    pending.session_id,
+                    pending_request.session_id,
                     exc,
                 )
                 continue
@@ -1718,7 +1720,7 @@ class DuplexControlPlane:
                 (item.session_id, item.lease_generation),
                 item,
             )
-        for key, item in list(self._pending_expirations.items()):
+        for expiry_key, item in list(self._pending_expirations.items()):
             try:
                 if item.submitted_request_ids:
                     await self._stage_port.cleanup(list(item.submitted_request_ids), abort=True)
@@ -1746,7 +1748,7 @@ class DuplexControlPlane:
             session = self.sessions.get(item.session_id)
             if session is not None and session.lease.generation == item.lease_generation:
                 self.sessions.finalize_close_session(session)
-            self._pending_expirations.pop(key, None)
+            self._pending_expirations.pop(expiry_key, None)
             completed += 1
         self._sync_session_metrics()
         return completed
@@ -1926,7 +1928,7 @@ class DuplexControlPlane:
         operation_id: str | None = None,
     ) -> None:
         control_error = self._control_error(error) if error is not None else None
-        if error is not None:
+        if control_error is not None:
             stage_results = [
                 {
                     "stage_id": -1,

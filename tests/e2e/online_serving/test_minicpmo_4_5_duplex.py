@@ -199,6 +199,7 @@ def test_duplex_single_session_response_required(omni_server, tmp_path: Path) ->
     _assert_request_metrics(result["request_metrics"], expected_count=2)
     _assert_session_metrics(result["session_metrics"], expected_count=2)
     append_observations = result["native_append_observations"]
+    assert isinstance(append_observations, list)
     assert append_observations
     assert len({item["request_id"] for item in append_observations}) == 1
     assert len({item["replica_id"] for item in append_observations}) == 1
@@ -262,6 +263,9 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) ->
     )
     assert result["ok"] is True
     assert result["session_count"] == 2
+    assert isinstance(result["resume"], dict)
+    assert isinstance(result["takeover"], dict)
+    assert isinstance(result["sessions"], list)
     assert result["resume"]["ok"] is True
     assert result["takeover"]["ok"] is True
     assert not result["failures"]
@@ -301,6 +305,7 @@ def test_duplex_configured_capacity_synchronized_isolation(omni_server, tmp_path
     assert result["identity_isolation_ok"] is True
     assert result["semantic_isolation_ok"] is True
     assert not result["failures"]
+    assert isinstance(result["sessions"], list)
     assert all(session["done_count"] == 1 for session in result["sessions"])
     assert all(session["error_count"] == 0 for session in result["sessions"])
     observations_by_session = [session["native_append_observations"] for session in result["sessions"]]
@@ -357,6 +362,7 @@ def test_duplex_four_sessions_rotate_without_starvation_across_multiple_turns(om
         assert result["identity_isolation_ok"] is True
         assert not result["failures"]
         sessions = result["sessions"]
+        assert isinstance(sessions, list)
         assert len(sessions) == 4
         assert all(session["done_count"] == 2 for session in sessions)
         assert result["native_model_turn_end_ok"] is True

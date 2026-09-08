@@ -208,23 +208,22 @@ class DuplexRequestClient:
                         self._remove_output_route(candidate_request_id, request_state)
                 return result
 
-            generation = duplex_resource_request_generation(request_id, fence, "stage0")
-            if generation not in candidate_generations:
+            returned_generation = duplex_resource_request_generation(request_id, fence, "stage0")
+            if returned_generation is None or returned_generation not in candidate_generations:
                 for candidate_request_id, request_state, created in routes.values():
                     if created and request_state.queue.empty():
                         self._remove_output_route(candidate_request_id, request_state)
                 expected_ids = tuple(item[0] for item in routes.values())
                 raise RuntimeError(
-                    "duplex data-plane request id mismatch: "
-                    f"expected one of {expected_ids!r}, got {request_id!r}"
+                    f"duplex data-plane request id mismatch: expected one of {expected_ids!r}, got {request_id!r}"
                 )
 
             # No await between validating and publishing the generation: an
             # append for this fence either sees the old or the new identity.
-            self._resource_generations[key] = generation
-            _, request_state, _ = routes[generation]
+            self._resource_generations[key] = returned_generation
+            _, request_state, _ = routes[returned_generation]
             for candidate_generation, (candidate_request_id, candidate_state, _) in routes.items():
-                if candidate_generation != generation:
+                if candidate_generation != returned_generation:
                     self._remove_output_route(candidate_request_id, candidate_state)
             if not collect_outputs:
                 return result

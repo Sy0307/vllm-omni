@@ -5,6 +5,14 @@
 
 import math
 import statistics
+from typing import TypedDict
+
+
+class _Stage0TokenMetrics(TypedDict):
+    source: str
+    output_token_count: int
+    ttft_ms: float
+    itls_ms: list[float]
 
 
 def native_measurement(result: dict, *, sessions: int, turns: int, elapsed_s: float) -> dict:
@@ -18,11 +26,11 @@ def native_measurement(result: dict, *, sessions: int, turns: int, elapsed_s: fl
     assert result.get("model_turn_end_count") == sessions * turns
     session_rows = result.get("sessions", [])
     assert len(session_rows) == sessions
-    request_ids = set()
+    request_ids: set[str] = set()
     append_count = 0
     max_context = 0
     metrics = []
-    stage0_metrics = []
+    stage0_metrics: list[_Stage0TokenMetrics] = []
     for row in session_rows:
         assert row.get("error_count") == 0
         assert row.get("done_count") == turns
@@ -32,7 +40,7 @@ def native_measurement(result: dict, *, sessions: int, turns: int, elapsed_s: fl
         ids = {item.get("request_id") for item in observations}
         assert len(ids) == 1 and all(isinstance(rid, str) and rid.startswith("duplex-s.") for rid in ids)
         assert not request_ids.intersection(ids), "physical request shared across sessions"
-        request_ids.update(ids)
+        request_ids.update(rid for rid in ids if isinstance(rid, str))
         # vLLM 0.28's resumable adapter exposes committed receipt counts and
         # prompt/computed offsets, not the older streaming_prompt flags.
         receipts = [item["omni_append_receipt_count"] for item in observations]
@@ -54,7 +62,7 @@ def native_measurement(result: dict, *, sessions: int, turns: int, elapsed_s: fl
             if isinstance(timing.get("stage0_tokens"), dict)
             and timing["stage0_tokens"].get("source") == "engine_stage_metrics"
         )
-    measured = {
+    measured: dict[str, object] = {
         "elapsed_s": elapsed_s,
         "completed_sessions": sessions,
         "completed_responses": sessions * turns,
@@ -70,8 +78,9 @@ def native_measurement(result: dict, *, sessions: int, turns: int, elapsed_s: fl
         measured[f"max_{name}"] = max(values)
     durations = [item["audio_duration_ms"] for item in metrics]
     assert all(isinstance(v, int | float) and math.isfinite(v) and v > 0 for v in durations)
-    measured["generated_audio_s"] = sum(durations) / 1000
-    measured["audio_seconds_per_s"] = measured["generated_audio_s"] / elapsed_s
+    generated_audio_s = sum(durations) / 1000
+    measured["generated_audio_s"] = generated_audio_s
+    measured["audio_seconds_per_s"] = generated_audio_s / elapsed_s
     measured["stage0_token_metrics_available"] = len(stage0_metrics) == sessions * turns
     if measured["stage0_token_metrics_available"]:
         measured["stage0_output_tokens"] = sum(item["output_token_count"] for item in stage0_metrics)

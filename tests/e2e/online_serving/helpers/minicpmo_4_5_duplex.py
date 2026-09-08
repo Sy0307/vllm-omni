@@ -8,8 +8,8 @@ from __future__ import annotations
 import hashlib
 import uuid
 import wave
+from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from huggingface_hub import snapshot_download
@@ -167,8 +167,8 @@ def demo_args(
     input_wav: Path,
     ref_audio: Path,
     output_dir: Path,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> Namespace:
+    return Namespace(
         url=realtime_url(omni_server),
         model=omni_server.model,
         session_id=f"duplex-ci-single-{uuid.uuid4().hex}",
@@ -205,8 +205,8 @@ def multi_session_args(
     ref_audio: Path,
     output_dir: Path,
     response_required: bool,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> Namespace:
+    return Namespace(
         url=realtime_url(omni_server),
         model=omni_server.model,
         sessions=2,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import pytest
@@ -9,12 +12,11 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.control_plane import (
     DuplexControlPlane,
 )
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.duplex.session import (
     DuplexReplayAppend,
     DuplexSessionRuntimeManager,
 )
-from vllm_omni.engine.duplex.messages import DuplexFence
-
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

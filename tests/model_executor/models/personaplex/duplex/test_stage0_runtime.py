@@ -14,6 +14,7 @@ from vllm_omni.model_executor.models.personaplex.duplex.policy import (
 )
 from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
     PersonaPlexStage0DuplexRuntime,
+    PersonaPlexStage0PreparedAppend,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
@@ -103,7 +104,7 @@ def _duplex_info(*, seq: int, session_id: str = "session", incarnation: int = 1)
 
 def _runtime(*codecs: _FakeCodec) -> PersonaPlexStage0DuplexRuntime:
     voice_embeddings = torch.arange(8, dtype=torch.float32).reshape(2, 1, 1, 4)
-    codec_args = {"codec": codecs[0]}
+    codec_args: dict[str, object] = {"codec": codecs[0]}
     if len(codecs) > 1:
         available = iter(codecs)
         codec_args = {
@@ -262,7 +263,12 @@ def test_decoded_pcm_is_writable_for_torch_zero_copy() -> None:
 
 def _prepare_two_sessions(
     runtime: PersonaPlexStage0DuplexRuntime,
-) -> tuple[object, object, object, object]:
+) -> tuple[
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+]:
     first_1 = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
     second_1 = runtime.prepare_append(
         _duplex_info(seq=1, session_id="other", incarnation=2),

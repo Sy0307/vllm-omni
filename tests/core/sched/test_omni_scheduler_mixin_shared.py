@@ -1,10 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from argparse import Namespace
 from collections import defaultdict
 from threading import get_ident
 from types import SimpleNamespace
 
 import pytest
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.request import RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched import omni_scheduler_mixin
@@ -68,6 +72,8 @@ class _FailingMetricsNativeAppendScheduler(_NativeAppendScheduler):
 
 
 class _FailOnceCommitNativeAppendScheduler(_NativeAppendScheduler):
+    fail_next_commit: bool
+
     def _commit_native_append(self, request_id):
         if self.fail_next_commit:
             self.fail_next_commit = False
@@ -76,6 +82,8 @@ class _FailOnceCommitNativeAppendScheduler(_NativeAppendScheduler):
 
 
 class _CommitThenFailOnceNativeAppendScheduler(_NativeAppendScheduler):
+    fail_after_commit: bool
+
     def _commit_native_append(self, request_id):
         self.commit_calls += 1
         super()._commit_native_append(request_id)
@@ -84,8 +92,9 @@ class _CommitThenFailOnceNativeAppendScheduler(_NativeAppendScheduler):
             raise RuntimeError("reply construction failed after commit")
 
 
-class _StreamingRequest(SimpleNamespace):
+class _StreamingRequest(Namespace):
     __hash__ = object.__hash__
+    __eq__ = object.__eq__
 
     def __init__(self, **kwargs):
         defaults = {
@@ -872,7 +881,7 @@ def test_full_payload_coordinator_matches_legacy_gate(monkeypatch, stage_id, asy
 
 
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
-    calls = []
+    calls: list[tuple[object, ...]] = []
     scheduler = _Scheduler()
     scheduler.waiting = ["waiting"]
     scheduler.running = ["running"]
@@ -929,7 +938,7 @@ def test_finished_request_attachment_keeps_ar_abort_policy_explicit(
 ):
     scheduler = _Scheduler()
     scheduler.finished_req_ids_dict = defaultdict(set, {2: {"req-finished"}})
-    outputs = {}
+    outputs: dict[int, EngineCoreOutputs] = {}
 
     scheduler._attach_finished_request_sets(
         outputs,

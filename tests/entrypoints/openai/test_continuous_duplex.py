@@ -1,4 +1,3 @@
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import minicpmo45_native_capabilities
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
@@ -18,9 +17,10 @@ from tests.entrypoints.openai_api.test_duplex_handler import (
     _native_session_create,
     _pcm_f32_b64,
 )
-from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import NemotronVoiceChatDataPlaneSession
 from vllm_omni.entrypoints.duplex.protocol import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import minicpmo45_native_capabilities
+from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import NemotronVoiceChatDataPlaneSession
 from vllm_omni.model_executor.models.personaplex.duplex.serving_adapter import PersonaPlexServingRuntimeAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -31,7 +31,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("drop_output", [False, True])
 async def test_personaplex_close_waits_for_pending_append_and_audio(mocker, partial, drop_output):
     entered, release = asyncio.Event(), asyncio.Event()
-    outputs = asyncio.Queue()
+    outputs: asyncio.Queue[object] = asyncio.Queue()
 
     class Engine(FakeEngineClient):
         async def append_duplex_input_async(self, session_id, **kwargs):
@@ -176,7 +176,7 @@ async def test_close_drains_accepted_append_or_reports_failure(drop_output, samp
     request_id = "req-continuous-close"
     entered = asyncio.Event()
     release = asyncio.Event()
-    outputs = asyncio.Queue()
+    outputs: asyncio.Queue[object] = asyncio.Queue()
 
     class ContinuousEngine(FakeEngineClient):
         async def append_duplex_input_async(self, session_id, **kwargs):

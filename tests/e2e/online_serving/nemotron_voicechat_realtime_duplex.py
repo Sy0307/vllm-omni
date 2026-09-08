@@ -243,7 +243,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         function_items = [
             event
             for event in _events(client, "response.output_item.done")
-            if isinstance(event.get("item"), dict) and event["item"].get("type") == "function_call"
+            if isinstance((item := event.get("item")), dict) and item.get("type") == "function_call"
         ]
         if args.expect_function_call and not any(
             event.get("type") == "response.function_call_arguments.done" for event in function_events
@@ -251,11 +251,14 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"no completed function call: {function_events}")
         if args.expect_function_call:
             matching_items = [
-                event for event in function_items if event["item"].get("name") == args.expected_function_name
+                event
+                for event in function_items
+                if isinstance((item := event.get("item")), dict) and item.get("name") == args.expected_function_name
             ]
             if not matching_items:
                 raise AssertionError(f"expected {args.expected_function_name!r}, got {function_items}")
             function_item = matching_items[-1]["item"]
+            assert isinstance(function_item, dict)
             try:
                 function_arguments = json.loads(str(function_item.get("arguments", "")))
             except json.JSONDecodeError as exc:
@@ -303,10 +306,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             if len(done_events) != 1 or len(client.events.response_ids) != 1:
                 raise AssertionError("expected one continuous response ending at graceful close")
             response = done_events[0].get("response", {})
-            if (
-                response.get("status") != "completed"
-                or response.get("status_details", {}).get("reason") != "stream_drained"
-            ):
+            assert isinstance(response, dict)
+            status_details = response.get("status_details", {})
+            assert isinstance(status_details, dict)
+            if response.get("status") != "completed" or status_details.get("reason") != "stream_drained":
                 raise AssertionError(f"stream did not drain successfully: {response}")
             drain = response.get("metadata", {}).get("drain", {})
             if drain != {
@@ -325,7 +328,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"unexpected output sample rates: {rates}")
         if not args.expect_function_call and args.minimum_audio_chunks and not audio:
             raise AssertionError("model produced no audio")
-        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * expected["chunk_period_ms"] // 1000
+        period_ms = expected["chunk_period_ms"]
+        assert isinstance(period_ms, int)
+        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * period_ms // 1000
         packet_sizes = [len(base64.b64decode(str(event.get("delta", "")), validate=True)) for event in audio_events]
         if not args.expect_function_call and any(size != expected_bytes for size in packet_sizes):
             raise AssertionError(f"audio deltas are not fixed 80 ms PCM16 packets: {packet_sizes}")
@@ -371,17 +376,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--trailing-silence-s", type=float, default=20.0)
     parser.add_argument("--minimum-audio-chunks", type=int, default=1)
-    parser.add_argument(
-        "--allow-incomplete-response",
-        action="store_true",
-        help=(
-            "Accept a session whose responses all completed before the final "
-            "commit. A realtime-paced pipeline delivers each turn's audio and "
-            "response.done as the turn happens, so the strict "
-            "done-after-commit gate only holds when delivery lags the frame "
-            "clock; use this flag when measuring latency on fast configs."
-        ),
-    )
     parser.add_argument("--minimum-audio-rms", type=float, default=1e-4)
     parser.add_argument("--expect-function-call", action="store_true")
     parser.add_argument("--expected-function-name", default="generate_random_number")

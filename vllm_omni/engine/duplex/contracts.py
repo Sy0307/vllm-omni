@@ -15,7 +15,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.session import DuplexSessionRuntimeManager, DuplexSessionRuntimeState
 
 from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.messages import EngineQueueMessage
@@ -64,7 +67,7 @@ class DuplexRuntimeCapabilities:
         values = (self.adapter_id, self.runtime_extension_id, self.stage_count)
         if not any(value not in ("", None) for value in values):
             return None
-        if not all(value not in ("", None) for value in values):
+        if not self.adapter_id or not self.runtime_extension_id or self.stage_count is None:
             raise ValueError("duplex plugin descriptor must declare adapter_id, runtime_extension_id, and stage_count")
         return DuplexPluginDescriptor(
             contract_version=self.contract_version,
@@ -258,13 +261,17 @@ class DuplexStagePort(Protocol):
 
 class DuplexControlPlanePort(Protocol):
     @property
-    def sessions(self) -> object: ...
+    def sessions(self) -> DuplexSessionRuntimeManager: ...
 
     def accepts(self, message: object) -> bool: ...
 
     def dispatch(self, message: object) -> None: ...
 
     async def shutdown(self) -> None: ...
+
+    async def reap_expired(self, now: float | None = None) -> int: ...
+
+    def defer_request_cleanups(self, session_ids: Iterable[str]) -> None: ...
 
     def prepare_replica_recovery(
         self,
@@ -286,7 +293,7 @@ class DuplexControlPlanePort(Protocol):
 
     def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None: ...
 
-    def session_for_identity(self, identity: DuplexRequestIdentity | None) -> object | None: ...
+    def session_for_identity(self, identity: DuplexRequestIdentity | None) -> DuplexSessionRuntimeState | None: ...
 
     def decide_output(
         self,

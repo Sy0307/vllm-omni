@@ -53,21 +53,6 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
 )
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.engine.duplex.control_plane import DuplexControlPlane
-from vllm_omni.engine.duplex.runtime import (
-    DuplexInputMode,
-    DuplexRuntimeCapabilities,
-    DuplexSessionRuntimeState,
-    duplex_resource_request_id,
-)
-from vllm_omni.engine.duplex.messages import (
-    AppendDuplexInputMessage,
-    CloseDuplexSessionMessage,
-    DuplexFence,
-    OpenDuplexSessionMessage,
-    SignalDuplexTurnMessage,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.outputs import OmniRequestOutput
@@ -131,6 +116,8 @@ class FakePromptRequest:
 
 
 class FakeStageClient:
+    sample_rate: int
+
     def __init__(
         self,
         *,
@@ -160,8 +147,8 @@ class FakeStageClient:
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
-        self._engine_core_outputs = queue.Queue()
-        self._diffusion_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[EngineCoreOutputs] = queue.Queue()
+        self._diffusion_outputs: queue.Queue[OmniRequestOutput] = queue.Queue()
 
     # Orchestrator-facing interface.
     async def add_request_async(self, *args, **kwargs) -> None:
@@ -342,7 +329,8 @@ class FakeOutputProcessor:
                 (ro for ro in self.request_outputs if getattr(ro, "request_id", None) == rid),
                 None,
             )
-            token_ids = list(seeded.outputs[0].token_ids) if seeded is not None and seeded.outputs else [1, 2]
+            seeded_outputs = getattr(seeded, "outputs", None)
+            token_ids = list(seeded_outputs[0].token_ids) if seeded_outputs else [1, 2]
             # Intentionally stamp an internal-looking id on the RequestOutput so
             # StagePool must re-key by the orchestrator id it passed in.
             outputs.append(
@@ -473,9 +461,9 @@ def _build_stage_pools(
 
 
 def _build_harness(
-    stage_clients: list[object],
+    stage_clients: list[FakeStageClient],
     *,
-    output_processors: list[object] | None = None,
+    output_processors: list[FakeOutputProcessor] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
     log_stats: bool = False,
@@ -1259,6 +1247,7 @@ async def test_duplex_control_plane_keeps_public_and_runtime_config_separate() -
     assert rpc_q.get_nowait().ok is True
     session = orchestrator.duplex_sessions.require(open_message.session_id)
     request_state = _duplex_request_state(orchestrator, session, stage_id=0)
+    assert request_state is not None
     assert request_state.sampling_params_list[0].max_tokens == 3
     assert request_state.sampling_params_list[0].stop_token_ids == [151705]
     bridge = request_state.streaming.bridge_states["duplex"]

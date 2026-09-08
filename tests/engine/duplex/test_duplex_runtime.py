@@ -21,7 +21,6 @@ from vllm_omni.engine.duplex.runtime import (
     DuplexRuntimeCapabilities,
     DuplexSessionRuntimeManager,
 )
-from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.adapter import (
     MiniCPMO45NativeDuplexServingAdapter,
 )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -11,6 +11,8 @@ logger = get_connector_logger(__name__)
 
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
+
+    stage_id: int
 
     # Whether the connector can handle raw bytes/torch.Tensor natively
     # without going through OmniSerializer.  Connectors that copy raw

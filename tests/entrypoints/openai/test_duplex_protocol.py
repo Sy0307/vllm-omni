@@ -34,7 +34,7 @@ def test_realtime_state_owner_uses_explicit_bindings_not_dynamic_attribute_proxy
 
 class _ProtocolWebSocket:
     def __init__(self, *events: dict[str, object]) -> None:
-        self._events = asyncio.Queue()
+        self._events: asyncio.Queue[str] = asyncio.Queue()
         for event in events:
             self._events.put_nowait(json.dumps(event))
 

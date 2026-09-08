@@ -21,7 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import janus
 import torch
@@ -74,6 +74,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.stage_client import StagePoolLLMClient
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
@@ -84,6 +85,12 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 logger = init_logger(__name__)
+
+
+class _DuplexCleanupOptions(TypedDict, total=False):
+    abort: bool
+    cleanup_in_progress: bool
+    reason: str
 
 
 def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
@@ -281,7 +288,7 @@ class StreamingInputState:
 
         Fresh rather than shared: ``output_metadata`` is handed out by reference.
         """
-        segment = self.segments.get(stage_id)
+        segment = self.segments.get(stage_id) if stage_id is not None else None
         return segment if segment is not None else StreamingSegmentState()
 
 
@@ -313,7 +320,13 @@ class _OrchestratorDuplexStagePort:
         return len(self._stage_pools)
 
     def sampling_defaults(self) -> tuple[object, ...]:
-        return tuple(pool.stage_client.default_sampling_params for pool in self._stage_pools)
+        defaults: list[object] = []
+        for pool in self._stage_pools:
+            client = pool.stage_client
+            if client is None:
+                raise StageUnavailableError(f"stage {pool.stage_id} has no live replica for sampling defaults")
+            defaults.append(client.default_sampling_params)
+        return tuple(defaults)
 
     def supports_scheduler_native_append(self, stage_id: int = 0) -> bool:
         """Return whether every live replica can execute the native lifecycle."""
@@ -782,7 +795,7 @@ class Orchestrator:
                 # process exit as EngineDeadError during teardown.
                 for pool in self.stage_pools:
                     for client in pool.clients:
-                        if hasattr(client, "_shutting_down"):
+                        if client is not None and hasattr(client, "_shutting_down"):
                             client._shutting_down = True
                 # Stage teardown runs once in run()'s finally after the
                 # orchestration loop observes _shutdown_event and exits.
@@ -1193,7 +1206,8 @@ class Orchestrator:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
-            req_state = self.request_states.get(getattr(eco, "request_id", None))
+            output_request_id = getattr(eco, "request_id", None)
+            req_state = self.request_states.get(output_request_id) if isinstance(output_request_id, str) else None
             if req_state is None or not req_state.streaming.enabled:
                 continue
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -1965,7 +1979,7 @@ class Orchestrator:
                     cleanup_ids.append(cid)
         closing_session_ids: list[str] = []
         if close_duplex_sessions and self.duplex_control_plane is not None:
-            close_kwargs: dict[str, object] = {
+            close_kwargs: _DuplexCleanupOptions = {
                 "abort": abort,
                 "cleanup_in_progress": True,
             }
@@ -1994,7 +2008,7 @@ class Orchestrator:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
                 if req_state is not None:
-                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
+                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", []))
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
                     req_state.running_counter_registered = False
@@ -2696,6 +2710,9 @@ class Orchestrator:
             await self._fail_request_dead_stage(req_id, next_logical)
             return
         next_client = next_pool.stage_client
+        if next_client is None:
+            await self._fail_request_dead_stage(req_id, next_logical)
+            return
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
@@ -2931,7 +2948,7 @@ class Orchestrator:
             req_state.streaming.source_token_decoder = decode
 
         try:
-            next_inputs = next_client.process_engine_inputs(
+            next_inputs = cast(StagePoolLLMClient, next_client).process_engine_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,

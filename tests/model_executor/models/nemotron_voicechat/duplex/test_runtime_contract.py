@@ -125,7 +125,7 @@ def test_nemotron_missing_continuation_state_fails_request_locally() -> None:
 
 def test_nemotron_retained_continuation_uses_current_frame_and_previous_sample() -> None:
     model = SimpleNamespace(
-        _sessions={"req": {"func_token": 5}},
+        _sessions={"req": {"func_token": 5, "prefill_embeds": torch.zeros(4, 4)}},
         _duplex_previous_text_tokens={"req": 6},
         _duplex_stable_frame=lambda *args: torch.ones(1, 4),
         _sync_forced_function_response=lambda *args: None,
@@ -147,9 +147,14 @@ def test_nemotron_retained_continuation_uses_current_frame_and_previous_sample()
 
 def test_function_output_becomes_versioned_nvidia_channel_tokens() -> None:
     encoded: list[str] = []
+
+    def encode(text: str, **_kwargs) -> list[int]:
+        encoded.append(text)
+        return [31, 32, 33]
+
     adapter = NemotronVoiceChatServingRuntimeAdapter(lambda *_: None)
     adapter._tokenizer = SimpleNamespace(
-        encode=lambda text, **_kwargs: encoded.append(text) or [31, 32, 33],
+        encode=encode,
     )
 
     first = adapter.runtime_config_for_function_output(

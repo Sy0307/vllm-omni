@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Engine Core Client for vLLM-Omni multi-stage runtime.
 
@@ -59,7 +62,15 @@ def _default_process_engine_inputs(
     ]
 
 
-class StageEngineCoreClientBase(StageClientBase):
+if TYPE_CHECKING:
+
+    class _StageEngineClientHost(StageClientBase, AsyncMPClient):
+        """Required async transport supplied by both concrete client MROs."""
+else:
+    _StageEngineClientHost = StageClientBase
+
+
+class StageEngineCoreClientBase(_StageEngineClientHost):
     """Shared stage-aware behavior for async EngineCore clients.
 
     The concrete transport/load-balancing behavior is supplied by the

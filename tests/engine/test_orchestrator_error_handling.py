@@ -21,6 +21,12 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_omni.engine.duplex.contracts import (
+    DuplexInputMode,
+    DuplexRequestIdentity,
+    DuplexRuntimeCapabilities,
+)
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     EngineQueueMessage,
@@ -35,12 +41,6 @@ from vllm_omni.engine.orchestrator import (
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.errors import OmniClientError
-from vllm_omni.engine.duplex.contracts import (
-    DuplexInputMode,
-    DuplexRequestIdentity,
-    DuplexRuntimeCapabilities,
-)
-from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors import (
     joyai_vl_interaction as joyai_bridge,
