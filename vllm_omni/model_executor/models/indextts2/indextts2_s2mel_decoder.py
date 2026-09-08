@@ -920,7 +920,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
         return finished
 
     def on_requests_finished(self, request_ids: Iterable[str]) -> None:
-        """Defer cleanup because the runner invokes this hook before forward."""
+        """Defer cleanup only for requests that can retain continuous CFM state."""
+        if not self.stepwise_generation:
+            return
         self._deferred_cleanup_ids.update(str(request_id) for request_id in request_ids)
 
     def _discard_continuous_requests(self, request_ids: set[str]) -> None:

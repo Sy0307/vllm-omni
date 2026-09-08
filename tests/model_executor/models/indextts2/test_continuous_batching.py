@@ -279,6 +279,7 @@ class _RecordingCFM:
 def _make_decoder_for_state_tests(cfm: _RecordingCFM | None = None) -> IndexTTS2S2MelDecoder:
     decoder = object.__new__(IndexTTS2S2MelDecoder)
     torch.nn.Module.__init__(decoder)
+    decoder.stepwise_generation = True
     decoder.s2mel_cfm_batch_size = 4
     decoder.s2mel_continuous_max_padding_ratio = 1.0
     decoder.s2mel_continuous_singleton_wait_ms = 0.0
@@ -813,3 +814,13 @@ def test_continuous_decoder_still_rejects_real_payload_without_request_ids() -> 
             input_ids=torch.zeros(1, dtype=torch.long),
             model_intermediate_buffer=[{"mel_codes": torch.tensor([1, 2, 3])}],
         )
+
+
+def test_non_continuous_decoder_does_not_retain_finished_request_ids():
+    decoder = _make_decoder_for_state_tests()
+    decoder.stepwise_generation = False
+
+    decoder.on_requests_finished(["first", "second"])
+    decoder.on_requests_finished(["third"])
+
+    assert decoder._deferred_cleanup_ids == set()
