@@ -169,8 +169,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         cannot be reused before completion. Other live requests join the tail
         of ``waiting`` without freeing their decoder state or KV blocks.
         Preserve WAITING_FOR_CHUNK until the coordinator observes fresh input.
+        Stateful codecs retain lifetime admission until their decoder state is
+        released, even when no chunk is currently executing.
         """
-        if not getattr(self, "_native_data_plane", False):
+        if not getattr(self, "_native_data_plane", False) or self._retains_state_across_chunks:
             return
         if not hasattr(self, "_native_chunk_started"):
             self._native_chunk_started = set()
@@ -192,7 +194,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         Preserve order within each group and leave explicit priority policies
         unchanged. In-flight requests remain queued but are not schedulable.
         """
-        if not getattr(self, "_native_data_plane", False) or self.policy != SchedulingPolicy.FCFS:
+        if (
+            not getattr(self, "_native_data_plane", False)
+            or self._retains_state_across_chunks
+            or self.policy != SchedulingPolicy.FCFS
+        ):
             return
         first: list[Request] = []
         continuation: list[Request] = []
@@ -257,10 +263,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._prioritize_native_first_chunks()
         self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
-        # Generation runners execute only requests with ready chunks. Parked
-        # request lifetimes do not consume a model batch slot in either runner,
-        # so they must not reduce admission capacity.
         native_chunks = bool(getattr(self, "_native_data_plane", False))
+        # Parking releases an execution slot, but stateful codecs retain their
+        # request-owned state until completion or abort, in either runner.
+        reserved_running_slots = (
+            self._get_async_chunk_reserved_running_slots() if self._retains_state_across_chunks else 0
+        )
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -332,7 +340,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         while (
             self.waiting
             and token_budget > 0
-            and (len(num_scheduled_tokens) if native_chunks else len(self.running)) < self.max_num_running_reqs
+            and (
+                len(num_scheduled_tokens)
+                if native_chunks and not self._retains_state_across_chunks
+                else len(self.running) + reserved_running_slots
+            )
+            < self.max_num_running_reqs
             and self._pause_state == PauseState.UNPAUSED
         ):
             request = self.waiting.peek_request()
