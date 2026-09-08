@@ -37,7 +37,7 @@ to the IndexTTS-2 serving contract.
 
 ### GPU
 
-### 1x NVIDIA H20 96GB
+### 1x NVIDIA H200
 
 #### Environment
 
@@ -46,6 +46,9 @@ to the IndexTTS-2 serving contract.
 - Driver / runtime: NVIDIA CUDA environment
 - vLLM version: Match the repository requirements for your checkout
 - vLLM-Omni version or commit: Use the commit you are deploying from
+
+The H200 validation used Python 3.12.3, vLLM 0.28.0, PyTorch 2.13.0+cu130,
+Transformers 5.14.1, and CUDA toolkit 13.2 for the fused activation build.
 
 Install vLLM-Omni with the IndexTTS text-processing dependencies:
 
@@ -77,7 +80,7 @@ vllm serve /path/to/indextts-2.5 \
   --deploy-config vllm_omni/deploy/indextts2_5.yaml
 ```
 
-For the validated high-throughput path, select the continuous recipe. It uses
+For opt-in continuous serving, select the continuous recipe. It uses
 continuous CFM batching, a 64 MiB bounded reference-conditioning prefix cache,
 and the fused BigVGAN CUDA activation (with eager fallback):
 
@@ -89,7 +92,7 @@ DEPLOY_CONFIG=vllm_omni/deploy/indextts2_5_continuous.yaml \
 bash examples/online_serving/text_to_speech/indextts2/run_server.sh
 ```
 
-#### Recommended: NVIDIA MPS for continuous single-GPU serving
+#### Optional: NVIDIA MPS for continuous single-GPU serving
 
 Stage 0 and Stage 1 run in separate processes on the same GPU. Enabling
 NVIDIA Multi-Process Service (MPS) can improve steady-state throughput by
