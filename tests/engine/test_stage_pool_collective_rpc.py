@@ -92,6 +92,46 @@ def test_collective_rpc_non_control_method_still_returns_error_dict():
 
 
 @pytest.mark.cpu
+def test_streaming_prompt_prefill_rejects_not_found(mocker):
+    async def run() -> None:
+        get_metrics = mocker.AsyncMock(
+            return_value={
+                "status": "NOT_FOUND",
+                "num_prompt_tokens": 0,
+                "num_computed_tokens": 0,
+                "is_finished": True,
+                "omni_request_found": False,
+            }
+        )
+        client = SimpleNamespace(get_streaming_prompt_metrics_async=get_metrics)
+
+        with pytest.raises(KeyError, match="streaming prompt request not found: closed-request"):
+            await StagePool._wait_for_streaming_prompt_prefill(client, "closed-request")
+        get_metrics.assert_awaited_once_with("closed-request")
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_streaming_prompt_initial_ack_waits_for_the_full_prompt(mocker):
+    async def run() -> None:
+        get_metrics = mocker.AsyncMock(
+            side_effect=[
+                {"status": "RUNNING", "num_prompt_tokens": 3, "num_computed_tokens": computed} for computed in (1, 2, 3)
+            ]
+        )
+        client = SimpleNamespace(get_streaming_prompt_metrics_async=get_metrics)
+
+        result = await StagePool._wait_for_streaming_prompt_prefill(client, "request-1")
+
+        assert result["num_computed_tokens"] == result["num_prompt_tokens"] == 3
+        assert get_metrics.await_count == 3
+        assert all(call.args == ("request-1",) for call in get_metrics.await_args_list)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
     async def run() -> None:
         class RecordingOutputProcessor:

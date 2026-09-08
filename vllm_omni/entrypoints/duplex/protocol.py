@@ -112,6 +112,9 @@ class DuplexCapabilities:
     supports_model_internal_state: bool = False
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
+    # Rebuilding model state from input prompts is a separate model contract;
+    # accepting an atomic scheduler append does not imply replay is safe.
+    supports_prompt_replay: bool = False
     supports_core_resumable_request: bool = False
     supports_stage_connector_handoff: bool = False
     supports_independent_io_streams: bool = False
@@ -125,12 +128,23 @@ class DuplexCapabilities:
     requires_model_runner_kv: bool = False
     requires_native_stage_role: bool = False
     implementation_level: str = "serving_session_adapter"
+    response_lifecycle: str = "model_turn"
     adapter_patterns: list[str] = field(default_factory=lambda: ["chunk_group_append"])
     input_modes: list[str] = field(default_factory=lambda: ["turn_commit_only", "reencode_context"])
     signal_sources: list[str] = field(default_factory=lambda: ["client_event", "server_policy", "model_native"])
     stage_handoff_transport: str | None = None
     chunk_period_ms: int | None = 1000
     target_barge_in_latency_ms: int | None = 1000
+    contract_version: str = "duplex.capabilities.v1"
+    adapter_id: str = ""
+    runtime_extension_id: str = ""
+    stage_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.response_lifecycle not in {"model_turn", "continuous_stream"}:
+            raise ValueError("unsupported duplex response lifecycle")
+        if self.supports_prompt_replay and not self.supports_scheduler_native_append:
+            raise ValueError("duplex prompt replay requires scheduler-native append")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -150,6 +164,7 @@ class DuplexCapabilities:
             "supports_model_internal_state": self.supports_model_internal_state,
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
+            "supports_prompt_replay": self.supports_prompt_replay,
             "supports_core_resumable_request": self.supports_core_resumable_request,
             "supports_stage_connector_handoff": self.supports_stage_connector_handoff,
             "supports_independent_io_streams": self.supports_independent_io_streams,
@@ -163,12 +178,17 @@ class DuplexCapabilities:
             "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,
             "implementation_level": self.implementation_level,
+            "response_lifecycle": self.response_lifecycle,
             "adapter_patterns": self.adapter_patterns,
             "input_modes": self.input_modes,
             "signal_sources": self.signal_sources,
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
+            "contract_version": self.contract_version,
+            "adapter_id": self.adapter_id,
+            "runtime_extension_id": self.runtime_extension_id,
+            "stage_count": self.stage_count,
         }
 
 

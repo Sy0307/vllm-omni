@@ -66,6 +66,31 @@ CORE_SERVER_PARAMS = [
     )
 ]
 
+FOUR_SESSION_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="four-session-async-off",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+                "--stage-overrides",
+                '{"1": {"active_stream_window": 2}}',
+            ],
+        ),
+        id="four-session-two-slot-contention",
+    ),
+]
+
 
 def deploy_max_sessions() -> int:
     """Concurrent duplex sessions the deploy config under test admits.
@@ -204,6 +229,7 @@ def multi_session_args(
         expire_session_index=None,
         expire_after_s=40.0,
         verify_admission_limit=None,
+        emit_duplex_control_results=False,
         model_policy_settle_ms=2000,
         timeout_s=180.0,
     )

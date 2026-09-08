@@ -71,6 +71,20 @@ class RealtimeOutputProjector:
             if event_type == "session.resumed":
                 self._hold_realtime_output_until_session_created = False
             return [dict(event)]
+        if event_type == "session.end":
+            return [dict(event)]
+        if event_type == "response.transcript.done":
+            response_id = event.get("response_id")
+            return [
+                {
+                    "type": "response.audio_transcript.done",
+                    "response_id": response_id,
+                    "item_id": self._response_item_id(response_id),
+                    "output_index": 0,
+                    "content_index": 0,
+                    "transcript": event.get("transcript", ""),
+                }
+            ]
         if event_type == "response.created":
             response_id = event.get("response_id")
             if isinstance(response_id, str) and response_id:
@@ -569,6 +583,11 @@ class RealtimeOutputProjector:
         return state
 
     def _response_is_done(self, response_id: object) -> bool:
+        if isinstance(response_id, str) and (
+            response_id in self._completed_response_ids
+            or (self._has_response_lifecycle and response_id not in self._response_states)
+        ):
+            return True
         state = self._response_state(response_id, create=False)
         return state is not None and state.done_emitted
 

@@ -125,6 +125,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # polled. Per-registration identity lets the receiver reject an old
         # segment's queued or in-flight work after the same request id resumes.
         self._registered_load_entries: dict[str, _LoadEntry] = {}
+        # One lookahead chunk per request. A boundary encountered while
+        # coalescing must remain available for the next receiver registration.
+        self._codec_lookahead: dict[str, tuple[dict[str, Any], int]] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         (
@@ -178,6 +181,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.replaced_streaming_prompt_ids: set[str] = set()
         self.requests_origin_status = {}
         self._active_streams: dict[str, Any] = {}
+        # Persistent FIFO independent of scheduler queue placement. A yielding
+        # stream rejoins the tail, behind every peer already waiting for a slot.
+        self._active_stream_waiters: dict[str, Request] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
         # waiting_queue.prepend_requests mid-step, which trips vllm's
@@ -444,14 +450,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 return True
             chunk_id = self.get_req_chunk[req_id]
             external_req_id = self.request_ids_mapping.get(req_id, req_id)
+            prefetched = self._codec_lookahead.pop(req_id, None)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
         try:
-            result = self.connector.get(
-                str(target_stage_id),
-                str(stage_id),
-                connector_get_key,
+            result = (
+                prefetched
+                if prefetched is not None
+                else self.connector.get(
+                    str(target_stage_id),
+                    str(stage_id),
+                    connector_get_key,
+                )
             )
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
@@ -465,6 +476,54 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
+
+        consumed = 1
+        frame = self._indexed_codec_chunk(result[0])
+        get_nowait = getattr(self.connector, "get_nowait", None)
+        # Never delay the first frame or wait to fill a batch. Only already
+        # available, contiguous codec data can amortize a generation step.
+        if self.model_mode != "ar" and frame is not None and frame[0] > 0 and callable(get_nowait):
+            offset, audio = frame
+            segment_finished = self._is_truthy_scalar(result[0]["meta"].get("is_segment_finished"))
+            parts = [audio]
+            total_frames = audio.shape[1]
+            total_size = result[1]
+            deadline = time.monotonic() + 0.001
+            while total_frames < 5 and time.monotonic() < deadline:
+                key = f"{external_req_id}_{target_stage_id}_{chunk_id + consumed}"
+                try:
+                    following = get_nowait(str(target_stage_id), str(stage_id), key)
+                except Exception:
+                    # The current chunk is already received; deliver it even
+                    # when the optional next-key probe fails.
+                    break
+                if following is None:
+                    break
+                candidate = self._indexed_codec_chunk(following[0])
+                if (
+                    candidate is None
+                    or candidate[0] != offset + total_frames
+                    or candidate[1].shape[0] != audio.shape[0]
+                    or candidate[1].dtype != audio.dtype
+                    or candidate[1].device != audio.device
+                    or total_frames + candidate[1].shape[1] > 5
+                    # The merged chunk retains the first metadata. A changed
+                    # segment marker must remain a separate receive/commit,
+                    # not disappear or prematurely finish the later frames.
+                    or self._is_truthy_scalar(following[0]["meta"].get("is_segment_finished")) != segment_finished
+                ):
+                    with self._receiver_state_lock:
+                        if self._registered_load_entries.get(req_id) is entry:
+                            self._codec_lookahead[req_id] = following
+                    break
+                parts.append(candidate[1])
+                total_frames += candidate[1].shape[1]
+                total_size += following[1]
+                consumed += 1
+            if consumed > 1:
+                payload = dict(result[0])
+                payload["codes"] = {"audio": torch.cat(parts, dim=1)}
+                result = payload, total_size
 
         with self._receiver_state_lock:
             # cleanup_receiver() can run while connector.get() is in flight.
@@ -481,8 +540,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 connector_get_key=connector_get_key,
             )
             if is_success:
+                self.get_req_chunk[req_id] += consumed - 1
                 self._registered_load_entries.pop(req_id, None)
             return is_success
+
+    @classmethod
+    def _indexed_codec_chunk(cls, payload: dict[str, Any]) -> tuple[int, torch.Tensor] | None:
+        if not isinstance(payload, dict) or set(payload) - {"codes", "meta"}:
+            return None
+        meta, codes = payload.get("meta"), payload.get("codes")
+        if not isinstance(meta, dict) or not isinstance(codes, dict) or set(codes) != {"audio"}:
+            return None
+        if meta.get("codec_coalesce") is not True:
+            return None
+        if set(meta) - {"codec_frame_offset", "codec_coalesce", "finished", "is_segment_finished"}:
+            return None
+        if cls._is_truthy_scalar(meta.get("finished")):
+            return None
+        offset, audio = meta.get("codec_frame_offset"), codes["audio"]
+        if (
+            isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and offset >= 0
+            and isinstance(audio, torch.Tensor)
+            and audio.ndim == 2
+            and audio.shape[1] > 0
+        ):
+            return offset, audio
+        return None
 
     def _commit_received_chunk(
         self,
@@ -819,6 +904,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def _clear_receiver_state_locked(self, request_id: str) -> None:
         """Clear receiver state while ``_receiver_state_lock`` is held."""
         self._active_streams.pop(request_id, None)
+        self._active_stream_waiters.pop(request_id, None)
         self.upstream_exhausted_requests.discard(request_id)
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
@@ -830,6 +916,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._streaming_condition_lengths.pop(request_id, None)
         self._streaming_condition_seqs.pop(request_id, None)
         self._registered_load_entries.pop(request_id, None)
+        self._codec_lookahead.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
@@ -965,8 +1052,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 waiting_queue.prepend_requests([request])
             return
 
-        self._promote_active_streams(running_queue)
-        self._promote_active_streams(waiting_queue)
+        # Normally ``restore_queues`` makes every parked request visible
+        # before the next scheduler tick.  A segment-boundary yield can race
+        # with that finally path, though, so include the private deques in the
+        # admission snapshot as well.  Looking at all queues in one pass is
+        # also important for fairness: a yielded running request must not
+        # reacquire a slot before an eligible waiting peer has been seen.
+        self._promote_active_streams(
+            running_queue,
+            self._held_non_active,
+            waiting_queue,
+            self.waiting_for_chunk_running_requests,
+            self.waiting_for_chunk_waiting_requests,
+        )
         self._process_chunk_queue(
             waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
         )
@@ -975,7 +1073,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._apply_pending_ar_prompt_updates(scheduler_requests)
         self._requeue_replaced_prompts(waiting_queue, running_queue)
-        self._promote_active_streams(waiting_queue)
+        self._promote_active_streams(
+            waiting_queue,
+            self.waiting_for_chunk_running_requests,
+            self.waiting_for_chunk_waiting_requests,
+            self._held_non_active,
+        )
         self._preempt_non_active_running(waiting_queue, running_queue)
 
     def update_streaming_prompt_for_condition(
@@ -1136,17 +1239,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.requests_origin_status[request_id] = RequestStatus.WAITING
             waiting_queue.add_request(request)
 
-    def _promote_active_streams(self, queue: Any) -> None:
-        if len(self._active_streams) >= self._active_window:
+    def _promote_active_streams(self, *queues: Any) -> None:
+        """Fill available slots in persistent FIFO order across scheduler ticks.
+
+        Register waiters even while the window is full. Only requests visible
+        in the supplied queues are eligible; a segment-stop request can be
+        temporarily off-queue until the scheduler parks it for its next input.
+        """
+        if self._active_window <= 0:
             return
-        for request in list(queue):
+        candidates: set[str] = set()
+        for queue in queues:
+            for request in queue:
+                request_id = request.request_id
+                candidates.add(request_id)
+                if request_id not in self._active_streams:
+                    # Updating an existing dict entry preserves its FIFO rank.
+                    self._active_stream_waiters[request_id] = request
+        for request_id in tuple(self._active_stream_waiters):
             if len(self._active_streams) >= self._active_window:
-                return
-            request_id = request.request_id
-            if request_id in self._active_streams:
+                break
+            if request_id not in candidates:
                 continue
-            # Iterating the existing queue preserves FIFO admission.
-            self._active_streams[request_id] = request
+            self._active_streams[request_id] = self._active_stream_waiters.pop(request_id)
 
     def _ensure_active_stream(self, request: Request) -> bool:
         if self._active_window <= 0:
@@ -1155,9 +1270,33 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if request_id in self._active_streams:
             self._active_streams[request_id] = request
             return True
+        self._active_stream_waiters[request_id] = request
         if len(self._active_streams) >= self._active_window:
             return False
+        if next(iter(self._active_stream_waiters)) != request_id:
+            return False
+        self._active_stream_waiters.pop(request_id)
         self._active_streams[request_id] = request
+        return True
+
+    def yield_active_stream(self, request_id: str) -> bool:
+        """Release one bounded-window slot at a resumable segment boundary.
+
+        Native duplex requests are intentionally long lived, so waiting for
+        whole-request cleanup before releasing ``_active_streams`` lets the
+        first K sessions monopolize a K-sized active window forever.  A local
+        segment stop is the safe scheduling boundary: no model step for that
+        segment remains runnable and the request is about to re-enter the
+        connector wait path for its next input.  Removing only the admission
+        marker here preserves all per-request prompt/connector state while
+        allowing FIFO promotion of another parked session on the next tick.
+        """
+        if self._active_window <= 0:
+            return False
+        request = self._active_streams.pop(request_id, None)
+        if request is None:
+            return False
+        self._active_stream_waiters[request_id] = request
         return True
 
     def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:

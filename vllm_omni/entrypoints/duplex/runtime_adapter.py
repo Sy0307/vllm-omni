@@ -87,6 +87,8 @@ class ServingRuntimeSessionState(Protocol):
     deferred_response_create: bool
     deferred_precreate_response: bool
     data_plane_task: asyncio.Task[None] | None
+    data_plane_request_id: str | None
+    data_plane_response_stage_id: int | None
     data_plane_restart_requested: bool
     continuation_owner_id: str | None
     continuation_units: int

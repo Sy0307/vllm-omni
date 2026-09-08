@@ -6,6 +6,10 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.data_entry_keys import OmniPayload
 
 
+class ModelInputError(RuntimeError):
+    """A request-local preparation failure; its KV must not be continued."""
+
+
 class OmniOutput(NamedTuple):
     """Output from the merged Omni model containing both text and audio."""
 

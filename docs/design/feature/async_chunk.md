@@ -230,6 +230,14 @@ sizing.
 - `connectors: dict`: Deploy-owned connector definitions
 - `max_num_seqs: int`: Maximum number of sequences for concurrent processing in the stage
 
+When `active_stream_window > 0`, the transfer adapter keeps a persistent FIFO
+of streams waiting for admission, including those observed while the window is
+full. A resumable stream that yields at a completed segment boundary rejoins
+the tail; scheduler queue restoration must not let it overtake existing
+waiters. Completion and cancellation remove both active and waiting entries.
+This is fairness at safe segment boundaries, not a wall-clock starvation SLO:
+a stalled active stream still needs the configured timeout/abort path.
+
 ### Connector Configuration
 
 ```yaml

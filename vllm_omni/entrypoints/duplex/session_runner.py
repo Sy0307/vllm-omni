@@ -47,6 +47,7 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexJournalOverflowError,
 )
 from vllm_omni.entrypoints.duplex.websocket import (
+    DuplexMailboxOverflowError,
     DuplexWebSocketActor,
     is_input_event,
     normalize_duplex_input_event,
@@ -82,17 +83,26 @@ class DuplexSessionRunnerMixin:
         transport_detached = False
         pending_turn_reservations = 0
 
-        async def attachment_send(payload: dict[str, object]) -> None:
+        async def attachment_send(payload: dict[str, object] | str) -> None:
             nonlocal resume_credential_delivered
             try:
-                await websocket.send_json(payload)
+                if isinstance(payload, str):
+                    await websocket.send_text(payload)
+                else:
+                    await websocket.send_json(payload)
             except RuntimeError as exc:
                 message = str(exc)
                 if "after sending 'websocket.close'" in message or "response already completed" in message:
                     raise WebSocketDisconnect(code=1006) from exc
                 raise
-            if payload.get("type") == "session.created" and isinstance(payload.get("resume_token"), str):
+            if (
+                isinstance(payload, dict)
+                and payload.get("type") == "session.created"
+                and isinstance(payload.get("resume_token"), str)
+            ):
                 resume_credential_delivered = True
+
+        attachment_send_text = attachment_send if callable(getattr(websocket, "send_text", None)) else None
 
         async def attachment_close(reason: str) -> None:
             close = getattr(websocket, "close", None)
@@ -212,9 +222,10 @@ class DuplexSessionRunnerMixin:
                         realtime_protocol=realtime_protocol,
                     )
                     if raw is None:
-                        await actor.enqueue_event({"type": "__timeout__"})
+                        await actor.enqueue_terminal("__timeout__")
                         return
-                    if len(raw.encode("utf-8")) > _MAX_EVENT_BYTES:
+                    encoded_bytes = len(raw.encode("utf-8"))
+                    if encoded_bytes > _MAX_EVENT_BYTES:
                         await emit_event(
                             {"type": "error", "error": "Duplex event too large", "code": "event_too_large"}
                         )
@@ -256,12 +267,16 @@ class DuplexSessionRunnerMixin:
                         pending_turn_reservations += 1
                     if is_input_event(event_type) and native_response_in_progress():
                         event["_duplex_overlap_candidate"] = True
-                    await actor.enqueue_event(event)
+                    await actor.enqueue_event(event, encoded_bytes=encoded_bytes)
+            except DuplexMailboxOverflowError:
+                begin_close("input_backpressure")
+                actor.discard_pending_events()
+                await actor.enqueue_terminal("__mailbox_overflow__")
             except WebSocketDisconnect:
-                await actor.enqueue_event({"type": "__disconnect__"})
+                await actor.enqueue_terminal("__disconnect__")
             except Exception as exc:
                 await emit_event({"type": "error", "error": str(exc), "code": "realtime_input_failed"})
-                await actor.enqueue_event({"type": "__disconnect__"})
+                await actor.enqueue_terminal("__disconnect__")
 
         async def next_actor_event() -> dict[str, object]:
             nonlocal pending_turn_reservations, transport_detached
@@ -453,6 +468,9 @@ class DuplexSessionRunnerMixin:
                 return
             if not silence_continuation:
                 mark_pending_silence_superseded()
+            append_operation_id = (
+                pcm_reservation.operation_id if pcm_reservation is not None else operation_id or uuid.uuid4().hex
+            )
             append_epoch = session.epoch
             append_turn_id = payload_turn_id(payload)
             if append_turn_id is None:
@@ -486,7 +504,7 @@ class DuplexSessionRunnerMixin:
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
-                        operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
+                        operation_id=append_operation_id,
                         final=final,
                         send_json=emit_event,
                         mode="append_audio_chunk",
@@ -537,6 +555,16 @@ class DuplexSessionRunnerMixin:
                             await emit_event(
                                 self._turn_controller.signal(session, DuplexTurnEventType.USER_STARTED.value)
                             )
+                    if append_ok and final and self._session_auto_responds(session):
+                        # A frame-locked model may still be listening at EOF.
+                        # Arm its existing bounded decision owner without
+                        # fabricating a response just to drive continuation.
+                        await self._arm_native_model_decision(
+                            emit_event,
+                            session=session,
+                            expected_epoch=append_epoch,
+                            expected_model_turn_id=append_turn_id,
+                        )
                     return append_ok
                 except asyncio.CancelledError:
                     if pcm_reservation is not None:
@@ -796,6 +824,7 @@ class DuplexSessionRunnerMixin:
                 realtime_protocol=realtime_protocol,
                 attachment_send=attachment_send,
                 attachment_close=attachment_close,
+                attachment_send_text=attachment_send_text,
             )
             if handshake is None:
                 return
@@ -860,6 +889,7 @@ class DuplexSessionRunnerMixin:
                     incarnation=session.incarnation,
                     send=attachment_send,
                     close=attachment_close,
+                    send_text=attachment_send_text,
                 )
                 attachment_generation = created_attachment.attachment_generation
                 attachment_ready = True
@@ -899,6 +929,24 @@ class DuplexSessionRunnerMixin:
                     actor.active_response_task = None
                     activate_waiting_server_vad_turn()
                     continue
+                if event_type == "__mailbox_overflow__":
+                    # The unread mailbox is outside the model-input byte
+                    # ledger. Fail this attachment explicitly and reclaim KV;
+                    # never let a slow peer block overload cleanup indefinitely.
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            emit_event(
+                                {
+                                    "type": "error",
+                                    "code": "input_backpressure",
+                                    "error": "Input mailbox limit exceeded; reopen the session and replay input.",
+                                }
+                            ),
+                            timeout=1.0,
+                        )
+                    with suppress(Exception):
+                        await asyncio.wait_for(websocket.close(code=1013, reason="input_backpressure"), timeout=1.0)
+                    return
 
                 if event_type == "__timeout__":
                     begin_close("timeout")
@@ -1016,6 +1064,79 @@ class DuplexSessionRunnerMixin:
                     event_type = str(event["type"])
 
                 if event_type == "session.close":
+                    stream_drain = None
+                    if session.capabilities.response_lifecycle == "continuous_stream":
+
+                        async def drain_accepted_stream():
+                            # Keep accepted append tasks runnable until their
+                            # receipts arrive. begin_close would cancel them.
+                            if not await wait_for_native_append_tail():
+                                raise RuntimeError("continuous stream append failed before close")
+                            if native.committed_audio_payload is not None:
+                                retained = native.committed_audio_payload
+                                await start_native_append(
+                                    retained,
+                                    final=True,
+                                    operation_id=native.committed_audio_operation_id,
+                                    retained_committed_payload=retained,
+                                )
+                                if not await wait_for_native_append_tail():
+                                    raise RuntimeError("continuous stream retained input failed")
+                            tail = native.audio_buffer.prepare_commit(
+                                operation_id=uuid.uuid4().hex,
+                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                            )
+                            if tail.payload is None:
+                                tail.commit()
+                            else:
+                                await start_native_append(tail.payload, final=True, pcm_reservation=tail)
+                                if not await wait_for_native_append_tail():
+                                    raise RuntimeError("continuous stream final frame failed")
+                            result = await self._drain_continuous_native_stream(emit_event, session=session)
+                            await actor.output_queue.join()
+                            return result
+
+                        try:
+                            stream_drain = await asyncio.wait_for(
+                                drain_accepted_stream(), timeout=self._runtime_control_timeout_s(session)
+                            )
+                        except Exception as exc:
+                            await emit_event(
+                                {
+                                    "type": "error",
+                                    "code": "stream_drain_failed",
+                                    "session_id": session.session_id,
+                                    "error": str(exc) or "stream drain timed out",
+                                }
+                            )
+                            response_id = session.active_response_id
+                            if response_id is not None:
+                                session.end_response(commit_text=False, preserve_request=True)
+                                await emit_event(
+                                    {
+                                        "type": "response.done",
+                                        "response_id": response_id,
+                                        "session_id": session.session_id,
+                                        "status": "failed",
+                                        "status_details": {"type": "failed", "reason": "stream_drain_failed"},
+                                    }
+                                )
+                        else:
+                            response_id = session.active_response_id
+                            if response_id is not None:
+                                session.end_response(commit_text=False, preserve_request=True)
+                                await emit_event(
+                                    {
+                                        "type": "response.done",
+                                        "response_id": response_id,
+                                        "session_id": session.session_id,
+                                        "epoch": session.epoch,
+                                        "status": "completed",
+                                        "status_details": {"type": "completed", "reason": "stream_drained"},
+                                        "drain": stream_drain,
+                                        "playback": session.playback.as_dict(),
+                                    }
+                                )
                     with suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(actor.output_queue.join(), timeout=1.0)
                     begin_close("session_close")
@@ -1029,12 +1150,13 @@ class DuplexSessionRunnerMixin:
                     native.clear_committed_audio()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
-                    await self._cancel_active_response(
-                        session,
-                        actor.active_response_task,
-                        emit_event,
-                        reason="session_close",
-                    )
+                    if stream_drain is None:
+                        await self._cancel_active_response(
+                            session,
+                            actor.active_response_task,
+                            emit_event,
+                            reason="session_close",
+                        )
                     runtime_closed = await self._close_runtime_session(
                         session,
                         reason="session_close",
@@ -1043,6 +1165,10 @@ class DuplexSessionRunnerMixin:
                     actor.active_response_task = None
                     if not runtime_closed:
                         return
+                    if stream_drain is not None:
+                        await emit_event(
+                            {"type": "session.end", "session_id": session.session_id, "stats": stream_drain}
+                        )
                     await emit_event({"type": "session.closed", "session_id": session.session_id})
                     session.close()
                     return
@@ -2206,6 +2332,16 @@ class DuplexSessionRunnerMixin:
                                     operation_id=commit_reservation.operation_id,
                                     retained_committed_payload=final_payload,
                                 )
+                            else:
+                                # Exact-frame EOF has no partial PCM tail to
+                                # append. It still needs to arm a decision
+                                # window when the model has not spoken yet.
+                                await self._arm_native_model_decision(
+                                    emit_event,
+                                    session=session,
+                                    expected_epoch=session.epoch,
+                                    expected_model_turn_id=data_plane_turn_id,
+                                )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
                         if (
@@ -2421,16 +2557,29 @@ class DuplexSessionRunnerMixin:
             with suppress(Exception):
                 await emit_event({"type": "error", "error": str(exc), "code": "internal_error"})
         finally:
-            if realtime_protocol is not None:
-                realtime_protocol.reject_realtime_turn_detection_update()
+            owns_session_cleanup = True
+            if reader_task is not None and not reader_task.done():
+                reader_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reader_task
             if session is not None:
-                if reader_task is not None and not reader_task.done():
-                    reader_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await reader_task
                 while pending_turn_reservations > 0:
                     session.release_pending_turn()
                     pending_turn_reservations -= 1
+                if self._registry.get(session.session_id) is not session or (
+                    attachment_ready
+                    and attachment_generation is not None
+                    and not await self._attachment_registry.is_current_attachment(
+                        session.session_id, attachment_generation, include_revoked=True
+                    )
+                ):
+                    # Expiry/reopen or takeover removed this connection's
+                    # authority. Its late finally must not remove the new
+                    # incarnation's registry entry or cancel the shared tasks.
+                    owns_session_cleanup = False
+            if realtime_protocol is not None and owns_session_cleanup:
+                realtime_protocol.reject_realtime_turn_detection_update()
+            if session is not None and owns_session_cleanup:
                 resumable_detach = (
                     transport_detached
                     and runtime_opened
@@ -2488,7 +2637,7 @@ class DuplexSessionRunnerMixin:
                         notify=False,
                     )
                     if runtime_opened and not runtime_closed and session.state != DuplexSessionState.CLOSED:
-                        await self._close_runtime_session(session, reason="disconnect")
+                        await self._close_runtime_session(session, reason=actor.close_reason or "disconnect")
                     self._cleanup_duplex_session_state(session)
                     self._registry.close(session.session_id)
                     self._session_tasks.pop(session.session_id, None)

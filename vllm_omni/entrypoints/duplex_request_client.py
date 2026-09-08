@@ -10,6 +10,7 @@ from typing import Protocol
 
 from vllm_omni.engine.duplex.contracts import (
     duplex_data_plane_request_info,
+    duplex_resource_request_generation,
     duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
@@ -72,10 +73,50 @@ class DuplexRequestClient:
     def __init__(self, engine: DuplexEnginePort, output_port: DuplexRequestOutputPort) -> None:
         self.engine = engine
         self.output_port = output_port
+        self._resource_generations: dict[tuple[str, int, int], int] = {}
+        self._append_locks: dict[tuple[str, int, int], asyncio.Lock] = {}
 
     @staticmethod
     def request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
         return duplex_data_plane_request_info(result)
+
+    @staticmethod
+    def _resource_key(fence: DuplexFence) -> tuple[str, int, int]:
+        return fence.session_id, fence.incarnation, fence.epoch
+
+    @staticmethod
+    def _physical_request_id(fence: DuplexFence, generation: int) -> str:
+        role = "stage0" if generation == 0 else f"stage0g{generation}"
+        return duplex_resource_request_id(fence, role)
+
+    def _ensure_output_route(self, request_id: str) -> tuple[ClientRequestState, bool]:
+        request_state = self.output_port.request_states.get(request_id)
+        created = request_state is None
+        if request_state is None:
+            request_state = ClientRequestState(request_id)
+            self.output_port.request_states[request_id] = request_state
+        if request_state.metrics is None:
+            wall_start_ts = time.time()
+            request_state.metrics = OrchestratorMetrics(
+                self.output_port.num_stages,
+                self.output_port.log_stats,
+                wall_start_ts,
+                max(0, self.output_port.num_stages - 1),
+            )
+            request_state.request_arrival_ts = wall_start_ts
+        return request_state, created
+
+    def _remove_output_route(self, request_id: str, request_state: ClientRequestState) -> None:
+        if self.output_port.request_states.get(request_id) is request_state:
+            self.output_port.request_states.pop(request_id, None)
+
+    def _clear_fence_routes(self, fence: DuplexFence) -> None:
+        for request_id in tuple(self.output_port.request_states):
+            if duplex_resource_request_generation(request_id, fence, "stage0") is not None:
+                self.output_port.request_states.pop(request_id, None)
+        key = self._resource_key(fence)
+        self._resource_generations.pop(key, None)
+        self._append_locks.pop(key, None)
 
     async def open(
         self,
@@ -101,7 +142,9 @@ class DuplexRequestClient:
         }
         if runtime_config is not None:
             kwargs["runtime_config"] = runtime_config
-        return await self.engine.open_duplex_session_async(session_id, **kwargs)
+        result = await self.engine.open_duplex_session_async(session_id, **kwargs)
+        self._resource_generations.setdefault(self._resource_key(fence), 0)
+        return result
 
     async def append(
         self,
@@ -127,52 +170,74 @@ class DuplexRequestClient:
         if operation_id is not None:
             kwargs["operation_id"] = operation_id
 
-        expected_request_id = duplex_resource_request_id(fence, "stage0")
-        request_state = self.output_port.request_states.get(expected_request_id)
-        created_request_state = request_state is None
-        if request_state is None:
-            request_state = ClientRequestState(expected_request_id)
-            self.output_port.request_states[expected_request_id] = request_state
-        if request_state.metrics is None:
-            wall_start_ts = time.time()
-            request_state.metrics = OrchestratorMetrics(
-                self.output_port.num_stages,
-                self.output_port.log_stats,
-                wall_start_ts,
-                max(0, self.output_port.num_stages - 1),
-            )
-            request_state.request_arrival_ts = wall_start_ts
-        self.output_port.start_output_handler()
-        try:
-            result = await self.engine.append_duplex_input_async(session_id, **kwargs)
-        except BaseException:
-            if created_request_state and request_state.queue.empty():
-                self.output_port.request_states.pop(expected_request_id, None)
-            raise
+        key = self._resource_key(fence)
+        append_lock = self._append_locks.setdefault(key, asyncio.Lock())
+        async with append_lock:
+            current_generation = self._resource_generations.get(key, 0)
+            candidate_generations = (current_generation, current_generation + 1)
+            routes: dict[int, tuple[str, ClientRequestState, bool]] = {}
+            for generation in candidate_generations:
+                candidate_request_id = self._physical_request_id(fence, generation)
+                request_state, created = self._ensure_output_route(candidate_request_id)
+                routes[generation] = (candidate_request_id, request_state, created)
+            self.output_port.start_output_handler()
+            try:
+                result = await self.engine.append_duplex_input_async(session_id, **kwargs)
+            except BaseException as exc:
+                # A failed KV rebuild consumed the attempted physical identity;
+                # the engine never reuses it, so the following retry must be
+                # pre-registered for the next generation.  A timeout or an
+                # explicitly uncertain operation may already have emitted, so
+                # retain both aliases until retry/cancel/close.  Definite
+                # failures discard only routes created by this attempt.
+                error_code = getattr(exc, "code", None)
+                if error_code == "kv_recovery_failed":
+                    self._resource_generations[key] = current_generation + 1
+                    for candidate_request_id, request_state, _ in routes.values():
+                        self._remove_output_route(candidate_request_id, request_state)
+                elif not isinstance(exc, TimeoutError) and error_code not in {"timeout", "uncertain_operation"}:
+                    for candidate_request_id, request_state, created in routes.values():
+                        if created and request_state.queue.empty():
+                            self._remove_output_route(candidate_request_id, request_state)
+                raise
 
-        request_id, response_stage_id = duplex_data_plane_request_info(result)
-        if request_id is None:
-            if created_request_state and request_state.queue.empty():
-                self.output_port.request_states.pop(expected_request_id, None)
-            return result
-        if request_id != expected_request_id:
-            if created_request_state and request_state.queue.empty():
-                self.output_port.request_states.pop(expected_request_id, None)
-            raise RuntimeError(
-                f"duplex data-plane request id mismatch: expected {expected_request_id!r}, got {request_id!r}"
+            request_id, response_stage_id = duplex_data_plane_request_info(result)
+            if request_id is None:
+                for candidate_request_id, request_state, created in routes.values():
+                    if created and request_state.queue.empty():
+                        self._remove_output_route(candidate_request_id, request_state)
+                return result
+
+            generation = duplex_resource_request_generation(request_id, fence, "stage0")
+            if generation not in candidate_generations:
+                for candidate_request_id, request_state, created in routes.values():
+                    if created and request_state.queue.empty():
+                        self._remove_output_route(candidate_request_id, request_state)
+                expected_ids = tuple(item[0] for item in routes.values())
+                raise RuntimeError(
+                    "duplex data-plane request id mismatch: "
+                    f"expected one of {expected_ids!r}, got {request_id!r}"
+                )
+
+            # No await between validating and publishing the generation: an
+            # append for this fence either sees the old or the new identity.
+            self._resource_generations[key] = generation
+            _, request_state, _ = routes[generation]
+            for candidate_generation, (candidate_request_id, candidate_state, _) in routes.items():
+                if candidate_generation != generation:
+                    self._remove_output_route(candidate_request_id, candidate_state)
+            if not collect_outputs:
+                return result
+            outputs = await self.collect_outputs(
+                request_id,
+                request_state,
+                response_stage_id=response_stage_id,
+                timeout=timeout,
             )
-        if not collect_outputs:
+            if outputs:
+                result = dict(result)
+                result["data_plane_outputs"] = outputs
             return result
-        outputs = await self.collect_outputs(
-            request_id,
-            request_state,
-            response_stage_id=response_stage_id,
-            timeout=timeout,
-        )
-        if outputs:
-            result = dict(result)
-            result["data_plane_outputs"] = outputs
-        return result
 
     async def collect_registered_outputs(
         self,
@@ -212,7 +277,7 @@ class DuplexRequestClient:
             kwargs["runtime_config"] = runtime_config
         result = await self.engine.signal_duplex_turn_async(session_id, **kwargs)
         if event in {"barge_in", "input.cancel", "response.cancel"}:
-            self.output_port.request_states.pop(duplex_resource_request_id(fence, "stage0"), None)
+            self._clear_fence_routes(fence)
         return result
 
     async def close(
@@ -229,7 +294,7 @@ class DuplexRequestClient:
             fence=fence,
             timeout=timeout,
         )
-        self.output_port.request_states.pop(duplex_resource_request_id(fence, "stage0"), None)
+        self._clear_fence_routes(fence)
         return result
 
     async def touch(

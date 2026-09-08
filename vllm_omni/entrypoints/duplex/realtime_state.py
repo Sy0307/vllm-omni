@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
@@ -148,6 +149,8 @@ class RealtimeSessionState:
     _initial_session_update: bool = False
     _input_speech_started: bool = False
     _response_states: dict[str | int, _RealtimeResponseState] = field(default_factory=dict)
+    _completed_response_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    _has_response_lifecycle: bool = False
     _item_truncation_cursors: dict[str, tuple[int, int]] = field(default_factory=dict)
     _active_response_id: str | None = None
     _last_response_id: str | None = None
@@ -232,6 +235,8 @@ class RealtimeStateOwner:
     _initial_session_update: bool = _RealtimeStateField()
     _input_speech_started: bool = _RealtimeStateField()
     _response_states: dict[str | int, _RealtimeResponseState] = _RealtimeStateField()
+    _completed_response_ids: OrderedDict[str, None] = _RealtimeStateField()
+    _has_response_lifecycle: bool = _RealtimeStateField()
     _item_truncation_cursors: dict[str, tuple[int, int]] = _RealtimeStateField()
     _active_response_id: str | None = _RealtimeStateField()
     _last_response_id: str | None = _RealtimeStateField()

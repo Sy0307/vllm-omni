@@ -130,15 +130,29 @@ def test_first_append_prepends_voice_and_persona_once() -> None:
     first = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
     second = runtime.prepare_append(_duplex_info(seq=2), prompt_len=18)
 
-    assert first.prefill_applied is True
+    assert first.info_update["duplex"]["prefill_applied"] is True
     assert first.prompt_offset == 0
-    assert first.user_codes.shape == (1, 8)
+    assert first.info_update["pplex_user_codes"].shape == (1, 8)
     assert first.inputs_embeds.shape == (18, 4)
-    assert second.prefill_applied is False
+    assert second.info_update["duplex"]["prefill_applied"] is False
     assert second.prompt_offset == 17
-    assert second.user_codes.shape == (2, 8)
+    assert second.info_update["pplex_user_codes"].shape == (2, 8)
     assert second.inputs_embeds.shape == (1, 4)
     assert codec.encode_calls == 2
+
+
+def test_user_delay_history_is_bounded_and_preserves_frame_clock():
+    runtime = _runtime(_FakeCodec())
+    first = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    for seq in range(2, 101):
+        prepared = runtime.prepare_append(_duplex_info(seq=seq), prompt_len=18 + seq)
+        assert prepared.info_update["pplex_user_codes"].shape[0] == min(3, seq)
+        assert prepared.info_update["meta"]["pplex_frame"] == 17 + seq
+        assert runtime.stage_model.frame_calls[-1]["user_d0"][0].item() == seq - 1
+        if seq > 2:
+            assert runtime.stage_model.frame_calls[-1]["user_d1"][0].item() == seq - 2
+    assert first.info_update["pplex_user_codes"][:, 0].tolist() == [1]
+    assert prepared.info_update["pplex_user_codes"][:, 0].tolist() == [98, 99, 100]
 
 
 @pytest.mark.parametrize(
@@ -204,7 +218,7 @@ def test_repeated_append_identity_does_not_advance_codec() -> None:
 
     assert codec.encode_calls == 1
     assert torch.equal(first.inputs_embeds, retry.inputs_embeds)
-    assert torch.equal(first.user_codes, retry.user_codes)
+    assert torch.equal(first.info_update["pplex_user_codes"], retry.info_update["pplex_user_codes"])
 
 
 def test_next_append_uses_prior_sample_and_causally_delayed_user_frame() -> None:
@@ -269,10 +283,10 @@ def test_live_sessions_keep_independent_streaming_encoders() -> None:
 
     first_1, second_1, first_2, second_2 = _prepare_two_sessions(runtime)
 
-    assert first_1.user_codes[:, 0].tolist() == [1]
-    assert second_1.user_codes[:, 0].tolist() == [1]
-    assert first_2.user_codes[:, 0].tolist() == [1, 2]
-    assert second_2.user_codes[:, 0].tolist() == [1, 2]
+    assert first_1.info_update["pplex_user_codes"][:, 0].tolist() == [1]
+    assert second_1.info_update["pplex_user_codes"][:, 0].tolist() == [1]
+    assert first_2.info_update["pplex_user_codes"][:, 0].tolist() == [1, 2]
+    assert second_2.info_update["pplex_user_codes"][:, 0].tolist() == [1, 2]
 
 
 def test_stage0_session_capacity_fails_before_codec_state_is_shared() -> None:
@@ -300,4 +314,4 @@ def test_close_session_resets_and_reuses_released_codec() -> None:
         _duplex_info(seq=1, session_id="replacement", incarnation=4),
         prompt_len=18,
     )
-    assert replacement.user_codes[:, 0].tolist() == [3]
+    assert replacement.info_update["pplex_user_codes"][:, 0].tolist() == [3]

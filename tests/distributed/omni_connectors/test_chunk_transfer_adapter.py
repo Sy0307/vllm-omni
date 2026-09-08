@@ -546,6 +546,135 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
     assert captured["spec"].extra == expected_extra
 
 
+@pytest.mark.parametrize("start,expected", [(0, 1), (1, 5)])
+def test_indexed_codec_backlog_coalesces_without_waiting(build_adapter, mocker, start, expected):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    connector.get_nowait = connector.get
+    request = _req("r", RequestStatus.WAITING)
+    chunks = {
+        f"r_0_{i}": (
+            {
+                "codes": {"audio": torch.full((2, 1), i)},
+                "meta": {"codec_frame_offset": start + i, "codec_coalesce": True},
+            },
+            16,
+        )
+        for i in range(7)
+    }
+    connector.get.side_effect = lambda _src, _dst, key: chunks.pop(key, None)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic", return_value=0.0
+    )
+    adapter.load_async(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert adapter.get_req_chunk["r"] == expected
+    assert request.additional_information["codes"]["audio"].shape == (2, expected)
+    assert request.additional_information["meta"]["codec_frame_offset"] == start
+    assert len(chunks) == 7 - expected
+
+
+@pytest.mark.parametrize(
+    "flags", [(False, True), (True, False), (False, False), (True, True), (None, False), (False, None)]
+)
+@pytest.mark.parametrize("tensor_flags", [(False, False), (True, True), (False, True), (True, False)])
+def test_codec_coalescing_preserves_segment_boundaries(build_adapter, mocker, flags, tensor_flags):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    connector.get_nowait = connector.get
+    request = _req("r", RequestStatus.WAITING)
+    request.resumable = True
+    payloads = []
+    for index, (flag, as_tensor) in enumerate(zip(flags, tensor_flags)):
+        meta = {"codec_frame_offset": index + 1, "codec_coalesce": True}
+        if flag is not None:
+            meta["is_segment_finished"] = torch.tensor(flag) if as_tensor else flag
+        payloads.append({"codes": {"audio": torch.full((2, 1), index)}, "meta": meta})
+    chunks = {f"r_0_{index}": (payload, 16) for index, payload in enumerate(payloads)}
+    connector.get.side_effect = lambda _src, _dst, key: chunks.pop(key, None)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic", return_value=0.0
+    )
+
+    adapter.load_async(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    same_segment_semantics = bool(flags[0]) == bool(flags[1])
+    consumed = 2 if same_segment_semantics else 1
+    assert adapter.get_req_chunk["r"] == consumed
+    info = request.additional_information
+    assert info["meta"]["codec_frame_offset"] == 1
+    assert adapter._is_truthy_scalar(info["meta"].get("is_segment_finished")) == bool(flags[0])
+    assert adapter.is_done_receiving_chunks("r") == bool(flags[0])
+    expected = torch.cat([payload["codes"]["audio"] for payload in payloads[:consumed]], dim=1)
+    assert torch.equal(info["codes"]["audio"], expected)
+    assert not chunks
+
+    if not same_segment_semantics:
+        assert adapter._codec_lookahead["r"][0] is payloads[1]
+        # Mirror the generation scheduler retiring the consumed segment before
+        # registering the next read; do not reset metadata, chunk indices or
+        # lookahead, whose continuity is what this regression must verify.
+        adapter.segment_finished_requests.discard("r")
+        adapter._finished_load_reqs.discard("r")
+        adapter.load_async(request)
+        assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+        assert adapter.get_req_chunk["r"] == 2
+        info = request.additional_information
+        assert info["meta"]["codec_frame_offset"] == 2
+        assert torch.equal(info["codes"]["audio"], payloads[1]["codes"]["audio"])
+        assert adapter._is_truthy_scalar(info["meta"].get("is_segment_finished")) == bool(flags[1])
+        assert adapter.is_done_receiving_chunks("r") == bool(flags[1])
+    assert not adapter._codec_lookahead
+    # Each real chunk is fetched once, followed by one empty lookahead probe.
+    assert [call.args[2] for call in connector.get.call_args_list] == ["r_0_0", "r_0_1", "r_0_2"]
+
+
+def test_codec_coalescing_preserves_terminal_lookahead(build_adapter, mocker):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    connector.get_nowait = connector.get
+    request = _req("r", RequestStatus.WAITING)
+    audio = {"codes": {"audio": torch.ones(2, 1)}, "meta": {"codec_frame_offset": 1, "codec_coalesce": True}}
+    terminal = {"meta": {"finished": True}}
+    connector.get.side_effect = [(audio, 16), (terminal, 1)]
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic", return_value=0.0
+    )
+    adapter.load_async(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert adapter.get_req_chunk["r"] == 1
+    assert "r" not in adapter.upstream_exhausted_requests
+    adapter.load_async(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert adapter.get_req_chunk["r"] == 2
+    assert "r" in adapter.upstream_exhausted_requests
+    assert connector.get.call_count == 2
+    adapter.cleanup_receiver("r")
+    assert not adapter._codec_lookahead
+
+
+def test_codec_lookahead_cannot_resurrect_cancelled_receiver(build_adapter, mocker):
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    connector.get_nowait = connector.get
+    request = _req("r", RequestStatus.WAITING)
+    mocker.patch(
+        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter.time.monotonic", return_value=0.0
+    )
+    calls = 0
+
+    def get(_src, _dst, _key):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"codes": {"audio": torch.ones(2, 1)}, "meta": {"codec_frame_offset": 1, "codec_coalesce": True}}, 16
+        adapter.cleanup_receiver("r")
+        return {"meta": {"finished": True}}, 1
+
+    connector.get.side_effect = get
+    adapter.load_async(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert not adapter._codec_lookahead
+    assert "r" not in adapter.get_req_chunk
+    assert "r" not in adapter._finished_load_reqs
+
+
 def test_load_poll(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -1821,6 +1950,124 @@ def test_cleanup_receiver_releases_multiple_slots_in_sequence(build_adapter):
     assert list(adapter._active_streams) == ["req-3", "req-4"], (
         "both freed slots must be reusable after ordinary completion"
     )
+
+
+def test_resumable_segment_boundary_yields_active_slot_without_losing_state(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=2, active_stream_window=2)
+    reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
+    waiting_queue = DummyWaitingQueue(reqs)
+    running_queue = []
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert list(adapter._active_streams) == ["req-1", "req-2"]
+    adapter.get_req_chunk["req-1"] = 7
+    adapter.request_ids_mapping["req-1"] = "external-1"
+
+    assert adapter.yield_active_stream("req-1") is True
+    assert adapter.yield_active_stream("unknown") is False
+    adapter.restore_queues(waiting_queue, running_queue)
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    assert list(adapter._active_streams) == ["req-2", "req-3"]
+    assert list(adapter._active_stream_waiters) == ["req-4", "req-1"]
+    assert adapter.get_req_chunk["req-1"] == 7
+    assert adapter.request_ids_mapping["req-1"] == "external-1"
+
+    assert adapter.yield_active_stream("req-2") is True
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert list(adapter._active_streams) == ["req-3", "req-4"]
+
+
+@pytest.mark.parametrize("window", [1, 2, 4])
+def test_resumable_window_serves_all_waiters_before_readmission(build_adapter, window):
+    """Repeated segment yields must not starve peers beyond a full window."""
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=window, active_stream_window=window)
+    request_ids = [f"req-{idx}" for idx in range(window + 2)]
+    waiting_queue = DummyWaitingQueue([_req(req_id, RequestStatus.WAITING) for req_id in request_ids])
+    adapter.process_pending_chunks(waiting_queue, [])
+    admitted = list(adapter._active_streams)
+
+    for _ in range(3 * len(request_ids)):
+        released = next(iter(adapter._active_streams))
+        assert adapter.yield_active_stream(released)
+        previous = set(adapter._active_streams)
+        adapter.restore_queues(waiting_queue, [])
+        adapter.process_pending_chunks(waiting_queue, [])
+        assert len(adapter._active_streams) == window
+        admitted.extend(req_id for req_id in adapter._active_streams if req_id not in previous)
+
+    assert admitted == [request_ids[idx % len(request_ids)] for idx in range(len(admitted))]
+
+
+def test_yielded_active_stream_reacquires_when_no_peer_can_use_slot(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=1, active_stream_window=1)
+    request = _req("req-only", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([request])
+
+    adapter.process_pending_chunks(waiting_queue, [])
+    assert adapter.yield_active_stream(request.request_id) is True
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == [request.request_id]
+    assert adapter._active_stream_waiters == {}
+
+
+def test_active_window_cleanup_removes_waiter_without_reordering_peers(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=1, active_stream_window=1)
+    requests = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(4)]
+    waiting_queue = DummyWaitingQueue(requests)
+    adapter.process_pending_chunks(waiting_queue, [])
+    assert adapter.yield_active_stream("req-0")
+    adapter.cleanup_receiver("req-1")
+    adapter.cleanup_receiver("req-1")
+
+    assert list(adapter._active_stream_waiters) == ["req-2", "req-3", "req-0"]
+    assert not adapter._ensure_active_stream(requests[0])
+    adapter.restore_queues(waiting_queue, [])
+    adapter.process_pending_chunks(waiting_queue, [])
+
+    assert list(adapter._active_streams) == ["req-2"]
+    assert list(adapter._active_stream_waiters) == ["req-3", "req-0"]
+
+
+def test_single_pipeline_window_owner_keeps_downstream_receiver_live(build_adapter):
+    """A downstream K=0 receiver must poll every upstream-owned stream.
+
+    Two independently rotating K=2 windows can select disjoint halves of a
+    four-stream pipeline.  The upstream stage then waits for consumers that
+    refuse to poll its streams, while the downstream stage polls streams for
+    which no producer is active.  Keep the bounded window on the bottleneck
+    producer only; the next stage's unbounded connector receiver does not make
+    all requests runnable, it merely waits for whichever two producers own.
+    """
+    owner, _ = build_adapter(stage_id=1, model_mode="ar", max_num_seqs=4, active_stream_window=2)
+    receiver, _ = build_adapter(stage_id=2, model_mode="generation", max_num_seqs=4, active_stream_window=0)
+    owner_requests = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(4)]
+    receiver_requests = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(4)]
+    owner_waiting = DummyWaitingQueue(owner_requests)
+    receiver_waiting = DummyWaitingQueue(receiver_requests)
+
+    owner.process_pending_chunks(owner_waiting, [])
+    receiver.process_pending_chunks(receiver_waiting, [])
+
+    assert list(owner._active_streams) == ["req-0", "req-1"]
+    assert [entry.request.request_id for entry in receiver._pending_load_reqs] == [
+        "req-0",
+        "req-1",
+        "req-2",
+        "req-3",
+    ]
+    assert receiver._active_streams == {}
+
+    assert owner.yield_active_stream("req-0") is True
+    assert owner.yield_active_stream("req-1") is True
+    owner.restore_queues(owner_waiting, [])
+    owner.process_pending_chunks(owner_waiting, [])
+
+    assert list(owner._active_streams) == ["req-2", "req-3"]
+    # The downstream receiver was already registered for both newly selected
+    # streams, so upstream rotation cannot strand them behind another window.
+    assert set(receiver._registered_load_entries) == {"req-0", "req-1", "req-2", "req-3"}
 
 
 # ---------------------------------------------------------------

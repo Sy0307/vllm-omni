@@ -55,6 +55,14 @@ class OmniConnectorBase(ABC):
         """
         pass
 
+    def get_nowait(self, from_stage: str, to_stage: str, get_key: str) -> tuple[Any, int] | None:
+        """Optional non-waiting lookahead; unsupported transports return None.
+
+        Unlike get(), this must not wait for missing data or a writer lock.
+        Returning None must leave the chunk available to the normal receiver.
+        """
+        return None
+
     @abstractmethod
     def cleanup(self, request_id: str) -> None:
         """Clean up resources for a request."""

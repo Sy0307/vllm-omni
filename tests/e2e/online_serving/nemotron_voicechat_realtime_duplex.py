@@ -37,7 +37,11 @@ DEFAULT_FUNCTION_TOOLS = [
         },
     }
 ]
-DEFAULT_INSTRUCTIONS = "You are NVIDIA Voice Chat. Answer briefly. Start by greeting the user."
+DEFAULT_INSTRUCTIONS = (
+    "You are an AI voice assistant developed by NVIDIA. Your name is NVIDIA Voice Chat. "
+    "Answer in a spoken, conversational style rather than a written one. "
+    "Do not repeat the same sentence over and over again. Start the conversation by greeting the user."
+)
 DEFAULT_FUNCTION_INSTRUCTIONS = (
     "You are NVIDIA Voice Chat. If the user's request matches an available tool, "
     "you MUST call that tool instead of answering from your own knowledge. "
@@ -138,14 +142,17 @@ def _write_events(path: Path, client: RealtimeDuplexClient) -> None:
 
 
 @asynccontextmanager
-async def _managed_client(client: RealtimeDuplexClient, *, timeout_s: float):
+async def _managed_client(client: RealtimeDuplexClient, *, timeout_s: float, events_path: Path):
     async with client:
         try:
             yield
         finally:
-            if client.events.count("session.created") and not client.events.count("session.closed"):
-                with suppress(Exception):
-                    await client.close_session(timeout_s=min(timeout_s, 30.0))
+            try:
+                if client.events.count("session.created") and not client.events.count("session.closed"):
+                    with suppress(Exception):
+                        await client.close_session(timeout_s=min(timeout_s, 30.0))
+            finally:
+                _write_events(events_path, client)
 
 
 async def run(args: argparse.Namespace) -> dict[str, object]:
@@ -158,7 +165,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     tools = DEFAULT_FUNCTION_TOOLS if args.expect_function_call else None
     session_id = f"nemotron-voicechat-{uuid.uuid4().hex}"
     client = RealtimeDuplexClient(_url(args.url, args.model, session_id))
-    async with _managed_client(client, timeout_s=args.timeout_s):
+    async with _managed_client(client, timeout_s=args.timeout_s, events_path=output_dir / "events.jsonl"):
         session_payload: dict[str, object] = {
             "session_id": session_id,
             "model": args.model,
@@ -168,7 +175,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             "instructions": instructions,
             "idle_timeout_s": args.timeout_s,
             "turn_detection": None,
-            "extra_body": {"auto_response": True},
+            "extra_body": {"auto_response": True, "emit_duplex_control_results": True},
         }
         if tools is not None:
             session_payload["tools"] = tools
@@ -189,6 +196,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             supports_core_resumable_request=True,
             supports_core_kv_lease=False,
             supports_multi_session=False,
+            response_lifecycle="continuous_stream",
         )
         if not isinstance(capabilities, dict) or any(capabilities.get(key) != value for key, value in expected.items()):
             raise AssertionError(f"unexpected capabilities: {capabilities}")
@@ -205,22 +213,21 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             else None
         )
         pcm = _read_wav(Path(args.input_wav), input_channel=args.input_channel)
-        frame_count = await _stream(client, pcm, max_frames=args.max_frames, realtime=not args.no_realtime)
-        completed_responses_at_commit = client.events.count("response.done")
-        await client.send({"type": "input_audio_buffer.commit", "final": True})
+        if args.max_frames is not None:
+            pcm = pcm[: args.max_frames * FRAME_SAMPLES]
+        source_frames = math.ceil(pcm.size / FRAME_SAMPLES)
+        silence_frames = math.ceil(args.trailing_silence_s / FRAME_PERIOD_S)
+        # NIM's documented file workflow supplies ~20s trailing silence and
+        # then session.close. It does not wait for a neural EOS after commit.
+        pcm = np.pad(pcm, (0, (source_frames + silence_frames) * FRAME_SAMPLES - pcm.size))
+        frame_count = await _stream(client, pcm, max_frames=None, realtime=not args.no_realtime)
         await wait_for(
             lambda: (
                 bool(client.events.errors())
                 or (
                     client.events.count("response.function_call_arguments.done") > 0
                     if args.expect_function_call
-                    else (
-                        client.events.count("response.audio.delta") >= args.minimum_audio_chunks
-                        and (
-                            args.allow_incomplete_response
-                            or client.events.count("response.done") > completed_responses_at_commit
-                        )
-                    )
+                    else client.events.count("response.audio.delta") >= args.minimum_audio_chunks
                 )
             ),
             timeout_s=args.timeout_s,
@@ -229,12 +236,6 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         await asyncio.sleep(args.drain_s)
         if client.events.errors():
             raise AssertionError(f"Realtime session emitted errors: {client.events.errors()}")
-        done_events = _events(client, "response.done")
-        if not args.expect_function_call and not args.allow_incomplete_response:
-            response = done_events[-1].get("response") if done_events else None
-            status = response.get("status") if isinstance(response, dict) else None
-            if status != "completed":
-                raise AssertionError(f"response did not complete successfully: {done_events[-1:]}")
 
         function_events = [
             event for event in client.events.events if str(event.get("type", "")).startswith("response.function_call")
@@ -281,10 +282,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                         for event in later
                         if event.get("type") == "response.audio_transcript.delta"
                     ).lower()
-                    return (
-                        any(event.get("type") == "response.audio.delta" for event in later)
-                        and any(event.get("type") == "response.done" for event in later)
-                        and (args.expected_post_tool_text is None or args.expected_post_tool_text.lower() in transcript)
+                    return any(event.get("type") == "response.audio.delta" for event in later) and (
+                        args.expected_post_tool_text is None or args.expected_post_tool_text.lower() in transcript
                     )
 
                 await wait_for(
@@ -296,6 +295,29 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     raise AssertionError(f"function output failed: {client.events.errors()}")
                 await asyncio.sleep(args.drain_s)
 
+        await client.close_session(timeout_s=args.timeout_s)
+        if client.events.errors():
+            raise AssertionError(f"stream close failed: {client.events.errors()}")
+        if not args.expect_function_call:
+            done_events = _events(client, "response.done")
+            if len(done_events) != 1 or len(client.events.response_ids) != 1:
+                raise AssertionError("expected one continuous response ending at graceful close")
+            response = done_events[0].get("response", {})
+            if (
+                response.get("status") != "completed"
+                or response.get("status_details", {}).get("reason") != "stream_drained"
+            ):
+                raise AssertionError(f"stream did not drain successfully: {response}")
+            drain = response.get("metadata", {}).get("drain", {})
+            if drain != {
+                "accepted_frames": frame_count,
+                "text_frames": frame_count,
+                "audio_frames": frame_count,
+                "drained": True,
+            }:
+                raise AssertionError(f"stream drain counts differ from sent input: {drain}, expected={frame_count}")
+            if client.events.count("response.audio.delta") != frame_count:
+                raise AssertionError("not all accepted audio frames reached the client")
         audio = client.events.audio_bytes()
         audio_events = _events(client, "response.audio.delta")
         rates = {event.get("sample_rate_hz") for event in audio_events}
@@ -314,13 +336,14 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 f"model output RMS {audio_rms:.6f} is below {args.minimum_audio_rms:.6f}; "
                 "received packets contain only silence"
             )
-    _write_events(output_dir / "events.jsonl", client)
     if audio:
         write_pcm16_wav(output_dir / "output.wav", audio, sample_rate_hz=OUTPUT_SAMPLE_RATE_HZ)
     result = {
         "ok": True,
         "session_id": session_id,
         "input_frames": frame_count,
+        "source_frames": source_frames,
+        "trailing_silence_frames": silence_frames,
         "capabilities": capabilities,
         "event_counts": {
             event_type: client.events.count(event_type)
@@ -346,6 +369,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="/tmp/nemotron-voicechat-duplex")
     parser.add_argument("--instructions", default=DEFAULT_INSTRUCTIONS)
     parser.add_argument("--max-frames", type=int)
+    parser.add_argument("--trailing-silence-s", type=float, default=20.0)
     parser.add_argument("--minimum-audio-chunks", type=int, default=1)
     parser.add_argument(
         "--allow-incomplete-response",
@@ -367,7 +391,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-realtime", action="store_true")
     parser.add_argument("--drain-s", type=float, default=2.0)
     parser.add_argument("--timeout-s", type=float, default=600.0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.trailing_silence_s) or not 0 <= args.trailing_silence_s <= 60:
+        parser.error("--trailing-silence-s must be between 0 and 60")
+    return args
 
 
 def main() -> None:

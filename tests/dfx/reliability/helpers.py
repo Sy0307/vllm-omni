@@ -904,7 +904,7 @@ def make_process_kill_fault_injector(
        ``Process.name()`` plus argv text. This matches how :func:`_safe_proc_info`
        logs processes and catches vLLM-style titles (``VLLM::...``) that often do not
        appear in ``pgrep -f``\'s command-line view.
-    2. **``pgrep -f``** (legacy): scoped to the server PID tree when it is known;
+    2. **``pgrep -f``** (legacy): always scoped to the known server PID tree;
        uses procps regular-expression rules for the pattern.
 
     If neither phase finds a target, the returned callable issues ``pytest.skip``.
@@ -921,9 +921,7 @@ def make_process_kill_fault_injector(
         _log_server_process_tree(server)
         server_tree = set(_list_server_process_tree(server))
         if not server_tree:
-            logger.warning(
-                "[reliability][process-kill] no server process tree found; fallback to global pgrep matching"
-            )
+            raise ValueError("Fault injection requires a known test server process tree; global matching is unsafe")
 
         def _kill_and_wait(filtered: list[int], pattern: str, *, source: str) -> None:
             sig = getattr(signal, signal_name, None)
@@ -972,7 +970,7 @@ def make_process_kill_fault_injector(
                 allow_zero_match=True,
                 execute_kill=False,
             )
-            filtered = [pid for pid in pids if not server_tree or pid in server_tree]
+            filtered = [pid for pid in pids if pid in server_tree]
             if pids and not filtered:
                 logger.warning(
                     "[reliability][process-kill] pattern=%s matched non-server pids=%s, skip them",

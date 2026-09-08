@@ -689,6 +689,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 num_tokens_padded,
                 intermediate_tensors,
             )
+            input_errors = getattr(scheduler_output, "model_input_errors", {})
+            if input_errors:
+                slots = {
+                    gid: self.input_batch.block_table[gid].slot_mapping.gpu
+                    for gid in range(len(self.kv_cache_config.kv_cache_groups))
+                }
+                self._mask_failed_input_kv_slots(input_errors, req_ids[:num_reqs], slots)
 
             #  -------------------------------------- Omni-new -------------------------------------------------
             if hasattr(self.model, "prepare_runner_inputs"):
@@ -881,6 +888,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ):
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            self._mask_failed_input_logits(logits)
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
@@ -1049,6 +1057,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        input_errors = dict(getattr(scheduler_output, "model_input_errors", {}) or {})
+        self._suppress_failed_input_samples(
+            input_errors, req_id_to_index_output_copy, valid_sampled_token_ids, invalid_req_indices
+        )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -1096,6 +1108,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if engine_output_type == "audio" and sparse_mm_req_ids is not None:
             sparse_req_id_set = set(sparse_mm_req_ids)
             downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in input_errors]
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
@@ -1278,6 +1291,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            model_input_errors=input_errors,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         model_runner_output.routed_experts = routed_experts_lists

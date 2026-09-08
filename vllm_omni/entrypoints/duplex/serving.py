@@ -8,7 +8,7 @@ import base64
 import binascii
 import inspect
 import json
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -23,6 +23,9 @@ from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
 from vllm_omni.entrypoints.duplex.capability import (
     should_enable_duplex_endpoint,
 )
+from vllm_omni.engine.duplex.runtime import duplex_resource_request_id
+from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.entrypoints.duplex.chat_fallback import (
     ChatFallbackProjectorMixin,
 )
@@ -67,6 +70,7 @@ from vllm_omni.entrypoints.duplex.server_vad import (
 from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexJournalGapError,
     DuplexSessionAttachmentRegistry,
+    DuplexTransportAttachment,
     InvalidResumeTokenError,
 )
 from vllm_omni.entrypoints.duplex.session_runner import (
@@ -172,10 +176,14 @@ class OmniDuplexSessionHandler(
         self._resync_required_sessions: set[str] = set()
         self._lifecycle_queue = getattr(self._chat_service.engine_client, "duplex_lifecycle_events", None)
         self._lifecycle_task: asyncio.Task[None] | None = None
+        self._lifecycle_cleanups: dict[str, asyncio.Task[None]] = {}
+        self._lifecycle_notifications: set[asyncio.Task[None]] = set()
+        self._pending_resume_controls: dict[str, asyncio.Task[int]] = {}
         self._attachment_registry = DuplexSessionAttachmentRegistry(
             replay_ttl_s=self._duplex_session_config.resume_replay_ttl_s,
             replay_max_bytes_per_session=self._duplex_session_config.resume_replay_max_bytes_per_session,
             disconnect_grace_s=self._duplex_session_config.disconnect_grace_s,
+            transport_timeout_s=self._duplex_session_config.attachment_io_timeout_s,
         )
 
     async def handle_realtime_session(self, websocket: WebSocket) -> None:
@@ -200,16 +208,31 @@ class OmniDuplexSessionHandler(
         try:
             while True:
                 message = await queue.get()
-                try:
-                    if isinstance(message, DuplexSessionLifecycleMessage):
-                        await self._apply_runtime_lifecycle(message)
-                finally:
+                if not isinstance(message, DuplexSessionLifecycleMessage):
                     queue.task_done()
-                if self._registry.active_count() == 0:
-                    return
+                    continue
+                previous = self._lifecycle_cleanups.get(message.session_id)
+                task = asyncio.create_task(self._run_session_lifecycle_cleanup(message, previous, queue))
+                self._lifecycle_cleanups[message.session_id] = task
         finally:
             if self._lifecycle_task is asyncio.current_task():
                 self._lifecycle_task = None
+
+    async def _run_session_lifecycle_cleanup(
+        self, message: DuplexSessionLifecycleMessage, previous: asyncio.Task[None] | None, queue: asyncio.Queue
+    ) -> None:
+        """Preserve per-session order without awaiting a peer's task cancellation."""
+        try:
+            if previous is not None:
+                await asyncio.shield(previous)
+            await self._apply_runtime_lifecycle(message)
+        except Exception:
+            logger.exception("Duplex lifecycle cleanup failed for %s", message.session_id)
+        finally:
+            queue.task_done()
+            if self._lifecycle_cleanups.get(message.session_id) is asyncio.current_task():
+                self._lifecycle_cleanups.pop(message.session_id, None)
+            self._stop_lifecycle_listener_if_idle()
 
     async def _apply_runtime_lifecycle(self, message: DuplexSessionLifecycleMessage) -> None:
         session = self._registry.get(message.session_id)
@@ -234,13 +257,10 @@ class OmniDuplexSessionHandler(
         }
         if protocol is not None:
             expired_payload = protocol.encode_outbound_event(expired_payload)[0]
-        with suppress(Exception):
-            await self._attachment_registry.send_event(
-                session.session_id,
-                expired_payload,
-                journal=False,
-            )
-
+        # Fence the transport first. Resource cleanup must never wait for a
+        # websocket send/close; the runtime has already terminated this lease.
+        session.mark_closing()
+        attachment = await self._attachment_registry.close(session.session_id)
         tasks = self._session_tasks.pop(session.session_id, None)
         if tasks is not None:
             await tasks.cancel_append_tasks()
@@ -253,6 +273,7 @@ class OmniDuplexSessionHandler(
         if native is not None and native.data_plane_task is not None:
             data_plane_task = native.data_plane_task
             native.data_plane_task = None
+            native.data_plane_request_id = None
             data_plane_task.cancel()
             with suppress(asyncio.CancelledError):
                 await data_plane_task
@@ -263,14 +284,26 @@ class OmniDuplexSessionHandler(
         self._realtime_protocols.pop(session.session_id, None)
         self._lease_generations.pop(session.session_id, None)
         self._resync_required_sessions.discard(session.session_id)
-        attachment = await self._attachment_registry.close(session.session_id)
         if attachment is not None:
-            with suppress(Exception):
-                await attachment.close("session_expired")
+            self._notify_retired_attachment(attachment, "session_expired", expired_payload)
+
+    def _notify_retired_attachment(
+        self, attachment: DuplexTransportAttachment, reason: str, payload: dict[str, object]
+    ) -> None:
+        """Track bounded best-effort transport work outside lifecycle cleanup."""
+        task = asyncio.create_task(self._attachment_registry.retire_attachment(attachment, reason, payload))
+        self._lifecycle_notifications.add(task)
+
+        def completed(done: asyncio.Task[None]) -> None:
+            self._lifecycle_notifications.discard(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                logger.warning("Duplex retired attachment notification failed: %s", error)
+
+        task.add_done_callback(completed)
 
     def _stop_lifecycle_listener_if_idle(self) -> None:
         task = self._lifecycle_task
-        if self._registry.active_count() != 0 or task is None or task.done():
+        if self._registry.active_count() != 0 or self._lifecycle_cleanups or task is None or task.done():
             return
         if task is not asyncio.current_task():
             task.cancel()
@@ -933,6 +966,7 @@ class OmniDuplexSessionHandler(
         realtime_protocol: NativeRealtimeSessionProtocol | None = None,
         attachment_send=None,
         attachment_close=None,
+        attachment_send_text: Callable[[str], Awaitable[None]] | None = None,
     ) -> _DuplexSessionHandshake | None:
         raw = await self._receive_text(
             websocket,
@@ -963,6 +997,7 @@ class OmniDuplexSessionHandler(
                 realtime_protocol=realtime_protocol,
                 attachment_send=attachment_send,
                 attachment_close=attachment_close,
+                attachment_send_text=attachment_send_text,
             )
         if not isinstance(event, dict) or event.get("type") not in {"session.create", "open_session", "session.config"}:
             await send_json(
@@ -1024,10 +1059,49 @@ class OmniDuplexSessionHandler(
         self,
         event: dict[str, object],
         *,
+        send_json: Callable[[dict[str, object]], Awaitable[None]],
+        realtime_protocol: NativeRealtimeSessionProtocol,
+        attachment_send: Callable[[dict[str, object]], Awaitable[None]],
+        attachment_close: Callable[[str], Awaitable[None]],
+        attachment_send_text: Callable[[str], Awaitable[None]] | None = None,
+    ) -> _DuplexSessionHandshake | None:
+        """Keep the engine lease CAS and transport activation in one session order."""
+        session_id = event.get("session_id")
+        try:
+            lock = self._attachment_registry.handshake_lock(session_id) if isinstance(session_id, str) else None
+        except KeyError:
+            lock = None
+
+        async def activate() -> _DuplexSessionHandshake | None:
+            return await self._resume_session_handshake_locked(
+                event,
+                send_json=send_json,
+                realtime_protocol=realtime_protocol,
+                attachment_send=attachment_send,
+                attachment_close=attachment_close,
+                attachment_send_text=attachment_send_text,
+            )
+
+        if lock is None:
+            return await activate()
+        async with lock:
+            pending = self._pending_resume_controls.get(session_id)
+            if pending is not None:
+                # A disconnected caller cannot cancel an already-issued CAS.
+                # Its completion records the generation before the next retry.
+                with suppress(Exception):
+                    await asyncio.shield(pending)
+            return await activate()
+
+    async def _resume_session_handshake_locked(
+        self,
+        event: dict[str, object],
+        *,
         send_json,
         realtime_protocol: NativeRealtimeSessionProtocol,
         attachment_send,
         attachment_close,
+        attachment_send_text: Callable[[str], Awaitable[None]] | None = None,
     ) -> _DuplexSessionHandshake | None:
         session_id = event.get("session_id")
         incarnation = event.get("incarnation")
@@ -1119,7 +1193,32 @@ class OmniDuplexSessionHandler(
             )
             return None
         expected_generation = self._lease_generations.get(session_id, 0)
-        try:
+        abandoned = False
+
+        async def detach_failed_resume(generation: int) -> int:
+            # A failed activation must not leave a detached client looking
+            # attached to the engine for the full idle TTL. A retry waits for
+            # this control before issuing another CAS, so it cannot detach a
+            # newer successful attachment. Preserve an old still-live socket
+            # when cancellation happened before transport takeover began.
+            if (
+                self._registry.get(session_id) is session
+                and session.state == DuplexSessionState.OPEN
+                and self._lease_generations.get(session_id) == generation
+                and not await self._attachment_registry.is_attached(session_id)
+            ):
+                touch = getattr(self._chat_service.engine_client, "touch_duplex_session_async", None)
+                if callable(touch):
+                    await touch(
+                        session_id,
+                        fence=DuplexFence(
+                            session_id, epoch=session.epoch, turn_id=session.turn_id, incarnation=session.incarnation
+                        ),
+                        activity=DuplexLeaseActivity.DETACH,
+                    )
+            return generation
+
+        async def resume_and_record_lease() -> int:
             runtime_result = await resume_runtime(
                 session_id,
                 fence=DuplexFence(
@@ -1133,6 +1232,36 @@ class OmniDuplexSessionHandler(
             lease_generation = self._runtime_lease_generation(runtime_result)
             if lease_generation is None:
                 raise RuntimeError("runtime resume result omitted lease_generation")
+            if self._registry.get(session_id) is not session or session.state != DuplexSessionState.OPEN:
+                raise RuntimeError("session expired during runtime resume")
+            self._lease_generations[session_id] = lease_generation
+            if abandoned:
+                await detach_failed_resume(lease_generation)
+            return lease_generation
+
+        control = asyncio.create_task(resume_and_record_lease())
+        self._pending_resume_controls[session_id] = control
+
+        def completed(done: asyncio.Task[int]) -> None:
+            if self._pending_resume_controls.get(session_id) is done:
+                self._pending_resume_controls.pop(session_id, None)
+            if not done.cancelled():
+                done.exception()
+
+        control.add_done_callback(completed)
+
+        def schedule_detach(generation: int) -> None:
+            cleanup = asyncio.create_task(detach_failed_resume(generation))
+            self._pending_resume_controls[session_id] = cleanup
+            cleanup.add_done_callback(completed)
+
+        try:
+            lease_generation = await asyncio.shield(control)
+        except asyncio.CancelledError:
+            abandoned = True
+            if control.done() and not control.cancelled() and control.exception() is None:
+                schedule_detach(control.result())
+            raise
         except Exception as exc:
             await send_json(
                 {
@@ -1165,12 +1294,15 @@ class OmniDuplexSessionHandler(
                 send=attachment_send,
                 close=attachment_close,
                 activation_payload_factory=activation_payload_factory,
+                send_text=attachment_send_text,
             )
-        except Exception as exc:
+        except BaseException as exc:
             # The engine-side CAS already advanced even if the transport
             # vanished before it received the rotated token. Keep that
             # generation so the registry's one-shot recovery token can retry.
-            self._lease_generations[session_id] = lease_generation
+            schedule_detach(lease_generation)
+            if not isinstance(exc, Exception):
+                raise
             await send_json(
                 {
                     "type": "error",
@@ -1179,7 +1311,6 @@ class OmniDuplexSessionHandler(
                 }
             )
             return None
-        self._lease_generations[session_id] = lease_generation
         replaced = resumed.replaced_attachment
         if replaced is not None:
             replaced_payload = realtime_protocol.encode_outbound_event(
@@ -1189,10 +1320,7 @@ class OmniDuplexSessionHandler(
                     "attachment_generation": replaced.generation,
                 }
             )[0]
-            with suppress(Exception):
-                await replaced.send(replaced_payload)
-            with suppress(Exception):
-                await replaced.close("session_replaced")
+            self._notify_retired_attachment(replaced, "session_replaced", replaced_payload)
         return _DuplexSessionHandshake(
             session=session,
             resumed=True,
