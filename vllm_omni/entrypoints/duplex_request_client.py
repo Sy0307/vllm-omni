@@ -7,6 +7,7 @@ import asyncio
 import time
 from collections.abc import Callable, MutableMapping
 from typing import Protocol
+from weakref import WeakSet
 
 from vllm_omni.engine.duplex.contracts import (
     duplex_data_plane_request_info,
@@ -20,6 +21,8 @@ from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import get_duplex_output_decision
+
+_RETIRED_DUPLEX_ROUTE = object()
 
 
 class DuplexEnginePort(Protocol):
@@ -75,6 +78,9 @@ class DuplexRequestClient:
         self.output_port = output_port
         self._resource_generations: dict[tuple[str, int, int], int] = {}
         self._append_locks: dict[tuple[str, int, int], asyncio.Lock] = {}
+        # Retired routes can still be held by collectors. Weak membership
+        # fences those readers without retaining one tombstone per session.
+        self._retired_output_routes: WeakSet[ClientRequestState] = WeakSet()
 
     @staticmethod
     def request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
@@ -108,12 +114,19 @@ class DuplexRequestClient:
 
     def _remove_output_route(self, request_id: str, request_state: ClientRequestState) -> None:
         if self.output_port.request_states.get(request_id) is request_state:
-            self.output_port.request_states.pop(request_id, None)
+            self.output_port.request_states.pop(request_id)
+            self._retired_output_routes.add(request_state)
+            try:
+                request_state.queue.put_nowait(_RETIRED_DUPLEX_ROUTE)
+            except asyncio.QueueFull:
+                # A full queue cannot have a blocked get; its next reader
+                # observes retirement before processing the queued output.
+                pass
 
     def _clear_fence_routes(self, fence: DuplexFence) -> None:
         for request_id in tuple(self.output_port.request_states):
             if duplex_resource_request_generation(request_id, fence, "stage0") is not None:
-                self.output_port.request_states.pop(request_id, None)
+                self._remove_output_route(request_id, self.output_port.request_states[request_id])
         key = self._resource_key(fence)
         self._resource_generations.pop(key, None)
         self._append_locks.pop(key, None)
@@ -159,6 +172,7 @@ class DuplexRequestClient:
         timeout: float | None,
         collect_outputs: bool,
     ) -> dict[str, object]:
+        deadline = None if timeout is None else time.monotonic() + timeout
         kwargs: dict[str, object] = {
             "mode": mode,
             "payload": payload,
@@ -172,7 +186,16 @@ class DuplexRequestClient:
 
         key = self._resource_key(fence)
         append_lock = self._append_locks.setdefault(key, asyncio.Lock())
-        async with append_lock:
+        if deadline is None:
+            await append_lock.acquire()
+        else:
+            await asyncio.wait_for(append_lock.acquire(), timeout=max(0.0, deadline - time.monotonic()))
+        try:
+            self._require_append_owner(key, append_lock)
+            if deadline is not None:
+                kwargs["timeout"] = max(0.0, deadline - time.monotonic())
+                if kwargs["timeout"] == 0.0:
+                    raise TimeoutError("duplex append deadline expired before submission")
             current_generation = self._resource_generations.get(key, 0)
             candidate_generations = (current_generation, current_generation + 1)
             routes: dict[int, tuple[str, ClientRequestState, bool]] = {}
@@ -191,7 +214,7 @@ class DuplexRequestClient:
                 # retain both aliases until retry/cancel/close.  Definite
                 # failures discard only routes created by this attempt.
                 error_code = getattr(exc, "code", None)
-                if error_code == "kv_recovery_failed":
+                if error_code == "kv_recovery_failed" and self._append_locks.get(key) is append_lock:
                     self._resource_generations[key] = current_generation + 1
                     for candidate_request_id, request_state, _ in routes.values():
                         self._remove_output_route(candidate_request_id, request_state)
@@ -201,6 +224,7 @@ class DuplexRequestClient:
                             self._remove_output_route(candidate_request_id, request_state)
                 raise
 
+            self._require_append_owner(key, append_lock)
             request_id, response_stage_id = duplex_data_plane_request_info(result)
             if request_id is None:
                 for candidate_request_id, request_state, created in routes.values():
@@ -231,12 +255,19 @@ class DuplexRequestClient:
                 request_id,
                 request_state,
                 response_stage_id=response_stage_id,
-                timeout=timeout,
+                timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
             )
+            self._require_append_owner(key, append_lock)
             if outputs:
                 result = dict(result)
                 result["data_plane_outputs"] = outputs
             return result
+        finally:
+            append_lock.release()
+
+    def _require_append_owner(self, key: tuple[str, int, int], owner: asyncio.Lock) -> None:
+        if self._append_locks.get(key) is not owner:
+            raise RuntimeError("duplex append superseded by a successful close or cancel")
 
     async def collect_registered_outputs(
         self,
@@ -348,6 +379,8 @@ class DuplexRequestClient:
         request_start_ts = {request_id: wall_start_ts}
         outputs: list[OmniRequestOutput] = []
         while True:
+            if request_state in self._retired_output_routes:
+                return []
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             if remaining == 0.0:
                 break
@@ -355,6 +388,11 @@ class DuplexRequestClient:
                 message = await asyncio.wait_for(request_state.queue.get(), timeout=remaining)
             except asyncio.TimeoutError:
                 break
+            if message is _RETIRED_DUPLEX_ROUTE:
+                # Relay the single marker to any other already-waiting reader.
+                request_state.queue.put_nowait(_RETIRED_DUPLEX_ROUTE)
+            if request_state in self._retired_output_routes:
+                return []
             if isinstance(message, ErrorMessage):
                 raise RuntimeError(message.error)
             if not isinstance(message, OutputMessage):

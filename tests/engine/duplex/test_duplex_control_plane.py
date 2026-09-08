@@ -130,6 +130,145 @@ class _Clock:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_control", ["open", "resume", "signal"])
+@pytest.mark.parametrize("terminal", ["cancel", "close"])
+@pytest.mark.parametrize("start_waiter", [False, True], ids=["same-tick", "waiting"])
+async def test_preempted_queued_append_does_not_cancel_its_predecessor(
+    monkeypatch, first_control, terminal, start_waiter
+):
+    results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    plane = DuplexControlPlane(extension=None, stage_port=_TypedStagePort(), result_sink=results)
+    fence = DuplexFence("queued-control-preemption")
+    entered, release = asyncio.Event(), asyncio.Event()
+    cancelled: list[str] = []
+    first_messages = {
+        "open": OpenDuplexSessionMessage(control_id="first", session_id=fence.session_id, fence=fence, capabilities={}),
+        "resume": ResumeDuplexSessionMessage(
+            control_id="first", session_id=fence.session_id, fence=fence, expected_lease_generation=0
+        ),
+        "signal": SignalDuplexTurnMessage(
+            control_id="first", session_id=fence.session_id, fence=fence, event="user_started"
+        ),
+    }
+
+    async def handle(message):
+        if message.control_id == "first":
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(first_control)
+                raise
+        await plane.put_result(
+            message.control_id, fence=fence, operation=first_control, session_id=fence.session_id, stage_results=[]
+        )
+
+    monkeypatch.setattr(plane, "handle", handle)
+    plane.dispatch(first_messages[first_control])
+    await asyncio.wait_for(entered.wait(), 1)
+    plane.dispatch(
+        AppendDuplexInputMessage(
+            control_id="append", session_id=fence.session_id, fence=fence, mode="append_tokens", payload={}
+        )
+    )
+    if start_waiter:
+        await asyncio.sleep(0)
+    if terminal == "close":
+        plane.dispatch(CloseDuplexSessionMessage(control_id="terminal", session_id=fence.session_id, fence=fence))
+    else:
+        plane.dispatch(
+            SignalDuplexTurnMessage(
+                control_id="terminal", session_id=fence.session_id, fence=fence, event="input.cancel"
+            )
+        )
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(plane.drain(), 1)
+        assert cancelled == []
+        replies = {result.control_id: result for result in (results.get_nowait() for _ in range(results.qsize()))}
+        assert set(replies) == {"first", "append", "terminal"}
+        assert replies["first"].ok and replies["terminal"].ok
+        assert replies["append"].error is not None and replies["append"].error.code == "cancelled"
+    finally:
+        release.set()
+        await plane.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cleanup_kind", "pause_at"),
+    [
+        ("close", "stage_cleanup"),
+        ("replica_lost", "stage_cleanup"),
+        ("replica_lost", "lifecycle_notification"),
+        ("expiry", "stage_cleanup"),
+        ("expiry", "lifecycle_notification"),
+    ],
+)
+async def test_late_cleanup_does_not_finalize_reopened_incarnation(cleanup_kind, pause_at):
+    entered, release = asyncio.Event(), asyncio.Event()
+    clock = _Clock()
+
+    class GatedPort(_TypedStagePort):
+        async def cleanup(self, request_ids, *, abort=False):
+            if pause_at == "stage_cleanup":
+                entered.set()
+                await release.wait()
+            await super().cleanup(request_ids, abort=abort)
+
+    class GatedSink:
+        async def put(self, message):
+            if pause_at == "lifecycle_notification":
+                entered.set()
+                await release.wait()
+
+    plane = DuplexControlPlane(
+        extension=None,
+        stage_port=GatedPort(),
+        result_sink=asyncio.Queue(),
+        lifecycle_sink=GatedSink(),
+        clock=clock,
+        lease_config=DuplexLeaseConfig(idle_ttl_s=1.0),
+    )
+    old_fence = DuplexFence("cleanup-reopen", incarnation=1)
+    old = plane.sessions.open_session(old_fence, lease_config=DuplexLeaseConfig(idle_ttl_s=1.0))
+    old.bind_stage_request(0, "old-request", fence=old_fence)
+    if cleanup_kind == "close":
+        pending = asyncio.create_task(
+            plane.handle_close(
+                CloseDuplexSessionMessage(control_id="close-old", session_id=old_fence.session_id, fence=old_fence)
+            )
+        )
+    elif cleanup_kind == "replica_lost":
+        pending = asyncio.create_task(plane._terminate_replica_lost_session(old))
+    else:
+        clock.advance(2.0)
+        pending = asyncio.create_task(plane.reap_expired())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        # Independent request cleanup completes before the original I/O await.
+        plane.sessions.finalize_close_session(old)
+        new_fence = DuplexFence(old_fence.session_id, incarnation=2)
+        new = plane.sessions.open_session(new_fence)
+        new.bind_stage_request(0, "new-request", fence=new_fence)
+        if cleanup_kind == "expiry":
+            # Both old expiry and a valid resume advance the lease counter.
+            # Equal lease generations do not imply equal incarnations.
+            new.resume(new_fence, expected_lease_generation=0)
+            assert new.lease.generation == old.lease.generation
+        release.set()
+        await asyncio.wait_for(pending, 1)
+        assert plane.sessions.get(new_fence.session_id) is new
+        assert new.resource_request_ids() == ["new-request"]
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        await plane.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_model_native_open_rejects_missing_append_contract_before_admission() -> None:
     stage_port = _TypedStagePort()
     result_sink: asyncio.Queue = asyncio.Queue()

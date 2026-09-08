@@ -200,7 +200,7 @@ class DuplexControlPlane:
             rollover_trigger_fraction=rollover_trigger_fraction,
             rollover_retain_tokens=rollover_retain_tokens,
         )
-        self._pending_expirations: dict[tuple[str, int], DuplexSessionExpiry] = {}
+        self._pending_expirations: dict[tuple[str, int, int], DuplexSessionExpiry] = {}
         self._pending_control_cleanups: dict[tuple[str, str, int, int, int, int], _PendingControlCleanup] = {}
         self._control_cleanup_tasks: dict[
             tuple[str, str, int, int, int, int],
@@ -215,6 +215,7 @@ class DuplexControlPlane:
         self._session_control_tasks: dict[str, set[asyncio.Task[None]]] = {}
         self._control_task_messages: dict[asyncio.Task[None], object] = {}
         self._control_task_preemption_reasons: dict[asyncio.Task[None], str] = {}
+        self._started_control_tasks: set[asyncio.Task[None]] = set()
         self._pending_append_counts: dict[str, int] = {}
         self._max_pending_appends_per_session = max_pending_appends_per_session
         self._max_pending_session_opens = max_pending_session_opens
@@ -304,18 +305,30 @@ class DuplexControlPlane:
                 if prior_task in self._control_task_preemption_reasons:
                     continue
                 self._control_task_preemption_reasons[prior_task] = preempt_reason
-                prior_task.cancel()
+                # Task.cancel() before the coroutine's first step bypasses
+                # its try/except entirely, losing the correlated reply.
+                # An unstarted task publishes the recorded cancellation at
+                # entry; only an already-started task needs interruption.
+                if prior_task in self._started_control_tasks:
+                    prior_task.cancel()
             predecessor = None
         else:
             predecessor = self._session_control_tails.get(session_id)
 
         async def run_ordered() -> None:
             handle_started = False
+            current = asyncio.current_task()
+            assert current is not None
+            self._started_control_tasks.add(current)
             try:
+                if current in self._control_task_preemption_reasons:
+                    raise asyncio.CancelledError
                 if preempted_tasks:
-                    await asyncio.gather(*preempted_tasks, return_exceptions=True)
+                    await asyncio.shield(asyncio.gather(*preempted_tasks, return_exceptions=True))
                 elif predecessor is not None:
-                    await asyncio.gather(predecessor, return_exceptions=True)
+                    # Ordering is not ownership: preempting this append must
+                    # not cancel the open/signal/resume it is waiting behind.
+                    await asyncio.shield(asyncio.gather(predecessor, return_exceptions=True))
                 self._metric(
                     "observe_duplex_control_queue_wait",
                     self._message_operation(message),
@@ -398,6 +411,7 @@ class DuplexControlPlane:
 
         def discard(completed: asyncio.Task[None]) -> None:
             self._dispatched_control_tasks.discard(completed)
+            self._started_control_tasks.discard(completed)
             self._control_task_preemption_reasons.pop(completed, None)
             self._control_task_messages.pop(completed, None)
             if update_tail:
@@ -1717,7 +1731,7 @@ class DuplexControlPlane:
             excluded_session_ids=set(self._pending_submission_cleanups),
         ):
             self._pending_expirations.setdefault(
-                (item.session_id, item.lease_generation),
+                (item.session_id, item.fence.incarnation, item.lease_generation),
                 item,
             )
         for expiry_key, item in list(self._pending_expirations.items()):
@@ -1746,9 +1760,14 @@ class DuplexControlPlane:
                 )
                 continue
             session = self.sessions.get(item.session_id)
-            if session is not None and session.lease.generation == item.lease_generation:
+            if (
+                session is not None
+                and session.fence.incarnation == item.fence.incarnation
+                and session.lease.generation == item.lease_generation
+            ):
                 self.sessions.finalize_close_session(session)
-            self._pending_expirations.pop(expiry_key, None)
+            if self._pending_expirations.get(expiry_key) is item:
+                self._pending_expirations.pop(expiry_key, None)
             completed += 1
         self._sync_session_metrics()
         return completed
@@ -1870,12 +1889,16 @@ class DuplexControlPlane:
         key: tuple[str, str, int, int, int, int],
         pending: _PendingControlCleanup,
     ) -> None:
+        # Capture the cleanup owner before any I/O. Another cleanup may retire
+        # it and reopen the same logical ID while these awaits are pending.
+        session = self.sessions.get(pending.session_id)
+        if session is not None and session.fence.incarnation != pending.fence.incarnation:
+            session = None
         if pending.submitted_request_ids:
             await self._stage_port.cleanup(list(pending.submitted_request_ids), abort=True)
         if pending.reserved_request_ids:
             await self._stage_port.cleanup(list(pending.reserved_request_ids))
-        session = self.sessions.get(pending.session_id)
-        if session is not None:
+        if session is not None and self.sessions.get(pending.session_id) is session:
             if pending.kind == "cancel":
                 session.release_fence(pending.fence)
             elif pending.kind in {"close", "open_rollback", "replica_lost"}:
@@ -1893,7 +1916,8 @@ class DuplexControlPlane:
                     )
                 self.sessions.finalize_close_session(session)
         self._sync_session_metrics()
-        self._pending_control_cleanups.pop(key, None)
+        if self._pending_control_cleanups.get(key) is pending:
+            self._pending_control_cleanups.pop(key, None)
 
     @classmethod
     def _iter_result_dicts(cls, result: object):

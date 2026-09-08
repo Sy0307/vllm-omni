@@ -144,6 +144,8 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
         timeout=16.5,
     )
 
+    append_timeout = calls[0][2]["timeout"]
+    assert 0 < append_timeout <= 12.5
     assert calls == [
         (
             "append",
@@ -154,7 +156,7 @@ async def test_async_omni_duplex_runtime_controls_forward_timeout():
                 "final": False,
                 "expected_epoch": None,
                 "fence": cancelled_fence,
-                "timeout": 12.5,
+                "timeout": append_timeout,
             },
         ),
         (
