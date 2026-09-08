@@ -73,5 +73,6 @@ previous model state before initializing the replacement.
 The ordinary generation path retains upstream encoder-transfer, KV-transfer,
 and external-launcher data-parallel handling for zero-token steps. The
 continuous recipe opts into recurrent work without changing that default.
-See the [IndexTTS-2.5 recipe](../../../recipes/IndexTeam/IndexTTS-2_5.md) for
-configuration and the disabled experimental vocoder overlap and admission delay.
+See the
+[IndexTTS-2.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md)
+for configuration and the disabled experimental vocoder overlap and admission delay.
