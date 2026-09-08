@@ -2365,6 +2365,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     request = _HashableRequest(
         request_id="req-ar",
         external_req_id="ext-ar",
+        output_token_ids=[],
         status=RequestStatus.RUNNING,
         is_finished=lambda: False,
         num_computed_tokens=1,

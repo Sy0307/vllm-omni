@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OmniModelState — generic ModelState base for all Omni model stages.
 
 Extends ``DefaultModelState`` with:
@@ -11,6 +14,8 @@ Extends ``DefaultModelState`` with:
 
 from __future__ import annotations
 
+import inspect
+import os
 import threading
 import types
 from collections.abc import Callable
@@ -133,6 +138,7 @@ class OmniModelState(DefaultModelState):
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
         self.plugins: list[OmniModelStatePlugin] = []
+        self._decode_preprocess = self._resolve_decode_preprocess(model)
         self._talker_mtp_generators: dict[str, torch.Generator] = {}
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
         self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
@@ -165,6 +171,28 @@ class OmniModelState(DefaultModelState):
         if hasattr(model, "get_omni_plugins"):
             for plugin in model.get_omni_plugins():
                 self.register_plugin(plugin)
+
+    @staticmethod
+    def _resolve_decode_preprocess(model: nn.Module) -> Callable | None:
+        """Adapt existing V1 hooks once, outside the per-step hot path.
+
+        Keep the V2 hook precedence for models with an optimized implementation.
+        Both hooks return the same five values; only the embedding argument is
+        optional in the original contract. Errors inside a hook propagate.
+        """
+        hook = getattr(model, "preprocess_decode_batch_mrv2", None)
+        if not callable(hook):
+            hook = getattr(model, "preprocess_decode_batch", None)
+        if not callable(hook):
+            return None
+        parameters = inspect.signature(hook).parameters
+        if "input_embeds" in parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            return hook
+
+        def decode_preprocess(*, input_ids, input_embeds, req_infos):
+            return hook(input_ids=input_ids, req_infos=req_infos)
+
+        return decode_preprocess
 
     def _init_talker_mtp_runner(self, model: nn.Module) -> Any:
         talker_mtp = getattr(model, "talker_mtp", None)
@@ -338,10 +366,7 @@ class OmniModelState(DefaultModelState):
         if isinstance(req_index_or_id, int):
             return req_index_or_id
 
-        for idx, buffer in enumerate(self.intermediate_buffer.buffers):
-            if buffer.get("req_id") == req_index_or_id:
-                return idx
-        return None
+        return self.intermediate_buffer.req_id_to_index.get(req_index_or_id)
 
     def remove_request(self, req_index: int | str) -> None:
         req_index = self._resolve_req_index(req_index)
@@ -561,7 +586,9 @@ class OmniModelState(DefaultModelState):
                     info.update(self.intermediate_buffer.buffers[req_idx])
                     info.update(runtime_info)
 
-        batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch_mrv2", None)
+        if not hasattr(self, "_decode_preprocess"):
+            self._decode_preprocess = self._resolve_decode_preprocess(self.model)
+        batch_decode_preprocess = self._decode_preprocess
         decode_entries = [entry for entry in preprocess_entries if entry[3] == 1 and not entry[5]]
         batched_decode_indices: set[int] = set()
         if callable(batch_decode_preprocess) and decode_entries:
@@ -614,8 +641,13 @@ class OmniModelState(DefaultModelState):
                         (batch_hidden[row : row + 1], batch_text_step[row : row + 1]),
                     )
                 )
-                self.intermediate_buffer.update(req_idx, updates, gpu_keys)
                 batched_decode_indices.add(i)
+            state_updates = [(entry[1], updates) for entry, updates in zip(decode_entries, updates_by_req, strict=True)]
+            if os.getenv("VLLM_OMNI_BATCH_STATE_COPIES", "0") == "1":
+                self.intermediate_buffer.update_batch(state_updates, gpu_keys)
+            else:
+                for req_idx, updates in state_updates:
+                    self.intermediate_buffer.update(req_idx, updates, gpu_keys)
             prepacked_mtp_inputs = batch_hidden, batch_text_step
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:
@@ -1103,7 +1135,16 @@ class OmniModelState(DefaultModelState):
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             if isinstance(model_output, (list, tuple)) or self.have_multimodal_outputs:
                 buffer_list = self.intermediate_buffer.gather(input_batch)
-                make_output_kwargs = {"model_intermediate_buffer": buffer_list}
+                make_output_kwargs = {
+                    "model_intermediate_buffer": buffer_list,
+                    "request_token_spans": [
+                        (
+                            int(input_batch.query_start_loc_np[i]),
+                            int(input_batch.query_start_loc_np[i]) + int(input_batch.num_scheduled_tokens[i]),
+                        )
+                        for i in range(input_batch.num_reqs)
+                    ],
+                }
                 if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
                     make_output_kwargs["runtime_additional_information"] = buffer_list
                 model_output = self.model.make_omni_output(model_output, **make_output_kwargs)

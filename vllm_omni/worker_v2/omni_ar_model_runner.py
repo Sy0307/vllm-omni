@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OmniARModelRunner — autoregressive stage runner on MR V2.
 
 Extends ``OmniGPUModelRunner`` with:
@@ -32,12 +35,17 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
 
 
 def _copy_mm_to_snapshot_slot(value: Any, slot: dict[tuple[Any, ...], torch.Tensor], path: tuple[Any, ...] = ()) -> Any:
+    if not path and isinstance(value, dict):
+        packed = pack_output_snapshot(value, slot, max_buckets=_ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT)
+        if packed is not None:
+            return packed
     if isinstance(value, torch.Tensor):
         bucket_key = path + (tuple(value.shape), value.dtype, value.device)
         cached = slot.get(bucket_key)
@@ -516,6 +524,10 @@ def _async_copy_mm(
     """Non-blocking D2H copy of multimodal output tensors."""
     if not mm_outputs:
         return {}
+    if isinstance(mm_outputs, PackedOutputSnapshot):
+        return mm_outputs.copy_to_cpu(
+            lambda tensor: _async_copy_tensor(tensor, copy_stream=copy_stream, pin_memory=pin_memory)
+        )
     return {
         key: _async_copy_mm_value(
             value,

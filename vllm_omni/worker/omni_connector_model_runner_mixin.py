@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified data-plane communication mixin for Model Runners.
 
 All connector.put()/get() calls are consolidated here. Background I/O
@@ -18,6 +18,7 @@ import os
 import threading
 from collections import defaultdict, deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -359,6 +360,7 @@ class OmniConnectorModelRunnerMixin:
                 self._put_req_chunk.pop(k, None)
                 self._send_side_request_payload.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
+                getattr(self, "_qwen3_tts_emitted_frames", {}).pop(k, None)
                 self._cached_ic.pop(k, None)
                 self._ramp_chunk_count.pop(k, None)
                 emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
@@ -382,6 +384,10 @@ class OmniConnectorModelRunnerMixin:
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
+        watermark = getattr(self, "_qwen3_tts_emitted_frames", {})
+        watermark.pop(req_id, None)
+        if ext_id is not None:
+            watermark.pop(ext_id, None)
         emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
@@ -1276,23 +1282,10 @@ class OmniConnectorModelRunnerMixin:
                         propagate_errors=propagate_errors,
                     )
                 )
-            emitted = 0
-            completions: list[Any] = []
-            for (request, _), payload in zip(entries, payloads, strict=True):
-                if payload is None:
-                    continue
-                enqueued, completion = self._enqueue_chunk_payload(
-                    request,
-                    payload,
-                    wait_for_delivery=wait_for_delivery,
-                )
-                if enqueued:
-                    emitted += 1
-                    if completion is not None:
-                        completions.append(completion)
-            for completion in completions:
-                completion.wait()
-            return emitted
+            return self._publish_chunk_cohort(
+                [(request, payload) for (request, _), payload in zip(entries, payloads, strict=True)],
+                wait_for_delivery=wait_for_delivery,
+            )
 
         requests = [request for request, _ in entries]
         pooling_outputs = [pooling_output for _, pooling_output in entries]
@@ -1333,23 +1326,34 @@ class OmniConnectorModelRunnerMixin:
                 raise RuntimeError(message)
             return 0
 
-        emitted = 0
-        completions: list[Any] = []
-        for request, payload_data in zip(requests, payloads):
-            if payload_data is None:
-                continue
-            enqueued, completion = self._enqueue_chunk_payload(
-                request,
-                payload_data,
-                wait_for_delivery=wait_for_delivery,
-            )
-            if enqueued:
-                emitted += 1
-                if completion is not None:
-                    completions.append(completion)
-        for completion in completions:
-            completion.wait()
-        return emitted
+        return self._publish_chunk_cohort(list(zip(requests, payloads)), wait_for_delivery=wait_for_delivery)
+
+    def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
+        entries = [(request, payload) for request, payload in entries if payload is not None]
+        if not entries:
+            return 0
+        # Only hold publication while there are actual puts. A zero-payload
+        # model step must not hide previously published keys from a receiver.
+        cohort = getattr(self._omni_connector, "publication_cohort", None)
+        context = (
+            cohort(str(self._stage_id), str(self._next_stage_id))
+            if wait_for_delivery and callable(cohort)
+            else nullcontext()
+        )
+        with context:
+            emitted = 0
+            completions: list[Any] = []
+            for request, payload in entries:
+                enqueued, completion = self._enqueue_chunk_payload(
+                    request, payload, wait_for_delivery=wait_for_delivery
+                )
+                if enqueued:
+                    emitted += 1
+                    if completion is not None:
+                        completions.append(completion)
+            for completion in completions:
+                completion.wait()
+            return emitted
 
     def _enqueue_chunk_payload(
         self,
@@ -2328,6 +2332,7 @@ class OmniConnectorModelRunnerMixin:
                 self._put_req_chunk.pop(cleanup_req_id, None)
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
+                getattr(self, "_qwen3_tts_emitted_frames", {}).pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
                 self._adaptive_states.pop(cleanup_req_id, None)

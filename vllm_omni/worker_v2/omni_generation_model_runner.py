@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OmniGenerationModelRunner — non-autoregressive stage runner on MR V2.
 
 Used for stages like Code2Wav that convert codec codes to audio waveforms.
@@ -8,6 +11,7 @@ buffer and lifecycle hooks.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import Any
 
@@ -243,6 +247,19 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self._prepare_native_data_plane(scheduler_output)
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
+            if (
+                scheduler_output.total_num_scheduled_tokens == 0
+                and os.getenv("VLLM_OMNI_CONTROL_FASTPATH", "1") == "1"
+                and not scheduler_output.scheduled_new_reqs
+                and not scheduler_output.scheduled_cached_reqs.req_ids
+            ):
+                # Registration/terminal/abort work has been applied above.
+                # There is no new or cached request state to add or update.
+                self._apply_block_table_staged_writes_if_available()
+                empty_output = self.kv_connector.no_forward(scheduler_output)
+                return self._attach_native_data_plane_signals(
+                    self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+                )
             # Handle async_chunk prompt_token_ids replacement for cached
             # requests BEFORE add/update — update the existing slot
             # in-place with the new chunk's tokens.

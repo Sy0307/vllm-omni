@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -33,6 +33,43 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
+
+
+@pytest.mark.parametrize("frames", [1, 26, 51])
+def test_terminal_without_new_frames_does_not_replay_last_chunk(frames):
+    tm = _tm(initial_chunk_frames=1)
+    emitted = 0
+    for count in range(1, frames + 1):
+        payload = _call(tm, "r", n_frames=count)
+        if payload is not None:
+            emitted += payload.codes.audio.numel() // _Q
+            tm.put_req_chunk["r"] += 1
+    terminal = _call(tm, "r", n_frames=frames, finished=True)
+    assert terminal is not None and terminal.meta.finished.item()
+    assert terminal.codes.audio.numel() == 0
+    assert emitted == frames
+
+
+def test_repeated_nonterminal_callback_does_not_republish_boundary():
+    tm = _tm(initial_chunk_frames=1)
+    first = _call(tm, "r", n_frames=1)
+    assert first is not None
+    tm.put_req_chunk["r"] += 1
+    assert _call(tm, "r", n_frames=1) is None
+    next_chunk = _call(tm, "r", n_frames=26)
+    assert next_chunk.codes.audio.numel() // _Q == 25
+
+
+def test_terminal_flush_contains_only_frames_not_previously_emitted():
+    tm = _tm(initial_chunk_frames=1)
+    _call(tm, "r", n_frames=1)
+    tm.put_req_chunk["r"] += 1
+    _call(tm, "r", n_frames=26)
+    tm.put_req_chunk["r"] += 1
+    final = _call(tm, "r", n_frames=30, finished=True)
+    assert final.codes.audio.numel() // _Q == 4
+    tm.put_req_chunk["r"] += 1
+    assert _call(tm, "r", n_frames=30, finished=True).codes.audio.numel() == 0
 
 
 def _req(rid, *, finished, initial_codec_chunk_frames=None, output_token_ids=None):
@@ -1131,6 +1168,7 @@ class TestChunkRampEmission:
         tm.put_req_chunk[rid] = 2
 
         tm.code_prompt_token_ids[rid] = []
+        tm._qwen3_tts_emitted_frames.pop(rid, None)
         tm.ramp_chunk_count.pop(rid, None)
 
         p_seg2_0 = self._emit(tm, rid, 4)
@@ -1154,6 +1192,7 @@ class TestChunkRampEmission:
         tm.put_req_chunk[rid] = 1
 
         tm.code_prompt_token_ids[rid] = []
+        tm._qwen3_tts_emitted_frames.pop(rid, None)
         tm.ramp_chunk_count.pop(rid, None)
 
         p_seg2_0 = self._emit(tm, rid, 4)
@@ -1532,6 +1571,7 @@ class TestAdaptiveEmission:
         tm.put_req_chunk[rid] = 1
 
         tm.code_prompt_token_ids[rid] = []
+        tm._qwen3_tts_emitted_frames.pop(rid, None)
         tm.ramp_chunk_count.pop(rid, None)
         tm._adaptive_states.pop(rid, None)
 

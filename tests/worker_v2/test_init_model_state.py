@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for init_omni_model_state factory dispatch."""
 
 from types import SimpleNamespace
@@ -81,3 +84,20 @@ def test_none_architectures_delegates_to_upstream(mock_upstream):
     init_omni_model_state(cfg, model, None, device)
 
     mock_upstream.assert_called_once()
+
+
+@pytest.mark.parametrize("flag", ["has_preprocess", "has_postprocess", "have_multimodal_outputs"])
+def test_unlisted_model_with_omni_capability_uses_omni_state(monkeypatch, flag):
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
+    model = SimpleNamespace(**{flag: True})
+    state = init_omni_model_state(_make_vllm_config(["UnlistedModel"]), model, None, torch.device("cpu"))
+    assert isinstance(state, OmniModelState)
+
+
+def test_disabled_capabilities_preserve_upstream_dispatch(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", lambda *args: sentinel)
+    model = SimpleNamespace(has_preprocess=False, has_postprocess=False, have_multimodal_outputs=False)
+    assert init_omni_model_state(_make_vllm_config(["OtherModel"]), model, None, torch.device("cpu")) is sentinel

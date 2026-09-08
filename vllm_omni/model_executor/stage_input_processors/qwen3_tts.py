@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
 import time
@@ -228,6 +231,17 @@ def talker2code2wav_async_chunk(
         )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    emitted_frames = getattr(transfer_manager, "_qwen3_tts_emitted_frames", None)
+    if emitted_frames is None:
+        emitted_frames = {}
+        transfer_manager._qwen3_tts_emitted_frames = emitted_frames
+    if request_id in emitted_frames and length <= emitted_frames[request_id]:
+        if finished:
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(request_id=request_id, left_context_size=0, finished=torch.tensor(True)),
+            )
+        return None
 
     if length <= 0:
         if finished:
@@ -338,6 +352,8 @@ def talker2code2wav_async_chunk(
 
     if finished and first_chunk:
         context_length = length
+    if request_id in emitted_frames:
+        context_length = min(context_length, length - emitted_frames[request_id])
 
     if adaptive_enabled:
         ctrl = transfer_manager._adaptive_states.get(request_id)
@@ -408,6 +424,7 @@ def talker2code2wav_async_chunk(
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
 
+    emitted_frames[request_id] = length
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=meta,

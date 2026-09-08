@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Omni-aware ``init_model_state`` factory.
 
 Extends the upstream v2 factory with Omni architecture dispatch.
@@ -15,8 +18,8 @@ from vllm.v1.worker.gpu.model_states import (
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 
-# Keep in sync: when adding a new Omni model architecture, add it here
-# AND update the corresponding test in tests/worker_v2/test_init_model_state.py.
+# Legacy models without capability declarations remain compatible. New models
+# use the existing Omni lifecycle flags; this list need not grow.
 _OMNI_ARCHITECTURES: set[str] = {
     "Qwen3OmniMoeForConditionalGeneration",
     "Qwen2_5OmniForConditionalGeneration",
@@ -37,10 +40,14 @@ def init_omni_model_state(
     """Create the appropriate ``ModelState`` for *model*.
 
     Returns an ``OmniModelState`` when the configured architecture is a
-    known Omni model; otherwise delegates to the upstream v2 factory.
+    known legacy Omni model or declares Omni lifecycle capabilities; otherwise
+    delegates to the upstream v2 factory.
     """
     archs = set(vllm_config.model_config.architectures or [])
-    if archs & _OMNI_ARCHITECTURES:
+    uses_omni_lifecycle = any(
+        getattr(model, flag, False) is True for flag in ("has_preprocess", "has_postprocess", "have_multimodal_outputs")
+    )
+    if uses_omni_lifecycle or archs & _OMNI_ARCHITECTURES:
         from vllm_omni.worker_v2.model_states.omni_model_state import (
             OmniModelState,
         )

@@ -2653,6 +2653,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if request.non_streaming_mode is not None:
             params["non_streaming_mode"] = [request.non_streaming_mode]
+        elif (
+            os.getenv("VLLM_OMNI_TTS_FULL_TEXT", "0") == "1"
+            and params["task_type"][0] == "Base"
+            and not params.get("x_vector_only_mode", [False])[0]
+        ):
+            # The Speech API already has the complete target text. This
+            # opt-in conditioning mode avoids the reproduced long repetitive
+            # tails without changing audio streaming, token limits or EOS.
+            params["non_streaming_mode"] = [True]
         # Preserve the legacy VoiceDesign fallback when the request omits an
         # explicit override. CustomVoice and Base rely on model defaults
         # (True and False respectively).

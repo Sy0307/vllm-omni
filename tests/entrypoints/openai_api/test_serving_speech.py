@@ -2144,6 +2144,23 @@ class TestTTSMethods:
         assert params["task_type"] == ["Base"]
         assert "non_streaming_mode" not in params
 
+    @pytest.mark.parametrize("override,expected", [(None, True), (False, False), (True, True)])
+    def test_base_full_text_conditioning_preserves_explicit_override(
+        self, speech_server, monkeypatch, override, expected
+    ):
+        monkeypatch.setenv("VLLM_OMNI_TTS_FULL_TEXT", "1")
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="reference",
+            non_streaming_mode=override,
+            stream=True,
+        )
+        params = speech_server._build_tts_params(request)
+        assert params["non_streaming_mode"] == [expected]
+        assert request.stream is True
+
     def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):
         """Explicit false should not be replaced by the VoiceDesign fallback."""
         req = OpenAICreateSpeechRequest(

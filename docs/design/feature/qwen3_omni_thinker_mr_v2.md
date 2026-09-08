@@ -112,6 +112,37 @@ Native sends use `propagate_errors=True`. Both batch and scalar payload
 builders must propagate construction failures. Legacy callers retain the
 best-effort default.
 
+### Generation chunk admission
+
+Native generation stages schedule individual chunks rather than granting a
+running slot to a stream until its final chunk. A request with outstanding
+tokens cannot schedule another chunk, while other requests may fill the next
+asynchronous batch. Once its output is settled, a live request returns to the
+waiting queue without freeing its decoder state or KV blocks. A consumed
+payload is not executed again while waiting for fresh input or an empty
+terminal notification.
+
+For FCFS scheduling, ready first chunks and continuations share the batch:
+each group gets half the slots and can borrow unused slots from the other.
+Order is preserved within each group. A single-slot stage alternates groups
+when both are ready. Explicit priority scheduling retains its configured
+ordering. The first-chunk state is cleared at a segment boundary or request
+cleanup so a reused request identifier does not inherit old admission state.
+
+This prevents a preloaded continuation from repeatedly occupying both
+asynchronous batches while new streams wait for their first audio. Validation
+must include first-chunk admission latency, throughput, audio underrun, token
+and chunk accounting, terminal delivery, and cancellation under load.
+
+The admission policy and the optional notification paths are separate. SHM
+receive notifications, EngineCore chunk wakeups, cohort publication, and
+payload-only scheduling are opt-in; see [runtime environment variables](../../configuration/environment_variables.md).
+A benchmark using those switches does not establish the behavior of the
+all-default deployment. Compare matched configurations and record playback
+underrun as well as first audio; earlier playback can increase underrun even
+when request throughput improves. HTTP first audio also does not establish
+that every internal stage handoff is faster.
+
 ### Readiness
 
 The connector receive worker publishes lightweight readiness to a scheduler
