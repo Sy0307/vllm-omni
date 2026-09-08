@@ -16,7 +16,7 @@ must not be advertised as complete. Implemented contracts and future
 architecture work are called out separately below.
 
 The current 0.28 interface cleanup is specified in
-[Transactional KV Append](../../../docs/design/feature/duplex_kv_append.md).
+[Transactional KV Append](feature/duplex_kv_append.md).
 It unifies the shared OpenAI Stage0 path for MiniCPM-o, PersonaPlex, and
 Nemotron while keeping model replay capability separate. The review snapshot
 and dated validation sections below describe earlier trees, including their
@@ -819,7 +819,7 @@ four-session gate; the failures described below are historical. The recorded
 Seed-TTS performance samples below use chat fallback, not native KV append;
 they cannot establish native speedup or its absence. Native performance needs
 separate validation, so the default remains off. See
-[the follow-up validation](../../../docs/validation/kv_append_v028.md).
+[the follow-up validation](../validation/kv_append_v028.md).
 The scheduler contains an async fence that rolls back an unconsumed lookahead placeholder,
 marks in-flight output stale, sets `drop_stale_output`, clears speculative
 tokens, and rejects impossible placeholder/computed-token state before append.

@@ -303,7 +303,7 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", lambda *args, **kwargs: str(tmp_path))
     monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
     monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
     monkeypatch.setattr(
