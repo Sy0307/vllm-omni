@@ -76,12 +76,23 @@ def test_auto_position_ids_reuse_sliding_mask_cache(monkeypatch: pytest.MonkeyPa
     assert len(model._sliding_attention_mask_cache) == 1
 
 
-def test_explicit_non_contiguous_position_ids_fail_closed():
+@pytest.mark.parametrize("positions", [[0, 1, 2, 3, 4, 5, 6], [0, 1, 0, 1, 2, 3, 4]])
+def test_explicit_position_ids_use_live_mask(monkeypatch, positions):
     model = _make_decoder_transformer_stub()
-    position_ids = torch.tensor([[0, 1, 0, 1, 2, 3, 4]])
+    position_ids = torch.tensor([positions])
+    received = []
 
-    with pytest.raises(ValueError, match="contiguous zero-based position_ids"):
-        model(inputs_embeds=torch.randn(1, 7, 4), position_ids=position_ids)
+    def build_mask(**kwargs):
+        received.append(kwargs["position_ids"])
+        return None
+
+    monkeypatch.setattr(decoder_module, "create_sliding_window_causal_mask", build_mask)
+    model(inputs_embeds=torch.randn(1, 7, 4), position_ids=position_ids)
+    model(inputs_embeds=torch.randn(1, 7, 4), position_ids=position_ids)
+
+    assert len(received) == 2
+    assert all(value is position_ids for value in received)
+    assert model._sliding_attention_mask_cache == {}
 
 
 def test_sliding_mask_cache_key_tracks_shape_dtype_and_attention_implementation(

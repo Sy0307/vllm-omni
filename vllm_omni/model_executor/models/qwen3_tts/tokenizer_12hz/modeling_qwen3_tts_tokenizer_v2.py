@@ -525,9 +525,8 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
-        # Code2Wav is cache-free and every decoder layer uses sliding attention.
-        # Cache one broadcastable mask per warmup shape instead of rebuilding
-        # it for every request batch.
+        # Stateless calls with implicit positions share one broadcastable mask
+        # per warmup shape. Incremental or explicit-position calls build a live mask.
         self._sliding_attention_mask_cache: dict[tuple[int, torch.dtype, torch.device, str], torch.Tensor | None] = {}
 
         # Initialize weights and apply final processing
@@ -608,6 +607,16 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         inputs_embeds = self.input_proj(inputs_embeds)
 
         sequence_length = inputs_embeds.shape[1]
+        # Only internally generated positions are known to be contiguous and
+        # zero-based without reading CUDA tensor values back to the host.
+        # Explicit positions use the live mask path, including during capture.
+        uses_prepared_or_incremental_mask = (
+            attention_mask is not None
+            or bool(use_cache)
+            or past_key_values is not None
+            or cache_position is not None
+            or position_ids is not None
+        )
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
@@ -621,35 +630,6 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-
-        uses_prepared_or_incremental_mask = (
-            isinstance(attention_mask, dict)
-            or bool(use_cache)
-            or past_key_values is not None
-            or attention_mask is not None
-        )
-        if not uses_prepared_or_incremental_mask:
-            expected_cache_position = torch.arange(
-                sequence_length,
-                device=inputs_embeds.device,
-            )
-            expected_position_ids = expected_cache_position.unsqueeze(0)
-            if (
-                cache_position.shape != expected_cache_position.shape
-                or cache_position.device != expected_cache_position.device
-                or not torch.equal(cache_position, expected_cache_position)
-            ):
-                raise ValueError("Cached Code2Wav masks require contiguous zero-based cache_position")
-            if (
-                position_ids.ndim != 2
-                or position_ids.shape[-1] != sequence_length
-                or position_ids.device != expected_position_ids.device
-                or not torch.equal(
-                    position_ids,
-                    expected_position_ids.expand_as(position_ids),
-                )
-            ):
-                raise ValueError("Cached Code2Wav masks require contiguous zero-based position_ids")
 
         hidden_states = inputs_embeds
 
