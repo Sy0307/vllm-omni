@@ -2446,6 +2446,15 @@ class Orchestrator:
             output,
             context,
         )
+        if decision is not None and decision.ends_model_turn:
+            # Direct controls bypass the stage-input handoff that normally
+            # advances model turns. Commit the boundary here, before processing
+            # already queued appends whose serving fence may still be older.
+            duplex_state = req_state.streaming.bridge_states.get("duplex")
+            if isinstance(duplex_state, dict):
+                turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id"))
+                if isinstance(turn_id, int) and not isinstance(turn_id, bool):
+                    duplex_state["model_turn_id"] = turn_id + 1
         return decision
 
     async def _emit_duplex_direct_output(

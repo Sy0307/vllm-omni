@@ -56,16 +56,18 @@ class MiniCPMO45ServingRuntimeAdapter:
     def is_enabled(config: object) -> bool:
         return MiniCPMO45NativeDuplexServingAdapter.is_enabled(config)  # type: ignore[arg-type]
 
-    @staticmethod
-    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
-        return minicpmo45_native_capabilities(max_sessions=max_sessions)
+    def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+        caps = minicpmo45_native_capabilities(max_sessions=max_sessions)
+        if getattr(self, "_gander_enabled", False) and caps.supports_prompt_replay:
+            caps.supports_context_replacement = True
+        return caps
 
     @staticmethod
     def validate_client_extra_body(extra_body: object) -> None:
         MiniCPMO45NativeDuplexServingAdapter.validate_client_extra_body(extra_body)
 
-    @staticmethod
-    async def prepare_runtime_config(config: object, *, model_config: Any) -> dict[str, object]:
+    async def prepare_runtime_config(self, config: object, *, model_config: Any) -> dict[str, object]:
+        self._gander_enabled = bool(getattr(getattr(model_config, "hf_config", None), "gander_unit8", False))
         return await MiniCPMO45NativeDuplexServingAdapter.prepare_runtime_config(
             config,  # type: ignore[arg-type]
             model_config=model_config,
@@ -103,3 +105,41 @@ class MiniCPMO45ServingRuntimeAdapter:
             speed=speed,
             modalities=modalities,
         )
+
+    @staticmethod
+    def prepare_context_input(item: dict, current: dict, *, epoch: int):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import prepare_context_input
+
+        return prepare_context_input(item, current, epoch=epoch)
+
+    @staticmethod
+    def register_function_call(native: dict, runtime: dict, *, epoch: int) -> dict:
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import register_call
+
+        return register_call(native, runtime, epoch=epoch)
+
+    @staticmethod
+    def prepare_context_replacement(item, current, *, epoch):
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import prepare_context_replacement
+
+        return prepare_context_replacement(item, current, epoch=epoch)
+
+    @staticmethod
+    def context_input_requires_replacement(item):
+        return isinstance(item, dict) and (item.get("kind") == "task_slate" or item.get("preempt") is True)
+
+    @staticmethod
+    def context_wakeup_payload(runtime):
+        return {
+            "gander_control": True,
+            "gander_wake": True,
+            "token_ids": [],
+            "context_version": runtime["duplex_context_version"],
+        }
+
+    @staticmethod
+    def prepare_append_context_policy(payload, runtime, *, response_active):
+        if runtime.get("gander_enabled") and isinstance(payload, dict):
+            # Keep this decision on the operation payload, including retries.
+            payload.setdefault("gander_defer_rollover", bool(response_active))
+        return payload

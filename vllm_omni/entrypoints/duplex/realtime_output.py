@@ -287,7 +287,7 @@ class RealtimeOutputProjector(RealtimeStateOwner):
         if event_type == "audio.cancelled":
             response_id = event.get("response_id")
             payloads = []
-            if event.get("reason") == "output_audio_buffer_clear":
+            if event.get("reason") in {"output_audio_buffer_clear", "context_replaced", "model_interrupt"}:
                 if not isinstance(response_id, str) or not response_id:
                     response_id = protocol._active_response_id or protocol._last_response_id
                 payloads.append(

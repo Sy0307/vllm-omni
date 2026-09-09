@@ -23,6 +23,7 @@ from vllm_omni.entrypoints.duplex.protocol import (
     DuplexSessionState,
 )
 from vllm_omni.entrypoints.duplex.runtime_adapter import (
+    ServingRuntimeConfigError,
     coerce_int,
     payload_turn_id,
     require_continuous_data_plane,
@@ -664,6 +665,7 @@ class NativeRuntimeBridgeMixin:
         next_fence: DuplexFence | None = None,
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
+        context: dict[str, object] | None = None,
     ) -> bool:
         handler = cast("OmniDuplexSessionHandler", self)
         if not handler._uses_serving_runtime_adapter(session.config):
@@ -689,6 +691,9 @@ class NativeRuntimeBridgeMixin:
                 signal_kwargs["session_config"] = session_config
             if runtime_config is not None and handler._callable_accepts_keyword(signal_turn, "runtime_config"):
                 signal_kwargs["runtime_config"] = runtime_config
+            if context is not None:
+                signal_kwargs["context"] = context
+                signal_kwargs["timeout"] = max(60.0, handler._runtime_control_timeout_s(session))
             result = await signal_turn(session.session_id, **signal_kwargs)
         except Exception as exc:
             logger.exception("Failed to signal duplex runtime session: %s", exc)
@@ -1103,6 +1108,17 @@ class NativeRuntimeBridgeMixin:
                     }
                 )
             return close_reason, False
+
+        if native_result.get("context_prefilled") is True:
+            await send_json(
+                {
+                    "type": "input.context.applied",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "context_version": native_result["context_version"],
+                }
+            )
+            return close_reason, emitted_response
         if isinstance(native_result.get("error_code"), str):
             response_id = session.active_response_id
             await send_json(
@@ -1133,6 +1149,34 @@ class NativeRuntimeBridgeMixin:
                 )
             return close_reason, True
         if native_result.get("function_call") is True:
+            register = getattr(handler._serving_runtime_adapter, "register_function_call", None)
+            if callable(register):
+                try:
+                    candidate_runtime = dict(session.runtime_config)
+                    register(native_result, candidate_runtime, epoch=session.epoch)
+                    session.replace_runtime_config(candidate_runtime)
+                except ServingRuntimeConfigError as exc:
+                    await send_json(
+                        {"type": "error", "session_id": session.session_id, "code": exc.code, "error": str(exc)}
+                    )
+                    return close_reason, True
+            if native_result.get("ends_response") is True:
+                response_id = session.active_response_id
+                session.complete_model_turn(session.turn_id)
+                handler._runtime_session_state(session).clear_continuation()
+                if response_id is not None:
+                    session.end_response(commit_text=True, preserve_request=True)
+                    await send_json(
+                        {
+                            "type": "response.done",
+                            "session_id": session.session_id,
+                            "response_id": response_id,
+                            "epoch": session.epoch,
+                            "committed": True,
+                            "status": "completed",
+                            "playback": session.playback.as_dict(),
+                        }
+                    )
             await send_json(
                 {
                     "type": "function_call.done",
@@ -1169,6 +1213,37 @@ class NativeRuntimeBridgeMixin:
             handler._attach_native_runtime_metadata(payload, native_result)
             await send_json(payload)
             return close_reason, emitted_response
+        if native_result.get("is_interrupt") is True:
+            if model_turn_id is not None and model_turn_id < session.turn_id:
+                return close_reason, emitted_response
+            # A model-owned interruption preserves the Thinker's listening KV.
+            # Complete its output turn so the next append resets downstream TTS.
+            response_id = session.active_response_id
+            completed_turn = model_turn_id if model_turn_id is not None else session.turn_id
+            session.complete_model_turn(completed_turn)
+            handler._runtime_session_state(session).clear_continuation()
+            if response_id is not None:
+                await send_json(
+                    {
+                        "type": "audio.cancelled",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": session.epoch,
+                        "reason": "model_interrupt",
+                        "playback": session.playback.as_dict(),
+                    }
+                )
+                session.end_response(commit_text=False, preserve_request=True)
+            await send_json(
+                {
+                    "type": "response.listen",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "reason": "model_interrupt",
+                    "model_listen": True,
+                }
+            )
+            return close_reason, True
         if is_listen is True:
             if session.capabilities.response_lifecycle == "continuous_stream":
                 return close_reason, False

@@ -51,9 +51,13 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 
-def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
+def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None, *, remaining_context: int = 4096) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
     boundary = isinstance(meta, Mapping) and (bool(meta.get("turn_start")) or bool(meta.get("turn_end")))
+    if isinstance(meta, Mapping) and meta.get("gander_speech_tokens") == 50:
+        # Gander masks early EOS even on the first speaking unit. Only the
+        # final unit may finish early (DetachedTalker visible_budget=50).
+        return (max(1, remaining_context), 0) if meta.get("turn_end") else (51, 50)
     ceiling = _DUPLEX_CODEC_TOKENS_PER_CHUNK
     return ceiling, 0 if boundary else ceiling
 
@@ -380,7 +384,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             code_ids = torch.as_tensor(previous_codes, device=self.emb_code[0].weight.device, dtype=torch.long)
         else:
             raise ValueError("streaming prompt recompute is missing confirmed codec ids")
-        if code_ids.numel() > _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1:
+        max_previous_codes = (
+            50 if getattr(getattr(self, "config", None), "gander_unit8", False) else _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
+        )
+        if code_ids.numel() > max_previous_codes:
             raise ValueError(f"streaming prompt recompute has too many codec ids: {code_ids.numel()}")
         if code_ids.numel() and bool(((code_ids < 0) | (code_ids >= self._codec_eos_id)).any()):
             raise ValueError("streaming prompt recompute codec ids include an invalid or terminal token")
@@ -509,7 +516,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     f"prompt_len={info_dict.get('_omni_prompt_len')}"
                 )
             if native_duplex:
-                max_tokens, min_tokens = _native_duplex_chunk_budget(meta if isinstance(meta, Mapping) else None)
+                max_tokens, min_tokens = _native_duplex_chunk_budget(
+                    meta if isinstance(meta, Mapping) else None,
+                    remaining_context=int(self._tts_config.max_position_embeddings) - target_len,
+                )
+                if isinstance(meta, Mapping) and meta.get("gander_speech_tokens") == 50:
+                    # Upstream creates a fresh within-unit penalty history.
+                    retained_codes = []
             else:
                 # MiniCPMTTS.generate()'s max_new_token, clamped to what the
                 # Talker context can still hold. Sampler min_tokens (upstream's
@@ -586,6 +599,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
+        gander_context_versions: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
@@ -632,6 +646,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                gander_context_versions.append(
+                    torch.tensor(int(meta_info.get("gander_context_version", 0)), dtype=torch.long)
+                )
                 segment_texts_utf8.append(
                     torch.tensor(
                         list(segment_text.encode("utf-8")),
@@ -698,6 +715,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "native_duplex": native_duplex_flags,
                     "duplex_epoch": duplex_epochs,
                     "duplex_turn_id": duplex_turn_ids,
+                    "gander_context_version": gander_context_versions,
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
                 }

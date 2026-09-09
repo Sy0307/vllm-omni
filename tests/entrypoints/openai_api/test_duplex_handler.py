@@ -9680,3 +9680,126 @@ async def test_minicpmo_native_duplex_idle_timeout_closes_runtime_with_timeout_r
     assert ws.sent_types() == ["session.created", "session.closed"]
     assert ws.sent[-1]["reason"] == "timeout"
     assert engine.closed == [("sid-native-timeout", "timeout")]
+
+
+@pytest.mark.asyncio
+async def test_native_model_interrupt_cancels_playback_and_preserves_listening_request():
+    request_id = "duplex-model-interrupt-e0-stage0"
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="model-interrupt",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    response_id = session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    ws = TimedWebSocket()
+
+    _, emitted = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "llm",
+            "is_listen": True,
+            "is_interrupt": True,
+            "data_plane_request_id": request_id,
+            "model_turn_id": 0,
+            "end_of_turn": True,
+        },
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert emitted
+    assert [event["type"] for event in ws.sent] == ["audio.cancelled", "response.listen"]
+    assert ws.sent[0]["response_id"] == response_id
+    assert session.active_response_id is None
+    assert session.active_request_id == request_id
+    assert session.turn_id == 1
+    assert session.epoch == 0
+
+
+@pytest.mark.asyncio
+async def test_native_context_append_reaches_runtime_once_in_wire_order(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter import MiniCPMO45ServingRuntimeAdapter
+
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine), config_timeout_s=0.1, idle_timeout_s=1)
+
+    def prepare(item, current, *, epoch):
+        assert epoch == 0
+        assert item["event_id"] == "ctx1"
+        if current.get("test_context_version") == 1:
+            return current, None
+        return {**current, "test_context_version": 1}, {"gander_control": True, "token_ids": [20, 21]}
+
+    monkeypatch.setattr(MiniCPMO45ServingRuntimeAdapter, "prepare_context_input", staticmethod(prepare))
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-control-order", modalities=["text"]))
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16000),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 1000,
+            "is_speech": True,
+        }
+    )
+    for _ in range(2):
+        ws.put({"type": "input.context.append", "context": {"event_id": "ctx1"}})
+    ws.put({"type": "session.close"})
+    await handler.handle_session(ws)
+    assert not [e for e in ws.sent if e.get("type") == "error"]
+    assert len(engine.appended) == 2
+    assert "audio" in engine.appended[0][2]
+    assert engine.appended[1][2] == {"gander_control": True, "token_ids": [20, 21]}
+    acks = [e for e in ws.sent if e.get("type") == "input.context.appended"]
+    assert [e["duplicate"] for e in acks] == [False, True]
+    assert sum(c is not None and c.get("test_context_version") == 1 for c in engine.signal_runtime_configs) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_context_rejected_before_first_audio():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()), config_timeout_s=0.1, idle_timeout_s=1
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-no-control-prefix", modalities=["text"]))
+    ws.put({"type": "input.context.append", "context": {"event_id": "c1"}})
+    ws.put({"type": "session.close"})
+    await handler.handle_session(ws)
+    assert next(e for e in ws.sent if e.get("type") == "error")["code"] == "context_not_initialized"
+
+
+@pytest.mark.asyncio
+async def test_gander_call_registered_before_function_event_and_speech_turn_closed():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter import MiniCPMO45ServingRuntimeAdapter
+
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()), config_timeout_s=0.1, idle_timeout_s=1
+    )
+    handler._serving_runtime_adapter = MiniCPMO45ServingRuntimeAdapter(lambda *args: None)
+    session = DuplexSession(session_id="sid-tool-call", config=DuplexSessionConfig())
+    session.replace_runtime_config(
+        {"gander_enabled": True, "gander_tools": [{"name": "task_start", "parameters": {"type": "object"}}]}
+    )
+    session.begin_response(turn_id=0)
+    session.bind_request("duplex-sid-tool-call-e0-stage0")
+    ws = TimedWebSocket()
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "function_call": True,
+            "ends_response": True,
+            "call_id": "call-test",
+            "name": "task_start",
+            "arguments": '{"name":"lookup"}',
+        },
+        session=session,
+        expected_epoch=0,
+    )
+    assert session.runtime_config["gander_calls"]["call-test"]["epoch"] == 0
+    assert ws.sent_types() == ["response.done", "function_call.done"]
+    assert session.active_request_id == "duplex-sid-tool-call-e0-stage0"
+    assert session.active_response_id is None
+    assert session.turn_id == 1

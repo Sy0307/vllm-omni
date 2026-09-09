@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -125,10 +126,38 @@ class DuplexAppendPlan:
 
 
 @dataclass(frozen=True)
+class DuplexContextOutput:
+    unit_sequence: int
+    data: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class DuplexContextUnit:
+    """A model-selected immutable input unit for context reconstruction."""
+
+    unit_id: str
+    prompt: Mapping[str, Any]
+
+    def __post_init__(self):
+        object.__setattr__(self, "prompt", MappingProxyType(deepcopy(dict(self.prompt))))
+
+
+@dataclass(frozen=True)
+class DuplexContextPlan:
+    """Model policy; engine validates budgets and owns KV replacement."""
+
+    units: tuple[DuplexContextUnit, ...]
+    retained_unit_ids: tuple[str, ...]
+    dropped_unit_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class DuplexOutputDecision:
     action: DuplexOutputAction
     metadata: Mapping[str, Any] = field(default_factory=dict)
     final_output_type: str = "text"
+    # A direct model control action can end a turn without visiting TTS.
+    ends_model_turn: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))

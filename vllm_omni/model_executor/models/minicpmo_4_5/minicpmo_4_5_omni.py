@@ -171,15 +171,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             for row in rows
             if not row.sampling_enabled or (row.seq is not None and closed_units.get(row.request_id) == row.seq)
         }
+        gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
         self._minicpmo45_duplex_row_sessions = {
-            row.row_idx: (row.session_id, row.incarnation) for row in rows if row.session_id is not None
+            row.row_idx: (row.request_id if gander else row.session_id, row.incarnation)
+            for row in rows
+            if row.session_id is not None
         }
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         if not isinstance(request_sessions, dict):
             request_sessions = {}
             self._minicpmo45_duplex_request_sessions = request_sessions
         request_sessions.update(
-            {row.request_id: (row.session_id, row.incarnation) for row in rows if row.session_id is not None}
+            {
+                row.request_id: (row.request_id if gander else row.session_id, row.incarnation)
+                for row in rows
+                if row.session_id is not None
+            }
         )
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
@@ -218,7 +225,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech = payload.get("is_speech")
             segment_key = (row.request_id, row.seq if row.seq is not None else -1)
             session_key = (row.session_id, row.incarnation) if row.session_id is not None else None
-            if turn_eos_id >= 0 and session_key is not None:
+            if (
+                turn_eos_id >= 0
+                and session_key is not None
+                and not getattr(getattr(self, "config", None), "gander_unit8", False)
+            ):
                 state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
                 pending_speech_context = (
                     bool(getattr(state, "pending_speech_context", False)) if state is not None else False
@@ -352,7 +363,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not session_id or not isinstance(payload, dict):
             raise ModelInputError("native_duplex_prefill_failed: bad_duplex_payload")
 
-        session_key = (session_id, incarnation)
+        physical_owner = str(kwargs.get("request_id") or f"{session_id}:{incarnation}:{duplex.get('epoch', 0)}")
+        gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
+        session_key = (physical_owner if gander else session_id, incarnation)
         state = helper.sessions.get(session_key)
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
@@ -370,7 +383,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
 
-        audio_waveform = helper._decode_audio_payload(payload)
+        audio_waveform = None if payload.get("gander_control") is True else helper._decode_audio_payload(payload)
         try:
             video_frames = helper._decode_video_frames_payload(payload)
         except ValueError as exc:
@@ -390,16 +403,48 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             turn_id = int(turn_id) if turn_id is not None else None
         except (TypeError, ValueError):
             turn_id = None
-        result = helper._stage_prefill_embeddings_only(
-            state,
-            audio_waveform,
-            video_frames=video_frames,
-            epoch=epoch,
-            turn_id=turn_id,
-            seq=seq,
-            is_speech=bool(payload.get("is_speech", False)),
-            final=bool(duplex.get("final")),
-        )
+        if payload.get("gander_control") is True:
+            if not getattr(self.config, "gander_unit8", False):
+                raise ValueError("Gander context payload on a non-Gander model")
+            result = helper._stage_control_embeddings(state, payload, epoch=epoch, seq=seq)
+        else:
+            result = helper._stage_prefill_embeddings_only(
+                state,
+                audio_waveform,
+                video_frames=video_frames,
+                epoch=epoch,
+                turn_id=turn_id,
+                seq=seq,
+                is_speech=bool(payload.get("is_speech", False)),
+                final=bool(duplex.get("final")),
+            )
+        if payload.get("gander_replay") and result.get("success") and not result.get("gander_history_embedded"):
+            history = payload.get("gander_replay_output_ids", [])
+            if history:
+                past_ids = list(history[:-1])
+                if past_ids:
+                    past_embeds = torch.cat([helper._as_2d_tensor(helper._embed_token(t)) for t in past_ids], dim=0)
+                    result["inputs_embeds"] = torch.cat([result["inputs_embeds"], past_embeds], dim=0)
+                    result["input_token_ids"] = [*result["input_token_ids"], *past_ids]
+                    result["num_input_tokens"] = len(result["input_token_ids"])
+                state.current_turn_ended = any(
+                    t in history
+                    for t in (
+                        helper.turn_eos_token_id,
+                        helper.listen_token_id,
+                        helper._special_token_ids().get("tool_call_token_id"),
+                    )
+                )
+            result["gander_history_embedded"] = True
+            state.prepared_inputs_embeds = result["inputs_embeds"]
+            state.prepared_input_token_ids = list(result["input_token_ids"])
+            state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
+        if getattr(getattr(self, "config", None), "gander_unit8", False) and result.get("success"):
+            result["special_token_ids"].update(
+                gander_append_seq=seq or 0,
+                gander_context_version=state.gander_context_version,
+                gander_control_input=int(payload.get("gander_control") is True),
+            )
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
@@ -772,6 +817,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row_idx: int,
         token_ids: dict[str, int],
     ) -> int:
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            return self._sample_gander_dialogue_row(logits, sampling_metadata, row_idx=row_idx, token_ids=token_ids)
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
@@ -908,6 +955,41 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             token_ids,
         )
 
+    def _sample_gander_dialogue_row(self, logits, sampling_metadata, *, row_idx, token_ids):
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if isinstance(payload, dict) and payload.get("gander_replay"):
+            history = payload.get("gander_replay_output_ids", [])
+            return int(history[-1]) if history else token_ids["listen_token_id"]
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import current_unit, tool_constraint
+
+        history = getattr(sampling_metadata, "output_token_ids", None) or []
+        recent = list(history[row_idx]) if row_idx < len(history) else []
+        recent = current_unit(recent, token_ids)
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        allow, constrained = tool_constraint(
+            recent, token_ids, enabled=bool(getattr(state, "gander_tools_enabled", False))
+        )
+        logits = logits.clone()
+        if allow:
+            masked = torch.full_like(logits, float("-inf"))
+            masked[:, list(constrained)] = logits[:, list(constrained)]
+            logits = masked
+        else:
+            logits[:, list(constrained)] = float("-inf")
+        eos_id = getattr(self._minicpmo45_tokenizer(), "eos_token_id", None)
+        if isinstance(eos_id, int) and 0 <= eos_id < logits.shape[-1]:
+            logits[:, eos_id] = float("-inf")
+        temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
+        if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
+            return int(logits.argmax(dim=-1).item())
+        logits = self._top_k_top_p_filter(
+            logits / temperature,
+            top_k=int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 20)),
+            top_p=float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8)),
+        )
+        generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
+        return int(torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).item())
+
     def _maybe_cut_minicpmo45_native_duplex_text_chunk(
         self,
         sampled: int,
@@ -1039,17 +1121,41 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if state is None:
             return
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            if isinstance(payload, dict) and payload.get("gander_replay"):
+                state.pending_terminator_token = int(sampled)
+                state.last_terminator_token = int(sampled)
+                return
+            if isinstance(payload, dict) and payload.get("gander_control") and payload.get("force_listen"):
+                # A slate changes model context, not the active speech turn.
+                state.pending_terminator_token = int(sampled)
+                state.last_terminator_token = int(sampled)
+                return
+            if sampled == token_ids.get("tool_call_token_id"):
+                state.gander_tool_active = True
+            if getattr(state, "gander_tool_active", False):
+                state.current_turn_ended = True
+                if sampled == token_ids.get("chunk_eos_token_id"):
+                    state.gander_tool_active = False
+                    state.pending_terminator_token = sampled
+                    state.last_terminator_token = sampled
+                return
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         chunk_tts_eos_id = token_ids.get("chunk_tts_eos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id, turn_eos_id}
+        interrupt_id = (
+            token_ids.get("interrupt_token_id", -1)
+            if getattr(getattr(self, "config", None), "gander_unit8", False)
+            else -1
+        )
+        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id, turn_eos_id, interrupt_id}
         if sampled in terminators:
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == turn_eos_id:
+            if sampled in {turn_eos_id, interrupt_id}:
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
@@ -1107,6 +1213,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return cached
         tokenizer = self._minicpmo45_tokenizer()
         cached = MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tokenizer)
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander import control_token_ids
+
+            cached.update(control_token_ids(tokenizer))
         self._minicpmo45_native_duplex_token_ids_cache = cached
         return cached
 

@@ -48,7 +48,9 @@ The current unified-runtime integrations are:
 - MiniCPM-o 4.5, using `vllm_omni/deploy/minicpmo_4_5.yaml`
   (`session_mode: duplex`);
 - PersonaPlex, whose default `vllm_omni/deploy/personaplex.yaml` enables duplex;
-- Nemotron VoiceChat, via its registered duplex plugin package.
+- Nemotron VoiceChat, via its registered duplex plugin package;
+- [Gander Unit8 dialogue and tool/context inputs](gander.md), reusing the MiniCPM-o 4.5 pipeline
+  with `vllm_omni/deploy/gander.yaml`.
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).

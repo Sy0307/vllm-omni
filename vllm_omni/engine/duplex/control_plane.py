@@ -27,6 +27,8 @@ from vllm.logger import init_logger
 from vllm_omni.engine.duplex.contracts import (
     DUPLEX_CONTRACT_VERSION,
     DuplexAppendPlan,
+    DuplexContextOutput,
+    DuplexContextPlan,
     DuplexInputMode,
     DuplexOutputContext,
     DuplexOutputDecision,
@@ -384,6 +386,8 @@ class DuplexControlPlane:
             "barge_in",
             "input.cancel",
             "response.cancel",
+            "context.replace",
+            "context.validate",
         }:
             return message.event
         return None
@@ -1125,6 +1129,16 @@ class DuplexControlPlane:
         replay_window_rollover = materialized.replay_append is not None and session.replay_window_rollover_needed(
             materialized.replay_append
         )
+        window_due = getattr(self._extension, "context_window_due", None)
+        if callable(window_due) and window_due(
+            tuple(item.prompt for item in session.replay_appends), session.runtime_config
+        ):
+            replay_window_rollover = True
+        rollover_allowed = getattr(self._extension, "automatic_rollover_allowed", None)
+        if callable(rollover_allowed) and not rollover_allowed(message.payload, session.runtime_config):
+            # A policy-triggered compaction cannot discard an undelivered reply.
+            # Hard journal/scheduler limits still reject below; no unbounded growth.
+            replay_window_rollover = False
         rebuild_reason = session.recovery_reason or "replica_loss" if session.recovery_required else None
         if rebuild_reason is not None or replay_window_rollover:
             if not session.capabilities.prompt_replay:
@@ -1143,7 +1157,20 @@ class DuplexControlPlane:
             compact_journal = replay_window_rollover
             retained = list(session.replay_appends)
             if compact_journal:
-                retained = session.compacted_replay_appends()
+                select_window = getattr(self._extension, "select_context_window", None)
+                indices = (
+                    select_window(tuple(item.prompt for item in retained), session.runtime_config)
+                    if callable(select_window)
+                    else None
+                )
+                if indices is None:
+                    retained = session.compacted_replay_appends()
+                else:
+                    if list(indices) != sorted(set(indices)) or any(
+                        type(i) is not int or not 0 <= i < len(retained) for i in indices
+                    ):
+                        raise ValueError("invalid model history selection")
+                    retained = [retained[i] for i in indices]
             retained, prepared_replay_prompts, current_prompt_override = self._fit_replay_appends_for_rebuild(
                 session,
                 retained,
@@ -1211,6 +1238,9 @@ class DuplexControlPlane:
             session.bind_stage_request(stage_id, request_id, fence=message.fence)
             if replay_append is not None:
                 session.record_replay_append(replay_append)
+                pending_output = session.pending_context_outputs.get(update.seq)
+                if pending_output is not None:
+                    self._record_context_output(session, pending_output)
         except BaseException:
             self._pending_submission_cleanups[session.session_id] = _PendingSubmissionCleanup(
                 session_id=session.session_id,
@@ -1266,14 +1296,29 @@ class DuplexControlPlane:
         request_id: str,
         initial: bool,
         recovery_replay: bool = True,
+        runtime_config: dict[str, Any] | None = None,
+        fence: DuplexFence | None = None,
     ) -> dict[str, Any]:
         """Rebase a prompt, suppressing outputs only for historical replay.
 
         An empty retained journal also rebases the *live* candidate to restore
         its session prefix. That candidate must retain normal output routing.
         """
+        prepare_context = getattr(self._extension, "prepare_context_replay", None)
         prepare = getattr(self._extension, "prepare_recovery_prompt", None)
-        if callable(prepare):
+        if callable(prepare_context) and runtime_config is not None:
+            prepared = prepare_context(
+                prompt=dict(append.prompt),
+                request_id=request_id,
+                initial=initial,
+                runtime_config=runtime_config,
+                fence=fence,
+                recovery_replay=recovery_replay,
+            )
+            if not isinstance(prepared, Mapping):
+                raise TypeError("model context replay must return a prompt mapping")
+            replay_prompt = deepcopy(dict(prepared))
+        elif callable(prepare):
             prepared = prepare(
                 prompt=dict(append.prompt),
                 request_id=request_id,
@@ -1324,6 +1369,8 @@ class DuplexControlPlane:
                         append,
                         request_id=request_id,
                         initial=index == 0,
+                        runtime_config=session.runtime_config,
+                        fence=session.fence,
                     )
                     for index, append in enumerate(retained)
                 )
@@ -1337,6 +1384,8 @@ class DuplexControlPlane:
                     request_id=request_id,
                     initial=True,
                     recovery_replay=False,
+                    runtime_config=session.runtime_config,
+                    fence=session.fence,
                 )
                 physical_tokens = self._prompt_token_count(current_prompt_override)
 
@@ -1350,7 +1399,13 @@ class DuplexControlPlane:
             if within_journal and within_context:
                 return retained, prepared_replay_prompts, current_prompt_override
             if retained:
-                retained.pop(0)
+                can_evict = getattr(self._extension, "can_evict_context_unit", None)
+                victim = next(
+                    (i for i, item in enumerate(retained) if not callable(can_evict) or can_evict(item.prompt)), None
+                )
+                if victim is None:
+                    raise ValueError("protected_context_exceeds_budget")
+                retained.pop(victim)
                 continue
             if not within_context:
                 raise RuntimeError(
@@ -1411,6 +1466,8 @@ class DuplexControlPlane:
                                 append,
                                 request_id=context.request_id,
                                 initial=index == 0,
+                                runtime_config=session.runtime_config,
+                                fence=session.fence,
                             )
                         ),
                         already_submitted=index > 0,
@@ -1499,14 +1556,155 @@ class DuplexControlPlane:
             self._metric("inc_duplex_replica_affinity_loss", 1)
         return recoverable, uncertain
 
+    async def _replace_context(self, message: SignalDuplexTurnMessage, session) -> dict[str, object]:
+        """Validate a model plan before retiring KV, then fence/rebuild or fail closed."""
+        plan_context = getattr(self._extension, "plan_context_replacement", None)
+        if not session.capabilities.prompt_replay or not callable(plan_context):
+            raise ValueError("context_replacement_unsupported")
+        session._validate_fence(message.fence)
+        new_fence = message.next_fence
+        if (
+            new_fence is None
+            or new_fence.session_id != message.fence.session_id
+            or new_fence.incarnation != message.fence.incarnation
+            or new_fence.epoch != message.fence.epoch + 1
+        ):
+            raise ValueError("context replacement requires the next epoch fence")
+        context = message.context
+        if not isinstance(context, dict):
+            raise ValueError("context replacement requires a context plan request")
+        if context.get("base_version") != session.runtime_config.get("duplex_context_version", 0):
+            raise ValueError("stale_context_version")
+        candidate_runtime = dict(message.runtime_config or session.runtime_config)
+        version = candidate_runtime.get("duplex_context_version")
+        if type(version) is not int or version != int(session.runtime_config.get("duplex_context_version", 0)) + 1:
+            raise ValueError("context replacement version must advance by one")
+        candidate_session = dict(message.session_config or session.session_config)
+        self.sampling_params_for_config(candidate_runtime)
+        request_id = self.stage_request_id(new_fence, stage_id=0, resource_generation=1)
+        plan = plan_context(
+            prompts=tuple(item.prompt for item in session.replay_appends),
+            runtime_config=candidate_runtime,
+            session_config=candidate_session,
+            request_id=request_id,
+            fence=new_fence,
+            context=context,
+        )
+        if not isinstance(plan, DuplexContextPlan) or not plan.units:
+            raise ValueError("invalid context replacement plan")
+        entries = []
+        for i, unit in enumerate(plan.units):
+            fingerprint = duplex_append_fingerprint(
+                mode=DuplexInputMode.REENCODE_CONTEXT,
+                payload=unit.prompt,
+                final=False,
+                config_generation=session.config_generation + 1,
+            )
+            entries.append(
+                session.prepare_replay_append(
+                    operation_id=f"context:{new_fence.epoch}:{i}:{unit.unit_id}",
+                    operation_fingerprint=fingerprint,
+                    prompt=unit.prompt,
+                )
+            )
+        tokens = sum(item.token_count for item in entries)
+        size = sum(item.byte_count for item in entries)
+        if tokens > session.recovery_max_replay_tokens or size > session.recovery_max_replay_bytes:
+            raise ValueError("context replacement exceeds replay journal budget")
+        if session.scheduler_context_limit is not None and tokens > session.scheduler_context_limit:
+            raise ValueError("context replacement exceeds model context limit")
+        if message.event == "context.validate":
+            return {
+                "supported": True,
+                "event": "context.validate",
+                "base_input_seq": session.input_seq,
+                "base_config_generation": session.config_generation,
+                "retained_unit_ids": list(plan.retained_unit_ids),
+                "replayed_tokens": tokens,
+            }
+        if context.get("base_input_seq", session.input_seq) != session.input_seq:
+            raise ValueError("context_changed_during_validation")
+        if context.get("base_config_generation", session.config_generation) != session.config_generation:
+            raise ValueError("context_config_changed_during_validation")
+        # All parsing/selection/fit checks finish before destructive cleanup.
+        # The next fence rejects late model outputs and old queued operations.
+        session.accept_fence(new_fence)
+        session.replace_configs(session_config=candidate_session, runtime_config=candidate_runtime)
+        try:
+            await self._rebuild_scheduler_native_session(
+                session,
+                tuple(entries),
+                deadline_monotonic=message.deadline_monotonic,
+                reason="context_replace",
+                replace_journal=True,
+                prepared_replay_prompts=tuple(item.prompt for item in entries),
+            )
+            wait_safe = getattr(self._stage_port, "wait_replay_safe", None)
+            if callable(wait_safe):
+                await wait_safe(request_id, deadline_monotonic=message.deadline_monotonic)
+        except BaseException:
+            # A replacement never exposes a partially reconstructed context.
+            session.lease.mark_terminal("context_replacement_failed")
+            request_ids = session.resource_request_ids(submitted=True)
+            if request_ids:
+                await self._stage_port.cleanup(request_ids, abort=True)
+                session.release_request_ids(request_ids)
+            raise
+        session.input_seq = len(entries)
+        session.input_turn_seq = len(entries)
+        session._append_turn_key = (new_fence.epoch, new_fence.turn_id, new_fence.response_seq)
+        return {
+            "supported": True,
+            "event": "context.replace",
+            "request_id": request_id,
+            "resource_generation": session.resource_generation,
+            "context_version": candidate_runtime.get("duplex_context_version", 0),
+            "retained_unit_ids": list(plan.retained_unit_ids),
+            "dropped_unit_ids": list(plan.dropped_unit_ids),
+            "replayed_tokens": tokens,
+            "epoch": new_fence.epoch,
+        }
+
     async def handle_signal(self, message: SignalDuplexTurnMessage) -> None:
         try:
             cancel_events = {"barge_in", "input.cancel", "response.cancel"}
-            if message.event not in {*cancel_events, "session.update"}:
+            if message.event not in {
+                *cancel_events,
+                "session.update",
+                "context.replace",
+                "context.inspect",
+                "context.validate",
+            }:
                 raise ValueError(f"unsupported duplex runtime signal: {message.event}")
             session = self.sessions.require(message.session_id)
             await self._complete_pending_submission_cleanup(message.session_id)
             effective_next_fence = message.next_fence
+            if message.event in {"context.replace", "context.inspect", "context.validate"}:
+                if message.event in {"context.replace", "context.validate"}:
+                    result = await self._replace_context(message, session)
+                else:
+                    session._validate_fence(message.fence)
+                    describe = getattr(self._extension, "describe_context", None)
+                    if not callable(describe):
+                        raise ValueError("context inspection unsupported")
+                    result = {
+                        "supported": True,
+                        "epoch": session.epoch,
+                        "context_version": session.runtime_config.get("duplex_context_version", 0),
+                        "resource_generation": session.resource_generation,
+                        "scheduler_context_tokens": session.scheduler_context_tokens,
+                        "replay_bytes": session.replay_byte_count,
+                        "replay_byte_limit": session.recovery_max_replay_bytes,
+                        "units": describe(tuple(item.prompt for item in session.replay_appends)),
+                    }
+                await self.put_result(
+                    message.control_id,
+                    fence=message.fence,
+                    operation="signal",
+                    session_id=message.session_id,
+                    stage_results=[{"stage_id": 0, "replica_id": -1, "result": result}],
+                )
+                return
             if message.event in cancel_events:
                 if effective_next_fence is None:
                     raise ValueError(f"{message.event} requires next_fence")
@@ -2055,6 +2253,27 @@ class DuplexControlPlane:
             retryable = False
         return DuplexControlError(code=code, message=message, retryable=retryable)
 
+    def _record_context_output(self, session, output):
+        get_seq = getattr(self._extension, "context_unit_sequence", None)
+        apply_output = getattr(self._extension, "apply_context_output", None)
+        if not callable(get_seq) or not callable(apply_output):
+            raise TypeError("model context output hooks are incomplete")
+        for index, old in enumerate(session.replay_appends):
+            if get_seq(old.prompt) != output.unit_sequence:
+                continue
+            prompt = apply_output(old.prompt, output)
+            entry = session.prepare_replay_append(
+                operation_id=old.operation_id, operation_fingerprint=old.operation_fingerprint, prompt=prompt
+            )
+            journal = list(session.replay_appends)
+            journal[index] = entry
+            session.replace_replay_journal(journal)
+            session.pending_context_outputs.pop(output.unit_sequence, None)
+            return
+        if len(session.pending_context_outputs) >= self._max_pending_appends_per_session + 2:
+            raise RuntimeError("pending context output limit exceeded")
+        session.pending_context_outputs[output.unit_sequence] = output
+
     def decide_output(
         self,
         stage_id: int,
@@ -2070,6 +2289,18 @@ class DuplexControlPlane:
             session.touch(context.identity.fence, DuplexLeaseActivity.MODEL_OUTPUT)
         except RuntimeError:
             return None
+        finalize = getattr(self._extension, "finalize_context_unit", None)
+        if stage_id == 0 and context.segment_finished and callable(finalize):
+            updated = finalize(
+                prompts=tuple(item.prompt for item in session.replay_appends),
+                output=output,
+                segment_token_ids=context.segment_token_ids,
+                segment_output_metadata=dict(context.segment_output_metadata),
+            )
+            if updated is not None:
+                if not isinstance(updated, DuplexContextOutput):
+                    raise TypeError("invalid model context output")
+                self._record_context_output(session, updated)
         decision = self._extension.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,

@@ -161,6 +161,7 @@ class DuplexControlClient:
         next_fence: DuplexFence | None,
         session_config: dict[str, object] | None,
         runtime_config: dict[str, object] | None,
+        context: dict[str, object] | None = None,
         timeout: float | None,
     ) -> dict[str, object]:
         return self.execute(
@@ -169,6 +170,8 @@ class DuplexControlClient:
                 fence=fence,
                 session_id=session_id,
                 event=event,
+                context=context,
+                deadline_monotonic=None if timeout is None else time.monotonic() + timeout,
                 next_fence=next_fence,
                 session_config=dict(session_config) if session_config is not None else None,
                 runtime_config=dict(runtime_config) if runtime_config is not None else None,

@@ -183,6 +183,8 @@ class DuplexSessionRunnerMixin:
 
             realtime_protocol.bind_sender(send_realtime_raw)
         native: ServingRuntimeSessionState = handler._create_runtime_session_state()
+        native_context_epoch: int | None = None
+        context_replacing = False
 
         def begin_close(reason: str) -> None:
             actor.closing = True
@@ -497,6 +499,7 @@ class DuplexSessionRunnerMixin:
             operation_id: str | None = None,
             retained_committed_payload: dict[str, object] | None = None,
             silence_continuation: bool = False,
+            context_input: bool = False,
             before_append=None,
         ) -> asyncio.Task[bool] | None:
             if session is None:
@@ -535,13 +538,21 @@ class DuplexSessionRunnerMixin:
                     session.release_input_bytes(native.clear_committed_audio())
 
             async def _run() -> bool:
-                nonlocal runtime_closed
+                nonlocal runtime_closed, native_context_epoch
                 assert session is not None
                 assert append_turn_id is not None
                 try:
+                    prepare_policy = getattr(handler._serving_runtime_adapter, "prepare_append_context_policy", None)
+                    effective_payload = (
+                        prepare_policy(
+                            payload, session.runtime_config, response_active=session.active_response_id is not None
+                        )
+                        if callable(prepare_policy)
+                        else payload
+                    )
                     append_ok, emitted_response = await handler._append_runtime_input(
                         session,
-                        payload,
+                        effective_payload,
                         operation_id=append_operation_id,
                         final=final,
                         send_json=emit_event,
@@ -550,6 +561,8 @@ class DuplexSessionRunnerMixin:
                     )
                     if append_ok:
                         native.native_context_locked = True
+                        if not context_input:
+                            native_context_epoch = append_epoch
                         if pcm_reservation is not None:
                             pcm_reservation.commit()
                             session.release_input_bytes(pcm_reservation.byte_count)
@@ -718,7 +731,7 @@ class DuplexSessionRunnerMixin:
             send_json,
         ) -> bool:
             del send_json
-            if session is None:
+            if session is None or context_replacing:
                 return False
             clear_completed_pending_silence()
             pending_silence = native.pending_silence_task
@@ -792,6 +805,203 @@ class DuplexSessionRunnerMixin:
                 # The append task already emitted its runtime error. Preserve
                 # wire order before the update path decides whether to continue.
                 return False
+
+        async def context_signal(event_name, *, fence, next_fence=None, config=None, request=None):
+            assert session is not None
+            engine = handler._chat_service.engine_client
+            result = await engine.signal_duplex_turn_async(
+                session.session_id,
+                event=event_name,
+                fence=fence,
+                next_fence=next_fence,
+                runtime_config=config,
+                context=request,
+                timeout=max(60.0, handler._runtime_control_timeout_s(session)),
+            )
+            if handler._runtime_signal_failed(result):
+                raise ServingRuntimeConfigError("Context transaction failed", code="context_replacement_failed")
+            for stage in result.get("stage_results", []):
+                value = stage.get("result", {})
+                if isinstance(value, dict) and value.get("supported"):
+                    return value
+            raise ServingRuntimeConfigError(
+                "Context transaction returned no receipt", code="context_replacement_failed"
+            )
+
+        async def replace_context_input(item: object) -> bool:
+            nonlocal context_replacing, native_context_epoch
+            assert session is not None
+            prepare = getattr(handler._serving_runtime_adapter, "prepare_context_replacement", None)
+            if not callable(prepare) or not isinstance(item, dict):
+                await emit_event({"type": "error", "code": "context_replacement_unsupported"})
+                return False
+            transitioned = False
+            try:
+                if not native.native_context_locked or native_context_epoch != session.epoch:
+                    await wait_for_native_append_tail()
+                if not native.native_context_locked or native_context_epoch != session.epoch:
+                    raise ServingRuntimeConfigError(
+                        "Initialize the audio session first", code="context_not_initialized"
+                    )
+                candidate, request = prepare(item, dict(session.runtime_config), epoch=session.epoch)
+                if request is None:
+                    await emit_event(
+                        {
+                            "type": "input.context.replaced",
+                            "session_id": session.session_id,
+                            "epoch": session.epoch,
+                            "event_id": item["event_id"],
+                            "duplicate": True,
+                            "context_version": candidate.get("duplex_context_version", 0),
+                        }
+                    )
+                    return True
+                context_replacing = True
+                mark_pending_silence_superseded()
+                await actor.cancel_append_tasks()
+                old_fence = DuplexFence(
+                    session.session_id, epoch=session.epoch, turn_id=session.turn_id, incarnation=session.incarnation
+                )
+                new_fence = DuplexFence(
+                    session.session_id,
+                    epoch=session.epoch + 1,
+                    turn_id=session.turn_id,
+                    incarnation=session.incarnation,
+                )
+                validation = await context_signal(
+                    "context.validate", fence=old_fence, next_fence=new_fence, config=candidate, request=request
+                )
+                async with event_emit_lock:
+                    old_fence = DuplexFence(
+                        session.session_id,
+                        epoch=session.epoch,
+                        turn_id=session.turn_id,
+                        incarnation=session.incarnation,
+                    )
+                    new_fence = DuplexFence(
+                        session.session_id,
+                        epoch=session.epoch + 1,
+                        turn_id=session.turn_id,
+                        incarnation=session.incarnation,
+                    )
+                    # Capture calls emitted while the previous unit was finishing.
+                    candidate, request = prepare(item, dict(session.runtime_config), epoch=session.epoch)
+                    assert request is not None
+                    request["base_input_seq"] = validation["base_input_seq"]
+                    request["base_config_generation"] = validation["base_config_generation"]
+                    request["discard_turn_id"] = session.active_response_turn_id
+                    response_id = session.active_response_id
+                    if response_id is not None:
+                        await send_outbound(
+                            {
+                                "type": "audio.cancelled",
+                                "session_id": session.session_id,
+                                "response_id": response_id,
+                                "epoch": session.epoch,
+                                "reason": "context_replaced",
+                                "playback": session.playback.as_dict(),
+                            }
+                        )
+                        session.end_response(commit_text=False)
+                    session.barge_in()
+                    session.clear_playback_cursor()
+                    native.clear_continuation()
+                    transitioned = True
+                await handler._cancel_native_data_plane_stream(session)
+                result = await context_signal(
+                    "context.replace", fence=old_fence, next_fence=new_fence, config=candidate, request=request
+                )
+                session.replace_runtime_config(candidate)
+                handler._require_serving_runtime_adapter().data_plane.close_session(session.session_id)
+                native_context_epoch = session.epoch
+                if attachment_ready:
+                    await handler._attachment_registry.invalidate_replay(session.session_id)
+                await emit_event(
+                    {
+                        "type": "input.context.replaced",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "event_id": item["event_id"],
+                        "duplicate": False,
+                        **{k: v for k, v in result.items() if k not in {"event", "supported"}},
+                    }
+                )
+                context_replacing = False
+                if request.get("generate"):
+                    wakeup = getattr(handler._serving_runtime_adapter, "context_wakeup_payload", None)
+                    if not callable(wakeup):
+                        raise ServingRuntimeConfigError(
+                            "Context wakeup is unsupported", code="context_wakeup_unsupported"
+                        )
+                    task = await start_native_append(wakeup(candidate), final=False, context_input=True)
+                    if task is not None:
+                        await task
+                return True
+            except Exception as exc:
+                await emit_event(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "code": getattr(exc, "code", "context_replacement_failed"),
+                        "error": str(exc),
+                    }
+                )
+                if transitioned:
+                    begin_close("context_replacement_failed")
+                return False
+            finally:
+                context_replacing = False
+
+        async def append_context_input(item: object) -> bool:
+            assert session is not None
+            requires_replacement = getattr(handler._serving_runtime_adapter, "context_input_requires_replacement", None)
+            if callable(requires_replacement) and requires_replacement(item):
+                return await replace_context_input(item)
+            prepare = getattr(handler._serving_runtime_adapter, "prepare_context_input", None)
+            try:
+                if not callable(prepare) or not handler._uses_native_input_append(session):
+                    raise ServingRuntimeConfigError("Context input is unsupported", code="context_input_unsupported")
+                if not await wait_for_native_append_tail():
+                    return False
+                if not native.native_context_locked or native_context_epoch != session.epoch:
+                    raise ServingRuntimeConfigError(
+                        "Send an audio unit before context inputs", code="context_not_initialized"
+                    )
+                if not isinstance(item, dict):
+                    raise ServingRuntimeConfigError("context must be an object", code="invalid_context_input")
+                candidate, payload = prepare(item, dict(session.runtime_config), epoch=session.epoch)
+            except ServingRuntimeConfigError as exc:
+                await emit_event(
+                    {"type": "error", "session_id": session.session_id, "code": exc.code, "error": str(exc)}
+                )
+                return False
+            if payload is not None:
+                if not await handler._signal_runtime_session(
+                    session,
+                    "session.update",
+                    emit_event,
+                    runtime_config=candidate,
+                ):
+                    return False
+                session.replace_runtime_config(candidate)
+                task = await start_native_append(payload, final=False, context_input=True)
+                if task is None or not await task:
+                    # A failed prefill may have partially mutated worker KV.
+                    # Do not acknowledge or retry against divergent context.
+                    begin_close("runtime_context_append_failed")
+                    return False
+            await emit_event(
+                {
+                    "type": "input.context.appended",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "event_id": item["event_id"],
+                    "context_version": candidate.get("duplex_context_version"),
+                    "status": "queued",
+                    "duplicate": payload is None,
+                }
+            )
+            return True
 
         async def start_runtime_append(
             payload: object,
@@ -1553,6 +1763,29 @@ class DuplexSessionRunnerMixin:
                                 "runtime_config_for_function_output",
                                 None,
                             )
+                            if item_type == "function_call_output" and callable(
+                                getattr(handler._serving_runtime_adapter, "prepare_context_input", None)
+                            ):
+                                assert isinstance(item, dict)
+                                call_id = item.get("call_id")
+                                if await append_context_input(
+                                    {
+                                        "kind": "tool_result",
+                                        "epoch": session.epoch,
+                                        "event_id": item.get("id") or f"result:{call_id}",
+                                        "call_id": call_id,
+                                        "output": item.get("output"),
+                                    }
+                                ):
+                                    await emit_event(
+                                        {
+                                            "type": "conversation.item.created",
+                                            "session_id": session.session_id,
+                                            "item": item,
+                                            "created": True,
+                                        }
+                                    )
+                                continue
                             if item_type == "function_call_output" and callable(prepare_function_output):
                                 if not await wait_for_native_append_tail():
                                     continue
@@ -1653,6 +1886,30 @@ class DuplexSessionRunnerMixin:
                         await emit_event(handler._turn_controller.signal(session, turn_event, event))
                     else:
                         await emit_event({"type": "error", "error": "turn.signal requires event", "code": "bad_event"})
+                    continue
+
+                if event_type == "input.context.replace":
+                    await replace_context_input(event.get("context"))
+                    continue
+                if event_type == "input.context.get":
+                    if not await wait_for_native_append_tail():
+                        continue
+                    try:
+                        result = await context_signal(
+                            "context.inspect",
+                            fence=DuplexFence(
+                                session.session_id,
+                                epoch=session.epoch,
+                                turn_id=session.turn_id,
+                                incarnation=session.incarnation,
+                            ),
+                        )
+                        await emit_event({"type": "input.context.snapshot", "session_id": session.session_id, **result})
+                    except Exception as exc:
+                        await emit_event({"type": "error", "code": "context_inspection_failed", "error": str(exc)})
+                    continue
+                if event_type == "input.context.append":
+                    await append_context_input(event.get("context"))
                     continue
 
                 if event_type == "playback.ack":

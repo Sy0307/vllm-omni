@@ -59,6 +59,9 @@ class SignalDuplexTurnMessage(EngineQueueMessage, kw_only=True):
     session_config: dict[str, object] | None = None
     runtime_config: dict[str, object] | None = None
 
+    context: dict[str, object] | None = None
+    deadline_monotonic: float | None = None
+
 
 class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     type: Literal["close_duplex_session"] = "close_duplex_session"

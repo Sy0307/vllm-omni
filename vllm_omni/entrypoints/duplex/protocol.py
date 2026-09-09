@@ -105,6 +105,7 @@ class DuplexCapabilities:
     supports_input_append: bool = False
     supports_replace_latest_chunk: bool = True
     supports_reencode_context: bool = True
+    supports_context_replacement: bool = False
     supports_rollback_to_checkpoint: bool = False
     supports_turn_commit_only: bool = True
     supports_kv_lease: bool = False

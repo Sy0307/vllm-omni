@@ -745,3 +745,56 @@ def test_native_handoff_clears_previous_turn_end_on_resumable_talker(segment_end
     output = talker.make_omni_output(torch.ones(1, 2), model_intermediate_buffer=[merged], request_token_spans=[(0, 1)])
     assert output.multimodal_outputs["meta"]["turn_end"][0].item() is False
     assert output.multimodal_outputs["meta"]["duplex_turn_id"][0].item() == 1
+
+
+def test_native_duplex_output_cursor_reset_keeps_talker_turn():
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+        _native_duplex_segment_output_ids,
+    )
+
+    context = SimpleNamespace(bridge_states={"duplex": {"model_turn_id": 7}})
+    first = _native_duplex_segment_output_ids([10, 11, 12], "first", context, request_id="r")
+    assert first[2] is True
+    # The first actual handoff has reached the Talker. The next native unit
+    # folds these output tokens into the prompt, restarting the output cursor.
+    context.bridge_states["minicpmo45_tts_handoff"]["condition_seq"] = 0
+    second = _native_duplex_segment_output_ids([20, 21, 22], "second", context, request_id="r")
+    assert second[0] == [20, 21, 22]
+    assert second[2] is False
+    context.bridge_states["duplex"]["model_turn_id"] = 8
+    assert _native_duplex_segment_output_ids([30, 31], "next turn", context, request_id="r")[2] is True
+    assert _native_duplex_segment_output_ids([40], "new request", context, request_id="r2")[2] is True
+
+
+def test_gander_terminal_condition_preserves_talker_context():
+    special = {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+        "gander_speech_tokens": 50,
+    }
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 1}})
+
+    def handoff(ids):
+        return llm2tts(
+            [
+                _output(
+                    prompt_ids=[101, 102],
+                    output_ids=ids,
+                    latent=torch.arange((2 + len(ids)) * 4, dtype=torch.float32).reshape(-1, 4),
+                    multimodal_output={"duplex_prompt_token_ids": [101, 102], "meta": special},
+                )
+            ],
+            prompt=[{}],
+            _streaming_context=context,
+        )[0]["model_intermediate_buffer"]["meta"]
+
+    assert handoff([9304, 21, 22, 9308])["replace_streaming_prompt"] is True
+    terminal = handoff([9304, 23, 9310, 9309])
+    assert terminal["turn_end"] is True
+    assert terminal["turn_start"] is False
+    assert terminal["replace_streaming_prompt"] is False

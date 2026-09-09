@@ -43,6 +43,10 @@ class _MiniCPMO45Stage0SessionState:
     pending_post_turn_eos_chunk: bool = False
     last_final_append_identity: tuple[int | None, int] | None = None
     generated_tokens: list[int] = field(default_factory=list)
+    gander_tools_enabled: bool = False
+    gander_tool_active: bool = False
+    gander_context_version: int = 0
+    gander_unit_count: int = 0
 
 
 class MiniCPMO45Stage0DuplexRuntime:
@@ -145,8 +149,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
+        state.gander_tools_enabled = bool((runtime_config or {}).get("gander_tools"))
+        state.gander_context_version = int((runtime_config or {}).get("gander_context_version", 0))
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-            session_config.get("instructions"),
+            (runtime_config or {}).get("gander_instructions", session_config.get("instructions")),
             ref_audio is not None,
             (runtime_config or {}).get("initial_user_text"),
         )
@@ -240,7 +246,8 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         embed_parts: list[Any] = []
         token_ids: list[int] = []
-        if state.audio_chunk_idx == 0 and state.context_embeds:
+        gander = bool(getattr(getattr(getattr(self, "stage_model", None), "config", None), "gander_unit8", False))
+        if (state.gander_unit_count == 0 if gander else state.audio_chunk_idx == 0) and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 
@@ -273,7 +280,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 chunk_size,
                 processor=processor,
             )
-            if state.audio_chunk_idx > 0:
+            if state.gander_unit_count > 0 if gander else state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
                 # The scheduler session update discards the previous segment's
@@ -312,6 +319,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
+            if gander:
+                state.gander_unit_count += 1
             units_built += 1
             chunk_size = self._streaming_chunk_size(processor)
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
@@ -353,6 +362,66 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.prepared_inputs_embeds = inputs_embeds
             state.prepared_input_token_ids = list(token_ids)
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
+        return result
+
+    def _stage_control_embeddings(self, state, payload, *, epoch, seq):
+        import torch
+
+        identity = (epoch, seq)
+        if state.prepared_append_identity == identity and state.prepared_inputs_embeds is not None:
+            return {
+                **state.prepared_result,
+                "inputs_embeds": state.prepared_inputs_embeds,
+                "input_token_ids": list(state.prepared_input_token_ids),
+            }
+        replay = payload.get("gander_replay") is True
+        wake = payload.get("gander_wake") is True
+        if state.audio_chunk_idx == 0 and state.gander_unit_count == 0 and not replay:
+            raise ValueError("Gander context input requires an initialized audio session")
+        token_ids = payload.get("token_ids")
+        if (
+            not isinstance(token_ids, list)
+            or (not token_ids and not replay and not wake)
+            or len(token_ids) > 1500
+            or any(type(token) is not int or token < 0 for token in token_ids)
+        ):
+            raise ValueError("Invalid Gander context token input")
+        version = payload.get("context_version")
+        expected_version = state.gander_context_version if wake else state.gander_context_version + 1
+        if type(version) is not int or (not replay and version != expected_version):
+            raise ValueError("Gander context version is stale or skipped")
+        terminator = state.pending_terminator_token
+        if terminator is None:
+            terminator = self.chunk_eos_token_id
+        first = state.gander_unit_count == 0 and replay
+        ids = (
+            [self.unit_token_id, *token_ids]
+            if first
+            else [terminator, self.unit_end_token_id, self.unit_token_id, *token_ids]
+        )
+        parts = [self._as_2d_tensor(self._embed_token(token)) for token in ids]
+        if first:
+            parts = [self._as_2d_tensor(x) for x in state.context_embeds] + parts
+            ids = list(state.context_token_ids) + ids
+        embeds = torch.cat(parts, dim=0)
+        state.gander_unit_count += 1
+        state.pending_terminator_token = None
+        state.gander_context_version = version
+        result = self._stage_prefill_result(True, time.time())
+        result.update(
+            inputs_embeds=embeds,
+            input_token_ids=ids,
+            special_token_ids=self._special_token_ids(),
+            num_input_tokens=len(ids),
+            prompt_suffix_len=0,
+            uses_model_runner_scheduler=True,
+            runner_kv_backed=True,
+            runtime_impl="scheduler_data_plane",
+        )
+        state.prepared_append_identity = identity
+        state.prepared_inputs_embeds = embeds
+        state.prepared_input_token_ids = ids
+        state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
 
     @staticmethod
@@ -681,7 +750,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         return []
 
     def _special_token_ids(self) -> dict[str, int]:
-        return {
+        result = {
             name: value
             for name, value in {
                 "unit_token_id": self.unit_token_id,
@@ -697,6 +766,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             }.items()
             if isinstance(value, int) and value >= 0
         }
+
+        if getattr(getattr(getattr(self, "stage_model", None), "config", None), "gander_unit8", False):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander import control_token_ids
+
+            result.update(control_token_ids(self.tokenizer))
+            result["gander_speech_tokens"] = 50
+        return result
 
     @staticmethod
     def _load_processor_from_path(model_path: str | None) -> Any | None:

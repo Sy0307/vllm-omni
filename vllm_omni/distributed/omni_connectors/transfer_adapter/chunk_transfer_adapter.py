@@ -262,6 +262,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
+        # Generation chunks replace the prompt. Keep the backing token lists
+        # in sync too: scheduler NewRequestData may expose _all_token_ids as
+        # prefill_token_ids, which otherwise still contains pre-warm zeros.
+        all_ids = getattr(request, "_all_token_ids", None)
+        if isinstance(all_ids, list):
+            all_ids[:] = request.prompt_token_ids
+        output_ids = getattr(request, "_output_token_ids", None)
+        if isinstance(output_ids, list):
+            output_ids.clear()
+        request.num_output_placeholders = 0
         request.num_prompt_tokens = len(request.prompt_token_ids)
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
@@ -661,11 +671,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                             for subkey, subvalue in value.items():
-                                # A 1-D audio tensor is represented by the
-                                # placeholder prompt above, but sibling fields
-                                # such as the reference voice still belong in
-                                # the current runtime snapshot.
-                                if subkey == "audio" and not use_tensor_codes:
+                                # Full snapshots retain their codec payload:
+                                # first-prefill input_ids can still contain the
+                                # runner's reserved placeholder tokens. Models
+                                # must be able to read the producer's real codes.
+                                if subkey == "audio" and not use_tensor_codes and not replace_snapshot:
                                     continue
                                 merged_sub[subkey] = subvalue
                             if merged_sub:

@@ -296,6 +296,7 @@ class DuplexRequestClient:
         next_fence: DuplexFence | None,
         session_config: dict[str, object] | None,
         runtime_config: dict[str, object] | None,
+        context: dict[str, object] | None = None,
         timeout: float | None,
     ) -> dict[str, object]:
         kwargs: dict[str, object] = {"event": event, "fence": fence, "timeout": timeout}
@@ -305,9 +306,19 @@ class DuplexRequestClient:
             kwargs["session_config"] = session_config
         if runtime_config is not None:
             kwargs["runtime_config"] = runtime_config
+        if context is not None:
+            kwargs["context"] = context
         result = await self.engine.signal_duplex_turn_async(session_id, **kwargs)
-        if event in {"barge_in", "input.cancel", "response.cancel"}:
+        if event in {"barge_in", "input.cancel", "response.cancel", "context.replace"}:
             self._clear_fence_routes(fence)
+        if event == "context.replace" and next_fence is not None:
+            stages = result.get("stage_results", [])
+            if not isinstance(stages, list):
+                raise TypeError("context replacement returned invalid stage results")
+            for stage in stages:
+                value = stage.get("result", {})
+                if value.get("event") == "context.replace":
+                    self._resource_generations[self._resource_key(next_fence)] = int(value["resource_generation"])
         return result
 
     async def close(

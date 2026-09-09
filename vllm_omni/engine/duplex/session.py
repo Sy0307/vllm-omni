@@ -295,6 +295,7 @@ class DuplexSessionRuntimeState:
     rollover_trigger_fraction: float = 0.8
     rollover_retain_tokens: int = 4096
     replay_appends: list[DuplexReplayAppend] = field(default_factory=list)
+    pending_context_outputs: dict[int, object] = field(default_factory=dict)
     replay_token_count: int = 0
     replay_byte_count: int = 0
     resource_generation: int = 0
@@ -401,6 +402,7 @@ class DuplexSessionRuntimeState:
             self.completed_appends.clear()
             self.retired_append_ids.clear()
             self.clear_replay_journal()
+            self.pending_context_outputs.clear()
             self.resource_generation = 0
             self.recovery_required = False
             self.recovery_reason = None

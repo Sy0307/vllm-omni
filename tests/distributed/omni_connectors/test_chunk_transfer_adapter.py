@@ -1599,7 +1599,7 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [7, 8]
-    assert "audio" not in request.additional_information["codes"]
+    torch.testing.assert_close(request.additional_information["codes"]["audio"], torch.tensor([7, 8]))
     torch.testing.assert_close(
         request.additional_information["codes"]["ref"],
         torch.tensor([0.1, -0.1]),
@@ -3382,3 +3382,22 @@ def test_save_async_boundary_holds_generation_without_request_counter(build_adap
 
     assert len(adapter._pending_save_reqs) == queued_before + 1
     assert adapter._pending_save_reqs[-1]["request"] is follow_up
+
+
+def test_generation_chunk_refreshes_prefill_token_backing_storage(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("codec-prefill", RequestStatus.WAITING)
+    request._all_token_ids = [0] * 5
+    request._output_token_ids = [0]
+    request.num_output_placeholders = 1
+    # Preserve the identity of backing lists used by Request's read-only views.
+    all_view = request._all_token_ids
+    output_view = request._output_token_ids
+    codes = [4218, 4218, 4218, 123, 456]
+    connector.get.return_value = ({"codes": {"audio": torch.tensor(codes)}, "meta": {"finished": False}}, 1)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+    assert request.prompt_token_ids == codes
+    assert all_view == codes
+    assert output_view == []
+    assert request.num_output_placeholders == 0
+    assert request.num_prompt_tokens == len(codes)

@@ -424,6 +424,18 @@ class DuplexSessionAttachmentRegistry:
                 await self._send_attachment(attachment, entry if entry is not None else dict(payload))
             return entry
 
+    async def invalidate_replay(self, session_id: str) -> int:
+        """Retire old output history at a context fence; stale resumes require resync."""
+        async with self._lock:
+            state = self._require(session_id)
+        async with state.outbound_lock:
+            async with self._lock:
+                if self._sessions.get(session_id) is not state:
+                    raise KeyError(session_id)
+                boundary = state.journal.last_sequence
+                state.journal.acknowledge(boundary)
+                return boundary
+
     async def acknowledge(self, session_id: str, sequence: int) -> int:
         async with self._lock:
             return self._require(session_id).journal.acknowledge(sequence)
