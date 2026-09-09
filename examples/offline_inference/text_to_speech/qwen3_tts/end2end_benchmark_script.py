@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline benchmark script for Qwen3 TTS via vLLM Omni.
 
 Supports warmup + test rounds with a single Omni instance to avoid

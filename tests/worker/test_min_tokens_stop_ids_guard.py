@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Guard against out-of-vocabulary stop ids in min-tokens masking (#4962).
 
 vLLM's input processor folds the stage tokenizer's EOS id into

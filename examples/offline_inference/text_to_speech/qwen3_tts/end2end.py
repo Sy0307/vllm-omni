@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline inference demo for Qwen3 TTS via vLLM Omni.
 
 Provides single and batch sample inputs for CustomVoice, VoiceDesign, and Base

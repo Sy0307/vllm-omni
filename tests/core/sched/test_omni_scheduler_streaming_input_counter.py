@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the ``num_waiting_for_streaming_input`` resync placed in
 ``OmniARScheduler.finish_requests`` / ``OmniGenerationScheduler.finish_requests``
 and in ``OmniARScheduler.schedule``.

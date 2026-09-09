@@ -299,11 +299,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
         already_finished_reqs: set[Request] = set()
-        while (
-            req_index < len(self.running)
-            and token_budget > 0
-            and len(num_scheduled_tokens) < execution_batch_size
-        ):
+        while req_index < len(self.running) and token_budget > 0 and len(num_scheduled_tokens) < execution_batch_size:
             request = self.running[req_index]
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (

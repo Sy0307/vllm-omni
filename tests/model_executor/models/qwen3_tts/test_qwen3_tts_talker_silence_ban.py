@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the Qwen3-TTS leading-silence ban (#4966, #5048).
 
 ``compute_logits`` suppresses the checkpoint-derived silence codec vocabulary

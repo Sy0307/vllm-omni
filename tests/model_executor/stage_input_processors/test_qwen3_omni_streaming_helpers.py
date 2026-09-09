@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers (PR #2581)."""
 
 from __future__ import annotations

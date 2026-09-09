@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # =============================================================================
 # Qwen3-Omni end2end functional test script
 # Uses default built-in assets, iterates over query-type x output-modalities combinations

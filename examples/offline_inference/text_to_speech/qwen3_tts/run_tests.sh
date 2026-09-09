@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # =============================================================================
 # Qwen3-TTS end2end functional test script
 # Iterates over query-type and mode combinations for qwen3_tts/end2end.py

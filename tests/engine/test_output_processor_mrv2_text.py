@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MRv2 Omni AR text + payload outputs."""
 
 from unittest.mock import MagicMock

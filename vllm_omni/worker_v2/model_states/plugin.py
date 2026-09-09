@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OmniModelStatePlugin — abstract extension point for model-specific behavior.
 
 Plugins are registered on OmniModelState at model-load time and receive

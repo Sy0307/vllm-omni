@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS pipeline: Talker (text → RVQ codec) → Code2Wav (codec → audio).
 
 Chunked vs end-to-end mode is dispatched from ``deploy.async_chunk``.

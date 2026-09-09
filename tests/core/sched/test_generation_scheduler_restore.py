@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Test that OmniGenerationScheduler restores chunk-waiting requests
 even when the OmniNewRequestData rewrapping fails.
 

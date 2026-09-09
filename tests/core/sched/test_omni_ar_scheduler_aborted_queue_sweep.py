@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for ``OmniARScheduler._drop_aborted_queued_requests``.
 
 ``schedule()`` sweeps ``FINISHED_ABORTED`` requests out of the queues before
