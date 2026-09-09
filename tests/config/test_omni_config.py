@@ -595,6 +595,7 @@ def test_joyai_code2wav_waits_for_full_payload():
     assert code2wav.connector_config.async_chunk is False
     assert code2wav.model_config.requires_full_payload_input is True
 
+
 def test_native_mrv2_data_plane_capability_is_declared_by_pipeline_stage():
     from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 

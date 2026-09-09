@@ -229,7 +229,6 @@ class OmniSchedulerMixin:
         session.num_prompt_tokens = len(new_prompt)
         self._finish_streaming_session_update(session, update)
 
-
     def _async_chunk_transport_enabled(self) -> bool:
         return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
             getattr(self, "_native_data_plane", False)
