@@ -52,7 +52,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import NativeAppendIdentity, NativeAppendOperation, StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.outputs import OmniRequestOutput
@@ -2738,10 +2738,8 @@ async def test_stage_pool_rejects_new_append_while_previous_operation_is_uncerta
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
     pool._request_bindings["req-uncertain"] = 0
-    pool._native_append_operations["req-uncertain"] = (
-        "append-old",
-        b"old-fingerprint",
-        (3,),
+    pool._native_append_operations["req-uncertain"] = NativeAppendOperation(
+        NativeAppendIdentity("append-old", b"old-fingerprint", (3,)),
         "uncertain",
     )
 
@@ -2763,10 +2761,8 @@ async def test_stage_pool_rejects_same_uncertain_operation_with_different_finger
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
     pool._request_bindings["req-uncertain-fingerprint"] = 0
-    pool._native_append_operations["req-uncertain-fingerprint"] = (
-        "append-stable",
-        b"old-fingerprint",
-        (3,),
+    pool._native_append_operations["req-uncertain-fingerprint"] = NativeAppendOperation(
+        NativeAppendIdentity("append-stable", b"old-fingerprint", (3,)),
         "uncertain",
     )
 
@@ -2786,10 +2782,8 @@ def test_stage_pool_binding_release_clears_uncertain_native_append_guard() -> No
         output_processor=FakeOutputProcessor(),
     )
     pool._request_bindings["req-release-uncertain"] = 0
-    pool._native_append_operations["req-release-uncertain"] = (
-        "append-stable",
-        b"fingerprint",
-        (3,),
+    pool._native_append_operations["req-release-uncertain"] = NativeAppendOperation(
+        NativeAppendIdentity("append-stable", b"fingerprint", (3,)),
         "uncertain",
     )
 

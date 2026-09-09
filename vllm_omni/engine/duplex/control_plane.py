@@ -42,6 +42,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_data_plane_request_info,
     duplex_resource_request_id,
 )
+from vllm_omni.engine.duplex.fence import preemption_covers, validate_cancel_fences, validate_fence
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity, DuplexLeaseConfig
 from vllm_omni.engine.duplex.messages import (
     AppendDuplexInputMessage,
@@ -290,12 +291,33 @@ class DuplexControlPlane:
         preempt_reason = self._preempt_reason(message)
         preempted_tasks: tuple[asyncio.Task[None], ...] = ()
         if preempt_reason is not None:
+            try:
+                can_preempt = self._validate_preemption(message)
+            except (DuplexFenceMismatchError, ValueError) as exc:
+                # Rejected controls must not touch the queue tail or cancel
+                # any task; their correlated error is independent of live work.
+                task = asyncio.create_task(
+                    self.put_result(
+                        message.control_id,
+                        fence=message.fence,
+                        operation=self._message_operation(message),
+                        session_id=session_id,
+                        stage_results=[],
+                        error=exc,
+                    )
+                )
+                self._register_control_task(task, message, count_append=False, update_tail=False)
+                return
             preempted_tasks = tuple(self._session_control_tasks.get(session_id, ()))
             for prior_task in preempted_tasks:
                 if prior_task.done():
                     continue
                 prior_message = self._control_task_messages.get(prior_task)
                 if not isinstance(prior_message, AppendDuplexInputMessage):
+                    continue
+                if not can_preempt or not preemption_covers(
+                    message.fence, prior_message.fence, close=isinstance(message, CloseDuplexSessionMessage)
+                ):
                     continue
                 # A prior cancel may already have interrupted this append and
                 # the task may now be publishing its correlated cancellation
@@ -359,6 +381,36 @@ class DuplexControlPlane:
             name=f"duplex-control-{session_id}-{message.control_id}",
         )
         self._register_control_task(task, message, count_append=is_append, update_tail=True)
+
+    def _validate_preemption(self, message: DuplexCommand) -> bool:
+        """Validate the control identity without advancing or cancelling it."""
+        if message.session_id != message.fence.session_id:
+            raise ValueError("duplex control session_id does not match its fence")
+        if isinstance(message, SignalDuplexTurnMessage) and message.next_fence is None:
+            raise ValueError(f"{message.event} requires next_fence")
+        session = self.sessions.get(message.session_id)
+        current = session.fence if session is not None else None
+        if current is None:
+            # Preserve open -> append -> close arriving in one queue drain.
+            # An arbitrary append is not authority for an unopened session.
+            current = next(
+                (
+                    queued.fence
+                    for task, queued in reversed(tuple(self._control_task_messages.items()))
+                    if not task.done()
+                    and isinstance(queued, OpenDuplexSessionMessage)
+                    and queued.session_id == message.session_id
+                ),
+                None,
+            )
+        if current is None:
+            return False
+        if isinstance(message, CloseDuplexSessionMessage):
+            validate_fence(current, message.fence)
+        elif isinstance(message, SignalDuplexTurnMessage):
+            assert message.next_fence is not None
+            validate_cancel_fences(current, message.fence, message.next_fence)
+        return True
 
     @staticmethod
     def _message_operation(message: object) -> str:
@@ -1446,7 +1498,7 @@ class DuplexControlPlane:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             self._metric("inc_duplex_kv_recovery", recovery_reason, "failure", 1)
-            retryable = isinstance(exc, (TimeoutError, ConnectionError)) or any(
+            retryable = isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)) or any(
                 marker in str(exc).lower()
                 for marker in (
                     "unavailable",
@@ -1505,11 +1557,20 @@ class DuplexControlPlane:
             if message.event not in {*cancel_events, "session.update"}:
                 raise ValueError(f"unsupported duplex runtime signal: {message.event}")
             session = self.sessions.require(message.session_id)
-            await self._complete_pending_submission_cleanup(message.session_id)
             effective_next_fence = message.next_fence
+            if message.session_id != message.fence.session_id:
+                raise ValueError("duplex control session_id does not match its fence")
             if message.event in cancel_events:
                 if effective_next_fence is None:
                     raise ValueError(f"{message.event} requires next_fence")
+                validate_cancel_fences(session.fence, message.fence, effective_next_fence)
+            else:
+                validate_fence(session.fence, message.fence)
+            await self._complete_pending_submission_cleanup(message.session_id)
+            if message.event in cancel_events:
+                if effective_next_fence is None:
+                    raise ValueError(f"{message.event} requires next_fence")
+                validate_cancel_fences(session.fence, message.fence, effective_next_fence)
                 cleanup_key = self._cleanup_key("cancel", message.fence)
                 pending = self._pending_control_cleanups.get(cleanup_key)
                 if pending is None:
@@ -1565,6 +1626,7 @@ class DuplexControlPlane:
 
     async def handle_close(self, message: CloseDuplexSessionMessage) -> None:
         try:
+            self._validate_preemption(message)
             await self._complete_pending_submission_cleanup(message.session_id)
             session = self.sessions.get(message.session_id)
             if session is None:
@@ -1805,7 +1867,7 @@ class DuplexControlPlane:
             raise TimeoutError(f"duplex submission cleanup deadline expired for session {session_id}")
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise TimeoutError(f"duplex submission cleanup deadline expired for session {session_id}") from exc
 
     async def _run_submission_cleanup(self, pending: _PendingSubmissionCleanup) -> None:
@@ -2047,7 +2109,7 @@ class DuplexControlPlane:
         elif isinstance(error, (TypeError, ValueError)):
             code = "invalid_argument"
             retryable = False
-        elif isinstance(error, TimeoutError):
+        elif isinstance(error, (TimeoutError, asyncio.TimeoutError)):
             code = "timeout"
             retryable = True
         else:

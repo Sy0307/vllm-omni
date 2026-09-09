@@ -18,6 +18,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexInputMode,
     DuplexRuntimeCapabilities,
 )
+from vllm_omni.engine.duplex.fence import DuplexFenceMismatchError, validate_cancel_fences, validate_fence
 from vllm_omni.engine.duplex.lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
@@ -31,13 +32,6 @@ _APPEND_TOMBSTONE_LIMIT = 65536
 
 def _default_capabilities() -> DuplexRuntimeCapabilities:
     return DuplexRuntimeCapabilities()
-
-
-class DuplexFenceMismatchError(RuntimeError):
-    def __init__(self, expected: DuplexFence, actual: DuplexFence) -> None:
-        super().__init__(f"duplex fence mismatch: expected {expected!r}, got {actual!r}")
-        self.expected = expected
-        self.actual = actual
 
 
 @dataclass
@@ -383,14 +377,7 @@ class DuplexSessionRuntimeState:
         return self.fence.turn_id
 
     def _validate_fence(self, fence: DuplexFence) -> None:
-        if fence.session_id != self.session_id or fence.incarnation != self.fence.incarnation:
-            raise DuplexFenceMismatchError(self.fence, fence)
-        current = self.fence
-        if fence.epoch < current.epoch or (
-            fence.epoch == current.epoch
-            and (fence.turn_id < current.turn_id or fence.response_seq < current.response_seq)
-        ):
-            raise DuplexFenceMismatchError(current, fence)
+        validate_fence(self.fence, fence)
 
     def accept_fence(self, fence: DuplexFence) -> None:
         self._validate_fence(fence)
@@ -765,19 +752,9 @@ class DuplexSessionRuntimeState:
 
     def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
-        if cancelled_fence.session_id != self.session_id or cancelled_fence.incarnation != self.fence.incarnation:
-            raise DuplexFenceMismatchError(self.fence, cancelled_fence)
-        if (
-            next_fence.session_id != self.session_id
-            or next_fence.incarnation != self.fence.incarnation
-            or next_fence.epoch <= cancelled_fence.epoch
-        ):
-            raise DuplexFenceMismatchError(cancelled_fence, next_fence)
+        validate_cancel_fences(self.fence, cancelled_fence, next_fence)
         current_key = (self.fence.epoch, self.fence.turn_id, self.fence.response_seq)
-        cancelled_key = (cancelled_fence.epoch, cancelled_fence.turn_id, cancelled_fence.response_seq)
         next_key = (next_fence.epoch, next_fence.turn_id, next_fence.response_seq)
-        if cancelled_key > current_key:
-            raise DuplexFenceMismatchError(self.fence, cancelled_fence)
         if next_key > current_key:
             self.accept_fence(next_fence)
         return self.resource_request_ids(cancelled_fence)

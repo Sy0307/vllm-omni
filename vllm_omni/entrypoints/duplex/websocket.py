@@ -128,7 +128,7 @@ class DuplexSessionTasks:
             task.cancel()
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             pass
         if cancelled_tail is not None and self.native_append_tail is cancelled_tail:
             self.native_append_tail = None

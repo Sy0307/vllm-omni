@@ -218,7 +218,10 @@ class DuplexRequestClient:
                     self._resource_generations[key] = current_generation + 1
                     for candidate_request_id, request_state, _ in routes.values():
                         self._remove_output_route(candidate_request_id, request_state)
-                elif not isinstance(exc, TimeoutError) and error_code not in {"timeout", "uncertain_operation"}:
+                elif not isinstance(exc, (TimeoutError, asyncio.TimeoutError)) and error_code not in {
+                    "timeout",
+                    "uncertain_operation",
+                }:
                     for candidate_request_id, request_state, created in routes.values():
                         if created and request_state.queue.empty():
                             self._remove_output_route(candidate_request_id, request_state)

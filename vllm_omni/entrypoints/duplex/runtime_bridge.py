@@ -158,7 +158,7 @@ class NativeRuntimeBridgeMixin:
             try:
                 result = await append_input(session.session_id, **append_kwargs)
             except Exception as exc:
-                retryable_uncertain = isinstance(exc, TimeoutError) or (
+                retryable_uncertain = isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or (
                     isinstance(exc, DuplexControlRequestError) and exc.code in {"timeout", "uncertain_operation"}
                 )
                 if not operation_id or not accepts_operation_id or not retryable_uncertain:

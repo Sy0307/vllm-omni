@@ -9,7 +9,7 @@ import asyncio
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
@@ -58,6 +58,19 @@ class StageUnavailableError(RuntimeError):
     ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
     not silently enrolled.
     """
+
+
+@dataclass(frozen=True)
+class NativeAppendIdentity:
+    operation_id: str
+    fingerprint: bytes
+    token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class NativeAppendOperation:
+    identity: NativeAppendIdentity
+    state: Literal["uncertain", "completed"]
 
 
 @dataclass
@@ -141,10 +154,7 @@ class StagePool:
         # means the utility reply was lost and only the same logical append
         # may proceed; ``completed`` keeps a duplicate retry from creating a
         # fresh output-processor registration for a scheduler-deduped unit.
-        self._native_append_operations: dict[
-            str,
-            tuple[str, bytes | None, tuple[int, ...], str],
-        ] = {}
+        self._native_append_operations: dict[str, NativeAppendOperation] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -544,7 +554,7 @@ class StagePool:
         must inspect it before releasing the dead replica's bindings.
         """
         operation = self._native_append_operations.get(request_id)
-        return operation[3] if operation is not None else None
+        return operation.state if operation is not None else None
 
     def release_replica_bindings(self, replica_id: int) -> list[str]:
         """Drop all route/session bindings owned by one physical replica."""
@@ -1202,7 +1212,7 @@ class StagePool:
             raise ValueError("scheduler-native streaming prompt append requires a non-empty operation_id")
         if not isinstance(operation_fingerprint, bytes) or not operation_fingerprint:
             raise ValueError("scheduler-native streaming prompt append requires a full operation_fingerprint")
-        operation_signature = (
+        operation_signature = NativeAppendIdentity(
             operation_id,
             operation_fingerprint,
             tuple(int(token_id) for token_id in token_ids),
@@ -1210,12 +1220,12 @@ class StagePool:
         previous_operation = self._native_append_operations.get(request_id)
         reuse_output_registration = False
         if previous_operation is not None:
-            previous_signature = previous_operation[:3]
-            previous_state = previous_operation[3]
+            previous_signature = previous_operation.identity
+            previous_state = previous_operation.state
             if previous_state == "uncertain" and previous_signature != operation_signature:
                 raise RuntimeError(
                     "streaming_prompt_uncertain_operation_requires_retry: "
-                    f"request={request_id}, operation={previous_operation[0]!r}"
+                    f"request={request_id}, operation={previous_operation.identity.operation_id!r}"
                 )
             reuse_output_registration = previous_signature == operation_signature
         await self._wait_for_streaming_prompt_append_ready(
@@ -1244,7 +1254,7 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-            self._native_append_operations[request_id] = (*operation_signature, "uncertain")
+            self._native_append_operations[request_id] = NativeAppendOperation(operation_signature, "uncertain")
             append_result = await self._await_with_deadline(
                 append_streaming_prompt(
                     request_id,
@@ -1267,8 +1277,8 @@ class StagePool:
                 }
             else:
                 raise RuntimeError(f"invalid streaming prompt append result for {request_id}: {append_result!r}")
-            self._native_append_operations[request_id] = (*operation_signature, "completed")
-        except TimeoutError:
+            self._native_append_operations[request_id] = NativeAppendOperation(operation_signature, "completed")
+        except (TimeoutError, asyncio.TimeoutError):
             # The core utility may have committed just before its reply was
             # lost. Keep output processing registered while that unit runs;
             # the same operation_id can be retried once it parks again.
@@ -1408,7 +1418,7 @@ class StagePool:
             raise TimeoutError(message)
         try:
             return await asyncio.wait_for(awaitable, timeout=remaining)
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise TimeoutError(message) from exc
 
     async def submit_interaction(
@@ -1632,7 +1642,7 @@ class StagePool:
             )
             if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
                 raise
-            if isinstance(exc, TimeoutError):
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
             else:
                 error = str(exc) or repr(exc)

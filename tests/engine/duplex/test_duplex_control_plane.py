@@ -164,6 +164,8 @@ async def test_preempted_queued_append_does_not_cancel_its_predecessor(
         )
 
     monkeypatch.setattr(plane, "handle", handle)
+    if first_control != "open":
+        plane.sessions.open_session(fence)
     plane.dispatch(first_messages[first_control])
     await asyncio.wait_for(entered.wait(), 1)
     plane.dispatch(
@@ -178,7 +180,11 @@ async def test_preempted_queued_append_does_not_cancel_its_predecessor(
     else:
         plane.dispatch(
             SignalDuplexTurnMessage(
-                control_id="terminal", session_id=fence.session_id, fence=fence, event="input.cancel"
+                control_id="terminal",
+                session_id=fence.session_id,
+                fence=fence,
+                event="input.cancel",
+                next_fence=DuplexFence(fence.session_id, epoch=1),
             )
         )
     try:
@@ -265,6 +271,147 @@ async def test_late_cleanup_does_not_finalize_reopened_incarnation(cleanup_kind,
     finally:
         release.set()
         await asyncio.gather(pending, return_exceptions=True)
+        await plane.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal", "invalid"),
+    [
+        (terminal, invalid)
+        for terminal in ("close", "cancel")
+        for invalid in ("incarnation", "epoch", "turn", "response")
+    ]
+    + [("cancel", invalid) for invalid in ("next_incarnation", "next_epoch", "missing_next")],
+)
+async def test_invalid_preemption_has_no_append_side_effect(monkeypatch, terminal, invalid):
+    fence = DuplexFence("fenced-preemption", incarnation=2, epoch=3, turn_id=4, response_seq=5)
+    kwargs = dict(incarnation=2, epoch=3, turn_id=4, response_seq=5)
+    field = {"incarnation": "incarnation", "epoch": "epoch", "turn": "turn_id", "response": "response_seq"}.get(invalid)
+    if field:
+        kwargs[field] -= 1
+    stale = DuplexFence(fence.session_id, **kwargs)
+    next_fence = DuplexFence(fence.session_id, incarnation=2, epoch=4)
+    if invalid == "next_incarnation":
+        next_fence = DuplexFence(fence.session_id, incarnation=1, epoch=4)
+    elif invalid == "next_epoch":
+        next_fence = DuplexFence(fence.session_id, incarnation=2, epoch=3)
+    elif invalid == "missing_next":
+        next_fence = None
+    sink: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    port = _TypedStagePort()
+    plane = DuplexControlPlane(extension=None, stage_port=port, result_sink=sink)
+    session = plane.sessions.open_session(fence)
+    started, release = asyncio.Event(), asyncio.Event()
+    cancelled = False
+
+    async def append(message):
+        nonlocal cancelled
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        await plane.put_result(
+            message.control_id, fence=fence, operation="append", session_id=fence.session_id, stage_results=[]
+        )
+
+    monkeypatch.setattr(plane, "handle_append", append)
+    plane.dispatch(
+        AppendDuplexInputMessage(
+            control_id="live", session_id=fence.session_id, fence=fence, mode="append_tokens", payload={}
+        )
+    )
+    await started.wait()
+    if terminal == "close":
+        plane.dispatch(CloseDuplexSessionMessage(control_id="invalid", session_id=fence.session_id, fence=stale))
+    else:
+        plane.dispatch(
+            SignalDuplexTurnMessage(
+                control_id="invalid",
+                session_id=fence.session_id,
+                fence=stale,
+                next_fence=next_fence,
+                event="input.cancel",
+            )
+        )
+    try:
+        # A rejected command must reply even while the live append is blocked.
+        reply = await asyncio.wait_for(sink.get(), 1)
+        assert reply.control_id == "invalid" and not reply.ok
+        assert not cancelled
+        assert session.fence == fence and plane.sessions.get(fence.session_id) is session
+        assert not port.cleanup_calls
+        release.set()
+        await asyncio.wait_for(plane.drain(), 1)
+        assert (await sink.get()).control_id == "live"
+    finally:
+        release.set()
+        await plane.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_retry_does_not_preempt_new_epoch_append(monkeypatch):
+    old = DuplexFence("cancel-retry")
+    current = DuplexFence(old.session_id, epoch=1)
+    sink: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    port = _TypedStagePort()
+    plane = DuplexControlPlane(extension=None, stage_port=port, result_sink=sink)
+    session = plane.sessions.open_session(current)
+    session.bind_stage_request(0, "live-request", fence=current)
+    started, release = asyncio.Event(), asyncio.Event()
+    cancelled = False
+
+    async def append(message):
+        nonlocal cancelled
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        await plane.put_result(
+            message.control_id,
+            fence=current,
+            operation="append",
+            session_id=current.session_id,
+            stage_results=[],
+        )
+
+    monkeypatch.setattr(plane, "handle_append", append)
+    plane.dispatch(
+        AppendDuplexInputMessage(
+            control_id="live",
+            session_id=current.session_id,
+            fence=current,
+            mode="append_tokens",
+            payload={},
+        )
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    plane.dispatch(
+        SignalDuplexTurnMessage(
+            control_id="retry",
+            session_id=old.session_id,
+            fence=old,
+            next_fence=current,
+            event="input.cancel",
+        )
+    )
+    try:
+        # dispatch must not even schedule cancellation of the newer append.
+        assert not plane._control_task_preemption_reasons
+        release.set()
+        await asyncio.wait_for(plane.drain(), 1)
+        replies = [sink.get_nowait(), sink.get_nowait()]
+        assert all(reply.ok for reply in replies)
+        assert not cancelled
+        assert session.fence == current
+        assert session.resource_request_ids() == ["live-request"]
+        assert not port.cleanup_calls
+    finally:
+        release.set()
         await plane.shutdown()
 
 
