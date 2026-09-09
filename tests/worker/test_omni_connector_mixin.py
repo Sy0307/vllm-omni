@@ -1194,7 +1194,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         tp_group = _FakeTPGroup(world_size=1, rank_in_group=0)
 
         with patch(
-            "vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group",
+            "vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport.get_tp_group",
             return_value=tp_group,
         ):
             made_progress = host._poll_single_request("r1")

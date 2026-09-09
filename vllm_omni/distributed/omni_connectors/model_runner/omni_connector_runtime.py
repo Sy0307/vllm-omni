@@ -9,9 +9,8 @@ import inspect
 import os
 import threading
 from collections import defaultdict, deque
-from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
-from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -21,6 +20,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
     get_stage_connector_role,
 )
+from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
@@ -323,7 +323,6 @@ class _OmniConnectorRuntimeMixin:
         # constructed mixin is never observable as initialised.
         self._omni_connector_initialized = True
 
-
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
         self._stop_event.set()
@@ -404,7 +403,6 @@ class _OmniConnectorRuntimeMixin:
             self._kv_triggered_requests.discard(req_id)
         self._cleanup_recv_delivery_state(req_id)
 
-
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
         ext_id = self._request_ids_mapping.pop(req_id, None)
@@ -430,7 +428,6 @@ class _OmniConnectorRuntimeMixin:
         self._cached_ic.pop(req_id, None)
         if emitted_frames is not None:
             emitted_frames.pop(req_id, None)
-
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
@@ -628,11 +625,10 @@ class _OmniConnectorRuntimeMixin:
 
         return None, None
 
-    @staticmethod
-    def _is_connector_payload_builder(func: Any) -> bool:
+    @classmethod
+    def _is_connector_payload_builder(cls, func: Any) -> bool:
         """Whether *func* matches the mixin payload-builder contract."""
-        return OmniConnectorModelRunnerMixin._connector_payload_kwarg(func) is not None
-
+        return cls._connector_payload_kwarg(func) is not None
 
     def _resolve_external_req_id(self, request: Any, fallback_req_id: str) -> str:
         """Resolve the external request ID consistently.
@@ -1127,7 +1123,6 @@ class _OmniConnectorRuntimeMixin:
             return "multimodal_output"
         return None
 
-
     @staticmethod
     def _load_custom_batch_func(custom_process_func: Any | None) -> Any | None:
         """Resolve an optional ``<scalar_builder>_batch`` peer."""
@@ -1150,9 +1145,7 @@ class _OmniConnectorRuntimeMixin:
             return None
         return batch_func if callable(batch_func) else None
 
-
     def _create_send_completion(self, *, request_id: str, put_key: str) -> Any:
         """Create a delivery completion; MRv2 overrides this with a ticket."""
         del request_id, put_key
         return _SendCompletion()
-

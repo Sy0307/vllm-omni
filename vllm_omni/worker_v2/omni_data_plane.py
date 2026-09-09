@@ -13,12 +13,14 @@ from queue import Full, Queue
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload, unflatten_payload
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
+from vllm_omni.worker.payload_span import get_tensor_span, merge_tensor_spans
 from vllm_omni.worker_v2.delivery import (
     DeliveryTimeoutError,
     OmniDeliveryManager,
@@ -433,6 +435,69 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         if isinstance(value, list):
             return list(value)
         return value
+
+    def _accumulate_payload(self, req_id: str, payload_data: OmniPayload) -> OmniPayload:
+        """Accumulate chunk payloads (concat tensors, extend lists)."""
+        if req_id not in self._send_side_request_payload:
+            self._send_side_request_payload[req_id] = dict(payload_data)
+            return dict(self._send_side_request_payload[req_id])
+
+        origin = self._send_side_request_payload[req_id]
+        merged = dict(origin)
+        raw_ok = payload_data.get("meta", {}).get("override_keys", []) if isinstance(payload_data, dict) else []
+        override_keys = {tuple(k) if isinstance(k, list) else k for k in raw_ok}
+
+        for key, value in payload_data.items():
+            if isinstance(value, dict):
+                origin_sub = origin.get(key)
+                merged_sub = dict(origin_sub) if isinstance(origin_sub, dict) else {}
+                span_handled: set[str] = set()
+                if key == "embed" and isinstance(origin_sub, dict):
+                    for tk, sk, ek in (("decode", "decode_token_start", "decode_token_end"),):
+                        if tk not in value or (key, tk) in override_keys:
+                            continue
+                        span = merge_tensor_spans(
+                            get_tensor_span(origin_sub, tensor_key=tk, start_key=sk, end_key=ek),
+                            get_tensor_span(value, tensor_key=tk, start_key=sk, end_key=ek),
+                        )
+                        if span is None:
+                            continue
+                        t, s, e = span
+                        merged_sub[tk] = t
+                        merged_sub[sk] = s
+                        merged_sub[ek] = e
+                        span_handled |= {tk, sk, ek}
+                for qual, qval in value.items():
+                    if qual in span_handled:
+                        continue
+                    if key == "meta" and qual == "finished":
+                        merged_sub[qual] = qval
+                        continue
+                    if (key, qual) in override_keys:
+                        merged_sub[qual] = qval
+                        continue
+                    osv = merged_sub.get(qual)
+                    if isinstance(qval, torch.Tensor) and isinstance(osv, torch.Tensor):
+                        merged_sub[qual] = torch.cat([osv, qval], dim=0)
+                    elif isinstance(qval, list) and isinstance(osv, list):
+                        merged_sub[qual] = osv + qval
+                    else:
+                        merged_sub[qual] = qval
+                merged[key] = merged_sub
+            else:
+                if key in override_keys:
+                    merged[key] = value
+                    continue
+                ov = origin.get(key)
+                if isinstance(value, torch.Tensor) and isinstance(ov, torch.Tensor):
+                    merged[key] = torch.cat([ov, value], dim=0)
+                elif isinstance(value, list) and isinstance(ov, list):
+                    merged[key] = ov + value
+                else:
+                    merged[key] = value
+
+        self._send_side_request_payload[req_id] = merged
+        return dict(merged)
 
     def pop_local_stage_payload(self, req_id: str) -> Any:
         """Hand one accumulated delta to the model and acknowledge its rows.

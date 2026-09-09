@@ -7,9 +7,9 @@ from __future__ import annotations
 import importlib
 import inspect
 from collections import deque
-from typing import TYPE_CHECKING, Any
 from collections.abc import Callable
 from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
@@ -17,7 +17,6 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
-    _SendCompletion,
     logger,
     should_accumulate_full_payload_output,
 )
@@ -103,7 +102,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             extracted["input_terminal"] = True
 
         return extracted
-
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
         ("meta", "finished"),
@@ -345,7 +343,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return self._drain_omni_connector_output()
         with drain_lock:
             return self._drain_omni_connector_output()
-
 
     @staticmethod
     def _connector_output_has_signals(output: OmniConnectorOutput) -> bool:
@@ -857,7 +854,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             completion.wait()
         return enqueued
 
-
     # ------------------------------------------------------------------ #
     #  Background I/O threads
     # ------------------------------------------------------------------ #
@@ -889,7 +885,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if not made_progress and not self._stop_event.is_set():
                 self._work_available.wait(timeout=0.005)
                 self._work_available.clear()
-
 
     _MAX_SEND_RETRIES = 3
 
@@ -925,7 +920,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
             self._work_available.wait(timeout=0.01)
             self._work_available.clear()
-
 
     def _requeue_or_drop_failed_send(
         self,
@@ -975,7 +969,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if completion is not None:
                 completion.set_error(failure)
             self._decrement_pending_save_count(req_id)
-
 
     # ------------------------------------------------------------------ #
     #  Chunk-level poll / send  (ported from OmniChunkTransferAdapter)
@@ -1120,7 +1113,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         logger.debug("[Stage-%s] Received data for key %s", self._stage_id, connector_get_key)
         return True
 
-
     def _build_custom_process_payload(
         self,
         request_id: str | None,
@@ -1185,7 +1177,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if propagate_errors:
                 raise
             return None
-
 
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""
@@ -1271,7 +1262,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             completion.set_result()
         return True
 
-
     def _decrement_pending_save_count(self, request_id: str) -> None:
         """Decrement pending save count and run deferred cleanup if zero."""
         cleanup_req_id = None
@@ -1292,7 +1282,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
                 self._adaptive_states.pop(cleanup_req_id, None)
-
 
     # ------------------------------------------------------------------ #
     #  Payload accumulation  (ported from OmniChunkTransferAdapter)
@@ -1405,7 +1394,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._stage_recv_req_ids.clear()
         return output
 
-
     def _enqueue_chunk_payload(
         self,
         request: Any,
@@ -1454,7 +1442,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._work_available.set()
         return True, completion
 
-
     def _poll_pending_requests_once(self, pending_ids: list[str]) -> bool:
         """Poll one receiver pass and publish its ready requests as a cohort."""
         made_progress = False
@@ -1468,7 +1455,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if made_progress and self._async_chunk:
             self.publish_omni_connector_output_to_sink()
         return made_progress
-
 
     def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
         entries = [(request, payload) for request, payload in entries if payload is not None]
@@ -1497,7 +1483,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 completion.wait()
             return emitted
 
-
     def publish_omni_connector_output_to_sink(self) -> bool:
         """Drain pending readiness into the same-process scheduler inbox."""
         sink = getattr(self, "_omni_connector_output_sink", None)
@@ -1508,7 +1493,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return False
         sink(output)
         return True
-
 
     def send_chunks(
         self,
@@ -1588,10 +1572,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         return self._publish_chunk_cohort(list(zip(requests, payloads)), wait_for_delivery=wait_for_delivery)
 
-
     def set_omni_connector_output_sink(
         self,
         sink: Callable[[OmniConnectorOutput], None] | None,
     ) -> None:
         self._omni_connector_output_sink = sink
-
