@@ -793,6 +793,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 and sampled
                 in {
                     token_ids.get("listen_token_id", -1),
+                    token_ids.get("interrupt_token_id", -1),
                     token_ids.get("chunk_eos_token_id", -1),
                     token_ids.get("chunk_tts_eos_token_id", -1),
                 }

@@ -28,7 +28,7 @@ ssh -NT -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
 
 Open <http://localhost:7865> in Chrome, use headphones, and allow the microphone.
 Start a new conversation after changing the tool toggle. The tested deployment
-admits one session. There is no client VAD gate: capture continues in 200 ms
+admits four sessions. There is no client VAD gate: capture continues in 200 ms
 packets during playback, and mute sends silence to preserve the input timeline.
 The listening display does not cancel audio. End the conversation to release
 the engine session. This local demo has no authentication; use the loopback bind
@@ -36,7 +36,7 @@ shown above. A remote browser needs HTTPS for microphone access.
 
 ## Verify a real tool call
 
-Keep the local lookup tool enabled and say:
+Enable the optional lookup tool (disabled by default), start a new session, and say:
 
 > 帮我查询一下取货暗号，查到之后告诉我。
 

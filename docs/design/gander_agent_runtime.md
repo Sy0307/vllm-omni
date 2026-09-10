@@ -64,8 +64,8 @@ history edits deliberately.
 ## Replacement transaction
 
 1. The adapter validates event identity, versions, schemas, and inserted data.
-2. Serving stops scheduling automatic continuations and cancels pending append
-   operations. `context.validate` checks the proposed history order, prefix,
+2. Serving stops scheduling automatic continuations and waits for preceding append
+   receipts without cancelling committed operations. `context.validate` checks the proposed history order, prefix,
    and memory budget before old KV is retired.
 3. Under the serving event lock, active playback is cancelled and the epoch
    advances. Old model output fails the epoch fence. The protocol emits an

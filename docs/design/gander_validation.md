@@ -10,7 +10,7 @@ The integration is based on transactional-duplex
 intentionally not included in this draft. The original running service was
 not rebased or restarted during PR preparation.
 
-The functional runs used one NVIDIA H200 (143 GB), one admitted session,
+The original single-session functional runs used one NVIDIA H200 (143 GB), one admitted session,
 vLLM 0.28.0, PyTorch 2.13.0, Transformers 5.15.1, and the three-stage
 `gander.yaml` deployment. Thinker and Talker run eager with one sequence per
 stage; the Stage0 context limit is 40,960 and the replay journal limit is
@@ -37,7 +37,7 @@ The final deployed-service run completed **10 passed in 460.63 seconds**:
 The last three checks are protocol/driver reuse on **Gander**, not a fresh
 base-MiniCPM checkpoint quality comparison. The deployed-service run used
 wrappers calling the checked-in tests against an already-running engine.
-The checked-in Gander file contains seven tests and normally starts its own
+The original Gander file contained seven tests (now eight with concurrency coverage) and normally starts its own
 server through the shared fixture.
 
 The default-window run recorded logical unit `u1-146`, a physical resource
@@ -108,7 +108,7 @@ These checks reach AudioWorklet output, not the OS mixer or physical headphones.
 They resolve the recorded reproductions; they do not guarantee zero omissions
 for arbitrary input. The frontend has no VAD playback gate, and a `listen`
 display transition does not cancel audio. The optional app and deterministic
-Node.js playback regression are in [Gander Live](../../apps/gander_live/README.md).
+Node.js playback regression are in [Gander Live](https://github.com/vllm-project/vllm-omni/blob/main/apps/gander_live/README.md).
 
 ## CPU tests and local checks
 
@@ -159,7 +159,7 @@ HF_HUB_OFFLINE=1 python -m pytest \
   -q -m 'core_model and cpu' --run-level core_model
 ```
 
-For the seven real-weight tests, compose the release as described in the
+For the eight real-weight tests, compose the release as described in the
 [serving guide](../serving/gander.md), select a free large-memory CUDA GPU,
 and let the fixture start its own service. Do not run a competing server on
 that GPU. H200 is the hardware actually validated here; the CI job targets H100.
@@ -190,7 +190,48 @@ WorldSense/Daily-Omni results.
 The paper's `Interrupt` timing metric concerns speaking before the user has
 finished, whereas the native `interrupt` action here cancels the assistant's
 current response. These are distinct measurements. No paper-equivalent score,
-quality parity, millisecond interruption SLA, multi-session stress result,
+quality parity, millisecond interruption SLA, production-scale concurrency,
 or non-CUDA hardware support is claimed. Gateway, Brain/GPT, persistent task
 revision/cancellation/retry semantics, and business-level stale-result filtering
 remain application responsibilities outside this inference integration.
+
+## Review fixes and four-session validation (2026-09-10)
+
+The deployment now admits four sessions, with four sequences per stage and
+an active stream window of four. Async scheduling remains disabled. This
+uses the same pinned #7294 dependency; later dependency commits are excluded.
+
+Review reproductions confirmed missing tool-turn advancement, the lost resume
+context epoch, cancellation of committed appends before their receipts during
+context validation, configuration commits overwriting newly registered calls,
+and token replay deduplication across distinct native units. These paths now
+advance the tool turn, restore the resume gate, wait for append receipts before
+validation, reconcile concurrent call registrations, and include native unit
+identity in the handoff cursor. The async closed-unit guard also includes the
+Gander interrupt terminator.
+
+Five focused reproductions fail against the previous implementation. The
+expanded CPU suite passes **1,956 tests**, with **3 skipped**, **26 deselected**,
+and **21 warnings** (195.92 seconds). It also includes
+`tests/worker/test_native_duplex_input_safety.py`; the async lookahead subset
+passes all four cases.
+
+On one H200 with the repaired source, four synchronized sessions each completed
+two audio turns: **32, 26, 24, and 19 audio deltas**, with isolated identities
+and native turn boundaries. A fifth session was rejected at capacity and a
+replacement session was admitted after release. A separate simultaneous run
+passed two independent model-generated tool queries (different result values),
+history replacement/rollover, and native interruption. These are bounded
+functional concurrency checks, not sustained throughput or latency benchmarks.
+
+The Read the Docs log identified two strict-build warnings for relative links
+to the browser app outside the docs tree. Those links now target GitHub; a new
+hosted documentation build has not yet been verified. Complete input-arrival,
+model-decision, audio-delivery, and rendered-playback timing instrumentation
+remains unimplemented.
+
+Two headless Chromium pages through the Mac WebSocket proxy each completed one
+model-generated local tool query and received 12 audio deltas, with no browser
+or protocol errors. Both transcripts contained the returned value. This checks
+the concurrent browser/tool path with synthetic microphone input; it does not
+measure acoustic playback fidelity or physical speaker output.

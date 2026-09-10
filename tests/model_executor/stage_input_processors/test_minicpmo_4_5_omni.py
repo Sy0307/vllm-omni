@@ -798,3 +798,17 @@ def test_gander_terminal_condition_preserves_talker_context():
     assert terminal["turn_end"] is True
     assert terminal["turn_start"] is False
     assert terminal["replace_streaming_prompt"] is False
+
+
+def test_identical_tokens_in_distinct_native_units_are_not_replay():
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _native_duplex_segment_output_ids
+
+    segment = SimpleNamespace(input_metadata={"duplex": {"epoch": 0, "seq": 1}})
+    context = SimpleNamespace(bridge_states={"duplex": {"model_turn_id": 7}}, segment=lambda _: segment)
+    assert _native_duplex_segment_output_ids([10, 11], "same", context, request_id="r")[0] == [10, 11]
+    context.bridge_states["minicpmo45_tts_handoff"]["condition_seq"] = 0
+    assert _native_duplex_segment_output_ids([10, 11], "same", context, request_id="r")[0] == []
+    segment.input_metadata["duplex"]["seq"] = 2
+    result = _native_duplex_segment_output_ids([10, 11], "same", context, request_id="r")
+    assert result[0] == [10, 11]
+    assert result[2] is False

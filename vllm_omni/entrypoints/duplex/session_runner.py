@@ -837,8 +837,12 @@ class DuplexSessionRunnerMixin:
                 return False
             transitioned = False
             try:
-                if not native.native_context_locked or native_context_epoch != session.epoch:
-                    await wait_for_native_append_tail()
+                # Settle scheduler receipts before validation; cancelling a
+                # committed append can leave its operation uncertain on rejection.
+                context_replacing = True
+                mark_pending_silence_superseded()
+                if not await wait_for_native_append_tail():
+                    return False
                 if not native.native_context_locked or native_context_epoch != session.epoch:
                     raise ServingRuntimeConfigError(
                         "Initialize the audio session first", code="context_not_initialized"
@@ -856,9 +860,6 @@ class DuplexSessionRunnerMixin:
                         }
                     )
                     return True
-                context_replacing = True
-                mark_pending_silence_superseded()
-                await actor.cancel_append_tasks()
                 old_fence = DuplexFence(
                     session.session_id, epoch=session.epoch, turn_id=session.turn_id, incarnation=session.incarnation
                 )
@@ -983,6 +984,9 @@ class DuplexSessionRunnerMixin:
                     runtime_config=candidate,
                 ):
                     return False
+                reconcile = getattr(handler._serving_runtime_adapter, "reconcile_context_config", None)
+                if callable(reconcile):
+                    candidate = reconcile(candidate, session.runtime_config)
                 session.replace_runtime_config(candidate)
                 task = await start_native_append(payload, final=False, context_input=True)
                 if task is None or not await task:
@@ -1082,6 +1086,8 @@ class DuplexSessionRunnerMixin:
             if handshake.resumed:
                 native = handler._serving_session_states[session.session_id]
                 actor.tasks = handler._session_tasks[session.session_id]
+                if native.native_context_locked:
+                    native_context_epoch = session.epoch
                 persisted_protocol = handler._realtime_protocols.get(session.session_id)
                 if persisted_protocol is None:
                     raise RuntimeError(f"Missing Realtime protocol state for resumed session {session.session_id}")

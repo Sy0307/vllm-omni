@@ -1736,3 +1736,35 @@ def send_duplex_context_edit_request(
                 await asyncio.gather(consumer, return_exceptions=True)
 
     return asyncio.run(run())
+
+
+def send_duplex_concurrent_audio_request(*, server, input_wav: Path, ref_audio: Path, output_dir: Path, sessions: int):
+    """Exercise synchronized independent streams and admission on one replica."""
+    import asyncio
+
+    from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import multi_session_args
+    from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import run_multi_session
+
+    args = multi_session_args(
+        omni_server=server, input_wav=input_wav, ref_audio=ref_audio, output_dir=output_dir, response_required=True
+    )
+    args.sessions = sessions
+    args.turns = 2
+    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    args.disconnect_session_index = None
+    args.takeover_session_index = None
+    args.synchronized_start = True
+    args.emit_duplex_control_results = True
+    args.verify_admission_limit = sessions
+    result = asyncio.run(run_multi_session(args))
+    assert result["ok"], result
+    assert result["identity_isolation_ok"] is True
+    assert result["native_model_turn_end_ok"] is True
+    assert result["session_count"] == sessions
+    streams = result["sessions"]
+    assert isinstance(streams, list)
+    for stream in streams:
+        assert stream["done_count"] == 2
+        assert stream["audio_delta_count"] > 0
+        assert stream["error_count"] == 0
+    return result

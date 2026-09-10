@@ -86,7 +86,7 @@ pytest -sv tests/e2e/online_serving/test_gander.py \
 pytest -q tests/model_executor/models/minicpmo_4_5/duplex/test_gander.py
 ```
 
-The default deployment admits one session on a large-memory GPU. Tools are
+The default deployment admits four sessions on a large-memory GPU. Tools are
 opt-in. Brain, Gateway execution, and trusted ASR binding remain external.
 The Gander model policy owns bounded history and protected-prefix replacement.
 
@@ -205,7 +205,7 @@ headroom instead of repeatedly rebuilding after every new input.
 
 ## Browser dialogue and local tool demo
 
-The optional [Gander Live app](../../apps/gander_live/README.md) runs separately
+The optional [Gander Live app](https://github.com/vllm-project/vllm-omni/blob/main/apps/gander_live/README.md) runs separately
 from the inference engine. It supports microphone/camera input, response-specific
 playback cancellation, visible function-call events, and a bounded local lookup
 tool. It can proxy a remote GPU service through an SSH tunnel.

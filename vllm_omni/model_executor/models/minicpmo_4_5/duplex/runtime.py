@@ -555,6 +555,9 @@ class MiniCPMO45DuplexRuntimeExtension:
                 identity = f"{getattr(output, 'request_id', '')}:{special_token_ids.get('gander_append_seq')}:{raw}"
                 return DuplexOutputDecision(
                     action=DuplexOutputAction.DIRECT_RESPONSE,
+                    # Serving ends the turn for silent tool units as well.
+                    # Advance before already-queued input can produce speech.
+                    ends_model_turn=True,
                     metadata={
                         **output_metadata,
                         **{f"meta.{k}": v for k, v in special_token_ids.items()},

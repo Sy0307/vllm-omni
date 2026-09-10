@@ -10,7 +10,7 @@
   <body>
     <header class="app-header">
       <div>
-        <p class="eyebrow">REALTIME INTELLIGENCE · H200</p>
+        <p class="eyebrow">REALTIME INTELLIGENCE · FULL DUPLEX</p>
         <h1>GANDER</h1>
       </div>
       <span id="connectionState" class="status status-offline">未连接</span>
@@ -26,7 +26,7 @@
         </div>
         <div class="intro">戴上耳机，点击开始并允许麦克风。你可以在它说话时继续说话或打断它。</div>
         <div class="orb-wrap"><canvas id="liveVisual" aria-hidden="true"></canvas><p id="visualLabel">等待连接 · READY TO LISTEN</p></div>
-        <label class="tool-toggle"><input id="toolsEnabled" type="checkbox" checked> 启用本地取货查询工具（开始新会话时生效）</label>
+        <label class="tool-toggle"><input id="toolsEnabled" type="checkbox"> 启用示例查询工具（开始新会话时生效）</label>
         <p class="hint">试着说：“帮我查询一下取货暗号。”工具调用由模型决定；执行后，右侧会显示本地记录和返回结果。</p>
         <textarea id="systemPrompt" hidden></textarea>
         <div class="meter" aria-label="Microphone level">
@@ -53,12 +53,12 @@
         </div>
       </section>
 
-      <section class="tool-panel"><p class="eyebrow">本机执行 · 无外部 API</p><h2>工具活动</h2>
-        <p class="hint">演示工具只查询本地取货记录，不执行其他任务。<br>记录：<code id="pickupRecord">读取中…</code></p>
+      <details class="tool-panel"><summary>示例工具与上下文诊断</summary><p class="eyebrow">本机执行 · 无外部 API</p><h2>工具活动</h2>
+        <p class="hint">演示工具只查询本地取货记录，不执行其他任务。<br>示例数据：<code id="pickupRecord">读取中…</code></p>
         <div id="toolEvents"><p class="empty-state">等待模型生成工具调用</p></div>
         <button id="inspectContext" class="secondary" type="button">查看当前上下文</button>
         <pre id="contextInfo">连接后可查看历史单元和 KV 重建代次。</pre>
-      </section>
+      </details>
       <details class="diagnostics">
         <summary>
           <span>事件日志 · 模型回复音频保存在 Mac 本地，便于排查漏词</span>

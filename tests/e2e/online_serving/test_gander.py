@@ -188,3 +188,18 @@ def test_gander_default_history_window(omni_server, tmp_path):
         rollover_input_seconds=140,
         input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
     )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_four_sessions_two_turns_and_admission(omni_server, tmp_path):
+    from tests.helpers.runtime import send_duplex_concurrent_audio_request
+
+    send_duplex_concurrent_audio_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        output_dir=tmp_path / "concurrent",
+        sessions=4,
+    )

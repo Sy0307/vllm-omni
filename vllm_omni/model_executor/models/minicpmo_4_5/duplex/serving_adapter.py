@@ -113,6 +113,15 @@ class MiniCPMO45ServingRuntimeAdapter:
         return prepare_context_input(item, current, epoch=epoch)
 
     @staticmethod
+    def reconcile_context_config(candidate: dict, current: dict) -> dict:
+        # Output registration runs while the engine configuration RPC awaits.
+        # Keep newly registered calls, while candidate owns result updates for
+        # calls that were already present when this context input was prepared.
+        calls = dict(current.get("gander_calls", {}))
+        calls.update(candidate.get("gander_calls", {}))
+        return {**candidate, "gander_calls": calls}
+
+    @staticmethod
     def register_function_call(native: dict, runtime: dict, *, epoch: int) -> dict:
         from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import register_call
 

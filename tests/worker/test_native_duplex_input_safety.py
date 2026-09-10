@@ -419,7 +419,7 @@ def test_failed_input_sample_mask_handles_deferred_async_tokens(async_output):
     assert tokens == ([] if async_output else [[11], [], [13]])
 
 
-@pytest.mark.parametrize("terminator", [2, 3, 4])
+@pytest.mark.parametrize("terminator", [2, 3, 4, 6])
 def test_native_async_lookahead_cannot_overwrite_unit_terminator(monkeypatch, terminator):
     model = _model_with_prepared_units()
     model._minicpmo45_native_duplex_token_ids_cache = {
@@ -430,6 +430,10 @@ def test_native_async_lookahead_cannot_overwrite_unit_terminator(monkeypatch, te
         "turn_eos_token_id": 5,
     }
     state = model._minicpmo45_duplex_data_plane_helper.sessions[("sid", 0)]
+    if terminator == 6:
+        model.config = SimpleNamespace(gander_unit8=True)
+        model._minicpmo45_duplex_data_plane_helper.sessions[("req", 0)] = state
+        model._minicpmo45_native_duplex_token_ids_cache["interrupt_token_id"] = 6
     row = DuplexSamplingRow(0, "req", "sid", 0, 1, {"is_speech": True}, 20)
     metadata = SimpleNamespace()
     calls = []

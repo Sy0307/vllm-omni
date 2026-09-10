@@ -190,3 +190,142 @@ async def test_context_snapshot_waits_for_preceding_input_submission():
         release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_resume_accepts_context_before_new_audio(monkeypatch):
+    from tests.entrypoints.openai_api.test_duplex_handler import _native_realtime_session_update
+
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()), config_timeout_s=0.1, idle_timeout_s=1
+    )
+    sid = "resume-context"
+    first = TimedWebSocket(receive_timeout_s=0.01)
+    first.put(_native_realtime_session_update(sid))
+    await handler.handle_realtime_session(first)
+    created = next(e for e in first.sent if e.get("type") == "session.created")
+    retained = handler._registry.get(sid)
+    handler._runtime_session_state(retained).native_context_locked = True
+    prepared = []
+
+    def prepare(item, current, *, epoch):
+        prepared.append(epoch)
+        return dict(current), None
+
+    monkeypatch.setattr(MiniCPMO45ServingRuntimeAdapter, "prepare_context_input", staticmethod(prepare))
+    second = TimedWebSocket(receive_timeout_s=0.1)
+    second.query_params = {"model": "openbmb/MiniCPM-o-4_5", "native_duplex": "1", "resume": "1"}
+    second.put(
+        {
+            "type": "session.resume",
+            "session_id": sid,
+            "incarnation": created["incarnation"],
+            "resume_token": created["resume_token"],
+            "last_received_server_event_seq": created.get("server_event_seq", 0),
+        }
+    )
+    second.put(
+        {"type": "input.context.append", "context": {"kind": "runtime_event", "event_id": "after-resume", "epoch": 0}}
+    )
+    second.put({"type": "session.close"})
+    await handler.handle_realtime_session(second)
+    assert prepared == [0]
+    assert not any(e.get("code") == "context_not_initialized" for e in second.sent)
+
+
+@pytest.mark.asyncio
+async def test_invalid_replacement_waits_for_committed_append_receipt(monkeypatch):
+    import asyncio
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    resumed_audio = asyncio.Event()
+    validations = []
+    cancelled: list[bool] = []
+
+    class Engine(FakeEngineClient):
+        calls = 0
+
+        async def append_duplex_input_async(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 3:
+                assert not cancelled, "uncertain previous operation"
+                resumed_audio.set()
+            if self.calls == 1:
+                kwargs.pop("expected_epoch", None)
+                return await super().append_duplex_input_async(*args, **kwargs)
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            kwargs.pop("expected_epoch", None)
+            return await super().append_duplex_input_async(*args, **kwargs)
+
+        async def signal_duplex_turn_async(self, session_id, *, event, **kwargs):
+            if event == "context.validate":
+                validations.append(release.is_set())
+                raise ValueError("unknown history unit")
+            return await super().signal_duplex_turn_async(session_id, event=event, **kwargs)
+
+    def prepare(item, current, *, epoch):
+        return {**current, "duplex_context_version": 1}, {"base_version": 0, "edits": []}
+
+    monkeypatch.setattr(MiniCPMO45ServingRuntimeAdapter, "prepare_context_replacement", staticmethod(prepare))
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(Engine()), config_timeout_s=0.1, idle_timeout_s=2)
+
+    def on_send(ws, event):
+        if event.get("type") == "error":
+            ws.put(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": _pcm_f32_b64(16000),
+                    "format": "pcm_f32le",
+                    "sample_rate_hz": 16000,
+                    "duration_ms": 1000,
+                    "is_speech": True,
+                }
+            )
+
+    ws = TimedWebSocket(receive_timeout_s=2, on_send=on_send)
+    sid = "receipt-barrier"
+    ws.put(_native_session_create(sid))
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16000),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 1000,
+            "is_speech": True,
+        }
+    )
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(16000),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 1000,
+            "is_speech": True,
+        }
+    )
+    task = asyncio.create_task(handler.handle_session(ws))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        ws.put(
+            {"type": "input.context.replace", "context": {"kind": "history_edit", "event_id": "bad-edit", "epoch": 0}}
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not validations and not cancelled
+        release.set()
+        await asyncio.wait_for(resumed_audio.wait(), 2)
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(task, 3)
+        assert validations == [True]
+        assert not cancelled
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

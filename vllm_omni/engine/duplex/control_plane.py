@@ -386,8 +386,6 @@ class DuplexControlPlane:
             "barge_in",
             "input.cancel",
             "response.cancel",
-            "context.replace",
-            "context.validate",
         }:
             return message.event
         return None

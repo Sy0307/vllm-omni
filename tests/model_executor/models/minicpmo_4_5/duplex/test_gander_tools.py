@@ -209,6 +209,7 @@ def test_tool_direct_routing_uses_cumulative_ids_when_delta_is_only_terminator()
     )
     assert decision.metadata["gander_tool_text"] == raw
     assert decision.action.value == "direct_response"
+    assert decision.ends_model_turn is True
 
 
 def test_context_applied_event_requires_worker_output_and_is_deduplicated():
@@ -348,3 +349,31 @@ def test_dialogue_without_tools_uses_gander_interaction_prompt():
     assert "Gander" in text and "interrupt" in text
     assert "{{运行时动态注入的 JSON Schema}}" not in text
     assert "<tools>\n[]\n</tools>" in text
+
+
+def test_context_config_preserves_concurrent_call_and_commits_existing_result():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter import MiniCPMO45ServingRuntimeAdapter
+
+    candidate = {"gander_calls": {"c1": {"result": "done"}}}
+    current = {"gander_calls": {"c1": {"result": None}, "c2": {"result": None}}}
+    merged = MiniCPMO45ServingRuntimeAdapter.reconcile_context_config(candidate, current)
+    assert merged["gander_calls"] == {"c1": {"result": "done"}, "c2": {"result": None}}
+    assert candidate["gander_calls"] == {"c1": {"result": "done"}}
+
+
+def test_concurrent_call_result_remains_valid_after_config_commit(runtime):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter import MiniCPMO45ServingRuntimeAdapter
+
+    register(runtime)
+    candidate, _ = gt.prepare_context_input(
+        {"kind": "tool_result", "event_id": "r1", "epoch": 0, "call_id": "c1", "output": 42}, runtime, epoch=0
+    )
+    # Independent output reader delivers c2 while the configuration RPC waits.
+    gt.register_call({"name": "task_start", "arguments": '{"name":"other"}', "call_id": "c2"}, runtime, epoch=0)
+    merged = MiniCPMO45ServingRuntimeAdapter.reconcile_context_config(candidate, runtime)
+    updated, payload = gt.prepare_context_input(
+        {"kind": "tool_result", "event_id": "r2", "epoch": 0, "call_id": "c2", "output": 43}, merged, epoch=0
+    )
+    assert payload is not None
+    assert updated["gander_calls"]["c1"]["result"] is not None
+    assert updated["gander_calls"]["c2"]["result"] is not None

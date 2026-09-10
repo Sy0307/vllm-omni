@@ -689,8 +689,14 @@ def _native_duplex_segment_output_ids(
         state["sent_output_len"] = 0
         state["sent_output_ids"] = []
         state["condition_seq"] = -1
+    unit_meta = _native_duplex_stage0_input_metadata(streaming_context).get("duplex", {})
+    unit_key = (unit_meta.get("epoch"), unit_meta.get("seq")) if isinstance(unit_meta, dict) else None
     previous_turn_id = state.get("turn_id")
     sent_len = state.get("sent_output_len", 0)
+    if unit_key is not None and isinstance(unit_key[1], int) and state.get("unit_key") != unit_key:
+        # Identical words in distinct native units are not replayed output.
+        sent_len = 0
+    state["unit_key"] = unit_key
     prev_output_ids = state.get("sent_output_ids", [])
     if not isinstance(sent_len, int) or sent_len < 0 or sent_len > len(output_ids):
         # Shrunken cumulative output = epoch reset after barge-in.
