@@ -189,7 +189,7 @@ class RealtimeOutputProjector(RealtimeStateOwner):
                     text = ""
                 payloads.append(
                     {
-                        "type": "response.audio_transcript.delta",
+                        "type": "response.output_audio_transcript.delta",
                         "response_id": response_id,
                         "item_id": protocol._response_item_id(response_id),
                         "output_index": 0,
@@ -872,7 +872,7 @@ class RealtimeOutputProjector(RealtimeStateOwner):
             )
         payloads.append(
             {
-                "type": "response.audio.delta",
+                "type": "response.output_audio.delta",
                 "response_id": response_id,
                 "item_id": item_id,
                 "output_index": 0,
@@ -906,7 +906,7 @@ class RealtimeOutputProjector(RealtimeStateOwner):
                 state.audio_done_emitted = True
             payloads.append(
                 {
-                    "type": "response.audio.done",
+                    "type": "response.output_audio.done",
                     "response_id": response_id,
                     "item_id": item_id,
                     "output_index": 0,
@@ -916,7 +916,7 @@ class RealtimeOutputProjector(RealtimeStateOwner):
             if transcript:
                 payloads.append(
                     {
-                        "type": "response.audio_transcript.done",
+                        "type": "response.output_audio_transcript.done",
                         "response_id": response_id,
                         "item_id": item_id,
                         "output_index": 0,
