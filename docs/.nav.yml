@@ -16,7 +16,6 @@ nav:
         - Videos: serving/videos_api.md
       - Streaming and Realtime:
         - Realtime Audio: serving/realtime_api.md
-        - Full Duplex: serving/full_duplex_api.md
         - Realtime Duplex Reference: serving/realtime_duplex_api.md
         - Streaming Video Input: serving/video_stream_api.md
         - Streaming Video Output: serving/streaming_video_output_api.md
@@ -126,7 +125,6 @@ nav:
         - Disaggregated Inference: design/feature/disaggregated_inference.md
         - Host Weight Runtime: design/feature/host_weight_runtime.md
         - Async Chunk: design/feature/async_chunk.md
-        - Transactional Duplex KV Append: design/feature/duplex_kv_append.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
         - Prefill/Decode Phase Contract: design/feature/preprocess_phase_contract.md
