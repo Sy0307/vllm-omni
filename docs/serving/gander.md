@@ -205,7 +205,6 @@ headroom instead of repeatedly rebuilding after every new input.
 
 ## Browser dialogue and local tool demo
 
-The optional [Gander Live app](https://github.com/vllm-project/vllm-omni/blob/main/apps/gander_live/README.md) runs separately
 from the inference engine. It supports microphone/camera input, response-specific
 playback cancellation, visible function-call events, and a bounded local lookup
 tool. It can proxy a remote GPU service through an SSH tunnel.
