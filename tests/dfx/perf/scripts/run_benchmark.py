@@ -21,7 +21,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
-from tests.helpers.runtime import OmniServer, get_model_prefix
+from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
 # ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": [{"hardware_marks":
@@ -48,11 +48,7 @@ _PERF_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
 CONFIG_FILE_PATH = _get_config_file_from_argv()
 if CONFIG_FILE_PATH is None:
     _all_configs = load_benchmark_configs(config_dir=_PERF_TESTS_DIR)
-    BENCHMARK_CONFIGS = [
-        cfg
-        for cfg in _all_configs
-        if not is_diffusion_perf_config(cfg) and cfg.get("benchmark_runner") != "native-duplex"
-    ]
+    BENCHMARK_CONFIGS = [cfg for cfg in _all_configs if not is_diffusion_perf_config(cfg)]
     print(
         f"No --test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts case(s) from "
         f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} diffusion; "
@@ -66,35 +62,6 @@ server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 
 _omni_server_lock = threading.Lock()
-
-
-def _resolve_benchmark_server_model(model: str) -> tuple[str, list[str]]:
-    """Resolve cached models exactly like the standard E2E server fixture.
-
-    ``MODEL_PREFIX`` is used on CUDA hosts whose checkpoints come from an
-    offline cache or a non-Hugging-Face mirror.  Keep the configured model ID
-    as the served name so benchmark request payloads and result metadata do
-    not depend on the host-specific cache path.
-    """
-    model_prefix = get_model_prefix()
-    resolved_model = str(Path(model_prefix) / model) if model_prefix else model
-    served_name_args = ["--served-model-name", model] if resolved_model != model else []
-    return resolved_model, served_name_args
-
-
-def _seed_tts_root_args(params: dict[str, Any]) -> list[str]:
-    """Use the standard Seed-TTS environment override as a config fallback."""
-    if params.get("dataset_name") != "seed-tts" or params.get("seed_tts_root"):
-        return []
-
-    configured_root = os.environ.get("SEED_TTS_ROOT", "").strip()
-    if not configured_root:
-        return []
-
-    root = Path(configured_root).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"SEED_TTS_ROOT is not a directory: {root}")
-    return ["--seed-tts-root", str(root)]
 
 
 class _SingleActiveContext:
@@ -132,8 +99,7 @@ def _start_omni_server(server_param):
 
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-    configured_model = model
-    model, server_args = _resolve_benchmark_server_model(configured_model)
+    server_args: list[str] = []
     if use_omni:
         server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
     # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
@@ -145,7 +111,6 @@ def _start_omni_server(server_param):
     if extra_cli_args:
         server_args = list(extra_cli_args) + server_args
     with OmniServer(model, server_args, use_omni=use_omni) as server:
-        server.model = configured_model
         server.test_name = test_name
         print("OmniServer started successfully")
         yield server
@@ -309,7 +274,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
             args.extend([arg_name, json_str])
         elif not isinstance(value, bool):
             args.extend([arg_name, str(value)])
-    args.extend(_seed_tts_root_args(params))
 
     for config in BENCHMARK_CONFIGS:
         if config.get("test_name") != test_name:
