@@ -742,7 +742,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         raise ValueError("codec_frame_valid must be scalar per request")
                     codec_frame_valid_device = ac.device
                     codec_frame_valid_parts.append(
-                        frame_valid.to(device=ac.device, dtype=torch.int8).reshape(1).expand(int(ac.shape[0]))
+                        frame_valid.to(device=ac.device, dtype=torch.int8, non_blocking=True)
+                        .reshape(1)
+                        .expand(int(ac.shape[0]))
                     )
                 cs = meta.get("codec_streaming")
                 if not async_chunk and isinstance(cs, bool):
