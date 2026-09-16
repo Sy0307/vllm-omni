@@ -17,13 +17,14 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexStageSubmission
+from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexOutputContext, DuplexStageSubmission
 from vllm_omni.engine.duplex.plugin import DuplexContextPolicy, DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.helpers import assistant_playback_active
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.session.context import DuplexSessionContext
     from vllm_omni.engine.duplex.session.emitter import SessionEmitter
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
     from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 
 
@@ -57,28 +58,29 @@ class DuplexContextHistory:
         self.max_bytes = policy.max_bytes
 
     @property
-    def session(self):
+    def session(self) -> DuplexEngineSession:
         return self._ctx.session
 
-    def _size(self, prompts) -> int:
+    def _size(self, prompts: list[dict]) -> int:
         # Prompt metadata contains a frozen fence and base64 media, not tensors.
         # JSON measures encoded media plus tokens/config, including replay data.
         return len(json.dumps(prompts, default=lambda o: vars(o) if hasattr(o, "__dict__") else str(o)).encode())
 
-    def check_budget(self, prompts) -> None:
+    def check_budget(self, prompts: list[dict]) -> None:
         tokens = sum(self.policy.token_count(p) for p in prompts)
         if tokens >= self.max_tokens or self._size(prompts) > self.max_bytes:
             raise ValueError("context replacement exceeds token/byte budget")
 
     def record(self, request_id: str, prompt: dict) -> None:
         """Reserve journal space before submitting a model input."""
+        # The submission and model hooks mutate metadata; the journal owns a stable snapshot.
         candidate = deepcopy(prompt)
         self.check_budget([*self.prompts, candidate])
         self.prompts.append(candidate)
         self.pending_request = request_id
         self.pending = asyncio.get_running_loop().create_future()
 
-    def observe(self, stage_id, request_id, output, context) -> bool:
+    def observe(self, stage_id: int, request_id: str, output: object, context: DuplexOutputContext) -> bool:
         """Complete one input at its actual model boundary; suppress replay output."""
         if context.identity.fence.epoch != self.session.epoch:
             return True
@@ -204,10 +206,9 @@ class DuplexContextHistory:
         session = self.session
         request: dict | None
         if automatic:
-            candidate = deepcopy(dict(session.runtime_config))
-            version = int(candidate.get("duplex_context_version", 0)) + 1
-            # Model policy prepares its own versioned rollover configuration.
-            candidate, request = self.policy.rollover(candidate, epoch=session.epoch)
+            # Model policy owns the snapshot and version increment.
+            candidate, request = self.policy.rollover(dict(session.runtime_config), epoch=session.epoch)
+            version = int(candidate["duplex_context_version"])
             event_id = f"rollover:{session.epoch}:{version}"
         else:
             if item is None:

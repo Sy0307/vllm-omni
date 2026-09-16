@@ -1393,6 +1393,7 @@ def send_duplex_tool_context_request(
     expected_followup_text=None,
     history_event=None,
     require_cancelled_response=False,
+    resume_before_result=False,
     timeout_s=90,
 ):
     """Run a real-model function call and feed deterministic client observations.
@@ -1404,17 +1405,27 @@ def send_duplex_tool_context_request(
     import json
     from contextlib import suppress
 
-    from vllm_omni.clients.duplex import DuplexClient, EventCollector, read_pcm16_wav, write_pcm16_wav
+    from vllm_omni.clients.duplex import DuplexClient, EventCollector, ReconnectPolicy, read_pcm16_wav, write_pcm16_wav
 
     async def run():
         collector = EventCollector()
         destination = Path(output_dir)
         destination.mkdir(parents=True, exist_ok=True)
+        connections = []
+
+        async def connect(target_url):
+            import websockets
+
+            ws = await websockets.connect(target_url, max_size=64 * 1024 * 1024)
+            connections.append(ws)
+            return ws
+
         async with DuplexClient(
             url,
             model=model,
             config=session_config,
-            reconnect=None,
+            reconnect=ReconnectPolicy() if resume_before_result else None,
+            connect=connect if resume_before_result else None,
             heartbeat_interval_s=None,
             handshake_timeout_s=timeout_s,
         ) as client:
@@ -1479,6 +1490,21 @@ def send_duplex_tool_context_request(
                 with suppress(asyncio.CancelledError):
                     await feeder
                 call_id = call["call_id"]
+                if resume_before_result:
+                    # Drop only transport, leaving the engine-owned session alive.
+                    # Context and the pending result must work before any fresh PCM.
+                    resume_start = len(collector.events)
+                    previous_session_id = client.session_id
+                    await connections[-1].close()
+                    await wait_for(lambda e: e.get("type") == "connection.resumed", resume_start)
+                    assert client.session_id == previous_session_id
+                    snapshot_start = len(collector.events)
+                    await client.send({"type": "input.context.get"})
+                    resumed = native(
+                        await wait_for(lambda e: native(e).get("type") == "input.context.snapshot", snapshot_start)
+                    )
+                    assert resumed["units"], "Resume lost initialized model context"
+                    context_epoch = int(resumed["epoch"])
                 if history_event is not None:
                     start_snapshot = len(collector.events)
                     await client.send({"type": "input.context.get"})
@@ -1589,6 +1615,12 @@ def send_duplex_tool_context_request(
                     if e.get("type") in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}
                 )
                 assert "<tool_call>" not in all_spoken and '"arguments"' not in all_spoken, all_spoken
+                completed_calls = [
+                    e["item"]["call_id"]
+                    for e in collector.events
+                    if e.get("type") == "response.output_item.done" and e.get("item", {}).get("type") == "function_call"
+                ]
+                assert completed_calls == [call_id], "Context replay or follow-up emitted an extra tool call"
                 cancelled_ids = set()
                 for event in collector.events:
                     if event.get("type") == "output_audio_buffer.cleared":
@@ -1725,6 +1757,18 @@ def send_duplex_context_edit_request(
                 assert rolled["resource_generation"] > applied["resource_generation"], rolled
                 assert len(rolled["units"]) <= expected_max_units
                 assert any(u["unit_id"] == ids[0] and u["pinned"] for u in rolled["units"])
+                unpinned = await replace(
+                    {
+                        "kind": "history_edit",
+                        "event_id": "unpin-oldest",
+                        "epoch": rolled["epoch"],
+                        "base_version": rolled["context_version"],
+                        "edits": [{"op": "unpin", "unit_id": ids[0]}],
+                    }
+                )
+                after_unpin = await snapshot()
+                assert unpinned["epoch"] == rolled["epoch"] + 1
+                assert any(u["unit_id"] == ids[0] and not u["pinned"] for u in after_unpin["units"])
                 start = len(collector.events)
                 await client.stream_pcm(
                     read_pcm16_wav(Path(input_wav)) + bytes(32000 * 20), chunk_ms=200, realtime=True
@@ -1748,7 +1792,9 @@ def send_duplex_context_edit_request(
     return asyncio.run(run())
 
 
-def send_duplex_concurrent_audio_request(*, server, input_wav: Path, ref_audio: Path, output_dir: Path, sessions: int):
+def send_duplex_concurrent_audio_request(
+    *, server, input_wav: Path, ref_audio: Path, output_dir: Path, sessions: int, resume_and_takeover=False
+):
     """Exercise synchronized independent streams and admission on one replica."""
     import asyncio
 
@@ -1767,18 +1813,75 @@ def send_duplex_concurrent_audio_request(*, server, input_wav: Path, ref_audio: 
     args.continuous_input = True
     # Zero selects the full recording; the base driver defaults to a 1.4 s crop.
     args.turn_duration_ms = [0] * args.turns
-    args.disconnect_session_index = None
-    args.takeover_session_index = None
+    if not resume_and_takeover:
+        args.disconnect_session_index = None
+        args.takeover_session_index = None
     args.synchronized_start = True
-    args.verify_admission_limit = sessions
+    args.verify_admission_limit = None if resume_and_takeover else sessions
     result = asyncio.run(run_multi_session(args))
     assert result["ok"], result
     assert result["identity_isolation_ok"] is True
     assert result["session_count"] == sessions
+    if resume_and_takeover:
+        resume, takeover = result["resume"], result["takeover"]
+        assert isinstance(resume, dict) and resume["ok"] is True
+        assert isinstance(takeover, dict) and takeover["ok"] is True
     streams = result["sessions"]
     assert isinstance(streams, list)
     for stream in streams:
         assert stream["done_count"] == 2
         assert stream["audio_delta_count"] > 0
         assert stream["error_count"] == 0
+    return result
+
+
+def send_duplex_protocol_request(*, server, ref_audio: Path):
+    """Reuse the MiniCPM duplex session lifecycle contract for another model."""
+    import asyncio
+
+    from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import _run_protocol_smoke
+
+    events = asyncio.run(
+        _run_protocol_smoke(
+            url=f"ws://{server.host}:{server.port}/v1/realtime?duplex=1", model=server.model, ref_audio=ref_audio
+        )
+    )
+    types = [event.get("type") for event in events]
+    assert "session.created" in types and "session.updated" in types
+    assert types[-1] == "session.closed"
+    assert "error" not in types
+
+
+def send_duplex_video_turns_request(*, server, input_wav: Path, ref_audio: Path, output_dir: Path):
+    """Exercise the shared audio/video driver with model-owned turn boundaries."""
+    import asyncio
+
+    from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import demo_args, duplex_camera_frames
+    from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import run_demo
+    from vllm_omni.clients.duplex import read_pcm16_wav, write_pcm16_wav
+    from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    full_turn = output_dir / "question_and_silence.wav"
+    write_pcm16_wav(full_turn, read_pcm16_wav(input_wav) + bytes(32000 * 20), sample_rate_hz=16000)
+    args = demo_args(omni_server=server, input_wav=full_turn, ref_audio=ref_audio, output_dir=output_dir)
+    args.turns = 2
+    args.turn_duration_ms = [0, 0]
+    args.continuous_input = True
+    args.omit_transcript_hints = True
+    frames = duplex_camera_frames(seconds=4, cache_dir=output_dir / "camera")
+    args.video_frames_b64 = frames
+    # End the camera clip; silence is only for draining the audio response.
+    args.repeat_last_video_frame = False
+    args.video_stacked_frames_b64 = [concat_frames_b64([frame] * 2) for frame in frames]
+    result = asyncio.run(run_demo(args))
+    assert result["ok"], result
+    assert result["done_count"] == 2
+    assert result["playback_ack_count"] == 2
+    assert result["video_frame_count"] == 4 and result["video_stacked_frame_count"] == 4
+    audio_delta_count = result["audio_delta_count"]
+    assert isinstance(audio_delta_count, int) and audio_delta_count > 0
+    assert result["error_count"] == 0
+    assert result["all_audio_responses_have_transcript"] and result["transcript_delta_done_ok"]
+    assert result["continuous_input_ok"]
     return result

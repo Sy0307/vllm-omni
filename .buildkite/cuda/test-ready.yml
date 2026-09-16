@@ -168,6 +168,17 @@ steps:
       - label: "Omni · Gander Speech Smoke Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_gander.py
+          - tests/assets/minicpmo_4_5/
+          - tests/helpers/runtime.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
+          - vllm_omni/deploy/minicpmo_4_5.yaml
+          - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
+          - vllm_omni/entrypoints/duplex/
+          - vllm_omni/worker/gpu_model_runner.py
+          - vllm_omni/worker/gpu_ar_model_runner.py
+          - tests/e2e/online_serving/helpers/
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+          - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
           - vllm_omni/deploy/gander.yaml
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/engine/duplex/

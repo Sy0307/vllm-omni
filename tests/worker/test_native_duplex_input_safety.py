@@ -50,7 +50,6 @@ def _preprocess(model, *, seq, ids, offset, prompt):
         request_id="physical-0",
         duplex_token_offset=offset,
         duplex_prompt_len=len(prompt),
-        duplex_scheduler_prompt_token_ids=prompt,
         duplex={"data_plane": True, "session_id": "sid", "epoch": 0, "seq": seq, "payload": {}},
     )
 

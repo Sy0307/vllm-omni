@@ -80,9 +80,3 @@ class DuplexPromptHistory:
             target = slice(lo - offset, hi - offset)
             embeddings[target] = span.embeddings[source].to(device=embeddings.device, dtype=embeddings.dtype)
             input_ids[target] = torch.tensor(span.token_ids[source], device=input_ids.device, dtype=input_ids.dtype)
-
-    def prompt_token_ids(self, scheduler_ids: list[int]) -> list[int]:
-        result = list(scheduler_ids)
-        for span in self.spans:
-            result[span.start : span.end] = span.token_ids
-        return result
