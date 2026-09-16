@@ -204,6 +204,21 @@ class DuplexSessionRunner:
             schedule_silence_continuation=self._schedule_silence_continuation,
             abort_request=self._abort_request_background,
         )
+        policy = plugin.context_policy(session.runtime_config)
+        if policy is not None:
+            from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
+
+            self.ctx.history = DuplexContextHistory(
+                self.ctx,
+                policy,
+                out=self.out,
+                model=self.model,
+                max_tokens=min(
+                    int(getattr(model_config, "max_model_len", None) or policy.max_tokens), policy.max_tokens
+                ),
+                wait_for_append_tail=self._wait_for_append_tail,
+                close_from_runtime=self._close_from_runtime,
+            )
         self.control = SessionControl(
             self.ctx,
             self.out,
@@ -246,9 +261,13 @@ class DuplexSessionRunner:
         context: DuplexOutputContext,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
+        if self.ctx.history is not None and self.ctx.history.observe(stage_id, request_id, output, context):
+            return True
         decision: DuplexOutputDecision | None = None
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
+        if decision is not None and decision.ends_model_turn:
+            self.session.complete_model_turn(context.identity.fence.turn_id)
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
         if not consume and not project_intermediate:
@@ -550,6 +569,12 @@ class DuplexSessionRunner:
         elif isinstance(command, CancelInput | BargeIn):
             await self._on_cancel(command.payload())
         elif isinstance(command, SignalTurn):
+            if command.event in {"input.context.append", "input.context.replace", "input.context.get"}:
+                if self.ctx.history is None:
+                    self._emit_error("context_input_unsupported", "This model does not support context editing")
+                else:
+                    await self.ctx.history.handle(command.event, dict(command.signal_payload))
+                return
             if command.event == "conversation.item.retrieve":
                 self._emit_events(
                     retrieve_item_events(
@@ -1077,6 +1102,8 @@ class DuplexSessionRunner:
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
     ) -> bool:
+        if self.ctx.history is not None and self.ctx.history.changing:
+            return False
         session = self.session
         model_state = self.model_state
         self._clear_completed_pending_silence()

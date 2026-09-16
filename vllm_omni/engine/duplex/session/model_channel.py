@@ -166,6 +166,10 @@ class ModelChannel:
         # commits timing state only if the append actually submitted.
         submit_time = time.monotonic()
         try:
+            if self._ctx.history is not None:
+                await self._ctx.history.before_append()
+                # Automatic rollover rebuilds this same input stream in a new epoch.
+                expected_epoch = session.epoch
             result = await self._append_via_data_plane(
                 payload,
                 final=final,
@@ -177,6 +181,8 @@ class ModelChannel:
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
             self.send_runtime_error("runtime_append_failed", exc)
+            if self._ctx.history is not None:
+                await self._close_from_runtime("runtime_append_failed")
             return False, False
         if result is None:
             return True, False
@@ -208,6 +214,7 @@ class ModelChannel:
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
+        history = self._ctx.history
         if self._ctx.stage_port.stage_count == 0:
             raise RuntimeError("duplex_data_plane_has_no_stage")
         fence = helpers.append_fence(session, payload)
@@ -254,6 +261,8 @@ class ModelChannel:
                 prompt=append_plan.prompt,
                 already_submitted=already_submitted,
             )
+            if history is not None:
+                history.record(request_id, append_plan.prompt)
             submission_result = await self._ctx.stage_port.submit(submission)
             try:
                 if submission_result.request_id != request_id or submission_result.stage_id != stage_id:
@@ -696,6 +705,16 @@ class ModelChannel:
             self._fail_response_from_model_error(model_result)
             return close_reason, True
         if model_result.get("function_call") is True:
+            if self._ctx.history is not None:
+                runtime = dict(session.runtime_config)
+                try:
+                    self._ctx.history.policy.register_call(model_result, runtime, epoch=session.epoch)
+                    session.replace_runtime_config(runtime)
+                except DuplexRuntimeConfigError as exc:
+                    self._out.emit_error(exc.code, str(exc))
+                    return close_reason, True
+                turn = coerce_int(model_result.get("model_turn_id"))
+                session.complete_model_turn(session.turn_id if turn is None else turn)
             self._out.emit(
                 {
                     "type": "function_call.done",
@@ -726,6 +745,19 @@ class ModelChannel:
             self._attach_runtime_metadata(payload, model_result)
             self._out.emit(payload)
             return close_reason, emitted_response
+        if model_result.get("is_interrupt") is True:
+            old_response = session.active_response_id
+            session.complete_model_turn(session.turn_id if model_turn_id is None else model_turn_id)
+            session.end_response(commit_text=False, preserve_request=True)
+            self._out.emit(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": old_response,
+                    "epoch": session.epoch,
+                    "reason": "model_interrupt",
+                }
+            )
         if is_listen is True:
             return await self._on_model_listen(
                 model_result,
