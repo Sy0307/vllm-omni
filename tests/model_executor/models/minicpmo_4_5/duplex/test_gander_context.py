@@ -163,3 +163,75 @@ def test_pin_only_edit_preserves_history_within_capacity():
     metadata(units[-1])["gander_pinned"] = True
     selected = select_units(units, {"gander_history": {"max_units": 4, "retain_units": 3}})
     assert [unit_id(p) for p in selected] == [unit_id(p) for p in units]
+
+
+@pytest.fixture
+async def context_budget_history():
+    from tests.engine.duplex.test_session_runner import close_harness, open_harness
+    from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
+    from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import GanderContextPolicy
+
+    h = await open_harness()
+    try:
+        yield DuplexContextHistory(
+            h.runner.ctx,
+            GanderContextPolicy(),
+            out=h.runner.out,
+            model=h.runner.model,
+            max_tokens=40960,
+            wait_for_append_tail=h.runner._wait_for_append_tail,
+            close_from_runtime=h.runner._close_from_runtime,
+        )
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("output_length", [0, 1, 250])
+@pytest.mark.parametrize("rollover", [False, True])
+def test_replay_budget_counts_output_once_across_repeated_edits(output_length, rollover, context_budget_history):
+    from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import GanderContextPolicy
+
+    runtime = {"gander_enabled": True, "duplex_first_append_context_tokens": 100}
+    units = []
+    for seq in range(1, 129 if rollover else 97):
+        p = build_duplex_data_plane_prompt(
+            request_id="old",
+            fence=DuplexFence("s"),
+            session_config={},
+            runtime_config=runtime,
+            seq=seq,
+            turn_seq=seq,
+            payload={"audio": base64.b64encode(bytes(64000)).decode(), "format": "pcm_f32le", "sample_rate_hz": 16000},
+            final=False,
+        )
+        metadata(p)["gander_output_ids"] = [100] * output_length
+        units.append(p)
+    policy = GanderContextPolicy()
+    for epoch in (1, 2):
+        rebuilt = make_plan(
+            prompts=units,
+            runtime_config=runtime,
+            session_config={},
+            request_id="new",
+            fence=DuplexFence("s", epoch=epoch),
+            context={"reason": "context_rollover"}
+            if rollover and epoch == 1
+            else {"edits": [{"op": "pin", "unit_id": unit_id(units[0])}]},
+        )
+        replay = [dict(unit.prompt) for unit in rebuilt.units]
+        assert len(replay) == 96
+        physical = sum(len(p["prompt_token_ids"]) + bool(output_length) for p in replay)
+        assert sum(policy.token_count(p) for p in replay) == physical
+        history = context_budget_history
+        history.max_tokens = physical + 1
+        history.check_budget(replay)
+        if output_length:
+            completed = deepcopy(replay)
+            for p in completed:
+                metadata(p)["gander_output_ids"] = [7]
+            assert sum(policy.token_count(p) for p in completed) == physical
+        history.max_tokens = physical
+        with pytest.raises(ValueError, match="budget"):
+            history.check_budget(replay)
+        assert physical < 40960
+        units = replay

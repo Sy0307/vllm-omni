@@ -200,7 +200,14 @@ class GanderContextPolicy:
 
     @staticmethod
     def token_count(prompt):
-        return len(prompt.get("prompt_token_ids", ())) + len(metadata(prompt).get("gander_output_ids", ()))
+        data = metadata(prompt)
+        outputs = len(data.get("gander_output_ids", ()))
+        payload = data.get("payload", {})
+        replay_outputs = len(payload.get("gander_replay_output_ids", ())) if payload.get("gander_replay") else 0
+        # Replay prefills N-1 historical output tokens and samples the terminal.
+        # Completion may report only that terminal, while the journal retains N.
+        remaining_outputs = max(outputs, replay_outputs) - max(0, replay_outputs - 1)
+        return len(prompt.get("prompt_token_ids", ())) + remaining_outputs
 
     @staticmethod
     def prepare_input(item, runtime, *, epoch):

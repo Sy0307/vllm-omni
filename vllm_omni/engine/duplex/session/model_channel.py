@@ -160,6 +160,9 @@ class ModelChannel:
         session = self._ctx.session
         if not session.capabilities.supports_input_append:
             return True, False
+        history = self._ctx.history
+        if expected_epoch is not None and history is not None:
+            expected_epoch = history.resolve_append_epoch(expected_epoch)
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
         # Anchor the submission time before the RPC; the acceptance callback
@@ -168,8 +171,10 @@ class ModelChannel:
         try:
             if self._ctx.history is not None:
                 await self._ctx.history.before_append()
-                # Automatic rollover rebuilds this same input stream in a new epoch.
-                expected_epoch = session.epoch
+                if expected_epoch is not None:
+                    expected_epoch = self._ctx.history.resolve_append_epoch(expected_epoch)
+                    if expected_epoch != session.epoch:
+                        return True, False
             result = await self._append_via_data_plane(
                 payload,
                 final=final,
@@ -179,6 +184,13 @@ class ModelChannel:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if (
+                isinstance(exc, DuplexRuntimeConfigError)
+                and exc.code == "context_not_initialized"
+                and expected_epoch is not None
+                and expected_epoch != session.epoch
+            ):
+                return True, False
             logger.exception("Failed to append duplex runtime input: %s", exc)
             self.send_runtime_error("runtime_append_failed", exc)
             if self._ctx.history is not None:

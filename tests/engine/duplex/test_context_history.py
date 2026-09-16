@@ -3,11 +3,12 @@
 """Exercise Gander history through the engine session and ordinary stage port."""
 
 import asyncio
+import base64
 from types import SimpleNamespace
 
 import pytest
 
-from tests.engine.duplex.test_session_runner import append_audio, close_harness, open_harness
+from tests.engine.duplex.test_session_runner import append_audio, close_harness, open_harness, pcm_f32
 from vllm_omni.engine.duplex.commands import SignalTurn
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
@@ -186,4 +187,88 @@ async def test_function_result_acknowledged_only_after_model_application(monkeyp
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_queued", [False, True])
+async def test_rollover_preserves_queued_inputs_but_cancel_invalidates_them(cancel_queued):
+    h = await initialized()
+    tasks = []
+    try:
+        history = h.runner.ctx.history
+        h.session.replace_runtime_config(
+            {**h.session.runtime_config, "gander_history": {"max_units": 2, "retain_units": 1}}
+        )
+        await h.run(append_audio())
+        # Leave Stage0 pending so A, B and C capture the same admission epoch.
+        for index, name in enumerate(("A", "B", "C"), 1):
+            tasks.append(
+                await h.runner._start_append(
+                    {
+                        "audio": base64.b64encode(pcm_f32(16000, value=index / 10)).decode(),
+                        "format": "pcm_f32le",
+                        "sample_rate_hz": 16000,
+                        "probe": name,
+                    },
+                    final=False,
+                )
+            )
+        complete(h, seq=2)
+        async with asyncio.timeout(2):
+            while len(h.port.submissions) < 3:
+                await asyncio.sleep(0)
+            assert h.session.epoch == 1
+            complete(h, seq=1)  # rollover replay
+            assert await tasks[0]
+            assert history.prompts[-1]["model_intermediate_buffer"]["duplex"]["payload"]["probe"] == "A"
+            if cancel_queued:
+                h.runner._cancel_pending_input(reason="test")
+            else:
+                # Complete every real/replayed unit, including another rollover
+                # before C. Queued inputs must survive more than one rollover.
+                while not all(task.done() for task in tasks):
+                    if history.pending is not None and not history.pending.done():
+                        complete(h, seq=history.prompts[-1]["model_intermediate_buffer"]["duplex"]["seq"])
+                    await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
+        submitted = [
+            d["payload"]["probe"]
+            for entry in h.port.submissions
+            if (d := entry.prompt["model_intermediate_buffer"]["duplex"])["payload"].get("probe")
+            and not d["payload"].get("gander_replay")
+        ]
+        assert submitted == (["A"] if cancel_queued else ["A", "B", "C"])
+        assert not h.runner.ctx.run.closing
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["input.cancel", "barge_in"])
+async def test_cancel_pending_model_unit_then_query_context_without_new_audio(event):
+    h = await initialized()
+    try:
+        await h.run(append_audio())
+        history = h.runner.ctx.history
+        pending = history.pending
+        assert pending is not None and not pending.done()
+        await h.runner._on_command(SignalTurn(event=event, signal_payload={}))
+        assert pending.done(), "epoch invalidation must wake existing waiters"
+        assert history.pending is None
+        assert not history.prompts
+        async with asyncio.timeout(1):
+            await h.runner._on_command(SignalTurn(event="input.context.get", signal_payload={}))
+        await h.settle()
+        assert any(e.to_realtime().get("error", {}).get("code") == "context_not_initialized" for e in h.events)
+        assert not h.runner.ctx.run.closing
+        await h.run(append_audio())
+        complete(h, seq=1)
+        await history.wait_applied()
+        assert len(history.prompts) == 1
+    finally:
         await close_harness(h)
