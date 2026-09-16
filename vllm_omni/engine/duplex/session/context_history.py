@@ -56,6 +56,8 @@ class DuplexContextHistory:
         self.resource_generation = 0
         self.max_tokens = max_tokens
         self.max_bytes = policy.max_bytes
+        self._epoch = self.session.epoch
+        self._input_epoch_floor = self._epoch
 
     @property
     def session(self) -> DuplexEngineSession:
@@ -102,16 +104,36 @@ class DuplexContextHistory:
                     self._ctx.services.spawn(self._close_from_runtime("context_output_failed"), name="context-close")
         return self.replaying
 
+    def synchronize_epoch(self) -> None:
+        """Invalidate abandoned history and wake waiters at a cancellation boundary."""
+        if self._epoch == self.session.epoch:
+            return
+        self._epoch = self.session.epoch
+        self._input_epoch_floor = self._epoch
+        self.prompts.clear()
+        if self.pending is not None and not self.pending.done():
+            self.pending.set_exception(
+                DuplexRuntimeConfigError("Context epoch was cancelled", code="context_not_initialized")
+            )
+            # There need not be a waiter when cancellation arrives.
+            self.pending.exception()
+        self.pending = None
+        self.pending_request = None
+
+    def resolve_append_epoch(self, epoch: int) -> int:
+        """Carry accepted inputs across automatic rollovers, never cancellations."""
+        self.synchronize_epoch()
+        if self._input_epoch_floor <= epoch <= self._epoch:
+            return self._epoch
+        return epoch
+
     async def wait_applied(self) -> None:
+        self.synchronize_epoch()
         if self.pending is not None:
             await asyncio.wait_for(asyncio.shield(self.pending), timeout=60)
 
     async def before_append(self) -> None:
         """Keep input/output identity aligned without a scheduler append RPC."""
-        if self.prompts and self.prompts[-1]["model_intermediate_buffer"]["duplex"]["epoch"] != self.session.epoch:
-            self.prompts.clear()
-            self.pending = None
-            self.pending_request = None
         await self.wait_applied()
         if (
             self.prompts
@@ -244,6 +266,9 @@ class DuplexContextHistory:
         old_requests = session.resource_request_ids()
         session.end_response(commit_text=False)
         session.epoch = new_fence.epoch
+        self._epoch = session.epoch
+        if not automatic:
+            self._input_epoch_floor = self._epoch
         session.sync_fence()
         session.clear_playback_cursor()
         self._ctx.model_state.clear_continuation()

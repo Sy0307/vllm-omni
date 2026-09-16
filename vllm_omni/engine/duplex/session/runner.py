@@ -710,7 +710,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -728,7 +728,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1181,7 +1181,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1199,7 +1199,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1218,7 +1218,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_barge_in_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1285,7 +1285,7 @@ class DuplexSessionRunner:
         # The epoch bump is the atomic part: from here on every model output
         # and append of the old epoch is dropped by the stale-epoch filter in
         # ``emit`` / the append tail, whatever the awaits below interleave with.
-        new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        new_epoch, old_playback = self._advance_barge_in_epoch()
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
@@ -1322,10 +1322,16 @@ class DuplexSessionRunner:
             if notify and self.session.state != DuplexSessionState.CLOSED:
                 self.model.send_runtime_error("runtime_abort_failed", exc)
 
+    def _advance_barge_in_epoch(self) -> tuple[int, dict[str, int]]:
+        result = helpers.advance_barge_in_epoch(self.session)
+        if self.ctx.history is not None:
+            self.ctx.history.synchronize_epoch()
+        return result
+
     def _cancel_pending_input(self, *, reason: str) -> None:
         session = self.session
         cancelled = session.cancel_pending_input()
-        helpers.advance_barge_in_epoch(session)
+        self._advance_barge_in_epoch()
         self.emit(
             {
                 "type": "input.cancelled",
