@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -67,17 +68,22 @@ def test_invalid_ramp_keeps_original_boundaries(ramp):
     [(None, [1, 15], 15), ([1, 2, 4, 8, 15], [1, 2, 4, 8, 15], 15), ([1, 20, 15], [1, 15, 20], 20)],
 )
 def test_codec_captures_every_ramp_length(ramp, expected, max_step):
+    from transformers import PretrainedConfig
+    from vllm.config import CompilationConfig, ModelConfig, SchedulerConfig, VllmConfig
+
     from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
 
-    cfg = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(),
+    cfg = Mock(
+        spec=VllmConfig,
+        model_config=Mock(
+            spec=ModelConfig,
+            hf_config=PretrainedConfig(),
             async_chunk=True,
             enforce_eager=False,
             stage_connector_config=manager(ramp).connector.config,
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4, 8]),
+        scheduler_config=Mock(spec=SchedulerConfig, max_num_seqs=8),
+        compilation_config=Mock(spec=CompilationConfig, cudagraph_capture_sizes=[1, 2, 4, 8]),
     )
     codec = MossTTSCodecDecoder(vllm_config=cfg)
     assert codec._streaming_graph_frame_sizes == expected
