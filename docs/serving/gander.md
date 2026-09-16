@@ -73,3 +73,33 @@ Automatic rollover waits for active responses and acknowledged audio playback.
 Hard context and replay byte/token limits still apply; each session has a
 256 MiB prompt journal limit. The configured admission limit is four sessions, not a
 hardware-independent capacity or latency guarantee.
+
+## Full-duplex validation
+
+With the composed model and Token2Wav dependencies above, run on an available
+H100/H200-class CUDA GPU from the repository root:
+
+```bash
+export GANDER_MODEL=/path/to/composed/gander-model
+# Session lifecycle and streaming speech smoke.
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
+  -sv -m 'core_model and cuda' --run-level core_model
+# All twelve scenarios; pytest starts and stops its own three-stage server.
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
+  -sv -m 'advanced_model and cuda' --run-level advanced_model
+```
+
+The suite reuses MiniCPM's protocol, audio/video and multi-session drivers with
+continuous microphone input. It covers two audio/video turns with a finite camera clip, playback
+acknowledgements, reconnect/takeover, four-session admission, native interrupt
+and follow-up speech. Vision assertions check input delivery and response
+completion, not visual-answer accuracy.
+
+Gander-specific cases exercise real model-generated function calls, result
+feedback, progress observations, slate replacement and a spoken query of the
+latest slate, pending-result delivery immediately after reconnect, historical event insertion, pin/unpin/move/delete, retry
+deduplication, invalid-edit preservation, and small/default-window rollover.
+They check continued inference, cancellation of old playback, and absence of
+duplicate tool calls during reconstruction. These tests supply deterministic
+external tool results; business-tool execution and task modification/cancellation
+semantics belong to the application.

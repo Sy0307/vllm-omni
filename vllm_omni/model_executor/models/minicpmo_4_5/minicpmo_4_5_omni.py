@@ -479,13 +479,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Generated-token gaps use normal token lookup; actual multimodal
         # spans come from the owned recovery history. Keep the same path for
         # live append and historical preemption recomputation.
+        # Overlay patches scheduler-owned IDs, so it needs request-local storage.
         req_input_ids = input_ids.clone()
         req_embeds = self.get_input_embeddings(req_input_ids).to(dtype=target_dtype).clone()
         history.overlay(offset=token_offset, input_ids=req_input_ids, embeddings=req_embeds)
-        scheduler_ids = kwargs.get("duplex_scheduler_prompt_token_ids")
-        if isinstance(scheduler_ids, list) and len(scheduler_ids) == prompt_len:
-            update_result["duplex_prompt_token_ids"] = history.prompt_token_ids(scheduler_ids)
-        elif token_offset == 0 and input_ids.shape[0] == prompt_len:
+        if token_offset == 0 and input_ids.shape[0] == prompt_len:
             update_result["duplex_prompt_token_ids"] = req_input_ids.tolist()
         return req_input_ids, req_embeds, {"duplex": update_result}
 
@@ -750,6 +748,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     for row, generator in sampling_metadata.generators.items()
                 },
             )
+            # The standard sampler mutates logits; native rows below still need the originals.
             standard_output = self.sampler(logits.clone(), standard_metadata)
 
         sampled_ids: list[int] = []
@@ -957,6 +956,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         allow, constrained = tool_constraint(
             recent, token_ids, enabled=bool(getattr(state, "gander_tools_enabled", False))
         )
+        # This row is a view of batch logits; grammar masking must stay local.
         logits = logits.clone()
         if allow:
             masked = torch.full_like(logits, float("-inf"))

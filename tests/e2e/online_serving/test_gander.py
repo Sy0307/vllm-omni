@@ -204,3 +204,50 @@ def test_gander_four_sessions_two_turns_and_admission(omni_server, tmp_path):
         output_dir=tmp_path / "concurrent",
         sessions=4,
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_websocket_protocol(omni_server):
+    from tests.helpers.runtime import send_duplex_protocol_request
+
+    send_duplex_protocol_request(server=omni_server, ref_audio=Path(MODEL) / "assets/ref_audio.wav")
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_video_two_turns(omni_server, tmp_path):
+    from tests.helpers.runtime import send_duplex_video_turns_request
+
+    send_duplex_video_turns_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        output_dir=tmp_path / "video",
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_resume_and_takeover(omni_server, tmp_path):
+    from tests.helpers.runtime import send_duplex_concurrent_audio_request
+
+    send_duplex_concurrent_audio_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        output_dir=tmp_path / "resume",
+        sessions=2,
+        resume_and_takeover=True,
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_pending_tool_result_after_resume(omni_server, tmp_path):
+    _tool_context_request(omni_server, tmp_path, resume_before_result=True)

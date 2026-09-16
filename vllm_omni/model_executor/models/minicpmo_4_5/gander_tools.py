@@ -13,11 +13,14 @@ import hashlib
 import json
 from copy import deepcopy
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError as ServingRuntimeConfigError
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 MAX_TOOL_TOKENS = 256
 MAX_CONTEXT_TOKENS = 1500
@@ -102,7 +105,7 @@ def error(message: str, code: str = "invalid_gander_context") -> ServingRuntimeC
     return ServingRuntimeConfigError(message, code=code)
 
 
-def data_json(value: Any) -> str:
+def data_json(value: object) -> str:
     return (
         json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         .replace("<", "\\u003c")
@@ -117,8 +120,9 @@ def tokenizer_for(path: str):
     return AutoTokenizer.from_pretrained(path, trust_remote_code=True, local_files_only=True)
 
 
-def normalize_tools(raw: object, tokenizer: Any) -> list[dict[str, Any]]:
+def normalize_tools(raw: object, tokenizer: PreTrainedTokenizerBase) -> list[dict[str, Any]]:
     from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import SchemaError
 
     if raw is None:
         return []
@@ -142,7 +146,7 @@ def normalize_tools(raw: object, tokenizer: Any) -> list[dict[str, Any]]:
             raise error("Schema references are not supported", "invalid_tools")
         try:
             Draft202012Validator.check_schema(schema)
-        except Exception as exc:
+        except SchemaError as exc:
             raise error(f"Invalid schema for {name}", "invalid_tools") from exc
         names.add(name)
         tools.append({"name": name, "description": str(tool.get("description", "")), "parameters": schema})
@@ -268,6 +272,7 @@ def parse_call(text: str) -> dict[str, Any]:
 
 def register_call(native: dict, runtime: dict, *, epoch: int) -> dict:
     from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
 
     if not runtime.get("gander_enabled"):
         raise error("Gander tools are not enabled")
@@ -278,7 +283,7 @@ def register_call(native: dict, runtime: dict, *, epoch: int) -> dict:
     try:
         arguments = strict_json(native["arguments"])
         Draft202012Validator(schemas[name]["parameters"]).validate(arguments)
-    except Exception as exc:
+    except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise error(f"Arguments do not match {name}'s schema", "gander_tool_schema_error") from exc
     calls = runtime.setdefault("gander_calls", {})
     call_id = str(native["call_id"])
