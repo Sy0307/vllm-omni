@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -99,10 +100,23 @@ class DuplexContextHistory:
                     self.pending.set_result(None)
                 except Exception as exc:
                     self.pending.set_exception(exc)
+                    # No waiter may exist when the completion arrives.
+                    self.pending.exception()
                     # A missing output journal must never silently become the
                     # source of the next history reconstruction.
                     self._ctx.services.spawn(self._close_from_runtime("context_output_failed"), name="context-close")
         return self.replaying
+
+    def fail_pending(self, exc: BaseException) -> None:
+        """Wake waiters when a journalised model unit can no longer complete.
+
+        Session-owned requests never surface as processed terminal outputs, so
+        a scheduler-side failure must be handed to the journal explicitly;
+        otherwise the next ``wait_applied`` would block for its full timeout.
+        """
+        if self.pending is not None and not self.pending.done():
+            self.pending.set_exception(exc)
+            self.pending.exception()
 
     def synchronize_epoch(self) -> None:
         """Invalidate abandoned history and wake waiters at a cancellation boundary."""
@@ -224,6 +238,15 @@ class DuplexContextHistory:
             }
         )
 
+    def _retire_replay_requests(self, request_ids: list[str]) -> None:
+        """Best-effort cleanup of replay stage requests orphaned by a supersede."""
+        if not request_ids:
+            return
+        with suppress(Exception):
+            self._ctx.services.spawn(
+                self._ctx.stage_port.cleanup(request_ids, abort=True), name="context-replay-cleanup"
+            )
+
     async def replace(self, item: dict | None, *, automatic: bool = False) -> None:
         session = self.session
         request: dict | None
@@ -285,6 +308,7 @@ class DuplexContextHistory:
                 "reason": "context_replaced",
             }
         )
+        replayed_request_ids: list[str] = []
         try:
             await self._ctx.stage_port.cleanup(old_requests, abort=True)
             for old_request in old_requests:
@@ -293,11 +317,17 @@ class DuplexContextHistory:
             self.prompts = []
             self.pending = None
             for index, unit in enumerate(plan.units):
+                if session.epoch != new_fence.epoch:
+                    # A cancellation superseded this replacement mid-replay:
+                    # its epoch transition already owns the journal cleanup.
+                    self._retire_replay_requests(replayed_request_ids)
+                    return
                 context = self._ctx.manager.ensure_stage_request(session, stage_id=0, fence=session.fence)
                 if context is None:
                     raise RuntimeError("duplex_data_plane_has_no_stage")
                 reservation = session.prepare_append(session.fence)
                 self.record(context.request_id, dict(unit.prompt))
+                replayed_request_ids.append(context.request_id)
                 await self._ctx.stage_port.submit(
                     DuplexStageSubmission(context=context, prompt=unit.prompt, already_submitted=index > 0)
                 )
@@ -317,6 +347,15 @@ class DuplexContextHistory:
                     **self.snapshot(),
                 }
             )
+        except asyncio.CancelledError:
+            # Cancellation is the normal way an append-owned automatic
+            # rollover is superseded by input.cancel/barge_in. The runner's
+            # epoch transition performs the shared journal cleanup; closing
+            # the session here would turn a user cancellation into a runtime
+            # failure. Retire only the replay requests this replacement already
+            # created, so they cannot linger until session close.
+            self._retire_replay_requests(replayed_request_ids)
+            raise
         except BaseException:
             await self._close_from_runtime("context_replacement_failed")
             raise

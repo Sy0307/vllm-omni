@@ -220,7 +220,9 @@ def test_replay_budget_counts_output_once_across_repeated_edits(output_length, r
         )
         replay = [dict(unit.prompt) for unit in rebuilt.units]
         assert len(replay) == 96
-        physical = sum(len(p["prompt_token_ids"]) + bool(output_length) for p in replay)
+        # Every replayed unit embeds max(0, N-1) outputs in its prompt and
+        # samples exactly one terminal token (even when N == 0).
+        physical = sum(len(p["prompt_token_ids"]) + 1 for p in replay)
         assert sum(policy.token_count(p) for p in replay) == physical
         history = context_budget_history
         history.max_tokens = physical + 1

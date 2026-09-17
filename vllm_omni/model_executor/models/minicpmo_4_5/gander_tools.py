@@ -427,7 +427,7 @@ def prepare_context_replacement(item: dict, current: dict, *, epoch: int):
         raise error("Context replacement ledger is full", "gander_context_limit")
     kind = item.get("kind")
     if not isinstance(kind, str) or type(item.get("generate", False)) is not bool:
-        raise error("Replacement kind must be text and generate must be boolean")
+        raise error("Replacement kind must be a string and generate must be boolean")
     base = int(current.get("gander_context_version", 0))
     edits = []
     candidate = deepcopy(current)
@@ -439,7 +439,7 @@ def prepare_context_replacement(item: dict, current: dict, *, epoch: int):
             return candidate, None
         edits.append({"op": "insert", "unit_id": f"e:{digest[:24]}", "payload": payload})
     elif kind == "history_edit":
-        if item.get("base_version") != base:
+        if type(item.get("base_version")) is not int or item["base_version"] != base:
             raise error("History edit base_version is stale", "stale_context_version")
         raw = item.get("edits")
         if not isinstance(raw, list) or not raw or len(raw) > 32:
