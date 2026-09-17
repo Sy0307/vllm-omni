@@ -217,7 +217,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return result
         self._require_special_token_ids()
         if audio_waveform is None or len(audio_waveform) == 0:
-            return self._stage_prefill_result(False, start_time, "empty audio", buffering=True)
+            return self._stage_prefill_result(False, start_time, "empty audio")
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size(processor)
         self._pad_first_audio_chunk_if_needed(state, processor)
@@ -239,7 +239,6 @@ class MiniCPMO45Stage0DuplexRuntime:
                 False,
                 start_time,
                 f"audio not enough: need {chunk_size} samples, only {len(state.audio_buffer)}",
-                buffering=True,
             )
         # Omni duplex: encode this append's camera frames so the first unit can
         # carry them, mirroring official streaming_prefill (feed <unit>, then
@@ -339,7 +338,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
         if units_built == 0:
-            return self._stage_prefill_result(False, start_time, "no model unit built for this append", buffering=True)
+            return self._stage_prefill_result(False, start_time, "no model unit built for this append")
 
         import torch
 
@@ -459,17 +458,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.last_final_append_identity = append_identity
 
     @staticmethod
-    def _stage_prefill_result(
-        success: bool, start_time: float, reason: str = "", *, buffering: bool = False
-    ) -> dict[str, object]:
+    def _stage_prefill_result(success: bool, start_time: float, reason: str = "") -> dict[str, object]:
         return {
             "success": success,
             "prefill_success": success,
             "is_buffering": not success,
-            # ``buffering`` marks results the prefill layer may report softly
-            # (keep the session listening); every other failure is an input
-            # error that isolates and terminates just this request.
-            "buffering": buffering,
             "reason": reason,
             "cost_all": time.time() - start_time,
             "stage_runtime_ready": True,

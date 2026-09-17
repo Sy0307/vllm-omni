@@ -1251,9 +1251,7 @@ def llm2tts(
                         # Final Gander units drain to EOS using whatever
                         # context remains. Reserve the first sample only;
                         # the Talker bounds decoding by its actual prompt.
-                        1
-                        if native_turn_end_handoff
-                        else special_token_ids["gander_speech_tokens"] + 1
+                        1 if native_turn_end_handoff else special_token_ids["gander_speech_tokens"] + 1
                     )
                 bridge_states = getattr(_streaming_context, "bridge_states", None)
                 handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
