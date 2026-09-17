@@ -1252,7 +1252,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
 
             fetch_start_s = time.perf_counter()
-            wav_np, fetched_sr = await self._media_connector.fetch_audio_async(ref_audio_str)
+            try:
+                wav_np, fetched_sr = await self._media_connector.fetch_audio_async(ref_audio_str)
+            except RuntimeError as exc:
+                if "Cannot load local files" in str(exc):
+                    # MediaConnector refuses file:// references unless the
+                    # operator opts in; translate the upstream RuntimeError
+                    # into a client-facing 400 with the actionable remedy
+                    # instead of an internal-error traceback.
+                    raise ValueError(
+                        "ref_audio points to a local file, which the server must opt into. "
+                        "Restart with `--allowed-local-media-path <dir>` to enable file:// references, "
+                        "or pass an http(s) URL / base64 data URL instead."
+                    ) from exc
+                raise
             fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
             tolist_start_s = time.perf_counter()
             wav_list, sr, artifact_key, duration = self._finalize_fetched_ref_audio(wav_np, fetched_sr)

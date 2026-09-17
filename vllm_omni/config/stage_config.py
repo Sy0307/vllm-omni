@@ -992,7 +992,18 @@ def _build_engine_args(
         # model-owned streaming state. Propagate it to every stage instead of
         # making individual models duplicate the value in connector extras.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
-    engine_args.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    # The runner selection is a deploy-topology decision owned by the
+    # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
+    # silently veto or force it per stage.
+    if ds is not None:
+        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
+            if reserved in ds.engine_extras:
+                raise ValueError(
+                    f"stage {ds.stage_id}: {reserved!r} must not be set via engine_extras; "
+                    "it is derived from the deploy-level `model_runner` field and the "
+                    "pipeline's `supports_native_mrv2_data_plane` declaration."
+                )
+    engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)

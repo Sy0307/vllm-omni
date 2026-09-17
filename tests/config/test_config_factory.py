@@ -2615,19 +2615,54 @@ class TestPlatformOverrides:
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     @pytest.mark.parametrize(
-        "filename",
+        ("filename", "pipeline_key"),
         [
-            "qwen3_tts.yaml",
-            "qwen3_tts_high_concurrency.yaml",
-            "qwen3_omni_moe.yaml",
-            "moss_tts_local.yaml",
+            ("qwen3_tts.yaml", "qwen3_tts"),
+            ("qwen3_tts_high_concurrency.yaml", "qwen3_tts"),
+            ("qwen3_omni_moe.yaml", "qwen3_omni_moe"),
+            ("moss_tts_local.yaml", "moss_tts_local"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_recommended_native_runner_platform_defaults(self, filename, platform):
+    def test_recommended_native_runner_platform_defaults(self, filename, pipeline_key, platform):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        assert deploy.model_runner == ("v2" if platform == "cuda" else "v1")
+        expect_v2 = platform == "cuda"
+        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+
+        # The selection must reach the live worker-dispatch consumer, not just
+        # the transport-level DeployConfig field.
+        pipeline = (
+            resolve_pipeline_config(pipeline_key, Q3_OMNI_ALL_STAGES_HF_CONFIG)
+            if pipeline_key == "qwen3_omni_moe"
+            else resolve_pipeline_config(pipeline_key)
+        )
+        assert isinstance(pipeline, PipelineConfig)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * len(stages)
+
+        if expect_v2 and pipeline.stages and deploy.async_chunk:
+            # model_runner=v2 only engages the native MRv2 data plane on
+            # stages that declare support; an undeclared stage silently falls
+            # back to the legacy chunk-transfer plane.
+            missing = [ps.stage_id for ps in pipeline.stages if not ps.supports_native_mrv2_data_plane]
+            assert not missing, (
+                f"{filename} selects model_runner=v2 but stage(s) {missing} do not declare "
+                "supports_native_mrv2_data_plane"
+            )
+
+    def test_runner_selection_rejects_engine_extras_override(self):
+        pipeline = PipelineConfig(
+            model_type="runner_selection_reserved",
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
+            deploy = DeployConfig(
+                model_runner="v2",
+                stages=[StageDeployConfig(stage_id=0, engine_extras={reserved: False})],
+            )
+            with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
+                merge_pipeline_deploy(pipeline, deploy)
 
     def test_invalid_platform_runner_rejected(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("qwen3_tts.yaml")))

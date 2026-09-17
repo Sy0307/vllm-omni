@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -97,6 +100,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [151645],
@@ -111,6 +115,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            supports_native_mrv2_data_plane=True,
             retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},

@@ -1610,6 +1610,32 @@ class TestTTSMethods:
         assert first[2] != second[2]
         assert connector.fetch_audio_async.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_ref_audio_local_file_without_opt_in_is_actionable_400(
+        self,
+        mocker: MockerFixture,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A local-file ref_audio without --allowed-local-media-path must surface
+        as a clean client error with the remedy, not an internal traceback."""
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+        connector = mocker.MagicMock()
+        connector.fetch_audio_async = mocker.AsyncMock(
+            side_effect=RuntimeError("Cannot load local files without `--allowed-local-media-path`.")
+        )
+        mocker.patch.object(serving_speech_module, "MediaConnector", return_value=connector)
+
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="test-model",
+        )
+        try:
+            with pytest.raises(ValueError, match="--allowed-local-media-path"):
+                await server._resolve_ref_audio((tmp_path / "reference.wav").as_uri())
+        finally:
+            server.shutdown()
+
     # ── ref-audio cache key tests (static helper) ──
 
     def test_local_file_cache_key_invalidation(self):

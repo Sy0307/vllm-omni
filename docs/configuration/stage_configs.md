@@ -48,6 +48,17 @@ for evidence and limits. In particular, the current Qwen3-TTS C64 run encountere
 a codec-EOS limit failure and remains under investigation; recommended runner
 selection does not imply completed performance or quality qualification.
 
+!!! note "Operational caveats (validated on 1x H200, vLLM 0.29)"
+    - First launch is compile- and graph-capture-heavy: with
+      `moss_tts_local.yaml` the server reaches readiness in ~9–10 minutes cold
+      (torch.compile plus the codec's CUDA-graph bucket sweep), and reuses
+      `~/.cache/vllm` caches afterwards. Plan load-balancer health timeouts
+      accordingly or pass a larger `--stage-init-timeout` / `--init-timeout`.
+    - Reference audio passed as a `file://` URI requires an explicit server
+      opt-in: start with `--allowed-local-media-path <dir>`, or send an
+      http(s) URL / base64 data URL instead. Without it the request fails as
+      HTTP 400.
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions
