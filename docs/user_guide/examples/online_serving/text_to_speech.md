@@ -350,13 +350,16 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
 
 ### Executor backend
 
-Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the only Qwen3-TTS deploy config; pass `--deploy-config <path>` to override.
+Single-GPU serves now default to the uniproc executor (lower IPC overhead, the Base cloning use case from [#2603](https://github.com/vllm-project/vllm-omni/issues/2603) / [#2604](https://github.com/vllm-project/vllm-omni/pull/2604)). `vllm_omni/deploy/qwen3_tts.yaml` is the default single-GPU profile and selects MRv2 on CUDA. The separate `qwen3_tts_high_concurrency.yaml` profile places Talker and Code2Wav on two GPUs; pass `--deploy-config <path>` to select it. See the [recommended deployment profiles](../../../configuration/stage_configs.md#recommended-cuda-deployment-profiles).
 
 To opt out of chunked streaming, pass `--no-async-chunk` — the pipeline auto-dispatches to the end-to-end codec processor.
 
 ### Tuning stage 1 `max_num_seqs` per task type
 
-The bundled `qwen3_tts.yaml` ships stage 1 (Code2Wav) at `max_num_seqs: 10`, tuned for Base voice cloning: stage-1 lifetimes are long (~3 s/req), so admitting up to 10 concurrent codec sequences lets requests progress in parallel in the scheduler — ~2× TTFA p95 at c=4 / c=8 (1× H100, 1.7B-Base, seed-tts) at an 8–12 % audio-throughput cost.
+The bundled `qwen3_tts.yaml` sets stage 1 (Code2Wav) to `max_num_seqs: 64`.
+The separate two-GPU `qwen3_tts_high_concurrency.yaml` profile uses `10`.
+These are scheduler admission limits, not decoder graph batch sizes; choose
+between them using measurements for the intended workload.
 
 CustomVoice / VoiceDesign have much shorter stage-1 lifetimes (~50–200 ms) and are TTFA-optimal at `max_num_seqs: 1`. Override the default when serving those task types:
 

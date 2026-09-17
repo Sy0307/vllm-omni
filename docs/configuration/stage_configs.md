@@ -5,6 +5,49 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
+## Recommended CUDA deployment profiles
+
+These are serving configurations under `vllm_omni/deploy`, selected by the
+model pipeline or `--deploy-config`. They are independent of CI pipeline YAMLs.
+The profiles below select `model_runner: v2` for the whole pipeline on CUDA.
+Their NPU, XPU, ROCm and MUSA sections retain V1.
+
+| Model / workload | Recommended deploy YAML | GPU placement |
+| --- | --- | --- |
+| Qwen3-TTS Base / CustomVoice / VoiceDesign | `qwen3_tts.yaml` | Talker and Code2Wav on GPU 0 |
+| Qwen3-TTS, separate stages for high concurrency | `qwen3_tts_high_concurrency.yaml` | Talker on GPU 0, Code2Wav on GPU 1 |
+| Qwen3-Omni Instruct, text and audio | `qwen3_omni_moe.yaml` | Thinker on GPU 0, Talker and Code2Wav on GPU 1 |
+| MOSS-TTS-Local-Transformer-v1.5 | `moss_tts_local.yaml` | Talker and codec on GPU 0 |
+
+The first, third and fourth profiles are loaded automatically for the matching
+model when `--deploy-config` is omitted. Explicit selection from a repository
+checkout is:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml
+
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+    --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency.yaml
+
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe.yaml
+
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+    --deploy-config vllm_omni/deploy/moss_tts_local.yaml
+```
+
+These recommendations select the native runner; they do not enable MPS,
+experimental Qwen decoder B2/B4 buckets, or code-predictor prefix graphs.
+MOSS Delay, Realtime and Nano, Qwen thinker-only, and forced-alignment profiles
+retain their separate model-specific settings. A CUDA overlay can explicitly
+select `model_runner: v1` for comparison.
+
+See the [validation record](../design/feature/mrv2_performance_evidence_20260917.md)
+for evidence and limits. In particular, the current Qwen3-TTS C64 run encountered
+a codec-EOS limit failure and remains under investigation; recommended runner
+selection does not imply completed performance or quality qualification.
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions

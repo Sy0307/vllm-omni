@@ -2620,10 +2620,11 @@ class TestPlatformOverrides:
             "qwen3_tts.yaml",
             "qwen3_tts_high_concurrency.yaml",
             "qwen3_omni_moe.yaml",
+            "moss_tts_local.yaml",
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen_native_runner_platform_defaults(self, filename, platform):
+    def test_recommended_native_runner_platform_defaults(self, filename, platform):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
         assert deploy.model_runner == ("v2" if platform == "cuda" else "v1")

@@ -46,9 +46,8 @@ per-row fallback unless they declare support for batched generators.
 
 ## Deployment defaults
 
-The CUDA profiles `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`, and
-`qwen3_omni_moe.yaml` select `model_runner: v2` for the whole pipeline.
-Their explicit `_mrv2.yaml` aliases remain available. Other platform sections
+The CUDA profiles `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`, `qwen3_omni_moe.yaml`, and `moss_tts_local.yaml` select `model_runner: v2` for the whole pipeline.
+The existing Qwen `_mrv2.yaml` aliases remain available. Other platform sections
 retain `model_runner: v1`; the platform runner override is applied before
 checking runner support. NPU and XPU still reject an explicit V2 selection.
 A CUDA deployment can select V1 by overriding the top-level `model_runner`.

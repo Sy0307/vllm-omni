@@ -3,6 +3,7 @@
 # Codec: OpenMOSS-Team/MOSS-Audio-Tokenizer-v2 (48 kHz, stereo, channel-interleaved RVQ)
 # Uses a 1-layer GPT2-style local depth transformer (no delay warm-up), reset every
 # frame — same per-frame timing (80 ms/frame, 12.5 fps) as MOSS-TTS-Realtime.
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -64,3 +65,14 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  # Native MRv2 is the CUDA recommendation; retain other platform runners.
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
