@@ -10,6 +10,7 @@ import pytest
 
 from tests.engine.duplex.test_session_runner import append_audio, close_harness, open_harness, pcm_f32
 from vllm_omni.engine.duplex.commands import SignalTurn
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
 from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import GanderContextPolicy
@@ -270,5 +271,125 @@ async def test_cancel_pending_model_unit_then_query_context_without_new_audio(ev
         complete(h, seq=1)
         await history.wait_applied()
         assert len(history.prompts) == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_automatic_rollover_keeps_session_open(monkeypatch):
+    h = await initialized()
+    rollover_started = asyncio.Event()
+
+    async def block_cleanup(request_ids, *, abort=False):
+        del request_ids, abort
+        rollover_started.set()
+        await asyncio.Event().wait()
+
+    task = None
+    try:
+        history = h.runner.ctx.history
+        h.session.replace_runtime_config(
+            {**h.session.runtime_config, "gander_history": {"max_units": 2, "retain_units": 1}}
+        )
+        await h.run(append_audio())
+        complete(h, seq=2)
+        await history.wait_applied()
+        monkeypatch.setattr(h.port, "cleanup", block_cleanup)
+
+        task = asyncio.create_task(history.replace(None, automatic=True))
+        await asyncio.wait_for(rollover_started.wait(), 1)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        # Drive the real input.cancel command path: its epoch transition owns
+        # the shared journal cleanup after the append task unwinds.
+        await h.runner._on_command(SignalTurn(event="input.cancel", signal_payload={}))
+        await h.settle()
+        assert not h.runner.ctx.run.closing
+        assert h.session.state.name == "OPEN"
+        assert history.pending is None
+        assert history.pending_request is None
+        assert not history.prompts
+        assert not history.replaying
+        assert h.runner.ctx.run.stream_request_id is None
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_replay_retires_replayed_requests(monkeypatch):
+    h = await initialized()
+    task = None
+    try:
+        history = h.runner.ctx.history
+        h.session.replace_runtime_config(
+            {**h.session.runtime_config, "gander_history": {"max_units": 3, "retain_units": 2}}
+        )
+        for seq, value in ((2, 0.2), (3, 0.3)):
+            await h.run(append_audio(value=value))
+            complete(h, seq=seq)
+            await history.wait_applied()
+
+        # The next append rolls max_units over inside its own append task and
+        # parks on the first replayed unit's completion.
+        task = await h.runner._start_append(
+            {
+                "audio": base64.b64encode(pcm_f32(16000, value=0.4)).decode(),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+                "probe": "C",
+            },
+            final=False,
+        )
+        for _ in range(400):
+            if len(h.port.submissions) >= 4:  # initial, A, B, replay unit 1
+                break
+            await asyncio.sleep(0.005)
+        assert len(h.port.submissions) >= 4
+        replayed_request_id = h.port.submissions[-1].context.request_id
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        await h.runner._on_command(SignalTurn(event="input.cancel", signal_payload={}))
+        await h.settle()
+        assert not h.runner.ctx.run.closing
+        assert not history.prompts
+        assert history.pending is None
+        # The replay request submitted before the cancel is retired through the
+        # ordinary abort-cleanup path instead of idling until session close.
+        retired = [request_id for ids, abort in h.port.cleanups if abort for request_id in ids]
+        assert replayed_request_id in retired
+
+        await h.run(append_audio())
+        complete(h, seq=1)
+        await history.wait_applied()
+        assert len(history.prompts) == 1
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_stage_request_error_fails_pending_and_closes_session():
+    h = await initialized()
+    try:
+        await h.run(append_audio())
+        history = h.runner.ctx.history
+        pending = history.pending
+        assert pending is not None and not pending.done()
+
+        # A session-owned request retired by the scheduler (e.g. an invalid
+        # model input isolated to this request) must wake the journal now --
+        # its processed terminal output will never arrive.
+        h.runner.on_request_error(0, h.stage0_request_id(), "native_duplex_prefill_failed: bad input")
+        with pytest.raises(DuplexRuntimeConfigError):
+            await pending
+        await h.settle()
+        assert h.runner.ctx.run.closing
     finally:
         await close_harness(h)

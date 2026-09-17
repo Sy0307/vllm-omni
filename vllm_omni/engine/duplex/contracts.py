@@ -179,6 +179,8 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 __all__ = [
     "DuplexFence",
     "DuplexAppendPlan",
+    "DuplexContextPlan",
+    "DuplexContextUnit",
     "DuplexOutputAction",
     "DuplexOutputContext",
     "DuplexOutputDecision",

@@ -90,6 +90,7 @@ def make_plan(*, prompts, runtime_config, session_config, request_id, fence, con
                 return i
         raise ValueError(f"unknown history unit: {key}")
 
+    deleted_ids: list[str] = []
     for edit in edits:
         if not isinstance(edit, dict):
             raise ValueError("each context edit must be an object")
@@ -121,6 +122,7 @@ def make_plan(*, prompts, runtime_config, session_config, request_id, fence, con
             if op == "delete":
                 if metadata(p).get("gander_pinned"):
                     raise ValueError("cannot delete a pinned unit; unpin explicitly first")
+                deleted_ids.append(unit_id(p))
                 units.pop(at)
             elif op == "move":
                 if edit.get("before") == unit_id(p):
@@ -135,8 +137,10 @@ def make_plan(*, prompts, runtime_config, session_config, request_id, fence, con
     ids = [unit_id(p) for p in units]
     if len(set(ids)) != len(ids):
         raise ValueError("history contains duplicate unit identities")
+    edited_ids = deleted_ids + ids
     units = select_units(units, runtime_config, compact=context.get("reason") == "context_rollover")
     retained_ids = tuple(unit_id(p) for p in units)
+    retained_set = frozenset(retained_ids)
     # The system/tools/reference/slate prefix is never a removable history unit.
     if not units:
         units = [
@@ -185,7 +189,10 @@ def make_plan(*, prompts, runtime_config, session_config, request_id, fence, con
     return DuplexContextPlan(
         units=tuple(rebuilt),
         retained_unit_ids=retained_ids,
-        dropped_unit_ids=tuple(unit_id(p) for p in original if unit_id(p) not in retained_ids),
+        # Report every unit the edit operated on that did not survive, not just
+        # the pre-edit journal: an insert evicted by the window must not vanish
+        # silently from the client's acknowledgement.
+        dropped_unit_ids=tuple(uid for uid in edited_ids if uid not in retained_set),
     )
 
 
@@ -201,13 +208,15 @@ class GanderContextPolicy:
     @staticmethod
     def token_count(prompt):
         data = metadata(prompt)
-        outputs = len(data.get("gander_output_ids", ()))
         payload = data.get("payload", {})
-        replay_outputs = len(payload.get("gander_replay_output_ids", ())) if payload.get("gander_replay") else 0
-        # Replay prefills N-1 historical output tokens and samples the terminal.
-        # Completion may report only that terminal, while the journal retains N.
-        remaining_outputs = max(outputs, replay_outputs) - max(0, replay_outputs - 1)
-        return len(prompt.get("prompt_token_ids", ())) + remaining_outputs
+        if payload.get("gander_replay"):
+            # Replay embeds max(0, N-1) historical output tokens in the prompt
+            # and always samples exactly one terminal (the last output, or the
+            # listen token when the unit produced none).
+            return len(prompt.get("prompt_token_ids", ())) + 1
+        # Live units count the outputs already generated for them; an in-flight
+        # completion settles the journal via ``observe`` + ``check_budget``.
+        return len(prompt.get("prompt_token_ids", ())) + len(data.get("gander_output_ids", ()))
 
     @staticmethod
     def prepare_input(item, runtime, *, epoch):

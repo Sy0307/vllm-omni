@@ -377,8 +377,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
 
-        audio_waveform = None if payload.get("gander_control") is True else helper._decode_audio_payload(payload)
         try:
+            audio_waveform = None if payload.get("gander_control") is True else helper._decode_audio_payload(payload)
             video_frames = helper._decode_video_frames_payload(payload)
         except ValueError as exc:
             raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
@@ -399,8 +399,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             turn_id = None
         if payload.get("gander_control") is True:
             if not getattr(self.config, "gander_unit8", False):
-                raise ValueError("Gander context payload on a non-Gander model")
-            result = helper._stage_control_embeddings(state, payload, epoch=epoch, seq=seq)
+                raise ModelInputError("native_duplex_prefill_failed: Gander context payload on a non-Gander model")
+            try:
+                result = helper._stage_control_embeddings(state, payload, epoch=epoch, seq=seq)
+            except ValueError as exc:
+                raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
         else:
             result = helper._stage_prefill_embeddings_only(
                 state,
@@ -442,6 +445,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
+            if result.get("buffering") is True:
+                # Not enough input for one model unit yet: report softly so the
+                # session keeps buffering instead of losing the request.
+                embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+                return input_ids, embeds, {"duplex": update_result}
             raise ModelInputError(f"native_duplex_prefill_failed: {result.get('reason', 'no prepared model unit')}")
 
         target_dtype = (
@@ -483,8 +491,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         req_input_ids = input_ids.clone()
         req_embeds = self.get_input_embeddings(req_input_ids).to(dtype=target_dtype).clone()
         history.overlay(offset=token_offset, input_ids=req_input_ids, embeddings=req_embeds)
-        if token_offset == 0 and input_ids.shape[0] == prompt_len:
-            update_result["duplex_prompt_token_ids"] = req_input_ids.tolist()
+        # The llm->tts handoff needs the full prompt ids. A first append larger
+        # than one scheduling quantum arrives chunked: accumulate per-chunk ids
+        # and publish them when the final chunk completes the prompt.
+        chunk_acc = getattr(self, "_minicpmo45_duplex_chunked_token_ids", None)
+        if chunk_acc is None:
+            chunk_acc = self._minicpmo45_duplex_chunked_token_ids = {}
+        collected = [] if token_offset == 0 else chunk_acc.get(request_id, [])
+        collected.extend(req_input_ids.tolist())
+        if token_offset + input_ids.shape[0] >= prompt_len:
+            chunk_acc.pop(request_id, None)
+            if len(collected) == prompt_len:
+                update_result["duplex_prompt_token_ids"] = collected
+        else:
+            chunk_acc[request_id] = collected
         return req_input_ids, req_embeds, {"duplex": update_result}
 
     def _duplex_data_plane_helper(self):
@@ -676,9 +696,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         histories = getattr(self, "_minicpmo45_duplex_input_histories", {})
         closed_units = getattr(self, "_minicpmo45_closed_duplex_units", {})
+        chunked_ids = getattr(self, "_minicpmo45_duplex_chunked_token_ids", None)
         for request_id in finished_req_ids:
             histories.pop(request_id, None)
             closed_units.pop(request_id, None)
+            if isinstance(chunked_ids, dict):
+                chunked_ids.pop(request_id, None)
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None

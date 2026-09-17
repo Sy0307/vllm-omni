@@ -70,6 +70,7 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
+    DuplexRuntimeConfigError,
     PcmAppendReservation,
 )
 from vllm_omni.engine.duplex.realtime_events import (
@@ -294,6 +295,40 @@ class DuplexSessionRunner:
             )
         )
         return consume
+
+    def on_request_error(self, stage_id: int, request_id: str, error: str) -> None:
+        """A scheduler-side failure retired one of this session's stage requests.
+
+        Session-owned requests never surface as processed terminal outputs, so
+        without this hook the journal would wait out its full completion
+        timeout while the client sees nothing. Wake waiters and close the
+        session immediately, like any other runtime fault.
+        """
+        session = self.session
+        if session.state == DuplexSessionState.CLOSED:
+            return
+        if self.ctx.history is not None:
+            self.ctx.history.fail_pending(DuplexRuntimeConfigError(error, code="context_output_failed"))
+        self._emit_error(
+            "runtime_input_failed",
+            f"Stage-{stage_id} request {request_id} failed: {error}",
+        )
+        response_id = session.active_response_id
+        if response_id is not None:
+            session.end_response(commit_text=False)
+            self.emit(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "status": "failed",
+                    "status_details": {"type": "failed", "reason": "runtime_input_failed"},
+                    "playback": session.playback.as_dict(),
+                }
+            )
+        self.spawn(self._close_from_runtime("runtime_input_failed"), name="duplex-request-error-close")
 
     def on_stage_failure(self, stage_id: int, exc: BaseException) -> None:
         """A stage rejected this session's request: fail the active response now.

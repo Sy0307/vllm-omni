@@ -60,8 +60,10 @@ confirms reconstruction and supplies the new epoch for subsequent commands.
 Appends use the engine session’s normal resumable request updates. Replacement
 uses the same request path in a new epoch, without a separate KV-append RPC.
 Replacement rebuilds scheduler-owned KV from selected inputs and completed
-assistant tokens; it does not splice raw KV tensors or replay historical audio.
-The system, tools, reference voice and latest slate remain protected.
+assistant tokens; it does not splice raw KV tensors, and stored historical
+payloads are re-encoded through a fresh prefill rather than replayed to the
+client as audio. The system, tools, reference voice and latest slate remain
+protected.
 Identical committed replacement IDs are deduplicated; conflicting IDs fail.
 Validation failure preserves old KV. Failure after replacement begins closes
 the session and requires reopening. Older reconnect cursors require
