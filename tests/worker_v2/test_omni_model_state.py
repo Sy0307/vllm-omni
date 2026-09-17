@@ -29,6 +29,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
+    query_start_loc: torch.Tensor
+    input_ids: torch.Tensor
+    num_tokens: int
+
     def __init__(self, indices, *, num_computed_tokens_cpu=None):
         self.idx_mapping_np = indices
         self.num_reqs = len(indices)
@@ -1459,3 +1463,46 @@ def test_staging_does_not_concatenate_different_source_devices(monkeypatch):
     monkeypatch.setattr(state, "_batch_move_tensor_rows", move)
     state._stage_batched_preprocess_inputs([0, 1], torch.device("cuda"))
     assert len(calls) == 2
+
+
+def test_seeded_talker_mtp_uses_uniforms_without_dispatcher():
+    state = _make_state(max_num_reqs=2)
+    state.vllm_config.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        use_sequence_parallel_moe=False,
+        is_moe_model=False,
+    )
+    state._mtp_sample_uniforms = torch.empty((2, 2, 4))
+    state._talker_mtp_runner = MagicMock()
+    state._is_talker_mtp_graph_runner = MagicMock(return_value=True)
+    state._prepare_talker_mtp_sample_uniforms = MagicMock(return_value=state._mtp_sample_uniforms[:1])
+    state._call_talker_mtp_with_sampling = MagicMock(
+        return_value=(torch.zeros(1, 3), torch.zeros(1, 1, dtype=torch.long))
+    )
+    state._talker_mtp_batch_offsets = MagicMock(return_value=torch.tensor([0]))
+    state._pack_talker_mtp_batch = MagicMock(
+        return_value=(
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, 3),
+            torch.zeros(1, 3),
+            torch.zeros(1, 3),
+            torch.tensor([0]),
+        )
+    )
+    state.intermediate_buffer.buffers[0] = {"req_id": "r0"}
+
+    input_batch = _DummyInputBatch([0])
+    with patch(
+        "vllm.forward_context.set_forward_context",
+        return_value=nullcontext(),
+    ):
+        state._run_batched_mtp(
+            [(0, 0, (torch.zeros(3), torch.zeros(3)))],
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, 3),
+            input_batch,
+            set(),
+        )
+
+    state._prepare_talker_mtp_sample_uniforms.assert_called_once()
+    assert state._call_talker_mtp_with_sampling.call_args.kwargs["sample_uniforms"] is not None

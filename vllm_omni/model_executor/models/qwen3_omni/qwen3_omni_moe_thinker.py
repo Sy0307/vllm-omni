@@ -256,7 +256,7 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
 
         self.scaling = self.head_dim**-0.5
 
-        self.qkv = QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
@@ -264,7 +264,7 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
             bias=True,
             disable_tp=disable_tp,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv",
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.out_proj = RowParallelLinear(
@@ -771,8 +771,8 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         prompt_ids: list[int],
         mm_kwargs: MultiModalKwargsItems,
         mm_prompt_updates: MultiModalPromptUpdates,
-        is_update_applied: bool,
-    ) -> tuple[list[int], str, Mapping[str, list[PlaceholderFeaturesInfo]]]:
+        is_update_applied: bool = False,
+    ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         """
         Qwen3-Omni reimplements this function to handle `use_audio_in_video`.
         """
@@ -957,17 +957,17 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_qwen2_audio,
             ),
             PromptReplacement(
                 modality="image",
-                target=image_token,
+                target=[image_token_id],
                 replacement=partial(get_replacement_qwen2_vision, modality="image"),
             ),
             PromptReplacement(
                 modality="video",
-                target=video_token,
+                target=[video_token_id],
                 replacement=get_replacement_qwen2_video,
             ),
         ]
@@ -1136,6 +1136,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            "talker.": None,
+            "code2wav.": None,
             "thinker.lm_head.": "language_model.lm_head.",
             "thinker.model.": "language_model.model.",
             "thinker.": "",
@@ -1530,10 +1532,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["talker.", "code2wav."],
-        )
+        loader = AutoWeightsLoader(self)
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         return loaded_weights

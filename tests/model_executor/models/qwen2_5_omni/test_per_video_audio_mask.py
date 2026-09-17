@@ -266,7 +266,6 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     inputs = MagicMock()
     inputs.mm_data_items = mm_data_items
     inputs.hf_processor_mm_kwargs = {"use_audio_in_video": True}
-    inputs.tokenization_kwargs = {}
     inputs.prompt = [1, 2, 3]
     inputs.get_mm_hashes = MagicMock(return_value={"video": ["v0"], "audio": ["a0"]})
 
@@ -307,7 +306,7 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     )
     fake_self._paired_cache_keys = Qwen2_5OmniThinkerMultiModalProcessor._paired_cache_keys
     fake_self.info.parse_mm_data = MagicMock(return_value=SimpleNamespace(name="missing"))
-    fake_self._apply_hf_processor_main = MagicMock(return_value=([9], {"video_grid_thw": object()}, False))
+    fake_self._apply_hf_processor_main = MagicMock(return_value={"video_grid_thw": object()})
     fake_self._get_mm_fields_config = MagicMock(return_value={})
     fake_self._get_mm_prompt_updates = MagicMock(return_value={"video": [[object()]], "audio": [[object()]]})
     fake_self._merge_mm_kwargs = capture_merge
@@ -316,13 +315,12 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
         "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.MultiModalKwargsItems.from_hf_inputs",
         return_value={"video": [object()], "audio": [object()]},
     ):
-        prompt_ids, mm_info, _ = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+        mm_info = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
             fake_self,
             inputs,
             timing_ctx,
         )
 
-    assert prompt_ids == [9]
     # Both modalities were reprocessed as one unit after pair-miss expansion.
     assert fake_self.info.parse_mm_data.call_args.args[0] == {
         "video": ["video-0"],
@@ -556,15 +554,16 @@ def test_qwen2_5_mm_only_dummy_counts_subtract_only_videos_using_audio():
     captured_counts = {}
     fake_self = SimpleNamespace(
         dummy_inputs=SimpleNamespace(get_dummy_text=lambda counts: captured_counts.update(counts) or "dummy"),
-        _apply_hf_processor_text_mm=lambda **_kwargs: ([], {}, False),
+        _get_hf_mm_data=lambda items: ({"videos": [object(), object()], "audios": [object()]}, {}),
+        _call_hf_processor=lambda **kwargs: {},
     )
     mm_items = SimpleNamespace(get_all_counts=lambda: {"video": 2, "audio": 1})
+    mm_items.select = lambda counts: mm_items
 
-    Qwen2_5OmniThinkerMultiModalProcessor._apply_hf_processor_mm_only(
+    Qwen2_5OmniThinkerMultiModalProcessor._apply_hf_processor_main(
         fake_self,
         mm_items,
         {"use_audio_in_video": [True, False]},
-        {},
     )
 
     assert captured_counts == {"video": 2, "audio": 0}

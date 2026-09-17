@@ -34,6 +34,7 @@ class HiddenStates(TypedDict, total=False):
 
 
 class Embeddings(TypedDict, total=False):
+    prepared_prefill: torch.Tensor
     prefill: torch.Tensor
     decode: torch.Tensor
     decode_token_start: int
@@ -58,6 +59,7 @@ class Codes(TypedDict, total=False):
 
 
 class Ids(TypedDict, total=False):
+    prepared_prefill: torch.Tensor
     all: list[int]
     prompt: list[int]
     output: list[int]

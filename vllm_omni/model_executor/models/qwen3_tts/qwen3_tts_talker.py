@@ -109,7 +109,7 @@ def _ref_audio_artifact_cache_capacity(vllm_config: VllmConfig) -> int:
     )
     if not isinstance(connector_extra, dict):
         connector_extra = {}
-    raw_capacity = connector_extra.get("ref_audio_artifact_cache_max_entries", 256)
+    raw_capacity = connector_extra.get("ref_audio_artifact_cache_max_entries", 1024)
     try:
         capacity = int(raw_capacity)
     except (TypeError, ValueError) as exc:
@@ -1289,6 +1289,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self._prompt_builder._projected_token_cache.clear()
         # Consume talker weights, and conditionally consume speaker encoder
         # weights only if they are present in the checkpoint.
         speaker_weights: list[tuple[str, torch.Tensor]] = []
@@ -1322,10 +1323,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             subfolder="speech_tokenizer",
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
-        enc_loaded = AutoWeightsLoader(
-            self,
-            skip_prefixes=["decoder."],
-        ).load_weights(subfolder_weights)
+        enc_loaded = AutoWeightsLoader(self).load_weights(
+            (name, weight) for name, weight in subfolder_weights if not name.startswith("decoder.")
+        )
         loaded |= enc_loaded
 
         # AutoWeightsLoader only loads parameters; the encoder's VQ

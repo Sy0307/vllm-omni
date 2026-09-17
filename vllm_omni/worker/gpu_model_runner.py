@@ -1982,6 +1982,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
             if code_predictor_codes is not None:
                 update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                if validity_key is not None:
+                    validity = torch.ones((), dtype=torch.bool, device=code_predictor_codes.device)
+                    if isinstance(validity_key, tuple) and len(validity_key) == 2:
+                        update_dict.setdefault(validity_key[0], {})[validity_key[1]] = validity
+                    elif isinstance(validity_key, str):
+                        update_dict[validity_key] = validity
+                    else:
+                        raise TypeError(f"Invalid talker_mtp_validity_key: {validity_key!r}")
                 self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(

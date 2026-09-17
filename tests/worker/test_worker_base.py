@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Characterization tests for ``vllm_omni.worker.base.OmniGPUWorkerBase``.
 
 Pins the CURRENT behaviour of ``determine_available_memory`` (device-level
@@ -14,6 +14,7 @@ method reads; module-level collaborators are monkeypatched. Pure CPU.
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -24,6 +25,53 @@ from vllm_omni.worker.base import OmniGPUWorkerBase
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 GIB = 1024**3
+
+
+@pytest.mark.parametrize("kind", ["cuda", "proton"])
+def test_profile_lazy_backend_lifecycle(monkeypatch, kind):
+    """The first start must create a backend; Proton restarts need a new name."""
+    import vllm.distributed.utils as distributed_utils
+    import vllm.v1.worker.gpu_worker as gpu_worker
+
+    events: list[Any] = []
+
+    class Profiler:
+        def __init__(self, config, **kwargs):
+            events.append(("create", config.profiler, kwargs.get("worker_name")))
+
+        def start(self):
+            events.append("start")
+
+        def stop(self):
+            events.append("stop")
+
+    monkeypatch.setattr(gpu_worker, "CudaProfilerWrapper", Profiler)
+    monkeypatch.setattr(gpu_worker, "ProtonProfilerWrapper", Profiler)
+    monkeypatch.setattr(distributed_utils, "get_worker_rank_suffix", lambda **_: "rank0")
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.profiler_config = SimpleNamespace(profiler=kind)
+    worker.vllm_config = SimpleNamespace(profiler_config=worker.profiler_config)
+    worker.profiler = None
+    worker.rank = 0
+
+    worker.profile(False)  # A stop before the first start is harmless.
+    assert events == []
+    worker.profile(True, "first")
+    worker.profile(False)
+    worker.profile(True, "second")
+    worker.profile(False)
+    names = [event[2] for event in events if isinstance(event, tuple)]
+    expected_names: list[str | None] = [None] if kind == "cuda" else ["first_rank0", "second_rank0"]
+    assert names == expected_names
+    assert events.count("start") == events.count("stop") == 2
+
+
+def test_profile_without_configuration_still_rejects():
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.vllm_config = SimpleNamespace(profiler_config=None)
+    worker.profiler = None
+    with pytest.raises(RuntimeError, match="Profiling is not enabled"):
+        worker.profile()
 
 
 def _fake_memory_profiling(*, non_torch: int, torch_peak: int):

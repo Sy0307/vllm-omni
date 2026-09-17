@@ -884,7 +884,11 @@ class CodePredictorWrapper(nn.Module):
         if not self._prefix_reprefill_enabled:
             required_entries = len(bucket_sizes)
         else:
-            prefix_buckets = self._prefix_graph_buckets.intersection(bucket_sizes)
+            prefix_buckets = (
+                self._prefix_graph_buckets.intersection(bucket_sizes)
+                if self._prefix_graph_buckets
+                else set(bucket_sizes)
+            )
             prefix_seq_lens = self._prefix_reprefill_seq_lens
             needs_full_graph = set(prefix_seq_lens) != set(range(2, self._num_groups + 1))
             full_graph_entries = len(bucket_sizes) - len(prefix_buckets)

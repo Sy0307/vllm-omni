@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the Qwen3-Omni thinker forward return contract.
 
 Background
@@ -173,3 +173,23 @@ def test_make_omni_output_accepts_capture_tuple():
     out = model.make_omni_output((_hidden_states(), captured))
     assert isinstance(out, OmniOutput)
     assert out.multimodal_outputs == captured
+
+
+@pytest.mark.parametrize("stage", ["thinker", "talker", "code2wav"])
+def test_weight_mapper_excludes_other_pipeline_stages(stage):
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker import (
+        Qwen3OmniMoeTalkerForConditionalGeneration,
+    )
+
+    classes = {
+        "thinker": Qwen3OmniMoeThinkerForConditionalGeneration,
+        "talker": Qwen3OmniMoeTalkerForConditionalGeneration,
+        "code2wav": Qwen3OmniMoeCode2Wav,
+    }
+    tensor = torch.zeros(1)
+    weights = [(f"{name}.test.weight", tensor) for name in classes]
+    mapped = list(classes[stage].hf_to_vllm_mapper.apply(weights))
+    assert len(mapped) == 1
+    assert mapped[0][0] == "test.weight"
+    assert mapped[0][1] is tensor

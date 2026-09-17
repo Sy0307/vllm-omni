@@ -57,6 +57,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
     # Weight mapper
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            "thinker.": None,
+            "talker.": None,
             "code2wav.pre_transformer.": "pre_transformer.",
             "code2wav.code_embedding.": "code_embedding.",
             "code2wav.upsample.": "upsample.",
@@ -344,10 +346,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["thinker.", "talker."],  # Already loaded above
-        )
+        loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         # Log load summary

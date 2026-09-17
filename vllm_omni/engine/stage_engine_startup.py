@@ -839,7 +839,7 @@ def connect_remote_engine_cores(
                 handshake_socket,
                 engines_to_handshake,
                 vllm_config.parallel_config,
-                False,  # coordinated_dp
+                False,
                 vllm_config.cache_config,
                 CoreEngineLaunch(
                     engine_manager=None,  # remote — no local procs
@@ -1197,7 +1197,7 @@ def launch_stage_replica(
             handshake_socket,
             engines_to_handshake,
             vllm_config.parallel_config,
-            False,  # coordinated_dp
+            False,
             vllm_config.cache_config,
             CoreEngineLaunch(
                 engine_manager=engine_manager,

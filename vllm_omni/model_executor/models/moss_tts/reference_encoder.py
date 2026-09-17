@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reference-audio encoding + speaker cache for the MOSS-TTS-family talker.
 
 This lives in the model package (not the shared serving layer) so all
@@ -24,8 +27,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable
+from functools import lru_cache
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 
@@ -43,15 +48,21 @@ def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
 
+@lru_cache(maxsize=16)
+def _reference_resampler(sr: int, sr_target: int):
+    import torchaudio
+
+    # Match functional.resample's float32 kernel construction.
+    return torchaudio.transforms.Resample(sr, sr_target, dtype=torch.float32)
+
+
 def _prep_wav_sync(wav_list: list, sr: int, sr_target: int) -> torch.Tensor:
     """Tensor-ise + resample one clip to ``sr_target`` (the blocking prep)."""
-    wav = torch.tensor(wav_list, dtype=torch.float32)
+    wav = torch.from_numpy(np.array(wav_list, dtype=np.float32, copy=True))
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
     if sr != sr_target:
-        import torchaudio
-
-        wav = torchaudio.functional.resample(wav, sr, sr_target)
+        wav = _reference_resampler(sr, sr_target)(wav)
     return wav
 
 

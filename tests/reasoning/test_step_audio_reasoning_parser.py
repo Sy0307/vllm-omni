@@ -38,13 +38,13 @@ def _install_vllm_stubs() -> dict[str, ModuleType | None]:
     parser is imported. These stubs are process-global: if they leak, they
     shadow the real vllm modules for every other test in the same worker
     (and any forked server subprocess), e.g. replacing
-    ``vllm.entrypoints.openai.engine.protocol`` with a stub that lacks
+    ``vllm.entrypoints.generate.base.protocol`` with a stub that lacks
     ``ErrorResponse`` and breaking unrelated server-startup tests.
     """
     stubs: dict[str, ModuleType] = {}
 
     # DeltaMessage stub
-    delta_mod = ModuleType("vllm.entrypoints.openai.engine.protocol")
+    delta_mod = ModuleType("vllm.entrypoints.generate.base.protocol")
 
     class DeltaMessage:
         __slots__ = ("reasoning", "content")
@@ -54,7 +54,7 @@ def _install_vllm_stubs() -> dict[str, ModuleType | None]:
             self.content = content
 
     delta_mod.DeltaMessage = DeltaMessage
-    stubs["vllm.entrypoints.openai.engine.protocol"] = delta_mod
+    stubs["vllm.entrypoints.generate.base.protocol"] = delta_mod
 
     # ReasoningParser stub
     reasoning_mod = ModuleType("vllm.reasoning")
@@ -101,7 +101,8 @@ def _install_vllm_stubs() -> dict[str, ModuleType | None]:
         "vllm",
         "vllm.entrypoints",
         "vllm.entrypoints.openai",
-        "vllm.entrypoints.openai.engine",
+        "vllm.entrypoints.generate",
+        "vllm.entrypoints.generate.base",
         "vllm.entrypoints.openai.chat_completion",
         "vllm.entrypoints.openai.responses",
     ]:

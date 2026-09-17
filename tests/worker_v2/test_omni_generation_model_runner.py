@@ -87,6 +87,7 @@ def test_execute_model_propagates_make_omni_output_failure(monkeypatch):
         num_tokens_after_padding=1,
         is_padding=False,
     )
+    runner.gather_batch_req_state = MagicMock(return_value=(SimpleNamespace(num_tokens=1), 1))
     runner.prepare_inputs = MagicMock(return_value=input_batch)
     runner.gather_batch_req_state = MagicMock(return_value=(SimpleNamespace(num_tokens=1), None))
     runner._prepare_mm_inputs = MagicMock(return_value=(torch.zeros(1, dtype=torch.long), None, None))
@@ -435,6 +436,7 @@ def test_sample_tokens_uses_async_output_for_cuda(monkeypatch):
     output = _make_omni_output({"model_outputs": [torch.randn(4)]})
     runner = _make_runner(output, num_reqs=1)
     runner.device = SimpleNamespace(type="cuda")
+    monkeypatch.setattr(generation_runner, "_contains_cuda_tensor", lambda _: True)
     runner.main_stream = object()
     runner.output_copy_stream = object()
     runner.model_config.async_chunk = True
@@ -467,6 +469,7 @@ def test_sample_tokens_snapshots_request_ids_before_async_finalize(monkeypatch):
     output = _make_omni_output({"model_outputs": [torch.randn(4)]})
     runner = _make_runner(output, num_reqs=1)
     runner.device = SimpleNamespace(type="cuda")
+    monkeypatch.setattr(generation_runner, "_contains_cuda_tensor", lambda _: True)
     runner.main_stream = object()
     runner.output_copy_stream = object()
     runner.model_config.async_chunk = True
@@ -501,6 +504,26 @@ def test_sample_tokens_keeps_sync_output_for_cpu(monkeypatch):
 
     assert isinstance(result, OmniModelRunnerOutput)
     assert result.multimodal_outputs[0]["model_outputs"].device.type == "cpu"
+
+
+def test_generation_pooler_materializes_nested_multimodal_payloads():
+    from vllm_omni.worker_v2.omni_generation_model_runner import (
+        OmniGenerationModelRunner,
+        _materialize_generation_value,
+    )
+
+    output = _make_omni_output(
+        {
+            "codes": {"audio": torch.tensor([[1, 2], [3, 4]])},
+        }
+    )
+    runner = _make_runner(output, num_reqs=2)
+
+    result = OmniGenerationModelRunner.sample_tokens(runner)
+
+    assert torch.equal(result.multimodal_outputs[0]["codes.audio"], torch.tensor([1, 2]))
+    assert torch.equal(result.multimodal_outputs[1]["codes.audio"], torch.tensor([3, 4]))
+    assert _materialize_generation_value({"metadata": [1, 2]}, 0, 2)["metadata"] == [1, 2]
 
 
 def test_sample_tokens_reserves_native_output_before_sync_finalize(monkeypatch):
@@ -611,3 +634,33 @@ def test_async_chunk_slot_recycle_notifies_model_state_plugins():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_per_request_waveform_list_does_not_slice_sample_axis():
+    from vllm_omni.worker_v2.omni_generation_model_runner import _materialize_generation_value
+
+    waves = [torch.tensor([0.1, 0.2]), torch.tensor([0.3, 0.4])]
+    for index in range(2):
+        payload = _materialize_generation_value({"audio": waves}, index, 2)
+        assert torch.equal(payload["audio"], waves[index])
+
+
+def test_nested_generation_preserves_per_request_sample_rates():
+    from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+    outputs = {"codes": {"audio": [torch.arange(2), torch.arange(4)]}, "sr": [24000, 16000]}
+    result = OmniGenerationModelRunner._build_pooler_output_from_cpu(outputs, 2)
+    assert result[0]["sr"] == 24000
+    assert result[1]["sr"] == 16000
+    assert torch.equal(result[0]["codes.audio"], torch.arange(2))
+    assert torch.equal(result[1]["codes.audio"], torch.arange(4))
+
+
+def test_cpu_generation_output_owns_waveform_after_model_buffer_reuse():
+    from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+    waveform = torch.arange(4, dtype=torch.float32)
+    output = OmniOutput(text_hidden_states=torch.empty(0), multimodal_outputs={"codes": {"audio": [waveform]}})
+    result = OmniGenerationModelRunner._build_pooler_output(output, 1)
+    waveform.fill_(-1)
+    assert torch.equal(result[0]["codes.audio"], torch.arange(4, dtype=torch.float32))

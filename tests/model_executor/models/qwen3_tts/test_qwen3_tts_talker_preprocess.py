@@ -163,6 +163,7 @@ def _make_minimal_builder(
     )
     builder._speaker_cache = None
     builder._text_tokenizer = None
+    builder._projected_token_cache = {}
     builder._embedding_dtype = torch.bfloat16
     builder._ref_audio_artifact_cache_max_entries = 256
     builder._ref_audio_artifact_cache = OrderedDict()
@@ -171,16 +172,23 @@ def _make_minimal_builder(
     return builder
 
 
-def test_ref_audio_artifact_cache_capacity_reads_nested_connector_extra():
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        ({}, 1024),
+        ({"ref_audio_artifact_cache_max_entries": 1024}, 1024),
+        ({"ref_audio_artifact_cache_max_entries": 128}, 128),
+        ({"ref_audio_artifact_cache_max_entries": 0}, 0),
+    ],
+)
+def test_ref_audio_artifact_cache_capacity_reads_nested_connector_extra(extra, expected):
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
         _ref_audio_artifact_cache_capacity,
     )
 
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(stage_connector_config={"extra": {"ref_audio_artifact_cache_max_entries": 1024}})
-    )
+    vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config={"extra": extra}))
 
-    assert _ref_audio_artifact_cache_capacity(vllm_config) == 1024
+    assert _ref_audio_artifact_cache_capacity(vllm_config) == expected
 
 
 def test_single_token_prefill_uses_prefill_path():
@@ -918,3 +926,21 @@ def test_ref_audio_artifact_only_cache_miss_fails_fast():
                 REF_AUDIO_CACHE_KEY: ["missing-ref"],
             },
         )
+
+
+def test_projected_special_tokens_reuse_exact_projection_dtype():
+    builder = _make_minimal_builder()
+    calls = []
+    builder._text_embedding = lambda ids: ids.to(torch.float32).unsqueeze(-1)
+
+    def project(embeds):
+        calls.append(embeds)
+        return embeds + 0.001
+
+    builder._text_projection = project
+    first = builder._projected_tokens([100, 101], torch.device("cpu"))
+    second = builder._projected_tokens([100, 101], torch.device("cpu"))
+    assert first is second
+    assert len(calls) == 1
+    assert first.dtype == torch.float32
+    assert torch.equal(first, calls[0] + 0.001)

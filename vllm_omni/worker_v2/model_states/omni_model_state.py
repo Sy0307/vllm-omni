@@ -967,6 +967,8 @@ class OmniModelState(DefaultModelState):
                 sample_uniforms = self._prepare_talker_mtp_sample_uniforms(generators, num_tokens)
         elif can_use_graph:
             cudagraph_mode = CUDAGraphMode.FULL
+            if sample_uniform_buffer is not None:
+                sample_uniforms = self._prepare_talker_mtp_sample_uniforms(generators, bsz)
         with set_forward_context(
             None,
             self.vllm_config,

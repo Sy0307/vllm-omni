@@ -745,10 +745,13 @@ class TestCodePredictorWrapperConfig:
         assert wrapper._padded_bsz(3) == 3
         assert (3, 2) in wrapper._bucket_pos_ids
 
-    def test_non_power_of_two_prefix_bucket_uses_static_compile_cache(
+    @pytest.mark.parametrize(("prefix_buckets", "expected_limit"), [([3, 4], 8), ([], 9)])
+    def test_prefix_buckets_use_sufficient_static_compile_cache(
         self,
         mocker: MockerFixture,
         loaded_target_classes,
+        prefix_buckets,
+        expected_limit,
     ) -> None:
         """Exact buckets keep static kernels without hitting Dynamo's cache limit."""
         _ = loaded_target_classes
@@ -762,7 +765,7 @@ class TestCodePredictorWrapperConfig:
         vllm_config.model_config.stage_connector_config = {
             "extra": {
                 "code_predictor_prefix_graphs": True,
-                "code_predictor_prefix_graph_buckets": [3, 4],
+                "code_predictor_prefix_graph_buckets": prefix_buckets,
                 "code_predictor_prefix_graph_seq_lens": [2, 3],
             }
         }
@@ -784,8 +787,8 @@ class TestCodePredictorWrapperConfig:
             assert torch._dynamo.config.cache_size_limit == 2
 
         assert compile_mock.call_args.kwargs["dynamic"] is False
-        assert wrapper._compile_cache_size_limit() == 8
-        assert observed_cache_limits == [8]
+        assert wrapper._compile_cache_size_limit() == expected_limit
+        assert observed_cache_limits == [expected_limit]
 
     def test_prefix_reprefill_uses_configured_sequence_lengths_without_inner_graphs(
         self,

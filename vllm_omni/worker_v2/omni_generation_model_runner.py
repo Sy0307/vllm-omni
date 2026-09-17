@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_ar_model_runner import (
@@ -43,6 +44,54 @@ from vllm_omni.worker_v2.omni_model_runner import (
 )
 
 logger = init_logger(__name__)
+
+
+def _contains_cuda_tensor(value: Any) -> bool:
+    """Return whether a nested output payload still owns CUDA storage."""
+    if isinstance(value, torch.Tensor):
+        return value.is_cuda
+    if isinstance(value, dict):
+        return any(_contains_cuda_tensor(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_cuda_tensor(v) for v in value)
+    return False
+
+
+def _materialize_generation_value(
+    value: Any,
+    req_index: int,
+    num_reqs: int,
+    *,
+    top_level: bool = True,
+    copy_cpu: bool = True,
+) -> Any:
+    """Recursively select and own one request's generation payload."""
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and value.shape[0] == num_reqs:
+            value = value[req_index]
+        return value.detach().to(device="cpu", copy=copy_cpu and value.device.type == "cpu").contiguous()
+    if isinstance(value, dict):
+        return {
+            key: _materialize_generation_value(item, req_index, num_reqs, top_level=False, copy_cpu=copy_cpu)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        # Tensor lists (e.g. variable-length waveforms) carry one item per
+        # request even inside a dict. Scalar lists remain payload metadata.
+        per_request = top_level or all(item is None or isinstance(item, torch.Tensor) for item in value)
+        if per_request and len(value) == num_reqs:
+            # The selected item no longer has a batch axis.
+            return _materialize_generation_value(value[req_index], 0, -1, top_level=False, copy_cpu=copy_cpu)
+        return [
+            _materialize_generation_value(item, req_index, num_reqs, top_level=False, copy_cpu=copy_cpu)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _materialize_generation_value(item, req_index, num_reqs, top_level=False, copy_cpu=copy_cpu)
+            for item in value
+        )
+    return value
 
 
 class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
@@ -280,12 +329,16 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(scheduler_output, dummy_run)
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
-        batch_desc, _ = self._dispatch_batch_descriptor(
+        batch_desc, dp_sync = self._dispatch_batch_descriptor(
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
             num_active_loras=0,
-            use_eager=is_profile,
+            # Generation stages return structured OmniOutput payloads and do
+            # not expose the tensor-only outer graph contract. Their model may
+            # still use an internal decoder graph, but the vLLM outer runner
+            # always uses eager dispatch here.
+            use_eager=True,
             max_query_len=max_query_len,
         )
 
@@ -375,6 +428,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
             finished_req_ids=scheduler_output.finished_req_ids,
+            dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=None,
         )
@@ -436,11 +490,12 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             multimodal_outputs=None,
             kv_connector_output=kv_connector_output,
             ec_connector_output=execute_model_state.ec_connector_output,
+            sampled_token_ids_materialized=True,
         )
 
         raw_multimodal_outputs = model_output.multimodal_outputs
-        can_copy_async = getattr(getattr(self, "device", None), "type", "cpu") == "cuda" and isinstance(
-            raw_multimodal_outputs, (dict, type(None))
+        can_copy_async = getattr(getattr(self, "device", None), "type", "cpu") == "cuda" and (
+            self.check_ep_fault or _contains_cuda_tensor(raw_multimodal_outputs)
         )
         if can_copy_async:
             async_output = OmniGenerationAsyncOutput(
@@ -507,21 +562,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         pooler: list[dict[str, Any] | None] = []
         for i in range(num_reqs):
-            payload: dict[str, Any] = {}
-            for key, val in mm.items():
-                # Primary path: val is list[Tensor] with len == num_reqs
-                # (Code2Wav make_omni_output format).
-                if isinstance(val, list) and len(val) == num_reqs:
-                    out = val[i]
-                    payload[key] = out.detach().cpu().contiguous() if isinstance(out, torch.Tensor) else out
-                elif isinstance(val, torch.Tensor):
-                    if val.dim() > 0 and val.shape[0] == num_reqs:
-                        payload[key] = val[i].detach().cpu().contiguous()
-                    else:
-                        payload[key] = val.detach().cpu().contiguous()
-                else:
-                    payload[key] = val
-            pooler.append(payload)
+            payload = {key: _materialize_generation_value(value, i, num_reqs) for key, value in mm.items()}
+            pooler.append(flatten_payload(payload) if isinstance(payload, dict) else payload)
         return pooler
 
     @staticmethod
@@ -535,17 +577,9 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         pooler: list[dict[str, Any] | None] = []
         for i in range(num_reqs):
-            payload: dict[str, Any] = {}
-            for key, value in multimodal_outputs.items():
-                if isinstance(value, list) and len(value) == num_reqs:
-                    out = value[i]
-                    payload[key] = out.contiguous() if isinstance(out, torch.Tensor) else out
-                elif isinstance(value, torch.Tensor):
-                    if value.dim() > 0 and value.shape[0] == num_reqs:
-                        payload[key] = value[i].contiguous()
-                    else:
-                        payload[key] = value.contiguous()
-                else:
-                    payload[key] = value
-            pooler.append(payload)
+            payload = {
+                key: _materialize_generation_value(value, i, num_reqs, copy_cpu=False)
+                for key, value in multimodal_outputs.items()
+            }
+            pooler.append(flatten_payload(payload) if isinstance(payload, dict) else payload)
         return pooler

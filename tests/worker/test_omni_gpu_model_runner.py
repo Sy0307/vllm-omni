@@ -308,6 +308,8 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
 
     monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
 
+    runner.model.talker_mtp_validity_key = ("meta", "codec_frame_valid")
+
     # Initialize per-request embeds (batch-major inside talker_mtp_inputs_embeds)
     runner.talker_mtp_inputs_embeds.gpu[0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
     runner.talker_mtp_inputs_embeds.gpu[1] = torch.tensor([10.0, 20.0, 30.0, 40.0])
@@ -327,6 +329,8 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     info_r2 = runner.requests["r2"].additional_information_cpu
     assert int(info_r1["codes"]["audio"][0, 0]) == 0
     assert int(info_r2["codes"]["audio"][0, 0]) == 1
+    assert bool(info_r1["meta"]["codec_frame_valid"])
+    assert bool(info_r2["meta"]["codec_frame_valid"])
 
 
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):

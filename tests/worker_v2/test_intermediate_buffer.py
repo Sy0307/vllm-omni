@@ -222,6 +222,19 @@ def test_update_gpu_tensor_rows_takes_one_owned_batch_snapshot():
     assert first.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
 
 
+def test_update_gpu_tensor_rows_does_not_mutate_previous_snapshot():
+    buf = OmniIntermediateBuffer(max_num_reqs=1)
+    buf.add_request(0, _make_new_req_data(req_id="r0"))
+
+    buf.update_gpu_tensor_rows([0], ("codes", "audio"), torch.tensor([[1, 2, 3]]))
+    previous = buf.buffers[0]["codes"]["audio"]
+
+    buf.update_gpu_tensor_rows([0], ("codes", "audio"), torch.tensor([[9, 9, 9]]))
+
+    assert torch.equal(previous, torch.tensor([[1, 2, 3]]))
+    assert torch.equal(buf.buffers[0]["codes"]["audio"], torch.tensor([[9, 9, 9]]))
+
+
 def test_update_list_values():
     buf = OmniIntermediateBuffer(max_num_reqs=2)
     buf.add_request(0, _make_new_req_data(req_id="r0"))

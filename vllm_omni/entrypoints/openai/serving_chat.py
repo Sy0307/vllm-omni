@@ -24,9 +24,6 @@ from vllm.entrypoints.chat_utils import (
     ConversationMessage,
     make_tool_call_id,
 )
-from vllm.parser.utils import (
-    count_chat_history_tool_calls as get_history_tool_calls_cnt,
-)
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -54,8 +51,17 @@ except ImportError:
     soundfile = None
 
 
+from vllm.entrypoints.generate.base.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    FunctionCall,
+    FunctionDefinition,
+    RequestResponseMetadata,
+    ToolCall,
+)
 from vllm.entrypoints.generate.base.serving import clamp_prompt_logprobs
-from vllm.entrypoints.launcher import terminate_if_errored
+from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -69,22 +75,11 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     _get_mm_token_counts,
     _make_prompt_tokens_details,
 )
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall,
-    DeltaMessage,
-    DeltaToolCall,
-    ErrorInfo,
-    ErrorResponse,
-    FunctionCall,
-    FunctionDefinition,
-    RequestResponseMetadata,
-    ToolCall,
-    UsageInfo,
-)
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse, UsageInfo
 from vllm.entrypoints.serve.engine.typing import ChatLikeRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
@@ -706,9 +701,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # Always attach mm_processor_kwargs (possibly empty) so
-                # OmniInputPreprocessor._process_text routes through the
+                # OmniRendererMixin._process_singleton routes through the
                 # multimodal processor path. Without it, the preprocessor
-                # falls back to plain _tokenize_prompt and AR-based image-gen
+                # falls back to plain tokenization and AR-based image-gen
                 # models like GLM-Image never see their image-generation
                 # scaffold.
                 mm_processor_kwargs: dict[str, Any] = {}
@@ -1520,7 +1515,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         all_previous_token_ids: list[list[int]] | None
         function_name_returned = [False] * num_choices
         if self.tool_call_id_type == "kimi_k2":
-            history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
+            history_tool_call_cnt = sum(len(message.get("tool_calls") or []) for message in conversation)
         else:
             history_tool_call_cnt = 0
 
@@ -2570,7 +2565,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         final_res = omni_outputs
         if self.tool_call_id_type == "kimi_k2":
-            history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
+            history_tool_call_cnt = sum(len(message.get("tool_calls") or []) for message in conversation)
         else:
             history_tool_call_cnt = 0
 

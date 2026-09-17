@@ -208,7 +208,7 @@ def _seed_tts_capture_pcm_for_wer() -> bool:
         "1",
         "true",
         "yes",
-    )
+    ) or bool(os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", ""))
 
 
 _DEFAULT_REQUEST_TIMEOUT_S = 900.0
@@ -1437,6 +1437,8 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                if data.get("error"):
+                                    raise RuntimeError(f"Server returned a streaming error: {data['error']}")
                                 _update_output_stage_metrics_from_payload(output, data)
                                 _update_output_peak_memory_from_payload(output, data)
                                 usage = data.get("usage")
@@ -1478,8 +1480,6 @@ async def async_request_openai_chat_omni_completions(
                                         if has_text_content:
                                             generated_text += content
                                     elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
                                         audio_generate_time = timestamp - st
                                         if content:
                                             audio_bytes = base64.b64decode(content)
@@ -1498,12 +1498,15 @@ async def async_request_openai_chat_omni_completions(
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        pcm_chunk = wav_reader.readframes(wav_reader.getnframes())
+                                                        if pcm_chunk and output.audio_ttfp == 0.0:
+                                                            output.audio_ttfp = timestamp - st
+                                                        wav_pcm_buffer.extend(pcm_chunk)
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
+                                                if audio_bytes and output.audio_ttfp == 0.0:
+                                                    output.audio_ttfp = timestamp - st
                                                 audio_bytes_buffer.extend(audio_bytes)
                                     elif modality == "image":
                                         output.image_count += 1
@@ -2824,6 +2827,7 @@ async def benchmark(
     _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    submitted_request_ids: list[str | None] = []
 
     rps_change_events = []
     last_int_rps = -1
@@ -2883,6 +2887,7 @@ async def benchmark(
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
+        submitted_request_ids.append(request_id)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
@@ -2898,6 +2903,23 @@ async def benchmark(
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
+    # Archive captured speech after the measured interval. Saving audio alone
+    # does not run ASR or contend with the measured server for GPU resources.
+    audio_paths: list[str | None] = [None] * len(outputs)
+    if audio_dir := os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", ""):
+        from pathlib import Path
+
+        from vllm_omni.benchmarks.data_modules.seed_tts_eval import _save_seed_tts_eval_audio
+
+        for index, output in enumerate(outputs):
+            if pcm := getattr(output, "tts_output_pcm_bytes", None):
+                audio_paths[index] = _save_seed_tts_eval_audio(
+                    pcm,
+                    output_dir=Path(audio_dir),
+                    index=index,
+                    utterance_id=submitted_request_ids[index],
+                    locale="audio",
+                )
 
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
@@ -2966,6 +2988,20 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
+            "audio_request_details": [
+                {
+                    "request_id": request_id,
+                    "audio_wav_path": audio_path,
+                    "success": output.success,
+                    "error": output.error,
+                    "audio_ttfp_s": getattr(output, "audio_ttfp", 0.0),
+                    "audio_duration_s": getattr(output, "audio_duration", 0.0),
+                    "audio_frames": getattr(output, "audio_frames", 0),
+                    "e2e_s": output.latency,
+                    "stage_metrics": getattr(output, "stage_metrics", None),
+                }
+                for request_id, output, audio_path in zip(submitted_request_ids, outputs, audio_paths, strict=True)
+            ],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
@@ -3014,7 +3050,7 @@ async def benchmark(
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
 
-    if _seed_tts_capture_pcm_for_wer():
+    if os.environ.get("SEED_TTS_WER_EVAL", "").lower() in ("1", "true", "yes"):
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
             compute_seed_tts_wer_metrics,
             print_seed_tts_wer_summary,

@@ -67,12 +67,38 @@ def test_legacy_data_plane_injects_required_forward_inputs():
     assert model_inputs["sampler"] is runner.sampler
 
 
-def test_get_mm_embeddings_uses_vllm_025_request_state_contract():
+def test_shutdown_releases_parent_resources_when_data_plane_close_fails():
+    runner = _make_runner()
+    runner._omni_data_plane = MagicMock()
+    runner._omni_data_plane.close.side_effect = RuntimeError("drain failed")
+
+    with patch.object(GPUModelRunner, "shutdown") as parent_shutdown:
+        with pytest.raises(RuntimeError, match="drain failed"):
+            runner.shutdown()
+
+    parent_shutdown.assert_called_once_with()
+
+
+def test_shutdown_preserves_data_plane_error_when_parent_shutdown_also_fails():
+    runner = _make_runner()
+    runner._omni_data_plane = MagicMock()
+    close_error = RuntimeError("drain failed")
+    parent_error = RuntimeError("parent failed")
+    runner._omni_data_plane.close.side_effect = close_error
+
+    with patch.object(GPUModelRunner, "shutdown", side_effect=parent_error):
+        with pytest.raises(RuntimeError, match="parent failed") as exc_info:
+            runner.shutdown()
+
+    assert exc_info.value.__context__ is close_error
+
+
+def test_get_mm_embeddings_uses_vllm_029_request_state_contract():
     runner = _make_runner()
     scheduled_encoder_inputs = {"r1": [0]}
     input_batch = object()
     expected = object()
-    runner.model_state = SimpleNamespace(get_mm_embeddings=MagicMock(return_value=expected))
+    runner.model_state = SimpleNamespace(prepare_inputs_embeds=MagicMock(return_value=expected))
 
     result = runner._get_mm_embeddings(
         scheduled_encoder_inputs,
@@ -80,7 +106,7 @@ def test_get_mm_embeddings_uses_vllm_025_request_state_contract():
     )
 
     assert result is expected
-    runner.model_state.get_mm_embeddings.assert_called_once_with(
+    runner.model_state.prepare_inputs_embeds.assert_called_once_with(
         scheduled_encoder_inputs,
         input_batch,
         runner.req_states,
@@ -96,7 +122,7 @@ def test_prepare_mm_inputs_uses_dummy_embeddings_without_encoder_cache():
     runner.model = SimpleNamespace(requires_raw_input_tokens=False)
     runner.model_state = SimpleNamespace(
         dummy_inputs_embeds=MagicMock(return_value=dummy_embeddings),
-        get_mm_embeddings=MagicMock(),
+        prepare_inputs_embeds=MagicMock(),
     )
     input_batch = SimpleNamespace(
         input_ids=input_ids,
@@ -113,7 +139,7 @@ def test_prepare_mm_inputs_uses_dummy_embeddings_without_encoder_cache():
     assert result_embeddings is dummy_embeddings
     assert ec_output is None
     runner.model_state.dummy_inputs_embeds.assert_called_once_with(8)
-    runner.model_state.get_mm_embeddings.assert_not_called()
+    runner.model_state.prepare_inputs_embeds.assert_not_called()
 
 
 def test_prepare_mm_inputs_preserves_raw_tokens_for_real_request():
@@ -126,7 +152,7 @@ def test_prepare_mm_inputs_preserves_raw_tokens_for_real_request():
     runner.model = SimpleNamespace(requires_raw_input_tokens=True)
     runner.model_state = SimpleNamespace(
         dummy_inputs_embeds=MagicMock(),
-        get_mm_embeddings=MagicMock(return_value=embeddings),
+        prepare_inputs_embeds=MagicMock(return_value=embeddings),
     )
     input_batch = SimpleNamespace(input_ids=input_ids)
     scheduled_encoder_inputs = {"r1": [0]}
@@ -142,7 +168,7 @@ def test_prepare_mm_inputs_preserves_raw_tokens_for_real_request():
     assert result_ids is input_ids
     assert result_embeddings is embeddings
     assert ec_output is expected_ec_output
-    runner.model_state.get_mm_embeddings.assert_called_once_with(
+    runner.model_state.prepare_inputs_embeds.assert_called_once_with(
         scheduled_encoder_inputs,
         input_batch,
         runner.req_states,

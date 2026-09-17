@@ -133,3 +133,22 @@ def test_sampling_params_guard_filters_only_unreachable_min_tokens_ids():
     assert params.all_stop_token_ids == {CODEC_EOS}
     assert params.stop_token_ids == [CODEC_EOS]
     assert params.eos_token_id == TEXT_EOS
+
+
+def test_guard_preserves_structured_output_stop_logit_restoration():
+    from vllm.sampling_params import StructuredOutputsParams
+
+    params = SamplingParams(
+        min_tokens=2,
+        stop_token_ids=[CODEC_EOS],
+        structured_outputs=StructuredOutputsParams(choice=["yes"]),
+    )
+    params.update_from_generation_config({}, TEXT_EOS)
+    proc = MinTokensLogitsProcessor(None, device=torch.device("cpu"), is_pin_memory=False)
+    proc.update_state(BatchUpdate(batch_size=1, removed=[], added=[(0, params, None, [])], moved=[]))
+    sanitize_min_tokens_stop_ids(LogitsProcessors([proc]), TALKER_VOCAB)
+    logits = torch.full((1, TALKER_VOCAB), -float("inf"))
+    logits[0, CODEC_EOS] = 3.0
+    result = proc.apply(logits)
+    assert result[0, CODEC_EOS] == 3.0
+    assert proc.restore_logits_slice[1].tolist() == [CODEC_EOS]

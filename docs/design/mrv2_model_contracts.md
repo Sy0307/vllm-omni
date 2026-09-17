@@ -1,5 +1,10 @@
 # Reusing Omni model contracts in Model Runner V2
 
+This implementation targets **vLLM 0.29.0** directly. Use a matching vLLM
+installation for both MRv1 and MRv2 comparisons; older upstream private
+interfaces are not supported. The renderer, weight loading, batch request
+state, `ExecuteModelState.dp_sync`, and profiler lifecycle use the 0.29 APIs.
+
 MRV2 should reuse a model's existing Omni lifecycle rather than require a
 second model implementation. `OmniModelState` is selected when the model
 explicitly declares `has_preprocess`, `has_postprocess`, or

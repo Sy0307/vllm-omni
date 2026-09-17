@@ -415,7 +415,9 @@ def test_runner_assisted_full_attention_metadata_request_and_context_hooks():
     ]
 
 
-def test_omni_async_gpu_model_runner_output_builds_lazily_once():
+@pytest.mark.parametrize("nan_count", [None, 2])
+def test_omni_async_gpu_model_runner_output_builds_lazily_once(monkeypatch, nan_count):
+    monkeypatch.setenv("VLLM_RAISE_ON_LOGIT_NANS", "0")
     async_output = object.__new__(OmniAsyncGPUModelRunnerOutput)
     calls = []
     sync_calls = []
@@ -434,6 +436,8 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
     async_output._logprobs_tensors_cpu = None
     async_output._routed_experts = None
     async_output._routed_experts_cpu = None
+    async_output._num_nans = None
+    async_output._num_nans_cpu = torch.tensor([nan_count]) if nan_count is not None else None
     async_output.vocab_size = 10
 
     output = async_output.get_output()
@@ -443,6 +447,8 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
     assert async_output._model_runner_output_builder is None
     assert output.req_ids == ["r1"]
     assert output.sampled_token_ids == [[7]]
+    if nan_count is not None:
+        assert output.num_nans_in_logits == {"r1": nan_count}
 
 
 def test_omni_async_gpu_model_runner_output_reraises_background_exception():
@@ -895,7 +901,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         GPUARModelRunner,
         "_bookkeeping_sync",
         lambda *args, **kwargs: (
-            0,
+            {},
             None,
             None,
             [],

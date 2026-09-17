@@ -514,6 +514,15 @@ def _async_copy_mm_value(
             )
             for val in value
         ]
+    if isinstance(value, tuple):
+        return tuple(
+            _async_copy_mm_value(
+                val,
+                copy_stream=copy_stream,
+                pin_memory=pin_memory,
+            )
+            for val in value
+        )
     return value
 
 
@@ -766,6 +775,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists(self.num_sampled_tokens_np)
         if self.routed_experts_cpu is not None:
             self.model_runner_output.routed_experts = self.routed_experts_cpu.tolists()
+        self.model_runner_output.sampled_token_ids_materialized = True
 
         # Logprobs
         if self.num_nans is not None:

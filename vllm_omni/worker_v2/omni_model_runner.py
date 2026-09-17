@@ -140,7 +140,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         input_batch: Any,
     ) -> torch.Tensor:
         """Call the native vLLM multimodal embedding contract."""
-        return self.model_state.get_mm_embeddings(
+        return self.model_state.prepare_inputs_embeds(
             scheduled_encoder_inputs,
             input_batch,
             self.req_states,
@@ -227,13 +227,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
-        worker = getattr(self, "_native_output_materializer", None)
-        if worker is not None:
-            worker.close()
+        # Every owner must release its resources even if an earlier drain fails.
+        try:
+            worker = getattr(self, "_native_output_materializer", None)
+            if worker is not None:
+                worker.close()
+        finally:
             self._native_output_materializer = None
-        if self._omni_data_plane is not None:
-            self._omni_data_plane.close()
-        super().shutdown()
+            try:
+                if self._omni_data_plane is not None:
+                    self._omni_data_plane.close()
+            finally:
+                super().shutdown()
 
     def _prepare_native_data_plane(self, scheduler_output: SchedulerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)
@@ -294,6 +299,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None or output is None:
             return output
+        # MRv2's data plane consumes the host-materialized token lists from
+        # the runner output.  Do not let a future connector path fall back to
+        # reading sampler tensors and synchronizing the device here.
+        if hasattr(output, "sampled_token_ids_materialized") and getattr(output, "sampled_token_ids", None) is not None:
+            if not output.sampled_token_ids_materialized:
+                raise RuntimeError("MRv2 native data plane received non-materialized sampled_token_ids")
         inter_stage_outputs = getattr(output, "inter_stage_outputs", None)
         plane.enqueue_outputs(
             req_ids=list(getattr(output, "req_ids", [])),
@@ -514,7 +525,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Encoder-decoder models: disable compilation when encoder inputs
         # are scheduled (dynamic cross-attention cache updates).
         skip_compiled = self.is_encoder_decoder and bool(scheduler_output.scheduled_encoder_inputs)
-        batch_desc, num_tokens_across_dp = self._dispatch_batch_descriptor(
+        batch_desc, dp_sync = self._dispatch_batch_descriptor(
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
@@ -645,7 +656,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
+                num_tokens_across_dp=dp_sync.num_tokens_across_dp if dp_sync is not None else None,
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
@@ -689,6 +700,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             hidden_states=hidden_states,
             aux_hidden_states=None,
             finished_req_ids=scheduler_output.finished_req_ids,
+            dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
         )

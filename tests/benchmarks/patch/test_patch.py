@@ -1537,3 +1537,71 @@ def test_video_unsupported_image_reference_raises() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+@pytest.mark.asyncio
+async def test_audio_ttfp_ignores_empty_events_and_wav_headers(mocker: MockerFixture):
+    import io
+    import wave
+
+    def wav_payload(pcm):
+        data = io.BytesIO()
+        with wave.open(data, "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(24000)
+            writer.writeframes(pcm)
+        return base64.b64encode(data.getvalue()).decode()
+
+    clock = [100.0]
+    mocker.patch("vllm_omni.benchmarks.patch.patch.time.perf_counter", side_effect=lambda: clock[0])
+    chunks = [
+        create_sse_chunk({"modality": "audio", "choices": [{"delta": {"content": value}}]})
+        for value in ["", wav_payload(b""), wav_payload(b"\x01\x00" * 24)]
+    ] + [b"data: [DONE]\n\n"]
+
+    class TimedResponse(MockResponse):
+        async def iter_any(self):
+            for chunk in self._chunks:
+                clock[0] += 1.0
+                yield chunk
+
+    session = mocker.AsyncMock()
+    session.post = mocker.MagicMock(return_value=TimedResponse(200, chunks))
+    request = RequestFuncInput(
+        model="test",
+        model_name="test",
+        prompt="hello",
+        prompt_len=1,
+        output_len=4,
+        api_url="http://test/v1/chat/completions",
+        extra_body={"audio": {"format": "wav"}, "modalities": ["text", "audio"]},
+    )
+    output = await async_request_openai_chat_omni_completions(request, session)
+    assert output.success
+    assert output.audio_ttfp == 3.0
+    assert output.audio_duration == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
+async def test_streaming_server_error_is_not_counted_as_success(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    response = MockResponse(
+        200,
+        [
+            create_sse_chunk({"error": {"message": "EngineCore failed", "type": "InternalServerError"}}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    session = mocker.AsyncMock()
+    session.post = mocker.MagicMock(return_value=response)
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+    assert output.success is False
+    assert "EngineCore failed" in output.error

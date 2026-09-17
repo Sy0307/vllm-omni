@@ -346,7 +346,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         tts_pad_embed: torch.Tensor,
         encode_ref_audio_batch: Callable[..., list[torch.Tensor]],
         speaker_cache: Any | None = None,
-        ref_audio_artifact_cache_max_entries: int = 256,
+        ref_audio_artifact_cache_max_entries: int = 1024,
     ):
         self._config = config
         self._talker_config = talker_config
@@ -362,6 +362,10 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._embedding_dtype = torch.bfloat16
 
         self._text_tokenizer: Any | None = None
+        # Projected special-token embeddings are immutable model constants.
+        # Reusing them avoids launching the embedding/projection pair once per
+        # request during prompt construction.
+        self._projected_token_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
 
         self._ref_audio_artifact_cache_max_entries = int(ref_audio_artifact_cache_max_entries)
         self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
@@ -393,6 +397,15 @@ class Qwen3TTSPromptEmbedsBuilder:
         if cached is None or cached.device != device:
             cached = torch.tensor([list(key[1])], device=device, dtype=torch.long)
             cache[key] = cached
+        return cached
+
+    def _projected_tokens(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
+        device = torch.device(device)
+        key = (str(device), tuple(int(v) for v in values))
+        cached = self._projected_token_cache.get(key)
+        if cached is None:
+            cached = self._text_projection(self._text_embedding(self._long_tensor(values, device)))
+            self._projected_token_cache[key] = cached
         return cached
 
     def _get_resampler(self, orig_sr: int, target_sr: int) -> AudioResampler:
@@ -1025,8 +1038,8 @@ class Qwen3TTSPromptEmbedsBuilder:
         # tts special token embeds (projected into talker hidden).
         # ``tts_pad_embed`` is precomputed (request-independent), so we only
         # need bos/eos here.
-        tts_tokens = self._long_tensor([config.tts_bos_token_id, config.tts_eos_token_id], input_ids.device)
-        tts_bos_embed, tts_eos_embed = text_projection(text_embedding(tts_tokens)).chunk(2, dim=1)
+        projected_tts = self._projected_tokens([config.tts_bos_token_id, config.tts_eos_token_id], input_ids.device)
+        tts_bos_embed, tts_eos_embed = projected_tts.chunk(2, dim=1)
         tts_pad_embed = self._pad_embed(input_ids.device, tts_bos_embed.dtype)
 
         # Codec prefill tags.

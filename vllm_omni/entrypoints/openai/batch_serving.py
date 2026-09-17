@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import time
 
@@ -11,10 +11,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
 )
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    UsageInfo,
-)
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat

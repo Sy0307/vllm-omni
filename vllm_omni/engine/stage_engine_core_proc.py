@@ -128,6 +128,20 @@ class StageEngineCoreProc(EngineCoreProc):
         self._omni_completion_observer = None
         self._omni_chunk_wakeup = False
         super().__init__(*args, **kwargs)
+        from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+        parallel = self.model_executor.vllm_config.parallel_config
+        self._omni_drain_ready_generation = (
+            os.getenv("VLLM_OMNI_DRAIN_READY_GENERATION", "0") == "1"
+            and self.batch_queue is not None
+            and isinstance(self.scheduler, OmniGenerationScheduler)
+            and isinstance(self.model_executor, UniProcExecutor)
+            and parallel.tensor_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size == 1
+        )
+        if self._omni_drain_ready_generation:
+            logger.info("Ready generation output drain enabled")
         requested = (
             os.getenv("VLLM_OMNI_CHUNK_ENGINE_WAKEUP", "0") == "1"
             and getattr(self.scheduler, "_native_data_plane", False)
@@ -164,7 +178,39 @@ class StageEngineCoreProc(EngineCoreProc):
                 return len(self.batch_queue) < self.batch_queue_size and self.scheduler.has_requests()
         return super().has_work()
 
+    def _drain_ready_generation_output(self) -> tuple[dict[int, Any], bool] | None:
+        """Deliver the oldest completed output before executing another batch.
+
+        A generation forward may already have materialized its CPU output.
+        Filling the batch queue first would delay delivery by another forward
+        without overlapping that completed work. Pending asynchronous outputs
+        retain the upstream scheduling path; never wait or reorder them here.
+        """
+        queue = self.batch_queue
+        if not queue or not queue[-1][0].done():
+            return None
+        future, scheduler_output, exec_future = queue.pop()
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                exec_future.result()
+                raise RuntimeError("unexpected error")
+        observer = getattr(self, "_omni_completion_observer", None)
+        if observer is not None:
+            observer.consumed(future)
+        self._process_aborts_queue()
+        outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+        self._attach_iteration_details(outputs, iteration_details)
+        return outputs, False
+
     def step_with_batch_queue(self):
+        if getattr(self, "_omni_drain_ready_generation", False):
+            ready = self._drain_ready_generation_output()
+            if ready is not None:
+                return ready
         observer = getattr(self, "_omni_completion_observer", None)
         if observer is None:
             return super().step_with_batch_queue()

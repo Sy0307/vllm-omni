@@ -78,44 +78,50 @@ depends on the installed kernels and model path.
 
 ### Serving and runtime
 
-Native MRv2 chunk-wakeup experiments (both default off):
+Native MRv2 chunk-wakeup experiments (default off):
 
-- `VLLM_OMNI_CHUNK_RECV_EVENTS=1` uses Linux SHM publication notifications for
+- `VLLM_OMNI_CHUNK_RECV_EVENTS` set to `1` uses Linux SHM publication notifications for
   TP1 downstream generation receivers. Other transports/runners retain polling.
   Registration and consumption rearm the next key; overflow and a one-second
   reconciliation retain key-addressed recovery. Watch failures fall back to polling.
-- `VLLM_OMNI_CHUNK_ENGINE_WAKEUP=1` lets local TP1/PP1/DP1 native generation
+- `VLLM_OMNI_DRAIN_READY_GENERATION` set to `1` delivers an already completed
+  generation output before filling the batch queue again. Default: `0`.
+  Applies only to `UniProcExecutor` generation stages with TP/PP/DP all 1.
+  Pending outputs keep the upstream scheduling path and FIFO order.
+- `VLLM_OMNI_CHUNK_ENGINE_WAKEUP` set to `1` lets local TP1/PP1/DP1 native generation
   EngineCore wait for chunk readiness on its input queue. It retains a 100ms
   maintenance tick while requests are parked, and does not apply when external
   KV/EC connectors are present. Control messages and in-flight batches continue
   to advance. This is independent of `VLLM_OMNI_EVENT_DRIVEN_ORCH`.
 
-Both switches are read at worker initialization and enable only for the exact
+These switches are read at worker initialization and enable only for the exact
 value `1`. They do not enable CUDA IPC or change payload ownership.
 
 Additional architecture experiments:
 
-- `VLLM_OMNI_SHM_COHORT_NAMESPACE=<unique-name>` groups a native output batch's
+- `VLLM_OMNI_SHM_COHORT_NAMESPACE` set to `<unique-name>` groups a native output batch's
   SHM publication. The sender completes its puts before readers can acquire
   the shared publication lock. Use the same namespace across a deployment,
   and a distinct namespace for each concurrent deployment. Names allow 1–64
   ASCII letters, digits, underscores or dashes. Default empty disables it.
   Linux cohort lock files must only be removed after all users have stopped.
-- `VLLM_OMNI_GENERATION_PAYLOAD_NATIVE=1` uses one control token per chunk for
+- `VLLM_OMNI_GENERATION_PAYLOAD_NATIVE` set to `1` uses one control token per chunk for
   local native TP1 generation stages whose model explicitly declares
   `supports_native_payload_input`. Codec tensors stay in the payload path.
   Default `0`; other stages retain token-based inputs.
-- `VLLM_OMNI_BATCH_STATE_COPIES=1` batches eligible model-state snapshot copies
+- `VLLM_OMNI_BATCH_STATE_COPIES` set to `1` batches eligible model-state snapshot copies
   with foreach operations while preserving independent destination storage.
   Default `0`; heterogeneous/unsupported updates keep the scalar copy path.
-- `VLLM_OMNI_CONTROL_FASTPATH=0` disables the control-only generation shortcut
+- `VLLM_OMNI_CONTROL_FASTPATH` set to `0` disables the control-only generation shortcut
   for A/B tests. Default `1` skips input construction only when no tokens,
   new requests or cached requests need processing; lifecycle/KV/EC hooks run.
-- `VLLM_OMNI_TTS_FULL_TEXT=1` opts Base ICL Speech API requests into complete-text
-  conditioning, while preserving streamed audio output. An explicit request
-  `non_streaming_mode` overrides it. Default `0` preserves model defaults.
-  This mitigates reproduced EOS degeneration; it does not guarantee arbitrary
-  model output quality or override token limits and length-finish errors.
+- `VLLM_OMNI_ASYNC_METADATA` enables asynchronous CUDA metadata staging
+  when set to `1`; default `0` retains synchronous staging.
+- `VLLM_OMNI_ASYNC_NATIVE_OUTPUT` controls the native output materializer;
+  default `1`, and `0` disables it. Shutdown drains its accepted work before
+  closing the data plane.
+- `VLLM_OMNI_GENERATION_COMPLETION_EVENTS` enables the completion observer
+  for the supported generation chunk-wakeup path when set to `1`; default `0`.
 
 Boolean switches above enable only for exact `1`; set them before server
 startup. These experiments do not enable CUDA IPC.

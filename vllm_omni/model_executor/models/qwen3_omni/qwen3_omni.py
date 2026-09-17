@@ -265,6 +265,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.talker_mtp_validity_key = ("meta", "codec_frame_valid")
             # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
             self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+                ("ids", "prepared_prefill"),
+                ("embed", "prepared_prefill"),
                 ("hidden_states", "last"),
                 ("hidden_states", "trailing_text"),
                 ("embed", "cached_decode"),
@@ -945,6 +947,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         return self.tts_bos_embed, self.tts_eos_embed, self.tts_pad_embed
 
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, payload: OmniPayload):
+        prepared = payload.get("embed", {}).get("prepared_prefill")
+        if isinstance(prepared, torch.Tensor):
+            start = int(payload.get("_omni_num_computed_tokens", 0))
+            end = start + input_embeds.shape[0]
+            if end > prepared.shape[0]:
+                raise ValueError("Prepared talker prefill span exceeds owned prompt")
+            updates = {"meta": {"prefill_consumed_text_tokens": 1}}
+            self._talker_cache_thinker_decode_embeds(payload.get("embed", {}), updates, retain_existing=True)
+            return payload["ids"]["prepared_prefill"][start:end], prepared[start:end], updates
+
         hs: HiddenStates = payload.get("hidden_states", {})
         embed: Embeddings = payload.get("embed", {})
         ids: Ids = payload.get("ids", {})
@@ -1056,7 +1068,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         except Exception:
             pass
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
-        self._talker_cache_thinker_decode_embeds(embed, update_dict)
+        self._talker_cache_thinker_decode_embeds(
+            embed,
+            update_dict,
+            retain_existing="_omni_num_computed_tokens" in payload and not meta.get("resumable", False),
+        )
+
+        if (
+            "_omni_num_computed_tokens" in payload
+            and not meta.get("resumable", False)
+            and end_index < req_embeds.shape[0]
+        ):
+            # A later Thinker decode chunk may replace hidden_states.output
+            # before the next Talker prefill slice. Keep the projected prompt
+            # owned by this request instead of rebuilding it from that delta.
+            update_dict.setdefault("ids", {})["prepared_prefill"] = req_input_ids.detach().clone()
+            update_dict.setdefault("embed", {})["prepared_prefill"] = req_embeds.detach().clone()
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
 
@@ -1064,6 +1091,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         embed: Embeddings,
         update_dict: OmniPayload,
+        *,
+        retain_existing: bool = False,
     ) -> None:
         """
         Cache thinker embeds for decode stage.
@@ -1077,6 +1106,20 @@ class Qwen3OmniMoeForConditionalGeneration(
         if embed.get("decode") is not None and incoming_span is None:
             raise RuntimeError("Thinker decode embeddings are missing a valid absolute token span.")
         if incoming_span is not None:
+            if retain_existing:
+                cached_span = get_tensor_span(
+                    embed,
+                    tensor_key="cached_decode",
+                    start_key="cached_decode_token_start",
+                    end_key="cached_decode_token_end",
+                )
+                if embed.get("cached_decode") is not None and cached_span is None:
+                    raise RuntimeError("Cached Thinker decode embeddings are missing a valid absolute token span.")
+                if cached_span is not None:
+                    merged = merge_tensor_spans(cached_span, incoming_span)
+                    if merged is None:
+                        raise RuntimeError("Non-contiguous Thinker decode spans during prefill")
+                    incoming_span = merged
             incoming, start, end = incoming_span
             cached_updates = update_dict.setdefault("embed", {})
             cached_updates["cached_decode"] = incoming

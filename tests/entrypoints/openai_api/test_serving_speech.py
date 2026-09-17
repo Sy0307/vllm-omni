@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
-from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
@@ -1562,7 +1562,8 @@ class TestTTSMethods:
 
         assert first[1] == 24000
         assert second[1] == 24000
-        assert first[0] is second[0]
+        assert first[0] == second[0]
+        assert first[0] is not second[0]
         assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
         cache_key = first[2]
         assert speech_server._get_resolved_ref_audio_artifact_key(
@@ -2259,10 +2260,8 @@ class TestTTSMethods:
         assert params["task_type"] == ["Base"]
         assert "non_streaming_mode" not in params
 
-    @pytest.mark.parametrize("override,expected", [(None, True), (False, False), (True, True)])
-    def test_base_full_text_conditioning_preserves_explicit_override(
-        self, speech_server, monkeypatch, override, expected
-    ):
+    @pytest.mark.parametrize("override,expected", [(None, None), (False, False), (True, True)])
+    def test_base_uses_request_override_not_removed_full_text_env(self, speech_server, monkeypatch, override, expected):
         monkeypatch.setenv("VLLM_OMNI_TTS_FULL_TEXT", "1")
         request = OpenAICreateSpeechRequest(
             input="Hello",
@@ -2273,7 +2272,10 @@ class TestTTSMethods:
             stream=True,
         )
         params = speech_server._build_tts_params(request)
-        assert params["non_streaming_mode"] == [expected]
+        if expected is None:
+            assert "non_streaming_mode" not in params
+        else:
+            assert params["non_streaming_mode"] == [expected]
         assert request.stream is True
 
     def test_build_tts_params_explicit_non_streaming_mode_overrides_voicedesign_default(self, speech_server):

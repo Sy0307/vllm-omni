@@ -523,9 +523,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
         del request_id
         server = self.ctx.server
-        # Only scalar fields on stage 0 are changed below. Shallow-copy each
-        # stage so the shared defaults stay immutable without deep-copying the
-        # complete sampling configuration on every request.
+        # Shallow-copy stage objects for scalar overrides, then separately own
+        # extra_args before adding a seed below.
         sampling_params_list = [copy.copy(params) for params in sampling_params_list]
         configured_cap = getattr(sampling_params_list[0], "max_tokens", None)
         task_type = request.task_type or "CustomVoice"
@@ -571,8 +570,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         stage0_params = sampling_params_list[0]
         default_seed = getattr(stage0_params, "seed", None)
         if default_seed is not None:
-            if stage0_params.extra_args is None:
-                stage0_params.extra_args = {}
+            # The stage object was shallow-copied; own the mutable mapping
+            # before adding request-local RNG state.
+            stage0_params.extra_args = dict(stage0_params.extra_args or {})
             stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
         logger.debug(

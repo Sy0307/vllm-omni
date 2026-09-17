@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -163,7 +164,7 @@ def test_talker_decode_consumes_absolute_cached_row_before_new_delta() -> None:
         },
         "meta": {"num_processed_tokens": 1},
     }
-    updates = {}
+    updates: dict[str, Any] = {}
 
     text_step = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), updates)
 
@@ -192,7 +193,7 @@ def test_talker_decode_uses_next_absolute_row_without_new_chunk() -> None:
         "meta": {"num_processed_tokens": 2},
     }
 
-    updates = {}
+    updates: dict[str, Any] = {}
     text_step = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), updates)
 
     assert text_step.shape == (2,)
@@ -217,7 +218,7 @@ def test_talker_decode_can_defer_text_projection_for_mrv2_batching() -> None:
         },
         "meta": {"num_processed_tokens": 1},
     }
-    updates = {}
+    updates: dict[str, Any] = {}
 
     text_step = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), updates)
 
@@ -240,7 +241,7 @@ def test_talker_decode_deduplicates_overlapping_absolute_delta() -> None:
         },
         "meta": {"num_processed_tokens": 3},
     }
-    updates = {}
+    updates: dict[str, Any] = {}
 
     text_step = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), updates)
 
@@ -306,7 +307,7 @@ def test_talker_decode_emits_eos_once_after_finished_horizon_is_consumed() -> No
             "finished": True,
         },
     }
-    eos_updates = {}
+    eos_updates: dict[str, Any] = {}
 
     eos = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), eos_updates)
 
@@ -314,7 +315,7 @@ def test_talker_decode_emits_eos_once_after_finished_horizon_is_consumed() -> No
     assert eos_updates["meta"]["eos_emitted"] is True
 
     payload["meta"].update(eos_updates["meta"])
-    pad_updates = {}
+    pad_updates: dict[str, Any] = {}
     pad = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), pad_updates)
 
     assert torch.equal(pad, model.tts_pad_embed)
@@ -442,3 +443,59 @@ def test_talker_decode_batch_propagates_missing_conditioning_credit() -> None:
             input_embeds=torch.zeros(1, 2),
             req_infos=[req_info],
         )
+
+
+def test_prefill_decode_cache_keeps_unconsumed_rows_across_new_payloads():
+    model = _model()
+    embed: dict[str, Any] = {}
+    for start, end in [(1, 3), (3, 5), (4, 6)]:
+        embed.update(
+            decode=torch.arange(start, end).float().reshape(-1, 1),
+            decode_token_start=start,
+            decode_token_end=end,
+        )
+        updates: dict[str, Any] = {}
+        model._talker_cache_thinker_decode_embeds(embed, updates, retain_existing=True)
+        embed.update(updates["embed"])
+    assert embed["cached_decode_token_start"] == 1
+    assert embed["cached_decode_token_end"] == 6
+    assert embed["cached_decode"].flatten().tolist() == [1, 2, 3, 4, 5]
+    # Talker has not consumed conditioning while executing prompt slices.
+    row = model._thinker_decode_to_talker_decode(
+        {"embed": embed, "meta": {"num_processed_tokens": 1}}, torch.device("cpu"), {}
+    )
+    assert row.tolist() == [1]
+
+
+def test_prefill_decode_cache_rejects_gap_without_dropping_old_rows():
+    model = _model()
+    embed = {
+        "cached_decode": torch.ones(2, 1),
+        "cached_decode_token_start": 1,
+        "cached_decode_token_end": 3,
+        "decode": torch.ones(1, 1),
+        "decode_token_start": 4,
+        "decode_token_end": 5,
+    }
+    with pytest.raises(RuntimeError, match="Non-contiguous Thinker decode spans during prefill"):
+        model._talker_cache_thinker_decode_embeds(embed, {}, retain_existing=True)
+
+
+def test_later_prefill_slice_uses_owned_prompt_after_thinker_delta():
+    model = _model()
+    ids = torch.arange(6)
+    embeds = torch.arange(12).reshape(6, 2).float()
+    payload = {
+        "ids": {"prepared_prefill": ids},
+        "embed": {"prepared_prefill": embeds},
+        "hidden_states": {"output": torch.full((1, 2), -1.0)},
+        "_omni_num_computed_tokens": 2,
+    }
+    selected_ids, selected_embeds, _ = model.talker_preprocess_prefill(
+        torch.zeros(2, dtype=torch.long), torch.zeros(2, 2), payload
+    )
+    assert torch.equal(selected_ids, ids[2:4])
+    assert torch.equal(selected_embeds, embeds[2:4])
+    payload["_omni_num_computed_tokens"] = 5
+    with pytest.raises(ValueError, match="exceeds owned prompt"):
+        model.talker_preprocess_prefill(torch.zeros(2, dtype=torch.long), torch.zeros(2, 2), payload)
