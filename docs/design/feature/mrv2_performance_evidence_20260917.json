@@ -1,0 +1,1193 @@
+{
+  "classification": "Historical experimental evidence; not current PR head measurements",
+  "tts": [
+    {
+      "experiment": "qwen3-tts-deep-profile-20260917",
+      "arm": "baseline",
+      "runs": [
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 62.22783579910174,
+          "pcm_audio_s": 4692.560000000002,
+          "audio_s_per_s": 75.40933956227575,
+          "req_per_s": 17.484136898357395,
+          "ttfp_mean_ms": 2718.5896829049693,
+          "ttfp_p50_ms": 2707.6311190612614,
+          "ttfp_p95_ms": 3559.794874489307,
+          "ttfp_p99_ms": 3626.0461382102217,
+          "e2e_mean_s": 3.5719557741480563,
+          "audio_mean_s": 4.313014705882353,
+          "audio_p95_s": 6.8,
+          "underrun_mean_s": 0.31434786737312714,
+          "underrun_p95_s": 0.6582646512240169,
+          "near_end_first_fraction": 0.16727941176470587,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            62.2201883927919
+          ]
+        },
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 62.97264495305717,
+          "pcm_audio_s": 4709.76,
+          "audio_s_per_s": 74.79056983410624,
+          "req_per_s": 17.277343214836336,
+          "ttfp_mean_ms": 2791.1995690917724,
+          "ttfp_p50_ms": 2798.9534866064787,
+          "ttfp_p95_ms": 3867.1264745760704,
+          "ttfp_p99_ms": 3988.1536257313564,
+          "e2e_mean_s": 3.6117391642512624,
+          "audio_mean_s": 4.328823529411765,
+          "audio_p95_s": 6.851999999999989,
+          "underrun_mean_s": 0.2986847289973144,
+          "underrun_p95_s": 0.6820197214186191,
+          "near_end_first_fraction": 0.1801470588235294,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            62.963707755785435
+          ]
+        }
+      ],
+      "combined_audio_s_per_s": 75.09811418865397,
+      "versions": {
+        "vllm": "0.29.0",
+        "torch": "2.13.0",
+        "transformers": "5.14.1",
+        "triton": "3.7.1"
+      },
+      "dataset_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f",
+      "report_sha256": "45e8f303a860d8f48f0c85f0474debdf3341fc7d2ec169b1b70db61466a85813",
+      "provenance_sha256": "359ce2317444016cbd234a588c89943931fcc70bc0a18cab22d4794055370c27",
+      "deploy_yaml": "async_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      code_predictor_prefix_graphs: true\n      code_predictor_prefix_graph_buckets:\n      - 64\n      code_predictor_prefix_graph_seq_lens:\n      - 2\n      - 4\n      - 6\n      - 8\n      - 10\n      - 12\n      - 14\n      ref_code_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_cudagraph_batch_sizes:\n      - 1\n      decode_compile_shapes: []\n      decode_batch_max_size: 2\n      decode_batch_bucket_frames:\n      - 73\n      - 98\n      - 123\n      - 148\n      - 169\n      decode_enable_tf32: false\n      ref_audio_artifact_cache_max_entries: 1024\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 512\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n  compilation_config:\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 16\n    - 24\n    - 32\n    - 40\n    - 48\n    - 56\n    - 60\n    - 64\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-deep-profile-20260917/baseline/traces\n    torch_profiler_with_stack: true\n    torch_profiler_record_shapes: true\n    torch_profiler_with_memory: false\n- stage_id: 1\n  max_num_seqs: 10\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-deep-profile-20260917/baseline/traces\n    torch_profiler_with_stack: true\n    torch_profiler_record_shapes: true\n    torch_profiler_with_memory: false\nplatforms:\n  npu:\n    stages:\n    - stage_id: 0\n      enforce_eager: true\nmodel_runner: v2\n"
+    },
+    {
+      "experiment": "qwen3-tts-deep-profile-20260917",
+      "arm": "copylite",
+      "runs": [
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 52.871631857939065,
+          "pcm_audio_s": 4643.039999999998,
+          "audio_s_per_s": 87.8172251704921,
+          "req_per_s": 20.57814298078316,
+          "ttfp_mean_ms": 2731.9571019808577,
+          "ttfp_p50_ms": 2873.082355596125,
+          "ttfp_p95_ms": 3032.278351066634,
+          "ttfp_p99_ms": 3138.7582935346286,
+          "e2e_mean_s": 3.0645103755009853,
+          "audio_mean_s": 4.2675,
+          "audio_p95_s": 6.451999999999989,
+          "underrun_mean_s": 0.07557680287347038,
+          "underrun_p95_s": 0.10843212784267929,
+          "near_end_first_fraction": 0.9466911764705882,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            52.864134496077895
+          ]
+        },
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 53.25025763781741,
+          "pcm_audio_s": 4711.359999999997,
+          "audio_s_per_s": 88.4758160616686,
+          "req_per_s": 20.431826027961247,
+          "ttfp_mean_ms": 2747.0130566772937,
+          "ttfp_p50_ms": 2887.472426518798,
+          "ttfp_p95_ms": 3074.4403375545503,
+          "ttfp_p99_ms": 3156.6041897656382,
+          "e2e_mean_s": 3.0854310690346587,
+          "audio_mean_s": 4.330294117647059,
+          "audio_p95_s": 6.8,
+          "underrun_mean_s": 0.07923690238750115,
+          "underrun_p95_s": 0.10045828703325238,
+          "near_end_first_fraction": 0.9457720588235294,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            53.242792474105954
+          ]
+        }
+      ],
+      "combined_audio_s_per_s": 88.14769548910125,
+      "versions": {
+        "vllm": "0.29.0",
+        "torch": "2.13.0",
+        "transformers": "5.14.1",
+        "triton": "3.7.1"
+      },
+      "dataset_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f",
+      "report_sha256": "45e8f303a860d8f48f0c85f0474debdf3341fc7d2ec169b1b70db61466a85813",
+      "provenance_sha256": "359ce2317444016cbd234a588c89943931fcc70bc0a18cab22d4794055370c27",
+      "deploy_yaml": "async_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      code_predictor_prefix_graphs: true\n      code_predictor_prefix_graph_buckets:\n      - 64\n      code_predictor_prefix_graph_seq_lens:\n      - 2\n      - 4\n      - 6\n      - 8\n      - 10\n      - 12\n      - 14\n      ref_code_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_cudagraph_batch_sizes:\n      - 1\n      decode_compile_shapes: []\n      decode_batch_max_size: 2\n      decode_batch_bucket_frames:\n      - 73\n      - 98\n      - 123\n      - 148\n      - 169\n      decode_enable_tf32: false\n      ref_audio_artifact_cache_max_entries: 1024\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 512\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n  compilation_config:\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 16\n    - 24\n    - 32\n    - 40\n    - 48\n    - 56\n    - 60\n    - 64\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-deep-profile-20260917/copylite/traces\n    torch_profiler_with_stack: true\n    torch_profiler_record_shapes: true\n    torch_profiler_with_memory: false\n- stage_id: 1\n  max_num_seqs: 10\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-deep-profile-20260917/copylite/traces\n    torch_profiler_with_stack: true\n    torch_profiler_record_shapes: true\n    torch_profiler_with_memory: false\nplatforms:\n  npu:\n    stages:\n    - stage_id: 0\n      enforce_eager: true\nmodel_runner: v2\n"
+    },
+    {
+      "experiment": "qwen3-tts-optimization-20260917",
+      "arm": "cache1024",
+      "runs": [
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 53.20943983225152,
+          "pcm_audio_s": 4726.8,
+          "audio_s_per_s": 88.83386133929892,
+          "req_per_s": 20.447499605897693,
+          "ttfp_mean_ms": 2745.8210913802545,
+          "ttfp_p50_ms": 2876.652876380831,
+          "ttfp_p95_ms": 3030.4126982111484,
+          "ttfp_p99_ms": 3130.404618564061,
+          "e2e_mean_s": 3.0837880719632,
+          "audio_mean_s": 4.344485294117647,
+          "audio_p95_s": 6.8,
+          "underrun_mean_s": 0.07662948878247441,
+          "underrun_p95_s": 0.10883742608595634,
+          "near_end_first_fraction": 0.9393382352941176,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            53.201508664060384
+          ]
+        },
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 53.31522681377828,
+          "pcm_audio_s": 4716.879999999992,
+          "audio_s_per_s": 88.47153584238352,
+          "req_per_s": 20.40692809579922,
+          "ttfp_mean_ms": 2755.9792859238396,
+          "ttfp_p50_ms": 2863.081927411258,
+          "ttfp_p95_ms": 3036.5702379029244,
+          "ttfp_p99_ms": 3229.942854917608,
+          "e2e_mean_s": 3.089357919741922,
+          "audio_mean_s": 4.335367647058823,
+          "audio_p95_s": 6.88,
+          "underrun_mean_s": 0.07371196416437777,
+          "underrun_p95_s": 0.07883243761491021,
+          "near_end_first_fraction": 0.9430147058823529,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            53.30756957177073
+          ]
+        }
+      ],
+      "combined_audio_s_per_s": 88.65251868264787,
+      "versions": {
+        "vllm": "0.29.0",
+        "torch": "2.13.0",
+        "transformers": "5.14.1",
+        "triton": "3.7.1"
+      },
+      "dataset_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f",
+      "report_sha256": "cb7b8fd023126190cdd6759cf85ff0251021897ab6549697f8e3afe7940d38f8",
+      "provenance_sha256": "e7cf334cd949239f13c7f7ae8286593d8ea64d7ba335f36e81b85fa5d9aa7a99",
+      "deploy_yaml": "async_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      code_predictor_prefix_graphs: true\n      code_predictor_prefix_graph_buckets:\n      - 64\n      code_predictor_prefix_graph_seq_lens:\n      - 2\n      - 4\n      - 6\n      - 8\n      - 10\n      - 12\n      - 14\n      ref_code_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_cudagraph_batch_sizes:\n      - 1\n      decode_compile_shapes: []\n      decode_batch_max_size: 2\n      decode_batch_bucket_frames:\n      - 73\n      - 98\n      - 123\n      - 148\n      - 169\n      decode_enable_tf32: false\n      ref_audio_artifact_cache_max_entries: 1024\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 512\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n  compilation_config:\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 16\n    - 24\n    - 32\n    - 40\n    - 48\n    - 56\n    - 60\n    - 64\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/cache1024/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 24\n    ignore_frontend: true\n- stage_id: 1\n  max_num_seqs: 10\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/cache1024/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 24\n    ignore_frontend: true\nplatforms:\n  npu:\n    stages:\n    - stage_id: 0\n      enforce_eager: true\nmodel_runner: v2\n"
+    },
+    {
+      "experiment": "qwen3-tts-optimization-20260917",
+      "arm": "decoder",
+      "runs": [
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 45.38945043692365,
+          "pcm_audio_s": 4697.360000000001,
+          "audio_s_per_s": 103.49012721640636,
+          "req_per_s": 23.970327675854122,
+          "ttfp_mean_ms": 2341.336593721815,
+          "ttfp_p50_ms": 2458.8206459302455,
+          "ttfp_p95_ms": 2608.9291537180543,
+          "ttfp_p99_ms": 2700.3828732296824,
+          "e2e_mean_s": 2.6286957970553297,
+          "audio_mean_s": 4.317426470588235,
+          "audio_p95_s": 6.6119999999999886,
+          "underrun_mean_s": 0.05148558361142504,
+          "underrun_p95_s": 0.0955496325436979,
+          "near_end_first_fraction": 0.9494485294117647,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            45.38163530593738
+          ]
+        },
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 45.24894420802593,
+          "pcm_audio_s": 4685.51999999999,
+          "audio_s_per_s": 103.54981938272289,
+          "req_per_s": 24.04475991744838,
+          "ttfp_mean_ms": 2334.076274160265,
+          "ttfp_p50_ms": 2443.6636795289814,
+          "ttfp_p95_ms": 2617.27626058273,
+          "ttfp_p99_ms": 2716.27313407138,
+          "e2e_mean_s": 2.616943445196632,
+          "audio_mean_s": 4.306544117647059,
+          "audio_p95_s": 6.691999999999989,
+          "underrun_mean_s": 0.04690200660567772,
+          "underrun_p95_s": 0.060561140771023876,
+          "near_end_first_fraction": 0.9522058823529411,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            45.240973342675716
+          ]
+        }
+      ],
+      "combined_audio_s_per_s": 103.51992703263096,
+      "versions": {
+        "vllm": "0.29.0",
+        "torch": "2.13.0",
+        "transformers": "5.14.1",
+        "triton": "3.7.1"
+      },
+      "dataset_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f",
+      "report_sha256": "cb7b8fd023126190cdd6759cf85ff0251021897ab6549697f8e3afe7940d38f8",
+      "provenance_sha256": "e7cf334cd949239f13c7f7ae8286593d8ea64d7ba335f36e81b85fa5d9aa7a99",
+      "deploy_yaml": "async_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      code_predictor_prefix_graphs: true\n      code_predictor_prefix_graph_buckets:\n      - 64\n      code_predictor_prefix_graph_seq_lens:\n      - 2\n      - 4\n      - 6\n      - 8\n      - 10\n      - 12\n      - 14\n      ref_code_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_cudagraph_batch_sizes:\n      - 1\n      - 2\n      decode_compile_shapes: []\n      decode_batch_max_size: 2\n      decode_batch_bucket_frames:\n      - 73\n      - 98\n      - 123\n      - 148\n      - 169\n      decode_enable_tf32: false\n      ref_audio_artifact_cache_max_entries: 1024\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 512\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n  compilation_config:\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 16\n    - 24\n    - 32\n    - 40\n    - 48\n    - 56\n    - 60\n    - 64\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/decoder/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 24\n    ignore_frontend: true\n- stage_id: 1\n  max_num_seqs: 10\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/decoder/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 8\n    ignore_frontend: true\nplatforms:\n  npu:\n    stages:\n    - stage_id: 0\n      enforce_eager: true\nmodel_runner: v2\n"
+    },
+    {
+      "experiment": "qwen3-tts-optimization-20260917",
+      "arm": "mpsfull",
+      "runs": [
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 40.419244768098,
+          "pcm_audio_s": 4710.319999999998,
+          "audio_s_per_s": 116.5365663565725,
+          "req_per_s": 26.917870589673512,
+          "ttfp_mean_ms": 2060.7522890178884,
+          "ttfp_p50_ms": 2149.788908660412,
+          "ttfp_p95_ms": 2266.8624971061945,
+          "ttfp_p99_ms": 2334.4954886334017,
+          "e2e_mean_s": 2.3286561286059784,
+          "audio_mean_s": 4.329338235294117,
+          "audio_p95_s": 6.72,
+          "underrun_mean_s": 0.05227618112035356,
+          "underrun_p95_s": 0.08998792970553036,
+          "near_end_first_fraction": 0.9448529411764706,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            40.41135869687423
+          ]
+        },
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 40.42839453089982,
+          "pcm_audio_s": 4752.559999999996,
+          "audio_s_per_s": 117.55500200156519,
+          "req_per_s": 26.91177853150787,
+          "ttfp_mean_ms": 2064.8873102515663,
+          "ttfp_p50_ms": 2148.398146033287,
+          "ttfp_p95_ms": 2297.184890229255,
+          "ttfp_p99_ms": 2366.8255513487384,
+          "e2e_mean_s": 2.3281234674740356,
+          "audio_mean_s": 4.368161764705882,
+          "audio_p95_s": 7.171999999999989,
+          "underrun_mean_s": 0.04339728977334316,
+          "underrun_p95_s": 0.07622911842074238,
+          "near_end_first_fraction": 0.9476102941176471,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            40.42050256719813
+          ]
+        }
+      ],
+      "combined_audio_s_per_s": 117.04584180873287,
+      "versions": {
+        "vllm": "0.29.0",
+        "torch": "2.13.0",
+        "transformers": "5.14.1",
+        "triton": "3.7.1"
+      },
+      "dataset_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f",
+      "report_sha256": "cb7b8fd023126190cdd6759cf85ff0251021897ab6549697f8e3afe7940d38f8",
+      "provenance_sha256": "e7cf334cd949239f13c7f7ae8286593d8ea64d7ba335f36e81b85fa5d9aa7a99",
+      "deploy_yaml": "async_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      code_predictor_prefix_graphs: true\n      code_predictor_prefix_graph_buckets:\n      - 64\n      code_predictor_prefix_graph_seq_lens:\n      - 2\n      - 4\n      - 6\n      - 8\n      - 10\n      - 12\n      - 14\n      ref_code_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_cudagraph_batch_sizes:\n      - 1\n      decode_compile_shapes: []\n      decode_batch_max_size: 2\n      decode_batch_bucket_frames:\n      - 73\n      - 98\n      - 123\n      - 148\n      - 169\n      decode_enable_tf32: false\n      ref_audio_artifact_cache_max_entries: 1024\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 512\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n  compilation_config:\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 16\n    - 24\n    - 32\n    - 40\n    - 48\n    - 56\n    - 60\n    - 64\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/mpsfull/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 24\n    ignore_frontend: true\n- stage_id: 1\n  max_num_seqs: 10\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/mpsfull/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 8\n    ignore_frontend: true\nplatforms:\n  npu:\n    stages:\n    - stage_id: 0\n      enforce_eager: true\nmodel_runner: v2\n"
+    },
+    {
+      "experiment": "qwen3-tts-optimization-20260917",
+      "arm": "final",
+      "runs": [
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 32.19886376103386,
+          "pcm_audio_s": 4753.760000000001,
+          "audio_s_per_s": 147.6375078102248,
+          "req_per_s": 33.790012221383606,
+          "ttfp_mean_ms": 1447.051450220255,
+          "ttfp_p50_ms": 1530.883449362591,
+          "ttfp_p95_ms": 1710.0391310174018,
+          "ttfp_p99_ms": 1765.9483555657787,
+          "e2e_mean_s": 1.8443763226425611,
+          "audio_mean_s": 4.369264705882353,
+          "audio_p95_s": 6.88,
+          "underrun_mean_s": 0.04411628198320293,
+          "underrun_p95_s": 0.4256749426061285,
+          "near_end_first_fraction": 0.7371323529411765,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            32.1906843627803
+          ]
+        },
+        {
+          "n": 1088,
+          "success": 1088,
+          "empty": 0,
+          "cap_like": 0,
+          "wall_s": 31.80373046081513,
+          "pcm_audio_s": 4691.279999999993,
+          "audio_s_per_s": 147.50722421635552,
+          "req_per_s": 34.20982332058522,
+          "ttfp_mean_ms": 1397.4787994627738,
+          "ttfp_p50_ms": 1473.639813484624,
+          "ttfp_p95_ms": 1655.7214598404244,
+          "ttfp_p99_ms": 1709.7915554512292,
+          "e2e_mean_s": 1.820524577384811,
+          "audio_mean_s": 4.311838235294117,
+          "audio_p95_s": 6.931999999999989,
+          "underrun_mean_s": 0.04184125692165895,
+          "underrun_p95_s": 0.41910369995050123,
+          "near_end_first_fraction": 0.6976102941176471,
+          "concurrency_peak": [
+            64
+          ],
+          "request_spans_s": [
+            31.795397953130305
+          ]
+        }
+      ],
+      "combined_audio_s_per_s": 147.57276817969478,
+      "versions": {
+        "vllm": "0.29.0",
+        "torch": "2.13.0",
+        "transformers": "5.14.1",
+        "triton": "3.7.1"
+      },
+      "dataset_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f",
+      "report_sha256": "cb7b8fd023126190cdd6759cf85ff0251021897ab6549697f8e3afe7940d38f8",
+      "provenance_sha256": "e7cf334cd949239f13c7f7ae8286593d8ea64d7ba335f36e81b85fa5d9aa7a99",
+      "deploy_yaml": "async_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      code_predictor_prefix_graphs: true\n      code_predictor_prefix_graph_buckets:\n      - 64\n      code_predictor_prefix_graph_seq_lens:\n      - 2\n      - 4\n      - 6\n      - 8\n      - 10\n      - 12\n      - 14\n      ref_code_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_cudagraph_batch_sizes:\n      - 1\n      - 2\n      decode_compile_shapes: []\n      decode_batch_max_size: 2\n      decode_batch_bucket_frames:\n      - 73\n      - 98\n      - 123\n      - 148\n      - 169\n      decode_enable_tf32: false\n      ref_audio_artifact_cache_max_entries: 1024\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 512\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n  compilation_config:\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 16\n    - 24\n    - 32\n    - 40\n    - 48\n    - 56\n    - 60\n    - 64\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/final/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 24\n    ignore_frontend: true\n- stage_id: 1\n  max_num_seqs: 10\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\n  profiler_config:\n    profiler: torch\n    torch_profiler_dir: /root/.cache/huggingface/qwen3-tts-optimization-20260917/final/traces\n    torch_profiler_with_stack: false\n    torch_profiler_record_shapes: false\n    torch_profiler_with_memory: false\n    max_iterations: 8\n    ignore_frontend: true\nplatforms:\n  npu:\n    stages:\n    - stage_id: 0\n      enforce_eager: true\nmodel_runner: v2\n"
+    }
+  ],
+  "current": {
+    "source_commit": "b0ecf406a3a901e021e33faeb305c9a97e03c10d",
+    "protocol": "SeedTTS EN1088, C64, default Qwen TTS MRv2 YAML, single H200, output limit1024, dataset seed42 but no per-request generation seed. First full warmup only; run aborted on failure, remaining warmups/formal runs and historical-config remeasurement not started.",
+    "completed": 1087,
+    "failed": 1,
+    "duration_s": 60.849299320951104,
+    "audio_s_per_s": 74.68023544579036,
+    "raw_result_sha256": "474b73352bcb7d3a94dda2ab14161ab394d8714b552440b1e1926b935a41996d",
+    "failure": "Qwen3TTSCodecLimitError: no codec EOS within 1024 tokens; benchmark request index48. Client observed incomplete streaming transfer. Cause unresolved.",
+    "deployment": "model_runner: v2\nasync_chunk: true\nconnectors:\n  connector_of_shared_memory:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      connector_get_sleep_s: 0.01\n      connector_get_max_wait_first_chunk: 3000\n      connector_get_max_wait: 300\n      codec_chunk_frames: 25\n      codec_left_context_frames: 72\n      initial_codec_chunk_frames: 1\n      decode_batch_max_size: 4\nstages:\n- stage_id: 0\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 32768\n  max_model_len: 4096\n  devices: '0'\n  output_connectors:\n    to_stage_1: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.9\n    top_k: 50\n    max_tokens: 1024\n    min_tokens: 2\n    repetition_penalty: 1.05\n  silence_ban_frames: 0\n  subtalker_sampling_params:\n    do_sample: true\n    temperature: 0.9\n    top_k: 50\n    top_p: 1.0\n- stage_id: 1\n  max_num_seqs: 64\n  gpu_memory_utilization: 0.3\n  enforce_eager: false\n  trust_remote_code: true\n  enable_prefix_caching: false\n  async_scheduling: true\n  max_num_batched_tokens: 65536\n  max_model_len: 65536\n  devices: '0'\n  input_connectors:\n    from_stage_0: connector_of_shared_memory\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    max_tokens: 65536\n    repetition_penalty: 1.0\nplatforms:\n  rocm:\n    model_runner: v1\n    stages:\n    - stage_id: 1\n      enforce_eager: true\n  npu:\n    model_runner: v1\n    stages:\n    - stage_id: 0\n      enforce_eager: false\n      compilation_config:\n        cudagraph_mode: PIECEWISE\n    - stage_id: 1\n      compilation_config:\n        cudagraph_mode: PIECEWISE\n  xpu:\n    model_runner: v1\n  musa:\n    model_runner: v1\n",
+    "command": [
+      "/root/venvs/vllm029/bin/python",
+      "-m",
+      "vllm.entrypoints.cli.main",
+      "bench",
+      "serve",
+      "--omni",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "35817",
+      "--model",
+      "/root/.cache/huggingface/modelscope/models/Qwen--Qwen3-TTS-12Hz-1.7B-Base/snapshots/master",
+      "--trust-remote-code",
+      "--backend",
+      "openai-audio-speech",
+      "--endpoint",
+      "/v1/audio/speech",
+      "--dataset-name",
+      "seed-tts",
+      "--dataset-path",
+      "/root/seedtts_full/seedtts_testset",
+      "--seed-tts-locale",
+      "en",
+      "--disable-shuffle",
+      "--num-prompts",
+      "1088",
+      "--num-warmups",
+      "0",
+      "--ready-check-timeout-sec",
+      "0",
+      "--output-len",
+      "1024",
+      "--max-concurrency",
+      "64",
+      "--request-rate",
+      "inf",
+      "--seed",
+      "42",
+      "--extra-body",
+      "{\"task_type\":\"Base\",\"max_new_tokens\":1024}",
+      "--save-result",
+      "--save-detailed",
+      "--result-dir",
+      "/root/.cache/huggingface/pr4582-defaults-20260917/c64-default-v2-r1",
+      "--result-filename",
+      "warm0.json",
+      "--disable-tqdm",
+      "--percentile-metrics",
+      "audio_ttfp,e2el,audio_rtf,audio_duration,audio_underrun",
+      "--metric-percentiles",
+      "50,95,99"
+    ],
+    "not_a_performance_result": true
+  },
+  "variant_smokes": {
+    "customvoice-text-v2": {
+      "requests": 16,
+      "empty": 0,
+      "runner": "v2"
+    },
+    "voicedesign-text-v2": {
+      "requests": 16,
+      "empty": 0,
+      "runner": "v2"
+    }
+  },
+  "omni_history": {
+    "experiment": "qwen3-quality-opt029-20260917",
+    "report_sha256": "c00c47f26adb5a5903b4b2df51af82d81eed5fe89911926de841a10daae5987b",
+    "summary": {
+      "groups": {
+        "packed_0_v2base_c128": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 114.73135385886815,
+          "request_s_per_s": 26.367194652259506,
+          "audio_mean": 4.351291647518383,
+          "mean_ttfa_ms": 2594.5794909786105,
+          "p95_ttfa_ms": 2872.487662243657,
+          "p99_ttfa_ms": 3378.64989282097,
+          "wall_s": 165.05358485784382,
+          "audio_s": 18936.82125,
+          "max_audio_s": 14.4,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_0_v2base_c64": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 115.86860082558826,
+          "request_s_per_s": 26.540888849525835,
+          "audio_mean": 4.365663918887868,
+          "mean_ttfa_ms": 613.5046292496127,
+          "p95_ttfa_ms": 918.4989512665197,
+          "p99_ttfa_ms": 1133.6629214510322,
+          "wall_s": 163.97340815048665,
+          "audio_s": 18999.369375,
+          "max_audio_s": 12.48,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_1_v2prefix_c128": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 117.09380556728891,
+          "request_s_per_s": 26.7621979553189,
+          "audio_mean": 4.3753433766084555,
+          "mean_ttfa_ms": 2553.0632444524063,
+          "p95_ttfa_ms": 2817.992866365239,
+          "p99_ttfa_ms": 3323.920185952444,
+          "wall_s": 162.61743550607935,
+          "audio_s": 19041.494375,
+          "max_audio_s": 18.0,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_1_v2prefix_c64": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 120.66409383768963,
+          "request_s_per_s": 27.72004827142843,
+          "audio_mean": 4.352953957950368,
+          "mean_ttfa_ms": 606.047103234446,
+          "p95_ttfa_ms": 903.8544615730643,
+          "p99_ttfa_ms": 1016.9112365087459,
+          "wall_s": 156.99828360276297,
+          "audio_s": 18944.055625,
+          "max_audio_s": 12.16,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_2_v2packed_c128": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 110.80955243205396,
+          "request_s_per_s": 25.350320549908616,
+          "audio_mean": 4.3711302274816175,
+          "mean_ttfa_ms": 2696.8228255227586,
+          "p95_ttfa_ms": 3070.455589913763,
+          "p99_ttfa_ms": 3275.2804810693488,
+          "wall_s": 171.67435778304935,
+          "audio_s": 19023.15875,
+          "max_audio_s": 18.96,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_2_v2packed_c64": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 114.63740084880449,
+          "request_s_per_s": 26.175823477008016,
+          "audio_mean": 4.379514590992647,
+          "mean_ttfa_ms": 607.0618905754707,
+          "p95_ttfa_ms": 889.0762974740937,
+          "p99_ttfa_ms": 1069.6677827183157,
+          "wall_s": 166.26028991304338,
+          "audio_s": 19059.6475,
+          "max_audio_s": 12.16,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_3_v2coalesced_c128": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 117.30311745736968,
+          "request_s_per_s": 26.688952658187723,
+          "audio_mean": 4.395193732766544,
+          "mean_ttfa_ms": 2559.85798079532,
+          "p95_ttfa_ms": 2830.869452143088,
+          "p99_ttfa_ms": 3361.470418246463,
+          "wall_s": 163.0637236214243,
+          "audio_s": 19127.883125,
+          "max_audio_s": 25.28,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "packed_3_v2coalesced_c64": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 115.55728632833456,
+          "request_s_per_s": 26.37471371873667,
+          "audio_mean": 4.381366469439338,
+          "mean_ttfa_ms": 631.8191104311314,
+          "p95_ttfa_ms": 941.2965310504659,
+          "p99_ttfa_ms": 1106.0643955133855,
+          "wall_s": 165.00653036125004,
+          "audio_s": 19067.706875,
+          "max_audio_s": 33.12,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "trial0_v2_c128": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 113.85109848797903,
+          "request_s_per_s": 26.00903309059756,
+          "audio_mean": 4.3773675896139705,
+          "mean_ttfa_ms": 2622.1336326985584,
+          "p95_ttfa_ms": 2923.554989392869,
+          "p99_ttfa_ms": 3379.8526218812885,
+          "wall_s": 167.32648172043264,
+          "audio_s": 19050.30375,
+          "max_audio_s": 13.44,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "trial0_v2_c64": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 115.03767817399152,
+          "request_s_per_s": 26.251758675357554,
+          "audio_mean": 4.382094152113971,
+          "mean_ttfa_ms": 607.0192505387026,
+          "p95_ttfa_ms": 911.5928981918842,
+          "p99_ttfa_ms": 1087.6045629894359,
+          "wall_s": 165.77936944412068,
+          "audio_s": 19070.87375,
+          "max_audio_s": 13.816875,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "trial2_v1_c128": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 84.39376697576317,
+          "request_s_per_s": 19.36642573888552,
+          "audio_mean": 4.357735811121323,
+          "mean_ttfa_ms": 3132.3685085365414,
+          "p95_ttfa_ms": 3757.9391689272593,
+          "p99_ttfa_ms": 4040.3882435336704,
+          "wall_s": 224.71880246140063,
+          "audio_s": 18964.86625,
+          "max_audio_s": 11.12,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        "trial2_v1_c64": {
+          "requests": 4352,
+          "failed": 0,
+          "audio_s_per_s": 82.97560922580693,
+          "request_s_per_s": 19.071102056597958,
+          "audio_mean": 4.350855497472427,
+          "mean_ttfa_ms": 622.6699637013286,
+          "p95_ttfa_ms": 757.6462894910945,
+          "p99_ttfa_ms": 935.9561845380813,
+          "wall_s": 228.19866345869377,
+          "audio_s": 18934.923125,
+          "max_audio_s": 14.96,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        }
+      },
+      "rounds": [
+        {
+          "file": "packed_0_v2base/formal_c128_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 114.51832034154575,
+          "request_s_per_s": 26.261379343170454,
+          "audio_mean": 4.36071231617647,
+          "mean_ttfa_ms": 2603.385985805824,
+          "p95_ttfa_ms": 2877.061299048364,
+          "p99_ttfa_ms": 3351.833900087513,
+          "wall_s": 82.85931868106127,
+          "audio_s": 9488.91,
+          "max_audio_s": 14.4,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_0_v2base/formal_c128_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 114.9461110788377,
+          "request_s_per_s": 26.473866137084094,
+          "audio_mean": 4.341870978860293,
+          "mean_ttfa_ms": 2585.772996151397,
+          "p95_ttfa_ms": 2864.2071316717193,
+          "p99_ttfa_ms": 3378.8964393315837,
+          "wall_s": 82.19426617678255,
+          "audio_s": 9447.91125,
+          "max_audio_s": 9.6,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_0_v2base/formal_c64_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 116.34621042896322,
+          "request_s_per_s": 26.547738314617398,
+          "audio_mean": 4.382528147977942,
+          "mean_ttfa_ms": 618.848027438456,
+          "p95_ttfa_ms": 950.667257187888,
+          "p99_ttfa_ms": 1139.9711194681004,
+          "wall_s": 81.96555104665458,
+          "audio_s": 9536.38125,
+          "max_audio_s": 12.48,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_0_v2base/formal_c64_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 115.39123761054614,
+          "request_s_per_s": 26.534042917923284,
+          "audio_mean": 4.348799689797794,
+          "mean_ttfa_ms": 608.1612310607692,
+          "p95_ttfa_ms": 896.2365363258868,
+          "p99_ttfa_ms": 1069.1839501960203,
+          "wall_s": 82.00785710383207,
+          "audio_s": 9462.988125,
+          "max_audio_s": 11.2,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c128_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 117.56609356014687,
+          "request_s_per_s": 26.78632515137775,
+          "audio_mean": 4.3890340647977935,
+          "mean_ttfa_ms": 2547.4965593211355,
+          "p95_ttfa_ms": 2825.9387311991304,
+          "p99_ttfa_ms": 3316.1572362296283,
+          "wall_s": 81.23548070527613,
+          "audio_s": 9550.538125,
+          "max_audio_s": 11.68,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c128_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 116.62236761491906,
+          "request_s_per_s": 26.738114184233424,
+          "audio_mean": 4.361652688419118,
+          "mean_ttfa_ms": 2558.629929583677,
+          "p95_ttfa_ms": 2814.460346708074,
+          "p99_ttfa_ms": 3359.9092663498595,
+          "wall_s": 81.38195480080321,
+          "audio_s": 9490.95625,
+          "max_audio_s": 18.0,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c64_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 120.69361586715024,
+          "request_s_per_s": 27.747186797248666,
+          "audio_mean": 4.349760454963236,
+          "mean_ttfa_ms": 613.7731803575982,
+          "p95_ttfa_ms": 945.8642498357221,
+          "p99_ttfa_ms": 1032.4419329408556,
+          "wall_s": 78.42236461304128,
+          "audio_s": 9465.07875,
+          "max_audio_s": 11.52,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c64_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 120.63462950067337,
+          "request_s_per_s": 27.6929627801698,
+          "audio_mean": 4.3561474609375,
+          "mean_ttfa_ms": 598.3210261112938,
+          "p95_ttfa_ms": 877.5566053809598,
+          "p99_ttfa_ms": 937.6668711192906,
+          "wall_s": 78.57591898972169,
+          "audio_s": 9478.976875,
+          "max_audio_s": 12.16,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_2_v2packed/formal_c128_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 112.2866020874359,
+          "request_s_per_s": 25.709866670411976,
+          "audio_mean": 4.36745174632353,
+          "mean_ttfa_ms": 2656.3146263880994,
+          "p95_ttfa_ms": 3018.5745018534362,
+          "p99_ttfa_ms": 3283.3644597558305,
+          "wall_s": 84.63676719507203,
+          "audio_s": 9503.575,
+          "max_audio_s": 11.76,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_2_v2packed/formal_c128_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 109.37324534940606,
+          "request_s_per_s": 25.00069206075398,
+          "audio_mean": 4.374808708639706,
+          "mean_ttfa_ms": 2737.331024657418,
+          "p95_ttfa_ms": 3081.884278799407,
+          "p99_ttfa_ms": 3255.3381910547614,
+          "wall_s": 87.03759058797732,
+          "audio_s": 9519.58375,
+          "max_audio_s": 18.96,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_2_v2packed/formal_c64_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 114.35805565889298,
+          "request_s_per_s": 26.061072971513784,
+          "audio_mean": 4.3880793313419115,
+          "mean_ttfa_ms": 604.1926923250738,
+          "p95_ttfa_ms": 851.3140825089067,
+          "p99_ttfa_ms": 1064.7414262639359,
+          "wall_s": 83.49617847194895,
+          "audio_s": 9548.460625,
+          "max_audio_s": 12.16,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_2_v2packed/formal_c64_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 114.91921690924431,
+          "request_s_per_s": 26.291588976324853,
+          "audio_mean": 4.370949850643382,
+          "mean_ttfa_ms": 609.9310888258675,
+          "p95_ttfa_ms": 921.9650665763766,
+          "p99_ttfa_ms": 1088.3038273314014,
+          "wall_s": 82.76411144109443,
+          "audio_s": 9511.186875,
+          "max_audio_s": 11.576875,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c128_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 117.49263813719082,
+          "request_s_per_s": 26.695347647587663,
+          "audio_mean": 4.401240234375,
+          "mean_ttfa_ms": 2559.452564411699,
+          "p95_ttfa_ms": 2826.023917645216,
+          "p99_ttfa_ms": 3314.802472363226,
+          "wall_s": 81.51233049016446,
+          "audio_s": 9577.09875,
+          "max_audio_s": 23.04,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c128_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 117.11368755684745,
+          "request_s_per_s": 26.682560731950364,
+          "audio_mean": 4.389147231158088,
+          "mean_ttfa_ms": 2560.2633971789414,
+          "p95_ttfa_ms": 2836.0197007423267,
+          "p99_ttfa_ms": 3491.6735676815733,
+          "wall_s": 81.55139313125983,
+          "audio_s": 9550.784375,
+          "max_audio_s": 25.28,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c64_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 115.70744446711245,
+          "request_s_per_s": 26.43339743121385,
+          "audio_mean": 4.3773201976102944,
+          "mean_ttfa_ms": 642.2312721682401,
+          "p95_ttfa_ms": 959.8795992787927,
+          "p99_ttfa_ms": 1121.9184682704508,
+          "wall_s": 82.32010303111747,
+          "audio_s": 9525.04875,
+          "max_audio_s": 9.04,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c64_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 115.40779343265284,
+          "request_s_per_s": 26.316289991731477,
+          "audio_mean": 4.385412741268382,
+          "mean_ttfa_ms": 621.4069486940228,
+          "p95_ttfa_ms": 939.2791168065742,
+          "p99_ttfa_ms": 1097.2489003324881,
+          "wall_s": 82.68642733013257,
+          "audio_s": 9542.658125,
+          "max_audio_s": 33.12,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial0_v2/formal_c128_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 113.22890598153168,
+          "request_s_per_s": 25.820611364532994,
+          "audio_mean": 4.385213982077206,
+          "mean_ttfa_ms": 2638.7203968712556,
+          "p95_ttfa_ms": 2978.5112721147016,
+          "p99_ttfa_ms": 3397.639892064035,
+          "wall_s": 84.2737597990781,
+          "audio_s": 9542.225625,
+          "max_audio_s": 13.44,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial0_v2/formal_c128_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 114.48243844438386,
+          "request_s_per_s": 26.200224985528216,
+          "audio_mean": 4.3695211971507355,
+          "mean_ttfa_ms": 2605.5468685258616,
+          "p95_ttfa_ms": 2872.0283979782835,
+          "p99_ttfa_ms": 3372.171913157217,
+          "wall_s": 83.05272192135453,
+          "audio_s": 9508.078125,
+          "max_audio_s": 13.2,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial0_v2/formal_c64_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 115.51748312758804,
+          "request_s_per_s": 26.343479815833422,
+          "audio_mean": 4.385050264246324,
+          "mean_ttfa_ms": 595.9481143382778,
+          "p95_ttfa_ms": 858.3454540930688,
+          "p99_ttfa_ms": 1100.840151659213,
+          "wall_s": 82.6010844130069,
+          "audio_s": 9541.869375,
+          "max_audio_s": 13.816875,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial0_v2/formal_c64_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 114.56120273982049,
+          "request_s_per_s": 26.16067401709524,
+          "audio_mean": 4.379138039981618,
+          "mean_ttfa_ms": 618.0903867391273,
+          "p95_ttfa_ms": 928.8563681766391,
+          "p99_ttfa_ms": 1074.5009165257215,
+          "wall_s": 83.17828503111377,
+          "audio_s": 9529.004375,
+          "max_audio_s": 12.0,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial2_v1/formal_c128_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 85.0814883442793,
+          "request_s_per_s": 19.541011381218297,
+          "audio_mean": 4.3539961511948535,
+          "mean_ttfa_ms": 3106.0009524782586,
+          "p95_ttfa_ms": 3642.239517183043,
+          "p99_ttfa_ms": 3877.8251815820113,
+          "wall_s": 111.35554642230272,
+          "audio_s": 9474.295625,
+          "max_audio_s": 9.496875,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial2_v1/formal_c128_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 83.71822543388127,
+          "request_s_per_s": 19.194932079663612,
+          "audio_mean": 4.361475471047794,
+          "mean_ttfa_ms": 3158.7360645948247,
+          "p95_ttfa_ms": 3851.2193743372336,
+          "p99_ttfa_ms": 4089.6606877213344,
+          "wall_s": 113.3632560390979,
+          "audio_s": 9490.570625,
+          "max_audio_s": 11.12,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial2_v1/formal_c64_r0.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 82.8613278008065,
+          "request_s_per_s": 19.03712862842519,
+          "audio_mean": 4.352616900275735,
+          "mean_ttfa_ms": 625.2858438139597,
+          "p95_ttfa_ms": 757.8990941401571,
+          "p99_ttfa_ms": 992.5710866227746,
+          "wall_s": 114.30295200878754,
+          "audio_s": 9471.294375,
+          "max_audio_s": 12.936875,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        },
+        {
+          "file": "trial2_v1/formal_c64_r1.json",
+          "requests": 2176,
+          "failed": 0,
+          "audio_s_per_s": 83.09029927050683,
+          "request_s_per_s": 19.105196958684886,
+          "audio_mean": 4.349094094669118,
+          "mean_ttfa_ms": 620.0540835886975,
+          "p95_ttfa_ms": 756.1049063224345,
+          "p99_ttfa_ms": 932.0692076580599,
+          "wall_s": 113.89571144990623,
+          "audio_s": 9463.62875,
+          "max_audio_s": 14.96,
+          "talker_at_cap": null,
+          "talker_cap_audit": "Stage 1 num_tokens_out is a stream output count here, not codec-token count; no exact cap audit available from these JSONs"
+        }
+      ],
+      "audit": [
+        {
+          "file": "packed_0_v2base/formal_c128_r0.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_0_v2base/formal_c128_r1.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_0_v2base/formal_c64_r0.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_0_v2base/formal_c64_r1.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c128_r0.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c128_r1.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c64_r0.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_1_v2prefix/formal_c64_r1.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_2_v2packed/formal_c128_r0.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_2_v2packed/formal_c128_r1.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_2_v2packed/formal_c64_r0.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_2_v2packed/formal_c64_r1.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c128_r0.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c128_r1.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c64_r0.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "packed_3_v2coalesced/formal_c64_r1.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "trial0_v2/formal_c128_r0.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "trial0_v2/formal_c128_r1.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "trial0_v2/formal_c64_r0.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "trial0_v2/formal_c64_r1.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "trial2_v1/formal_c128_r0.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "trial2_v1/formal_c128_r1.json",
+          "peak": 128,
+          "issues": []
+        },
+        {
+          "file": "trial2_v1/formal_c64_r0.json",
+          "peak": 64,
+          "issues": []
+        },
+        {
+          "file": "trial2_v1/formal_c64_r1.json",
+          "peak": 64,
+          "issues": []
+        }
+      ]
+    },
+    "limitations": "Different archived source, not current-head performance. Sampled WER V1 2.15%, V2 3.08%; no quality-equivalence claim."
+  }
+}
