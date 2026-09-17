@@ -11,7 +11,7 @@
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
-# model_runner: v2  # Opt in via qwen3_tts_mrv2.yaml.
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -116,7 +116,9 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  # Native MRv2 is the CUDA default; other platform workers retain MRv1.
   rocm:
+    model_runner: v1
     stages:
       - stage_id: 1
         # MIOpen Conv1d cannot be invoked while vLLM captures the outer
@@ -124,6 +126,7 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
+    model_runner: v1
     stages:
       - stage_id: 0
         enforce_eager: false
@@ -132,3 +135,9 @@ platforms:
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE
+
+  xpu:
+    model_runner: v1
+
+  musa:
+    model_runner: v1

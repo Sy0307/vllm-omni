@@ -2614,6 +2614,33 @@ class TestPlatformOverrides:
             # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "qwen3_tts.yaml",
+            "qwen3_tts_high_concurrency.yaml",
+            "qwen3_omni_moe.yaml",
+        ],
+    )
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_qwen_native_runner_platform_defaults(self, filename, platform):
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+        assert deploy.model_runner == ("v2" if platform == "cuda" else "v1")
+
+    def test_invalid_platform_runner_rejected(self):
+        deploy = load_deploy_config(Path(get_deploy_config_path("qwen3_tts.yaml")))
+        deploy.platforms = {"cuda": {"model_runner": "invalid"}}
+        with pytest.raises(ValueError, match="platform model_runner"):
+            _apply_platform_overrides(deploy, platform="cuda")
+
+    @pytest.mark.parametrize("platform", ["npu", "xpu"])
+    def test_explicit_unsupported_platform_runner_rejected(self, platform):
+        deploy = load_deploy_config(Path(get_deploy_config_path("qwen3_tts.yaml")))
+        deploy.platforms = {platform: {"model_runner": "v2"}}
+        with pytest.raises(NotImplementedError, match="Model Runner V2 is not supported"):
+            _apply_platform_overrides(deploy, platform=platform)
+
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         if not deploy_path.exists():

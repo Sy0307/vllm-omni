@@ -832,12 +832,18 @@ def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
 ) -> DeployConfig:
-    """Merge platform-specific stage overrides into deploy config."""
+    """Merge platform-specific runner and stage overrides into deploy config."""
     if platform is None:
         from vllm_omni.platforms import current_omni_platform
 
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
+    platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "model_runner" in platform_section:
+        model_runner = platform_section["model_runner"]
+        if model_runner not in ("v1", "v2"):
+            raise ValueError(f"platform model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
+        deploy.model_runner = model_runner
     if deploy.model_runner == "v2" and platform in {"npu", "xpu"}:
         raise NotImplementedError(
             f"Model Runner V2 is not supported on {platform.upper()}: "
@@ -845,7 +851,6 @@ def _apply_platform_overrides(
         )
     if platform is None or deploy.platforms is None:
         return deploy
-    platform_section = deploy.platforms.get(platform)
     if platform_section is None:
         return deploy
 

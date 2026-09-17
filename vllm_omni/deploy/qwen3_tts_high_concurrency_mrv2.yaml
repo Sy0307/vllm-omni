@@ -1,4 +1,4 @@
-# Experimental high-concurrency native Model Runner V2 profile for Qwen3-TTS.
+# Explicit MRv2 alias; the base profile now also defaults to MRv2 on CUDA.
 base_config: qwen3_tts_high_concurrency.yaml
 model_runner: v2
 

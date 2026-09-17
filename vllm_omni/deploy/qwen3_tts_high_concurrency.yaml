@@ -9,6 +9,7 @@
 # Profile validated for the c64 / PROMPTS=512 performance experiments:
 # Stage 0 talker on GPU 0 with S0=64, Stage 1 Code2Wav on GPU 1 with S1=10.
 #
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -21,11 +22,8 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 72
-      # Stage0 code-predictor prefix CUDA graphs for the c64 hot path.
-      # These keys are consumed by Qwen3-TTS talker and ignored by Code2Wav.
-      code_predictor_prefix_graphs: true
-      code_predictor_prefix_graph_buckets: [64]
-      code_predictor_prefix_graph_seq_lens: [2, 3, 4, 5, 6, 7, 8]
+      # Prefix graphs remain opt-in pending matched quality validation.
+      code_predictor_prefix_graphs: false
       # Keep voice-clone reference context bounded so Stage1 chunk lengths are
       # stable across different reference-audio durations.
       ref_code_context_frames: 72
@@ -106,7 +104,18 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  # Native MRv2 is the CUDA default; other platform workers retain MRv1.
   npu:
+    model_runner: v1
     stages:
       - stage_id: 0
         enforce_eager: true
+
+  rocm:
+    model_runner: v1
+
+  xpu:
+    model_runner: v1
+
+  musa:
+    model_runner: v1

@@ -12,7 +12,7 @@
 #     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
-# model_runner: v2  # Opt in via qwen3_omni_moe_mrv2.yaml.
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -72,6 +72,7 @@ stages:
       repetition_penalty: 1.1
 
 platforms:
+  # Native MRv2 is the CUDA default; other platform workers retain MRv1.
   # vLLM 0.27's compiled native MRoPE path can vertically fuse the thinker's
   # Q/K RMSNorm reductions into the rotary operations and materially change
   # Qwen3-Omni audio output (#6090). Keep MRoPE on its CUDA path instead.
@@ -85,6 +86,7 @@ platforms:
   # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
   # profile before vLLM performs its normal quantization auto-detection.
   musa:
+    model_runner: v1
     stages:
       - stage_id: 1
         hf_overrides:
@@ -94,6 +96,7 @@ platforms:
           quantization_config: null
 
   npu:
+    model_runner: v1
     stages:
       - stage_id: 0
         gpu_memory_utilization: 0.6
@@ -119,11 +122,13 @@ platforms:
   # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
   # graph-capture failures.
   rocm:
+    model_runner: v1
     stages:
       - stage_id: 2
         enforce_eager: true
 
   xpu:
+    model_runner: v1
     stages:
       - stage_id: 0
         tensor_parallel_size: 4
