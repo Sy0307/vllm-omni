@@ -445,11 +445,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         update_result = dict(result)
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
-            if result.get("buffering") is True:
-                # Not enough input for one model unit yet: report softly so the
-                # session keeps buffering instead of losing the request.
-                embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-                return input_ids, embeds, {"duplex": update_result}
+            # Sub-chunk residuals are padded by the serving buffer before they
+            # reach Stage0; a failed prefill is always a real input error, so
+            # isolate it to this request instead of decoding placeholder ids.
             raise ModelInputError(f"native_duplex_prefill_failed: {result.get('reason', 'no prepared model unit')}")
 
         target_dtype = (
