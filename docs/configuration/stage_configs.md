@@ -290,3 +290,92 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
+
+## Qwen3-TTS with Model Runner V2
+
+Qwen3-TTS can opt into the native CUDA Model Runner V2 pipeline on vLLM
+0.29.0. Select one of these deployment profiles:
+
+| Profile | Runner | Code2Wav graph batches | Intended use |
+| --- | --- | --- | --- |
+| `qwen3_tts.yaml` | V1 | Existing defaults | Existing deployment / regression control |
+| `qwen3_tts_mrv2.yaml` | V2 | B1 | Native runner validation |
+| `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
+| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_mrv2.yaml
+```
+
+The V2 profiles bound Talker prefill to 512 tokens per step and select the
+Talker AR runner and the Code2Wav generation
+runner together. Native inter-stage delivery carries codec payloads directly;
+request-owned snapshots preserve buffers through asynchronous completion and
+CUDA graph reuse. Terminal completion waits for upstream stage metrics before
+releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
+this change does not qualify MRV2 on those backends or enable other model families.
+
+### Included performance work
+
+- Request snapshots have a fast path for immutable scalar leaves, including
+  waveform lists. Mutable containers, aliases and cycles keep deep-copy
+  semantics. This is not the historical shallow `dict(prompt)` experiment.
+- The API reference cache holds owned float32 arrays with a default capacity
+  of 1024 entries and a 512 MiB waveform-payload budget. Cache hits return
+  independent lists. Qwen3-TTS model artifact caches also default to 1024
+  entries. These caches have different owners and eviction policies; equal
+  entry limits do not make them a single coherent cache.
+- Talker state stays on GPU where its lifecycle allows it. BOS/EOS projections
+  are cached in their projection dtype and invalidated on weight loading.
+- Code2Wav packs CPU codec inputs before device transfer. Optional B2/B4 graph
+  buckets batch compatible requests without sharing their per-request state.
+- Native output materialization runs in a bounded worker and drains before
+  closing the data plane. The existing control-only shortcut avoids launching
+  model work for a step that has only lifecycle events.
+
+MTP prefix re-prefill remains disabled in the high-concurrency V2 profile.
+Adding more graph shapes increases compilation cost and has not established a
+stable end-to-end gain for this extracted version.
+
+### Decoder batches and playback
+
+Changing `decode_cudagraph_batch_sizes` selects the captured batch buckets.
+Keep `decode_batch_max_size` consistent with the intended maximum too; the
+stateful graph path currently groups according to the captured buckets, while
+the stateless path also uses the explicit maximum.
+
+Historical H200 C64 experiments on a different source snapshot found a B4
+throughput improvement over B2, but also longer playback gaps after an early
+first packet. That is why B4 is a separate experimental profile. First-packet
+latency alone does not establish uninterrupted playback. Validate inter-chunk
+arrival times, buffering, WER and speaker similarity before adopting either
+batching preset for a production workload. Floating-point decoder outputs can
+differ across batch sizes; this PR does not claim bitwise or quality equivalence.
+
+### Optional MPS deployment
+
+NVIDIA MPS can reduce interference between colocated Talker and Code2Wav CUDA
+contexts. It is an operator setting, not a YAML option or a library default.
+Use an idle assigned GPU and an independent MPS pipe directory; a private MPS
+server does not provide exclusive GPU ownership or MIG isolation.
+
+For example, in a shell with the assigned GPU selected:
+
+```bash
+# Replace this with the UUID of the GPU assigned to this deployment.
+export CUDA_VISIBLE_DEVICES=GPU-REPLACE-WITH-ASSIGNED-UUID
+qwen_mps_dir=$(mktemp -d /tmp/qwen-tts-mps.XXXXXX)
+export CUDA_MPS_PIPE_DIRECTORY="$qwen_mps_dir/pipe"
+export CUDA_MPS_LOG_DIRECTORY="$qwen_mps_dir/log"
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+nvidia-cuda-mps-control -d
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
+# After this deployment and its workers have exited, stop only this MPS server.
+echo quit | nvidia-cuda-mps-control
+```
+
+Measure the exact deployment with and without MPS. Historical results combining
+shallow-copy experiments, different graph settings and MPS are not performance
+measurements of this branch.

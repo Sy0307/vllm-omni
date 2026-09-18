@@ -163,6 +163,8 @@ def test_multimodal_kwarg_overrides(monkeypatch):
         assert self.mm_processor_cache_gb == override_val
         return fake_model_config
 
+    monkeypatch.setattr(EngineArgs, "__post_init__", lambda self: None)
+
     monkeypatch.setattr(EngineArgs, "create_model_config", _fake_parent_create_model_config)
     monkeypatch.setattr(OmniModelConfig, "from_vllm_model_config", lambda model_config, **_: model_config)
 
@@ -295,6 +297,8 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
     tokenizer_dir.mkdir()
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
+
+    monkeypatch.setattr(EngineArgs, "__post_init__", lambda self: None)
 
     monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", lambda *args, **kwargs: str(tmp_path))
     monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
@@ -439,6 +443,8 @@ def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
         parent_inputs["model"] = self.model
         parent_inputs["hf_config_path"] = self.hf_config_path
         return PretrainedConfig.get_config_dict(self.model)[0]
+
+    monkeypatch.setattr(EngineArgs, "__post_init__", lambda self: None)
 
     monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(controlled_get_config_dict))
     monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: True)

@@ -40,6 +40,7 @@ from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEm
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1936,11 +1937,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         def _explicit_talker_seed(req_id: str) -> int | None:
             sampling_params = getattr(self.requests[req_id], "sampling_params", None)
-            extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
-            seed = None
-            if isinstance(extra_args, dict):
-                seed = extra_args.get("tts_local_seed")
-            return int(seed) if seed is not None else None
+            return get_tts_local_seed(sampling_params)
 
         def _row_generator(req_id: str) -> torch.Generator | None:
             seed = _explicit_talker_seed(req_id)
@@ -1958,6 +1955,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             return generator
 
         row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
+        has_explicit_generator = any(generator is not None for generator in row_generators)
+        talker_mtp_runner = self.talker_mtp
+        if has_explicit_generator:
+            # The outer whole-MTP graph owns one captured RNG stream and cannot
+            # represent independent request generators. Bypass only that wrapper;
+            # the raw code predictor still uses its compiled/device-graph body.
+            _cudagraph_mode = CUDAGraphMode.NONE
+            num_tokens_padded = decode_batch_size
+            req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+            req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+            last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+            text_step = self.text_step.gpu[:num_tokens_padded]
+            talker_mtp_runner = self.model.talker_mtp
         cache = getattr(self, "_talker_mtp_generators", None)
         if cache:
             # Generators live as long as their request; drop finished ones.
@@ -2010,7 +2020,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         with current_omni_platform.set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
+            req_embeds, code_predictor_codes = talker_mtp_runner(
                 req_input_ids,
                 req_embeds,
                 last_talker_hidden,
@@ -2042,10 +2052,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                     if req_state is not None:
                         existing = self.model_intermediate_buffer.setdefault(req_id, {})
                         existing.setdefault(out_key[0], {})[out_key[1]] = row
+                        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                        if validity_key is not None:
+                            existing.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
+                                (), dtype=torch.bool, device=code_predictor_codes.device
+                            )
                         req_state.additional_information_cpu = existing
             else:
                 for idx, req_id in enumerate(decode_req_ids):
                     update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                    validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+                    if validity_key is not None:
+                        update_dict.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
+                            (), dtype=torch.bool, device=code_predictor_codes.device
+                        )
                     self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(
