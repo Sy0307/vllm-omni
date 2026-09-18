@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import TYPE_CHECKING, Any, cast
 
@@ -240,11 +239,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
         # Multi-rank executors already consume outputs asynchronously and choose
         # the replying rank themselves. Preserve that ownership contract.
-        return (
-            getattr(parallel, "tensor_parallel_size", 1) == 1
-            and getattr(self, "_omni_data_plane", None) is not None
-            and os.getenv("VLLM_OMNI_ASYNC_NATIVE_OUTPUT", "1") != "0"
-        )
+        return getattr(parallel, "tensor_parallel_size", 1) == 1 and getattr(self, "_omni_data_plane", None) is not None
 
     def _materialize_native_output(self, output: Any) -> Any:
         from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker

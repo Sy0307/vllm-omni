@@ -8,7 +8,6 @@ import importlib
 import inspect
 from collections import deque
 from collections.abc import Callable
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -1463,28 +1462,17 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         entries = [(request, payload) for request, payload in entries if payload is not None]
         if not entries:
             return 0
-        # Only hold publication while there are actual puts. A zero-payload
-        # model step must not hide previously published keys from a receiver.
-        cohort = getattr(self._omni_connector, "publication_cohort", None)
-        context = (
-            cohort(str(self._stage_id), str(self._next_stage_id))
-            if wait_for_delivery and callable(cohort)
-            else nullcontext()
-        )
-        with context:
-            emitted = 0
-            completions: list[Any] = []
-            for request, payload in entries:
-                enqueued, completion = self._enqueue_chunk_payload(
-                    request, payload, wait_for_delivery=wait_for_delivery
-                )
-                if enqueued:
-                    emitted += 1
-                    if completion is not None:
-                        completions.append(completion)
-            for completion in completions:
-                completion.wait()
-            return emitted
+        emitted = 0
+        completions: list[Any] = []
+        for request, payload in entries:
+            enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
+            if enqueued:
+                emitted += 1
+                if completion is not None:
+                    completions.append(completion)
+        for completion in completions:
+            completion.wait()
+        return emitted
 
     def publish_omni_connector_output_to_sink(self) -> bool:
         """Drain pending readiness into the same-process scheduler inbox."""

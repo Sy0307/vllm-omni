@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from collections import defaultdict
@@ -11,7 +10,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from queue import Full, Queue
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -25,9 +24,6 @@ from vllm_omni.worker_v2.delivery import (
     DeliveryTimeoutError,
     OmniDeliveryManager,
 )
-
-if TYPE_CHECKING:
-    from vllm_omni.distributed.omni_connectors.utils.shm_readiness import ShmReadiness
 
 
 @dataclass
@@ -81,7 +77,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
     """MRv2-owned stage transport and request-side payload state."""
 
     def __init__(self, vllm_config: Any, model_config: Any) -> None:
-        self._recv_readiness: ShmReadiness | None = None
         self._native_requests: dict[str, _NativeRequestState] = {}
         self._native_output_lock = threading.RLock()
         self._native_send_lock = threading.Lock()
@@ -94,81 +89,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         )
         self._can_send = self._custom_process_func is not None
         self._start_output_worker(max_pending_batches=_NATIVE_OUTPUT_QUEUE_DEPTH)
-
-    def _wake_chunk_receiver(self) -> None:
-        notifier = getattr(self, "_recv_readiness", None)
-        if notifier is not None:
-            notifier.wake()
-
-    def register_chunk_recv(self, request: Any) -> None:
-        super().register_chunk_recv(request)
-        self._wake_chunk_receiver()
-
-    def _recv_loop(self) -> None:
-        from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
-        from vllm_omni.distributed.omni_connectors.utils.shm_readiness import ShmReadiness
-
-        if not (
-            os.getenv("VLLM_OMNI_CHUNK_RECV_EVENTS", "0") == "1"
-            and self._async_chunk
-            and self._model_mode != "ar"
-            and self._stage_id > 0
-            and self._from_tp == self._to_tp == 1
-            and isinstance(self._omni_connector, SharedMemoryConnector)
-        ):
-            return super()._recv_loop()
-        try:
-            # Match the same sequential input edge used by _poll_single_request.
-            # Other pipeline edges must not trigger reconciliation of this one.
-            notifier = ShmReadiness(
-                cohort_name=self._omni_connector.cohort_notification_name(str(self._stage_id - 1), str(self._stage_id))
-            )
-        except OSError:
-            logger.warning("SHM publication notifications unavailable; retaining receiver polling", exc_info=True)
-            return super()._recv_loop()
-        self._recv_readiness = notifier
-        logger.info("Native MRv2 Stage-%s receiver uses SHM publication events", self._stage_id)
-        try:
-            self._recv_ready_loop(notifier)
-        except OSError:
-            logger.warning("SHM publication watch failed; reverting to receiver polling", exc_info=True)
-            if not self._stop_event.is_set():
-                super()._recv_loop()
-        finally:
-            self._recv_readiness = None
-            notifier.close()
-
-    def _recv_ready_loop(self, notifier: Any) -> None:
-        interested: set[str] = set()
-        arrived: set[str] = set()
-        rescan = False
-        while not self._stop_event.is_set():
-            with self._lock:
-                # Only requests whose staged payload/metadata has been handed
-                # off can receive another chunk. Rearm after consumption.
-                keys = {
-                    (
-                        f"{self._request_ids_mapping.get(req_id, req_id)}"
-                        f"_{self._stage_id - 1}_{self._get_req_chunk[req_id]}"
-                    ): req_id
-                    for req_id in self._pending_load_reqs
-                    if not self._payload_is_consumable(
-                        cast(OmniPayload | None, self._local_stage_payload_cache.get(req_id))
-                    )
-                    and req_id not in self._local_request_metadata
-                    and req_id not in self._finished_load_reqs
-                }
-            # Probe newly armed keys once: data may predate registration, or
-            # may have arrived while a previous chunk was staged/in flight.
-            candidates = set(keys) if rescan else ((set(keys) - interested) | (arrived & keys.keys()))
-            interested = set(keys)
-            arrived = set()
-            rescan = False
-            if candidates:
-                # Preserve registration order and publish a single cohort.
-                self._poll_pending_requests_once([req_id for key, req_id in keys.items() if key in candidates])
-                continue
-            arrived, rescan = notifier.wait()
 
     def _connector_delivery_timeout(self) -> float:
         config = getattr(getattr(self, "_omni_connector", None), "config", None)
@@ -526,7 +446,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 ids = accumulated.get("ids")
                 if isinstance(ids, dict):
                     ids.pop("output", None)
-            self._wake_chunk_receiver()
             return delivered
 
     def emit_chunks(
@@ -628,7 +547,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._delivery_manager.shutdown(RuntimeError("MRv2 connector shutdown"))
         self._stop_event.set()
         self._work_available.set()
-        self._wake_chunk_receiver()
 
         close_errors: list[BaseException] = []
         connector = getattr(self, "_omni_connector", None)

@@ -11,7 +11,6 @@ buffer and lifecycle hooks.
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from typing import Any
 
@@ -298,7 +297,6 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.free_states(scheduler_output)
             if (
                 scheduler_output.total_num_scheduled_tokens == 0
-                and os.getenv("VLLM_OMNI_CONTROL_FASTPATH", "1") == "1"
                 and not scheduler_output.scheduled_new_reqs
                 and not scheduler_output.scheduled_cached_reqs.req_ids
             ):

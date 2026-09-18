@@ -9,7 +9,6 @@ Uses ``req_index`` (not ``req_id``) for O(1) access, aligned with v2's
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -116,14 +115,10 @@ class OmniIntermediateBuffer:
         return top_level, nested
 
     @staticmethod
-    def _store_value(
-        dest: dict[Any, Any], key: Any, value: Any, gpu_keys: set[Any], owned_gpu_values: set[int] | None = None
-    ) -> None:
+    def _store_value(dest: dict[Any, Any], key: Any, value: Any, gpu_keys: set[Any]) -> None:
         if isinstance(value, torch.Tensor):
             if key in gpu_keys:
-                dest[key] = (
-                    value.detach() if owned_gpu_values and id(value) in owned_gpu_values else value.detach().clone()
-                )
+                dest[key] = value.detach().clone()
             else:
                 dest[key] = value.detach().cpu().contiguous()
         elif isinstance(value, list):
@@ -145,8 +140,6 @@ class OmniIntermediateBuffer:
         req_index: int,
         updates: dict[Any, Any],
         gpu_resident_keys: set[Any] | None = None,
-        *,
-        _owned_gpu_values: set[int] | None = None,
     ) -> None:
         """Merge *updates* into the buffer at *req_index*.
 
@@ -164,7 +157,7 @@ class OmniIntermediateBuffer:
                 if not isinstance(existing_sub, dict):
                     existing_sub = {}
                     existing[type_key] = existing_sub
-                self._store_value(existing_sub, qualifier, v, nested_gpu_keys.get(type_key, set()), _owned_gpu_values)
+                self._store_value(existing_sub, qualifier, v, nested_gpu_keys.get(type_key, set()))
             elif isinstance(v, dict):
                 existing_sub = existing.setdefault(k, {})
                 if not isinstance(existing_sub, dict):
@@ -211,57 +204,9 @@ class OmniIntermediateBuffer:
                 for qualifier, value in v.items():
                     if qualifier in merged_qualifiers:
                         continue
-                    self._store_value(existing_sub, qualifier, value, nested_gpu_keys.get(k, set()), _owned_gpu_values)
+                    self._store_value(existing_sub, qualifier, value, nested_gpu_keys.get(k, set()))
             else:
-                self._store_value(existing, k, v, top_gpu_keys, _owned_gpu_values)
-
-    def update_batch(self, entries: list[tuple[int, dict]], gpu_resident_keys: set[Any] | None = None) -> None:
-        """Copy a model-provided batch of state updates with foreach kernels.
-
-        Every destination still has independent storage, including when the
-        producer aliases one source across requests. No shared row views or
-        assumptions about downstream in-place resize are introduced.
-        """
-        top, nested = self._split_gpu_keys(gpu_resident_keys)
-        prepared = [
-            (index, {key: dict(value) if isinstance(value, dict) else value for key, value in updates.items()})
-            for index, updates in entries
-        ]
-        groups: dict[Any, list] = defaultdict(list)
-
-        def collect(container, key, value, keys):
-            if (
-                key in keys
-                and isinstance(value, torch.Tensor)
-                and value.layout == torch.strided
-                and value.is_contiguous()
-            ):
-                groups[(value.device, value.dtype)].append((container, key, value))
-
-        for _, updates in prepared:
-            for key, value in updates.items():
-                if isinstance(key, tuple) and len(key) == 2:
-                    collect(updates, key, value, {key} if key[1] in nested.get(key[0], ()) else set())
-                elif isinstance(value, dict):
-                    for qualifier, tensor in value.items():
-                        # Span merging owns a separate snapshot transition.
-                        if key == "embed" and qualifier == "decode":
-                            continue
-                        collect(value, qualifier, tensor, nested.get(key, set()))
-                else:
-                    collect(updates, key, value, top)
-        owned: set[int] = set()
-        for group in groups.values():
-            if len(group) < 2:
-                continue
-            sources = [value.detach() for _, _, value in group]
-            copies = [torch.empty_like(value) for value in sources]
-            torch._foreach_copy_(copies, sources)
-            for (container, key, _), snapshot in zip(group, copies, strict=True):
-                container[key] = snapshot
-                owned.add(id(snapshot))
-        for index, updates in prepared:
-            self.update(index, updates, gpu_resident_keys, _owned_gpu_values=owned)
+                self._store_value(existing, k, v, top_gpu_keys)
 
     def update_gpu_tensor_rows(
         self,

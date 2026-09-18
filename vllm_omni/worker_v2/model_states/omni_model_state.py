@@ -14,7 +14,6 @@ Extends ``DefaultModelState`` with:
 from __future__ import annotations
 
 import inspect
-import os
 import threading
 import types
 from collections.abc import Callable
@@ -42,18 +41,6 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
 )
 
 logger = init_logger(__name__)
-
-
-def _stage_cpu_indices(values: list[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Stage runner-owned CPU indices without synchronizing the compute stream.
-
-    Each transfer owns fresh pinned storage. PyTorch retains the allocation
-    until its asynchronous copy completes, so subsequent batches cannot
-    overwrite in-flight indices.
-    """
-    if device.type != "cuda" or os.getenv("VLLM_OMNI_ASYNC_METADATA", "0") != "1":
-        return torch.as_tensor(values, device=device, dtype=dtype)
-    return torch.tensor(values, dtype=dtype, pin_memory=True).to(device=device, non_blocking=True)
 
 
 _rope_patch_lock = threading.Lock()
@@ -672,7 +659,7 @@ class OmniModelState(DefaultModelState):
                 batch_embeds = embeds[:batch_size]
                 batch_offsets = None
             else:
-                batch_offsets = _stage_cpu_indices(starts, device=input_ids.device, dtype=torch.long)
+                batch_offsets = torch.as_tensor(starts, device=input_ids.device, dtype=torch.long)
                 batch_ids = input_ids.index_select(0, batch_offsets)
                 batch_embeds = embeds.index_select(0, batch_offsets)
 
@@ -720,11 +707,8 @@ class OmniModelState(DefaultModelState):
                 )
                 batched_decode_indices.add(i)
             state_updates = [(entry[1], updates) for entry, updates in zip(decode_entries, updates_by_req, strict=True)]
-            if os.getenv("VLLM_OMNI_BATCH_STATE_COPIES", "0") == "1":
-                self.intermediate_buffer.update_batch(state_updates, gpu_keys)
-            else:
-                for req_idx, updates in state_updates:
-                    self.intermediate_buffer.update(req_idx, updates, gpu_keys)
+            for req_idx, updates in state_updates:
+                self.intermediate_buffer.update(req_idx, updates, gpu_keys)
             prepacked_mtp_inputs = batch_hidden, batch_text_step
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:
@@ -804,7 +788,7 @@ class OmniModelState(DefaultModelState):
         """Pack per-request Talker state with a bounded number of GPU ops."""
         bsz = len(mtp_batches)
         if offsets is None:
-            offsets = _stage_cpu_indices(
+            offsets = torch.as_tensor(
                 [start for _i, start, _mtp in mtp_batches],
                 device=input_ids.device,
                 dtype=torch.long,
@@ -880,7 +864,7 @@ class OmniModelState(DefaultModelState):
             offsets.copy_(query_start_loc[:bsz], non_blocking=True)
             return offsets
 
-        return _stage_cpu_indices(
+        return torch.as_tensor(
             [start for _i, start, _mtp in mtp_batches],
             device=device,
             dtype=torch.long,
@@ -1205,7 +1189,7 @@ class OmniModelState(DefaultModelState):
                 ):
                     last_token_indices = query_start_loc[1 : input_batch.num_reqs + 1] - 1
                 else:
-                    last_token_indices = _stage_cpu_indices(
+                    last_token_indices = torch.as_tensor(
                         [
                             int(input_batch.query_start_loc_np[i]) + int(input_batch.num_scheduled_tokens[i]) - 1
                             for i in range(input_batch.num_reqs)

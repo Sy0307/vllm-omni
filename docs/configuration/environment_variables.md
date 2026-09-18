@@ -78,39 +78,6 @@ depends on the installed kernels and model path.
 
 ### Serving and runtime
 
-Native MRv2 receiver experiments (default off):
-
-- `VLLM_OMNI_CHUNK_RECV_EVENTS` set to `1` uses Linux SHM publication notifications for
-  TP1 downstream generation receivers. Other transports/runners retain polling.
-  Registration and consumption rearm the next key; overflow and a one-second
-  reconciliation retain key-addressed recovery. Watch failures fall back to polling.
-
-These switches are read at worker initialization and enable only for the exact
-value `1`. They do not enable CUDA IPC or change payload ownership.
-
-Additional architecture experiments:
-
-- `VLLM_OMNI_SHM_COHORT_NAMESPACE` set to `<unique-name>` groups a native output batch's
-  SHM publication. The sender completes its puts before readers can acquire
-  the shared publication lock. Use the same namespace across a deployment,
-  and a distinct namespace for each concurrent deployment. Names allow 1–64
-  ASCII letters, digits, underscores or dashes. Default empty disables it.
-  Linux cohort lock files must only be removed after all users have stopped.
-- `VLLM_OMNI_BATCH_STATE_COPIES` set to `1` batches eligible model-state snapshot copies
-  with foreach operations while preserving independent destination storage.
-  Default `0`; heterogeneous/unsupported updates keep the scalar copy path.
-- `VLLM_OMNI_CONTROL_FASTPATH` set to `0` disables the control-only generation shortcut
-  for A/B tests. Default `1` skips input construction only when no tokens,
-  new requests or cached requests need processing; lifecycle/KV/EC hooks run.
-- `VLLM_OMNI_ASYNC_METADATA` enables asynchronous CUDA metadata staging
-  when set to `1`; default `0` retains synchronous staging.
-- `VLLM_OMNI_ASYNC_NATIVE_OUTPUT` controls the native output materializer;
-  default `1`, and `0` disables it. Shutdown drains its accepted work before
-  closing the data plane.
-
-Boolean switches above enable only for exact `1`; set them before server
-startup. These experiments do not enable CUDA IPC.
-
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `SPEAKER_SAMPLES_DIR` | Filesystem path; default `~/.cache/vllm-omni/speakers` | Speech server; read when speaker storage initializes | Environment-only setting. The directory is created; filesystem errors propagate. | Stable |

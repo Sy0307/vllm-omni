@@ -136,7 +136,6 @@ def test_capacity_bounds_pending_materialization():
 def test_multi_rank_preserves_existing_consumer(monkeypatch, tp_size, enabled):
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-    monkeypatch.setenv("VLLM_OMNI_ASYNC_NATIVE_OUTPUT", "1")
     runner = N(_omni_data_plane=object(), vllm_config=N(parallel_config=N(tensor_parallel_size=tp_size)))
     assert OmniGPUModelRunner._uses_native_output_materializer(runner) is enabled
 
