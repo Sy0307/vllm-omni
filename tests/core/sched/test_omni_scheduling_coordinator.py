@@ -100,7 +100,7 @@ class MockQueue:
 
 
 class TestNativeMRV2DataPlaneSelection(unittest.TestCase):
-    def test_qwen3_omni_async_chunk_uses_native_data_plane_only_on_mrv2(self):
+    def test_declared_async_chunk_capability_uses_native_data_plane_only_on_mrv2(self):
         model_config = SimpleNamespace(
             async_chunk=True,
             supports_native_mrv2_data_plane=True,
@@ -192,104 +192,6 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
         )
         self.assertNotEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
 
-    def test_talker_decode_horizon_grants_exact_row_credits(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("r1", status=RequestStatus.RUNNING)
-        req._output_token_ids = [100]
-        waiting = MockQueue()
-        running = [req]
-        coord.update_request_metadata(
-            {"r1": req},
-            {"r1": {"decode_token_end": 4}},
-            model_mode="ar",
-        )
-
-        for generated_count in (1, 2, 3):
-            req._output_token_ids = [100] * generated_count
-            coord.process_pending_chunks(waiting, running, set(), set())
-            self.assertEqual(req.status, RequestStatus.RUNNING)
-            self.assertIn(req, running)
-
-        req._output_token_ids = [100] * 4
-        coord.process_pending_chunks(waiting, running, set(), set())
-
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-        self.assertNotIn(req, running)
-
-    def test_talker_exhausted_credit_resumes_only_after_upstream_finishes(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("r1", status=RequestStatus.RUNNING)
-        req._output_token_ids = [100, 101]
-        waiting = MockQueue()
-        running = [req]
-        coord.update_request_metadata(
-            {"r1": req},
-            {"r1": {"decode_token_end": 2}},
-            model_mode="ar",
-        )
-
-        coord.process_pending_chunks(waiting, running, set(), set())
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-
-        coord.restore_queues(waiting, running)
-        coord.process_pending_chunks(waiting, running, {"r1"}, {"r1"})
-
-        self.assertEqual(req.status, RequestStatus.RUNNING)
-        self.assertIn("r1", coord.finished_requests)
-
-    def test_talker_initial_chunk_readiness_is_consumed_once(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(waiting, running, {"r1"}, set())
-        self.assertEqual(req.status, RequestStatus.WAITING)
-
-        scheduler_output = SimpleNamespace(
-            scheduled_new_reqs=[SimpleNamespace(req_id="r1")],
-            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
-        )
-        coord.postprocess_scheduler_output(scheduler_output)
-        coord.process_pending_chunks(waiting, running, set(), set())
-
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-
-    def test_talker_decode_horizon_ignores_stale_async_metadata(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("r1", status=RequestStatus.RUNNING)
-        coord.update_request_metadata(
-            {"r1": req},
-            {"r1": {"decode_token_end": 4}},
-            model_mode="ar",
-        )
-
-        coord.update_request_metadata(
-            {"r1": req},
-            {"r1": {"decode_token_end": 3}},
-            model_mode="ar",
-        )
-
-        self.assertEqual(coord.decode_token_horizons["r1"], 4)
-
-    def test_talker_credit_reserves_async_output_placeholders(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("r1", status=RequestStatus.RUNNING)
-        req._output_token_ids = [100]
-        req.num_output_placeholders = 1
-        waiting = MockQueue()
-        running = [req]
-        coord.update_request_metadata(
-            {"r1": req},
-            {"r1": {"decode_token_end": 2}},
-            model_mode="ar",
-        )
-
-        coord.process_pending_chunks(waiting, running, set(), set())
-
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-        self.assertNotIn(req, running)
-
 
 class TestChunkCoordinatorRestoreQueues(unittest.TestCase):
     """Test 6: restore_queues returns waiting-for-chunk requests."""
@@ -353,50 +255,6 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.num_prompt_tokens, 50)
         # additional_information should NOT be set
         self.assertIsNone(getattr(req, "additional_information", None))
-
-    def test_ar_mode_uses_exact_prompt_ids_instead_of_zero_placeholders(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
-        req = _make_request("r1")
-        req.prompt_token_ids = [0, 0, 0]
-        req.num_prompt_tokens = 3
-        req._all_token_ids = [0, 0, 0]
-
-        coord.update_request_metadata(
-            {"r1": req},
-            {
-                "r1": {
-                    "next_stage_prompt_len": 3,
-                    "next_stage_prompt_ids": [3071, 872, 3071],
-                }
-            },
-            model_mode="ar",
-        )
-
-        self.assertEqual(req.prompt_token_ids, [3071, 872, 3071])
-        self.assertEqual(req.num_prompt_tokens, 3)
-        self.assertEqual(req._all_token_ids, [3071, 872, 3071])
-        self.assertEqual(req._output_token_ids, [])
-        self.assertEqual(req.num_computed_tokens, 0)
-
-    def test_ar_mode_does_not_replace_prompt_ids_after_decode_started(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
-        req = _make_request("r1")
-        req.prompt_token_ids = [11, 12]
-        req.num_prompt_tokens = 2
-        req._all_token_ids = [11, 12, 99]
-        req._output_token_ids = [99]
-        req.num_computed_tokens = 3
-
-        coord.update_request_metadata(
-            {"r1": req},
-            {"r1": {"next_stage_prompt_ids": [3071, 872, 3071]}},
-            model_mode="ar",
-        )
-
-        self.assertEqual(req.prompt_token_ids, [11, 12])
-        self.assertEqual(req._all_token_ids, [11, 12, 99])
-        self.assertEqual(req._output_token_ids, [99])
-        self.assertEqual(req.num_computed_tokens, 3)
 
     def test_generation_mode(self):
         coord = OmniSchedulingCoordinator(stage_id=1)
@@ -675,7 +533,6 @@ class TestTimeoutDetection(unittest.TestCase):
         coord._full_payload_input_received.add("r1")
         coord.finished_requests.add("r1")
         coord.requests_with_ready_chunks.add("r1")
-        coord.decode_token_horizons["r1"] = 7
         coord._waiting_for_chunk_waiting.extend([r1, r2])
         coord._waiting_for_chunk_running.extend([r1, r2])
         coord._waiting_for_input.extend([r1, r2])
@@ -694,7 +551,6 @@ class TestTimeoutDetection(unittest.TestCase):
         self.assertNotIn("r1", coord._full_payload_input_received)
         self.assertNotIn("r1", coord.finished_requests)
         self.assertNotIn("r1", coord.requests_with_ready_chunks)
-        self.assertNotIn("r1", coord.decode_token_horizons)
         for queue in (
             coord._waiting_for_chunk_waiting,
             coord._waiting_for_chunk_running,

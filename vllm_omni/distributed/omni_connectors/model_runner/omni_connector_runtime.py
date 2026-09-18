@@ -399,9 +399,6 @@ class _OmniConnectorRuntimeMixin:
                 getattr(self, "_qwen3_tts_emitted_frames", {}).pop(k, None)
                 self._cached_ic.pop(k, None)
                 self._ramp_chunk_count.pop(k, None)
-                emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
-                if emitted_frames is not None:
-                    emitted_frames.pop(k, None)
                 self._adaptive_states.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
@@ -424,16 +421,11 @@ class _OmniConnectorRuntimeMixin:
         watermark.pop(req_id, None)
         if ext_id is not None:
             watermark.pop(ext_id, None)
-        emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
             self._cached_ic.pop(ext_id, None)
-            if emitted_frames is not None:
-                emitted_frames.pop(ext_id, None)
         self._send_side_request_payload.pop(req_id, None)
         self._cached_ic.pop(req_id, None)
-        if emitted_frames is not None:
-            emitted_frames.pop(req_id, None)
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""

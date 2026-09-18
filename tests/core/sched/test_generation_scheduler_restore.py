@@ -147,7 +147,6 @@ def _scheduler_with_parked_generation_request(
     scheduler.ec_connector = None
     scheduler.prev_step_scheduled_req_ids = set()
     scheduler._pending_finish_reqs = []
-    scheduler._native_chunk_started = set()
     scheduler._consume_pending_connector_output = lambda model_mode: None
     scheduler._process_pending_input_timeouts = lambda: None
     scheduler._make_cached_request_data = lambda **kwargs: SimpleNamespace(

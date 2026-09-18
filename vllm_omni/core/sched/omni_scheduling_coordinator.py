@@ -69,11 +69,6 @@ class OmniSchedulingCoordinator:
         self.finished_requests: set[str] = set()
         self.requests_with_ready_chunks: set[str] = set()
         self.input_terminal_req_ids: set[str] = set()
-        # Absolute Thinker decode horizon visible to each Stage-1 Talker.
-        # A Talker may consume row i iff i < decode_token_end.  This is
-        # deliberately monotonic and independent of connector chunk count:
-        # one chunk can expose multiple conditioning rows.
-        self.decode_token_horizons: dict[str, int] = {}
         self._full_payload_input_received: set[str] = set()
 
         self._waiting_for_chunk_waiting: deque[Any] = deque()
@@ -221,7 +216,6 @@ class OmniSchedulingCoordinator:
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
         self.input_terminal_req_ids.discard(request_id)
-        self.decode_token_horizons.pop(request_id, None)
         self._waiting_since.pop(request_id, None)
         for queue_attr in (
             "_waiting_for_chunk_waiting",
@@ -354,33 +348,13 @@ class OmniSchedulingCoordinator:
             if metadata.get("input_terminal") is True:
                 self.input_terminal_req_ids.add(req_id)
 
-            decode_token_end = metadata.get("decode_token_end")
-            if decode_token_end is not None:
-                decode_token_end = int(decode_token_end)
-                previous_end = self.decode_token_horizons.get(req_id)
-                self.decode_token_horizons[req_id] = max(
-                    previous_end if previous_end is not None else decode_token_end,
-                    decode_token_end,
-                )
-
-            # Handle the downstream sampler history if present (for models like
-            # Qwen3-Omni). Exact IDs are part of sampling semantics; a same-sized
-            # zero placeholder is sufficient for KV allocation but changes
-            # repetition-penalty behavior and therefore the seeded Talker path.
+            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni).
             # Only apply when the request has not started decoding yet
             # (no output tokens). Resetting a mid-decode request would
             # destroy generated tokens and desync KV cache state.
-            prompt_ids_value = metadata.get("next_stage_prompt_ids")
-            next_prompt_ids = None
-            if isinstance(prompt_ids_value, (list, tuple)) and prompt_ids_value:
-                next_prompt_ids = [int(token_id) for token_id in prompt_ids_value]
-            next_len = metadata.get("next_stage_prompt_len")
-            if next_prompt_ids is not None or (isinstance(next_len, int) and next_len > 0):
-                if next_prompt_ids is None:
-                    next_prompt_ids = [0] * int(next_len)
-                else:
-                    next_len = len(next_prompt_ids)
-                if next_len > 0:
+            if "next_stage_prompt_len" in metadata:
+                next_len = metadata["next_stage_prompt_len"]
+                if isinstance(next_len, int) and next_len > 0:
                     output_token_ids = getattr(request, "_output_token_ids", None)
                     has_decode_output = output_token_ids is not None and len(output_token_ids) > 0
                     if has_decode_output:
@@ -394,15 +368,12 @@ class OmniSchedulingCoordinator:
                     else:
                         current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
                         current_prompt_len = len(current_prompt_ids)
-                        if (
-                            current_prompt_ids != next_prompt_ids
-                            or current_prompt_len != next_len
-                            or getattr(request, "num_prompt_tokens", None) != next_len
-                        ):
-                            request.prompt_token_ids = next_prompt_ids
+                        if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
+                            new_prompt = [0] * next_len
+                            request.prompt_token_ids = new_prompt
                             request.num_prompt_tokens = next_len
                             request._all_token_ids.clear()
-                            request._all_token_ids.extend(next_prompt_ids)
+                            request._all_token_ids.extend(new_prompt)
                             request._output_token_ids.clear()
                             request.num_computed_tokens = 0
                             logger.debug(
@@ -513,25 +484,8 @@ class OmniSchedulingCoordinator:
     ) -> bool:
         req_id = request.request_id
         if req_id in self.finished_requests:
-            # Once the producer is terminal, the Talker must be allowed to
-            # inject TTS EOS and subsequent pad frames until its own sampler
-            # reaches codec EOS.
+            # Admit the final payload or terminal marker for cleanup.
             return True
-
-        decode_token_end = self.decode_token_horizons.get(req_id)
-        if self._stage_id == 1 and decode_token_end is not None:
-            output_token_ids = getattr(request, "_output_token_ids", ())
-            # Async scheduling reserves future decode positions with output
-            # placeholders before sampled tokens are committed to
-            # _output_token_ids. Count both or the scheduler can overbook one
-            # conditioning row while the previous Talker step is in flight.
-            in_flight_outputs = int(getattr(request, "num_output_placeholders", 0) or 0)
-            next_decode_token = len(output_token_ids) + in_flight_outputs
-            if next_decode_token == 0:
-                # The initial prefill payload has no decode span.  Its
-                # one-shot connector readiness admits Talker prefill.
-                return req_id in chunk_ready_req_ids or req_id in self.requests_with_ready_chunks
-            return next_decode_token < decode_token_end
 
         return req_id in chunk_ready_req_ids or req_id in self.requests_with_ready_chunks
 

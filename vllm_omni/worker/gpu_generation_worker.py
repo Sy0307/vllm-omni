@@ -26,14 +26,6 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 logger = init_logger(__name__)
 
 
-def _supports_generation_device_type(device_type: str) -> bool:
-    return device_type in ("cuda", "musa")
-
-
-def _make_compilation_times(language_model_time: float) -> CompilationTimes:
-    return CompilationTimes(language_model=language_model_time, encoder=0.0)
-
-
 class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU Worker for Generation model (non-autoregressive waveform generation).
 
@@ -45,7 +37,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if _supports_generation_device_type(self.device_config.device_type):
+        if self.device_config.device_type in ("cuda", "musa"):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
@@ -126,7 +118,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             report_usage_stats(self.vllm_config)
 
     @instrument(span_name="Compile/warmup")
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         """Generation stages have no KV cache or sampler — skip warmup_kernels."""
         if not self.use_v2_model_runner:
             return super().compile_or_warm_up_model()
@@ -134,4 +126,4 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         start = time.perf_counter()
         self.model_runner.profile_run()
-        return _make_compilation_times(time.perf_counter() - start)
+        return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

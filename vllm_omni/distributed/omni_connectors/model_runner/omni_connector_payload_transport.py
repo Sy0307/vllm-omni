@@ -65,17 +65,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         extracted: dict[str, Any] = {}
         meta = payload.get("meta") if isinstance(payload, dict) else None
         meta = meta if isinstance(meta, dict) else {}
-        embed = payload.get("embed") if isinstance(payload, dict) else None
-        embed = embed if isinstance(embed, dict) else {}
-
-        decode_token_end = embed.get("decode_token_end")
-        if isinstance(decode_token_end, torch.Tensor):
-            if decode_token_end.numel() != 1:
-                raise ValueError("embed.decode_token_end must be a scalar")
-            decode_token_end = decode_token_end.item()
-        if decode_token_end is not None:
-            extracted["decode_token_end"] = int(decode_token_end)
-
         if "next_stage_prompt_len" in meta:
             extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
         elif "next_stage_prompt_len" in payload:
@@ -83,11 +72,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
             )
             extracted["next_stage_prompt_len"] = payload["next_stage_prompt_len"]
-
-        if "next_stage_prompt_ids" in meta:
-            prompt_ids = meta["next_stage_prompt_ids"]
-            if isinstance(prompt_ids, (list, tuple)):
-                extracted["next_stage_prompt_ids"] = [int(token_id) for token_id in prompt_ids]
 
         audio_codes = cls._payload_audio_codes(payload)
         if audio_codes is not None:

@@ -470,38 +470,6 @@ class TestOmniConnectorOutput(unittest.TestCase):
 
         host.shutdown_omni_connectors()
 
-    def test_extracts_exact_next_stage_prompt_ids_for_scheduler(self):
-        metadata = MixinHost._extract_scheduling_metadata(
-            {
-                "meta": {
-                    "next_stage_prompt_len": 3,
-                    "next_stage_prompt_ids": [3071, 872, 3071],
-                }
-            }
-        )
-
-        self.assertEqual(
-            metadata,
-            {
-                "next_stage_prompt_len": 3,
-                "next_stage_prompt_ids": [3071, 872, 3071],
-            },
-        )
-
-    def test_extracts_thinker_decode_horizon_for_scheduler_backpressure(self):
-        metadata = MixinHost._extract_scheduling_metadata(
-            {
-                "embed": {
-                    "decode": torch.ones(3, 4),
-                    "decode_token_start": 7,
-                    "decode_token_end": 10,
-                },
-                "meta": {"finished": False},
-            }
-        )
-
-        self.assertEqual(metadata["decode_token_end"], 10)
-
     def test_extracts_terminal_input_status_for_scheduler_output_contract(self):
         metadata = MixinHost._extract_scheduling_metadata(
             {
@@ -1721,7 +1689,7 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
                     "decode_token_start": 0,
                     "decode_token_end": 1,
                 },
-                "meta": {"finished": torch.tensor(False)},
+                "meta": {"finished": torch.tensor(False), "next_stage_prompt_len": 1},
             },
             1,
         )
@@ -1732,7 +1700,7 @@ class TestAttachOmniConnectorOutput(unittest.TestCase):
 
         self.assertEqual(len(direct_outputs), 1)
         self.assertEqual(direct_outputs[0].chunk_ready_req_ids, {"r1"})
-        self.assertEqual(direct_outputs[0].request_metadata["r1"]["decode_token_end"], 1)
+        self.assertEqual(direct_outputs[0].request_metadata["r1"]["next_stage_prompt_len"], 1)
         fallback = host.get_omni_connector_output()
         self.assertEqual(fallback.chunk_ready_req_ids, set())
         self.assertEqual(fallback.request_metadata, {})

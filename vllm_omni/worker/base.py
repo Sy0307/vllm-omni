@@ -72,12 +72,6 @@ class OmniGPUWorkerBase(GPUWorker):
         vLLM's profile() only passes is_start, so we generate a descriptive
         trace filename here before delegating to the profiler.
         """
-        # vLLM 0.29 creates CUDA/Proton profilers lazily in profile(). Only
-        # Torch uses Omni's eagerly constructed wrapper and trace naming.
-        profiler_config = self.vllm_config.profiler_config
-        if profiler_config and profiler_config.profiler in ("cuda", "proton"):
-            return super().profile(is_start=is_start, profile_prefix=profile_prefix)
-
         if self.profiler is None:
             raise RuntimeError(
                 "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "

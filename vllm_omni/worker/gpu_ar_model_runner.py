@@ -220,7 +220,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
-        self._num_nans = num_nans
         self._has_fault: torch.Tensor | None = None
         # Upstream b1e12d142d (PR #51304) added device-side NaN-in-logits
         # counts (num_nans) to AsyncGPUModelRunnerOutput. Omni keeps the
@@ -1195,6 +1194,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
+
             (
                 input_ids,
                 inputs_embeds,
@@ -2156,7 +2156,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
-                num_nans_device,
+                num_nans,
                 logprobs_lists,
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,
@@ -2274,7 +2274,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
-                num_nans=num_nans_device,
+                num_nans=num_nans,
             )
             if use_async_omni_output:
                 async_output = async_output_cls(
