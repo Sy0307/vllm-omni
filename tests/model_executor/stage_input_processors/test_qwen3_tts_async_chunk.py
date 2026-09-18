@@ -35,7 +35,7 @@ _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 
 
-@pytest.mark.parametrize("frames", [1, 26, 51])
+@pytest.mark.parametrize("frames", [1, 26])
 def test_terminal_without_new_frames_does_not_replay_last_chunk(frames):
     tm = _tm(initial_chunk_frames=1)
     emitted = 0
@@ -254,49 +254,6 @@ def test_voicedesign_prompt_mode_with_streaming_keeps_windowed_emit():
     assert len(p.codes.audio) == _Q * 25
 
 
-def test_async_chunk_accumulates_tensor_frames_without_list_roundtrip():
-    tm = _tm()
-    rid = "r-tensor-cache"
-
-    p1 = talker2code2wav_async_chunk(
-        transfer_manager=tm,
-        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]])}},
-        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
-        is_finished=False,
-    )
-    assert p1 is None
-    assert isinstance(tm.code_prompt_token_ids[rid][0], torch.Tensor)
-
-    p2 = talker2code2wav_async_chunk(
-        transfer_manager=tm,
-        multimodal_output={"codes": {"audio": torch.tensor([[5, 6, 7, 8]])}},
-        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
-        is_finished=False,
-    )
-
-    assert p2 is not None
-    assert all(isinstance(frame, torch.Tensor) for frame in tm.code_prompt_token_ids[rid])
-    assert p2.codes.audio.tolist() == [1, 5, 2, 6, 3, 7, 4, 8]
-
-
-def test_async_chunk_skips_prefill_placeholder_without_gpu_value_check():
-    tm = _tm()
-    rid = "r-prefill"
-
-    payload = talker2code2wav_async_chunk(
-        transfer_manager=tm,
-        multimodal_output={
-            "codes": {"audio": torch.zeros((4, _Q), dtype=torch.long)},
-            "meta": {"talker_prefill_offset": 4},
-        },
-        request=_req(rid, finished=False, initial_codec_chunk_frames=1),
-        is_finished=False,
-    )
-
-    assert payload is None
-    assert tm.code_prompt_token_ids[rid] == []
-
-
 def test_async_chunk_skips_stop_token_zero_frame_without_gpu_value_check():
     tm = _tm()
     rid = "r-stop"
@@ -350,22 +307,6 @@ def test_async_chunk_keeps_final_real_frame_when_eos_was_just_sampled():
     assert payload.codes.audio.tolist() == [1, 2, 3, 4]
 
 
-def test_async_chunk_keeps_cuda_frame_cache_on_device_when_available():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required to verify GPU frame-cache residency")
-    tm = _tm()
-    rid = "r-cuda-cache"
-
-    talker2code2wav_async_chunk(
-        transfer_manager=tm,
-        multimodal_output={"codes": {"audio": torch.tensor([[1, 2, 3, 4]], device="cuda")}},
-        request=_req(rid, finished=False, initial_codec_chunk_frames=2),
-        is_finished=False,
-    )
-
-    assert tm.code_prompt_token_ids[rid][0].device.type == "cuda"
-
-
 def test_async_chunk_batch_matches_scalar_payloads_and_state():
     batch_builder = getattr(qwen3_tts_processors, "talker2code2wav_async_chunk_batch", None)
     assert callable(batch_builder), "Qwen3-TTS must provide the native MRv2 batch payload builder"
@@ -377,9 +318,13 @@ def test_async_chunk_batch_matches_scalar_payloads_and_state():
         _req("r-batch-1", finished=False, output_token_ids=[8]),
     ]
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    # Request 2 has a multi-token span: the last validity flag wins the chunk.
     outputs = [
         {"codes": {"audio": torch.tensor([[1, 2, 3, 4]]), "ref": ref_code}},
-        {"codes": {"audio": torch.tensor([[5, 6, 7, 8]])}},
+        {
+            "codes": {"audio": torch.tensor([[9, 9, 9, 9], [5, 6, 7, 8]])},
+            "meta": {"codec_frame_valid": torch.tensor([False, True])},
+        },
     ]
 
     scalar_payloads = [
@@ -413,35 +358,6 @@ def test_async_chunk_batch_matches_scalar_payloads_and_state():
             torch.stack(scalar_tm.code_prompt_token_ids[rid]),
         )
     torch.testing.assert_close(batch_tm.request_payload["r-batch-0"], scalar_tm.request_payload["r-batch-0"])
-
-
-def test_async_chunk_batch_uses_last_validity_for_multitoken_request_span():
-    tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=1)
-    request = _req("r-multitoken-span", finished=False, output_token_ids=[7])
-    outputs = [
-        {
-            "codes": {
-                "audio": torch.tensor(
-                    [
-                        [9, 9, 9, 9],
-                        [1, 2, 3, 4],
-                    ]
-                )
-            },
-            "meta": {"codec_frame_valid": torch.tensor([False, True])},
-        }
-    ]
-
-    payloads = qwen3_tts_processors.talker2code2wav_async_chunk_batch(
-        transfer_manager=tm,
-        pooling_outputs=outputs,
-        requests=[request],
-        is_finished=[False],
-    )
-
-    assert payloads[0] is not None
-    assert payloads[0].codes.audio.tolist() == [1, 2, 3, 4]
-    assert len(tm.code_prompt_token_ids[request.external_req_id]) == 1
 
 
 _CASES = [

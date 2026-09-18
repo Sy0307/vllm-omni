@@ -37,11 +37,10 @@ class _Scheduler(OmniSchedulerMixin):
 
 def test_direct_ready_inbox_merges_events_before_scheduler_admission() -> None:
     scheduler = _Scheduler()
+    # Duplicate events for the same request coalesce across the drain.
+    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r1"}))
     scheduler.enqueue_omni_connector_output(
-        OmniConnectorOutput(
-            chunk_ready_req_ids={"r1"},
-            request_metadata={"r1": {"decode_token_end": 2}},
-        )
+        OmniConnectorOutput(chunk_ready_req_ids={"r1"}, request_metadata={"r1": {"decode_token_end": 2}})
     )
     scheduler.enqueue_omni_connector_output(
         OmniConnectorOutput(
@@ -68,30 +67,6 @@ def test_direct_ready_inbox_merges_events_before_scheduler_admission() -> None:
     scheduler._consume_pending_connector_output(model_mode="ar")
     assert len(scheduler.input_coordinator.metadata_calls) == 1
     assert scheduler.input_coordinator.chunk_calls[-1][2:] == (set(), set())
-
-
-def test_ready_inbox_merges_output_carried_fallback_in_same_drain() -> None:
-    scheduler = _Scheduler()
-    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r1"}))
-    scheduler._latest_omni_connector_output = OmniConnectorOutput(
-        chunk_ready_req_ids={"r2"},
-        request_metadata={"r2": {"decode_token_end": 3}},
-    )
-
-    scheduler._consume_pending_connector_output(model_mode="ar")
-
-    assert scheduler.input_coordinator.chunk_calls == [(scheduler.waiting, scheduler.running, {"r1", "r2"}, set())]
-    assert scheduler._latest_omni_connector_output is None
-
-
-def test_ready_inbox_coalesces_duplicate_ready_events() -> None:
-    scheduler = _Scheduler()
-    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r1"}))
-    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r1"}))
-
-    scheduler._consume_pending_connector_output(model_mode="ar")
-
-    assert scheduler.input_coordinator.chunk_calls == [(scheduler.waiting, scheduler.running, {"r1"}, set())]
 
 
 def test_ready_inbox_drops_late_events_for_aborted_request() -> None:

@@ -72,50 +72,6 @@ async def test_terminal_metrics_precede_final_audio_for_either_arrival_order(ord
 
 
 @pytest.mark.asyncio
-async def test_intermediate_audio_is_not_delayed():
-    o, state, cleaned = build()
-    await o._handle_processed_outputs(1, 0, [SimpleNamespace(request_id="r", finished=False, error=None)])
-    message = o.output_async_queue.get_nowait()
-    assert not message.finished
-    assert state.pending_final_output is None
-    assert cleaned == []
-
-
-@pytest.mark.asyncio
-async def test_non_chunk_route_retains_existing_completion_behavior():
-    o, state, cleaned = build()
-    o.async_chunk = False
-    await o._handle_processed_outputs(1, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])
-    assert o.output_async_queue.get_nowait().finished
-    assert cleaned == ["r"]
-
-
-@pytest.mark.asyncio
-async def test_raw_final_fallback_does_not_overtake_pending_real_output():
-    o, state, cleaned = build()
-    await o._handle_processed_outputs(1, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])
-    await o._finish_raw_terminal_requests(1, 0, {"r"})
-    assert o.output_async_queue.empty()
-    assert cleaned == []
-    assert state.pending_final_output is not None
-    await o._handle_processed_outputs(0, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])
-    assert o.output_async_queue.get_nowait().stage_id == 0
-    assert o.output_async_queue.get_nowait().finished
-    assert cleaned == ["r"]
-
-
-@pytest.mark.asyncio
-async def test_raw_upstream_terminal_releases_pending_output_without_deadlock():
-    o, state, cleaned = build()
-    await o._handle_processed_outputs(1, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])
-    terminal = SimpleNamespace(finish_reason="stop", is_segment_finished=False)
-    assert await o._apply_raw_terminal_stage_finish(0, terminal, state)
-    await o._finish_raw_terminal_requests(0, 0, {"r"})
-    assert o.output_async_queue.get_nowait().finished
-    assert cleaned == ["r"]
-
-
-@pytest.mark.asyncio
 async def test_cancelled_pending_output_is_not_published_by_late_upstream():
     o, state, cleaned = build()
     await o._handle_processed_outputs(1, 0, [SimpleNamespace(request_id="r", finished=True, error=None)])

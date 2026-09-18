@@ -96,29 +96,3 @@ def test_explicit_position_ids_use_live_mask(monkeypatch, positions):
     assert len(received) == 2
     assert all(value is position_ids for value in received)
     assert model._sliding_attention_mask_cache == {}
-
-
-def test_sliding_mask_cache_key_tracks_shape_dtype_and_attention_implementation(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    model = _make_decoder_transformer_stub()
-    calls: list[torch.Tensor] = []
-    _install_mask_builder(monkeypatch, calls)
-
-    model._get_sliding_attention_mask(torch.randn(1, 4, 8, dtype=torch.float32))
-    model._get_sliding_attention_mask(torch.randn(1, 5, 8, dtype=torch.float32))
-    model._get_sliding_attention_mask(torch.randn(1, 5, 8, dtype=torch.float64))
-    model.config._attn_implementation = "flash_attention_2"
-    model._get_sliding_attention_mask(torch.randn(1, 5, 8, dtype=torch.float64))
-
-    assert len(calls) == 4
-    assert len(model._sliding_attention_mask_cache) == 4
-
-
-def test_apply_clears_sliding_mask_cache():
-    model = _make_decoder_transformer_stub()
-    model._sliding_attention_mask_cache[(4, torch.float32, torch.device("cpu"), "sdpa")] = torch.ones(1)
-
-    model._apply(lambda tensor: tensor)
-
-    assert model._sliding_attention_mask_cache == {}

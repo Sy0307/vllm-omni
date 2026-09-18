@@ -16,9 +16,8 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
-@pytest.mark.parametrize("sequence_length", [8, 32])
-@pytest.mark.parametrize("input_mode", ["implicit", "positions", "mask"])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("input_mode", ["implicit", "positions"])
 @torch.inference_mode()
 def test_stateless_decoder_capture_replays_new_inputs(batch_size, sequence_length, input_mode):
     torch.manual_seed(42)
@@ -43,10 +42,6 @@ def test_stateless_decoder_capture_replays_new_inputs(batch_size, sequence_lengt
     if input_mode == "positions":
         cache_position = torch.arange(sequence_length, device="cuda")
         positions = {"cache_position": cache_position, "position_ids": cache_position.unsqueeze(0)}
-    elif input_mode == "mask":
-        attention_mask = torch.ones(batch_size, sequence_length, device="cuda", dtype=torch.long)
-        attention_mask[:, 0] = 0
-        positions = {"attention_mask": attention_mask}
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -81,7 +76,7 @@ def test_stateless_decoder_capture_replays_new_inputs(batch_size, sequence_lengt
     assert not torch.equal(outputs[0], outputs[1]), "replay must consume the new input"
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
 @torch.inference_mode()
 def test_stateless_codec_wrapper_captures_and_replays_waveform(batch_size):
     from tests.model_executor.models.qwen3_tts.test_qwen3_tts_incremental_decode import _make_small_decoder

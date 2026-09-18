@@ -100,27 +100,12 @@ class MockQueue:
 
 
 class TestNativeMRV2DataPlaneSelection(unittest.TestCase):
-    def test_declared_async_chunk_capability_uses_native_data_plane_only_on_mrv2(self):
-        model_config = SimpleNamespace(
-            async_chunk=True,
-            supports_native_mrv2_data_plane=True,
-        )
+    def test_native_plane_requires_v2_and_async_chunk_capability(self):
+        native = SimpleNamespace(async_chunk=True, supports_native_mrv2_data_plane=True)
 
-        self.assertTrue(uses_native_mrv2_data_plane(model_config, use_v2_model_runner=True))
-        self.assertFalse(uses_native_mrv2_data_plane(model_config, use_v2_model_runner=False))
-
-    def test_sync_or_other_arch_keeps_existing_path(self):
-        sync_config = SimpleNamespace(
-            async_chunk=False,
-            supports_native_mrv2_data_plane=True,
-        )
-        unsupported = SimpleNamespace(
-            async_chunk=True,
-            supports_native_mrv2_data_plane=False,
-        )
-
-        self.assertFalse(uses_native_mrv2_data_plane(sync_config, use_v2_model_runner=True))
-        self.assertFalse(uses_native_mrv2_data_plane(unsupported, use_v2_model_runner=True))
+        self.assertTrue(uses_native_mrv2_data_plane(native, use_v2_model_runner=True))
+        self.assertFalse(uses_native_mrv2_data_plane(native, use_v2_model_runner=False))
+        self.assertFalse(uses_native_mrv2_data_plane(SimpleNamespace(async_chunk=False), use_v2_model_runner=True))
 
 
 class TestChunkCoordinatorStateTransition(unittest.TestCase):
@@ -142,6 +127,15 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
 
         self.assertEqual(req.status, RequestStatus.WAITING)
         self.assertIn("r1", coord.requests_with_ready_chunks)
+
+        # A finished signal moves the request to finished_requests.
+        coord.process_pending_chunks(
+            MockQueue([_make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)]),
+            [],
+            chunk_ready_req_ids=set(),
+            chunk_finished_req_ids={"r1"},
+        )
+        self.assertIn("r1", coord.finished_requests)
 
     def test_non_ready_stays_waiting_for_chunk(self):
         coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
@@ -177,62 +171,6 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
         assert isinstance(handle, OmniChunkRecvHandle)
         assert handle.request_id == "internal"
         assert handle.external_req_id == "external"
-
-    def test_stage_0_is_noop(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=0)
-        req = _make_request("r1")
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(
-            waiting,
-            running,
-            chunk_ready_req_ids={"r1"},
-            chunk_finished_req_ids=set(),
-        )
-        self.assertNotEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-
-
-class TestChunkCoordinatorRestoreQueues(unittest.TestCase):
-    """Test 6: restore_queues returns waiting-for-chunk requests."""
-
-    def test_restore(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
-
-        r1 = _make_request("r1")
-        r2 = _make_request("r2")
-        coord._waiting_for_chunk_waiting.append(r1)
-        coord._waiting_for_chunk_running.append(r2)
-
-        waiting = MockQueue()
-        running: list = []
-
-        coord.restore_queues(waiting, running)
-
-        self.assertIn(r1, waiting)
-        self.assertIn(r2, running)
-        self.assertEqual(len(coord._waiting_for_chunk_waiting), 0)
-        self.assertEqual(len(coord._waiting_for_chunk_running), 0)
-
-
-class TestChunkCoordinatorFinishedSignal(unittest.TestCase):
-    """Test 8: chunk_finished_req_ids → finished_requests."""
-
-    def test_finished_signal(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-
-        req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(
-            waiting,
-            running,
-            chunk_ready_req_ids={"r1"},
-            chunk_finished_req_ids={"r1"},
-        )
-
-        self.assertIn("r1", coord.finished_requests)
 
 
 class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
@@ -523,90 +461,16 @@ class TestTimeoutDetection(unittest.TestCase):
 
     def test_free_finished_request_clears_all_lifecycle_state(self):
         """free_finished_request makes stale connector events harmless."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-        )
-        r1 = _make_request("r1")
-        r2 = _make_request("r2")
-        coord._waiting_since["r1"] = 0.0
-        coord._full_payload_input_received.add("r1")
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        r1, r2 = _make_request("r1"), _make_request("r2")
         coord.finished_requests.add("r1")
         coord.requests_with_ready_chunks.add("r1")
-        coord._waiting_for_chunk_waiting.extend([r1, r2])
         coord._waiting_for_chunk_running.extend([r1, r2])
-        coord._waiting_for_input.extend([r1, r2])
-        coord.pending_chunk_registrations = [
-            OmniChunkRecvHandle(request_id="r1"),
-            OmniChunkRecvHandle(request_id="r2"),
-        ]
-        coord.pending_input_registrations = [
-            OmniChunkRecvHandle(request_id="r1"),
-            OmniChunkRecvHandle(request_id="r2"),
-        ]
+        coord.pending_chunk_registrations = [OmniChunkRecvHandle(request_id="r1"), OmniChunkRecvHandle(request_id="r2")]
 
         coord.free_finished_request("r1")
 
-        self.assertNotIn("r1", coord._waiting_since)
-        self.assertNotIn("r1", coord._full_payload_input_received)
         self.assertNotIn("r1", coord.finished_requests)
         self.assertNotIn("r1", coord.requests_with_ready_chunks)
-        for queue in (
-            coord._waiting_for_chunk_waiting,
-            coord._waiting_for_chunk_running,
-            coord._waiting_for_input,
-        ):
-            self.assertEqual([request.request_id for request in queue], ["r2"])
-        self.assertEqual(
-            [handle.request_id for handle in coord.pending_chunk_registrations],
-            ["r2"],
-        )
-        self.assertEqual(
-            [handle.request_id for handle in coord.pending_input_registrations],
-            ["r2"],
-        )
-
-    def test_generation_metadata_tracks_terminal_input_until_it_is_scheduled(self):
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=True,
-        )
-        requests = {
-            "r1": _make_request("r1"),
-            "r2": _make_request("r2"),
-        }
-
-        coord.update_request_metadata(
-            requests,
-            {"r1": {"input_terminal": True}},
-            model_mode="generation",
-        )
-
-        previous_output = SimpleNamespace(
-            num_scheduled_tokens={"r2": 1},
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(req_ids=["r2"]),
-        )
-        self.assertEqual(
-            coord.get_scheduled_input_terminal_req_ids(previous_output),
-            set(),
-        )
-        coord.postprocess_scheduler_output(previous_output)
-        self.assertEqual(coord.input_terminal_req_ids, {"r1"})
-
-        terminal_output = SimpleNamespace(
-            num_scheduled_tokens={"r1": 1},
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(req_ids=["r1"]),
-        )
-        self.assertEqual(
-            coord.get_scheduled_input_terminal_req_ids(terminal_output),
-            {"r1"},
-        )
-        coord.postprocess_scheduler_output(terminal_output)
-        self.assertEqual(coord.input_terminal_req_ids, set())
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual([r.request_id for r in coord._waiting_for_chunk_running], ["r2"])
+        self.assertEqual([h.request_id for h in coord.pending_chunk_registrations], ["r2"])

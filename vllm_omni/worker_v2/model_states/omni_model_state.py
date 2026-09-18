@@ -555,14 +555,8 @@ class OmniModelState(DefaultModelState):
         Modifies ``model_inputs["input_ids"]`` and ``model_inputs["inputs_embeds"]``
         in-place.  Collects decode-step MTP inputs and runs a single batched MTP
         forward at the end.
-
-        Skipped when the model declares ``preprocess_in_forward = True``,
-        meaning it handles preprocess internally inside forward().
         """
         if not self.has_preprocess:
-            return
-        # Model does preprocess+MTP inside forward() — skip external preprocess.
-        if getattr(self.model, "preprocess_in_forward", False):
             return
 
         input_ids = model_inputs.get("input_ids")
@@ -1165,15 +1159,8 @@ class OmniModelState(DefaultModelState):
 
         Extracts per-request updates from hidden_states and writes them
         back to the intermediate buffer (e.g. ``last_talker_hidden``).
-
-        Skipped when the model declares ``preprocess_in_forward = True``
-        (the flag covers both pre- and post-processing — both run inside
-        the model's forward()).
         """
         if not self.has_postprocess:
-            return
-        # preprocess_in_forward also covers postprocess — both run inside forward()
-        if getattr(self.model, "preprocess_in_forward", False):
             return
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
         batch_postprocess = getattr(self.model, "postprocess_batch_mrv2", None)

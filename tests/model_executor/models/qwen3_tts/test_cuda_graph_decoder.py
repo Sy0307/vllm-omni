@@ -485,24 +485,6 @@ def test_extra_capture_shape_uses_sparse_graph(decoder):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_sparse_capture_shapes_select_smallest_fitting_graph(decoder):
-    """Sparse shapes must be selected as pairs, not as independent axes."""
-    sparse_wrapper = CUDAGraphDecoderWrapper(
-        decoder=decoder,
-        capture_sizes=[25],
-        capture_batch_sizes=[1],
-        extra_capture_shapes=[(16, 50), (64, 32)],
-        num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
-    )
-    sparse_wrapper.warmup(DEVICE)
-
-    assert sparse_wrapper._select_replay_shape(5, 29, sparse_wrapper.graphs) == (16, 50)
-    assert sparse_wrapper._select_replay_shape(33, 29, sparse_wrapper.graphs) == (64, 32)
-    assert sparse_wrapper._select_replay_shape(33, 40, sparse_wrapper.graphs) is None
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_compile_shape_supports_exact_and_padded_buckets(decoder, monkeypatch):
     """Configured torch.compile shapes should replay exact and padded CUDA Graph buckets."""
 

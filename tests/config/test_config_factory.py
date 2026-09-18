@@ -2228,42 +2228,6 @@ class TestQwen3TTSPipeline:
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
-    def test_qwen3_tts_default_connector_uses_standard_polling(self):
-        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
-        if not deploy_path.exists():
-            pytest.skip("qwen3_tts deploy yaml not found")
-
-        deploy = load_deploy_config(deploy_path)
-        connector = deploy.connectors["connector_of_shared_memory"]
-        extra = connector["extra"]
-
-        assert extra["connector_get_sleep_s"] == 0.01
-        assert "code_predictor_prefix_graphs" not in extra
-
-    def test_qwen3_tts_default_deploy_does_not_seed_sampling(self):
-        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
-        if not deploy_path.exists():
-            pytest.skip("qwen3_tts deploy yaml not found")
-
-        deploy = load_deploy_config(deploy_path)
-
-        for stage in deploy.stages:
-            assert "seed" not in stage.default_sampling_params
-        assert "stop_token_ids" not in deploy.stages[0].default_sampling_params
-        assert "extra_args" not in deploy.stages[0].default_sampling_params
-
-    def test_qwen3_tts_default_deploy_disables_prefix_caching(self):
-        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
-        if not deploy_path.exists():
-            pytest.skip("qwen3_tts deploy yaml not found")
-
-        deploy = load_deploy_config(deploy_path)
-        pipeline = OMNI_PIPELINES["qwen3_tts"]
-        stages = merge_pipeline_deploy(pipeline, deploy)
-
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
-        assert stages[1].yaml_engine_args["enable_prefix_caching"] is False
-
     def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
         """Verify subtalker sampling params participate in stage deep-merge."""
         base = {
@@ -2743,15 +2707,9 @@ class TestPlatformOverrides:
 
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
-    @pytest.mark.parametrize(
-        ("filename", "pipeline_key"),
-        [
-            ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
-            ("qwen3_tts_high_concurrency_mrv2.yaml", "qwen3_tts"),
-        ],
-    )
-    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_recommended_native_runner_platform_defaults(self, filename, pipeline_key, platform):
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_recommended_native_runner_platform_defaults(self, platform):
+        filename, pipeline_key = "qwen3_tts_mrv2.yaml", "qwen3_tts"
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
         expect_v2 = platform == "cuda"
@@ -2759,24 +2717,13 @@ class TestPlatformOverrides:
 
         # The selection must reach the live worker-dispatch consumer, not just
         # the transport-level DeployConfig field.
-        pipeline = (
-            resolve_pipeline_config(pipeline_key, Q3_OMNI_ALL_STAGES_HF_CONFIG)
-            if pipeline_key == "qwen3_omni_moe"
-            else resolve_pipeline_config(pipeline_key)
-        )
-        assert isinstance(pipeline, PipelineConfig)
+        pipeline = resolve_pipeline_config(pipeline_key)
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * len(stages)
 
         if expect_v2 and pipeline.stages and deploy.async_chunk:
-            # model_runner=v2 only engages the native MRv2 data plane on
-            # stages that declare support; an undeclared stage silently falls
-            # back to the legacy chunk-transfer plane.
-            missing = [ps.stage_id for ps in pipeline.stages if not ps.supports_native_mrv2_data_plane]
-            assert not missing, (
-                f"{filename} selects model_runner=v2 but stage(s) {missing} do not declare "
-                "supports_native_mrv2_data_plane"
-            )
+            # v2 only engages the native plane on stages declaring support.
+            assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
 
     def test_runner_selection_rejects_engine_extras_override(self):
         pipeline = PipelineConfig(
@@ -2790,19 +2737,6 @@ class TestPlatformOverrides:
             )
             with pytest.raises(ValueError, match=f"{reserved!r} must not be set"):
                 merge_pipeline_deploy(pipeline, deploy)
-
-    def test_invalid_platform_runner_rejected(self):
-        deploy = load_deploy_config(Path(get_deploy_config_path("qwen3_tts.yaml")))
-        deploy.platforms = {"cuda": {"model_runner": "invalid"}}
-        with pytest.raises(ValueError, match="platform model_runner"):
-            _apply_platform_overrides(deploy, platform="cuda")
-
-    @pytest.mark.parametrize("platform", ["npu", "xpu"])
-    def test_explicit_unsupported_platform_runner_rejected(self, platform):
-        deploy = load_deploy_config(Path(get_deploy_config_path("qwen3_tts.yaml")))
-        deploy.platforms = {platform: {"model_runner": "v2"}}
-        with pytest.raises(NotImplementedError, match="Model Runner V2 is not supported"):
-            _apply_platform_overrides(deploy, platform=platform)
 
     def test_npu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

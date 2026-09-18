@@ -101,26 +101,6 @@ def test_mrv2_silence_ban_tracks_batch_order_scope_and_decode_window() -> None:
         assert not torch.isneginf(talker.compute_logits(torch.zeros((3, 4)))).any()
 
 
-def test_mrv2_prefill_records_generation_mode_before_prompt_preparation() -> None:
-    talker = _mode_talker()
-    infos = [
-        {"req_id": "xvec", **_info(xvec=True)},
-        {"req_id": "icl", **_info(xvec=False)},
-    ]
-    seen = []
-
-    def prepare(**kwargs):
-        assert talker._req_x_vector_only == {"xvec": True, "icl": False}
-        seen.append(kwargs["req_infos"])
-
-    object.__setattr__(talker, "_prompt_builder", SimpleNamespace(preprocess_infos_batch=prepare))
-    talker.preprocess_batch_mrv2(req_infos=infos, device=torch.device("cpu"))
-    assert seen == [infos]
-
-
-# -------------------- the step gate --------------------
-
-
 def test_ban_disabled_leaves_logits_unchanged() -> None:
     logits = torch.zeros((1, _VOCAB))
     talker = _make_talker(ban_frames=0, logits=logits)

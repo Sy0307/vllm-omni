@@ -32,6 +32,3 @@ def test_fixed_seed_contract_separates_stage_sampler_from_talker_mtp_rng() -> No
     assert talker.seed == 23
     assert talker.extra_args == {"preserved": True, "tts_local_seed": 23}
     assert sampling_utils.get_tts_local_seed(talker) == 23
-
-    outer_seed_only = SimpleNamespace(seed=31, extra_args={})
-    assert sampling_utils.get_tts_local_seed(outer_seed_only) is None

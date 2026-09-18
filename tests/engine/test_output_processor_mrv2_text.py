@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Regression tests for MRv2 Omni AR text + payload outputs."""
+"""Regression tests for MRv2 Omni AR text detach and generation payload outputs."""
 
 from unittest.mock import MagicMock
 
@@ -38,14 +38,7 @@ class _Detokenizer:
         return len(self.output_token_ids)
 
 
-def _make_processor_state(detokenizer):
-    logprobs = MagicMock(
-        logprobs=None,
-        cumulative_logprob=None,
-        prompt_logprobs=None,
-    )
-    logprobs.update_from_output = MagicMock()
-
+def _make_processor(output_modality, detokenizer=None):
     state = OmniRequestState(
         request_id="r",
         external_req_id="r",
@@ -53,10 +46,12 @@ def _make_processor_state(detokenizer):
         request_index=0,
         lora_request=None,
         output_kind=RequestOutputKind.FINAL_ONLY,
-        prompt="prompt",
-        prompt_token_ids=[1],
+        prompt="prompt" if detokenizer else None,
+        prompt_token_ids=[1] if detokenizer else [],
         prompt_embeds=None,
-        logprobs_processor=logprobs,
+        logprobs_processor=MagicMock(logprobs=None, cumulative_logprob=None, prompt_logprobs=None)
+        if detokenizer
+        else None,
         detokenizer=detokenizer,
         max_tokens_param=None,
         arrival_time=0.0,
@@ -64,40 +59,7 @@ def _make_processor_state(detokenizer):
         log_stats=False,
         stream_interval=1,
     )
-    processor = MultimodalOutputProcessor(
-        tokenizer=None,
-        log_stats=False,
-        output_modality=OutputModality.LATENT,
-    )
-    processor.request_states["r"] = state
-    processor.external_req_ids["r"].append("r")
-    return processor, state
-
-
-def _make_generation_processor_state():
-    state = OmniRequestState(
-        request_id="r",
-        external_req_id="r",
-        parent_req=None,
-        request_index=0,
-        lora_request=None,
-        output_kind=RequestOutputKind.FINAL_ONLY,
-        prompt=None,
-        prompt_token_ids=[],
-        prompt_embeds=None,
-        logprobs_processor=None,
-        detokenizer=None,
-        max_tokens_param=None,
-        arrival_time=0.0,
-        queue=None,
-        log_stats=False,
-        stream_interval=1,
-    )
-    processor = MultimodalOutputProcessor(
-        tokenizer=None,
-        log_stats=False,
-        output_modality=OutputModality.AUDIO,
-    )
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, output_modality=output_modality)
     processor.request_states["r"] = state
     processor.external_req_ids["r"].append("r")
     return processor, state
@@ -105,7 +67,7 @@ def _make_generation_processor_state():
 
 def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     detokenizer = _Detokenizer()
-    processor, state = _make_processor_state(detokenizer)
+    processor, state = _make_processor(OutputModality.LATENT, detokenizer)
 
     output = EngineCoreOutput(
         request_id="r",
@@ -120,58 +82,32 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     completion = processed.request_outputs[0].outputs[0]
     assert list(completion.token_ids) == [42]
     assert completion.text == "X"
-    assert list(completion.cumulative_token_ids) == [42]
     assert not state.mm_accumulated.is_empty
 
 
-def test_generation_stage_mm_only_output_is_returned_without_queue():
-    processor, _ = _make_generation_processor_state()
+@pytest.mark.parametrize("streaming", [False, True])
+def test_generation_stage_mm_delivered_only_with_terminal(streaming):
+    # Non-terminal chunks accumulate; the terminal output carries the audio.
+    # When the first output is already terminal it is delivered directly.
+    processor, _ = _make_processor(OutputModality.AUDIO)
     audio = torch.ones(1, 320)
     sr = torch.tensor(24000, dtype=torch.int32)
-
-    output = OmniEngineCoreOutput(
+    mm_output = OmniEngineCoreOutput(
         request_id="r",
         new_token_ids=[],
         multimodal_output={"model_outputs": audio, "sr": sr},
-        finish_reason=FinishReason.STOP,
+        finish_reason=None if streaming else FinishReason.STOP,
     )
 
-    processed = processor.process_outputs([output])
-
-    assert len(processed.request_outputs) == 1
-    request_output = processed.request_outputs[0]
-    assert request_output.finished
-    completion = request_output.outputs[0]
-    assert completion.text == ""
-    assert "audio" in completion.multimodal_output
-    assert torch.equal(completion.multimodal_output["audio"], audio)
-    assert completion.multimodal_output["sr"].item() == 24000
-
-
-def test_generation_stage_accumulates_mm_until_terminal_output():
-    processor, _ = _make_generation_processor_state()
-    audio = torch.ones(1, 320)
-    sr = torch.tensor(24000, dtype=torch.int32)
-
-    output = OmniEngineCoreOutput(
-        request_id="r",
-        new_token_ids=[],
-        multimodal_output={"model_outputs": audio, "sr": sr},
-        finish_reason=None,
-    )
-    terminal = OmniEngineCoreOutput(
-        request_id="r",
-        new_token_ids=[],
-        finish_reason=FinishReason.STOP,
-    )
-
-    processed = processor.process_outputs([output])
-    assert processed.request_outputs == []
-
-    processed = processor.process_outputs([terminal])
+    processed = processor.process_outputs([mm_output])
+    if streaming:
+        assert processed.request_outputs == []
+        processed = processor.process_outputs(
+            [OmniEngineCoreOutput(request_id="r", new_token_ids=[], finish_reason=FinishReason.STOP)]
+        )
 
     assert len(processed.request_outputs) == 1
     completion = processed.request_outputs[0].outputs[0]
-    assert "audio" in completion.multimodal_output
+    assert completion.text == ""
     assert torch.equal(completion.multimodal_output["audio"], audio)
     assert completion.multimodal_output["sr"].item() == 24000

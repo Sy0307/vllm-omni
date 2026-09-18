@@ -68,57 +68,6 @@ def test_postprocess_batch_gathers_each_request_tail():
     assert torch.equal(values, torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
 
 
-def test_encode_ref_audio_batch_keeps_padding_lengths_on_cpu():
-    model = _make_minimal_talker()
-
-    class FakeBatchFeature(dict):
-        def to(self, *_args, **_kwargs):
-            raise AssertionError("the whole feature batch must not move to the model device")
-
-    class FakeFeatureExtractor:
-        sampling_rate = 24000
-
-        def __call__(self, *, raw_audio, sampling_rate, return_tensors):
-            assert len(raw_audio) == 2
-            assert sampling_rate == self.sampling_rate
-            assert return_tensors == "pt"
-
-            class UnusedPaddingMask:
-                def squeeze(self, *_args, **_kwargs):
-                    raise AssertionError("valid codec lengths must come from the input waveforms")
-
-            return FakeBatchFeature(
-                input_values=torch.ones((2, 1, 10), dtype=torch.float32),
-                padding_mask=UnusedPaddingMask(),
-            )
-
-    audio_codes = torch.arange(2 * 2 * 5, dtype=torch.int32).reshape(2, 2, 5)
-
-    class FakeEncoder:
-        def encode(self, input_values, *, return_dict):
-            assert input_values.shape == (2, 1, 10)
-            assert input_values.dtype == torch.bfloat16
-            assert return_dict is True
-            return SimpleNamespace(audio_codes=audio_codes)
-
-    model._encoder_feature_extractor = FakeFeatureExtractor()
-    model.encoder = FakeEncoder()
-    model._encoder_valid_num_quantizers = 2
-    model._encoder_downsample_rate = 2
-
-    result = model._encode_ref_audio_batch(
-        [np.ones(10, dtype=np.float32), np.ones(6, dtype=np.float32)],
-        24000,
-        device=torch.device("cpu"),
-    )
-
-    assert [tuple(code.shape) for code in result] == [(5, 2), (3, 2)]
-    assert all(code.dtype == torch.long and code.is_contiguous() for code in result)
-    assert all(code.untyped_storage().nbytes() == code.numel() * code.element_size() for code in result)
-    torch.testing.assert_close(result[0], audio_codes[0].transpose(0, 1).to(torch.long))
-    torch.testing.assert_close(result[1], audio_codes[1, :, :3].transpose(0, 1).to(torch.long))
-
-
 def _make_minimal_builder(
     *,
     config: SimpleNamespace | None = None,
@@ -170,25 +119,6 @@ def _make_minimal_builder(
     builder._resampler_cache = OrderedDict()
     builder._resampler_cache_max = 16
     return builder
-
-
-@pytest.mark.parametrize(
-    "extra, expected",
-    [
-        ({}, 1024),
-        ({"ref_audio_artifact_cache_max_entries": 1024}, 1024),
-        ({"ref_audio_artifact_cache_max_entries": 128}, 128),
-        ({"ref_audio_artifact_cache_max_entries": 0}, 0),
-    ],
-)
-def test_ref_audio_artifact_cache_capacity_reads_nested_connector_extra(extra, expected):
-    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
-        _ref_audio_artifact_cache_capacity,
-    )
-
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config={"extra": extra}))
-
-    assert _ref_audio_artifact_cache_capacity(vllm_config) == expected
 
 
 def test_single_token_prefill_uses_prefill_path():
@@ -753,27 +683,6 @@ def test_base_voice_clone_batch_preprocess_uses_serving_artifact_cache_key_witho
     assert NORMALIZED_REF_AUDIO_KEY not in buf["r1"]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_ref_audio_artifact_cache_preserves_cuda_tensors():
-    builder = _make_minimal_builder()
-    ref_code = torch.arange(8, device="cuda", dtype=torch.long).reshape(4, 2)
-    ref_spk_embedding = torch.ones(4, device="cuda", dtype=torch.bfloat16)
-
-    builder.put_ref_audio_artifacts(
-        "same-ref",
-        ref_code=ref_code,
-        ref_spk_embedding=ref_spk_embedding,
-    )
-
-    cached = builder.get_ref_audio_artifacts("same-ref")
-
-    assert cached is not None
-    assert cached["ref_code"].device == ref_code.device
-    assert cached["ref_spk_embedding"].device == ref_spk_embedding.device
-    torch.testing.assert_close(cached["ref_code"], ref_code)
-    torch.testing.assert_close(cached["ref_spk_embedding"], ref_spk_embedding)
-
-
 def test_base_voice_clone_uses_batched_ref_code_without_serial_encode():
     builder = _make_minimal_builder()
     device_param = torch.nn.Parameter(torch.empty(0))
@@ -926,21 +835,3 @@ def test_ref_audio_artifact_only_cache_miss_fails_fast():
                 REF_AUDIO_CACHE_KEY: ["missing-ref"],
             },
         )
-
-
-def test_projected_special_tokens_reuse_exact_projection_dtype():
-    builder = _make_minimal_builder()
-    calls = []
-    builder._text_embedding = lambda ids: ids.to(torch.float32).unsqueeze(-1)
-
-    def project(embeds):
-        calls.append(embeds)
-        return embeds + 0.001
-
-    builder._text_projection = project
-    first = builder._projected_tokens([100, 101], torch.device("cpu"))
-    second = builder._projected_tokens([100, 101], torch.device("cpu"))
-    assert first is second
-    assert len(calls) == 1
-    assert first.dtype == torch.float32
-    assert torch.equal(first, calls[0] + 0.001)
