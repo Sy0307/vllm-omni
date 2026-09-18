@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from vllm_omni.worker_v2.model_states import (
-    _OMNI_ARCHITECTURES,
     init_omni_model_state,
 )
 
@@ -20,32 +19,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_vllm_config(architectures):
     model_config = SimpleNamespace(architectures=architectures)
     return SimpleNamespace(model_config=model_config)
-
-
-@patch("vllm_omni.worker_v2.model_states.omni_model_state.OmniModelState.__init__", return_value=None)
-def test_qwen3_tts_talker_dispatches_to_omni_model_state(mock_init):
-    cfg = _make_vllm_config(["Qwen3TTSTalkerForConditionalGeneration"])
-    model = MagicMock()
-    device = torch.device("cpu")
-
-    state = init_omni_model_state(cfg, model, None, device)
-
-    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
-
-    assert isinstance(state, OmniModelState)
-
-
-@patch("vllm_omni.worker_v2.model_states.omni_model_state.OmniModelState.__init__", return_value=None)
-def test_qwen3_tts_code2wav_dispatches_to_omni_model_state(mock_init):
-    cfg = _make_vllm_config(["Qwen3TTSCode2Wav"])
-    model = MagicMock()
-    device = torch.device("cpu")
-
-    state = init_omni_model_state(cfg, model, None, device)
-
-    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
-
-    assert isinstance(state, OmniModelState)
 
 
 @patch("vllm_omni.worker_v2.model_states._upstream_init_model_state")
@@ -59,14 +32,6 @@ def test_unknown_arch_delegates_to_upstream(mock_upstream):
 
     mock_upstream.assert_called_once_with(cfg, model, None, device)
     assert state is mock_upstream.return_value
-
-
-def test_omni_architectures_set_contains_expected():
-    expected = {
-        "Qwen3TTSTalkerForConditionalGeneration",
-        "Qwen3TTSCode2Wav",
-    }
-    assert _OMNI_ARCHITECTURES == expected
 
 
 @patch("vllm_omni.worker_v2.model_states._upstream_init_model_state")
@@ -96,3 +61,12 @@ def test_disabled_capabilities_preserve_upstream_dispatch(monkeypatch):
     monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", lambda *args: sentinel)
     model = SimpleNamespace(has_preprocess=False, has_postprocess=False, have_multimodal_outputs=False)
     assert init_omni_model_state(_make_vllm_config(["OtherModel"]), model, None, torch.device("cpu")) is sentinel
+
+
+@pytest.mark.parametrize("architecture", ["Qwen3TTSTalkerForConditionalGeneration", "Qwen3TTSCode2Wav"])
+def test_qwen3_tts_dispatches_to_omni_model_state(monkeypatch, architecture):
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
+    state = init_omni_model_state(_make_vllm_config([architecture]), SimpleNamespace(), None, torch.device("cpu"))
+    assert isinstance(state, OmniModelState)

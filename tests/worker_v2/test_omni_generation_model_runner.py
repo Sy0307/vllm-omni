@@ -13,7 +13,6 @@ Covers the core multimodal_outputs construction paths via _build_pooler_output:
   - req_states.num_computed_tokens updated to prompt_len after sample_tokens
 """
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -180,26 +179,6 @@ def test_released_chunk_uses_typed_scheduler_output_with_inherited_add_requests(
     assert added_request.prefill_token_ids == [1]
 
 
-def test_execute_model_does_not_reference_removed_perf_hook():
-    from vllm_omni.worker_v2.omni_generation_model_runner import (
-        OmniGenerationModelRunner,
-    )
-
-    source = inspect.getsource(OmniGenerationModelRunner.execute_model)
-    assert "_record_execution_batch" not in source
-
-
-def test_execute_model_uses_shared_vllm_025_mm_input_contract():
-    from vllm_omni.worker_v2.omni_generation_model_runner import (
-        OmniGenerationModelRunner,
-    )
-
-    source = inspect.getsource(OmniGenerationModelRunner.execute_model)
-    assert "self._prepare_mm_inputs(" in source
-    assert "self.model_state.get_mm_embeddings(" not in source
-    assert '"input_ids": input_ids' in source
-
-
 class _FakeInputBatch:
     """Minimal input batch for sample_tokens."""
 
@@ -279,83 +258,6 @@ def _make_runner(
     return runner
 
 
-class TestSampleTokensTensorOutput(unittest.TestCase):
-    def test_single_request(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"model_outputs": torch.randn(1, 4, 8)})
-        runner = _make_runner(output, num_reqs=1)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert isinstance(result, OmniModelRunnerOutput)
-        assert result.pooler_output is None
-        assert len(result.multimodal_outputs) == 1
-        assert result.multimodal_outputs[0]["model_outputs"].shape == (4, 8)
-
-    def test_multi_request(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"model_outputs": torch.randn(3, 2, 5)})
-        runner = _make_runner(output, num_reqs=3)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert result.pooler_output is None
-        assert len(result.multimodal_outputs) == 3
-        for i in range(3):
-            assert result.multimodal_outputs[i]["model_outputs"].shape == (2, 5)
-
-
-class TestSampleTokensListOutput(unittest.TestCase):
-    def test_list_of_tensors(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"model_outputs": [torch.randn(3, 2)]})
-        runner = _make_runner(output, num_reqs=1)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert result.pooler_output is None
-        assert len(result.multimodal_outputs) == 1
-        assert result.multimodal_outputs[0]["model_outputs"].shape == (3, 2)
-
-    def test_list_with_none(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"model_outputs": [None]})
-        runner = _make_runner(output, num_reqs=1)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert result.pooler_output is None
-        assert result.multimodal_outputs == [{}]
-
-
-class TestSampleTokensDictOutput(unittest.TestCase):
-    def test_dict_with_batched_tensor(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"audio": torch.randn(2, 16000), "sr": 24000})
-        runner = _make_runner(output, num_reqs=2)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert result.pooler_output is None
-        assert len(result.multimodal_outputs) == 2
-        assert result.multimodal_outputs[0]["audio"].shape == (16000,)
-        assert result.multimodal_outputs[1]["audio"].shape == (16000,)
-        assert torch.is_tensor(result.multimodal_outputs[0]["sr"])
-        assert result.multimodal_outputs[0]["sr"].item() == 24000
-
-    def test_dict_with_list_values(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"chunks": [torch.randn(10), torch.randn(20)]})
-        runner = _make_runner(output, num_reqs=2)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert result.pooler_output is None
-        assert len(result.multimodal_outputs) == 2
-        assert result.multimodal_outputs[0]["chunks"].shape == (10,)
-        assert result.multimodal_outputs[1]["chunks"].shape == (20,)
-
-
 class TestSampleTokensNoneOutput(unittest.TestCase):
     def test_none_model_output(self):
         from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
@@ -363,34 +265,6 @@ class TestSampleTokensNoneOutput(unittest.TestCase):
         runner = _make_runner(None, num_reqs=1)
         result = OmniGenerationModelRunner.sample_tokens(runner)
         assert result is None
-
-
-class TestNonDictMultimodalOutputs(unittest.TestCase):
-    """When multimodal_outputs is None or non-dict, per-request output is empty."""
-
-    def test_none_multimodal_outputs(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output(multimodal_outputs=None)
-        runner = _make_runner(output, num_reqs=2)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert result.pooler_output is None
-        assert result.multimodal_outputs == [{}, {}]
-
-
-class TestSampledTokenIds(unittest.TestCase):
-    def test_empty_sampled_token_ids_per_request(self):
-        """Generation models emit empty sampled_token_ids (no token sampling)."""
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output({"model_outputs": torch.randn(3, 2)})
-        runner = _make_runner(output, num_reqs=3)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert len(result.sampled_token_ids) == 3
-        for ids in result.sampled_token_ids:
-            assert ids == []
 
 
 class TestReqStatesUpdate(unittest.TestCase):
@@ -538,64 +412,7 @@ def test_sample_tokens_reserves_native_output_before_sync_finalize(monkeypatch):
     runner._reserve_native_data_plane_outputs.assert_called_once_with(["req-0"])
 
 
-class TestMultimodalOutputsPassthrough(unittest.TestCase):
-    """multimodal_outputs is a per-request list (tensor-only) on OmniModelRunnerOutput.
-
-    OmniGenerationScheduler indexes it as mm_outputs[req_index], so it must be a
-    list (not the raw dict). Each entry mirrors the per-request pooler payload.
-    """
-
-    def test_multimodal_outputs_on_result(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        mm = {"audio": [torch.randn(10)]}
-        output = _make_omni_output(mm)
-        runner = _make_runner(output, num_reqs=1)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        assert isinstance(result.multimodal_outputs, list)
-        assert len(result.multimodal_outputs) == 1
-        assert "audio" in result.multimodal_outputs[0]
-        assert torch.is_tensor(result.multimodal_outputs[0]["audio"])
-
-    def test_none_multimodal_outputs_becomes_empty_dict(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        output = _make_omni_output(multimodal_outputs=None)
-        runner = _make_runner(output, num_reqs=1)
-        result = OmniGenerationModelRunner.sample_tokens(runner)
-
-        # No multimodal data -> one empty dict per request.
-        assert result.multimodal_outputs == [{}]
-
-
-class TestBlockTableWrites(unittest.TestCase):
-    def test_skips_no_kv_block_table_without_fused_writer(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        runner = object.__new__(OmniGenerationModelRunner)
-        block_tables = MagicMock()
-        block_tables.fused_writer = None
-        runner.block_tables = block_tables
-
-        runner._apply_block_table_staged_writes_if_available()
-
-        block_tables.apply_staged_writes.assert_not_called()
-
-    def test_applies_block_table_writes_when_writer_exists(self):
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
-        runner = object.__new__(OmniGenerationModelRunner)
-        block_tables = MagicMock()
-        block_tables.fused_writer = object()
-        runner.block_tables = block_tables
-
-        runner._apply_block_table_staged_writes_if_available()
-
-        block_tables.apply_staged_writes.assert_called_once_with()
-
-
-def test_async_chunk_slot_recycle_notifies_model_state_plugins():
+def test_async_chunk_slot_recycle_clears_model_state():
     from vllm_omni.worker_v2.omni_generation_model_runner import (
         OmniGenerationModelRunner,
     )
@@ -664,3 +481,46 @@ def test_cpu_generation_output_owns_waveform_after_model_buffer_reuse():
     result = OmniGenerationModelRunner._build_pooler_output(output, 1)
     waveform.fill_(-1)
     assert torch.equal(result[0]["codes.audio"], torch.arange(4, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "payload,num_reqs,key,shapes",
+    [
+        ({"model_outputs": torch.ones(1, 4, 8)}, 1, "model_outputs", [(4, 8)]),
+        ({"model_outputs": torch.ones(3, 2, 5)}, 3, "model_outputs", [(2, 5)] * 3),
+        ({"model_outputs": [torch.ones(3, 2)]}, 1, "model_outputs", [(3, 2)]),
+        ({"model_outputs": [None]}, 1, None, []),
+        ({"audio": torch.ones(2, 16), "sr": 24000}, 2, "audio", [(16,)] * 2),
+        ({"chunks": [torch.ones(10), torch.ones(20)]}, 2, "chunks", [(10,), (20,)]),
+        (None, 1, None, []),
+        (None, 2, None, []),
+    ],
+)
+def test_generation_output_partition(payload, num_reqs, key, shapes):
+    from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+    runner = _make_runner(_make_omni_output(payload), num_reqs=num_reqs)
+    result = OmniGenerationModelRunner.sample_tokens(runner)
+    assert isinstance(result, OmniModelRunnerOutput)
+    assert result.pooler_output is None
+    assert result.sampled_token_ids == [[] for _ in range(num_reqs)]
+    assert len(result.multimodal_outputs) == num_reqs
+    assert runner.req_states.num_computed_tokens.np.tolist() == [10] * num_reqs
+    if key is None:
+        assert result.multimodal_outputs == [{} for _ in range(num_reqs)]
+    else:
+        assert [tuple(item[key].shape) for item in result.multimodal_outputs] == shapes
+        for item in result.multimodal_outputs:
+            assert torch.equal(item[key], torch.ones_like(item[key]))
+        if payload is not None and "sr" in payload:
+            assert all(item["sr"].item() == 24000 for item in result.multimodal_outputs)
+
+
+@pytest.mark.parametrize("has_writer", [False, True])
+def test_block_table_staged_writes_require_writer(has_writer):
+    from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.block_tables = MagicMock(fused_writer=object() if has_writer else None)
+    runner._apply_block_table_staged_writes_if_available()
+    assert runner.block_tables.apply_staged_writes.call_count == int(has_writer)

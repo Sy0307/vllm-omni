@@ -9,7 +9,6 @@ Extends ``DefaultModelState`` with:
 * ``model_intermediate_buffer`` / ``runtime_additional_information`` injection
   into ``model_inputs`` via ``prepare_inputs()``
 * ``OmniOutput`` → ``(text_hidden, multimodal_outputs)`` post-processing
-* Plugin lifecycle dispatch (``OmniModelStatePlugin``)
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ from vllm_omni.worker.sampling_utils import get_tts_local_seed
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
-from vllm_omni.worker_v2.model_states.plugin import OmniModelStatePlugin
 
 logger = init_logger(__name__)
 
@@ -101,8 +99,7 @@ def _make_safe_get_rope(orig_get_rope):
 class OmniModelState(DefaultModelState):
     """Generic Omni ``ModelState`` — works for **all** Omni model stages.
 
-    Model-specific behaviour is injected via ``OmniModelStatePlugin``
-    instances or subclasses; this class itself is model-agnostic.
+    Model-owned preprocess and postprocess hooks supply stage-specific behavior.
     """
 
     def __init__(
@@ -149,7 +146,6 @@ class OmniModelState(DefaultModelState):
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
-        self.plugins: list[OmniModelStatePlugin] = []
         self._decode_preprocess = self._resolve_decode_preprocess(model)
         self._talker_mtp_generators: dict[str, torch.Generator] = {}
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
@@ -188,10 +184,6 @@ class OmniModelState(DefaultModelState):
                     device=device,
                 )
             self._talker_mtp_runner = self._init_talker_mtp_runner(model)
-
-        if hasattr(model, "get_omni_plugins"):
-            for plugin in model.get_omni_plugins():
-                self.register_plugin(plugin)
 
     @staticmethod
     def _resolve_decode_preprocess(model: nn.Module) -> Callable | None:
@@ -356,13 +348,6 @@ class OmniModelState(DefaultModelState):
         )
 
     # ------------------------------------------------------------------
-    # Plugin management
-    # ------------------------------------------------------------------
-
-    def register_plugin(self, plugin: OmniModelStatePlugin) -> None:
-        self.plugins.append(plugin)
-
-    # ------------------------------------------------------------------
     # Request lifecycle
     # ------------------------------------------------------------------
 
@@ -370,8 +355,6 @@ class OmniModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         self.intermediate_buffer.add_request(req_index, new_req_data)
         self._initialize_upstream_warmup_buffer(req_index, new_req_data.req_id)
-        for plugin in self.plugins:
-            plugin.on_add_request(req_index, new_req_data)
 
     def _initialize_upstream_warmup_buffer(self, req_index: int, req_id: str) -> None:
         """Satisfy model-declared output contracts for vLLM warmup requests."""
@@ -408,8 +391,6 @@ class OmniModelState(DefaultModelState):
         if req_id is not None:
             getattr(self, "_talker_mtp_generators", {}).pop(req_id, None)
         self.intermediate_buffer.remove_request(req_index)
-        for plugin in self.plugins:
-            plugin.on_remove_request(req_index)
 
     # ------------------------------------------------------------------
     # Input preparation
@@ -434,8 +415,6 @@ class OmniModelState(DefaultModelState):
         # tensor address that was captured.  Preprocess fills it in-place.
         if self._static_inputs_embeds is not None:
             base["inputs_embeds"] = self._static_inputs_embeds[: input_batch.num_tokens_after_padding]
-        for plugin in self.plugins:
-            base.update(plugin.prepare_extra_inputs(input_batch, req_states))
         return base
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
@@ -1281,7 +1260,7 @@ class OmniModelState(DefaultModelState):
         """Convert raw model output to ``(text_hidden, multimodal_outputs)``.
 
         Handles ``OmniOutput`` unwrapping and ``make_omni_output``
-        conversion, then dispatches to registered plugins.
+        conversion.
         """
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             if isinstance(model_output, (list, tuple)) or self.have_multimodal_outputs:
@@ -1309,10 +1288,5 @@ class OmniModelState(DefaultModelState):
         else:
             text_hidden = model_output
             multimodal_outputs = {}
-
-        for plugin in self.plugins:
-            text_hidden, multimodal_outputs = plugin.postprocess(
-                text_hidden, multimodal_outputs, input_batch, req_states
-            )
 
         return text_hidden, multimodal_outputs

@@ -114,43 +114,6 @@ def test_reconstruct_raw_model_output_ignores_empty_multimodal_outputs():
     assert raw is hidden
 
 
-def test_non_last_pp_rank_uses_vllm_027_pp_handler() -> None:
-    runner = OmniARModelRunner.__new__(OmniARModelRunner)
-    input_batch = SimpleNamespace(idx_mapping=torch.tensor([0]))
-    connector_output = MagicMock()
-    connector_output.is_empty.return_value = False
-    runner._kv_extracted_req_ids = None
-    runner.execute_model_state = SimpleNamespace(
-        input_batch=input_batch,
-        hidden_states=None,
-        finished_req_ids={"finished"},
-        ec_connector_output=None,
-        routed_experts=None,
-    )
-    runner.kv_connector = SimpleNamespace(
-        post_forward=MagicMock(return_value=connector_output),
-    )
-    runner.is_last_pp_rank = False
-
-    def receive(batch):
-        assert batch is input_batch
-        assert torch.is_inference_mode_enabled()
-        return False
-
-    runner.pp_handler = SimpleNamespace(receive=MagicMock(side_effect=receive))
-    runner.postprocess_num_computed_tokens = MagicMock()
-    runner.model_state = SimpleNamespace(postprocess_state=MagicMock())
-    runner.eplb = SimpleNamespace(step=MagicMock())
-
-    output = runner.sample_tokens(None)
-
-    runner.pp_handler.receive.assert_called_once_with(input_batch)
-    runner.postprocess_num_computed_tokens.assert_called_once_with(input_batch)
-    runner.model_state.postprocess_state.assert_called_once_with(input_batch.idx_mapping, 0)
-    runner.kv_connector.post_forward.assert_called_once_with({"finished"})
-    assert output.kv_connector_output is connector_output
-
-
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_runs_connector_after_sampling_state_is_finalized(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)

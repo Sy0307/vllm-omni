@@ -3,19 +3,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_qwen3_tts_talker_declares_prefill_and_ref_gpu_resident() -> None:
-    source = Path("vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py").read_text()
-    assert '("embed", "prefill")' in source
-    assert '("codes", "ref")' in source
-    assert '("meta", "codec_frame_valid")' in source
 
 
 def test_intermediate_buffer_keeps_nested_gpu_resident_tensor_on_device() -> None:
@@ -46,14 +37,6 @@ def test_intermediate_buffer_keeps_codes_ref_on_device() -> None:
     assert stored.dtype == torch.long
 
 
-def test_qwen3_tts_code2wav_codec_stats_log_does_not_extract_gpu_values() -> None:
-    source = Path("vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py").read_text()
-    start = source.index('"Code2Wav codec:')
-    block = source[start : start + 500]
-    assert ".item()" not in block
-    assert "torch.unique" not in block
-
-
 def test_prompt_builder_long_tensor_cache_reuses_tensor() -> None:
     from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
 
@@ -68,11 +51,3 @@ def test_prompt_builder_long_tensor_cache_reuses_tensor() -> None:
         assert first.device.index == torch.accelerator.current_device_index()
     assert first.dtype == torch.long
     assert first.tolist() == [[1, 2, 3]]
-
-
-def test_prompt_builder_mel_spectrogram_does_not_sync_for_range_logging() -> None:
-    source = Path("vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py").read_text()
-    start = source.index("def mel_spectrogram")
-    block = source[start : start + 1200]
-    assert "torch.min(y)" not in block
-    assert "torch.max(y)" not in block

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Unit tests for OmniModelState core methods and plugin dispatch."""
+"""Unit tests for OmniModelState core methods."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -18,7 +18,6 @@ from vllm_omni.worker_v2.model_states.omni_model_state import (
     OmniModelState,
     _make_safe_get_rope,
 )
-from vllm_omni.worker_v2.model_states.plugin import OmniModelStatePlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -46,33 +45,7 @@ class _DummyReqState:
     pass
 
 
-class _SpyPlugin(OmniModelStatePlugin):
-    """Plugin that records calls for verification."""
-
-    def __init__(self):
-        self.add_calls: list = []
-        self.remove_calls: list = []
-        self.prepare_calls: list = []
-        self.postprocess_calls: list = []
-
-    def on_add_request(self, req_index, new_req_data):
-        self.add_calls.append((req_index, new_req_data))
-
-    def on_remove_request(self, req_index):
-        self.remove_calls.append(req_index)
-
-    def prepare_extra_inputs(self, input_batch, req_states):
-        self.prepare_calls.append(True)
-        return {"plugin_key": "plugin_value"}
-
-    def postprocess(self, text_hidden, multimodal_outputs, input_batch, req_states):
-        self.postprocess_calls.append(True)
-        return text_hidden, multimodal_outputs
-
-
-def _make_state(
-    max_num_reqs=4, has_preprocess=False, has_postprocess=False, have_multimodal_outputs=False, plugins=None
-):
+def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, have_multimodal_outputs=False):
     """Create an OmniModelState without calling real __init__."""
     state = object.__new__(OmniModelState)
 
@@ -93,7 +66,6 @@ def _make_state(
     model.preprocess_decode_batch_mrv2 = None
     model.preprocess_decode_batch = None
     model.postprocess_batch_mrv2 = None
-    model.get_omni_plugins = MagicMock(return_value=[])
     state.model = model
 
     # scheduler_config mock
@@ -104,7 +76,6 @@ def _make_state(
     state.has_preprocess = has_preprocess
     state.has_postprocess = has_postprocess
     state.have_multimodal_outputs = have_multimodal_outputs
-    state.plugins = plugins or []
 
     from vllm_omni.worker_v2.model_states.intermediate_buffer import (
         OmniIntermediateBuffer,
@@ -142,18 +113,6 @@ def test_add_request_populates_buffer():
         state.add_request(0, req)
 
     assert state.intermediate_buffer.buffers[0]["req_id"] == "r1"
-
-
-def test_add_request_dispatches_to_plugins():
-    plugin = _SpyPlugin()
-    state = _make_state(plugins=[plugin])
-    req = _make_new_req_data("r1")
-
-    with patch.object(type(state).__bases__[0], "add_request", return_value=None):
-        state.add_request(0, req)
-
-    assert len(plugin.add_calls) == 1
-    assert plugin.add_calls[0][0] == 0
 
 
 def test_add_request_initializes_declared_validity_for_upstream_warmup():
@@ -237,13 +196,6 @@ def test_remove_request_ignores_unknown_req_id():
     assert state.intermediate_buffer.buffers == [{}, {}, {}, {}]
 
 
-def test_remove_request_dispatches_to_plugins():
-    plugin = _SpyPlugin()
-    state = _make_state(plugins=[plugin])
-    state.remove_request(2)
-    assert plugin.remove_calls == [2]
-
-
 def test_intermediate_buffer_update_merges_nested_and_tuple_keys():
     state = _make_state()
     trailing = torch.randn(2, 4)
@@ -309,19 +261,6 @@ def test_prepare_inputs_native_buffer_models_skip_runtime_info():
     assert "model_intermediate_buffer" in result
     assert "runtime_additional_information" not in result
     assert result["model_intermediate_buffer"][0]["req_id"] == "r1"
-
-
-def test_prepare_inputs_merges_plugin_extra():
-    plugin = _SpyPlugin()
-    state = _make_state(plugins=[plugin])
-
-    batch = _DummyInputBatch([])
-
-    with patch.object(type(state).__bases__[0], "prepare_inputs", return_value={"base": True}):
-        result = state.prepare_inputs(batch, _DummyReqState())
-
-    assert result["base"] is True
-    assert result["plugin_key"] == "plugin_value"
 
 
 # ---------------------------------------------------------------
@@ -406,16 +345,6 @@ def test_postprocess_native_buffer_models_skip_runtime_info():
     _, kwargs = state.model.make_omni_output.call_args
     assert "model_intermediate_buffer" in kwargs
     assert "runtime_additional_information" not in kwargs
-
-
-def test_postprocess_dispatches_to_plugins():
-    plugin = _SpyPlugin()
-    state = _make_state(plugins=[plugin])
-    hidden = torch.randn(4, 8)
-
-    batch = _DummyInputBatch([0])
-    state.postprocess_model_output(hidden, batch, _DummyReqState())
-    assert len(plugin.postprocess_calls) == 1
 
 
 def test_run_postprocess_does_not_duplicate_hidden_states_kwarg():

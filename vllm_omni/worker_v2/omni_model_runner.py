@@ -10,11 +10,8 @@ import threading
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import (
-    get_forward_context,
-    is_forward_context_available,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -69,65 +66,20 @@ class OmniGPUModelRunner(GPUModelRunner):
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
-    _supports_full_graph_aux_outputs: bool
-    _aux_output_tree_spec: Any
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
         self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
-        self._supports_full_graph_aux_outputs = bool(getattr(self.model, "supports_mrv2_full_graph_aux_outputs", False))
-        if self._supports_full_graph_aux_outputs and not self._model_returns_tuple:
-            raise ValueError("supports_mrv2_full_graph_aux_outputs requires a tuple-returning model")
-        self._aux_output_tree_spec = None
-        self._exclude_full_graph = (self._model_returns_tuple and not self._supports_full_graph_aux_outputs) or hasattr(
-            self.model, "_last_captured_layers"
-        )
-        if self._supports_full_graph_aux_outputs:
-            self.use_aux_hidden_state_outputs = True
+        self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
 
-    def _prepare_cudagraph_capture_output(
-        self,
-        model_output: Any,
-        cg_mode: CUDAGraphMode,
-    ) -> Any:
-        """Adapt an Omni output to vLLM's native CUDA graph contract."""
+    @staticmethod
+    def _prepare_cudagraph_capture_output(model_output: Any) -> Any:
+        """Unwrap model outputs for the upstream PIECEWISE capture warmup."""
         if isinstance(model_output, OmniOutput):
             return model_output.text_hidden_states
-        if not (isinstance(model_output, tuple) and len(model_output) == 2):
-            return model_output
-
-        hidden_states, aux_output = model_output
-        supports_aux = getattr(self, "_supports_full_graph_aux_outputs", False)
-        if cg_mode == CUDAGraphMode.PIECEWISE or not supports_aux:
-            return hidden_states
-
-        flat_aux, tree_spec = tree_flatten(aux_output)
-        if not flat_aux or not all(isinstance(value, torch.Tensor) for value in flat_aux):
-            raise TypeError("MRv2 FULL CUDA graph auxiliary outputs require a non-empty tensor-only pytree")
-        if not isinstance(hidden_states, torch.Tensor):
-            raise TypeError("MRv2 FULL CUDA graph primary output must be a tensor")
-        for value in flat_aux:
-            if value.ndim == 0 or value.shape[0] != hidden_states.shape[0]:
-                raise ValueError(
-                    "MRv2 FULL CUDA graph auxiliary tensor leading dimensions must match the primary hidden states"
-                )
-
-        if self._aux_output_tree_spec is None:
-            self._aux_output_tree_spec = tree_spec
-        elif self._aux_output_tree_spec != tree_spec:
-            raise RuntimeError("MRv2 FULL CUDA graph auxiliary output structure changed during capture")
-        return hidden_states, flat_aux
-
-    def _unpack_full_graph_output(self, model_output: Any) -> tuple[Any, Any]:
-        """Restore the model-owned auxiliary pytree after FULL graph replay."""
-        if not self._supports_full_graph_aux_outputs:
-            return model_output, None
-        if not (isinstance(model_output, tuple) and len(model_output) == 2):
-            raise RuntimeError("MRv2 FULL CUDA graph replay did not return auxiliary outputs")
-        if self._aux_output_tree_spec is None:
-            raise RuntimeError("MRv2 FULL CUDA graph auxiliary output schema was not captured")
-        hidden_states, flat_aux = model_output
-        return hidden_states, tree_unflatten(list(flat_aux), self._aux_output_tree_spec)
+        if isinstance(model_output, tuple) and len(model_output) == 2:
+            return model_output[0]
+        return model_output
 
     def _add_legacy_forward_inputs(self, model_inputs: dict[str, Any], input_batch: Any) -> None:
         """Supply forward-only metadata for pipelines not on the native plane."""
@@ -357,64 +309,22 @@ class OmniGPUModelRunner(GPUModelRunner):
     # CUDA Graph: conditionally exclude FULL mode
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _without_full_graph_candidates(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {
-                key: OmniGPUModelRunner._without_full_graph_candidates(item)
-                for key, item in value.items()
-                if key != CUDAGraphMode.FULL
-            }
-        if isinstance(value, list):
-            return [
-                OmniGPUModelRunner._without_full_graph_candidates(item)
-                for item in value
-                if getattr(item, "cg_mode", None) != CUDAGraphMode.FULL
-            ]
-        if isinstance(value, tuple):
-            return tuple(
-                OmniGPUModelRunner._without_full_graph_candidates(item)
-                for item in value
-                if getattr(item, "cg_mode", None) != CUDAGraphMode.FULL
-            )
-        return value
-
-    @staticmethod
-    def _contains_full_graph_candidate(value: Any) -> bool:
-        if isinstance(value, dict):
-            return CUDAGraphMode.FULL in value or any(
-                OmniGPUModelRunner._contains_full_graph_candidate(item) for item in value.values()
-            )
-        if isinstance(value, (list, tuple)):
-            return any(OmniGPUModelRunner._contains_full_graph_candidate(item) for item in value)
-        return getattr(value, "cg_mode", None) == CUDAGraphMode.FULL
-
     def _exclude_unsupported_full_graphs(self) -> None:
+        # vLLM 0.29 keys dispatch candidates by (uniform token count, LoRA count).
         manager = self.cudagraph_manager
-        capture_descs = getattr(manager, "_capture_descs", None)
-        candidates = getattr(manager, "_candidates", None)
-        if not isinstance(capture_descs, dict) or not isinstance(candidates, (dict, list, tuple)):
-            raise RuntimeError(
-                "cannot safely exclude FULL CUDA graphs for this Omni model: "
-                "vLLM CudaGraphManager internals have changed"
-            )
-
-        manager._capture_descs = self._without_full_graph_candidates(capture_descs)
-        manager._candidates = self._without_full_graph_candidates(candidates)
-        if self._contains_full_graph_candidate(manager._capture_descs) or self._contains_full_graph_candidate(
-            manager._candidates
-        ):
-            raise RuntimeError(
-                "cannot safely exclude FULL CUDA graphs for this Omni model: FULL candidates remain after filtering"
-            )
+        assert manager is not None
+        manager._capture_descs.pop(CUDAGraphMode.FULL, None)
+        manager._candidates = {
+            key: [desc for desc in candidates if desc.cg_mode != CUDAGraphMode.FULL]
+            for key, candidates in manager._candidates.items()
+        }
         logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
 
     def capture_model(self) -> int:
         """Handle CUDA graph capture for Omni models.
 
-        Tuple-returning models must explicitly declare a stable tensor-only
-        auxiliary output schema to use FULL mode. Other tuple outputs keep the
-        conservative FULL exclusion.
+        Tuple-returning models use PIECEWISE graphs; FULL replay requires
+        a tensor output.
 
         For PIECEWISE capture, the warmup pass runs with
         ``CUDAGraphMode.NONE`` which hits ``torch.empty_like(hidden_states)``
@@ -432,10 +342,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             def _capture_forward(*args: Any, **kwargs: Any) -> Any:
                 output = original_forward(*args, **kwargs)
-                cg_mode = CUDAGraphMode.NONE
-                if is_forward_context_available():
-                    cg_mode = get_forward_context().cudagraph_runtime_mode
-                return self._prepare_cudagraph_capture_output(output, cg_mode)
+                return self._prepare_cudagraph_capture_output(output)
 
             self.model.forward = _capture_forward  # type: ignore[assignment]
             try:
@@ -648,8 +555,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             # inputs_embeds buffer above.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-            hidden_states, self._last_aux_output = self._unpack_full_graph_output(model_output)
+            hidden_states = self.cudagraph_manager.run_fullgraph(batch_desc)
+            self._last_aux_output = None
             self._last_multimodal_outputs = None
             if hasattr(self.model, "_last_captured_layers"):
                 self.model._last_captured_layers = self._last_aux_output

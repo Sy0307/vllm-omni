@@ -192,70 +192,6 @@ def test_add_requests_sanitizes_stop_ids_for_narrow_logits_head():
     assert sampling_params.eos_token_id == 151645
 
 
-def test_finish_requests_calls_remove_for_finished():
-    runner = _make_runner()
-    mock_state = MagicMock()
-    runner.model_state = mock_state
-
-    sched_output = SimpleNamespace(
-        finished_req_ids={"r1"},
-        preempted_req_ids=set(),
-    )
-
-    with patch.object(type(runner).__bases__[0], "finish_requests", return_value=None):
-        runner.finish_requests(sched_output)
-
-    mock_state.remove_request.assert_called_once_with(0)
-
-
-def test_finish_requests_calls_remove_for_preempted():
-    runner = _make_runner()
-    mock_state = MagicMock()
-    runner.model_state = mock_state
-
-    sched_output = SimpleNamespace(
-        finished_req_ids=set(),
-        preempted_req_ids={"r2"},
-    )
-
-    with patch.object(type(runner).__bases__[0], "finish_requests", return_value=None):
-        runner.finish_requests(sched_output)
-
-    mock_state.remove_request.assert_called_once_with(1)
-
-
-def test_finish_requests_ignores_unknown_req_ids():
-    runner = _make_runner()
-    mock_state = MagicMock()
-    runner.model_state = mock_state
-
-    sched_output = SimpleNamespace(
-        finished_req_ids={"unknown"},
-        preempted_req_ids=set(),
-    )
-
-    with patch.object(type(runner).__bases__[0], "finish_requests", return_value=None):
-        runner.finish_requests(sched_output)
-
-    mock_state.remove_request.assert_not_called()
-
-
-def test_finish_requests_handles_both_finished_and_preempted():
-    runner = _make_runner()
-    mock_state = MagicMock()
-    runner.model_state = mock_state
-
-    sched_output = SimpleNamespace(
-        finished_req_ids={"r1"},
-        preempted_req_ids={"r2"},
-    )
-
-    with patch.object(type(runner).__bases__[0], "finish_requests", return_value=None):
-        runner.finish_requests(sched_output)
-
-    assert mock_state.remove_request.call_count == 2
-
-
 def test_update_requests_preserves_cached_gpu_resident_side_state():
     runner = _make_runner()
     gpu_keys = {("hidden_states", "last"), ("hidden_states", "trailing_text")}
@@ -375,23 +311,6 @@ def test_thinker_stage_needs_capture_tensor_unwrap():
     assert not _needs_capture_tensor_unwrap(SimpleNamespace(model_stage="talker"))
 
 
-def test_configure_cudagraph_output_contract_enables_explicit_aux_support():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = SimpleNamespace(
-        _returns_tuple=True,
-        supports_mrv2_full_graph_aux_outputs=True,
-    )
-    runner.use_aux_hidden_state_outputs = False
-
-    runner._configure_cudagraph_output_contract()
-
-    assert runner._model_returns_tuple
-    assert runner._supports_full_graph_aux_outputs
-    assert runner.use_aux_hidden_state_outputs
-    assert not runner._exclude_full_graph
-    assert runner._aux_output_tree_spec is None
-
-
 def test_configure_cudagraph_output_contract_keeps_unsupported_tuple_safe():
     runner = object.__new__(OmniGPUModelRunner)
     runner.model = SimpleNamespace(_returns_tuple=True)
@@ -400,79 +319,8 @@ def test_configure_cudagraph_output_contract_keeps_unsupported_tuple_safe():
     runner._configure_cudagraph_output_contract()
 
     assert runner._model_returns_tuple
-    assert not runner._supports_full_graph_aux_outputs
     assert not runner.use_aux_hidden_state_outputs
     assert runner._exclude_full_graph
-
-
-def test_full_graph_capture_flattens_and_replay_restores_aux_output_tree():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner._supports_full_graph_aux_outputs = True
-    runner._aux_output_tree_spec = None
-    hidden = torch.ones(2, 4)
-    layer_0 = torch.full((2, 4), 3.0)
-    layer_24 = torch.full((2, 4), 7.0)
-    aux = {"hidden_states": {"layers": {0: layer_0, 24: layer_24}}}
-
-    capture_output = runner._prepare_cudagraph_capture_output(
-        (hidden, aux),
-        CUDAGraphMode.FULL,
-    )
-
-    assert capture_output[0] is hidden
-    assert capture_output[1] == [layer_0, layer_24]
-    replay_hidden, replay_aux = runner._unpack_full_graph_output(capture_output)
-    assert replay_hidden is hidden
-    assert replay_aux["hidden_states"]["layers"][0] is layer_0
-    assert replay_aux["hidden_states"]["layers"][24] is layer_24
-
-
-def test_piecewise_capture_unwraps_main_tensor_without_recording_aux_schema():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner._supports_full_graph_aux_outputs = True
-    runner._aux_output_tree_spec = None
-    hidden = torch.ones(2, 4)
-    aux = {"hidden_states": {"layers": {0: torch.ones(2, 4)}}}
-
-    capture_output = runner._prepare_cudagraph_capture_output(
-        (hidden, aux),
-        CUDAGraphMode.PIECEWISE,
-    )
-
-    assert capture_output is hidden
-    assert runner._aux_output_tree_spec is None
-
-
-def test_piecewise_warmup_preserves_native_aux_output_pair():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner._supports_full_graph_aux_outputs = True
-    runner._aux_output_tree_spec = None
-    hidden = torch.ones(2, 4)
-    layer_0 = torch.full((2, 4), 3.0)
-    aux = {"hidden_states": {"layers": {0: layer_0}}}
-
-    capture_output = runner._prepare_cudagraph_capture_output(
-        (hidden, aux),
-        CUDAGraphMode.NONE,
-    )
-
-    # vLLM warms up every capture descriptor in NONE mode. When auxiliary
-    # outputs are enabled, its graph manager still unpacks a strict pair.
-    assert capture_output == (hidden, [layer_0])
-    assert runner._aux_output_tree_spec is not None
-
-
-def test_full_graph_capture_rejects_non_tensor_aux_leaves():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner._supports_full_graph_aux_outputs = True
-    runner._aux_output_tree_spec = None
-    hidden = torch.ones(2, 4)
-
-    with pytest.raises(TypeError, match="tensor-only"):
-        runner._prepare_cudagraph_capture_output(
-            (hidden, {"hidden_states": None}),
-            CUDAGraphMode.FULL,
-        )
 
 
 def test_capture_model_unwraps_tuple_outputs():
@@ -515,78 +363,6 @@ def test_capture_model_unwraps_omni_outputs():
         assert runner.capture_model() == 5
 
     assert runner.model.forward is original_forward
-
-
-def test_capture_model_excludes_full_graph_without_assuming_candidate_descriptors():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = SimpleNamespace(forward=lambda: torch.ones(1, 2))
-    runner._model_returns_tuple = False
-    runner._exclude_full_graph = True
-    piecewise = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
-    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
-    manager = SimpleNamespace(
-        _capture_descs={
-            CUDAGraphMode.FULL: [full],
-            CUDAGraphMode.PIECEWISE: [piecewise],
-        },
-        _candidates=[
-            [1, 2, 4],
-            [piecewise, full],
-        ],
-    )
-    runner.cudagraph_manager = manager
-
-    with patch.object(type(runner).__bases__[0], "capture_model", return_value=7):
-        assert runner.capture_model() == 7
-
-    assert CUDAGraphMode.FULL not in manager._capture_descs
-    assert manager._candidates[0] == [1, 2, 4]
-    assert manager._candidates[1] == [piecewise]
-
-
-def test_capture_model_excludes_full_graph_when_candidates_are_dict():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = SimpleNamespace(forward=lambda: torch.ones(1, 2))
-    runner._model_returns_tuple = False
-    runner._exclude_full_graph = True
-    piecewise = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
-    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
-    manager = SimpleNamespace(
-        _capture_descs={
-            CUDAGraphMode.FULL: [full],
-            CUDAGraphMode.PIECEWISE: [piecewise],
-        },
-        _candidates={
-            CUDAGraphMode.FULL: [full],
-            CUDAGraphMode.PIECEWISE: [piecewise, full],
-            "sizes": [1, 2, 4],
-        },
-    )
-    runner.cudagraph_manager = manager
-
-    with patch.object(type(runner).__bases__[0], "capture_model", return_value=9):
-        assert runner.capture_model() == 9
-
-    assert CUDAGraphMode.FULL not in manager._capture_descs
-    assert CUDAGraphMode.FULL not in manager._candidates
-    assert manager._candidates[CUDAGraphMode.PIECEWISE] == [piecewise]
-    assert manager._candidates["sizes"] == [1, 2, 4]
-
-
-def test_capture_model_fails_closed_when_full_graph_exclusion_api_drifted():
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = SimpleNamespace(forward=lambda: torch.ones(1, 2))
-    runner._model_returns_tuple = False
-    runner._exclude_full_graph = True
-    runner.cudagraph_manager = SimpleNamespace()
-
-    with (
-        patch.object(type(runner).__bases__[0], "capture_model") as capture_model,
-        pytest.raises(RuntimeError, match="cannot safely exclude FULL"),
-    ):
-        runner.capture_model()
-
-    capture_model.assert_not_called()
 
 
 def test_capture_model_captures_talker_mtp_graphs_after_main_capture():
@@ -723,3 +499,37 @@ def test_finish_notifies_model_after_chunk_slot_was_released(monkeypatch):
     assert calls == [{"released"}]
     runner.finish_requests(SimpleNamespace(finished_req_ids=set(), preempted_req_ids={"r2"}))
     assert calls == [{"released"}]
+
+
+@pytest.mark.parametrize(
+    "finished,preempted,expected",
+    [({"r1"}, set(), [0]), (set(), {"r2"}, [1]), ({"unknown"}, set(), []), ({"r1"}, {"r2"}, [0, 1])],
+)
+def test_finish_requests_cleans_known_finished_and_preempted_slots(finished, preempted, expected):
+    runner = _make_runner()
+    runner.model_state = MagicMock()
+    scheduled = SimpleNamespace(finished_req_ids=finished, preempted_req_ids=preempted)
+    with patch.object(type(runner).__bases__[0], "finish_requests", return_value=None):
+        runner.finish_requests(scheduled)
+    assert sorted(call.args[0] for call in runner.model_state.remove_request.call_args_list) == expected
+
+
+@pytest.mark.parametrize("with_full", [False, True])
+def test_capture_excludes_full_graph_from_vllm_029_dispatch(with_full):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(forward=lambda: torch.ones(1, 2))
+    runner._model_returns_tuple = False
+    runner._exclude_full_graph = True
+    piecewise = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
+    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+    captures = {CUDAGraphMode.PIECEWISE: [piecewise]}
+    if with_full:
+        captures[CUDAGraphMode.FULL] = [full]
+    runner.cudagraph_manager = SimpleNamespace(
+        _capture_descs=captures,
+        _candidates={(1, 0): [piecewise, full] if with_full else [piecewise], (1, 2): [full] if with_full else []},
+    )
+    with patch.object(type(runner).__bases__[0], "capture_model", return_value=7):
+        assert runner.capture_model() == 7
+    assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
+    assert runner.cudagraph_manager._candidates == {(1, 0): [piecewise], (1, 2): []}
