@@ -523,11 +523,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
         self._add_legacy_forward_inputs(model_inputs, input_batch)
-        if not self.is_first_pp_rank:
-            model_inputs["input_ids"] = None
-            model_inputs["inputs_embeds"] = None
-            assert intermediate_tensors is not None
-
         # ★ PRE-FORWARD: per-request preprocess + batched MTP.
         # Runs for ALL graph modes (FULL, PIECEWISE, NONE).
         # For FULL graph: OmniModelState provides a static inputs_embeds
@@ -615,9 +610,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             routed_experts=routed_experts,
         )
 
-        if not self.is_last_pp_rank:
-            assert isinstance(hidden_states, IntermediateTensors)
-            return hidden_states
         assert isinstance(hidden_states, torch.Tensor)
         return None
 

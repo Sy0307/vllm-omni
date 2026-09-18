@@ -50,34 +50,15 @@ class FakeAdapter:
         pass
 
 
-class _FakeQueue:
-    def __init__(self, requests):
-        self._requests = deque(requests)
-
-    def __bool__(self):
-        return bool(self._requests)
-
-    def __iter__(self):
-        return iter(self._requests)
-
-    def peek_request(self):
-        return self._requests[0]
-
-    def pop_request(self):
-        return self._requests.popleft()
-
-    def prepend_request(self, request):
-        self._requests.appendleft(request)
-
-
 def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
     scheduler.max_num_scheduled_tokens = 8
     scheduler.max_num_running_reqs = 1
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.running = []
-    scheduler.waiting = _FakeQueue([waiting_request])
-    scheduler.skipped_waiting = _FakeQueue([])
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.waiting.add_request(waiting_request)
+    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.requests = {waiting_request.request_id: waiting_request}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.chunk_transfer_adapter = FakeAdapter()
@@ -138,16 +119,6 @@ def _chunk_request(request_id, **kwargs):
     return SimpleNamespace(**defaults)
 
 
-def test_native_generation_scheduler_reads_terminal_state_from_coordinator() -> None:
-    scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
-    scheduler.chunk_transfer_adapter = None
-    scheduler._native_data_plane = True
-    scheduler.input_coordinator = SimpleNamespace(finished_requests={"done"})
-
-    assert scheduler._is_done_receiving_chunks("done")
-    assert not scheduler._is_done_receiving_chunks("running")
-
-
 def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> None:
     # Native plane: a completed payload without a new chunk is never executed
     # again; requeued requests keep WAITING_FOR_CHUNK and their token counts.
@@ -167,6 +138,8 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     scheduler.requests = {"completed": completed}
     scheduler.input_coordinator.finished_requests.add("completed")  # terminal payload, no new chunk
 
+    assert scheduler._is_done_receiving_chunks("completed")
+    assert not scheduler._is_done_receiving_chunks("unknown")
     output = scheduler.schedule()
     assert not output.num_scheduled_tokens
     assert scheduler._pending_finish_reqs == [completed]
@@ -193,9 +166,7 @@ def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeyp
     scheduler.requests = {"terminal": waiting}
     assert _has_async_chunk_payload_to_run(waiting)
     # A terminal codec request with an empty prompt is still scheduled exactly once.
-    monkeypatch.setattr(
-        "vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", lambda policy: _FakeQueue([])
-    )
+    monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", create_request_queue)
 
     output = OmniGenerationScheduler.schedule(scheduler)
 

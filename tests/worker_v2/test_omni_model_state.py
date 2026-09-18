@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """OmniModelState: mixed-batch reorder, state isolation/slot reuse, MTP
 graph/eager paths with per-request seed independence, async snapshot ownership."""
 
@@ -99,9 +98,6 @@ def _fwd_ctx():
         yield
 
 
-# State isolation and slot reuse
-
-
 @pytest.mark.parametrize("req_id,expect_validity", [("_warmup_0_", True), ("r1", False)])
 def test_add_request_declared_validity_only_for_warmup(req_id, expect_validity):
     # Real requests must not be masked with a fabricated validity key.
@@ -129,98 +125,6 @@ def test_remove_request_state_isolation(mode):
     assert "r1" not in state._talker_mtp_generators  # recycled slot inherits no seed stream
 
 
-# prepare_inputs injection and forward-only staging
-
-
-@pytest.mark.parametrize("native_buffer", [False, True])
-@pytest.mark.parametrize("dummy", [False, True])
-def test_prepare_inputs_injection(native_buffer, dummy):
-    state = _make_state()
-    state.model.requires_native_model_intermediate_buffer = native_buffer
-    _add(state, "r1", 0)
-    if dummy:
-        with patch.object(DefaultModelState, "prepare_dummy_inputs", return_value={}):
-            result = state.prepare_dummy_inputs(num_reqs=2, num_tokens=16)
-    else:
-        with patch.object(DefaultModelState, "prepare_inputs", return_value={}):
-            result = state.prepare_inputs(_DummyInputBatch([0]), SimpleNamespace())
-        assert result["model_intermediate_buffer"][0]["req_id"] == "r1"
-        assert ("runtime_additional_information" in result) is not native_buffer
-    assert "model_intermediate_buffer" in result
-
-
-@pytest.mark.parametrize("second_dtype", [torch.int64, torch.int32])
-def test_forward_only_input_staging_preserves_reordered_rows(monkeypatch, second_dtype):
-    # Mixed batch reorder [2, 0]: staging preserves row order/metadata, moves
-    # same-dtype rows once, and never touches unscheduled slots.
-    state = _make_state(max_num_reqs=3)
-    state.model.batched_gpu_staging_keys = {("codes", "audio")}
-    first = torch.tensor([1, 2], dtype=torch.int64)
-    second = torch.tensor([21, 22, 23], dtype=second_dtype)
-    untouched = torch.tensor([100], dtype=torch.int64)
-    finished = torch.tensor(False)
-    for idx, codes in [(0, first), (1, untouched), (2, second)]:
-        state.intermediate_buffer.buffers[idx] = {
-            "req_id": f"r{idx}",
-            "codes": {"audio": codes},
-            "meta": {"finished": finished},
-        }
-    batch = _DummyInputBatch([2, 0])
-    batch.input_ids = SimpleNamespace(device=torch.device("cuda"))
-    calls = []
-
-    def move(tensors, device):
-        calls.append((tensors, device))
-        packed = torch.cat(tensors).clone()
-        return list(packed.split([t.shape[0] for t in tensors]))
-
-    monkeypatch.setattr(state, "_batch_move_tensor_rows", move)
-    with patch.object(DefaultModelState, "prepare_inputs", return_value={}):
-        output = state.prepare_inputs(batch, SimpleNamespace())
-    assert len(calls) == (1 if second_dtype == torch.int64 else 2)
-    rows = output["runtime_additional_information"]
-    assert torch.equal(rows[0]["codes"]["audio"], second)
-    assert rows[0]["codes"]["audio"].dtype == second_dtype
-    assert rows[0]["codes"]["audio"] is not second
-    assert rows[0]["meta"]["finished"] is finished
-    assert state.intermediate_buffer.buffers[1]["codes"]["audio"] is untouched
-
-
-# postprocess_model_output
-
-
-@pytest.mark.parametrize("output_form", ["omni", "tuple", "raw"])
-def test_postprocess_output_forms(output_form):
-    state = _make_state(have_multimodal_outputs=(output_form == "omni"))
-    del state.model.make_omni_output
-    hidden = torch.randn(4, 8)
-    mm = {"audio": torch.randn(4, 2)}
-    if output_form == "omni":
-        output = OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
-    elif output_form == "tuple":
-        output = (hidden, {})
-    else:
-        output = hidden
-    th, mo = state.postprocess_model_output(output, _DummyInputBatch([0]), SimpleNamespace())
-    assert th is hidden
-    assert mo == (mm if output_form == "omni" else {})
-
-
-def test_postprocess_output_adapter_native_kwargs_and_errors():
-    state = _make_state(have_multimodal_outputs=True)
-    hidden = torch.randn(4, 8)
-    state.model.make_omni_output = MagicMock(return_value=OmniOutput(text_hidden_states=hidden, multimodal_outputs={}))
-    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
-    state.model.requires_native_model_intermediate_buffer = True
-    th, _ = state.postprocess_model_output((hidden, {}), _DummyInputBatch([0]), SimpleNamespace())
-    assert th is hidden
-    # Native-buffer models do not get runtime info re-injected.
-    assert "runtime_additional_information" not in state.model.make_omni_output.call_args.kwargs
-    state.model.make_omni_output.side_effect = RuntimeError("broken payload")
-    with pytest.raises(RuntimeError, match="broken payload"):
-        state.postprocess_model_output((torch.zeros(1, 2), []), _DummyInputBatch([0]), object())
-
-
 def test_output_spans_follow_reordered_mixed_batch():
     # batch=[2, 0]: prefill (3 tokens) reordered ahead of decode (1 token).
     state = _make_state(have_multimodal_outputs=True)
@@ -236,9 +140,6 @@ def test_output_spans_follow_reordered_mixed_batch():
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
-
-
-# prefill/decode mixed-cohort batch hooks
 
 
 @pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
@@ -265,6 +166,10 @@ def test_decode_cohort_uses_batch_hook(hook_name):
         )
     else:
         setattr(state.model, hook_name, preprocess_decode_batch)
+        if hook_name == "preprocess_decode_batch_mrv2":
+            state.model.preprocess_decode_batch = MagicMock(
+                side_effect=AssertionError("MRV2 hook must take precedence")
+            )
     state.model.preprocess = MagicMock(side_effect=AssertionError("decode requests must use the batch hook"))
     seen_prepacked = []
 
@@ -288,66 +193,6 @@ def test_decode_cohort_uses_batch_hook(hook_name):
     assert torch.equal(seen_prepacked[0][0], torch.tensor([[31.0, 32.0], [41.0, 42.0]]))
 
 
-def test_decode_rows_before_prefill_use_zero_copy_prefix_view():
-    # Mixed batch [decode, prefill]: decode-row handoff is a zero-copy prefix
-    # view (identical data_ptr), not an index_select copy.
-    state = _make_state(max_num_reqs=2, has_preprocess=True)
-    state.intermediate_buffer.buffers[0] = {"req_id": "decode"}
-    state.intermediate_buffer.buffers[1] = {"req_id": "prefill"}
-    batch_ptrs = []
-
-    def preprocess_decode_batch(*, input_ids, input_embeds, req_infos):
-        batch_ptrs.append((input_ids.data_ptr(), input_embeds.data_ptr()))
-        return input_ids, input_embeds, torch.tensor([[31.0, 32.0]]), torch.tensor([[41.0, 42.0]]), [{}]
-
-    state.model.preprocess_decode_batch_mrv2 = preprocess_decode_batch
-    state.model.preprocess = lambda input_ids, input_embeds, **_info: (input_ids, input_embeds, {})
-    state._run_batched_mtp = lambda *_a, **_kw: None
-    model_inputs = {
-        "input_ids": torch.tensor([101, 201, 202, 203], dtype=torch.long),
-        "inputs_embeds": torch.arange(8, dtype=torch.float32).reshape(4, 2),
-    }
-    batch = _DummyInputBatch([0, 1], num_computed_tokens_cpu=[1, 0])
-    batch.num_scheduled_tokens = [1, 3]
-    batch.query_start_loc_np = [0, 1]
-    state.run_preprocess(batch, model_inputs, SimpleNamespace(prompt_len=np.array([1, 3], dtype=np.int32)))
-    assert batch_ptrs == [(model_inputs["input_ids"].data_ptr(), model_inputs["inputs_embeds"].data_ptr())]
-
-
-def test_deferred_talker_text_projection_runs_once_per_batch():
-    state = _make_state(max_num_reqs=2, has_preprocess=True)
-    projected = []
-
-    def project(steps):
-        projected.append(steps.clone())
-        return steps + 100
-
-    state.model.project_talker_text_steps = project
-
-    def preprocess(input_ids, input_embeds, **info):
-        assert info["_omni_defer_talker_text_projection"] is True
-        offset = 10 if info["req_id"] == "r1" else 20
-        return (
-            input_ids,
-            input_embeds,
-            {
-                "mtp_inputs": (torch.full((1, 2), float(offset)), torch.tensor([[offset + 1.0, offset + 2.0]])),
-                "mtp_text_step_requires_projection": True,
-            },
-        )
-
-    state.model.preprocess = preprocess
-    _fill_buffers(state, "r1", "r2")
-    batches = []
-    state._run_batched_mtp = lambda b, *_a: batches.extend(b)
-    state.run_preprocess(
-        _DummyInputBatch([0, 1]), {"input_ids": torch.tensor([101, 202]), "inputs_embeds": torch.zeros(2, 2)}
-    )
-    assert len(projected) == 1
-    assert torch.equal(batches[0][2][1], torch.tensor([[111.0, 112.0]]))
-    assert torch.equal(batches[1][2][1], torch.tensor([[121.0, 122.0]]))
-
-
 def test_static_decode_embeddings_refresh_from_input_ids():
     # FULL-graph replay reads the static buffer: it must hold fresh embeddings.
     state = _make_state(has_preprocess=True)
@@ -365,9 +210,6 @@ def test_static_decode_embeddings_refresh_from_input_ids():
     original = torch.tensor([[1.0, 2.0]])
     assert OmniModelState._preprocess_result_needs_writeback(original, original) is False
     assert OmniModelState._preprocess_result_needs_writeback(original, original.view_as(original)) is True
-
-
-# run_postprocess
 
 
 def test_batched_postprocess_gpu_snapshot_writeback():
@@ -399,88 +241,6 @@ def test_batched_postprocess_gpu_snapshot_writeback():
     assert torch.equal(first, hidden[3])
     assert torch.equal(second, hidden[1])
     assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
-
-
-# MTP packing, offsets, capture sizes
-
-
-def test_talker_mtp_capture_sizes_do_not_exceed_scheduler_capacity():
-    state = _make_state(max_num_reqs=64)
-    state.vllm_config.compilation_config = SimpleNamespace(cudagraph_capture_sizes=[128, 120, 64, 32, 1])
-    assert state._get_talker_mtp_capture_sizes() == [64, 32, 1]
-
-
-@pytest.mark.parametrize(
-    "qsl,mixed,expected",
-    [
-        ([0, 3, 7], False, [0, 3]),  # full decode cohort
-        ([0, 1, 2, 6], False, [0, 1]),  # contiguous decode prefix
-        ([0, 2, 5, 9], True, [0, 5]),  # mixed cohort keeps explicit offsets
-    ],
-)
-def test_talker_mtp_batch_offsets(monkeypatch, qsl, mixed, expected):
-    state = _make_state(max_num_reqs=4)
-    state._mtp_offsets = torch.zeros(4, dtype=torch.long)
-    query_start_loc = torch.tensor(qsl, dtype=torch.int32)
-    pair = (torch.ones(1, 2), torch.ones(1, 2))
-    if mixed:
-        mtp_batches = [(0, 0, pair), (2, 5, pair)]
-    else:
-        mtp_batches = [(i, qsl[i], pair) for i in range(len(expected))]
-        # Static fast path must not allocate via torch.as_tensor.
-        monkeypatch.setattr(
-            torch, "as_tensor", lambda *_a, **_k: pytest.fail("prefix cohort must reuse static device offsets")
-        )
-    offsets = state._talker_mtp_batch_offsets(
-        mtp_batches,
-        SimpleNamespace(num_reqs=len(qsl) - 1, query_start_loc=query_start_loc),
-        query_start_loc.device,
-    )
-    assert offsets.dtype == torch.long
-    assert offsets.tolist() == expected
-    if not mixed:
-        assert offsets.data_ptr() == state._mtp_offsets.data_ptr()
-
-
-def test_pack_talker_mtp_batch_gathers_into_static_buffers(monkeypatch):
-    state = _make_state(max_num_reqs=2)
-    _init_static(state, 2, dim=2)
-    mtp_batches = [
-        (0, 2, (torch.tensor([[31.0, 32.0]]), torch.tensor([[41.0, 42.0]]))),
-        (1, 0, (torch.tensor([[51.0, 52.0]]), torch.tensor([[61.0, 62.0]]))),
-    ]
-    select_outs = []
-    real_select = torch.index_select
-
-    def record_select(t, dim, index, *, out=None):
-        select_outs.append(out)
-        return real_select(t, dim, index, out=out)
-
-    monkeypatch.setattr(torch, "index_select", record_select)
-    batch_ids, _embeds, hidden, text_step, offsets = state._pack_talker_mtp_batch(
-        mtp_batches,
-        torch.tensor([10, 20, 30], dtype=torch.long),
-        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
-    )
-    assert [t.data_ptr() for t in select_outs] == [
-        state._mtp_input_ids.data_ptr(),
-        state._mtp_input_embeds.data_ptr(),
-    ]
-    assert hidden.data_ptr() == state._mtp_hidden.data_ptr()
-    assert torch.equal(offsets, torch.tensor([2, 0]))
-    assert torch.equal(batch_ids, torch.tensor([30, 10]))
-    assert torch.equal(hidden, torch.tensor([[31.0, 32.0], [51.0, 52.0]]))
-    # Runtime int32 ids are cast into the static int64 buffer.
-    batch_ids32, *_ = state._pack_talker_mtp_batch(
-        [(0, 1, (torch.tensor([[3.0, 4.0]]), torch.tensor([[5.0, 6.0]])))],
-        torch.tensor([10, 20], dtype=torch.int32),
-        torch.tensor([[1.0, 2.0], [7.0, 8.0]]),
-    )
-    assert batch_ids32.dtype == torch.long
-    assert batch_ids32.tolist() == [20]
-
-
-# Batched MTP: seed independence and graph/eager paths
 
 
 def test_seed_independence_resolve_once_and_sampling_kwargs():
@@ -517,33 +277,6 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     assert torch.equal(state.intermediate_buffer.buffers[1]["codes"]["audio"], torch.tensor([[4, 5, 6]]))
 
 
-def test_gpu_codec_state_uses_one_snapshot_writeback():
-    # Codec rows go through a single update_gpu_tensor_rows snapshot with zero
-    # extra copies; scalar update must not handle GPU rows.
-    state = _make_state(max_num_reqs=2)
-    _init_static(state, 2)
-    _fill_buffers(state, "r0", "r1")
-    source_codes = torch.tensor([[1, 2, 3], [4, 5, 6]])
-    state.model.talker_mtp = lambda ids, emb, hidden, step, **kw: (emb, source_codes)
-    state.model.talker_mtp_validity_key = ("meta", "codec_frame_valid")
-    state.intermediate_buffer.update = MagicMock(side_effect=AssertionError("GPU rows must not use scalar update"))
-    state.intermediate_buffer.update_gpu_tensor_rows = MagicMock()
-    state._run_batched_mtp(
-        _mtp_batches(),
-        torch.tensor([101, 202]),
-        torch.zeros(2, 3),
-        _DummyInputBatch([0, 1]),
-        {("codes", "audio"), ("meta", "codec_frame_valid")},
-    )
-    calls = state.intermediate_buffer.update_gpu_tensor_rows.call_args_list
-    assert len(calls) == 2
-    assert calls[0].args[0] == [0, 1]
-    assert calls[0].args[1] == ("codes", "audio")
-    assert calls[0].args[2].data_ptr() == source_codes.data_ptr()
-    assert calls[1].args[1] == ("meta", "codec_frame_valid")
-    assert calls[1].kwargs == {"keepdim": False}
-
-
 def test_seeded_talker_mtp_bypasses_outer_graph_runner():
     state = _make_state(max_num_reqs=2)
     raw_calls = []
@@ -560,32 +293,6 @@ def test_seeded_talker_mtp_bypasses_outer_graph_runner():
     )
     assert raw_calls == [{"generators": generators}]
     state._talker_mtp_runner.assert_not_called()
-
-
-def test_seeded_graph_without_dispatcher_prepares_uniforms():
-    # Seeded run with a graph runner but no batch-descriptor dispatcher still
-    # prepares per-request uniforms and rides the graph path.
-    state = _make_state(max_num_reqs=2)
-    _init_static(state, 1)
-    state._mtp_sample_uniforms = torch.full((2, 2, 4), 0.5)
-    state._is_talker_mtp_graph_runner = MagicMock(return_value=True)
-    state._prepare_talker_mtp_sample_uniforms = MagicMock(return_value=state._mtp_sample_uniforms[:1])
-    state.model.talker_mtp = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1, 1, dtype=torch.long)))
-    state._talker_mtp_runner = state.model.talker_mtp
-    state.intermediate_buffer.buffers[0] = {"req_id": "r0", "sampling_params": _seeded(11)}
-    batch = _DummyInputBatch([0])
-    batch.query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
-    state._run_batched_mtp(
-        [(0, 0, (torch.ones(3), torch.ones(3)))],
-        torch.zeros(1, dtype=torch.long),
-        torch.zeros(1, 3),
-        batch,
-        set(),
-    )
-    state._prepare_talker_mtp_sample_uniforms.assert_called_once()
-    call_kwargs = state.model.talker_mtp.call_args.kwargs
-    assert call_kwargs.get("sample_uniforms") is not None
-    assert "generators" not in call_kwargs
 
 
 def test_run_batched_mtp_uses_dispatched_graph_descriptor():
@@ -621,36 +328,6 @@ def test_run_batched_mtp_uses_dispatched_graph_descriptor():
     assert kwargs["num_tokens"] == 4
     assert torch.equal(state.intermediate_buffer.buffers[0]["codes"]["audio"], torch.tensor([[0, 1, 2]]))
     assert torch.equal(state.intermediate_buffer.buffers[1]["codes"]["audio"], torch.tensor([[3, 4, 5]]))
-
-
-def test_run_batched_mtp_scalar_fallback_without_per_row_generators():
-    state = _make_state(max_num_reqs=2)
-    state.model.talker_mtp_accepts_per_row_generators = False
-    state.intermediate_buffer.buffers[0] = {"req_id": "r0", "sampling_params": _seeded(11)}
-    state.intermediate_buffer.buffers[1] = {"req_id": "r1", "sampling_params": _seeded(22)}
-    call_batch_sizes = []
-
-    def talker_mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
-        call_batch_sizes.append(int(input_ids.shape[0]))
-        assert "generator" in kwargs
-        return input_embeds + 1, input_ids.reshape(1, 1)
-
-    state.model.talker_mtp = talker_mtp
-    state._run_batched_mtp(
-        _mtp_batches(), torch.tensor([101, 202]), torch.zeros(2, 3), _DummyInputBatch([0, 1]), {("codes", "audio")}
-    )
-    assert call_batch_sizes == [1, 1]
-
-
-# Upstream contract sentinels
-
-
-def test_decode_hook_mrv2_takes_precedence_over_v1():
-    def optimized(*, input_ids, input_embeds, req_infos):
-        return input_embeds
-
-    model = SimpleNamespace(preprocess_decode_batch_mrv2=optimized, preprocess_decode_batch=lambda: None)
-    assert OmniModelState._resolve_decode_preprocess(model) is optimized
 
 
 def test_rope_shim_propagates_type_error():

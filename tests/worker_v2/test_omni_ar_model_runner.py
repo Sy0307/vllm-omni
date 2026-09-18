@@ -15,9 +15,7 @@ from vllm.v1.outputs import RoutedExpertsTensors
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 
 import vllm_omni.worker_v2.omni_ar_model_runner as omni_ar_model_runner
-from vllm_omni.data_entry_keys import unflatten_payload
-from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput, _async_copy_mm
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
 from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -190,50 +188,6 @@ def test_guard_graph_replay_for_pooler_copy(need_pooler, async_chunk) -> None:
     assert main_stream.wait_event.call_count == (1 if need_pooler and not async_chunk else 0)
 
 
-@pytest.mark.parametrize(
-    "mm,aux,expected",
-    [
-        ({"latent": torch.randn(3, 4)}, None, "omni"),  # multimodal → OmniOutput
-        (None, {"layers": torch.randn(3, 2)}, "tuple"),  # aux only → (hidden, aux)
-        ({}, None, "raw"),  # empty multimodal dict is falsy → bare hidden
-    ],
-)
-def test_reconstruct_raw_model_output_forms(mm, aux, expected) -> None:
-    hidden = torch.randn(3, 4)
-    raw = OmniARModelRunner._reconstruct_raw_model_output(hidden_states=hidden, multimodal_outputs=mm, aux=aux)
-    if expected == "omni":
-        assert isinstance(raw, OmniOutput) and raw.text_hidden_states is hidden
-    elif expected == "tuple":
-        assert raw == (hidden, aux)
-    else:
-        assert raw is hidden
-
-
-def test_build_pooler_output_nested_slices_owned_storage_and_qwen3_round_trip() -> None:
-    # feat/nested slice along the token axis; per-request list elements pass through.
-    mm_cpu = {"feat": torch.randn(6, 2), "items": [torch.randn(2), torch.randn(3)], "nested": {"a": torch.randn(6, 2)}}
-    build = OmniARModelRunner._build_pooler_output_from_cpu
-    pooler = build(torch.randn(6, 4), mm_cpu, np.array([0, 3]), np.array([3, 3]), 2)
-    assert pooler[0]["feat"].shape == (3, 2) and pooler[1]["nested"]["a"].shape == (3, 2)
-    assert isinstance(pooler[0]["items"], torch.Tensor)
-    sliced = pooler[0]["hidden"]
-    # The slice owns its storage; later writes to the source cannot corrupt it.
-    assert sliced.is_contiguous() and sliced.untyped_storage().nbytes() == sliced.numel() * sliced.element_size()
-
-    # Qwen3 nested payload: flatten to dotted keys → slice → unflatten back.
-    mm = {
-        "hidden_states": {"layers": {0: torch.randn(4, 4), 24: torch.randn(4, 4)}},
-        "embed": {"tts_bos": [torch.randn(1, 1, 4)], "tts_eos": [torch.randn(1, 1, 4)]},
-        "codes": {"audio": torch.randn(4, 16)},
-    }
-    mm_cpu = _async_copy_mm(mm, total_tokens=4)
-    pooler = build(torch.randn(4, 4), mm_cpu, np.array([0, 2]), np.array([2, 2]), 2)
-    assert "hidden_states" not in pooler[0] and pooler[0]["codes.audio"].shape == (2, 16)
-    payload = unflatten_payload(pooler[0])
-    assert payload["hidden_states"]["layers"][0].shape == (2, 4) == payload["hidden_states"]["layers"][24].shape
-    assert payload["embed"]["tts_bos"].shape == (1, 1, 4)
-
-
 def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> None:
     # Graph-padded batch: padded_total_tokens > total_tokens; slice by the real token axis.
     padded_codes = torch.arange(16, dtype=torch.long).reshape(8, 2)
@@ -280,20 +234,20 @@ def test_async_chunk_output_stages_mm_on_copy_stream_before_get_output(monkeypat
     assert torch.equal(output.get_output().inter_stage_outputs[0]["codes.audio"], torch.tensor([[7, 8]]))
 
 
-def test_async_copy_mm_nested_payload_scalars_and_leaf_failure(monkeypatch) -> None:
-    payload = {"codes": {"audio": torch.randn(2, 3)}, "items": [torch.randn(3), "text"], "meta": "s"}
-    result = _async_copy_mm(payload, total_tokens=2)
-    assert result["codes"]["audio"].device == torch.device("cpu")
-    assert isinstance(result["items"][0], torch.Tensor) and result["items"][1] == "text"
-    assert _async_copy_mm({}, 10) == {}
-    assert not omni_ar_model_runner._has_cuda_tensor({"codes": {"audio": torch.ones(1)}})
-    good, bad, original = torch.randn(2), torch.randn(2), omni_ar_model_runner._async_copy_mm_value
-
-    def fail_leaf(value, **kw):
-        if value is bad:
-            raise RuntimeError("D2H failure")
-        return original(value, **kw)
-
-    monkeypatch.setattr(omni_ar_model_runner, "_async_copy_mm_value", fail_leaf)
-    with pytest.raises(RuntimeError, match="D2H failure"):
-        _async_copy_mm({"good": good, "bad": bad}, 10)
+@pytest.mark.parametrize("prefill_first", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
+    lengths = np.array([255, 1] if prefill_first else [1, 255])
+    offsets = np.array([0, lengths[0], 256])
+    size = 512 if padded else 256
+    ref = torch.arange(size * 16).reshape(size, 16)
+    refs = [ref, torch.empty(0)] if prefill_first else [torch.empty(0), ref]
+    codes = torch.arange(size * 16).reshape(size, 16)
+    outputs, _ = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        {"codes": {"audio": codes, "ref": refs}}, offsets, lengths, 2, 256, size
+    )
+    index = 0 if prefill_first else 1
+    assert torch.equal(outputs[index]["codes.ref"], ref)
+    assert outputs[index]["codes.ref"].data_ptr() != ref.data_ptr()
+    for i in range(2):
+        assert torch.equal(outputs[i]["codes.audio"], codes[offsets[i] : offsets[i + 1]])

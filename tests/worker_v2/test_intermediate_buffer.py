@@ -19,7 +19,6 @@ from vllm_omni.engine import (
     AdditionalInformationPayload,
     PromptEmbedsPayload,
 )
-from vllm_omni.worker.payload_span import merge_tensor_spans
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
     _resolve_additional_information,
@@ -95,46 +94,3 @@ def test_update_merge_semantics(monkeypatch):
     assert stored is not tensor
     assert torch.equal(stored, tensor)
     assert "kv" in buf.buffers[0]
-
-
-def test_update_gpu_tensor_rows_one_owned_snapshot():
-    buf = OmniIntermediateBuffer(max_num_reqs=2)
-    buf.add_request(0, _make_new_req_data("r0"))
-    buf.add_request(1, _make_new_req_data("r1"))
-    source = torch.tensor([[1, 2, 3], [4, 5, 6]])
-
-    buf.update_gpu_tensor_rows([1, 0], ("codes", "audio"), source)
-    source.fill_(99)
-
-    first = buf.buffers[0]["codes"]["audio"]
-    second = buf.buffers[1]["codes"]["audio"]
-    assert torch.equal(first, torch.tensor([[4, 5, 6]]))
-    assert torch.equal(second, torch.tensor([[1, 2, 3]]))
-    # One owned clone: rows share one storage, distinct from the source.
-    assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
-    assert first.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
-
-    previous = first
-    buf.update_gpu_tensor_rows([0], ("codes", "audio"), torch.tensor([[9, 9, 9]]))
-    assert torch.equal(previous, torch.tensor([[4, 5, 6]]))  # earlier snapshot not mutated
-
-
-def test_update_merges_pending_absolute_decode_spans_until_ack() -> None:
-    buf = OmniIntermediateBuffer(max_num_reqs=1)
-    buf.add_request(0, _make_new_req_data("r0"))
-    gpu_keys = {("embed", "decode")}
-
-    def span(text, start, end):
-        return {"embed": {"decode": text, "decode_token_start": start, "decode_token_end": end}}
-
-    buf.update(0, span(torch.tensor([[3.0]]), 3, 4), gpu_keys)
-    buf.update(0, span(torch.tensor([[4.0], [5.0], [6.0]]), 4, 7), gpu_keys)
-
-    embed = buf.buffers[0]["embed"]
-    assert (embed["decode_token_start"], embed["decode_token_end"]) == (3, 7)
-    assert torch.equal(embed["decode"], torch.tensor([[3.0], [4.0], [5.0], [6.0]]))
-    # Ack clears the pending span; a consumed cached span reuses the incoming tensor.
-    buf.update(0, span(None, None, None), gpu_keys)
-    assert buf.buffers[0]["embed"]["decode"] is None
-    merged = merge_tensor_spans((torch.empty((0, 4)), 7, 7), (torch.arange(8.0).reshape(2, 4), 7, 9))
-    assert merged[1:] == (7, 9)

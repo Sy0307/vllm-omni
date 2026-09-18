@@ -108,69 +108,23 @@ class TestNativeMRV2DataPlaneSelection(unittest.TestCase):
         self.assertFalse(uses_native_mrv2_data_plane(SimpleNamespace(async_chunk=False), use_v2_model_runner=True))
 
 
-class TestChunkCoordinatorStateTransition(unittest.TestCase):
-    """Test 5: process_pending_chunks transitions WAITING_FOR_CHUNK → target."""
-
-    def test_ready_request_transitions_to_waiting(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-
-        req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(
-            waiting,
-            running,
-            chunk_ready_req_ids={"r1"},
-            chunk_finished_req_ids=set(),
-        )
-
-        self.assertEqual(req.status, RequestStatus.WAITING)
-        self.assertIn("r1", coord.requests_with_ready_chunks)
-
-        # A finished signal moves the request to finished_requests.
-        coord.process_pending_chunks(
-            MockQueue([_make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)]),
-            [],
-            chunk_ready_req_ids=set(),
-            chunk_finished_req_ids={"r1"},
-        )
-        self.assertIn("r1", coord.finished_requests)
-
-    def test_non_ready_stays_waiting_for_chunk(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-
-        req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(
-            waiting,
-            running,
-            chunk_ready_req_ids=set(),
-            chunk_finished_req_ids=set(),
-        )
-
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-
-    def test_new_waiter_emits_minimal_runner_registration_handle(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("internal", status=RequestStatus.WAITING)
-        req.external_req_id = "external"
-        waiting = MockQueue([req])
-
-        coord.process_pending_chunks(
-            waiting,
-            [],
-            chunk_ready_req_ids=set(),
-            chunk_finished_req_ids=set(),
-        )
-
-        assert len(coord.pending_chunk_registrations) == 1
-        handle = coord.pending_chunk_registrations[0]
-        assert isinstance(handle, OmniChunkRecvHandle)
-        assert handle.request_id == "internal"
-        assert handle.external_req_id == "external"
+def test_chunk_registration_ready_and_terminal_lifecycle():
+    coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+    req = _make_request("internal", status=RequestStatus.WAITING)
+    req.external_req_id = "external"
+    waiting = MockQueue([req])
+    coord.process_pending_chunks(waiting, [], set(), set())
+    assert req.status == RequestStatus.WAITING_FOR_CHUNK
+    [handle] = coord.pending_chunk_registrations
+    assert isinstance(handle, OmniChunkRecvHandle)
+    assert (handle.request_id, handle.external_req_id) == ("internal", "external")
+    coord.restore_queues(waiting, [])
+    coord.process_pending_chunks(waiting, [], {"internal"}, set())
+    assert req.status == RequestStatus.WAITING
+    assert "internal" in coord.requests_with_ready_chunks
+    req.status = RequestStatus.WAITING_FOR_CHUNK
+    coord.process_pending_chunks(waiting, [], set(), {"internal"})
+    assert "internal" in coord.finished_requests
 
 
 class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):

@@ -164,16 +164,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         routed_experts = self.execute_model_state.routed_experts
         self.execute_model_state = None
 
-        if not self.is_last_pp_rank:
-            assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
-            self.postprocess_num_computed_tokens(input_batch)
-            if not all_decode_next:
-                self.model_state.postprocess_state(input_batch.idx_mapping, 0)
-            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
-
         # --- Omni: reconstruct raw model output and post-process ---
         aux = self._last_aux_output
         self._last_aux_output = None
@@ -559,12 +549,13 @@ def _slice_pooler_value(
     end: int,
     total_tokens: int,
     padded_total_tokens: int | None = None,
+    request_scoped: bool = False,
 ) -> Any:
     if isinstance(value, torch.Tensor):
         token_axis_sizes = {total_tokens}
         if padded_total_tokens is not None:
             token_axis_sizes.add(padded_total_tokens)
-        if value.dim() > 0 and value.shape[0] in token_axis_sizes:
+        if not request_scoped and value.dim() > 0 and value.shape[0] in token_axis_sizes:
             return value[start:end].contiguous()
         return value.clone()
     if isinstance(value, dict):
@@ -576,21 +567,28 @@ def _slice_pooler_value(
                 end=end,
                 total_tokens=total_tokens,
                 padded_total_tokens=padded_total_tokens,
+                request_scoped=request_scoped,
             )
             for key, val in value.items()
         }
     if isinstance(value, list):
         if not value:
             return []
-        elem = value[req_index] if req_index < len(value) else value[0]
-        return _slice_pooler_value(
-            elem,
-            req_index=req_index,
-            start=start,
-            end=end,
-            total_tokens=total_tokens,
-            padded_total_tokens=padded_total_tokens,
-        )
+        # Lists at the batch level contain request-owned payloads. Their
+        # tensors use local axes even when a size coincides with batch tokens.
+        values = value if request_scoped else [value[req_index] if req_index < len(value) else value[0]]
+        owned = [
+            _slice_pooler_value(
+                item,
+                req_index=req_index,
+                start=start,
+                end=end,
+                total_tokens=total_tokens,
+                request_scoped=True,
+            )
+            for item in values
+        ]
+        return owned if request_scoped else owned[0]
     return value
 
 

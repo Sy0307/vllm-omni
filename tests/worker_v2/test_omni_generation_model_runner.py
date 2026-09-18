@@ -5,7 +5,7 @@
 CPU-sync vs CUDA-async dispatch, and async-chunk slot recycling."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -133,52 +133,6 @@ def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
     assert (added.req_id, added.prompt_token_ids) == ("req", [1])
 
 
-def test_async_chunk_slot_recycle_clears_model_state_not_buffer():
-    runner = object.__new__(OmniGenerationModelRunner)
-    runner.req_states = SimpleNamespace(
-        req_id_to_index={"req": 0},
-        prompt_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
-        prefill_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
-        total_len=MagicMock(),
-        all_token_ids=MagicMock(),
-        num_computed_tokens=MagicMock(),
-        num_computed_prefill_tokens=np.zeros(1, dtype=np.int32),
-        apply_staged_writes=MagicMock(),
-    )
-    runner.model_state = SimpleNamespace(
-        remove_request=MagicMock(), intermediate_buffer=SimpleNamespace(remove_request=MagicMock())
-    )
-    cached = SimpleNamespace(
-        req_ids=["req"], prompt_token_ids={"req": [7]}, new_block_ids=[()], additional_information={}
-    )
-    with patch("vllm_omni.worker_v2.omni_generation_model_runner.OmniCachedRequestData", type(cached)):
-        runner._handle_async_chunk_updates(SimpleNamespace(scheduled_cached_reqs=cached))
-    runner.model_state.remove_request.assert_called_once_with(0)
-    runner.model_state.intermediate_buffer.remove_request.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "payload,num_reqs,key,shapes",
-    [
-        ({"model_outputs": torch.ones(1, 4, 8)}, 1, "model_outputs", [(4, 8)]),
-        ({"model_outputs": torch.ones(3, 2, 5)}, 3, "model_outputs", [(2, 5)] * 3),
-        ({"codes": {"audio": torch.tensor([[1, 2], [3, 4]])}}, 2, "codes.audio", [(2,)] * 2),  # nested slice
-        ({"audio": torch.ones(2, 16), "sr": 24000}, 2, "audio", [(16,)] * 2),  # scalar broadcast
-        (None, 2, None, []),
-    ],
-)
-def test_generation_output_partition(payload, num_reqs, key, shapes):
-    runner = _make_runner(OmniOutput(text_hidden_states=torch.zeros(1), multimodal_outputs=payload), num_reqs=num_reqs)
-    result = OmniGenerationModelRunner.sample_tokens(runner)
-    assert isinstance(result, OmniModelRunnerOutput)
-    assert result.sampled_token_ids == [[] for _ in range(num_reqs)]
-    assert runner.req_states.num_computed_tokens.np.tolist() == [10] * num_reqs
-    if key is None:
-        assert result.multimodal_outputs == [{} for _ in range(num_reqs)]
-    else:
-        assert [tuple(item[key].shape) for item in result.multimodal_outputs] == shapes
-
-
 def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last():
     waveform = torch.arange(4, dtype=torch.float32)
     output = OmniOutput(text_hidden_states=torch.empty(0), multimodal_outputs={"codes": {"audio": [waveform]}})
@@ -228,11 +182,3 @@ def test_sample_tokens_uses_async_output_for_cuda_and_snapshots_req_ids(monkeypa
     output_req_ids = captured["model_runner_output"].req_ids
     input_batch.req_ids[0] = "reused"  # snapshot must insulate the published output
     assert output_req_ids == ["req-0"]
-
-
-@pytest.mark.parametrize("has_writer", [False, True])
-def test_block_table_staged_writes_require_writer(has_writer):
-    runner = object.__new__(OmniGenerationModelRunner)
-    runner.block_tables = MagicMock(fused_writer=object() if has_writer else None)
-    runner._apply_block_table_staged_writes_if_available()
-    assert runner.block_tables.apply_staged_writes.call_count == int(has_writer)

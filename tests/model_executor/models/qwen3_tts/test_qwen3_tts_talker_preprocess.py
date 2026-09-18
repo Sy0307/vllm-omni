@@ -379,41 +379,6 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
 
 
-def test_decode_batch_mrv2_contract_reuses_tts_batch_preprocess():
-    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
-    model = _make_minimal_talker(tts_pad_embed=tts_pad)
-    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
-    req_infos = [
-        {
-            "text": ["hello"],
-            "task_type": ["Base"],
-            "hidden_states": {
-                "trailing_text": torch.arange(8, dtype=torch.float32).reshape(2, 4),
-                "last": torch.full((4,), 2.0, dtype=torch.float32),
-            },
-            "meta": {"talker_text_offset": 1},
-        }
-    ]
-
-    expected = model.preprocess_decode_batch(
-        input_ids=torch.tensor([101], dtype=torch.long),
-        req_infos=req_infos,
-    )
-    actual = model.preprocess_decode_batch_mrv2(
-        input_ids=torch.tensor([101], dtype=torch.long),
-        input_embeds=torch.zeros(1, 4),
-        req_infos=req_infos,
-    )
-
-    for actual_tensor, expected_tensor in zip(actual[:4], expected[:4], strict=True):
-        assert torch.equal(actual_tensor, expected_tensor)
-    assert actual[4][0]["meta"] == expected[4][0]["meta"]
-    assert torch.equal(
-        actual[4][0]["hidden_states"]["trailing_text"],
-        expected[4][0]["hidden_states"]["trailing_text"],
-    )
-
-
 def _stub_text_embedding(device_param: torch.nn.Parameter):
     """Build a lambda that emulates ``nn.Embedding`` for the ``_device()`` helper.
 

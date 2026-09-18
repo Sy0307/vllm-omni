@@ -285,6 +285,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         """Cancel deferred outputs and terminate each live request once."""
         with self._native_output_lock:
             active_req_ids = {req_id for req_id in req_ids if req_id in self._native_requests}
+            # Receivers are registered before requests acquire model slots.
+            # Cancelling during that interval must still stop recv polling.
+            for req_id in req_ids - active_req_ids:
+                self.cleanup_finished_request(req_id)
             if not active_req_ids:
                 return 0
             for req_id in active_req_ids:

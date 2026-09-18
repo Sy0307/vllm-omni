@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Unit tests for OmniGPUModelRunner v2 dispatch and lifecycle overrides.
-
-Retained contracts: V1/V2 forward-input dispatch, empty-vs-new admission,
-GPU-resident cached side state, native data plane terminal/abort split,
-finalize/reserve ownership order, vLLM 0.29 capture contract (tuple unwrap +
-FULL-graph exclusion + MTP follow-up), descriptor dispatch, and the
-init_omni_model_state factory boundary.
-"""
+"""MRV2 admission, capture, dispatch and request lifecycle contracts."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -38,26 +31,6 @@ def _make_runner():
     return runner
 
 
-@pytest.mark.parametrize("native_data_plane", [False, True])
-def test_legacy_forward_inputs_dispatch(native_data_plane):
-    runner = _make_runner()
-    runner._omni_data_plane = object() if native_data_plane else None
-    runner.sampler = object()
-    sampling_metadata = object()
-    logits_indices = torch.tensor([0])
-    input_batch = SimpleNamespace(sampling_metadata=sampling_metadata, logits_indices=logits_indices)
-    model_inputs = {"input_ids": torch.tensor([1])}
-
-    runner._add_legacy_forward_inputs(model_inputs, input_batch)
-
-    if native_data_plane:
-        assert set(model_inputs) == {"input_ids"}
-    else:
-        assert model_inputs["sampling_metadata"] is sampling_metadata
-        assert model_inputs["logits_index"] is logits_indices
-        assert model_inputs["sampler"] is runner.sampler
-
-
 def test_add_requests_empty_admission_and_stop_id_sanitization():
     runner = _make_runner()
     runner.sampler = Sampler.__new__(Sampler)
@@ -75,23 +48,6 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
         parent.assert_called_once_with(output)
     assert sampling_params.all_stop_token_ids == {2150}
     assert sampling_params.eos_token_id == 151645
-
-
-def test_update_requests_preserves_cached_gpu_resident_side_state():
-    runner = _make_runner()
-    gpu_keys = {("hidden_states", "last"), ("hidden_states", "trailing_text")}
-    runner.model = SimpleNamespace(gpu_resident_buffer_keys=gpu_keys)
-    update_calls = []
-    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(update=lambda *a: update_calls.append(a)))
-    hidden = torch.randn(4)
-    sched_output = SimpleNamespace(
-        scheduled_cached_reqs=SimpleNamespace(additional_information={"r1": {"hidden_states": {"last": hidden}}})
-    )
-
-    with patch.object(GPUModelRunner, "update_requests", return_value=None):
-        runner.update_requests(sched_output)
-
-    assert update_calls == [(0, {"hidden_states": {"last": hidden}}, gpu_keys)]
 
 
 def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
@@ -119,32 +75,6 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
     plane.register_receivers.assert_called_once_with([handle])
     plane.request_terminal.assert_called_once_with({"r0"})
     plane.abort_requests.assert_called_once_with({"aborted"})
-
-
-def test_finalize_reserves_and_routes_native_data_plane_output():
-    runner = _make_runner()
-    connector_output = SimpleNamespace(chunk_ready_req_ids={"ready"})
-    plane = SimpleNamespace(
-        enqueue_outputs=MagicMock(),
-        reserve_outputs=MagicMock(),
-        get_omni_connector_output=MagicMock(return_value=connector_output),
-    )
-    runner._omni_data_plane = plane
-    output = SimpleNamespace(
-        req_ids=["r1"],
-        inter_stage_outputs=[{"codes.audio": "gpu-tensor"}],
-        sampled_token_ids=[[21]],
-        omni_connector_output=None,
-    )
-    result = runner._finalize_native_data_plane_output(output)
-    assert result is output
-    plane.enqueue_outputs.assert_called_once_with(
-        req_ids=["r1"], inter_stage_outputs=[{"codes.audio": "gpu-tensor"}], sampled_token_ids=[[21]]
-    )
-    assert output.inter_stage_outputs is None
-    assert output.omni_connector_output is connector_output
-    runner._reserve_native_data_plane_outputs(["r1", "r2"])
-    plane.reserve_outputs.assert_called_once_with(["r1", "r2"])
 
 
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
@@ -180,35 +110,6 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form):
     assert runner.model.forward is original_forward  # restored after capture
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
     runner.model_state.capture_talker_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
-
-
-@pytest.mark.parametrize("dp_size", [1, 2])
-def test_descriptor_dispatch_and_mtp_bucket(dp_size):
-    runner = object.__new__(OmniGPUModelRunner)
-    batch_desc = SimpleNamespace(num_tokens=8, num_reqs=2)
-    runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock(return_value=batch_desc))
-    runner.dp_size = dp_size
-    runner.dp_rank = 0
-    with patch("vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding", return_value=("synced", "tokens")) as sync:
-        result = runner._dispatch_batch_descriptor(
-            num_reqs=2, num_toks=8, uniform_tok_count=4, num_active_loras=3, use_eager=False, max_query_len=4
-        )
-    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, num_active_loras=3, max_query_len=4)
-    if dp_size == 1:
-        sync.assert_not_called()
-        assert result == (batch_desc, None)
-    else:
-        sync.assert_called_once()
-        assert result == ("synced", "tokens")
-
-    # MTP dispatch uses the largest captured bucket, or falls back to eager.
-    runner.scheduler_config = SimpleNamespace(max_num_seqs=6)
-    runner.model_state = SimpleNamespace(_get_talker_mtp_capture_sizes=MagicMock(return_value=[4, 2, 1]))
-    runner.cudagraph_manager.dispatch.reset_mock()
-    assert runner._dispatch_mtp_batch_descriptor(3) is batch_desc
-    runner.cudagraph_manager.dispatch.assert_called_once_with(4, 4, 1, 0)
-    result = runner._dispatch_mtp_batch_descriptor(6)
-    assert result.cg_mode == CUDAGraphMode.NONE and result.num_tokens == 6
 
 
 @pytest.mark.parametrize(

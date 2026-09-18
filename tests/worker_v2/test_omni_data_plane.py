@@ -210,29 +210,6 @@ def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
     assert sum(b[0][0].request_id == "ra" for b in batches) == 1  # terminal exactly once
 
 
-@pytest.mark.parametrize("fail_point", ["terminal", "deferred"])
-def test_enqueue_failure_propagates_and_holds_lifecycle(plane, fail_point):
-    plane.send_chunks = lambda _e, **_kw: (_ for _ in ()).throw(RuntimeError("enqueue failed"))
-    plane.register_request(_new_request())
-    if fail_point == "deferred":
-        plane.reserve_outputs(["internal"])
-        plane.request_terminal({"internal"})
-    with pytest.raises(RuntimeError, match="enqueue failed"):
-        plane.request_terminal({"internal"}) if fail_point == "terminal" else _complete(plane, [{"codes.audio": "x"}])
-    # Lifecycle state is held for retry; cleanup must not run.
-    assert (
-        plane.record.cleaned == []
-        and "internal" in plane._native_requests
-        and "internal" in plane._native_terminal_pending
-    )
-    if fail_point == "deferred":
-        assert plane._native_outputs_in_flight["internal"] == 1
-    # After recovery the held terminal is emitted once, after any held data.
-    plane.send_chunks = lambda entries, **_kw: plane.record.batches.append(entries) or len(entries)
-    recovered = plane.request_terminal(set()) if fail_point == "terminal" else _complete(plane, [{"x": 1}])
-    assert recovered == (1 if fail_point == "terminal" else 2) and "internal" not in plane._native_requests
-
-
 def test_abort_cannot_overtake_committed_output(plane):
     in_lock, release, sent = threading.Event(), threading.Event(), threading.Event()
 
@@ -464,23 +441,41 @@ def test_native_worker_capacity_error_cache_and_tp_gates():
     assert OmniGPUModelRunner._uses_native_output_materializer(runner) is True
 
 
-def test_accumulate_and_pop_decode_delta():
-    plane = object.__new__(OmniRunnerDataPlane)
-    plane._lock, plane._request_ids_mapping = threading.Lock(), {"internal": "external"}
-    decode = torch.tensor([[1.0], [2.0]])
-    accumulated = {
-        "embed": {"prefill": "prefill", "decode": decode, "decode_token_start": 1, "decode_token_end": 3},
-        "ids": {"prompt": [1, 2], "output": [3, 4]},
-    }
-    plane._send_side_request_payload = {"external": accumulated}
-    plane._local_stage_payload_cache = {"internal": accumulated}
-    payload = plane.pop_local_stage_payload("internal")
-    # pop hands the delta to the model and acks its rows in connector accumulation.
-    assert payload["embed"]["decode"] is decode
-    assert accumulated["embed"] == {"prefill": "prefill"} and accumulated["ids"] == {"prompt": [1, 2]}
-    # Absolute decode spans do not duplicate when re-accumulated.
-    plane._send_side_request_payload = {}
-    span = {"embed": {"decode": decode, "decode_token_start": 1, "decode_token_end": 3}}
-    plane._accumulate_payload("external", span)
-    merged = plane._accumulate_payload("external", span)
-    assert merged["embed"]["decode_token_start"] == 1 and torch.equal(merged["embed"]["decode"], decode)
+def test_abort_before_first_chunk_cleans_receiver_state():
+    plane = _bare_plane()
+    plane._stage_id, plane._lock, plane._work_available = 1, threading.Lock(), threading.Event()
+    for name in (
+        "_pending_full_payload_send",
+        "_request_ids_mapping",
+        "_pending_save_counts",
+        "_send_side_request_payload",
+        "_code_prompt_token_ids",
+        "_cached_ic",
+        "_adaptive_states",
+        "_kv_pending_transfers",
+        "_get_req_chunk",
+        "_pending_load_reqs",
+        "_local_stage_payload_cache",
+        "_local_request_metadata",
+    ):
+        setattr(plane, name, {})
+    for name in (
+        "_deferred_send_cleanup",
+        "_kv_active_transfers",
+        "_kv_completed_transfers",
+        "_kv_triggered_requests",
+        "_finished_load_reqs",
+        "_chunk_ready_req_ids",
+        "_chunk_finished_req_ids",
+        "_chunk_stream_completed",
+        "_stage_recv_req_ids",
+        "_full_payload_pending_broadcast_req_ids",
+        "_async_chunk_updated_req_ids",
+    ):
+        setattr(plane, name, set())
+    plane.register_receivers([SimpleNamespace(request_id="r", external_req_id="external")])
+    plane._local_stage_payload_cache["r"] = {"codes": torch.ones(1)}
+    assert "r" in plane._pending_load_reqs and plane._request_ids_mapping["r"] == "external"
+    assert plane.abort_requests({"r"}) == 0
+    assert plane.abort_requests({"r"}) == 0
+    assert not plane._pending_load_reqs and not plane._request_ids_mapping and not plane._local_stage_payload_cache

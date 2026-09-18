@@ -761,12 +761,12 @@ class TestCodePredictorWrapperConfig:
         wrapper._prefix_graph_seq_lens = {1, 2, 4, 8, 99}
         assert wrapper._prefix_seq_lens(6) == [2, 4]
 
-    def test_prefix_reprefill_does_not_require_nested_cuda_graphs(
+    def test_prefix_graph_env_requires_cuda_graphs(
         self,
         mocker: MockerFixture,
         loaded_target_classes,
     ) -> None:
-        """Outer MRv2 graphs can capture prefix re-prefill without inner graphs."""
+        """Avoid prefix warmup on shared code-predictor users that disable CUDA graphs."""
         _ = loaded_target_classes
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
@@ -786,7 +786,6 @@ class TestCodePredictorWrapperConfig:
             cp_config=cp_config,
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
         )
-        assert no_graph_wrapper._prefix_reprefill_enabled is True
         assert no_graph_wrapper._prefix_graphs_enabled is False
         assert no_graph_wrapper._prefix_graph_buckets == {2}
         assert no_graph_wrapper._prefix_graph_seq_lens == {2, 3}
@@ -796,42 +795,7 @@ class TestCodePredictorWrapperConfig:
             cp_config=cp_config,
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
         )
-        assert graph_wrapper._prefix_reprefill_enabled is True
         assert graph_wrapper._prefix_graphs_enabled is True
-
-    def test_prefix_reprefill_uses_configured_batch_buckets(
-        self,
-        mocker: MockerFixture,
-        loaded_target_classes,
-    ) -> None:
-        """Outer MRv2 graph buckets must also bound predictor padding."""
-        _ = loaded_target_classes
-        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
-        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
-
-        cp_config, _ = _make_tiny_config(loaded_target_classes)
-        vllm_config = _make_vllm_config(mocker, max_num_seqs=4)
-        vllm_config.model_config.stage_connector_config = {
-            "extra": {
-                "code_predictor_prefix_graphs": True,
-                "code_predictor_prefix_graph_buckets": [3, 4],
-                "code_predictor_prefix_graph_seq_lens": [2, 3],
-            }
-        }
-        wrapper = common_mod.CodePredictorWrapper(
-            vllm_config=vllm_config,
-            cp_config=cp_config,
-            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
-            talker_hidden_size=cp_config.hidden_size,
-        )
-        wrapper._model_dtype = next(wrapper.model.parameters()).dtype
-        wrapper._compiled_model_fwd = wrapper.model.forward
-
-        wrapper._warmup_buckets()
-
-        assert wrapper._bucket_sizes == [1, 2, 3, 4]
-        assert wrapper._padded_bsz(3) == 3
-        assert (3, 2) in wrapper._bucket_pos_ids
 
 
 class TestGumbelMaxSampling:
