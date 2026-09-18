@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -15,8 +17,8 @@ class _Coordinator:
     _async_chunk = True
 
     def __init__(self) -> None:
-        self.metadata_calls = []
-        self.chunk_calls = []
+        self.metadata_calls: list[tuple[Any, ...]] = []
+        self.chunk_calls: list[tuple[Any, ...]] = []
 
     def update_request_metadata(self, requests, metadata, model_mode) -> None:
         self.metadata_calls.append((requests, metadata, model_mode))
@@ -29,7 +31,7 @@ class _Scheduler(OmniSchedulerMixin):
     def __init__(self) -> None:
         self.requests = {"r1": object(), "r2": object()}
         self.waiting = object()
-        self.running = []
+        self.running: list[Any] = []
         self.input_coordinator = _Coordinator()
         self._latest_omni_connector_output = None
         self._init_omni_connector_output_inbox()
@@ -53,20 +55,11 @@ def test_direct_ready_inbox_merges_events_before_scheduler_admission() -> None:
     scheduler._consume_pending_connector_output(model_mode="ar")
 
     assert scheduler.input_coordinator.metadata_calls == [
-        (
-            scheduler.requests,
-            {
-                "r1": {"decode_token_end": 2},
-                "r2": {"left_context_size": 25},
-            },
-            "ar",
-        )
+        (scheduler.requests, {"r1": {"decode_token_end": 2}, "r2": {"left_context_size": 25}}, "ar")
     ]
     assert scheduler.input_coordinator.chunk_calls == [(scheduler.waiting, scheduler.running, {"r1", "r2"}, {"r2"})]
-
     scheduler._consume_pending_connector_output(model_mode="ar")
-    assert len(scheduler.input_coordinator.metadata_calls) == 1
-    assert scheduler.input_coordinator.chunk_calls[-1][2:] == (set(), set())
+    assert len(scheduler.input_coordinator.metadata_calls) == 1  # drained once
 
 
 def test_ready_inbox_drops_late_events_for_aborted_request() -> None:

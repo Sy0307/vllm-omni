@@ -492,9 +492,9 @@ class OmniSchedulingCoordinator:
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:
             for req_data in scheduler_output.scheduled_new_reqs:
-                self.requests_with_ready_chunks.discard(
-                    getattr(req_data, "req_id", None),
-                )
+                req_id = getattr(req_data, "req_id", None)
+                if req_id is not None:
+                    self.requests_with_ready_chunks.discard(req_id)
 
         if scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:

@@ -1223,7 +1223,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         if connector is None:
             return True
 
-        request_id = task.get("request_id")
+        request_id = task["request_id"]
         payload_data = task.get("data")
         if payload_data is None and task.get("request") is not None:
             payload_data = self._build_custom_process_payload(

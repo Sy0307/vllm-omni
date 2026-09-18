@@ -345,37 +345,20 @@ Keep `decode_batch_max_size` consistent with the intended maximum too; the
 stateful graph path currently groups according to the captured buckets, while
 the stateless path also uses the explicit maximum.
 
-Historical H200 C64 experiments on a different source snapshot found a B4
-throughput improvement over B2, but also longer playback gaps after an early
-first packet. That is why B4 is a separate experimental profile. First-packet
-latency alone does not establish uninterrupted playback. Validate inter-chunk
-arrival times, buffering, WER and speaker similarity before adopting either
-batching preset for a production workload. Floating-point decoder outputs can
-differ across batch sizes; this PR does not claim bitwise or quality equivalence.
+B4 remains experimental. First-packet latency alone does not establish
+uninterrupted playback. Validate inter-chunk arrival times, buffering, WER and
+speaker similarity before adopting either batching preset for a production
+workload. Floating-point decoder outputs can differ across batch sizes; this PR
+does not claim bitwise or quality equivalence.
 
 ### Optional MPS deployment
 
-NVIDIA MPS can reduce interference between colocated Talker and Code2Wav CUDA
-contexts. It is an operator setting, not a YAML option or a library default.
-Use an idle assigned GPU and an independent MPS pipe directory; a private MPS
-server does not provide exclusive GPU ownership or MIG isolation.
+NVIDIA MPS is an optional operator setting for colocated CUDA processes, not a
+YAML option or a library default. This PR does not establish a throughput or
+first-packet latency benefit from MPS. Measure the exact deployment with and
+without MPS before enabling it.
 
-For example, in a shell with the assigned GPU selected:
-
-```bash
-# Replace this with the UUID of the GPU assigned to this deployment.
-export CUDA_VISIBLE_DEVICES=GPU-REPLACE-WITH-ASSIGNED-UUID
-qwen_mps_dir=$(mktemp -d /tmp/qwen-tts-mps.XXXXXX)
-export CUDA_MPS_PIPE_DIRECTORY="$qwen_mps_dir/pipe"
-export CUDA_MPS_LOG_DIRECTORY="$qwen_mps_dir/log"
-mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-nvidia-cuda-mps-control -d
-vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2.yaml
-# After this deployment and its workers have exited, stop only this MPS server.
-echo quit | nvidia-cuda-mps-control
-```
-
-Measure the exact deployment with and without MPS. Historical results combining
-shallow-copy experiments, different graph settings and MPS are not performance
-measurements of this branch.
+Use only assigned GPUs and an independent MPS pipe directory. A private MPS
+server does not provide exclusive GPU ownership or MIG isolation. For a
+single-GPU deployment, explicitly place both stages on that GPU; the supplied
+high-concurrency profile places its two stages on different GPUs by default.

@@ -3,6 +3,7 @@
 
 from collections import OrderedDict, UserDict
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -533,7 +534,7 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
 
     text_tok = FakeTextTokenizer()
     builder._text_tokenizer = text_tok
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -594,7 +595,7 @@ def test_base_voice_clone_batch_preprocess_reuses_singleton_normalized_audio_wit
             return {"input_ids": [[7, 8, 9] for _ in texts]}
 
     builder._text_tokenizer = FakeTextTokenizer()
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -627,7 +628,7 @@ def test_base_voice_clone_batch_preprocess_skips_after_initial_prefill_state_exi
     builder._encode_ref_audio_batch_fn = lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("speech tokenizer not expected")
     )
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -662,7 +663,7 @@ def test_base_voice_clone_batch_preprocess_uses_serving_artifact_cache_key_witho
             return {"input_ids": [[7, 8, 9] for _ in texts]}
 
     builder._text_tokenizer = FakeTextTokenizer()
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],

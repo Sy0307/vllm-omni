@@ -636,7 +636,7 @@ class _OmniConnectorRuntimeMixin:
         """Whether *func* matches the mixin payload-builder contract."""
         return cls._connector_payload_kwarg(func) is not None
 
-    def _resolve_external_req_id(self, request: Any, fallback_req_id: str) -> str:
+    def _resolve_external_req_id(self, request: Any, fallback_req_id: str | None) -> str:
         """Resolve the external request ID consistently.
 
         Checks ``_request_ids_mapping`` first (populated by
@@ -644,7 +644,7 @@ class _OmniConnectorRuntimeMixin:
         ``external_req_id`` attribute, and finally to the given
         ``fallback_req_id``.
         """
-        mapped = self._request_ids_mapping.get(fallback_req_id)
+        mapped = self._request_ids_mapping.get(fallback_req_id) if fallback_req_id is not None else None
         if mapped is not None:
             return mapped
         if request is not None:
@@ -652,6 +652,8 @@ class _OmniConnectorRuntimeMixin:
             ext = getattr(request, "external_req_id", None)
             if ext is not None:
                 return ext
+        if fallback_req_id is None:
+            raise ValueError("Connector request has neither an external nor an internal request ID")
         return fallback_req_id
 
     def _resolve_next_stage_id(self, model_config: Any) -> int:

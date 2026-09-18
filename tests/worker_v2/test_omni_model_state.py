@@ -20,6 +20,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
+    input_ids: SimpleNamespace
+    query_start_loc: torch.Tensor
+
     def __init__(self, indices, *, num_computed_tokens_cpu=None):
         self.idx_mapping_np = indices
         self.num_reqs = len(indices)
@@ -314,7 +317,12 @@ def test_decode_rows_before_prefill_use_zero_copy_prefix_view():
 def test_deferred_talker_text_projection_runs_once_per_batch():
     state = _make_state(max_num_reqs=2, has_preprocess=True)
     projected = []
-    state.model.project_talker_text_steps = lambda steps: projected.append(steps.clone()) or (steps + 100)
+
+    def project(steps):
+        projected.append(steps.clone())
+        return steps + 100
+
+    state.model.project_talker_text_steps = project
 
     def preprocess(input_ids, input_embeds, **info):
         assert info["_omni_defer_talker_text_projection"] is True
@@ -539,7 +547,12 @@ def test_gpu_codec_state_uses_one_snapshot_writeback():
 def test_seeded_talker_mtp_bypasses_outer_graph_runner():
     state = _make_state(max_num_reqs=2)
     raw_calls = []
-    state.model.talker_mtp = lambda *args, **kwargs: (raw_calls.append(kwargs) or (args[1], args[0].reshape(-1, 1)))
+
+    def talker_mtp(*args, **kwargs):
+        raw_calls.append(kwargs)
+        return args[1], args[0].reshape(-1, 1)
+
+    state.model.talker_mtp = talker_mtp
     state._talker_mtp_runner = MagicMock(side_effect=AssertionError("seeded sampling must not replay the graph"))
     generators = [torch.Generator().manual_seed(11), torch.Generator().manual_seed(22)]
     state._call_talker_mtp_runner(

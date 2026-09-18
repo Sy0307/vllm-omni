@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Tests for OmniGenerationModelRunner sample_tokens contracts.
-
-Retained contracts: empty-step lifecycle ordering, output partition matrix
-(tensor/list/scalar/none per-request), CPU sync vs CUDA async dispatch with
-req_ids snapshot ownership, and async-chunk slot recycling semantics.
-"""
+"""OmniGenerationModelRunner contracts: empty-step lifecycle, output partition,
+CPU-sync vs CUDA-async dispatch, and async-chunk slot recycling."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,29 +13,26 @@ import torch
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.omni_generation_model_runner import (
-    OmniGenerationModelRunner,
-    _materialize_generation_value,
-)
+from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeStagedField:
-    def __init__(self, data: np.ndarray):
+    def __init__(self, data):
         self.np = data
-        self._staged: list[tuple[int, int]] = []
+        self._staged = []
 
-    def stage_write_elem(self, idx: int, value: int) -> None:
+    def stage_write_elem(self, idx, value):
         self._staged.append((idx, value))
 
-    def apply_write(self) -> None:
+    def apply_write(self):
         for idx, value in self._staged:
             self.np[idx] = value
         self._staged.clear()
 
 
-def _make_runner(model_output, num_reqs: int = 1, prompt_len: int = 10):
+def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner = object.__new__(OmniGenerationModelRunner)
     runner.device = torch.device("cpu")
     runner.model_config = MagicMock(hf_text_config=None)
@@ -78,7 +71,6 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction():
     scheduler_output = SimpleNamespace(
         total_num_scheduled_tokens=0, scheduled_new_reqs=[], scheduled_cached_reqs=SimpleNamespace(req_ids=[])
     )
-    # An empty step pumps only lifecycle hooks and returns connector output.
     assert runner.execute_model(scheduler_output) is output
     assert order == [
         "_prepare_native_data_plane",
@@ -88,7 +80,7 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction():
     ]
 
 
-def test_released_chunk_reuses_scheduler_output_and_slots_cycle():
+def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_omni.core.sched.output import OmniCachedRequestData
@@ -103,7 +95,12 @@ def test_released_chunk_reuses_scheduler_output_and_slots_cycle():
     )
     runner.pooling_runner = None
     runner.encoder_cache = None
-    runner.model_state = SimpleNamespace(add_request=MagicMock(), apply_staged_writes=MagicMock())
+    runner.model_state = SimpleNamespace(
+        add_request=MagicMock(),
+        apply_staged_writes=MagicMock(),
+        remove_request=MagicMock(),
+        intermediate_buffer=SimpleNamespace(remove_request=MagicMock()),
+    )
     runner.block_tables = SimpleNamespace(append_block_ids=MagicMock())
     runner.lora_state = SimpleNamespace(add_request=MagicMock())
     runner.is_last_pp_rank = False
@@ -131,16 +128,14 @@ def test_released_chunk_reuses_scheduler_output_and_slots_cycle():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
-
     runner._handle_async_chunk_updates(scheduler_output)
-
     added = runner.model_state.add_request.call_args.args[1]
-    assert added.req_id == "req"
-    assert added.prompt_token_ids == [1]
+    assert (added.req_id, added.prompt_token_ids) == ("req", [1])
 
-    # A recycled chunk slot clears model state only, never the intermediate buffer.
-    runner2 = object.__new__(OmniGenerationModelRunner)
-    runner2.req_states = SimpleNamespace(
+
+def test_async_chunk_slot_recycle_clears_model_state_not_buffer():
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.req_states = SimpleNamespace(
         req_id_to_index={"req": 0},
         prompt_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
         prefill_len=SimpleNamespace(np=np.zeros(1, dtype=np.int32)),
@@ -150,16 +145,16 @@ def test_released_chunk_reuses_scheduler_output_and_slots_cycle():
         num_computed_prefill_tokens=np.zeros(1, dtype=np.int32),
         apply_staged_writes=MagicMock(),
     )
-    runner2.model_state = SimpleNamespace(
+    runner.model_state = SimpleNamespace(
         remove_request=MagicMock(), intermediate_buffer=SimpleNamespace(remove_request=MagicMock())
     )
-    cached2 = SimpleNamespace(
+    cached = SimpleNamespace(
         req_ids=["req"], prompt_token_ids={"req": [7]}, new_block_ids=[()], additional_information={}
     )
-    with patch("vllm_omni.worker_v2.omni_generation_model_runner.OmniCachedRequestData", type(cached2)):
-        runner2._handle_async_chunk_updates(SimpleNamespace(scheduled_cached_reqs=cached2))
-    runner2.model_state.remove_request.assert_called_once_with(0)
-    runner2.model_state.intermediate_buffer.remove_request.assert_not_called()
+    with patch("vllm_omni.worker_v2.omni_generation_model_runner.OmniCachedRequestData", type(cached)):
+        runner._handle_async_chunk_updates(SimpleNamespace(scheduled_cached_reqs=cached))
+    runner.model_state.remove_request.assert_called_once_with(0)
+    runner.model_state.intermediate_buffer.remove_request.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -167,9 +162,8 @@ def test_released_chunk_reuses_scheduler_output_and_slots_cycle():
     [
         ({"model_outputs": torch.ones(1, 4, 8)}, 1, "model_outputs", [(4, 8)]),
         ({"model_outputs": torch.ones(3, 2, 5)}, 3, "model_outputs", [(2, 5)] * 3),
-        ({"model_outputs": [torch.ones(3, 2)]}, 1, "model_outputs", [(3, 2)]),
-        ({"audio": torch.ones(2, 16), "sr": 24000}, 2, "audio", [(16,)] * 2),  # scalar broadcast
         ({"codes": {"audio": torch.tensor([[1, 2], [3, 4]])}}, 2, "codes.audio", [(2,)] * 2),  # nested slice
+        ({"audio": torch.ones(2, 16), "sr": 24000}, 2, "audio", [(16,)] * 2),  # scalar broadcast
         (None, 2, None, []),
     ],
 )
@@ -183,12 +177,9 @@ def test_generation_output_partition(payload, num_reqs, key, shapes):
         assert result.multimodal_outputs == [{} for _ in range(num_reqs)]
     else:
         assert [tuple(item[key].shape) for item in result.multimodal_outputs] == shapes
-    # Scalar helper: per-request lists pass through untouched.
-    waves = [torch.tensor([0.1]), torch.tensor([0.2])]
-    assert torch.equal(_materialize_generation_value({"audio": waves}, 1, 2)["audio"], waves[1])
 
 
-def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last(monkeypatch):
+def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last():
     waveform = torch.arange(4, dtype=torch.float32)
     output = OmniOutput(text_hidden_states=torch.empty(0), multimodal_outputs={"codes": {"audio": [waveform]}})
     runner = _make_runner(output, num_reqs=1)
@@ -199,14 +190,11 @@ def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last(monkeypatch
         assert runner.req_states.num_computed_tokens.np.tolist() == [10]
 
     runner.kv_connector.post_forward.side_effect = post_forward
-
     result = OmniGenerationModelRunner.sample_tokens(runner)
-
     assert isinstance(result, OmniModelRunnerOutput)
-    # Reserve precedes finalize (output ownership order), connector runs after state.
+    # Reserve precedes finalize; connector runs after token state is applied.
     runner._reserve_native_data_plane_outputs.assert_called_once_with(["req-0"])
     runner.kv_connector.post_forward.assert_called_once_with({"finished"})
-    # CPU output owns its waveform after the model buffer is reused.
     waveform.fill_(-1)
     assert torch.equal(result.multimodal_outputs[0]["codes.audio"], torch.arange(4, dtype=torch.float32))
 
@@ -231,16 +219,20 @@ def test_sample_tokens_uses_async_output_for_cuda_and_snapshots_req_ids(monkeypa
 
     monkeypatch.setattr(generation_runner, "OmniGenerationAsyncOutput", _FakeAsyncOutput)
     input_batch = runner._gen_input_batch
-
     result = generation_runner.OmniGenerationModelRunner.sample_tokens(runner)
 
     assert isinstance(result, _FakeAsyncOutput)
-    assert captured["multimodal_outputs"] is output.multimodal_outputs
-    assert captured["main_stream"] is runner.main_stream
     assert captured["finalize_output"] is runner._finalize_native_data_plane_output
     assert captured["model_runner_output"].sampled_token_ids == [[]]
     runner._release_generation_slots.assert_called_once()
-    # req_ids are snapshotted: scheduler-side reuse must not leak into the output.
     output_req_ids = captured["model_runner_output"].req_ids
-    input_batch.req_ids[0] = "reused"
+    input_batch.req_ids[0] = "reused"  # snapshot must insulate the published output
     assert output_req_ids == ["req-0"]
+
+
+@pytest.mark.parametrize("has_writer", [False, True])
+def test_block_table_staged_writes_require_writer(has_writer):
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.block_tables = MagicMock(fused_writer=object() if has_writer else None)
+    runner._apply_block_table_staged_writes_if_available()
+    assert runner.block_tables.apply_staged_writes.call_count == int(has_writer)

@@ -12,11 +12,13 @@ from typing import Any
 
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import RequestQueue
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
@@ -104,6 +106,12 @@ elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    # Provided by the concrete vLLM scheduler.
+    vllm_config: VllmConfig
+    requests: dict[str, Request]
+    waiting: RequestQueue
+    running: list[Request]
 
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
@@ -258,11 +266,11 @@ class OmniSchedulerMixin:
             held = ()
         for request in parked:
             req_id = getattr(request, "request_id", None)
-            if req_id in live_requests:
+            if req_id is not None and req_id in live_requests:
                 reserved_ids.add(req_id)
         for request in held:
             req_id = getattr(request, "request_id", None)
-            if req_id in live_requests:
+            if req_id is not None and req_id in live_requests:
                 reserved_ids.add(req_id)
         return len(reserved_ids)
 
@@ -568,7 +576,7 @@ class OmniSchedulerMixin:
             else:
                 pending_input_registrations = input_coordinator.pending_input_registrations
         if data_plane_terminal_req_ids is None:
-            pending_terminal = getattr(self, "_pending_data_plane_terminal_req_ids", set())
+            pending_terminal: set[str] = getattr(self, "_pending_data_plane_terminal_req_ids", set())
             data_plane_terminal_req_ids = set(pending_terminal)
             pending_terminal.clear()
         if input_coordinator is not None:

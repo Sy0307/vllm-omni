@@ -22,10 +22,15 @@ def test_dispatch_eager_and_manager_paths(monkeypatch, dp_size):
 
     expected_tokens = object()
     sync_calls = []
+
+    def sync_padding(*args, **kwargs):
+        sync_calls.append((args, kwargs))
+        return args[1], expected_tokens
+
     monkeypatch.setattr(
         dp_utils,
         "sync_cudagraph_and_dp_padding",
-        lambda *args, **kwargs: sync_calls.append((args, kwargs)) or (args[1], expected_tokens),
+        sync_padding,
     )
 
     batch_desc, num_tokens_across_dp = runner._dispatch_batch_descriptor(
@@ -41,7 +46,12 @@ def test_dispatch_eager_and_manager_paths(monkeypatch, dp_size):
     # Non-eager dispatch goes through the cudagraph manager.
     expected = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=8, num_reqs=1)
     dispatch_calls = []
-    runner.cudagraph_manager = SimpleNamespace(dispatch=lambda *a, **kw: dispatch_calls.append((a, kw)) or expected)
+
+    def dispatch(*args, **kwargs):
+        dispatch_calls.append((args, kwargs))
+        return expected
+
+    runner.cudagraph_manager = SimpleNamespace(dispatch=dispatch)
     runner.dp_size = 1
     batch_desc, _ = runner._dispatch_batch_descriptor(
         num_reqs=1, num_toks=8, uniform_tok_count=8, num_active_loras=0, use_eager=False, max_query_len=8

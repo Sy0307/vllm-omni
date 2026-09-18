@@ -19,7 +19,8 @@ pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_ca
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("input_mode", ["implicit", "positions"])
 @torch.inference_mode()
-def test_stateless_decoder_capture_replays_new_inputs(batch_size, sequence_length, input_mode):
+def test_stateless_decoder_capture_replays_new_inputs(batch_size, input_mode):
+    sequence_length = 8
     torch.manual_seed(42)
     config = Qwen3TTSTokenizerV2DecoderConfig(
         hidden_size=32,

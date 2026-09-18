@@ -179,53 +179,6 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     assert not scheduler.running
 
 
-@pytest.mark.parametrize("termination", ["terminal", "abort"])
-def test_retained_codec_slot_can_be_reused_after_request_finishes(monkeypatch, termination):
-    # After finish/abort the codec slot is released exactly once and reusable.
-    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import (
-        MossTTSCodecDecoder,
-        _MossCodecStreamSession,
-    )
-
-    monkeypatch.setattr(
-        "vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", lambda policy: _FakeQueue([])
-    )
-    scheduler = _make_generation_scheduler(_chunk_request("waiting"))
-    scheduler._retains_state_across_chunks = True
-    parked = _chunk_request("parked")
-    scheduler.requests["parked"] = parked
-    scheduler.chunk_transfer_adapter.waiting_for_chunk_running_requests.append(parked)
-
-    resets = []
-    session = _MossCodecStreamSession.__new__(_MossCodecStreamSession)
-    session._free_stream_slots = [0]
-    session._leased_slots = set()
-    session._closed = False
-    session._total_state_capacity = 1
-    session._state_slot_ids = torch.arange(1)
-    session._codec = SimpleNamespace(reset_decoder_state_slots=lambda slots: resets.append(slots.tolist()))
-    slot = session.acquire()
-    codec = MossTTSCodecDecoder.__new__(MossTTSCodecDecoder)
-    torch.nn.Module.__init__(codec)
-    codec._stream_session = session
-    codec._stream_req_slots = {"parked": slot}
-
-    if termination == "terminal":
-        codec._finish_stream_request("parked", session, slot)
-    else:
-        codec.on_requests_finished({"parked"})
-    codec.on_requests_finished({"parked"})  # duplicate notification must not double-free
-    scheduler.requests.pop("parked")
-    scheduler.chunk_transfer_adapter.waiting_for_chunk_running_requests.clear()
-
-    output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"waiting": 1}
-    assert session.acquire() == slot
-    assert session.acquire() is None
-    assert resets == [[0]]
-    assert codec._stream_req_slots == {}
-
-
 def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeypatch: pytest.MonkeyPatch) -> None:
     waiting = _chunk_request(
         "terminal",

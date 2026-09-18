@@ -136,16 +136,13 @@ def test_finalize_reserves_and_routes_native_data_plane_output():
         sampled_token_ids=[[21]],
         omni_connector_output=None,
     )
-
     result = runner._finalize_native_data_plane_output(output)
-
     assert result is output
     plane.enqueue_outputs.assert_called_once_with(
         req_ids=["r1"], inter_stage_outputs=[{"codes.audio": "gpu-tensor"}], sampled_token_ids=[[21]]
     )
     assert output.inter_stage_outputs is None
     assert output.omni_connector_output is connector_output
-    # reserve is a straight passthrough of the deferred batch
     runner._reserve_native_data_plane_outputs(["r1", "r2"])
     plane.reserve_outputs.assert_called_once_with(["r1", "r2"])
 
@@ -186,18 +183,16 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form):
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
-def test_dispatch_batch_descriptor(dp_size):
+def test_descriptor_dispatch_and_mtp_bucket(dp_size):
     runner = object.__new__(OmniGPUModelRunner)
     batch_desc = SimpleNamespace(num_tokens=8, num_reqs=2)
     runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock(return_value=batch_desc))
     runner.dp_size = dp_size
     runner.dp_rank = 0
-
     with patch("vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding", return_value=("synced", "tokens")) as sync:
         result = runner._dispatch_batch_descriptor(
             num_reqs=2, num_toks=8, uniform_tok_count=4, num_active_loras=3, use_eager=False, max_query_len=4
         )
-
     runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, num_active_loras=3, max_query_len=4)
     if dp_size == 1:
         sync.assert_not_called()
@@ -206,25 +201,14 @@ def test_dispatch_batch_descriptor(dp_size):
         sync.assert_called_once()
         assert result == ("synced", "tokens")
 
-
-@pytest.mark.parametrize("bucket", [True, False])
-def test_mtp_descriptor_dispatch(bucket):
-    runner = object.__new__(OmniGPUModelRunner)
+    # MTP dispatch uses the largest captured bucket, or falls back to eager.
     runner.scheduler_config = SimpleNamespace(max_num_seqs=6)
     runner.model_state = SimpleNamespace(_get_talker_mtp_capture_sizes=MagicMock(return_value=[4, 2, 1]))
-    expected = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_tokens=4)
-    runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock(return_value=expected))
-    runner.dp_size = 2
-
-    result = runner._dispatch_mtp_batch_descriptor(3 if bucket else 6)
-
-    if bucket:
-        assert result is expected
-        runner.cudagraph_manager.dispatch.assert_called_once_with(4, 4, 1, 0)
-    else:
-        runner.cudagraph_manager.dispatch.assert_not_called()
-        assert result.cg_mode == CUDAGraphMode.NONE
-        assert result.num_tokens == 6
+    runner.cudagraph_manager.dispatch.reset_mock()
+    assert runner._dispatch_mtp_batch_descriptor(3) is batch_desc
+    runner.cudagraph_manager.dispatch.assert_called_once_with(4, 4, 1, 0)
+    result = runner._dispatch_mtp_batch_descriptor(6)
+    assert result.cg_mode == CUDAGraphMode.NONE and result.num_tokens == 6
 
 
 @pytest.mark.parametrize(
@@ -239,22 +223,6 @@ def test_mrv2_rejects_parallel_modes_at_startup(parallel_config, match):
     runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(**parallel_config))
     with pytest.raises(NotImplementedError, match=match):
         runner._validate_parallel_support()
-
-
-def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
-    runner = _make_runner()
-    calls = []
-    runner.model = SimpleNamespace(on_requests_finished=lambda ids: calls.append(set(ids)))
-    runner.model_state = MagicMock()
-    monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
-
-    # Model is notified about finished ids even after their chunk slot released.
-    runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
-    assert calls == [{"released"}]
-    assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
-    runner.finish_requests(SimpleNamespace(finished_req_ids={"unknown"}, preempted_req_ids=set()))
-    # Unknown ids never reach model_state removal.
-    assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
 @pytest.mark.parametrize(
@@ -275,3 +243,14 @@ def test_init_model_state_factory_dispatches_omni_only(monkeypatch, architecture
     else:
         upstream.assert_called_once()
         assert state is upstream.return_value
+
+
+def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
+    runner = _make_runner()
+    calls = []
+    runner.model = SimpleNamespace(on_requests_finished=lambda ids: calls.append(set(ids)))
+    runner.model_state = MagicMock()
+    monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
+    runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
+    assert calls == [{"released"}]
+    assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]

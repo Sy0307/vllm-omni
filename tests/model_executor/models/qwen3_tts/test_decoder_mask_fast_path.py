@@ -25,14 +25,9 @@ class _RotaryStub(nn.Module):
 def _make_decoder_transformer_stub():
     model = object.__new__(Qwen3TTSTokenizerV2DecoderTransformerModel)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(
-        num_hidden_layers=0,
-        max_position_embeddings=32,
-        _attn_implementation="sdpa",
-    )
-    model.input_proj = nn.Identity()
-    model.output_proj = nn.Identity()
-    model.norm = nn.Identity()
+    model.config = SimpleNamespace(num_hidden_layers=0, max_position_embeddings=32, _attn_implementation="sdpa")
+    for name in ("input_proj", "output_proj", "norm"):
+        setattr(model, name, nn.Identity())
     model.rotary_emb = _RotaryStub()
     model.layers = nn.ModuleList()
     model._sliding_attention_mask_cache = {}

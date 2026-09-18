@@ -3,6 +3,7 @@
 
 from collections import defaultdict
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from vllm.v1.engine import FinishReason
@@ -90,7 +91,7 @@ def test_full_payload_coordinator_matches_legacy_gate(monkeypatch, stage_id, asy
 
 
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
-    calls = []
+    calls: list[tuple[Any, ...]] = []
     scheduler = _Scheduler()
     scheduler.waiting = ["waiting"]
     scheduler.running = ["running"]
