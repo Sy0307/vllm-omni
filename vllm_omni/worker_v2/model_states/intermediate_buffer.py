@@ -217,15 +217,40 @@ class OmniIntermediateBuffer:
         keepdim: bool = True,
     ) -> None:
         """Snapshot a batch-first tensor once and retain owned row views."""
+        self._store_gpu_tensor_rows(req_indices, key, values.detach().clone(), keepdim=keepdim)
+
+    def update_owned_gpu_tensor_rows(
+        self,
+        req_indices: list[int],
+        key: Any,
+        owned_values: torch.Tensor,
+        *,
+        keepdim: bool = True,
+    ) -> None:
+        """Store row views of an already-owned batch tensor without cloning.
+
+        The caller must guarantee ``owned_values`` is not written after this
+        call (the model output ownership contract). Row views keep the owned storage
+        alive until each request row is replaced or the slot is freed.
+        """
+        self._store_gpu_tensor_rows(req_indices, key, owned_values, keepdim=keepdim)
+
+    def _store_gpu_tensor_rows(
+        self,
+        req_indices: list[int],
+        key: Any,
+        owned: torch.Tensor,
+        *,
+        keepdim: bool,
+    ) -> None:
         num_rows = len(req_indices)
-        if values.ndim == 0 or values.shape[0] != num_rows:
+        if owned.ndim == 0 or owned.shape[0] != num_rows:
             raise ValueError(
                 "Batched GPU state update changed the request axis: "
                 f"key={key!r} expected={num_rows} "
-                f"actual={values.shape[0] if values.ndim else 0}"
+                f"actual={owned.shape[0] if owned.ndim else 0}"
             )
 
-        owned = values.detach().clone()
         for row, req_index in enumerate(req_indices):
             existing = self.buffers[req_index]
             row_value = owned[row : row + 1] if keepdim else owned[row]

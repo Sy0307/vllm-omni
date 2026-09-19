@@ -12,7 +12,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -212,19 +212,26 @@ def test_static_decode_embeddings_refresh_from_input_ids():
     assert OmniModelState._preprocess_result_needs_writeback(original, original.view_as(original)) is True
 
 
-def test_batched_postprocess_gpu_snapshot_writeback():
+@pytest.mark.parametrize("owned", [False, True])
+def test_batched_postprocess_gpu_snapshot_writeback(owned):
     # batch=[1, 0]: last-token indices follow the reordered batch, the scalar
     # hook is not called, and both rows share one snapshot storage so a later
-    # graph replay cannot overwrite published rows.
+    # graph replay cannot overwrite published rows. Owned producer batches
+    # skip the extra snapshot while borrowed graph output still gets one.
     state = _make_state(max_num_reqs=2, has_postprocess=True)
     state.model.gpu_resident_buffer_keys = {("hidden_states", "last")}
     _fill_buffers(state, "r0", "r1")
     state.model.postprocess = MagicMock(side_effect=AssertionError("batch hook must replace scalar postprocess"))
     calls = []
+    produced = []
 
     def postprocess_batch(*, hidden_states, last_token_indices):
         calls.append(last_token_indices.clone())
-        return (("hidden_states", "last"), hidden_states.index_select(0, last_token_indices))
+        gathered = hidden_states.index_select(0, last_token_indices)
+        produced.append(gathered)
+        if owned:
+            return (("hidden_states", "last"), OwnedBatchTensor(gathered))
+        return (("hidden_states", "last"), gathered)
 
     state.model.postprocess_batch_mrv2 = postprocess_batch
     batch = _DummyInputBatch([1, 0])
@@ -241,6 +248,12 @@ def test_batched_postprocess_gpu_snapshot_writeback():
     assert torch.equal(first, hidden[3])
     assert torch.equal(second, hidden[1])
     assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+    if owned:
+        # Owned output: rows view into the producer batch, no extra snapshot.
+        assert first.untyped_storage().data_ptr() == produced[0].untyped_storage().data_ptr()
+    else:
+        # Borrowed/graph output: the snapshot owns its storage, not the producer.
+        assert first.untyped_storage().data_ptr() != produced[0].untyped_storage().data_ptr()
 
 
 def test_seed_independence_resolve_once_and_sampling_kwargs():

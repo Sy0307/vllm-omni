@@ -33,7 +33,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
@@ -1190,18 +1190,34 @@ class OmniModelState(DefaultModelState):
                 )
                 if output_key not in gpu_keys:
                     raise RuntimeError(f"Batched Omni postprocess output must be GPU-resident: key={output_key!r}")
-                if not isinstance(values, torch.Tensor) or values.shape[0] != input_batch.num_reqs:
-                    actual = values.shape[0] if isinstance(values, torch.Tensor) and values.ndim else 0
+                owned_rows = isinstance(values, OwnedBatchTensor)
+                raw_values = values.tensor if owned_rows else values
+                if (
+                    not isinstance(raw_values, torch.Tensor)
+                    or raw_values.ndim == 0
+                    or raw_values.shape[0] != input_batch.num_reqs
+                ):
+                    actual = raw_values.shape[0] if isinstance(raw_values, torch.Tensor) and raw_values.ndim else 0
                     raise RuntimeError(
                         "Batched Omni postprocess changed the request axis: "
                         f"expected={input_batch.num_reqs} actual={actual}"
                     )
-                self.intermediate_buffer.update_gpu_tensor_rows(
-                    req_indices,
-                    output_key,
-                    values,
-                    keepdim=False,
-                )
+                if owned_rows:
+                    # Owned batch: share row views, no second snapshot.
+                    self.intermediate_buffer.update_owned_gpu_tensor_rows(
+                        req_indices,
+                        output_key,
+                        raw_values,
+                        keepdim=False,
+                    )
+                else:
+                    # Borrowed output (graph buffer or shared scratch): snapshot once.
+                    self.intermediate_buffer.update_gpu_tensor_rows(
+                        req_indices,
+                        output_key,
+                        raw_values,
+                        keepdim=False,
+                    )
                 return
         for i in range(input_batch.num_reqs):
             req_idx = int(input_batch.idx_mapping_np[i])

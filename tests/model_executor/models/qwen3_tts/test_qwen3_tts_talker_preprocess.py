@@ -57,6 +57,8 @@ def _make_minimal_talker(
 
 
 def test_postprocess_batch_gathers_each_request_tail():
+    from vllm_omni.model_executor.models.output_templates import OwnedBatchTensor
+
     model = _make_minimal_talker()
     hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
 
@@ -66,7 +68,8 @@ def test_postprocess_batch_gathers_each_request_tail():
     )
 
     assert key == ("hidden_states", "last")
-    assert torch.equal(values, torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
+    assert isinstance(values, OwnedBatchTensor)  # freshly allocated rows transfer ownership
+    assert torch.equal(values.tensor, torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
 
 
 def _make_minimal_builder(
@@ -333,11 +336,13 @@ def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
     assert update["meta"]["codec_frame_valid"].item() is False
 
 
-def test_decode_batch_preprocess_matches_decode_state_updates():
+@pytest.mark.parametrize("mrv2", [False, True])
+def test_decode_batch_preprocess_matches_decode_state_updates(mrv2):
     tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
     model = _make_minimal_talker(tts_pad_embed=tts_pad)
 
     def fake_embed_input_ids(input_ids):
+        assert not mrv2, "MRV2 must reuse the prepared token embeddings"
         return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
 
     model.embed_input_ids = fake_embed_input_ids
@@ -346,7 +351,10 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     last_a = torch.full((4,), 2.0, dtype=torch.float32)
     last_b = torch.full((4,), 3.0, dtype=torch.float32)
 
-    out_ids, out_embeds, past_hidden, text_step, updates = model.preprocess_decode_batch(
+    preprocess = model.preprocess_decode_batch_mrv2 if mrv2 else model.preprocess_decode_batch
+    prepared = torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16)
+    out_ids, out_embeds, past_hidden, text_step, updates = preprocess(
+        **({"input_embeds": prepared} if mrv2 else {}),
         input_ids=torch.tensor([101, 202], dtype=torch.long),
         req_infos=[
             {
@@ -365,6 +373,8 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     )
 
     assert out_ids.tolist() == [101, 202]
+    if mrv2:
+        assert out_embeds.data_ptr() == prepared.data_ptr()
     assert torch.equal(out_embeds.cpu(), torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16))
     assert torch.equal(past_hidden.cpu(), torch.stack([last_a, last_b]).to(torch.bfloat16))
     assert torch.equal(text_step[0].cpu(), trailing_a[1].to(torch.bfloat16))

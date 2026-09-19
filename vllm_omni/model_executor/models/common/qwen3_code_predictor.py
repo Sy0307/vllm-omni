@@ -682,6 +682,9 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
+        # Outer-runner execution buckets when a model host declares them (MRv2);
+        # ``None`` keeps the legacy power-of-two bucket derivation.
+        self._execution_batch_buckets: list[int] | None = None
         prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
@@ -873,8 +876,33 @@ class CodePredictorWrapper(nn.Module):
         if device.type != "cpu":
             current_omni_platform.synchronize()
 
+    def configure_mtp_execution_buckets(self, sizes: Iterable[int]) -> None:
+        """Declare the batch buckets the outer runner can actually reach.
+
+        Must be called before the first warmup; once buckets are captured the
+        existing set is only acceptable when it already covers the declaration
+        (never clear active graphs to rebuild them).
+        """
+        max_bsz = int(self._vllm_config.scheduler_config.max_num_seqs)
+        cleaned = sorted({int(size) for size in sizes if 0 < int(size) <= max_bsz} | {max_bsz})
+        if self._bucket_sizes:
+            missing = [size for size in cleaned if size not in self._bucket_sizes]
+            if missing:
+                raise RuntimeError(
+                    "mtp execution buckets must be configured before the first warmup; "
+                    f"missing={missing} existing={self._bucket_sizes}"
+                )
+            return
+        self._execution_batch_buckets = cleaned
+
     def _batch_bucket_sizes(self) -> list[int]:
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
+        if self._execution_batch_buckets is not None:
+            # Outer-reachable buckets plus prefix-graph capture buckets and the
+            # full-size eager fallback row already merged at configure time.
+            bucket_sizes = list(self._execution_batch_buckets)
+            bucket_sizes.extend(bucket for bucket in self._prefix_graph_buckets if bucket <= max_bsz)
+            return sorted(set(bucket_sizes))
         bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
         bucket_sizes.extend(bucket for bucket in self._prefix_graph_buckets if bucket <= max_bsz)
         bucket_sizes.append(max_bsz)

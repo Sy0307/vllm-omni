@@ -26,7 +26,7 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -509,6 +509,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # CPU-to-GPU round-trips on every decode step.
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
         self.gpu_resident_buffer_keys = _qwen3_tts_gpu_resident_buffer_keys(self._use_v2_model_runner)
+
+        if self._use_v2_model_runner:
+            # Align predictor warmup/capture buckets with the outer MRv2 MTP
+            # graph buckets so the compile cache covers every reachable size.
+            outer_max_bsz = int(vllm_config.scheduler_config.max_num_seqs)
+            outer_buckets = {
+                int(size)
+                for size in vllm_config.compilation_config.cudagraph_capture_sizes
+                if 0 < int(size) <= outer_max_bsz
+            }
+            outer_buckets.update({1, outer_max_bsz})  # eager fallback rows
+            self.code_predictor.configure_mtp_execution_buckets(sorted(outer_buckets))
 
         # ``text_proj(text_emb(tts_pad_token_id))`` is request-independent —
         # it depends only on frozen ``text_embedding`` / ``text_projection``
@@ -1059,11 +1071,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         *,
         input_ids: torch.Tensor,
         req_infos: list[dict[str, Any]],
+        input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
         """Batch the decode-only preprocess path for Qwen3-TTS.
 
         This mirrors the scalar decode branch in ``preprocess()``, but performs
-        the token embedding lookup once for the whole decode batch.
+        the token embedding lookup once for the whole decode batch, unless
+        the runner has already prepared embeddings for these input ids.
         """
         input_ids_flat = input_ids.reshape(-1)
         if int(input_ids_flat.numel()) != len(req_infos):
@@ -1151,11 +1165,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 info_update["hidden_states"] = {"trailing_text": trailing_text_update.detach()}
             updates.append(info_update)
 
-        inputs_embeds_out = self.embed_input_ids(input_ids_flat.reshape(-1, 1).to(torch.long)).to(
-            device=device,
-            dtype=dtype,
-        )
-        inputs_embeds_out = inputs_embeds_out.reshape(len(req_infos), -1)
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids_flat.reshape(-1, 1).to(torch.long))
+        inputs_embeds_out = input_embeds.to(device=device, dtype=dtype).reshape(len(req_infos), -1)
         return (
             input_ids_flat,
             inputs_embeds_out,
@@ -1172,7 +1184,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         req_infos: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
         """Expose the existing TTS decode batcher through the MRv2 contract."""
-        return self.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+        return self.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos, input_embeds=input_embeds)
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.
@@ -1187,11 +1199,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         *,
         hidden_states: torch.Tensor,
         last_token_indices: torch.Tensor,
-    ) -> tuple[tuple[str, str], torch.Tensor]:
-        """Gather every request's Talker tail in one GPU operation."""
+    ) -> tuple[tuple[str, str], OwnedBatchTensor]:
+        """Gather every request's Talker tail in one GPU operation.
+
+        ``index_select`` freshly allocates the result, so the batch is marked
+        as owned and the intermediate buffer stores row views without taking
+        a second snapshot.
+        """
         return (
             ("hidden_states", "last"),
-            hidden_states.index_select(0, last_token_indices),
+            OwnedBatchTensor(hidden_states.index_select(0, last_token_indices)),
         )
 
     @torch.inference_mode()
