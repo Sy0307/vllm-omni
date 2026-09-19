@@ -1464,13 +1464,15 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
     @staticmethod
     def _slice_dynamic_cache(cache: DynamicCache, row: int) -> DynamicCache:
-        request_cache = copy.deepcopy(cache)
-        for layer in request_cache.layers:
-            if layer.keys is not None:
-                layer.keys = layer.keys[row : row + 1].clone()
-            if layer.values is not None:
-                layer.values = layer.values[row : row + 1].clone()
-        return request_cache
+        # Preserve cache metadata and independent ownership without cloning the
+        # full batch for every request. Seed deepcopy with only the selected KV
+        # rows; it will copy the remaining cache structure normally.
+        memo: dict[int, Any] = {}
+        for layer in cache.layers:
+            for tensor in (layer.keys, layer.values):
+                if tensor is not None and id(tensor) not in memo:
+                    memo[id(tensor)] = tensor[row : row + 1].clone()
+        return copy.deepcopy(cache, memo)
 
     @staticmethod
     def _cache_tensors_are_batchable(request_caches: list[dict[str, Any]], keys: tuple[str, ...]) -> bool:
