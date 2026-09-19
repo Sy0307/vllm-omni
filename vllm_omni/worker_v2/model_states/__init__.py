@@ -18,13 +18,6 @@ from vllm.v1.worker.gpu.model_states import (
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 
-# Legacy models without capability declarations remain compatible. New models
-# use the existing Omni lifecycle flags; this list need not grow.
-_OMNI_ARCHITECTURES: set[str] = {
-    "Qwen3TTSTalkerForConditionalGeneration",
-    "Qwen3TTSCode2Wav",
-}
-
 
 def init_omni_model_state(
     vllm_config: VllmConfig,
@@ -34,15 +27,14 @@ def init_omni_model_state(
 ) -> ModelState:
     """Create the appropriate ``ModelState`` for *model*.
 
-    Returns an ``OmniModelState`` when the configured architecture is a
-    known legacy Omni model or declares Omni lifecycle capabilities; otherwise
+    Returns an ``OmniModelState`` when the model declares Omni lifecycle
+    capabilities; otherwise
     delegates to the upstream v2 factory.
     """
-    archs = set(vllm_config.model_config.architectures or [])
     uses_omni_lifecycle = any(
         getattr(model, flag, False) is True for flag in ("has_preprocess", "has_postprocess", "have_multimodal_outputs")
     )
-    if uses_omni_lifecycle or archs & _OMNI_ARCHITECTURES:
+    if uses_omni_lifecycle:
         from vllm_omni.worker_v2.model_states.omni_model_state import (
             OmniModelState,
         )

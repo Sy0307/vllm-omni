@@ -97,7 +97,7 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form):
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
     )
-    runner.model_state = SimpleNamespace(capture_talker_mtp_graphs=MagicMock())
+    runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock())
     runner._dispatch_mtp_batch_descriptor = MagicMock(return_value="desc")
 
     def assert_unwrapped(_self):
@@ -109,7 +109,7 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form):
 
     assert runner.model.forward is original_forward  # restored after capture
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
-    runner.model_state.capture_talker_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
+    runner.model_state.capture_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
 
 
 @pytest.mark.parametrize(
@@ -127,16 +127,16 @@ def test_mrv2_rejects_parallel_modes_at_startup(parallel_config, match):
 
 
 @pytest.mark.parametrize(
-    "architectures,expect_omni",
-    [(["LlamaForCausalLM"], False), (["Qwen3TTSTalkerForConditionalGeneration"], True)],
+    "flag,expect_omni",
+    [(None, False), ("has_preprocess", True), ("has_postprocess", True), ("have_multimodal_outputs", True)],
 )
-def test_init_model_state_factory_dispatches_omni_only(monkeypatch, architectures, expect_omni):
+def test_init_model_state_factory_dispatches_omni_only(monkeypatch, flag, expect_omni):
     upstream = MagicMock(return_value=object())
     monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", upstream)
     monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
-    cfg = SimpleNamespace(model_config=SimpleNamespace(architectures=architectures))
-
-    state = init_omni_model_state(cfg, SimpleNamespace(), None, torch.device("cpu"))
+    cfg = SimpleNamespace(model_config=SimpleNamespace(architectures=["CustomModel"]))
+    model = SimpleNamespace(**({flag: True} if flag else {}))
+    state = init_omni_model_state(cfg, model, None, torch.device("cpu"))
 
     if expect_omni:
         assert isinstance(state, OmniModelState)
@@ -155,3 +155,12 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     runner.finish_requests(SimpleNamespace(finished_req_ids={"released"}, preempted_req_ids={"r1"}))
     assert calls == [{"released"}]
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
+
+
+@pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
+def test_capture_contract_uses_model_declaration(stage, declared):
+    runner = _make_runner()
+    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared)
+    runner._configure_cudagraph_output_contract()
+    assert runner._model_returns_tuple is declared
+    assert runner._exclude_full_graph is declared

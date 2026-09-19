@@ -52,7 +52,7 @@ _model_state_patch_lock = threading.RLock()
 
 
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
-    return bool(getattr(model, "_returns_tuple", False) or getattr(model, "model_stage", None) == "thinker")
+    return bool(getattr(model, "_returns_tuple", False))
 
 
 class OmniGPUModelRunner(GPUModelRunner):
@@ -347,13 +347,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             result = super().capture_model()
 
-        capture_talker_mtp = getattr(getattr(self, "model_state", None), "capture_talker_mtp_graphs", None)
-        if callable(capture_talker_mtp):
-            capture_talker_mtp(self._dispatch_mtp_batch_descriptor)
+        capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
+        if callable(capture_mtp):
+            capture_mtp(self._dispatch_mtp_batch_descriptor)
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
-        capture_sizes = self.model_state._get_talker_mtp_capture_sizes()
+        capture_sizes = self.model_state._get_mtp_capture_sizes()
         captured_bucket = next(
             (size for size in sorted(capture_sizes) if num_mtp_reqs <= size <= self.scheduler_config.max_num_seqs),
             None,

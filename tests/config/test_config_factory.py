@@ -2725,6 +2725,25 @@ class TestPlatformOverrides:
             # v2 only engages the native plane on stages declaring support.
             assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
 
+    @pytest.mark.parametrize("runner,native", [("v1", False), ("v2", False), ("v2", True)])
+    def test_mrv2_undeclared_transport_warns(self, monkeypatch, runner, native):
+        from unittest.mock import Mock
+
+        warning = Mock()
+        monkeypatch.setattr("vllm_omni.config.stage_config.logger.warning", warning)
+        pipeline = PipelineConfig(
+            model_type="custom_pipeline",
+            stages=[
+                StagePipelineConfig(
+                    stage_id=0, model_stage="custom_ar", final_output=True, supports_native_mrv2_data_plane=native
+                )
+            ],
+        )
+        merge_pipeline_deploy(pipeline, DeployConfig(model_runner=runner))
+        assert warning.call_count == int(runner == "v2" and not native)
+        if warning.called:
+            assert "legacy transport path" in warning.call_args.args[0]
+
     def test_runner_selection_rejects_engine_extras_override(self):
         pipeline = PipelineConfig(
             model_type="runner_selection_reserved",

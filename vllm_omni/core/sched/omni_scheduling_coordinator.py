@@ -356,8 +356,7 @@ class OmniSchedulingCoordinator:
                 next_len = metadata["next_stage_prompt_len"]
                 if isinstance(next_len, int) and next_len > 0:
                     output_token_ids = getattr(request, "_output_token_ids", None)
-                    has_decode_output = output_token_ids is not None and len(output_token_ids) > 0
-                    if has_decode_output:
+                    if output_token_ids is not None and len(output_token_ids) > 0:
                         logger.debug(
                             "[Coordinator stage-%s] Skipping prompt resize for req %s: "
                             "request already has %s output tokens",
@@ -384,11 +383,7 @@ class OmniSchedulingCoordinator:
                             )
 
             if model_mode != "ar":
-                new_ids = (
-                    ([0] if metadata.get("payload_ready") else [])
-                    if getattr(self, "payload_native", False)
-                    else self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
-                )
+                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
                 runtime_seed = None
                 if "left_context_size" in metadata:
                     runtime_seed = {

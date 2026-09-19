@@ -33,6 +33,7 @@ from vllm_omni.utils.speaker_cache import (
     load_validated_profile_tensors,
     validate_qwen3_tts_profile,
 )
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
@@ -401,15 +402,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
-        self.talker_mtp_output_key = ("codes", "audio")
-        self.talker_mtp_graph_safe = True
+        self.mtp_output_key = self.talker_mtp_output_key = ("codes", "audio")
+        self.mtp_graph_safe = self.talker_mtp_graph_safe = True
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
-        self.talker_mtp_accepts_per_row_generators = True
-        self.talker_mtp_sample_uniforms = True
-        self.talker_mtp_sample_steps = max(0, int(self.talker_config.num_code_groups) - 1)
-        self.talker_mtp_sample_vocab_size = self._codebook_vocab_size
+        self.mtp_accepts_per_row_generators = self.talker_mtp_accepts_per_row_generators = True
+        self.mtp_sample_uniforms = True
+        self.mtp_sample_steps = max(0, int(self.talker_config.num_code_groups) - 1)
+        self.mtp_sample_vocab_size = self._codebook_vocab_size
         self.use_async_omni_output = True
         self.eager_omni_postprocess_before_async_output = True
         self.omni_pooler_payload_include_hidden = False
@@ -560,6 +561,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
         )
+        self.mtp_sampling_params = self._subtalker_sampling_params
 
         self._stacked_codec_embed: torch.Tensor | None = None
 
@@ -1552,3 +1554,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
+
+    # MRV2 capability names; V1 keeps its existing talker_mtp entry point.
+    mtp = talker_mtp
+    get_mtp_seed = staticmethod(get_tts_local_seed)

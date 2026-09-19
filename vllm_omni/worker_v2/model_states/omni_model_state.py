@@ -17,10 +17,7 @@ import inspect
 import threading
 import types
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.utils import AttentionGroup
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -35,7 +32,6 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.worker.sampling_utils import get_tts_local_seed
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
@@ -134,7 +130,7 @@ class OmniModelState(DefaultModelState):
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
         self._decode_preprocess = self._resolve_decode_preprocess(model)
-        self._talker_mtp_generators: dict[str, torch.Generator] = {}
+        self._mtp_generators: dict[str, torch.Generator] = {}
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
         self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
 
@@ -154,23 +150,23 @@ class OmniModelState(DefaultModelState):
         self._mtp_text_step: torch.Tensor | None = None
         self._mtp_offsets: torch.Tensor | None = None
         self._mtp_sample_uniforms: torch.Tensor | None = None
-        self._talker_mtp_runner: Any | None = None
-        if self._embed_dim > 0 and hasattr(model, "talker_mtp"):
+        self._mtp_runner: Any | None = None
+        if self._embed_dim > 0 and hasattr(model, "mtp"):
             max_bs = max_num_reqs
             self._mtp_input_ids = torch.zeros(max_bs, dtype=torch.long, device=device)
             self._mtp_input_embeds = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
             self._mtp_hidden = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
             self._mtp_text_step = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
             self._mtp_offsets = torch.zeros(max_bs, dtype=torch.long, device=device)
-            sample_steps = int(getattr(model, "talker_mtp_sample_steps", 0))
-            sample_vocab_size = int(getattr(model, "talker_mtp_sample_vocab_size", 0))
-            if bool(getattr(model, "talker_mtp_sample_uniforms", False)) and sample_steps > 0 and sample_vocab_size > 0:
+            sample_steps = int(getattr(model, "mtp_sample_steps", 0))
+            sample_vocab_size = int(getattr(model, "mtp_sample_vocab_size", 0))
+            if bool(getattr(model, "mtp_sample_uniforms", False)) and sample_steps > 0 and sample_vocab_size > 0:
                 self._mtp_sample_uniforms = torch.empty(
                     (max_bs, sample_steps, sample_vocab_size),
                     dtype=torch.float32,
                     device=device,
                 )
-            self._talker_mtp_runner = self._init_talker_mtp_runner(model)
+            self._mtp_runner = self._init_mtp_runner(model)
 
     @staticmethod
     def _resolve_decode_preprocess(model: nn.Module) -> Callable | None:
@@ -194,32 +190,34 @@ class OmniModelState(DefaultModelState):
 
         return decode_preprocess
 
-    def _init_talker_mtp_runner(self, model: nn.Module) -> Any:
-        talker_mtp = getattr(model, "talker_mtp", None)
-        if talker_mtp is None:
+    def _init_mtp_runner(self, model: nn.Module) -> Any:
+        mtp = getattr(model, "mtp", None)
+        if mtp is None:
             return None
+        output_key = getattr(model, "mtp_output_key", None)
+        if not (isinstance(output_key, str) or (isinstance(output_key, tuple) and len(output_key) == 2)):
+            raise TypeError("Models with an mtp hook must declare mtp_output_key as a string or 2-tuple")
 
         compilation_config = self.vllm_config.compilation_config
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", CUDAGraphMode.NONE)
-        if bool(getattr(model, "talker_mtp_disable_graph", False)):
-            logger.info("Skipping talker_mtp graph wrapper because the model marks it graph-unsafe.")
-            return talker_mtp
-        has_separate_talker = getattr(model, "talker", None) is not None
-        graph_safe = bool(getattr(model, "talker_mtp_graph_safe", False))
-        if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or graph_safe):
+        if bool(getattr(model, "mtp_disable_graph", False)):
+            logger.info("Skipping mtp graph wrapper because the model marks it graph-unsafe.")
+            return mtp
+        graph_safe = bool(getattr(model, "mtp_graph_safe", False))
+        if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs() and graph_safe:
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
-            return graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-        return talker_mtp
+            return graph_wrapper_cls(mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+        return mtp
 
-    def _is_talker_mtp_graph_runner(self) -> bool:
-        runner = getattr(self, "_talker_mtp_runner", None)
+    def _is_mtp_graph_runner(self) -> bool:
+        runner = getattr(self, "_mtp_runner", None)
         if runner is None:
             return False
         graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
         return isinstance(runner, graph_wrapper_cls)
 
-    def capture_talker_mtp_graphs(self, dispatch_batch_descriptor: Callable[[int], Any]) -> None:
-        if not self._is_talker_mtp_graph_runner():
+    def capture_mtp_graphs(self, dispatch_batch_descriptor: Callable[[int], Any]) -> None:
+        if not self._is_mtp_graph_runner():
             return
         if (
             self._mtp_input_ids is None
@@ -228,8 +226,8 @@ class OmniModelState(DefaultModelState):
             or self._mtp_text_step is None
         ):
             return
-        if getattr(self.model, "talker_mtp_accepts_req_infos", False):
-            logger.warning("Skipping talker_mtp graph capture because this model requires per-request req_infos.")
+        if getattr(self.model, "mtp_accepts_req_infos", False):
+            logger.warning("Skipping mtp graph capture because this model requires per-request req_infos.")
             return
 
         from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -237,10 +235,10 @@ class OmniModelState(DefaultModelState):
         from vllm.forward_context import set_forward_context
 
         compilation_config = self.vllm_config.compilation_config
-        capture_sizes = self._get_talker_mtp_capture_sizes()
+        capture_sizes = self._get_mtp_capture_sizes()
         num_warmups = compilation_config.cudagraph_num_of_warmups
-        capture_kwargs = self._get_talker_mtp_base_sampling_kwargs()
-        logger.info("Capturing MRv2 talker_mtp graphs for sizes %s", capture_sizes)
+        capture_kwargs = self._get_mtp_base_sampling_kwargs()
+        logger.info("Capturing MRv2 mtp graphs for sizes %s", capture_sizes)
 
         set_cudagraph_capturing_enabled(True)
         try:
@@ -260,7 +258,7 @@ class OmniModelState(DefaultModelState):
                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
                             batch_descriptor=batch_descriptor,
                         ):
-                            self._call_talker_mtp_runner(ids, emb, hidden, text_step, **capture_kwargs)
+                            self._call_mtp_runner(ids, emb, hidden, text_step, **capture_kwargs)
 
                     with set_forward_context(
                         None,
@@ -272,7 +270,7 @@ class OmniModelState(DefaultModelState):
                         if self._mtp_sample_uniforms is not None:
                             sample_uniforms = self._mtp_sample_uniforms[:num_tokens]
                             sample_uniforms.fill_(0.5)
-                        self._call_talker_mtp_runner(
+                        self._call_mtp_runner(
                             ids,
                             emb,
                             hidden,
@@ -282,13 +280,13 @@ class OmniModelState(DefaultModelState):
                         )
                     torch.accelerator.synchronize()
 
-            logger.info("Captured MRv2 talker_mtp graphs for %d sizes", len(capture_sizes))
+            logger.info("Captured MRv2 mtp graphs for %d sizes", len(capture_sizes))
         except RuntimeError as e:
-            raise RuntimeError(f"MRv2 talker_mtp graph capture failed: {e}") from e
+            raise RuntimeError(f"MRv2 mtp graph capture failed: {e}") from e
         finally:
             set_cudagraph_capturing_enabled(False)
 
-    def _get_talker_mtp_capture_sizes(self) -> list[int]:
+    def _get_mtp_capture_sizes(self) -> list[int]:
         """Return graph buckets that a request-batched Talker can reach."""
         max_num_reqs = int(self.scheduler_config.max_num_seqs)
         return sorted(
@@ -311,30 +309,6 @@ class OmniModelState(DefaultModelState):
         return 0
 
     # ------------------------------------------------------------------
-    # Attention metadata
-    # ------------------------------------------------------------------
-
-    def prepare_attn(
-        self,
-        input_batch: InputBatch,
-        cudagraph_mode: CUDAGraphMode,
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        attn_groups: list[list[AttentionGroup]],
-        kv_cache_config: Any,
-        for_capture: bool = False,
-    ) -> dict[str, Any]:
-        return super().prepare_attn(
-            input_batch,
-            cudagraph_mode,
-            block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture,
-        )
-
-    # ------------------------------------------------------------------
     # Request lifecycle
     # ------------------------------------------------------------------
 
@@ -348,7 +322,7 @@ class OmniModelState(DefaultModelState):
         if not str(req_id).startswith("_warmup_"):
             return
 
-        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+        validity_key = getattr(self.model, "mtp_validity_key", None)
         if validity_key is None:
             return
 
@@ -360,8 +334,7 @@ class OmniModelState(DefaultModelState):
             buffer[validity_key] = validity
         else:
             raise TypeError(
-                "talker_mtp_validity_key must be a string or 2-tuple, "
-                f"got {type(validity_key).__name__}: {validity_key!r}"
+                f"mtp_validity_key must be a string or 2-tuple, got {type(validity_key).__name__}: {validity_key!r}"
             )
 
     def _resolve_req_index(self, req_index_or_id: int | str) -> int | None:
@@ -376,7 +349,7 @@ class OmniModelState(DefaultModelState):
             return
         req_id = self.intermediate_buffer.buffers[req_index].get("req_id")
         if req_id is not None:
-            getattr(self, "_talker_mtp_generators", {}).pop(req_id, None)
+            getattr(self, "_mtp_generators", {}).pop(req_id, None)
         self.intermediate_buffer.remove_request(req_index)
 
     # ------------------------------------------------------------------
@@ -395,8 +368,7 @@ class OmniModelState(DefaultModelState):
         base = super().prepare_inputs(input_batch, req_states)
         buffer_list = self.intermediate_buffer.gather(input_batch)
         base["model_intermediate_buffer"] = buffer_list
-        if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
-            base["runtime_additional_information"] = buffer_list
+        base["runtime_additional_information"] = buffer_list
         base["seq_token_counts"] = [int(input_batch.num_scheduled_tokens[i]) for i in range(input_batch.num_reqs)]
         # Return static inputs_embeds so FULL graph replay uses the same
         # tensor address that was captured.  Preprocess fills it in-place.
@@ -408,8 +380,7 @@ class OmniModelState(DefaultModelState):
         base = super().prepare_dummy_inputs(num_reqs, num_tokens)
         dummy_buffer: list[dict[str, Any]] = [{} for _ in range(num_reqs)]
         base["model_intermediate_buffer"] = dummy_buffer
-        if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
-            base["runtime_additional_information"] = dummy_buffer
+        base["runtime_additional_information"] = dummy_buffer
         if num_reqs > 0:
             per_req = num_tokens // num_reqs
             remainder = num_tokens % num_reqs
@@ -579,8 +550,6 @@ class OmniModelState(DefaultModelState):
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
         mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]] = []
         prepacked_mtp_inputs: tuple[torch.Tensor, torch.Tensor] | None = None
-        deferred_text_projection_rows: list[int] = []
-        project_text_steps = getattr(self.model, "project_talker_text_steps", None)
 
         req_indices = [int(input_batch.idx_mapping_np[i]) for i in range(input_batch.num_reqs)]
         self._stage_batched_preprocess_inputs(req_indices, embeds.device)
@@ -613,8 +582,6 @@ class OmniModelState(DefaultModelState):
                 info["_omni_num_computed_tokens"] = int(num_computed_tokens)
             if prompt_len is not None and num_computed_tokens is not None:
                 info["_omni_is_prefill"] = int(num_computed_tokens) < int(prompt_len)
-            if callable(project_text_steps):
-                info["_omni_defer_talker_text_projection"] = True
 
             is_prefill = (
                 int(num_computed_tokens) < int(prompt_len)
@@ -722,35 +689,12 @@ class OmniModelState(DefaultModelState):
 
             # Collect MTP inputs for decode steps (n_tok == 1 with mtp_inputs)
             mtp_inputs = updates.pop("mtp_inputs", None)
-            text_step_requires_projection = bool(updates.pop("mtp_text_step_requires_projection", False))
             if mtp_inputs is not None and n_tok == 1:
                 mtp_batches.append((i, start, mtp_inputs))
-                if text_step_requires_projection:
-                    deferred_text_projection_rows.append(len(mtp_batches) - 1)
 
             self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
-        if deferred_text_projection_rows:
-            if not callable(project_text_steps):
-                raise RuntimeError("Deferred Talker text projection requires project_talker_text_steps().")
-            raw_text_steps = torch.cat(
-                [mtp_batches[row][2][1].reshape(1, -1) for row in deferred_text_projection_rows],
-                dim=0,
-            )
-            projected_text_steps = project_text_steps(raw_text_steps)
-            if projected_text_steps.shape[0] != len(deferred_text_projection_rows):
-                raise RuntimeError(
-                    "Batched Talker text projection changed the request axis: "
-                    f"expected={len(deferred_text_projection_rows)} actual={projected_text_steps.shape[0]}"
-                )
-            for projected_row, batch_row in enumerate(deferred_text_projection_rows):
-                req_idx, start, (past_hidden, original_text_step) = mtp_batches[batch_row]
-                text_step = projected_text_steps[projected_row]
-                if original_text_step.ndim > 1:
-                    text_step = text_step.reshape(1, -1)
-                mtp_batches[batch_row] = (req_idx, start, (past_hidden, text_step))
-
-        if mtp_batches and hasattr(self.model, "talker_mtp"):
+        if mtp_batches and hasattr(self.model, "mtp"):
             if prepacked_mtp_inputs is None:
                 self._run_batched_mtp(
                     mtp_batches,
@@ -771,7 +715,7 @@ class OmniModelState(DefaultModelState):
                     prepacked_mtp_inputs=prepacked_mtp_inputs,
                 )
 
-    def _pack_talker_mtp_batch(
+    def _pack_mtp_batch(
         self,
         mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]],
         input_ids: torch.Tensor,
@@ -829,7 +773,7 @@ class OmniModelState(DefaultModelState):
             offsets,
         )
 
-    def _talker_mtp_batch_offsets(
+    def _mtp_batch_offsets(
         self,
         mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]],
         input_batch: InputBatch,
@@ -882,12 +826,12 @@ class OmniModelState(DefaultModelState):
         from vllm.forward_context import set_forward_context
 
         bsz = len(mtp_batches)
-        batch_offsets = self._talker_mtp_batch_offsets(
+        batch_offsets = self._mtp_batch_offsets(
             mtp_batches,
             input_batch,
             input_ids.device,
         )
-        batch_ids, batch_emb, batch_hidden, batch_step, batch_offsets = self._pack_talker_mtp_batch(
+        batch_ids, batch_emb, batch_hidden, batch_step, batch_offsets = self._pack_mtp_batch(
             mtp_batches,
             input_ids,
             embeds,
@@ -899,7 +843,7 @@ class OmniModelState(DefaultModelState):
         buffers = [self.intermediate_buffer.buffers[req_idx] for req_idx in req_indices]
         req_ids = [str(buffer.get("req_id")) for buffer in buffers]
         generators = [
-            self._get_talker_mtp_generator(
+            self._get_mtp_generator(
                 req_id,
                 buffer.get("sampling_params"),
                 batch_ids.device,
@@ -907,7 +851,7 @@ class OmniModelState(DefaultModelState):
             for req_id, buffer in zip(req_ids, buffers, strict=True)
         ]
 
-        use_graph_runner = self._is_talker_mtp_graph_runner()
+        use_graph_runner = self._is_mtp_graph_runner()
         has_explicit_generator = any(generator is not None for generator in generators)
         sample_uniform_buffer = getattr(self, "_mtp_sample_uniforms", None)
         can_use_graph = use_graph_runner and (not has_explicit_generator or sample_uniform_buffer is not None)
@@ -928,11 +872,11 @@ class OmniModelState(DefaultModelState):
             batch_hidden = self._mtp_hidden[:num_tokens]
             batch_step = self._mtp_text_step[:num_tokens]
             if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_talker_mtp_sample_uniforms(generators, num_tokens)
+                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
         elif can_use_graph:
             cudagraph_mode = CUDAGraphMode.FULL
             if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_talker_mtp_sample_uniforms(generators, bsz)
+                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, bsz)
         with set_forward_context(
             None,
             self.vllm_config,
@@ -940,7 +884,7 @@ class OmniModelState(DefaultModelState):
             cudagraph_runtime_mode=cudagraph_mode,
             batch_descriptor=batch_descriptor,
         ):
-            new_emb, codes = self._call_talker_mtp_with_sampling(
+            new_emb, codes = self._call_mtp_with_sampling(
                 batch_ids,
                 batch_emb,
                 batch_hidden,
@@ -952,8 +896,8 @@ class OmniModelState(DefaultModelState):
             )
 
         embeds.index_copy_(0, batch_offsets, new_emb[:bsz].reshape(bsz, -1))
-        audio_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
-        validity_key = getattr(self.model, "talker_mtp_validity_key", None)
+        audio_key = getattr(self.model, "mtp_output_key", None)
+        validity_key = getattr(self.model, "mtp_validity_key", None)
         valid_rows = None
         if codes is not None and validity_key is not None:
             valid_rows = torch.ones((bsz,), dtype=torch.bool, device=codes.device)
@@ -981,7 +925,7 @@ class OmniModelState(DefaultModelState):
                 updates = {audio_key: codes[j : j + 1]}
             else:
                 raise TypeError(
-                    f"talker_mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
+                    f"mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
                 )
             if valid_rows is not None:
                 if isinstance(validity_key, tuple) and len(validity_key) == 2:
@@ -990,29 +934,29 @@ class OmniModelState(DefaultModelState):
                     updates[validity_key] = valid_rows[j]
                 else:
                     raise TypeError(
-                        "talker_mtp_validity_key must be a string or 2-tuple, "
+                        "mtp_validity_key must be a string or 2-tuple, "
                         f"got {type(validity_key).__name__}: {validity_key!r}"
                     )
             self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
-    def _get_talker_mtp_base_sampling_kwargs(self) -> dict[str, Any]:
-        subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
-        if not isinstance(subtalker_params, dict):
-            subtalker_params = {}
+    def _get_mtp_base_sampling_kwargs(self) -> dict[str, Any]:
+        sampling_params = getattr(self.model, "mtp_sampling_params", None)
+        if not isinstance(sampling_params, dict):
+            sampling_params = {}
         return {
-            "do_sample": subtalker_params.get("do_sample"),
-            "temperature": subtalker_params.get("temperature"),
-            "top_k": subtalker_params.get("top_k"),
-            "top_p": subtalker_params.get("top_p"),
+            "do_sample": sampling_params.get("do_sample"),
+            "temperature": sampling_params.get("temperature"),
+            "top_k": sampling_params.get("top_k"),
+            "top_p": sampling_params.get("top_p"),
         }
 
-    def _get_talker_mtp_sampling_kwargs(
+    def _get_mtp_sampling_kwargs(
         self,
         buffers: list[dict[str, Any]],
         req_ids: list[str],
         generators: list[torch.Generator | None],
     ) -> dict[str, Any]:
-        kwargs = self._get_talker_mtp_base_sampling_kwargs()
+        kwargs = self._get_mtp_base_sampling_kwargs()
 
         if len(generators) == 1:
             if generators[0] is not None:
@@ -1020,26 +964,27 @@ class OmniModelState(DefaultModelState):
         elif any(generator is not None for generator in generators):
             kwargs["generators"] = generators
 
-        if getattr(self.model, "talker_mtp_accepts_req_infos", False):
+        if getattr(self.model, "mtp_accepts_req_infos", False):
             kwargs["req_ids"] = req_ids
             kwargs["req_infos"] = buffers
 
         return kwargs
 
-    def _get_talker_mtp_generator(
+    def _get_mtp_generator(
         self,
         req_id: str,
         sampling_params: Any,
         device: torch.device,
     ) -> torch.Generator | None:
-        seed = get_tts_local_seed(sampling_params)
+        resolve_seed = getattr(self.model, "get_mtp_seed", None)
+        seed = resolve_seed(sampling_params) if resolve_seed is not None else None
         if seed is None:
             return None
 
-        cache = getattr(self, "_talker_mtp_generators", None)
+        cache = getattr(self, "_mtp_generators", None)
         if cache is None:
             cache = {}
-            self._talker_mtp_generators = cache
+            self._mtp_generators = cache
         generator = cache.get(req_id)
         if generator is None or generator.device != device:
             generator = torch.Generator(device=device)
@@ -1047,7 +992,7 @@ class OmniModelState(DefaultModelState):
             cache[req_id] = generator
         return generator
 
-    def _prepare_talker_mtp_sample_uniforms(
+    def _prepare_mtp_sample_uniforms(
         self,
         generators: list[torch.Generator | None],
         num_tokens: int,
@@ -1076,7 +1021,7 @@ class OmniModelState(DefaultModelState):
             sample_uniforms[bsz:num_tokens].uniform_(1e-20, 1.0 - 1e-20)
         return sample_uniforms[:num_tokens]
 
-    def _call_talker_mtp_with_sampling(
+    def _call_mtp_with_sampling(
         self,
         batch_ids: torch.Tensor,
         batch_emb: torch.Tensor,
@@ -1089,11 +1034,11 @@ class OmniModelState(DefaultModelState):
         sample_uniforms: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if sample_uniforms is None:
-            kwargs = self._get_talker_mtp_sampling_kwargs(buffers, req_ids, generators)
+            kwargs = self._get_mtp_sampling_kwargs(buffers, req_ids, generators)
         else:
-            kwargs = self._get_talker_mtp_base_sampling_kwargs()
+            kwargs = self._get_mtp_base_sampling_kwargs()
             kwargs["sample_uniforms"] = sample_uniforms
-            if getattr(self.model, "talker_mtp_accepts_req_infos", False):
+            if getattr(self.model, "mtp_accepts_req_infos", False):
                 kwargs["req_ids"] = req_ids
                 kwargs["req_infos"] = buffers
 
@@ -1101,17 +1046,17 @@ class OmniModelState(DefaultModelState):
             len(req_ids) > 1
             and "generators" in kwargs
             and "sample_uniforms" not in kwargs
-            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+            and not getattr(self.model, "mtp_accepts_per_row_generators", False)
         ):
             emb_chunks = []
             code_chunks = []
             for row, (req_id, buffer, generator) in enumerate(zip(req_ids, buffers, generators, strict=True)):
-                row_kwargs = self._get_talker_mtp_sampling_kwargs(
+                row_kwargs = self._get_mtp_sampling_kwargs(
                     [buffer],
                     [req_id],
                     [generator],
                 )
-                row_emb, row_codes = self._call_talker_mtp_runner(
+                row_emb, row_codes = self._call_mtp_runner(
                     batch_ids[row : row + 1],
                     batch_emb[row : row + 1],
                     batch_hidden[row : row + 1],
@@ -1125,7 +1070,7 @@ class OmniModelState(DefaultModelState):
             codes = torch.cat(code_chunks) if code_chunks else None
             return new_emb, codes
 
-        return self._call_talker_mtp_runner(
+        return self._call_mtp_runner(
             batch_ids,
             batch_emb,
             batch_hidden,
@@ -1133,7 +1078,7 @@ class OmniModelState(DefaultModelState):
             **kwargs,
         )
 
-    def _call_talker_mtp_runner(
+    def _call_mtp_runner(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
@@ -1146,8 +1091,8 @@ class OmniModelState(DefaultModelState):
         # predictor graphs, but call the raw MTP function so per-row streams
         # remain deterministic and independent of scheduler batch makeup.
         has_explicit_generator = kwargs.get("generator") is not None or kwargs.get("generators") is not None
-        runner = self.model.talker_mtp if has_explicit_generator else getattr(self, "_talker_mtp_runner", None)
-        runner = runner or self.model.talker_mtp
+        runner = self.model.mtp if has_explicit_generator else getattr(self, "_mtp_runner", None)
+        runner = runner or self.model.mtp
         return runner(input_ids, input_embeds, last_hidden, text_step, **kwargs)
 
     # ------------------------------------------------------------------
@@ -1262,8 +1207,7 @@ class OmniModelState(DefaultModelState):
                         for i in range(input_batch.num_reqs)
                     ],
                 }
-                if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
-                    make_output_kwargs["runtime_additional_information"] = buffer_list
+                make_output_kwargs["runtime_additional_information"] = buffer_list
                 model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 
         if isinstance(model_output, OmniOutput):

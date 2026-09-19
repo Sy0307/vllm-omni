@@ -345,13 +345,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         for handle in handles:
             self.register_chunk_recv(handle)
 
-    def put_local_request_metadata(self, req_id: str, metadata: dict[str, Any]) -> None:
-        if getattr(self, "payload_native", False):
-            metadata = dict(metadata)
-            codes = metadata.pop("code_predictor_codes", None)
-            metadata["payload_ready"] = self._payload_value_has_content(codes)
-        super().put_local_request_metadata(req_id, metadata)
-
     @classmethod
     def _copy_payload_structure(cls, value: Any) -> Any:
         if isinstance(value, dict):

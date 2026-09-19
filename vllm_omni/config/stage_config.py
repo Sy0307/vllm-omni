@@ -1041,6 +1041,15 @@ def _build_engine_args(
                 )
     engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
+    if deploy.model_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+        logger.warning(
+            "Stage %s (%s) selects model_runner=v2 without declaring "
+            "supports_native_mrv2_data_plane. It will use the legacy transport path; "
+            "MRV2 support for this pipeline has not been validated. Use model_runner=v1 "
+            "unless you are validating a new MRV2 integration.",
+            ps.stage_id,
+            ps.model_arch or pipeline.model_arch or pipeline.model_type,
+        )
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input

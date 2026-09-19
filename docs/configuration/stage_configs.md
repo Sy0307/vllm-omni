@@ -315,6 +315,21 @@ request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
 releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
 this change does not qualify MRV2 on those backends or enable other model families.
+Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
+when pipeline and deployment settings are merged. That stage retains the legacy
+transport path; the warning does not establish support for that combination.
+
+MRV2 model hooks use capability declarations rather than architecture or stage
+names. Omni lifecycle flags select the model state, and `_returns_tuple` declares
+the capture output contract. The optional batched predictor hook is `mtp`, with
+an explicit `mtp_output_key` (a string or two-part payload key), optional
+`mtp_validity_key`, and `mtp_graph_safe`/`mtp_disable_graph` capture controls.
+Its inputs are token IDs, embeddings, previous hidden states and per-row
+conditioning; it returns updated embeddings and prediction codes. Models may
+supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local explicit seeds, and declare
+`mtp_accepts_per_row_generators`, `mtp_accepts_req_infos`, or `mtp_sample_uniforms`
+(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
+its existing `talker_mtp` entry point for V1.
 
 ### Included performance work
 

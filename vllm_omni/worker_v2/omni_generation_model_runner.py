@@ -409,8 +409,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         if not isinstance(model_output, OmniOutput):
             buffer_list = self.model_state.intermediate_buffer.gather(input_batch)
             make_output_kwargs = {"model_intermediate_buffer": buffer_list}
-            if not getattr(self.model, "requires_native_model_intermediate_buffer", False):
-                make_output_kwargs["runtime_additional_information"] = buffer_list
+            make_output_kwargs["runtime_additional_information"] = buffer_list
             model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 
         self._gen_model_output = model_output

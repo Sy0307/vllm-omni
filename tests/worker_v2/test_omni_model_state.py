@@ -39,11 +39,12 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.have_multimodal_outputs = have_multimodal_outputs
     model.gpu_resident_buffer_keys = set()
     model.batched_gpu_staging_keys = set()
-    model.talker_mtp_accepts_per_row_generators = False
-    model.talker_mtp_accepts_req_infos = False
-    model.talker_mtp_output_key = ("codes", "audio")
-    model.talker_mtp_validity_key = None
-    model.requires_native_model_intermediate_buffer = False
+    model.mtp_accepts_per_row_generators = False
+    model.mtp_accepts_req_infos = False
+    model.mtp_output_key = ("codes", "audio")
+    model.mtp_validity_key = None
+    model.mtp_sampling_params = {}
+    model.get_mtp_seed = lambda params: (getattr(params, "extra_args", None) or {}).get("test_seed")
     model.preprocess_batch_mrv2 = None
     model.preprocess_decode_batch_mrv2 = None
     model.preprocess_decode_batch = None
@@ -59,8 +60,8 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
 
     state.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
     state._static_inputs_embeds = None
-    state._talker_mtp_generators = {}
-    state._talker_mtp_runner = None
+    state._mtp_generators = {}
+    state._mtp_runner = None
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step", "_mtp_offsets"):
         setattr(state, name, None)
     return state
@@ -77,7 +78,7 @@ def _fill_buffers(state, *req_ids):
 
 
 def _seeded(seed):
-    return SimpleNamespace(extra_args={"tts_local_seed": seed}, seed=None)
+    return SimpleNamespace(extra_args={"test_seed": seed}, seed=None)
 
 
 def _init_static(state, bsz, dim=3):
@@ -102,7 +103,7 @@ def _fwd_ctx():
 def test_add_request_declared_validity_only_for_warmup(req_id, expect_validity):
     # Real requests must not be masked with a fabricated validity key.
     state = _make_state()
-    state.model.talker_mtp_validity_key = ("meta", "codec_frame_valid")
+    state.model.mtp_validity_key = ("meta", "codec_frame_valid")
     _add(state, req_id, 0)
     buf = state.intermediate_buffer.buffers[0]
     assert ("meta" in buf) is expect_validity
@@ -114,15 +115,15 @@ def test_add_request_declared_validity_only_for_warmup(req_id, expect_validity):
 def test_remove_request_state_isolation(mode):
     state = _make_state()
     _add(state, "r1", 0)
-    state._talker_mtp_generators["r1"] = torch.Generator(device="cpu")
+    state._mtp_generators["r1"] = torch.Generator(device="cpu")
     if mode == "unknown":
         state.remove_request("missing")
         assert state.intermediate_buffer.buffers[0]["req_id"] == "r1"
-        assert "r1" in state._talker_mtp_generators
+        assert "r1" in state._mtp_generators
         return
     state.remove_request(0 if mode == "index" else "r1")
     assert state.intermediate_buffer.buffers[0] == {}
-    assert "r1" not in state._talker_mtp_generators  # recycled slot inherits no seed stream
+    assert "r1" not in state._mtp_generators  # recycled slot inherits no seed stream
 
 
 def test_output_spans_follow_reordered_mixed_batch():
@@ -260,28 +261,28 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     state = _make_state(max_num_reqs=2)
     # vLLM sampling seed must not produce a talker generator.
     cpu = torch.device("cpu")
-    assert state._get_talker_mtp_generator("r1", SimpleNamespace(extra_args={}, seed=42), cpu) is None
-    # Same tts_local_seed reproduces identical uniforms regardless of batch makeup.
+    assert state._get_mtp_generator("r1", SimpleNamespace(extra_args={}, seed=42), cpu) is None
+    # Same model-local seed reproduces identical uniforms regardless of batch makeup.
     state._mtp_sample_uniforms = torch.empty((2, 2, 4))
     assert torch.equal(
-        state._prepare_talker_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1).clone(),
-        state._prepare_talker_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1),
+        state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1).clone(),
+        state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1),
     )
     # Per-request generators are resolved once per step and ride sampling kwargs.
-    state.vllm_config.model_config.subtalker_sampling_params = {"do_sample": True, "temperature": 0.7}
-    state.model.talker_mtp_accepts_per_row_generators = True
+    state.model.mtp_sampling_params = {"do_sample": True, "temperature": 0.7}
+    state.model.mtp_accepts_per_row_generators = True
     _init_static(state, 2)
     state.intermediate_buffer.buffers[0] = {"req_id": "r0", "sampling_params": _seeded(11)}
     state.intermediate_buffer.buffers[1] = {"req_id": "r1", "sampling_params": _seeded(22)}
-    resolver = MagicMock(wraps=state._get_talker_mtp_generator)
-    state._get_talker_mtp_generator = resolver
+    resolver = MagicMock(wraps=state._get_mtp_generator)
+    state._get_mtp_generator = resolver
 
-    def talker_mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
+    def mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
         assert (kwargs["do_sample"], kwargs["temperature"]) == (True, 0.7)
         assert all(isinstance(g, torch.Generator) for g in kwargs["generators"])
         return input_embeds + 10, torch.tensor([[1, 2, 3], [4, 5, 6]])
 
-    state.model.talker_mtp = talker_mtp
+    state.model.mtp = mtp
     state._run_batched_mtp(
         _mtp_batches(), torch.tensor([101, 202]), torch.zeros(2, 3), _DummyInputBatch([0, 1]), {("codes", "audio")}
     )
@@ -290,22 +291,22 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     assert torch.equal(state.intermediate_buffer.buffers[1]["codes"]["audio"], torch.tensor([[4, 5, 6]]))
 
 
-def test_seeded_talker_mtp_bypasses_outer_graph_runner():
+def test_seeded_mtp_bypasses_outer_graph_runner():
     state = _make_state(max_num_reqs=2)
     raw_calls = []
 
-    def talker_mtp(*args, **kwargs):
+    def mtp(*args, **kwargs):
         raw_calls.append(kwargs)
         return args[1], args[0].reshape(-1, 1)
 
-    state.model.talker_mtp = talker_mtp
-    state._talker_mtp_runner = MagicMock(side_effect=AssertionError("seeded sampling must not replay the graph"))
+    state.model.mtp = mtp
+    state._mtp_runner = MagicMock(side_effect=AssertionError("seeded sampling must not replay the graph"))
     generators = [torch.Generator().manual_seed(11), torch.Generator().manual_seed(22)]
-    state._call_talker_mtp_runner(
+    state._call_mtp_runner(
         torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3), generators=generators
     )
     assert raw_calls == [{"generators": generators}]
-    state._talker_mtp_runner.assert_not_called()
+    state._mtp_runner.assert_not_called()
 
 
 def test_run_batched_mtp_uses_dispatched_graph_descriptor():
@@ -316,7 +317,7 @@ def test_run_batched_mtp_uses_dispatched_graph_descriptor():
             assert input_ids.shape[0] == 4  # graph runs the padded descriptor size
             return input_embeds + 2, torch.arange(12, dtype=torch.long).reshape(4, 3)
 
-    state._talker_mtp_runner = _FakeGraphRunner()
+    state._mtp_runner = _FakeGraphRunner()
     _init_static(state, 4)
     _fill_buffers(state, "r0", "r1")
     graph_desc = SimpleNamespace(cg_mode="FULL", num_tokens=4)
@@ -350,3 +351,11 @@ def test_rope_shim_propagates_type_error():
 
     with pytest.raises(TypeError, match="rope API drift"):
         _make_safe_get_rope(broken_get_rope)(SimpleNamespace(uses_mrope=False), object())
+
+
+@pytest.mark.parametrize("output_key", [None, ("only_one",)])
+def test_mtp_requires_model_declared_output_key(output_key):
+    state = _make_state()
+    model = SimpleNamespace(mtp=lambda: None, mtp_output_key=output_key)
+    with pytest.raises(TypeError, match="must declare mtp_output_key"):
+        state._init_mtp_runner(model)
