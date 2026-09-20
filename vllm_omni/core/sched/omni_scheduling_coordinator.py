@@ -469,7 +469,10 @@ class OmniSchedulingCoordinator:
                         self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)
                     continue
-            queue.remove_request(request)
+            if isinstance(queue, list):
+                queue.remove(request)
+            else:
+                queue.remove_request(request)
             waiting_for_chunk_list.append(request)
 
     def _request_can_run(

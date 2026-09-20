@@ -127,6 +127,18 @@ def test_chunk_registration_ready_and_terminal_lifecycle():
     assert "internal" in coord.finished_requests
 
 
+def test_chunk_waiting_removes_request_from_running_list():
+    coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+    req = _make_request("running", status=RequestStatus.RUNNING)
+    running = [req]
+
+    coord.process_pending_chunks(MockQueue(), running, set(), set())
+
+    assert running == []
+    assert req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert list(coord._waiting_for_chunk_running) == [req]
+
+
 class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
     """Test update_request_metadata applies scheduling metadata to requests."""
 
