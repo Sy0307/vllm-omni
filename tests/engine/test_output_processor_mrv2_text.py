@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MRv2 Omni AR text detach and generation payload outputs."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine import EngineCoreOutput, FinishReason
+from vllm.v1.engine import FinishReason
 
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.output_modality import OutputModality
@@ -65,16 +66,36 @@ def _make_processor(output_modality, detokenizer=None):
     return processor, state
 
 
+def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
+    """Build the post-StagePool shape without violating vLLM's wire schema."""
+    return SimpleNamespace(
+        request_id="r",
+        new_token_ids=[42],
+        pooling_output=pooling_output,
+        finish_reason=finish_reason,
+        stop_reason=None,
+        kv_transfer_params=None,
+        ec_transfer_params=None,
+        routed_experts=None,
+        trace_headers=None,
+        prefill_stats=None,
+        num_nans_in_logits=0,
+        multimodal_output=None,
+        is_segment_finished=False,
+        is_non_final_audio_chunk=False,
+        output_type=None,
+        num_generation_tokens=None,
+    )
+
+
 def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     detokenizer = _Detokenizer()
     processor, state = _make_processor(OutputModality.LATENT, detokenizer)
 
-    output = EngineCoreOutput(
-        request_id="r",
-        new_token_ids=[42],
-        pooling_output={"hidden": torch.ones(1, 4)},
-        finish_reason=FinishReason.STOP,
-    )
+    # StagePool has already rehydrated the MRv2 carrier.  Use a structural
+    # output here because upstream EngineCoreOutput strictly validates
+    # pooling_output as torch.Tensor | None on construction.
+    output = _rehydrated_output(pooling_output={"hidden": torch.ones(1, 4)})
 
     processed = processor.process_outputs([output])
 
