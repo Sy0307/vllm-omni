@@ -86,7 +86,7 @@ class MockQueue:
     def prepend_requests(self, requests):
         self._items = list(requests) + self._items
 
-    def remove(self, request):
+    def remove_request(self, request):
         self._items.remove(request)
 
     def remove_requests(self, requests):

@@ -33,7 +33,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_flat_payload, partition_payload_list
+from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 
@@ -85,19 +85,6 @@ def _guard_graph_replay_for_pooler_copy(
     """Keep static graph outputs alive until non-snapshotted D2H completes."""
     if need_pooler and not async_chunk:
         main_stream.wait_event(copy_event)
-
-
-def _partition_pooler_outputs(
-    pooler_output: list[dict[str, Any]],
-    *,
-    async_chunk: bool,
-) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
-    if not pooler_output:
-        return None, None
-    if async_chunk:
-        return partition_payload_list(pooler_output)
-    outputs = cast(list[dict[str, Any] | None], pooler_output)
-    return outputs, outputs
 
 
 class OmniARModelRunner(OmniGPUModelRunner):
@@ -655,7 +642,6 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
-        self._mm_gpu_sources = multimodal_outputs if self._async_chunk else None
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
@@ -762,7 +748,6 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> OmniModelRunnerOutput:
         self.copy_event.synchronize()
-        self._mm_gpu_sources = None
 
         # Sampled token ids
         sampled_token_ids: list[list[int]] = self.sampled_token_ids_np.tolist()
@@ -821,15 +806,11 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._num_scheduled_tokens,
                 self._num_reqs,
             )
-            async_chunk = bool(getattr(self.model_runner_output, "_async_chunk", False))
-            pooler_inter, pooler_client = _partition_pooler_outputs(
-                pooler_output,
-                async_chunk=async_chunk,
-            )
-            self.model_runner_output.pooler_output = None if async_chunk else pooler_output
-            self.model_runner_output.inter_stage_outputs = pooler_inter
+            pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
+            self.model_runner_output.pooler_output = pooler_payload
+            self.model_runner_output.inter_stage_outputs = pooler_payload
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(p) if p else {} for p in pooler_client] if pooler_client else None
+                [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
             )
 
         if self._finalize_output is not None:

@@ -103,31 +103,6 @@ def _append_tensor_frame(transfer_manager: Any, request_id: str, frame: torch.Te
     transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(torch.long).reshape(-1).contiguous())
 
 
-def _frames_to_tensor(frames: list[Any]) -> torch.Tensor:
-    """Coerce legacy list frames and MRv2 tensor frames into [num_frames, Q]."""
-    device = None
-    for frame in frames:
-        if isinstance(frame, torch.Tensor):
-            device = frame.device
-            break
-
-    tensor_frames: list[torch.Tensor] = []
-    for frame in frames:
-        if isinstance(frame, torch.Tensor):
-            tensor = frame.detach()
-            if device is None:
-                tensor = tensor.to(torch.long)
-            else:
-                tensor = tensor.to(device=device, dtype=torch.long)
-            tensor = tensor.reshape(-1)
-        elif device is None:
-            tensor = torch.as_tensor(frame, dtype=torch.long).reshape(-1)
-        else:
-            tensor = torch.as_tensor(frame, dtype=torch.long, device=device).reshape(-1)
-        tensor_frames.append(tensor.contiguous())
-    return torch.stack(tensor_frames, dim=0)
-
-
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any] | None,

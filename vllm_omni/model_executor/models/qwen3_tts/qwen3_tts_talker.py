@@ -402,12 +402,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
-        self.mtp_output_key = self.talker_mtp_output_key = ("codes", "audio")
-        self.mtp_graph_safe = self.talker_mtp_graph_safe = True
+        self.talker_mtp_output_key = ("codes", "audio")
+        self.talker_mtp_graph_safe = True
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
-        self.mtp_accepts_per_row_generators = self.talker_mtp_accepts_per_row_generators = True
+        self.talker_mtp_accepts_per_row_generators = True
         self.mtp_sample_uniforms = True
         self.mtp_sample_steps = max(0, int(self.talker_config.num_code_groups) - 1)
         self.mtp_sample_vocab_size = self._codebook_vocab_size
@@ -1555,6 +1555,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
 
-    # MRV2 capability names; V1 keeps its existing talker_mtp entry point.
+    # MRV2 capability names read the V1 canonical values so platform patches
+    # such as the NPU 310P graph-safety override apply to both runners.
     mtp = talker_mtp
     get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    @property
+    def mtp_output_key(self) -> tuple[str, str]:
+        return self.talker_mtp_output_key
+
+    @property
+    def mtp_graph_safe(self) -> bool:
+        return self.talker_mtp_graph_safe
+
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return self.talker_mtp_accepts_per_row_generators
