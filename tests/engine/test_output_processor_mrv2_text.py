@@ -79,12 +79,15 @@ def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
         routed_experts=None,
         trace_headers=None,
         prefill_stats=None,
+        spec_decode_metrics=None,
+        new_sampling_mask=None,
         num_nans_in_logits=0,
         multimodal_output=None,
         is_segment_finished=False,
         is_non_final_audio_chunk=False,
         output_type=None,
         num_generation_tokens=None,
+        finished=True,
     )
 
 
