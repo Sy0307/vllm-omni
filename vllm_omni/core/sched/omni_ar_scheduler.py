@@ -194,9 +194,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and discard any incomplete KV-wait timing."""
+        cleanup_ids: Iterable[str]
         if isinstance(request_ids, str):
             cleanup_ids = (request_ids,)
-            finish_request_ids: str | tuple[str, ...] | None = request_ids
+            finish_request_ids: str | Iterable[str] | None = request_ids
         elif request_ids is None:
             cleanup_ids = ()
             finish_request_ids = None
@@ -611,7 +612,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             confirmed_num_computed_tokens = None
             boundary_generation = None
             # Capture before resumable stop handling can clear token history.
-            num_generation_tokens = len(request.output_token_ids)
+            output_token_ids: Any = getattr(request, "output_token_ids", None)
+            if output_token_ids is None:
+                output_token_ids = getattr(request, "_output_token_ids", ())
+            num_generation_tokens = len(output_token_ids)
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -896,7 +900,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
                 return
             if replaced is not None:
                 if replaced:

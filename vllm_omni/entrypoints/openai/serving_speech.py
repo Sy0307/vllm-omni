@@ -249,6 +249,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.uploaded_speakers: dict[str, dict[str, Any]] = {}
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[np.ndarray, int, int, str]] = OrderedDict()
+        self._ref_audio_resolve_cache_lists: dict[str, list[float]] = {}
         self._ref_audio_resolve_cache_bytes = 0
         self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
         self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
@@ -1276,7 +1277,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if cached is not None:
                 self._ref_audio_resolve_cache.move_to_end(cache_key)
                 wav_array, sr, _, _ = cached
-                cached_samples: list[float] = wav_array.tolist()
+                cached_samples = self._ref_audio_resolve_cache_lists.get(cache_key)
+                if cached_samples is None:
+                    cached_samples = wav_array.tolist()
+                    self._ref_audio_resolve_cache_lists[cache_key] = cached_samples
                 logger.debug(
                     "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
                     len(cached_samples),
@@ -1355,18 +1359,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if size > self._ref_audio_resolve_cache_max_bytes:
             return
         previous = self._ref_audio_resolve_cache.pop(cache_key, None)
+        cache_lists = getattr(self, "_ref_audio_resolve_cache_lists", None)
+        if cache_lists is None:
+            cache_lists = {}
+            self._ref_audio_resolve_cache_lists = cache_lists
         if previous is not None:
             self._ref_audio_resolve_cache_bytes -= previous[2]
             if previous[3] != artifact_key:
                 self._discard_ref_audio_artifact_ready_if_unreferenced(previous[3])
         self._ref_audio_resolve_cache[cache_key] = (wav_array, int(sr), size, artifact_key)
+        cache_lists[cache_key] = wav_list
         self._ref_audio_resolve_cache_bytes += size
         while len(self._ref_audio_resolve_cache) > self._ref_audio_resolve_cache_max_entries:
-            _, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
+            old_cache_key, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
+            cache_lists.pop(old_cache_key, None)
             self._ref_audio_resolve_cache_bytes -= old_size
             self._discard_ref_audio_artifact_ready_if_unreferenced(old_artifact_key)
         while self._ref_audio_resolve_cache_bytes > self._ref_audio_resolve_cache_max_bytes:
-            _, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
+            old_cache_key, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
+            cache_lists.pop(old_cache_key, None)
             self._ref_audio_resolve_cache_bytes -= old_size
             self._discard_ref_audio_artifact_ready_if_unreferenced(old_artifact_key)
 
