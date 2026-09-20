@@ -289,19 +289,9 @@ def test_thinker_prefix_caching_async_chunk_identical(omni_server, online_client
     _assert_omni_payload_complete(first_response)
     _assert_omni_payload_complete(cached_response)
 
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
-def test_thinker_prefix_caching_async_chunk_shared_image_prefix(omni_server, online_client) -> None:
-    """Shared image / system prefix, different user text — not a full-prompt replay.
-
-    The second request must still hit cached tokens (block-aligned, less than
-    its prompt). A merge that only works when ``hit_upto == prompt_len`` would
-    fail this.
-    """
+    # Reuse this server for the partial-prefix case. Starting another 30B
+    # Qwen3-Omni server here makes the CUDA core suite exceed its 20-minute
+    # Buildkite budget without increasing coverage.
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
     first_messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
