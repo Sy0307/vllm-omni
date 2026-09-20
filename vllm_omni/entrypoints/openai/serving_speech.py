@@ -1364,10 +1364,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     ) -> None:
         if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:
             return
-        # Own a compact float32 copy at the cache boundary.  Besides keeping
-        # the byte accounting stable, this accepts legacy list callers and
-        # prevents a caller from mutating cached samples after insertion.
-        waveform = np.array(waveform, dtype=np.float32, copy=True, order="C")
+        # Keep the finalized ndarray's ownership and identity for the array
+        # resolver. Legacy list callers are materialized into a compact array;
+        # their Python list remains independent from cached storage.
+        waveform = np.asarray(waveform, dtype=np.float32)
+        if not waveform.flags.c_contiguous:
+            waveform = np.ascontiguousarray(waveform)
         size = int(waveform.nbytes)
         if size > self._ref_audio_resolve_cache_max_bytes:
             return
