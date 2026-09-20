@@ -70,6 +70,8 @@ def sanitize_sampling_params_min_tokens_stop_ids(
         str(sorted(unreachable)),
         logits_vocab,
     )
+
+
 def build_model_sampler_extra_args(input_batch: Any, requests: Any) -> list[dict | None]:
     """Return per-request ``SamplingParams.extra_args`` in batch-row order."""
     request_states = requests or {}
