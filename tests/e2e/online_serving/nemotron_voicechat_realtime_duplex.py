@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import math
-import uuid
 import wave
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, suppress
@@ -45,10 +44,12 @@ DEFAULT_FUNCTION_INSTRUCTIONS = (
 )
 
 
-def _url(base_url: str, model: str, session_id: str) -> str:
+def _url(base_url: str, model: str) -> str:
     parts = urlsplit(base_url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.update(duplex="1", model=model, autostart="0", session_id=session_id)
+    # The server allocates the session id; ``?session_id=`` is reserved for
+    # resume on the duplex realtime endpoint.
+    query.update(duplex="1", model=model, autostart="0")
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -156,11 +157,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     else:
         instructions = args.instructions
     tools = DEFAULT_FUNCTION_TOOLS if args.expect_function_call else None
-    session_id = f"nemotron-voicechat-{uuid.uuid4().hex}"
-    client = RealtimeDuplexClient(_url(args.url, args.model, session_id))
+    client = RealtimeDuplexClient(_url(args.url, args.model))
     async with _managed_client(client, timeout_s=args.timeout_s):
         session_payload: dict[str, object] = {
-            "session_id": session_id,
             "model": args.model,
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm_f32le",
@@ -182,6 +181,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"session setup failed: {client.events.errors()}")
         created = _events(client, "session.created")[-1]
         session = created.get("session")
+        session_id = session.get("id") if isinstance(session, dict) else None
         capabilities = session.get("capabilities") if isinstance(session, dict) else None
         expected = dict(
             implementation_level="model_native_duplex",
@@ -240,21 +240,19 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             event for event in client.events.events if str(event.get("type", "")).startswith("response.function_call")
         ]
         function_items = [
-            event
+            item
             for event in _events(client, "response.output_item.done")
-            if isinstance(event.get("item"), dict) and event["item"].get("type") == "function_call"
+            if isinstance((item := event.get("item")), dict) and item.get("type") == "function_call"
         ]
         if args.expect_function_call and not any(
             event.get("type") == "response.function_call_arguments.done" for event in function_events
         ):
             raise AssertionError(f"no completed function call: {function_events}")
         if args.expect_function_call:
-            matching_items = [
-                event for event in function_items if event["item"].get("name") == args.expected_function_name
-            ]
+            matching_items = [item for item in function_items if item.get("name") == args.expected_function_name]
             if not matching_items:
                 raise AssertionError(f"expected {args.expected_function_name!r}, got {function_items}")
-            function_item = matching_items[-1]["item"]
+            function_item: dict[str, object] = matching_items[-1]
             try:
                 function_arguments = json.loads(str(function_item.get("arguments", "")))
             except json.JSONDecodeError as exc:
@@ -303,7 +301,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"unexpected output sample rates: {rates}")
         if not args.expect_function_call and args.minimum_audio_chunks and not audio:
             raise AssertionError("model produced no audio")
-        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * expected["chunk_period_ms"] // 1000
+        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * int(str(expected["chunk_period_ms"])) // 1000
         packet_sizes = [len(base64.b64decode(str(event.get("delta", "")), validate=True)) for event in audio_events]
         if not args.expect_function_call and any(size != expected_bytes for size in packet_sizes):
             raise AssertionError(f"audio deltas are not fixed 80 ms PCM16 packets: {packet_sizes}")
@@ -317,9 +315,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     _write_events(output_dir / "events.jsonl", client)
     if audio:
         write_pcm16_wav(output_dir / "output.wav", audio, sample_rate_hz=OUTPUT_SAMPLE_RATE_HZ)
-    result = {
+    result: dict[str, object] = {
         "ok": True,
-        "session_id": session_id,
+        "session_id": session_id if isinstance(session_id, str) else None,
         "input_frames": frame_count,
         "capabilities": capabilities,
         "event_counts": {

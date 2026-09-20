@@ -951,6 +951,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             token = func_logits.argmax(dim=-1)
         token = token.reshape(-1)[-1].reshape(()).detach()
         request_id = kwargs.get("request_id")
+        consumed_generation: int | None = None
         if isinstance(request_id, str):
             session = self._sessions.get(request_id)
             if session is not None:
@@ -966,7 +967,10 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 # StreamingUpdate replaces the runner payload at each append;
                 # retain the function channel in model-owned session state.
                 session["func_token"] = int(token.item())
+                consumed_generation = int(session.get("function_response_generation", 0))
         update: dict[str, Any] = {"nvc_prev_function_token": token}
+        if consumed_generation is not None:
+            update["nvc_function_response_consumed_generation"] = consumed_generation
         if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
             existing = kwargs.get("nvc_function_tokens")
             if isinstance(existing, torch.Tensor) and existing.numel() > 0:

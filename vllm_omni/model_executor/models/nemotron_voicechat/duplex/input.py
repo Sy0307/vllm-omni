@@ -10,6 +10,8 @@ import binascii
 import numpy as np
 import pybase64 as base64
 
+from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
+
 NEMOTRON_VOICECHAT_SAMPLE_RATE = 16000
 NEMOTRON_VOICECHAT_FRAME_SAMPLES = 1280
 _SAMPLE_BYTES = 4
@@ -60,7 +62,7 @@ def _frame_payload(raw: bytes, *, final: bool) -> dict[str, object]:
     }
 
 
-class NemotronVoiceChatPcmAppendReservation:
+class NemotronVoiceChatPcmAppendReservation(PcmAppendReservation):
     def __init__(
         self,
         owner: NemotronVoiceChatPcmAppendBuffer,
@@ -107,7 +109,7 @@ class NemotronVoiceChatPcmAppendReservation:
         self._owner._buffer[:0] = restore
 
 
-class NemotronVoiceChatPcmAppendBuffer:
+class NemotronVoiceChatPcmAppendBuffer(PcmAppendBuffer):
     """Adapt Realtime packets to the current full-duplex PCM buffer contract.
 
     The model consumes exactly one 1280-sample frame per scheduler append.

@@ -242,6 +242,7 @@ vllm_omni/
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
 ├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
 ├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
+├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, session, capabilities)
 └── clients/
     ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
     ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
@@ -397,11 +398,12 @@ sampling defaults once the stage pools exist. Plugin hooks that may block
 offloaded from the loop.
 
 The MiniCPM-o 4.5 plugin (`model_executor/models/minicpmo_4_5/duplex/plugin.py`)
-is the only integration in this framework version. PersonaPlex and Nemotron
-VoiceChat still carry their pre-framework duplex code (runtime extension plus
-serving adapter) and are therefore not served over this framework yet: their
-pipelines declare no `duplex_plugin`, so they run turn-based until the
-follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
+and the Nemotron VoiceChat plugin
+(`model_executor/models/nemotron_voicechat/duplex/plugin.py`) integrate with
+this framework version. PersonaPlex still carries its pre-framework duplex
+code (runtime extension plus serving adapter) and is therefore not served over
+this framework yet: its pipeline declares no `duplex_plugin`, so it runs
+turn-based until the follow-up PR ports it (RFC vllm-omni#7181).
 
 ## Serving
 

@@ -146,6 +146,65 @@ class DuplexModelSessionState(ABC):
     def clear_continuation(self) -> None: ...
 
 
+@dataclass(slots=True)
+class DefaultDuplexModelSessionState(DuplexModelSessionState):
+    """Framework-owned flag anatomy, implemented once.
+
+    The flag set above is the session runner's contract with the model (commit
+    retention, deferred response/creates, silence-continuation bookkeeping); it
+    is identical for every lockstep or frame-locked model, so a plugin only
+    binds its input packetization: subclass and give ``audio_buffer`` a
+    ``field(default_factory=...)``.
+    """
+
+    audio_buffer: PcmAppendBuffer
+    input_since_commit: bool = False
+    speech_since_commit: bool = False
+    context_locked: bool = False
+    committed_audio_payload: dict[str, object] | None = None
+    committed_audio_operation_id: str | None = None
+    committed_audio_reserved_bytes: int = 0
+    deferred_response_create: bool = False
+    deferred_precreate_response: bool = False
+    continuation_owner_id: str | None = None
+    continuation_units: int = 0
+    pending_silence_task: asyncio.Task[bool] | None = None
+    pending_silence_owner_id: str | None = None
+    # Deadline-aligned silence continuation state: the monotonic submission
+    # time of the most recent native input unit and the next silence
+    # continuation deadline. A real (non-silence) input resets the chain.
+    last_native_submit_monotonic: float | None = None
+    silence_deadline_monotonic: float | None = None
+
+    def retain_committed_audio(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str | None,
+        reserved_bytes: int = 0,
+    ) -> None:
+        self.committed_audio_payload = payload
+        self.committed_audio_operation_id = operation_id
+        self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+
+    def clear_committed_audio(self) -> int:
+        reserved_bytes = self.committed_audio_reserved_bytes
+        self.committed_audio_payload = None
+        self.committed_audio_operation_id = None
+        self.committed_audio_reserved_bytes = 0
+        self.deferred_response_create = False
+        self.deferred_precreate_response = False
+        return reserved_bytes
+
+    def clear_continuation(self) -> None:
+        self.continuation_owner_id = None
+        self.continuation_units = 0
+        self.pending_silence_task = None
+        self.pending_silence_owner_id = None
+        self.last_native_submit_monotonic = None
+        self.silence_deadline_monotonic = None
+
+
 class DuplexDataPlane(ABC):
     """Projects raw stage outputs of one model into internal duplex events."""
 
@@ -397,6 +456,20 @@ class DuplexModelPlugin(ABC):
         del config, current, item
         return None
 
+    def runtime_config_after_model_output(
+        self,
+        current: Mapping[str, object],
+        output_metadata: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return a runtime-config patch after a model output is observed.
+
+        Plugins may use model-owned output metadata to retire server-side
+        runtime state that has been consumed by the worker. The default keeps
+        the framework unaware of model-specific metadata.
+        """
+        del current, output_metadata
+        return None
+
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
     module_name, separator, attribute_name = path.rpartition(".")
@@ -448,6 +521,7 @@ def coerce_int(value: object) -> int | None:
 
 
 __all__ = [
+    "DefaultDuplexModelSessionState",
     "DuplexDataPlane",
     "DuplexModelPlugin",
     "DuplexModelSessionState",
