@@ -151,6 +151,9 @@ def test_only_thinker_handoff_transports_hidden_states(stage, include_hidden):
     model.model_stage = stage
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
     runner.model = model
+    # OmniGPUModelRunner caches the model's opt-in flag at load time; mirror
+    # that binding on the bare instance instead of re-running __init__.
+    runner._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
     assert runner._model_omni_pooler_payload_include_hidden() is include_hidden
 
 
