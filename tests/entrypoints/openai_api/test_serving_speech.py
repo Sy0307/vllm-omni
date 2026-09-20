@@ -1592,7 +1592,9 @@ class TestTTSMethods:
 
         assert first[1] == 24000
         assert second[1] == 24000
-        assert first[0] is second[0]
+        # Cache storage is compact ndarray-backed state; each API return owns
+        # an independent list so callers cannot mutate the cached waveform.
+        assert first[0] == second[0]
         assert first[0][0] == pytest.approx(float(wav[0]), abs=1e-4)
         cache_key = first[2]
         assert speech_server._get_resolved_ref_audio_artifact_key(
