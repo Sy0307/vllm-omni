@@ -110,8 +110,8 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
-_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 1024
-_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 512 * 1024 * 1024
+_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
+_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _DEFAULT_VOICE_NAME = "default"
 
@@ -1222,7 +1222,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             allowed_local_media_path,
         )
 
-    def _finalize_fetched_ref_audio(self, wav_np: np.ndarray, sr: int) -> tuple[list[float], int, str, float]:
+    def _finalize_fetched_ref_audio(self, wav_np: np.ndarray, sr: int) -> tuple[np.ndarray, int, str, float]:
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
@@ -1238,11 +1238,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"Reference audio too long ({duration:.1f}s). "
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
             )
-        artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
-        return wav_np.tolist(), sr, artifact_key, duration
+        # Own the buffer: a view could retain a much larger decoded allocation.
+        waveform = np.array(wav_np, dtype=np.float32, order="C", copy=True)
+        artifact_key = self._make_ref_audio_artifact_cache_key(waveform, sr)
+        return waveform, sr, artifact_key, duration
 
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int, str]:
+        """Keep list-based consumers and their engine transport compatible.
+
+        Only the numeric array is cached; this temporary list belongs to the
+        caller. Server-side reference encoders should use the array resolver.
+        """
+        waveform, sr, cache_key = await self._resolve_ref_audio_array(ref_audio_str)
+        return waveform.tolist(), sr, cache_key
+
+    async def _resolve_ref_audio_array(self, ref_audio_str: str) -> tuple[np.ndarray, int, str]:
         """Resolve ref_audio to (wav_samples, sample_rate, cache_key).
+
+        The float32 array can be shared with the cache. Callers must not mutate
+        it; copy before any in-place processing.
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
         URLs, ``data:`` base64 URIs, and ``file:`` local paths (the latter
@@ -1266,7 +1280,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             allowed_path = getattr(self.model_config, "allowed_local_media_path", None)
 
-        wav_list: list[float] | None = None
+        waveform: np.ndarray | None = None
         sr = 0
         artifact_key = ""
         post_key = ""
@@ -1275,15 +1289,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             cached = self._ref_audio_resolve_cache.get(cache_key)
             if cached is not None:
                 self._ref_audio_resolve_cache.move_to_end(cache_key)
-                wav_array, sr, _, _ = cached
-                cached_samples: list[float] = wav_array.tolist()
+                waveform, sr, _, _ = cached
                 logger.debug(
                     "Resolved ref_audio from cache: samples=%d sr=%d duration_s=%.3f",
-                    len(cached_samples),
+                    len(waveform),
                     sr,
-                    len(cached_samples) / sr if sr > 0 else 0.0,
+                    len(waveform) / sr if sr > 0 else 0.0,
                 )
-                return cached_samples, sr, cache_key
+                return waveform, sr, cache_key
 
             if self._media_connector is None:
                 model_config = self.model_config
@@ -1295,21 +1308,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             fetch_start_s = time.perf_counter()
             wav_np, fetched_sr = await self._media_connector.fetch_audio_async(ref_audio_str)
             fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
-            tolist_start_s = time.perf_counter()
-            wav_list, sr, artifact_key, duration = self._finalize_fetched_ref_audio(wav_np, fetched_sr)
-            tolist_ms = (time.perf_counter() - tolist_start_s) * 1000.0
+            finalize_start_s = time.perf_counter()
+            waveform, sr, artifact_key, duration = self._finalize_fetched_ref_audio(wav_np, fetched_sr)
+            finalize_ms = (time.perf_counter() - finalize_start_s) * 1000.0
             logger.debug(
-                "Resolved ref_audio: fetch_decode_ms=%.3f tolist_ms=%.3f samples=%d sr=%d duration_s=%.3f",
+                "Resolved ref_audio: fetch_decode_ms=%.3f finalize_ms=%.3f samples=%d sr=%d duration_s=%.3f",
                 fetch_decode_ms,
-                tolist_ms,
-                len(wav_list),
+                finalize_ms,
+                len(waveform),
                 sr,
                 duration,
             )
             post_key = await self._ref_audio_cache_key(ref_audio_str, allowed_path)
             if post_key == cache_key:
-                self._put_resolved_ref_audio(cache_key, wav_list, sr, artifact_key)
-                return wav_list, sr, cache_key
+                self._put_resolved_ref_audio(cache_key, waveform, sr, artifact_key)
+                return waveform, sr, cache_key
             logger.debug(
                 "ref_audio metadata changed during fetch (attempt %d/%d); retrying",
                 attempt + 1,
@@ -1320,8 +1333,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "ref_audio file changed during fetch after %d attempts; skipping resolve cache",
             _REF_AUDIO_METADATA_FETCH_ATTEMPTS,
         )
-        assert wav_list is not None and post_key
-        return wav_list, sr, post_key
+        assert waveform is not None and post_key
+        return waveform, sr, post_key
 
     @staticmethod
     def _make_ref_audio_artifact_cache_key(wav: np.ndarray, sr: int) -> str:
@@ -1346,12 +1359,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_resolve_cache.move_to_end(cache_key)
         return cached[3]
 
-    def _put_resolved_ref_audio(self, cache_key: str, wav_list: list[float], sr: int, artifact_key: str) -> None:
+    def _put_resolved_ref_audio(self, cache_key: str, waveform: np.ndarray, sr: int, artifact_key: str) -> None:
         if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:
             return
-        # Store owned float32 samples; callers receive independent lists.
-        wav_array = np.array(wav_list, dtype=np.float32, copy=True)
-        size = int(wav_array.nbytes)
+        size = waveform.nbytes
         if size > self._ref_audio_resolve_cache_max_bytes:
             return
         previous = self._ref_audio_resolve_cache.pop(cache_key, None)
@@ -1359,7 +1370,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._ref_audio_resolve_cache_bytes -= previous[2]
             if previous[3] != artifact_key:
                 self._discard_ref_audio_artifact_ready_if_unreferenced(previous[3])
-        self._ref_audio_resolve_cache[cache_key] = (wav_array, int(sr), size, artifact_key)
+        self._ref_audio_resolve_cache[cache_key] = (waveform, int(sr), size, artifact_key)
         self._ref_audio_resolve_cache_bytes += size
         while len(self._ref_audio_resolve_cache) > self._ref_audio_resolve_cache_max_entries:
             _, (_, _, old_size, old_artifact_key) = self._ref_audio_resolve_cache.popitem(last=False)
