@@ -71,8 +71,6 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
         return False
     if getattr(model_config, "async_chunk", False):
         return False
-    if getattr(model_config, "final_output", False):
-        return False
     next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
     if not isinstance(next_stage_func, str) or not next_stage_func:
         return False
