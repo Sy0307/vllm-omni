@@ -22,6 +22,8 @@ from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
+
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import (
@@ -56,8 +58,6 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
-
-from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1552,6 +1552,7 @@ def test_from_pipeline_config_derives_has_sampling_extra_args_from_stage_default
 
 def test_diffusion_config_preserves_existing_coercion_hooks():
     import torch
+
     from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 
     cfg = omni_config_module._DiffusionConfigProjection(
