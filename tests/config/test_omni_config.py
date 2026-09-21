@@ -22,8 +22,6 @@ from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
-
-from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import (
@@ -58,6 +56,8 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+
+from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -816,19 +816,25 @@ def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
         _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
 
 
-@pytest.mark.parametrize(
-    ("default_name", "mrv2_name"),
-    [
-        ("qwen3_tts.yaml", "qwen3_tts_mrv2.yaml"),
-        (
-            "qwen3_tts_high_concurrency.yaml",
-            "qwen3_tts_high_concurrency_mrv2.yaml",
-        ),
-    ],
-)
-def test_qwen3_mrv2_profiles_are_explicit_opt_in(default_name: str, mrv2_name: str):
-    assert load_deploy_config(_DEPLOY_DIR / default_name).model_runner == "v1"
-    assert load_deploy_config(_DEPLOY_DIR / mrv2_name).model_runner == "v2"
+def test_qwen3_tts_high_concurrency_mrv2_profile_is_explicit_opt_in():
+    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml").model_runner == "v1"
+    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml").model_runner == "v2"
+
+
+def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallback():
+    deploy_path = _DEPLOY_DIR / "qwen3_tts.yaml"
+    assert load_deploy_config(deploy_path).model_runner == "v2"
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in stages)
+
+    assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda").model_runner == "v2"
+    for platform in ("npu", "xpu", "rocm", "musa"):
+        assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v1"
+
+    # The explicit MRV2 profile resolves to the same runner selection.
+    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_mrv2.yaml").model_runner == "v2"
 
 
 def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
@@ -1546,7 +1552,6 @@ def test_from_pipeline_config_derives_has_sampling_extra_args_from_stage_default
 
 def test_diffusion_config_preserves_existing_coercion_hooks():
     import torch
-
     from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 
     cfg = omni_config_module._DiffusionConfigProjection(
