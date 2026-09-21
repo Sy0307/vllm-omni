@@ -153,8 +153,7 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     The flag set above is the session runner's contract with the model (commit
     retention, deferred response/creates, silence-continuation bookkeeping); it
     is identical for every lockstep or frame-locked model, so a plugin only
-    binds its input packetization: subclass and give ``audio_buffer`` a
-    ``field(default_factory=...)``.
+    supplies its input packetizer as ``audio_buffer``.
     """
 
     audio_buffer: PcmAppendBuffer

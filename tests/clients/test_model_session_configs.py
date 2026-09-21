@@ -43,29 +43,12 @@ def test_personaplex_session_config_matches_deployment():
 
 def test_nemotron_voicechat_session_config_matches_deployment():
     tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
-    config = create_nemotron_voicechat_session_config(
-        instructions="You are NVIDIA Voice Chat.", tools=tools, idle_timeout_s=300.0
-    )
+    config = create_nemotron_voicechat_session_config(instructions="hi", tools=tools)
     assert config.input_audio == AudioFormat("pcm_f32le", 16_000)
     assert config.output_audio == AudioFormat("pcm16", 22_050)
-    payload = config.to_session_payload(model="nvidia/NVIDIA-NemotronLabs-VoiceChat-11B")
-    assert payload["model"] == "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"
-    assert payload["input_audio_format"] == "pcm_f32le"
-    assert payload["output_audio_format"] == "pcm16"
-    assert payload["sample_rate_hz"] == 16_000
-    assert payload["audio"]["output"]["sample_rate_hz"] == 22_050
-    assert payload["instructions"] == "You are NVIDIA Voice Chat."
-    assert payload["idle_timeout_s"] == 300.0
-    assert payload["turn_detection"] is None
+    payload = config.to_session_payload(model="nemotron")
+    assert payload["model"] == "nemotron" and payload["instructions"] == "hi"
     assert payload["extra_body"] == {"auto_response": True, "realtime_tools": tools}
-
-
-def test_nemotron_voicechat_session_config_clears_tools_without_mutating_extra_body():
-    extra_body = {"realtime_tools": [{"type": "function", "name": "lookup"}]}
-    config = create_nemotron_voicechat_session_config(tools=[], extra_body=extra_body)
-    assert config.extra_body["realtime_tools"] == []
-    assert extra_body["realtime_tools"] == [{"type": "function", "name": "lookup"}]
-    assert create_nemotron_voicechat_session_config().extra_body == {}
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
 )
 from vllm_omni.engine.duplex.plugin import (
+    DefaultDuplexModelSessionState,
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
     EncodeAudio,
@@ -47,10 +48,8 @@ from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
     NEMOTRON_VOICECHAT_FRAME_SAMPLES,
+    NemotronVoiceChatPcmAppendBuffer,
     decode_pcm_f32le,
-)
-from vllm_omni.model_executor.models.nemotron_voicechat.duplex.session import (
-    NemotronVoiceChatSessionState,
 )
 
 if TYPE_CHECKING:
@@ -79,8 +78,6 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "nvc_tokenizer_ref",
         "nvc_tools_signature",
         "nvc_function_response_generation",
-        "nvc_function_response_token_ids",
-        "nvc_function_response_call_id",
         "nvc_function_response_batches",
     }
 )
@@ -370,8 +367,8 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
 
     # ---- session policy ----
 
-    def create_session_state(self) -> NemotronVoiceChatSessionState:
-        return NemotronVoiceChatSessionState()
+    def create_session_state(self) -> DefaultDuplexModelSessionState:
+        return DefaultDuplexModelSessionState(audio_buffer=NemotronVoiceChatPcmAppendBuffer())
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return nemotron_voicechat_capabilities(max_sessions=max_sessions)
@@ -511,10 +508,8 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
                 "return tool results after the model has consumed the previous one",
                 code="function_response_backlog",
             )
-        batches = [*batches, {"generation": generation, "call_id": call_id, "token_ids": token_ids}]
+        batches = [*batches, {"generation": generation, "token_ids": token_ids}]
         runtime["nvc_function_response_generation"] = generation
-        runtime["nvc_function_response_token_ids"] = token_ids
-        runtime["nvc_function_response_call_id"] = call_id
         runtime["nvc_function_response_batches"] = batches
         return runtime
 

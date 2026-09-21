@@ -735,13 +735,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
                     raise ValueError("Nemotron VoiceChat function response requires token ids")
                 unseen.append((batch_generation, [int(token_id) for token_id in raw_tokens]))
-            if not unseen:
-                # Backward-compatible single-response payload used by older
-                # serving adapters and serialized test fixtures.
-                raw_tokens = runtime_config.get("nvc_function_response_token_ids")
-                if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
-                    raise ValueError("Nemotron VoiceChat function response requires token ids")
-                unseen = [(generation, [int(token_id) for token_id in raw_tokens])]
             expected = seen + 1
             queue = session.setdefault("forced_function_tokens", [])
             if not isinstance(queue, list):

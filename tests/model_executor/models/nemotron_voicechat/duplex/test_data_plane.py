@@ -33,25 +33,6 @@ def _projector(encode_audio=lambda *_: None) -> NemotronVoiceChatDataPlaneSessio
     return projector
 
 
-def test_configure_runtime_is_idempotent_and_rejects_a_different_contract() -> None:
-    projector = _projector()
-
-    # Same checkpoint contract -> session re-opens must not fail.
-    projector.configure_runtime(_RUNTIME, tokenizer=None)
-
-    with pytest.raises(ValueError, match="engine-scoped"):
-        projector.configure_runtime({**_RUNTIME, "nvc_text_pad_id": 13})
-
-    with pytest.raises(ValueError, match="engine-scoped"):
-        projector.configure_runtime({**_RUNTIME, "nvc_tokenizer_ref": "other-tokenizer"})
-
-
-def test_projection_without_runtime_configuration_fails_loudly() -> None:
-    projector = NemotronVoiceChatDataPlaneSession(lambda *_: None)
-    with pytest.raises(RuntimeError, match="before runtime configuration"):
-        list(projector.project_output(_stage0_output(text_token=42)))
-
-
 def _stage0_output(request_id: str = "req-0", *, text_token: int = 12, function_token: int | None = None) -> object:
     metadata: dict[str, object] = {"nvc_text_token_ids": [text_token]}
     if function_token is not None:

@@ -5,8 +5,8 @@
 
 The single ``duplex_plugin`` seam (RFC vllm-omni#7181):
 ``NemotronVoiceChatDuplexPlugin`` carries the engine and session policies,
-``data_plane.py`` projects stage outputs, ``input.py`` packetizes 80 ms PCM
-frames and ``session.py`` holds the per-session model state.
+``data_plane.py`` projects stage outputs and ``input.py`` packetizes 80 ms PCM
+frames into the framework's per-session model state.
 """
 
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin import (

@@ -242,11 +242,12 @@ vllm_omni/
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
 ├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
 ├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
-├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, session, capabilities)
+├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, capabilities)
 └── clients/
     ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
     ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
     ├── minicpmo_4_5.py              MiniCPM-o 4.5 session preset
+    ├── nemotron_voicechat.py        Nemotron VoiceChat session preset
     └── personaplex.py               PersonaPlex session preset
 ```
 
@@ -389,7 +390,7 @@ policy that used to be two separately configured objects:
 | Half | Members |
 | --- | --- |
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
-| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
@@ -397,13 +398,8 @@ sampling defaults once the stage pools exist. Plugin hooks that may block
 (`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
 offloaded from the loop.
 
-The MiniCPM-o 4.5 plugin (`model_executor/models/minicpmo_4_5/duplex/plugin.py`)
-and the Nemotron VoiceChat plugin
-(`model_executor/models/nemotron_voicechat/duplex/plugin.py`) integrate with
-this framework version. PersonaPlex still carries its pre-framework duplex
-code (runtime extension plus serving adapter) and is therefore not served over
-this framework yet: its pipeline declares no `duplex_plugin`, so it runs
-turn-based until the follow-up PR ports it (RFC vllm-omni#7181).
+See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
+for the current plugin integrations and deployment configurations.
 
 ## Serving
 
