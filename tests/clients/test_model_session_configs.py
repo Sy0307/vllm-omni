@@ -11,6 +11,9 @@ from vllm_omni.clients.duplex import AudioFormat
 from vllm_omni.clients.minicpmo_4_5 import (
     create_duplex_session_config as create_minicpmo45_session_config,
 )
+from vllm_omni.clients.nemotron_voicechat import (
+    create_duplex_session_config as create_nemotron_voicechat_session_config,
+)
 from vllm_omni.clients.personaplex import (
     create_duplex_session_config as create_personaplex_session_config,
 )
@@ -38,12 +41,39 @@ def test_personaplex_session_config_matches_deployment():
     assert payload["instructions"] == "You are calm."
 
 
+def test_nemotron_voicechat_session_config_matches_deployment():
+    tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    config = create_nemotron_voicechat_session_config(
+        instructions="You are NVIDIA Voice Chat.", tools=tools, idle_timeout_s=300.0
+    )
+    assert config.input_audio == AudioFormat("pcm_f32le", 16_000)
+    assert config.output_audio == AudioFormat("pcm16", 22_050)
+    payload = config.to_session_payload(model="nvidia/NVIDIA-NemotronLabs-VoiceChat-11B")
+    assert payload["model"] == "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"
+    assert payload["input_audio_format"] == "pcm_f32le"
+    assert payload["output_audio_format"] == "pcm16"
+    assert payload["sample_rate_hz"] == 16_000
+    assert payload["audio"]["output"]["sample_rate_hz"] == 22_050
+    assert payload["instructions"] == "You are NVIDIA Voice Chat."
+    assert payload["idle_timeout_s"] == 300.0
+    assert payload["turn_detection"] is None
+    assert payload["extra_body"] == {"auto_response": True, "realtime_tools": tools}
+
+
+def test_nemotron_voicechat_session_config_clears_tools_without_mutating_extra_body():
+    extra_body = {"realtime_tools": [{"type": "function", "name": "lookup"}]}
+    config = create_nemotron_voicechat_session_config(tools=[], extra_body=extra_body)
+    assert config.extra_body["realtime_tools"] == []
+    assert extra_body["realtime_tools"] == [{"type": "function", "name": "lookup"}]
+    assert create_nemotron_voicechat_session_config().extra_body == {}
+
+
 @pytest.mark.parametrize(
     "duplex_package",
     [
-        # PersonaPlex and Nemotron VoiceChat rejoin this list with the follow-up
-        # PRs that port them to the duplex plugin framework.
+        # PersonaPlex rejoins with its port to the duplex plugin framework.
         "vllm_omni.model_executor.models.minicpmo_4_5.duplex",
+        "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     ],
 )
 def test_model_duplex_packages_stay_clear_of_client_library(duplex_package: str):

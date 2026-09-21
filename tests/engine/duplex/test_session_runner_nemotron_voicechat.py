@@ -314,7 +314,7 @@ async def test_listen_during_an_open_response_schedules_an_80ms_silence_unit() -
 
 @pytest.mark.asyncio
 async def test_function_output_rides_the_runtime_config_into_the_worker() -> None:
-    """A tool result the client returns lands, versioned, in the session runtime config."""
+    """Queue a tool result and retire it when the worker reports consumption."""
     h = await open_nemotron_harness()
     try:
         await run(h, append_frame())
@@ -349,6 +349,19 @@ async def test_function_output_rides_the_runtime_config_into_the_worker() -> Non
         assert runtime["nvc_function_response_generation"] == 1
         assert runtime["nvc_function_response_call_id"] == call_id
         assert runtime["nvc_function_response_token_ids"] == [42]
+        assert len(runtime["nvc_function_response_batches"]) == 1
+
+        events = await deliver_and_settle(
+            h,
+            thinker_output(request_id, PAD_TOKEN_ID),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[PAD_TOKEN_ID],
+            segment_output_metadata={"nvc_function_response_consumed_generation": 1},
+        )
+        assert not [event for event in events if event.type == "error"], types(events)
+        assert h.session.runtime_config["nvc_function_response_batches"] == []
+        assert h.session.runtime_config["nvc_function_response_generation"] == 1
     finally:
         await close_harness(h)
 

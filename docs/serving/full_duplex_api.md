@@ -79,6 +79,13 @@ code: its pipeline declares no `duplex_plugin`, so it runs turn-based until the
 follow-up PR ports it to the plugin contract
 (RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
 
+For Nemotron VoiceChat Python clients, use
+`vllm_omni.clients.nemotron_voicechat.create_duplex_session_config()` with
+`DuplexClient`. The preset selects 16 kHz float32 input, 22.05 kHz PCM16 output,
+and automatic responses. Append 1,280-sample (80 ms) input frames; when using
+`stream_pcm`, set `chunk_ms=80`. Pass `instructions` and optional `tools` to
+the preset before opening the session.
+
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).
 
