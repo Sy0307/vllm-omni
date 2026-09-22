@@ -185,7 +185,7 @@ The high-concurrency profile places both stages on one GPU, sets each stage's
 capacity to 256 and fixes the Talker KV budget at 32 GiB. It selects
 `codec_attention_backend: triton_slot`, Inductor mode 3 with combo kernels
 disabled, and codec CUDA graph buckets through 256. The configuration was
-validated on one H200; the compiled profile used about 117.2 GiB of sampled
+validated on one H200; the compiled profile used about 118.3 GiB of sampled
 peak GPU memory, including loading and warmup. Reduce the stage capacities
 and graph buckets together when adapting it to smaller GPUs. Cold codec
 compilation can take several minutes; subsequent starts can reuse the AOT
@@ -242,7 +242,8 @@ cap matches the benchmark protocol; success alone does not establish speech
 quality or that every sentence ended before the cap. Dataset seed 42 does
 not fix an independent sampling seed for every request.
 
-For an attention-only comparison, copy the high-concurrency YAML, change its
+For an attention-only comparison, copy the high-concurrency YAML beside the
+original to preserve relative `base_config` resolution. Change its
 codec `compilation_config.mode` to `0` while retaining `cudagraph_mode: FULL`,
 and compare `codec_attention_backend: triton` against `triton_slot`. Keep all
 other settings, warmup and client concurrency identical. Restart the server
