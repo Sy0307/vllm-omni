@@ -221,6 +221,11 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     checkpoint config.
     """
 
+    omni_client_multimodal_output_keys = (
+        "nvc_function_token",
+        "nvc_function_response_consumed_generation",
+    )
+
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
         from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
@@ -323,7 +328,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.prefer_model_sampler = True
-        self.omni_client_multimodal_output_keys = ("nvc_function_token",)
         self.has_postprocess = True  # per-step greedy function-channel token
         self.requires_full_prefix_cached_hidden_states = False
         # The per-step function token is a scalar; no GPU-resident buffers needed.
@@ -399,8 +403,23 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
-        multimodal_outputs: dict[str, torch.Tensor] = {}
+        multimodal_outputs: dict[str, torch.Tensor | list[torch.Tensor]] = {}
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information")
+        if model_outputs.numel() and isinstance(info_dicts, list):
+            # Preprocess has copied these batches into the model-owned queue.
+            # Acknowledge that ownership through the wire payload, not the
+            # worker-local postprocess buffer. Lists preserve request alignment
+            # even when a mixed prefill/decode batch has unequal token spans.
+            generations = [
+                int(self._sessions.get(info.get("request_id"), {}).get("function_response_generation", 0))
+                if isinstance(info, dict)
+                else 0
+                for info in info_dicts
+            ]
+            if any(generations):
+                multimodal_outputs["nvc_function_response_consumed_generation"] = [
+                    torch.tensor([generation], dtype=torch.int64) for generation in generations
+                ]
         single_request = isinstance(info_dicts, list) and len(info_dicts) == 1
         if self._use_function_head and model_outputs.numel() and single_request:
             # Only a single-request batch can attribute the batch's last row
@@ -944,7 +963,6 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             token = func_logits.argmax(dim=-1)
         token = token.reshape(-1)[-1].reshape(()).detach()
         request_id = kwargs.get("request_id")
-        consumed_generation: int | None = None
         if isinstance(request_id, str):
             session = self._sessions.get(request_id)
             if session is not None:
@@ -960,10 +978,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 # StreamingUpdate replaces the runner payload at each append;
                 # retain the function channel in model-owned session state.
                 session["func_token"] = int(token.item())
-                consumed_generation = int(session.get("function_response_generation", 0))
         update: dict[str, Any] = {"nvc_prev_function_token": token}
-        if consumed_generation is not None:
-            update["nvc_function_response_consumed_generation"] = consumed_generation
         if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
             existing = kwargs.get("nvc_function_tokens")
             if isinstance(existing, torch.Tensor) and existing.numel() > 0:

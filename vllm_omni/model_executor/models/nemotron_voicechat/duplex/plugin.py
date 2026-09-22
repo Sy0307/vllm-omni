@@ -87,11 +87,9 @@ class NemotronVoiceChatClientRuntimeConfigError(DuplexRuntimeConfigError):
     pass
 
 
-#: Upper bound on queued (not yet worker-drained) function-response batches.
-#: Each batch drains at the frame-locked rate of one forced token per 80 ms
-#: frame; eight pending batches is far beyond any real client behaviour and
-#: keeps the per-append runtime_config snapshot (embedded in every Stage-0
-#: scheduler payload) bounded.
+#: Bound batches awaiting worker ownership so per-append runtime snapshots
+#: stay bounded. Once acknowledged, their tokens remain in the model-owned
+#: queue and drain at one forced token per 80 ms frame.
 _MAX_PENDING_FUNCTION_RESPONSE_BATCHES = 8
 
 
@@ -518,7 +516,7 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
         output_metadata: Mapping[str, object],
     ) -> dict[str, object] | None:
-        """Retire function-response batches after the thinker consumes them."""
+        """Retire batches after the thinker takes ownership of their tokens."""
         consumed = output_metadata.get("nvc_function_response_consumed_generation")
         try:
             consumed_generation = int(consumed)
