@@ -38,6 +38,21 @@ class DuplexRuntimeConfigError(ValueError):
         self.code = code
 
 
+def reject_private_runtime_keys(
+    extra_body: object,
+    private_runtime_config_keys: frozenset[str],
+    *,
+    message: str,
+    error_cls: type[DuplexRuntimeConfigError] = DuplexRuntimeConfigError,
+) -> None:
+    """Reject client overrides while preserving each plugin's error contract."""
+    if not isinstance(extra_body, dict):
+        return
+    private_keys = sorted(private_runtime_config_keys.intersection(extra_body))
+    if private_keys:
+        raise error_cls(message + ", ".join(private_keys))
+
+
 def reject_changed_runtime_value(
     new_value: object,
     current_value: object,

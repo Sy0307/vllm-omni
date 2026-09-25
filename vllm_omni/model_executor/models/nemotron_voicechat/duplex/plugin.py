@@ -39,6 +39,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
     EncodeAudio,
+    reject_private_runtime_keys,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.capabilities import (
     nemotron_voicechat_capabilities,
@@ -359,13 +360,12 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         return nemotron_voicechat_capabilities(max_sessions=max_sessions)
 
     def validate_client_extra_body(self, extra_body: object) -> None:
-        if not isinstance(extra_body, dict):
-            return
-        private = sorted(PRIVATE_RUNTIME_CONFIG_KEYS.intersection(extra_body))
-        if private:
-            raise NemotronVoiceChatClientRuntimeConfigError(
-                "Nemotron VoiceChat runtime configuration is server-owned: " + ", ".join(private)
-            )
+        reject_private_runtime_keys(
+            extra_body,
+            self.private_runtime_config_keys,
+            message="Nemotron VoiceChat runtime configuration is server-owned: ",
+            error_cls=NemotronVoiceChatClientRuntimeConfigError,
+        )
 
     async def prepare_runtime_config(
         self,

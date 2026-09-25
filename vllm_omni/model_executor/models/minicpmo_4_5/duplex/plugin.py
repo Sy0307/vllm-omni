@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
     EncodeAudio,
     reject_changed_runtime_value,
+    reject_private_runtime_keys,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
@@ -715,13 +716,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return minicpmo45_native_capabilities(max_sessions=max_sessions)
 
     def validate_client_extra_body(self, extra_body: object) -> None:
-        if not isinstance(extra_body, dict):
-            return
-        private_keys = sorted(PRIVATE_RUNTIME_CONFIG_KEYS.intersection(extra_body))
-        if private_keys:
-            raise MiniCPMO45ClientRuntimeConfigError(
-                "duplex runtime configuration is server-owned: " + ", ".join(private_keys)
-            )
+        reject_private_runtime_keys(
+            extra_body,
+            self.private_runtime_config_keys,
+            message="duplex runtime configuration is server-owned: ",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
 
     async def prepare_runtime_config(
         self, config: DuplexSessionConfig, *, model_config: ModelConfig | None
