@@ -372,14 +372,22 @@ speaker similarity before adopting either batching preset for a production
 workload. Floating-point decoder outputs can differ across batch sizes; this PR
 does not claim bitwise or quality equivalence.
 
-### Optional MPS deployment
+### Experimental MPS deployment
 
-NVIDIA MPS is an optional operator setting for colocated CUDA processes, not a
-YAML option or a library default. This PR does not establish a throughput or
-first-packet latency benefit from MPS. Measure the exact deployment with and
-without MPS before enabling it.
+NVIDIA MPS lets colocated CUDA stage processes share GPU execution resources.
+It is disabled by default. The experimental
+`qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile sets `cuda_mps: true`,
+alongside cached residual prediction, fused sampling, time-major codec
+convolutions, first-frame delivery, and larger graph batches.
 
-Use only assigned GPUs and an independent MPS pipe directory. A private MPS
-server does not provide exclusive GPU ownership or MIG isolation. For a
-single-GPU deployment, explicitly place both stages on that GPU; the supplied
-high-concurrency profile places its two stages on different GPUs by default.
+The runtime requires `nvidia-cuda-mps-control` on `PATH` and one explicit CUDA
+GPU per local EngineCore stage, with `parallel_stage_init: false`.
+Use numeric GPU ordinals for stage placement and visibility so initialization
+locks identify the physical GPU before MPS remaps it. It starts a private MPS daemon for each selected
+GPU and stops its own daemon after the stages exit. If
+`CUDA_MPS_PIPE_DIRECTORY` already names an operator-managed daemon, the runtime
+reuses it without stopping it. Diffusion and remote stages are unsupported.
+Set `cuda_mps: false` in a deploy overlay to disable automatic MPS management.
+
+MPS does not reserve a GPU. Use only assigned GPUs, explicitly place stages on
+the intended GPU, and warm the complete pipeline before measuring performance.

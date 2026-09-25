@@ -313,7 +313,7 @@ self._compiled_model_fwd = torch.compile(
 The historical benchmark results above use re-prefill. It remains the default
 for Qwen3-TTS and the shared Qwen3-Omni predictor.
 
-### Experimental Qwen3-TTS frame-local KV reuse
+### Experimental Qwen3-TTS single-GPU throughput profile
 
 The opt-in `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile uses a
 Qwen3-TTS-specific execution path on CUDA with BF16 weights:
@@ -336,11 +336,25 @@ Qwen3-TTS-specific execution path on CUDA with BF16 weights:
   warmup and graph capture. The process's cuDNN flags are restored afterwards,
   including on capture failure. Captured graphs retain the selected algorithms.
 
-All three options default to false outside this explicit throughput profile.
-It uses fixed 1/25-frame chunks, 72 frames of left context, Talker/codec
-capacities of 128/64, codec batches through 8, and synchronous codec scheduling.
-Client concurrency is independent of those capacities. MPS is optional and is
-not started by the profile. Startup includes compilation and graph capture.
+- `decode_time_major_conv` keeps codec convolution activations in time-major
+  layout to reduce transposes and copies between layers.
+- `talker_first_audio` completes residual prediction immediately after the
+  first codebook sample and decodes the first frame in the Talker process.
+  The codec advances its state without repeating the delivered frame; the
+  orchestrator orders that frame before subsequent codec chunks. This path
+  requires CUDA, MRV2, asynchronous chunks, a single-process executor, TP/PP 1,
+  and disabled prefix caching. Reference-code requests retain codec delivery.
+  Supported Qwen3-TTS profiles enable it explicitly; other models do not opt in.
+
+The predictor, sampling, convolution-layout and autotuning options default to
+false outside this throughput profile. It uses fixed 1/25-frame chunks,
+72 frames of left context, Talker/codec capacities of 128/64, codec batches
+through 8, and synchronous codec scheduling. Client concurrency is independent
+of those capacities. This profile also sets `cuda_mps: true`; the runtime owns
+a private MPS daemon unless an operator supplies an existing MPS pipe directory.
+Ordinary profiles leave MPS disabled. See
+[experimental MPS deployment](../configuration/stage_configs.md#experimental-mps-deployment)
+for requirements and ownership. Startup includes compilation and graph capture.
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
@@ -352,10 +366,9 @@ KV reuse changes GEMM shapes and attention reduction order; cuDNN autotuning
 can also change waveform numerics. This path is not bitwise equivalent to
 re-prefill, and aggregate WER alone cannot establish perceptual or speaker
 similarity equivalence. Validate quality on the intended workload before
-adopting it. The default profiles and Qwen3-Omni keep their existing behavior.
+adopting it. Qwen3-Omni keeps its existing predictor and audio-delivery behavior.
 
-For a controlled ablation, copy the profile and disable each of the three
-options above while keeping capacities, chunking, hardware, client concurrency,
+For a controlled ablation, copy the profile and disable individual options while keeping capacities, chunking, hardware, client concurrency,
 and warmup identical. Report repeated runs, first-audio latency and failures
 alongside throughput. Warm requests measure a ready service; they do not measure
 cold-start latency.

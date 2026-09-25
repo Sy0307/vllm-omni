@@ -34,6 +34,7 @@ from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -65,8 +66,34 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 logger = init_logger(__name__)
+
+
+def _upstream_first_audio_output(request_id: str, audio: torch.Tensor, sample_rate: Any) -> OmniRequestOutput:
+    """First audio decoded upstream, shaped like a final stage's streamed audio output.
+
+    Consumers read audio either from the output itself (speech) or from its
+    first completion (chat), so it carries both, like the final stage's
+    per-chunk outputs.
+    """
+    raw = {"model_outputs": audio, "sr": sample_rate}
+    completion = MultimodalCompletionOutput(
+        index=0,
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        logprobs=None,
+        multimodal_output=MultimodalPayload.from_raw(raw, "audio"),
+    )
+    return OmniRequestOutput(
+        request_id=request_id,
+        finished=False,
+        final_output_type="audio",
+        outputs=[completion],
+        _multimodal_output=raw,
+    )
 
 
 def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
@@ -226,6 +253,9 @@ class OrchestratorRequestState:
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
     native_kv_transfer_id: str | None = None
+    # First-frame delivery and final-stage outputs use different channels.
+    upstream_first_audio: bool = False
+    pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -272,7 +302,7 @@ class StreamingInputState:
 
         Fresh rather than shared: ``output_metadata`` is handed out by reference.
         """
-        segment = self.segments.get(stage_id)
+        segment = self.segments.get(stage_id) if stage_id is not None else None
         return segment if segment is not None else StreamingSegmentState()
 
 
@@ -440,9 +470,13 @@ class OrchestratorBase:
         # Start membership watcher if distributed mode is active.
         membership_watcher: asyncio.Task[None] | None = None
         if self._membership is not None:
+
+            async def cleanup_member_requests(ids: list[str]) -> None:
+                await self._cleanup_request_ids(ids, abort=True)
+
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
-                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+                cleanup_callback=cleanup_member_requests,
                 replica_removed_callback=self._remove_stage_replica_waiting,
             )
             membership_watcher = self._membership.start()
@@ -528,7 +562,7 @@ class OrchestratorBase:
                 # process exit as EngineDeadError during teardown.
                 for pool in self.stage_pools:
                     for client in pool.clients:
-                        if hasattr(client, "_shutting_down"):
+                        if client is not None and hasattr(client, "_shutting_down"):
                             client._shutting_down = True
                 # Stage teardown runs once in run()'s finally after the
                 # orchestration loop observes _shutdown_event and exits.
@@ -786,6 +820,7 @@ class OrchestratorBase:
         ``_finish_raw_terminal_requests`` once routing is done.
         """
         pool = self.stage_pools[stage_id]
+        await self._route_upstream_first_audio(stage_id, replica_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
@@ -800,7 +835,7 @@ class OrchestratorBase:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
-            req_state = self.request_states.get(getattr(eco, "request_id", None))
+            req_state = self.request_states.get(eco.request_id)
             if req_state is None:
                 continue
             if (
@@ -860,6 +895,65 @@ class OrchestratorBase:
                 int(_sched_stats.num_waiting_reqs),
             )
         return processed
+
+    async def _route_upstream_first_audio(self, stage_id: int, replica_id: int, raw_outputs: Any) -> None:
+        """Order explicitly marked first audio ahead of a codec that skipped it.
+
+        The sender and codec run independently. Keep overtaking codec outputs,
+        including terminal outputs, on the request until its first PCM arrives.
+        Cancellation and stage errors use ordinary request cleanup.
+        """
+        from vllm_omni.engine import OmniEngineCoreOutputs
+
+        kept = []
+        ready = []
+        final_output = self.stage_pools[stage_id].final_output
+        for eco in raw_outputs.outputs:
+            mm = getattr(eco, "multimodal_output", None)
+            is_first = isinstance(mm, dict) and bool(mm.pop(FIRST_AUDIO_KEY, False))
+            requires_first = isinstance(mm, dict) and bool(mm.pop(FIRST_AUDIO_REQUIRED_KEY, False))
+            req_state = self.request_states.get(eco.request_id)
+            if is_first:
+                assert isinstance(mm, dict)
+                # Only the dedicated first-frame channel is intercepted.
+                if req_state is None or req_state.upstream_first_audio:
+                    continue
+                audio = mm.get("model_outputs")
+                if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+                    continue
+                req_state.upstream_first_audio = True
+                await self.output_async_queue.put(
+                    OutputMessage(
+                        request_id=req_state.request_id,
+                        stage_id=req_state.final_stage_id,
+                        replica_id=replica_id,
+                        engine_outputs=_upstream_first_audio_output(req_state.request_id, audio, mm.get("sr")),
+                        metrics=None,
+                        finished=False,
+                        stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
+                    )
+                )
+                ready.extend(req_state.pending_first_audio_outputs)
+                req_state.pending_first_audio_outputs.clear()
+                continue
+            if (
+                req_state is not None
+                and final_output
+                and not req_state.upstream_first_audio
+                and (requires_first or req_state.pending_first_audio_outputs)
+                and getattr(eco, "finish_reason", None) != FinishReason.ERROR
+            ):
+                req_state.pending_first_audio_outputs.append((stage_id, replica_id, eco))
+                continue
+            kept.append(eco)
+        raw_outputs.outputs = kept
+        for pending_stage, pending_replica, output in ready:
+            terminal: set[str] = set()
+            processed = await self._process_llm_stage_outputs(
+                pending_stage, pending_replica, OmniEngineCoreOutputs(outputs=[output]), terminal
+            )
+            await self._handle_processed_outputs(pending_stage, pending_replica, processed)
+            await self._finish_raw_terminal_requests(pending_stage, pending_replica, terminal)
 
     def _absorb_diffusion_metrics(self, stage_id: int, replica_id: int, diffusion_output: Any) -> bool:
         """Drain a diffusion output's piggybacked metrics.
@@ -1543,7 +1637,7 @@ class OrchestratorBase:
             self._pd_kv_params.pop(request_id, None)
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
-                cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
+                cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", set()))
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
                 req_state.running_counter_registered = False
@@ -2201,7 +2295,7 @@ class OrchestratorBase:
                 )
                 return
             diffusion_source_outputs = [output, *companion_outputs]
-            if next_client.custom_process_input_func is not None:
+            if next_client is not None and next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}
@@ -2386,7 +2480,9 @@ class OrchestratorBase:
             req_state.streaming.source_token_decoder = decode
 
         try:
-            next_inputs = next_client.process_engine_inputs(
+            assert next_client is not None
+            process_inputs = getattr(next_client, "process_engine_inputs")
+            next_inputs = process_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,

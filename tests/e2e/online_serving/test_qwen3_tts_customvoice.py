@@ -73,6 +73,7 @@ _FAST_PATH_STAGE_CONFIG = modify_stage_config(
     updates={
         # The temporary overlay lives outside deploy/, so anchor its parent.
         "base_config": get_deploy_config_path("qwen3_tts_high_concurrency_mrv2.yaml"),
+        "cuda_mps": False,
         "connectors.connector_of_shared_memory.extra.decode_batch_max_size": 2,
         "connectors.connector_of_shared_memory.extra.decode_cudagraph_batch_sizes": [1, 2],
         "stages": {
@@ -98,7 +99,7 @@ _FAST_PATH_STAGE_CONFIG = modify_stage_config(
     indirect=True,
 )
 def test_cached_predictor_streaming_audio(omni_server, online_client) -> None:
-    """Cover cached MTP at L2; real codec weights and autotune are added at L3."""
+    """Cover the optimized predictor, first audio and codec path with real weights at L3."""
     online_client.send_audio_speech_request(
         {
             "model": omni_server.model,

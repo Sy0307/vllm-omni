@@ -1107,7 +1107,7 @@ def _project_omni_stage_engine_args(
         "default_sampling_params",
         "has_sampling_extra_args",
     }
-    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus"}
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.

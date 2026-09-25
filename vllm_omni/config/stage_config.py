@@ -582,6 +582,8 @@ class DeployConfig:
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
+    cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
@@ -804,7 +806,11 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if model_runner not in ("v1", "v2"):
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
+    if not isinstance(raw_dict.get("cuda_mps", False), bool):
+        raise ValueError("cuda_mps must be a boolean")
+
     kwargs: dict[str, Any] = {
+        "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
@@ -1178,6 +1184,8 @@ def merge_pipeline_deploy(
             runtime["num_replicas"] = ds.num_replicas
             if ds.env is not None:
                 runtime["env"] = ds.env
+        if deploy.cuda_mps:
+            runtime["cuda_mps"] = True
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(

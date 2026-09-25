@@ -639,8 +639,14 @@ class CUDAGraphDecoderWrapper:
             dtype=dtype,
             device=device,
         )
+        # The Talker delivers exactly one frame upstream: a one-frame first
+        # chunk then only needs its state; a longer one keeps the other frames.
+        state_only = self._skips_delivered_first() and self.initial_chunk_frames == 1
+        first_chunk = (
+            self.decoder._decode_xvec_first_chunk_state_only if state_only else self.decoder._decode_xvec_first_chunk
+        )
         with torch.no_grad():
-            _ = self.decoder._decode_xvec_first_chunk(static_input, {})
+            _ = first_chunk(static_input, {})
         torch.accelerator.synchronize(device)
 
         config = self.decoder.config
@@ -662,13 +668,14 @@ class CUDAGraphDecoderWrapper:
         graph = CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_output = self.decoder._decode_xvec_first_chunk(static_input, caches)
+                static_output = first_chunk(static_input, caches)
 
         self.xvec_prefix_states[batch_size] = {
             "graph": graph,
             "input": {"codes": static_input},
             "output": static_output,
             "cache": caches,
+            "state_only": state_only,
         }
 
     def _ensure_suffix_buffers(self, caches: dict) -> None:
@@ -808,6 +815,8 @@ class CUDAGraphDecoderWrapper:
         codes_list: list[torch.Tensor],
         request_caches: list[dict],
     ) -> list[torch.Tensor] | None:
+        if any(bool(cache.get("skip_first_audio", False)) != self._skips_delivered_first() for cache in request_caches):
+            return None
         available = set(getattr(self, "xvec_prefix_states", {}))
         if not available:
             self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
@@ -855,8 +864,16 @@ class CUDAGraphDecoderWrapper:
             cache["suffix_conv"] = static_caches["suffix_conv"][row : row + 1].clone()
             cache["suffix_frames"] = self.initial_chunk_frames
             self._ensure_suffix_buffers(cache)
-            outputs.append(state["output"][row : row + 1].clone())
+            if state.get("state_only"):
+                outputs.append(static_input.new_zeros((1, 1, 0), dtype=torch.float32))
+            elif self._skips_delivered_first():
+                outputs.append(state["output"][row : row + 1, :, self.decoder.total_upsample :].clone())
+            else:
+                outputs.append(state["output"][row : row + 1].clone())
         return outputs
+
+    def _skips_delivered_first(self) -> bool:
+        return bool(getattr(self.decoder, "skip_delivered_first_audio", False))
 
     def _decode_suffix_batch(
         self,
@@ -983,6 +1000,8 @@ class CUDAGraphDecoderWrapper:
     def _decode_request_fallback(self, codes: torch.Tensor, cache: dict) -> torch.Tensor:
         if "suffix_quantized" not in cache:
             if int(cache["prefix_frames"]) == 0:
+                if cache.get("skip_first_audio", False):
+                    return self.decoder._decode_stream_first_chunk(codes, cache)
                 return self.decoder._decode_xvec_first_chunk(codes, cache)
             prefix_frames = int(cache["prefix_frames"])
             output = self.decoder._decode_icl_first_chunk(codes, cache, prefix_frames)

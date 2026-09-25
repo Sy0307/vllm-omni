@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
@@ -113,6 +114,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         dec_config = tok_config.decoder_config
         self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
         self.decoder.eval()
+
         self._num_quantizers = int(dec_config.num_quantizers)
         self._output_sample_rate = int(tok_config.output_sample_rate)
         self._total_upsample = int(self.decoder.total_upsample)
@@ -303,6 +305,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
+        first_audio_flags = [False] * len(request_ids_list)
         segment_finished_flags = [False] * len(request_ids_list)
         request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
@@ -337,6 +340,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if not isinstance(info, dict):
                     continue
                 meta = info.get("meta", {})
+                first_audio_flags[i] = _meta_bool(meta.get("first_audio", False))
                 if "is_segment_finished" in meta:
                     segment_finished_flags[i] = _meta_bool(meta["is_segment_finished"])
                 if "left_context_size" in meta:
@@ -405,6 +409,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                         )
                     state = {}
                     self._decoder_state_cache[state_req_id] = state
+                state.setdefault("skip_first_audio", first_audio_flags[i])
                 state.setdefault("prefix_frames", 0)
                 if state_req_id.startswith(_DUMMY_REQUEST_ID):
                     state["_is_dummy_run"] = True
@@ -516,6 +521,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
             self.log_decode_batch_stats()
 
+        first_audio_required = [torch.tensor(False)] * num_req
+        if request_states is not None:
+            for row, idx in enumerate(valid_indices):
+                first_audio_required[idx] = torch.tensor(bool(request_states[row].get("skip_first_audio", False)))
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
@@ -539,7 +548,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, "sr": srs, FIRST_AUDIO_REQUIRED_KEY: first_audio_required},
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
@@ -715,6 +724,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
             self._decode_batch_max_size = decode_batch_max_size
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            decode_time_major_conv = _get_bool_config("decode_time_major_conv", False)
+            self.decoder.skip_delivered_first_audio = self._async_chunk and _get_bool_config(
+                "talker_first_audio", False
+            )
             decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
         else:
             codec_chunk_frames = 0
@@ -725,6 +738,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
             decode_cudnn_benchmark = False
+            decode_time_major_conv = False
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -740,6 +754,9 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.backends.cudnn.allow_tf32,
                 torch.get_float32_matmul_precision(),
             )
+
+        if decode_time_major_conv and device.type == "cuda":
+            self.decoder.enable_time_major_conv()
 
         self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
