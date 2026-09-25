@@ -119,3 +119,10 @@ def test_mps_rejects_parallel_initialization():
     )
     with pytest.raises(ValueError, match="parallel_stage_init=false"):
         runtime._validate_mps_topology([SimpleNamespace(replicas=[replica])])
+
+
+def test_failed_launch_command_still_checks_private_daemon_cleanup(controls):
+    controls.side_effect = [RuntimeError("launch failed after fork"), SimpleNamespace(stdout="")]
+    with pytest.raises(RuntimeError, match="launch failed after fork"):
+        cuda_mps.CudaMPSServer("GPU-example")
+    assert controls.call_args.kwargs["input"] == "quit\n"

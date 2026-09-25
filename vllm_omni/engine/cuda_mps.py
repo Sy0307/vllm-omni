@@ -59,20 +59,16 @@ class CudaMPSServer:
             "CUDA_MPS_PIPE_DIRECTORY": str(root / "pipe"),
             "CUDA_MPS_LOG_DIRECTORY": str(root / "log"),
         }
-        started = False
         try:
             self._run("-d")
-            started = True
             self._run(input="get_server_list\n")
         except BaseException:
-            if started:
-                try:
-                    self.close()
-                except Exception:
-                    logger.exception("MPS startup cleanup failed; control files remain at %s", root)
-            else:
-                shutil.rmtree(root)
-                self._directory = None
+            # A failed/timed-out launcher may already have forked the daemon.
+            # Always address our private socket; keep it if cleanup also fails.
+            try:
+                self.close()
+            except Exception:
+                logger.exception("MPS startup cleanup failed; control files remain at %s", root)
             raise
         logger.info("Started private MPS for %s at %s", gpu_uuid, self.env["CUDA_MPS_PIPE_DIRECTORY"])
 
