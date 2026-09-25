@@ -412,7 +412,7 @@ def talker2code2wav_async_chunk(
     if isinstance(first_audio, torch.Tensor):
         first_audio = bool(first_audio.numel() and first_audio.reshape(-1)[-1].item())
     if first_audio:
-        meta.first_audio = True
+        meta.first_audio = torch.tensor(True, dtype=torch.bool)
     if ref_context_size > 0 and ref_context_request_id is not None:
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id

@@ -219,7 +219,7 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
-    first_audio: bool | torch.Tensor | None = None
+    first_audio: torch.Tensor | None = None
     codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
     # Expected FINAL length of a growing async-chunk sequence, when the

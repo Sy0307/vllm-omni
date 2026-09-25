@@ -835,7 +835,8 @@ class OrchestratorBase:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
-            req_state = self.request_states.get(eco.request_id)
+            request_id = getattr(eco, "request_id", None)
+            req_state = self.request_states.get(request_id) if request_id is not None else None
             if req_state is None:
                 continue
             if (
@@ -912,7 +913,8 @@ class OrchestratorBase:
             mm = getattr(eco, "multimodal_output", None)
             is_first = isinstance(mm, dict) and bool(mm.pop(FIRST_AUDIO_KEY, False))
             requires_first = isinstance(mm, dict) and bool(mm.pop(FIRST_AUDIO_REQUIRED_KEY, False))
-            req_state = self.request_states.get(eco.request_id)
+            request_id = getattr(eco, "request_id", None)
+            req_state = self.request_states.get(request_id) if request_id is not None else None
             if is_first:
                 assert isinstance(mm, dict)
                 # Only the dedicated first-frame channel is intercepted.
