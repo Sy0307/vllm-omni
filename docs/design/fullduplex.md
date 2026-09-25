@@ -398,6 +398,10 @@ sampling defaults once the stage pools exist. Plugin hooks that may block
 (`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
 offloaded from the loop.
 
+Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
+for the shared request identity, sequencing and config snapshots. Token budgets,
+PCM framing and model-specific worker fields remain in the plugins.
+
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
 

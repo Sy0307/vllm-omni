@@ -33,6 +33,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputAction,
     DuplexOutputDecision,
 )
+from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
     DefaultDuplexModelSessionState,
     DuplexModelPlugin,
@@ -261,16 +262,13 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         for params in configured:
             if isinstance(params, SamplingParams):
                 params.output_kind = RequestOutputKind.DELTA
-        stage0 = defaults[0]
+        stage0 = configured[0]
         if isinstance(stage0, SamplingParams):
-            stage0 = stage0.clone()
             stage0.temperature = 0.0
             stage0.top_p = 1.0
             stage0.top_k = 0
             stage0.max_tokens = 1
             stage0.ignore_eos = True
-            stage0.output_kind = RequestOutputKind.DELTA
-            configured[0] = stage0
         return tuple(configured)
 
     def plan_append(
@@ -313,29 +311,18 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             raise ValueError("Nemotron VoiceChat runtime requires nvc_text_pad_id") from exc
         scheduler_prompt = prompt_ids + [pad_id] if seq <= 1 else [pad_id]
         return DuplexAppendPlan(
-            prompt={
-                "prompt_token_ids": scheduler_prompt,
-                "model_intermediate_buffer": {
-                    "request_id": request_id,
-                    "global_request_id": [fence.session_id],
-                    "duplex": {
-                        "data_plane": True,
-                        "fence": fence,
-                        "session_id": fence.session_id,
-                        "epoch": fence.epoch,
-                        "source_input_seq": seq,
-                        "seq": seq,
-                        "turn_id": fence.turn_id,
-                        "turn_seq": turn_seq,
-                        "mode": "append_audio_chunk",
-                        "payload": normalized_payload,
-                        "final": final,
-                        "session_config": dict(session_config),
-                        "runtime_config": dict(runtime_config),
-                        "scheduler_token_budget": len(scheduler_prompt),
-                    },
-                },
-            }
+            prompt=build_duplex_append_prompt(
+                request_id=request_id,
+                fence=fence,
+                session_config=session_config,
+                runtime_config=runtime_config,
+                seq=seq,
+                turn_seq=turn_seq,
+                payload=normalized_payload,
+                final=final,
+                prompt_token_ids=scheduler_prompt,
+                model_fields={"source_input_seq": seq},
+            )
         )
 
     def decide_output(

@@ -32,6 +32,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputAction,
     DuplexOutputDecision,
 )
+from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
@@ -269,29 +270,18 @@ def build_duplex_data_plane_prompt(
         and payload.get("force_listen") is not True
     ):
         payload = {**payload, "force_listen": True}
-    return {
-        "prompt_token_ids": [token_id] * token_budget,
-        "model_intermediate_buffer": {
-            "request_id": request_id,
-            "global_request_id": [fence.session_id],
-            "duplex": {
-                "fence": fence,
-                "session_id": fence.session_id,
-                "epoch": fence.epoch,
-                "seq": seq,
-                "turn_id": fence.turn_id,
-                "turn_seq": turn_seq,
-                "mode": "append_audio_chunk",
-                "payload": payload,
-                "final": final,
-                "data_plane": True,
-                "session_config": dict(session_config),
-                "runtime_config": dict(runtime_config),
-                "scheduler_token_budget": token_budget,
-                "scheduler_token_id": token_id,
-            },
-        },
-    }
+    return build_duplex_append_prompt(
+        request_id=request_id,
+        fence=fence,
+        session_config=session_config,
+        runtime_config=runtime_config,
+        seq=seq,
+        turn_seq=turn_seq,
+        payload=payload,
+        final=final,
+        prompt_token_ids=[token_id] * token_budget,
+        model_fields={"scheduler_token_id": token_id},
+    )
 
 
 # ---- engine policy helpers: listen decision ----

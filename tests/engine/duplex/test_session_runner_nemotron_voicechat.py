@@ -103,6 +103,8 @@ async def test_frame_buffering_prefill_and_resumable_append(harness):
     first, second = h.port.submissions
     assert first.prompt["prompt_token_ids"] == [0, 42, 1, 12]
     assert second.prompt["prompt_token_ids"] == [12]
+    assert first.prompt["model_intermediate_buffer"]["duplex"]["source_input_seq"] == 1
+    assert second.prompt["model_intermediate_buffer"]["duplex"]["source_input_seq"] == 2
     assert not first.already_submitted and second.already_submitted
     assert first.context.request_id == second.context.request_id == h.stage0_request_id()
     assert "error" not in types(h.events)
