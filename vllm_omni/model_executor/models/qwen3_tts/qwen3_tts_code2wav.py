@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -714,6 +715,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
             self._decode_batch_max_size = decode_batch_max_size
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
         else:
             codec_chunk_frames = 0
             codec_left_context_frames = 0
@@ -722,6 +724,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
+            decode_cudnn_benchmark = False
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -744,15 +747,30 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
-                self._maybe_enable_decoder_cudagraph(
-                    device=device,
-                    codec_chunk_frames=codec_chunk_frames,
-                    codec_left_context_frames=codec_left_context_frames,
-                    initial_codec_chunk_frames=initial_codec_chunk_frames,
-                    codec_chunk_ramp=codec_chunk_ramp,
-                    decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
-                    decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                # Autotune only during warmup/capture, then restore the process
+                # flags. The captured convolution algorithms remain in the
+                # graphs without changing later models' cuDNN policy.
+                autotune = (
+                    torch.backends.cudnn.flags(
+                        enabled=torch.backends.cudnn.enabled,
+                        benchmark=True,
+                        benchmark_limit=10,
+                        deterministic=torch.backends.cudnn.deterministic,
+                        allow_tf32=torch.backends.cudnn.allow_tf32,
+                    )
+                    if decode_cudnn_benchmark
+                    else nullcontext()
                 )
+                with autotune:
+                    self._maybe_enable_decoder_cudagraph(
+                        device=device,
+                        codec_chunk_frames=codec_chunk_frames,
+                        codec_left_context_frames=codec_left_context_frames,
+                        initial_codec_chunk_frames=initial_codec_chunk_frames,
+                        codec_chunk_ramp=codec_chunk_ramp,
+                        decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+                        decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav decoder",

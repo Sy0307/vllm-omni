@@ -93,13 +93,13 @@ Each optimization stacks on the previous one. The summary plots below show the c
 
 **Benchmark environment:**
 
-| | Qwen3-Omni                  | Qwen3-TTS |
-| --- |-----------------------------| --- |
-| **GPU** | A100                        | H200 |
+| | Qwen3-Omni | Qwen3-TTS |
+| --- | ----------------------------- | --- |
+| **GPU** | A100 | H200 |
 | **Model** | Qwen3-Omni-30B-A3B-Instruct | Qwen3-TTS-12Hz-1.7B-CustomVoice |
-| **vLLM** | v0.17.0                     | v0.18.0 |
-| **vllm-omni** | commit 199f7832             | v0.18.0rc2 |
-| **CUDA** | 12.9                        | 12.8 |
+| **vLLM** | v0.17.0 | v0.18.0 |
+| **vllm-omni** | commit 199f7832 | v0.18.0rc2 |
+| **CUDA** | 12.9 | 12.8 |
 
 This post walks through each optimization in the same order they are typically enabled in practice, then ends with deployment playbooks for both models.
 
@@ -310,7 +310,55 @@ self._compiled_model_fwd = torch.compile(
 
 `mode="default"` is used instead of `mode="reduce-overhead"` to avoid conflicts with vLLM's own CUDA graph capture on the main Talker model. `dynamic=True` handles the growing sequence length without recompilation.
 
-These optimizations are always-on in the current codebase - all Qwen3-TTS benchmark results in this post include them.
+The historical benchmark results above use re-prefill. It remains the default
+for Qwen3-TTS and the shared Qwen3-Omni predictor.
+
+### Experimental Qwen3-TTS frame-local KV reuse
+
+The opt-in `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile uses a
+Qwen3-TTS-specific execution path on CUDA with BF16 weights:
+
+- `code_predictor_kv_cache` reuses each layer's keys and values across the 15
+  residual-codebook predictions within one audio frame. The first step writes
+  two positions; subsequent steps write one. Scratch storage is bounded by the
+  configured batch capacity, overwritten for every frame, and never shared
+  between requests across frames. The worker's serialized CUDA stream owns it;
+  it is separate from the Talker's paged KV cache.
+- A short causal/GQA Triton kernel masks unwritten K/V loads. Dynamic-batch
+  `torch.compile` warms the predictor before the runner captures whole-MTP
+  CUDA graphs. This path creates no inner CUDA graphs. Unsupported devices and
+  dtypes retain re-prefill; FP16 retains its existing precision safeguards.
+- `code_predictor_fused_sampling` fuses temperature scaling, top-k filtering,
+  and Gumbel argmax when the runner supplies FP32 uniforms. It preserves top-k
+  ties and uses the supplied randomness. Explicit generator paths retain the
+  existing sampler. Qwen3-Omni does not read either TTS option.
+- `decode_cudnn_benchmark` selects convolution algorithms during Code2Wav
+  warmup and graph capture. The process's cuDNN flags are restored afterwards,
+  including on capture failure. Captured graphs retain the selected algorithms.
+
+All three options default to false outside this explicit throughput profile.
+It uses fixed 1/25-frame chunks, 72 frames of left context, Talker/codec
+capacities of 128/64, codec batches through 8, and synchronous codec scheduling.
+Client concurrency is independent of those capacities. MPS is optional and is
+not started by the profile. Startup includes compilation and graph capture.
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml \
+  --api-server-count 4 --stage-init-timeout 1800 --init-timeout 2400
+```
+
+KV reuse changes GEMM shapes and attention reduction order; cuDNN autotuning
+can also change waveform numerics. This path is not bitwise equivalent to
+re-prefill, and aggregate WER alone cannot establish perceptual or speaker
+similarity equivalence. Validate quality on the intended workload before
+adopting it. The default profiles and Qwen3-Omni keep their existing behavior.
+
+For a controlled ablation, copy the profile and disable each of the three
+options above while keeping capacities, chunking, hardware, client concurrency,
+and warmup identical. Report repeated runs, first-audio latency and failures
+alongside throughput. Warm requests measure a ready service; they do not measure
+cold-start latency.
 
 ---
 
