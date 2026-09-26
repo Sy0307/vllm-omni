@@ -337,6 +337,36 @@ supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local
 (with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
 its existing `talker_mtp` entry point for V1.
 
+### Qwen3-TTS first-frame delivery and rollback
+
+The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
+`qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+enable the `talker_first_audio` connector option, as does the experimental
+single-GPU profile. This changes the default CUDA MRV2 streaming path:
+residual prediction runs eagerly after the Talker sample, the Talker loads
+an additional first-frame decoder with its weights and CUDA graphs, and the
+orchestrator orders its audio before subsequent Code2Wav chunks.
+
+The path requires asynchronous chunks, TP/PP 1, an in-process executor and
+disabled prefix caching. Requests with reference codes and unsupported
+runners or platforms retain regular Code2Wav delivery.
+
+To restore regular codec delivery and avoid loading the Talker's additional
+decoder, use a deploy overlay with the relevant base profile:
+
+```yaml
+base_config: qwen3_tts.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      talker_first_audio: false
+```
+
+First-packet latency measures when PCM starts arriving. Time to first audible
+audio (TTFA) also includes any leading silence in the generated audio. An
+earlier first packet therefore does not necessarily improve TTFA; measure
+both for the intended voice and workload.
+
 ### Included performance work
 
 - Request snapshots have a fast path for immutable scalar leaves, including
@@ -388,6 +418,12 @@ GPU and stops its own daemon after the stages exit. If
 `CUDA_MPS_PIPE_DIRECTORY` already names an operator-managed daemon, the runtime
 reuses it without stopping it. Diffusion and remote stages are unsupported.
 Set `cuda_mps: false` in a deploy overlay to disable automatic MPS management.
+
+MPS can improve throughput under concurrent load while increasing first-packet
+or first-audible-audio latency, particularly at low request rates. For a
+latency-sensitive workload, compare the same profile with `cuda_mps: false`.
+An inherited operator-managed MPS daemon must also be disabled by its owner
+for that comparison; this switch only controls automatic MPS management.
 
 MPS does not reserve a GPU. Use only assigned GPUs, explicitly place stages on
 the intended GPU, and warm the complete pipeline before measuring performance.

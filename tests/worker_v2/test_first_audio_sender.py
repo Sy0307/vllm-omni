@@ -57,6 +57,9 @@ def test_sink_skips_requests_that_already_left_the_scheduler():
 
 
 class _DoneEvent:
+    def record(self):
+        pass
+
     def synchronize(self):
         pass
 
@@ -111,3 +114,46 @@ def test_delivery_failure_emits_request_error():
     delivery.fail(["r"])
     _, outputs = output_queue.get_nowait()
     assert outputs.outputs[0].finish_reason == FinishReason.ERROR
+
+
+@pytest.mark.parametrize("client_index", [0, 3])
+def test_submit_reports_only_requests_with_a_prepared_route(monkeypatch, client_index):
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender
+
+    # Exercise the routing contract without allocating CUDA or pinned memory.
+    original_empty = torch.empty
+    monkeypatch.setattr(torch, "empty", lambda *args, pin_memory=False, **kwargs: original_empty(*args, **kwargs))
+    monkeypatch.setattr(torch.cuda, "Event", _DoneEvent)
+    output_queue: queue.Queue = queue.Queue()
+    sender = FirstAudioSender(engine_output_queue_sink(output_queue, _scheduler(kept=client_index)))
+    pcm = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    try:
+        accepted = sender.submit(["gone", "kept", "also-gone"], pcm, torch.tensor(24000))
+    finally:
+        sender.close()
+
+    assert accepted == ["kept"]
+    client, outputs = output_queue.get_nowait()
+    assert client == client_index
+    assert [output.request_id for output in outputs.outputs] == ["kept"]
+    assert torch.equal(outputs.outputs[0].multimodal_output["model_outputs"], pcm[1])
+    assert output_queue.empty()
+
+
+def test_submit_without_any_route_leaves_audio_to_the_codec(monkeypatch):
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender
+
+    def unexpected_copy(*args, **kwargs):
+        pytest.fail("No delivery is possible; do not start a device copy")
+
+    monkeypatch.setattr(torch, "empty", unexpected_copy)
+    monkeypatch.setattr(torch.cuda, "Event", unexpected_copy)
+    output_queue: queue.Queue = queue.Queue()
+    sender = FirstAudioSender(engine_output_queue_sink(output_queue, _scheduler()))
+    try:
+        accepted = sender.submit(["gone"], torch.ones(1, 2), torch.tensor(24000))
+    finally:
+        sender.close()
+
+    assert accepted == []
+    assert output_queue.empty()

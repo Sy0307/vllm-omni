@@ -222,5 +222,5 @@ class EagerMTPState:
             if frame_valid is not None:
                 frame_valid.record_stream(stream)
             request_ids = [entries[row][2] for row, _i in first]
-            sender.submit(request_ids, pcm, sr, valid=frame_valid)
-            self.owner._first_audio_requests.update(request_ids)
+            accepted = sender.submit(request_ids, pcm, sr, valid=frame_valid)
+            self.owner._first_audio_requests.update(accepted)

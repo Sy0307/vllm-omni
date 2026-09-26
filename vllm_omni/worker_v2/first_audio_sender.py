@@ -45,12 +45,21 @@ class FirstAudioSender:
         pcm: torch.Tensor,
         sample_rate: torch.Tensor,
         valid: torch.Tensor | None = None,
-    ) -> None:
+    ) -> list[str]:
         """Queue a D2H copy of ``pcm`` [n, samples] on the current stream and deliver it once done.
 
         ``valid`` [n] (on device) drops rows whose frame turned out not to be
         audio (e.g. a codec EOS sample); it is read only after the copy.
+
+        Return the request IDs whose delivery was accepted. Rows without an
+        engine output route must retain regular codec delivery instead of
+        promising the orchestrator a first frame that can never arrive.
         """
+        prepare = getattr(self._sink, "prepare", None)
+        delivery = prepare(request_ids) if prepare is not None else self._sink
+        accepted = list(delivery.routes) if isinstance(delivery, _PreparedDelivery) else list(request_ids)
+        if not accepted:
+            return []
         host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
         host.copy_(pcm, non_blocking=True)
         host_valid = None
@@ -59,9 +68,8 @@ class FirstAudioSender:
             host_valid.copy_(valid, non_blocking=True)
         copied = torch.cuda.Event()
         copied.record()
-        prepare = getattr(self._sink, "prepare", None)
-        delivery = prepare(request_ids) if prepare is not None else self._sink
         self._queue.put((copied, host, list(request_ids), sample_rate, host_valid, delivery))
+        return accepted
 
     def close(self) -> None:
         self._queue.put(None)

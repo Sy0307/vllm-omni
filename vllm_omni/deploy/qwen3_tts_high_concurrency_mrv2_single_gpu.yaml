@@ -7,6 +7,9 @@
 # and stops it after they exit. An existing CUDA_MPS_PIPE_DIRECTORY is reused
 # without taking ownership. Requires nvidia-cuda-mps-control on PATH.
 # Set cuda_mps: false in an overlay to disable it.
+# MPS can increase throughput under load but also increase first-packet and
+# first-audible-audio latency. Compare cuda_mps: false for latency-sensitive
+# workloads, especially at low request rates.
 # Warm the full pipeline before measuring latency or throughput.
 #
 # vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \

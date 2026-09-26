@@ -565,3 +565,30 @@ def test_first_audio_requirement_survives_eos_only_if_audio_was_queued(first_was
     outputs["meta"]["first_audio"] = torch.zeros(1, dtype=torch.bool)
     state.run_eager_mtp(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[_EOS]]), outputs)
     assert outputs["meta"]["first_audio"].tolist() == [first_was_valid]
+
+
+@pytest.mark.parametrize("accepted", [[], ["r1"], ["r0", "r1"]])
+def test_first_audio_marker_requires_accepted_delivery(monkeypatch, accepted):
+    from contextlib import nullcontext
+
+    state = _make_eager_state()
+    _fill_buffers(state, "r0", "r1")
+    state.model.first_frame_decoder = SimpleNamespace(
+        sample_rate=24000, decode=lambda codes: torch.ones(codes.shape[0], 2)
+    )
+    state._first_audio_stream = SimpleNamespace(wait_stream=lambda stream: None)
+    state._first_audio_sender = SimpleNamespace(submit=lambda ids, pcm, sr, valid: accepted)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: None)
+    batch = _EagerBatch([1, 1])
+    state._eager_rows = (batch, [(0, 0, "r0", True), (1, 1, "r1", True)], torch.zeros(2, dtype=torch.long))
+    outputs = _eager_outputs(2)
+    outputs["meta"]["first_audio"] = torch.zeros(2, dtype=torch.bool)
+
+    state.run_eager_mtp(batch, torch.zeros(2, _EAGER_DIM), torch.tensor([[7], [8]]), outputs)
+
+    assert state._first_audio_requests == set(accepted)
+    # A missing route must leave the normal codec path responsible for frame 0;
+    # otherwise it skips the frame and the orchestrator waits forever for it.
+    assert outputs["meta"]["first_audio"].tolist() == ["r0" in accepted, "r1" in accepted]

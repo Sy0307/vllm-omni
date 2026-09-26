@@ -1649,7 +1649,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return self._tts_pad_embed.reshape(1, -1)
 
     def capture_first_frame_graphs(self) -> None:
-        # Set by load_weights when this stage decodes first frames (VLLM_OMNI_TALKER_FIRST_AUDIO).
+        # Set by load_weights when talker_first_audio_enabled accepts the connector option.
         decoder = getattr(self, "first_frame_decoder", None)
         if decoder is not None:
             decoder.capture()
