@@ -942,7 +942,11 @@ def _resolve_execution_mode(
 
 
 def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
-    return bool(deploy.async_chunk and (stage is None or stage.async_chunk is not False))
+    if not isinstance(deploy.async_chunk, bool):
+        raise ValueError("async_chunk must be a boolean")
+    if stage is not None and stage.async_chunk is not None and not isinstance(stage.async_chunk, bool):
+        raise ValueError(f"Stage {stage.stage_id} async_chunk must be a boolean or null")
+    return deploy.async_chunk and (stage is None or stage.async_chunk is not False)
 
 
 def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployConfig) -> None:

@@ -2052,6 +2052,28 @@ def test_async_chunk_rejects_mismatched_connector_edge(disabled_stage, builder):
             builder(pipeline, user_deploy_config=deploy)
 
 
+@pytest.mark.parametrize("scope", ["pipeline", "stage"])
+@pytest.mark.parametrize("from_yaml", [False, True])
+@pytest.mark.parametrize("builder", [merge_pipeline_deploy, VllmOmniConfig.from_pipeline_config])
+def test_async_chunk_rejects_quoted_false_before_selecting_processors(tmp_path, scope, from_yaml, builder):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    if from_yaml:
+        path = tmp_path / "quoted_false.yaml"
+        path.write_text(
+            'async_chunk: "false"\n' if scope == "pipeline" else 'stages:\n  - stage_id: 0\n    async_chunk: "false"\n'
+        )
+        deploy = load_deploy_config(path)
+    elif scope == "pipeline":
+        deploy = DeployConfig(async_chunk="false")
+    else:
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, async_chunk="false")])
+    with pytest.raises(ValueError, match="async_chunk must be a boolean"):
+        if builder is merge_pipeline_deploy:
+            builder(pipeline, deploy)
+        else:
+            builder(pipeline, user_deploy_config=deploy)
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 def test_diffusion_quantization_origin_survives_projection_and_transport(monkeypatch, explicit):
     from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig

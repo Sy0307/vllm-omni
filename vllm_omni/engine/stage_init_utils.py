@@ -1041,14 +1041,17 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
             return
 
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
-        previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
-
-    if previous_env:
-        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
     try:
+        for key, value in runtime_env.items():
+            env_key = str(key)
+            old_value = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+            # Track only successful writes, preserving the original value
+            # if distinct keys normalize to the same environment name.
+            previous_env.setdefault(env_key, old_value)
+
+        if previous_env:
+            logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
         yield
     finally:
         for key, old_value in previous_env.items():

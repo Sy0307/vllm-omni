@@ -424,6 +424,12 @@ GPU and stops its own daemon after the stages exit. If
 reuses it without stopping it. Diffusion and remote stages are unsupported.
 Set `cuda_mps: false` in a deploy overlay to disable automatic MPS management.
 
+Stage `env.CUDA_MPS_PIPE_DIRECTORY` overrides the parent setting when selecting
+the daemon; an explicit empty string selects a private daemon. Stages sharing
+a GPU reuse the first stage's daemon. Later stages may omit the setting or
+explicitly match that policy; a conflicting explicit setting fails before
+that stage starts. The parent environment is unchanged.
+
 MPS can improve throughput under concurrent load while increasing first-packet
 or first-audible-audio latency, particularly at low request rates. For a
 latency-sensitive workload, compare the same profile with `cuda_mps: false`.

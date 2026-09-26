@@ -547,10 +547,19 @@ class StageRuntime:
             return {}
         if not current_omni_platform.is_cuda() or devices is None or len(devices.split(",")) != 1:
             raise ValueError("cuda_mps currently requires a local CUDA stage on exactly one explicit GPU")
+        runtime_env = runtime_cfg.get("env") if isinstance(runtime_cfg, Mapping) else getattr(runtime_cfg, "env", None)
+        pipe_directory = (
+            str(runtime_env["CUDA_MPS_PIPE_DIRECTORY"])
+            if isinstance(runtime_env, Mapping) and "CUDA_MPS_PIPE_DIRECTORY" in runtime_env
+            else None
+        )
         uuid = physical_gpu_uuid(devices.strip())
         if uuid not in self._mps_servers:
-            self._mps_servers[uuid] = CudaMPSServer(uuid)
-        return self._mps_servers[uuid].env
+            self._mps_servers[uuid] = CudaMPSServer(uuid, pipe_directory=pipe_directory)
+        server = self._mps_servers[uuid]
+        if pipe_directory is not None and (pipe_directory or None) != server.operator_pipe_directory:
+            raise ValueError(f"Conflicting CUDA_MPS_PIPE_DIRECTORY settings for stages sharing GPU {uuid}")
+        return server.env
 
     def _close_mps_servers(self) -> None:
         for uuid, server in list(self._mps_servers.items()):
