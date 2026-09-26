@@ -725,7 +725,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             self._decode_batch_max_size = decode_batch_max_size
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
             decode_time_major_conv = _get_bool_config("decode_time_major_conv", False)
-            self.decoder.skip_delivered_first_audio = self._async_chunk and _get_bool_config(
+            self.decoder.capture_first_audio_state_only = self._async_chunk and _get_bool_config(
                 "talker_first_audio", False
             )
             decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)

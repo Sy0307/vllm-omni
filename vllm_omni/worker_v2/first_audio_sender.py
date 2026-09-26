@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from vllm.logger import init_logger
@@ -25,15 +24,21 @@ from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
 
 logger = init_logger(__name__)
 
-# (request ids, host PCM rows, sample rate) -> None; runs on the sender thread.
-FirstAudioSink = Callable[[list[str], list[torch.Tensor], torch.Tensor], None]
+
+class FirstAudioSink(Protocol):
+    def prepare(self, request_ids: list[str]) -> _PreparedDelivery:
+        """Freeze request routes on the submitting thread before accepting delivery."""
+        ...
 
 
 class FirstAudioSender:
     def __init__(self, sink: FirstAudioSink) -> None:
+        if not callable(getattr(sink, "prepare", None)):
+            raise TypeError("FirstAudioSender requires a sink with prepare(request_ids)")
         self._sink = sink
         self._queue: queue.SimpleQueue[
-            tuple[torch.cuda.Event, torch.Tensor, list[str], torch.Tensor, torch.Tensor | None, Any] | None
+            tuple[torch.cuda.Event, torch.Tensor, list[str], torch.Tensor, torch.Tensor | None, _PreparedDelivery]
+            | None
         ]
         self._queue = queue.SimpleQueue()
         self._thread = threading.Thread(target=self._run, daemon=True, name="omni-first-audio-sender")
@@ -55,9 +60,8 @@ class FirstAudioSender:
         engine output route must retain regular codec delivery instead of
         promising the orchestrator a first frame that can never arrive.
         """
-        prepare = getattr(self._sink, "prepare", None)
-        delivery = prepare(request_ids) if prepare is not None else self._sink
-        accepted = list(delivery.routes) if isinstance(delivery, _PreparedDelivery) else list(request_ids)
+        delivery = self._sink.prepare(request_ids)
+        accepted = list(delivery.routes)
         if not accepted:
             return []
         host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
@@ -78,21 +82,25 @@ class FirstAudioSender:
     def _run(self) -> None:
         while (item := self._queue.get()) is not None:
             copied, host, request_ids, sample_rate, host_valid, delivery = item
+            pending = request_ids
             try:
                 copied.synchronize()
                 rows = [row for row in range(len(request_ids)) if host_valid is None or bool(host_valid[row])]
+                pending = [request_ids[row] for row in rows]
                 if rows:
-                    delivery([request_ids[row] for row in rows], [host[row].clone() for row in rows], sample_rate)
+                    delivery(pending, [host[row].clone() for row in rows], sample_rate)
             except Exception:
-                logger.exception("First-audio delivery failed for %s", request_ids)
-                fail = getattr(delivery, "fail", None)
-                if fail is not None:
-                    fail(request_ids)
+                # If synchronization failed, validity is not readable yet.
+                # Otherwise only valid, not-yet-delivered rows owe first audio.
+                logger.exception("First-audio delivery failed for %s", pending)
+                delivery.fail(pending)
 
 
 @dataclass
 class _PreparedDelivery:
     sink: _EngineOutputSink
+    # Frozen client indices for outstanding deliveries. Successful enqueues
+    # retire their routes so a later failure cannot abort completed deliveries.
     routes: dict[str, int]
 
     def __call__(self, request_ids: list[str], pcm_rows: list[torch.Tensor], sample_rate: torch.Tensor) -> None:
@@ -115,9 +123,6 @@ class _EngineOutputSink:
                 routes[request_id] = int(getattr(request, "client_index", 0) or 0)
         return _PreparedDelivery(self, routes)
 
-    def __call__(self, request_ids: list[str], pcm_rows: list[torch.Tensor], sample_rate: torch.Tensor) -> None:
-        self.prepare(request_ids)(request_ids, pcm_rows, sample_rate)
-
     def _send(self, routes: dict[str, int], request_ids, pcm_rows, sample_rate) -> None:
         from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 
@@ -138,6 +143,8 @@ class _EngineOutputSink:
             )
         for client_index, outputs in by_client.items():
             self.output_queue.put_nowait((client_index, OmniEngineCoreOutputs(outputs=outputs)))
+            for output in outputs:
+                routes.pop(output.request_id)
 
     def _fail(self, routes: dict[str, int], request_ids: list[str]) -> None:
         from vllm.v1.engine import FinishReason
@@ -153,6 +160,7 @@ class _EngineOutputSink:
                     stop_reason="First-audio delivery failed",
                 )
                 self.output_queue.put_nowait((routes[request_id], OmniEngineCoreOutputs(outputs=[output])))
+                routes.pop(request_id)
 
 
 def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:

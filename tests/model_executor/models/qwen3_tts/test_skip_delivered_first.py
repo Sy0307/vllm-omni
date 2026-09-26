@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Code2Wav drops only the frame the Talker already delivered (VLLM_OMNI_CODEC_SKIP_DELIVERED_FIRST)."""
+"""Code2Wav drops only frames explicitly marked as delivered by the Talker."""
 
 import pytest
 import torch
@@ -16,7 +16,7 @@ UPSAMPLE = 4
 
 def _decoder(skip: bool):
     decoder = Qwen3TTSTokenizerV2Decoder.__new__(Qwen3TTSTokenizerV2Decoder)
-    decoder.__dict__["skip_delivered_first_audio"] = skip
+    decoder.__dict__["capture_first_audio_state_only"] = skip
     decoder.__dict__["total_upsample"] = UPSAMPLE
     calls = []
 
@@ -44,7 +44,7 @@ def test_longer_first_chunk_keeps_all_but_the_delivered_frame():
     decoder, calls = _decoder(skip=True)
     out = decoder._decode_stream_first_chunk(
         torch.zeros(1, 16, 3, dtype=torch.long),
-        {"skip_first_audio": calls == [] and decoder.skip_delivered_first_audio},
+        {"skip_first_audio": True},
     )
     assert calls == ["full"]
     assert torch.equal(out, torch.arange(UPSAMPLE, 3 * UPSAMPLE, dtype=torch.float32).view(1, 1, -1))
@@ -54,7 +54,7 @@ def test_without_skip_the_whole_first_chunk_is_decoded():
     decoder, calls = _decoder(skip=False)
     out = decoder._decode_stream_first_chunk(
         torch.zeros(1, 16, 3, dtype=torch.long),
-        {"skip_first_audio": calls == [] and decoder.skip_delivered_first_audio},
+        {"skip_first_audio": False},
     )
     assert calls == ["full"] and out.shape[-1] == 3 * UPSAMPLE
 

@@ -25,7 +25,7 @@ def test_sink_groups_outputs_by_client_and_carries_audio():
     sample_rate = torch.tensor(24000, dtype=torch.int32)
     rows = [torch.full((4,), float(i)) for i in range(3)]
 
-    sink(["a", "b", "c"], rows, sample_rate)
+    sink.prepare(["a", "b", "c"])(["a", "b", "c"], rows, sample_rate)
 
     delivered = {}
     while not output_queue.empty():
@@ -47,8 +47,8 @@ def test_sink_skips_requests_that_already_left_the_scheduler():
     output_queue: queue.Queue = queue.Queue()
     sink = engine_output_queue_sink(output_queue, _scheduler(kept=0))
 
-    sink(["gone", "kept"], [torch.zeros(2), torch.ones(2)], torch.tensor(24000, dtype=torch.int32))
-    sink(["gone"], [torch.zeros(2)], torch.tensor(24000, dtype=torch.int32))
+    sink.prepare(["gone", "kept"])(["gone", "kept"], [torch.zeros(2), torch.ones(2)], torch.tensor(24000))
+    sink.prepare(["gone"])(["gone"], [torch.zeros(2)], torch.tensor(24000))
 
     client_index, outputs = output_queue.get_nowait()
     assert client_index == 0
@@ -67,11 +67,18 @@ class _DoneEvent:
 def _run_sender(items):
     from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender
 
-    delivered = []
-    sender = FirstAudioSender(lambda ids, rows, sr: delivered.append((list(ids), [row.clone() for row in rows])))
+    output_queue: queue.Queue = queue.Queue()
+    sink = engine_output_queue_sink(output_queue, _scheduler(**{rid: 0 for item in items for rid in item[2]}))
+    sender = FirstAudioSender(sink)
     for item in items:
-        sender._queue.put((*item, sender._sink))
+        sender._queue.put((*item, sink.prepare(item[2])))
     sender.close()
+    delivered = []
+    while not output_queue.empty():
+        _, outputs = output_queue.get_nowait()
+        delivered.append(
+            ([o.request_id for o in outputs.outputs], [o.multimodal_output["model_outputs"] for o in outputs.outputs])
+        )
     return delivered
 
 
@@ -156,4 +163,75 @@ def test_submit_without_any_route_leaves_audio_to_the_codec(monkeypatch):
         sender.close()
 
     assert accepted == []
+    assert output_queue.empty()
+
+
+@pytest.mark.parametrize("sink", [lambda ids, rows, sr: None, SimpleNamespace(prepare=None)])
+def test_sender_rejects_sink_without_route_preparation(sink):
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender
+
+    with pytest.raises(TypeError, match="prepare"):
+        FirstAudioSender(sink)
+
+
+def test_sender_failure_only_aborts_valid_undelivered_rows():
+    from vllm.v1.engine import FinishReason
+
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender
+
+    class FailSecondClientOnce(queue.Queue):
+        def put_nowait(self, item):
+            client, outputs = item
+            if client == 1 and outputs.outputs[0].finish_reason is None:
+                raise RuntimeError("client enqueue failed")
+            super().put_nowait(item)
+
+    output_queue = FailSecondClientOnce()
+    sink = engine_output_queue_sink(output_queue, _scheduler(eos=1, sent=0, failed=1, pending=2, next=3))
+    sender = FirstAudioSender(sink)
+    ids = ["eos", "sent", "failed", "pending", "gone"]
+    sender._queue.put(
+        (
+            _DoneEvent(),
+            torch.ones(5, 2),
+            ids,
+            torch.tensor(24000),
+            torch.tensor([False, True, True, True, True]),
+            sink.prepare(ids),
+        )
+    )
+    sender._queue.put((_DoneEvent(), torch.ones(1, 2), ["next"], torch.tensor(24000), None, sink.prepare(["next"])))
+    sender.close()
+
+    actual: list[tuple[int, str, FinishReason | None]] = []
+    while not output_queue.empty():
+        client, outputs = output_queue.get_nowait()
+        actual.extend((client, o.request_id, o.finish_reason) for o in outputs.outputs)
+    assert actual == [
+        (0, "sent", None),
+        (1, "failed", FinishReason.ERROR),
+        (2, "pending", FinishReason.ERROR),
+        (3, "next", None),
+    ]
+
+
+def test_sender_copy_failure_reports_all_prepared_routes():
+    from vllm.v1.engine import FinishReason
+
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender
+
+    class FailedEvent:
+        def synchronize(self):
+            raise RuntimeError("copy failed before validity became readable")
+
+    output_queue: queue.Queue = queue.Queue()
+    sink = engine_output_queue_sink(output_queue, _scheduler(r=3))
+    sender = FirstAudioSender(sink)
+    sender._queue.put(
+        (FailedEvent(), torch.ones(2, 2), ["r", "gone"], torch.tensor(24000), None, sink.prepare(["r", "gone"]))
+    )
+    sender.close()
+    client, outputs = output_queue.get_nowait()
+    assert client == 3
+    assert [(o.request_id, o.finish_reason) for o in outputs.outputs] == [("r", FinishReason.ERROR)]
     assert output_queue.empty()

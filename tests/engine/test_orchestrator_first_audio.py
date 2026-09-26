@@ -3,13 +3,14 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 import torch
 from vllm.v1.engine import FinishReason
 
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, _upstream_first_audio_output
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -42,7 +43,7 @@ def _raw(*, first=False, required=False, terminal=False):
 
 
 @pytest.mark.asyncio
-async def test_codec_terminal_that_overtakes_first_audio_is_released_in_order():
+async def test_codec_terminal_that_overtakes_first_audio_is_released_in_order(mocker):
     obj = _orchestrator()
     later = _raw(required=True)
     terminal = _raw(terminal=True)
@@ -59,8 +60,8 @@ async def test_codec_terminal_that_overtakes_first_audio_is_released_in_order():
         return []
 
     obj._process_llm_stage_outputs = process
-    obj._handle_processed_outputs = AsyncMock()
-    obj._finish_raw_terminal_requests = AsyncMock()
+    obj._handle_processed_outputs = mocker.AsyncMock()
+    obj._finish_raw_terminal_requests = mocker.AsyncMock()
     await obj._route_upstream_first_audio(0, 0, _raw(first=True))
     assert released == expected
     assert obj.request_states["r"].pending_first_audio_outputs == []
@@ -94,3 +95,32 @@ def test_first_audio_supports_both_speech_and_chat_consumers():
     assert not result.finished
     assert torch.equal(result.outputs[0].multimodal_output["audio"], audio)
     assert torch.equal(result.multimodal_output["audio"], audio)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio", [None, [], torch.empty(0)])
+@pytest.mark.parametrize("codec_overtook", [False, True])
+async def test_invalid_first_audio_reports_error_and_releases_request(mocker, audio, codec_overtook):
+    obj = _orchestrator()
+    obj._cfg_tracker = CfgCompanionTracker()
+    obj._pd_kv_params = {}
+    obj._running_counter = None
+    obj._abort_request_ids = mocker.AsyncMock(return_value=[])
+    obj._release_request_bindings = mocker.Mock()
+    obj.request_states["healthy"] = OrchestratorRequestState(request_id="healthy", final_stage_id=1)
+    if codec_overtook:
+        await obj._route_upstream_first_audio(1, 0, _raw(required=True, terminal=True))
+        assert obj.request_states["r"].pending_first_audio_outputs
+    first = _raw(first=True)
+    first.outputs[0].multimodal_output["model_outputs"] = audio
+    await obj._route_upstream_first_audio(0, 0, first)
+
+    error = obj.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.request_id == "r" and "first-audio" in error.error
+    assert not first.outputs and set(obj.request_states) == {"healthy"}
+    obj._abort_request_ids.assert_awaited_once_with(["r"])
+    obj._release_request_bindings.assert_called_once_with(["r"])
+    # A late duplicate cannot restart the request or emit a second error.
+    await obj._route_upstream_first_audio(0, 0, _raw(first=True))
+    assert obj.output_async_queue.empty()

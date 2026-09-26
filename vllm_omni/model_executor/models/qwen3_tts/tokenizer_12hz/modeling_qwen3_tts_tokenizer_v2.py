@@ -1156,9 +1156,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         """State for later chunks when the first chunk's audio was delivered upstream."""
         return self._init_xvec_first_chunk_state(codes, caches)
 
-    # Set on the Code2Wav stage's decoder when the Talker stage already
-    # delivers eligible first chunks through the talker_first_audio connector option.
-    skip_delivered_first_audio = False
+    # Capture hint only: the raw connector option does not guarantee that
+    # a request received upstream audio. Only its skip_first_audio marker does.
+    capture_first_audio_state_only = False
 
     def _decode_stream_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         if not caches.get("skip_first_audio", False):

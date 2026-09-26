@@ -922,6 +922,7 @@ class OrchestratorBase:
                     continue
                 audio = mm.get("model_outputs")
                 if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+                    await self._handle_stage_error(stage_id, eco, error="Invalid or empty first-audio payload")
                     continue
                 req_state.upstream_first_audio = True
                 await self.output_async_queue.put(

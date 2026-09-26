@@ -347,6 +347,11 @@ residual prediction runs eagerly after the Talker sample, the Talker loads
 an additional first-frame decoder with its weights and CUDA graphs, and the
 orchestrator orders its audio before subsequent Code2Wav chunks.
 
+Code2Wav retains full-audio prefix graphs alongside the optional state-only
+graphs. Each request's delivery marker selects the graph and audio trimming;
+enabling the option alone never suppresses audio or disables prefix batching
+for requests that retain regular codec delivery.
+
 The path requires asynchronous chunks, TP/PP 1, an in-process executor and
 disabled prefix caching. Requests with reference codes and unsupported
 runners or platforms retain regular Code2Wav delivery.
