@@ -21,7 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import janus
 import torch
@@ -66,34 +66,11 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
+
+if TYPE_CHECKING:
+    from vllm_omni.engine import OmniEngineCoreOutput
 
 logger = init_logger(__name__)
-
-
-def _upstream_first_audio_output(request_id: str, audio: torch.Tensor, sample_rate: Any) -> OmniRequestOutput:
-    """First audio decoded upstream, shaped like a final stage's streamed audio output.
-
-    Consumers read audio either from the output itself (speech) or from its
-    first completion (chat), so it carries both, like the final stage's
-    per-chunk outputs.
-    """
-    raw = {"model_outputs": audio, "sr": sample_rate}
-    completion = MultimodalCompletionOutput(
-        index=0,
-        text="",
-        token_ids=[],
-        cumulative_logprob=None,
-        logprobs=None,
-        multimodal_output=MultimodalPayload.from_raw(raw, "audio"),
-    )
-    return OmniRequestOutput(
-        request_id=request_id,
-        finished=False,
-        final_output_type="audio",
-        outputs=[completion],
-        _multimodal_output=raw,
-    )
 
 
 def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
@@ -255,6 +232,7 @@ class OrchestratorRequestState:
     native_kv_transfer_id: str | None = None
     # First-frame delivery and final-stage outputs use different channels.
     upstream_first_audio: bool = False
+    pending_upstream_first_audio: tuple[int, OmniEngineCoreOutput] | None = None
     pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
 
 
@@ -904,10 +882,7 @@ class OrchestratorBase:
         including terminal outputs, on the request until its first PCM arrives.
         Cancellation and stage errors use ordinary request cleanup.
         """
-        from vllm_omni.engine import OmniEngineCoreOutputs
-
         kept = []
-        ready = []
         final_output = self.stage_pools[stage_id].final_output
         for eco in raw_outputs.outputs:
             mm = getattr(eco, "multimodal_output", None)
@@ -918,26 +893,19 @@ class OrchestratorBase:
             if is_first:
                 assert isinstance(mm, dict)
                 # Only the dedicated first-frame channel is intercepted.
-                if req_state is None or req_state.upstream_first_audio:
+                if (
+                    req_state is None
+                    or req_state.upstream_first_audio
+                    or req_state.pending_upstream_first_audio is not None
+                    or stage_id + 1 > req_state.final_stage_id
+                ):
                     continue
                 audio = mm.get("model_outputs")
                 if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
                     await self._handle_stage_error(stage_id, eco, error="Invalid or empty first-audio payload")
                     continue
-                req_state.upstream_first_audio = True
-                await self.output_async_queue.put(
-                    OutputMessage(
-                        request_id=req_state.request_id,
-                        stage_id=req_state.final_stage_id,
-                        replica_id=replica_id,
-                        engine_outputs=_upstream_first_audio_output(req_state.request_id, audio, mm.get("sr")),
-                        metrics=None,
-                        finished=False,
-                        stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
-                    )
-                )
-                ready.extend(req_state.pending_first_audio_outputs)
-                req_state.pending_first_audio_outputs.clear()
+                req_state.pending_upstream_first_audio = (stage_id, eco)
+                await self._flush_upstream_first_audio(req_state)
                 continue
             if (
                 req_state is not None
@@ -950,7 +918,47 @@ class OrchestratorBase:
                 continue
             kept.append(eco)
         raw_outputs.outputs = kept
+
+    async def _flush_upstream_first_audio(self, req_state: OrchestratorRequestState) -> None:
+        """Feed upstream PCM through the codec's normal output-kind contract.
+
+        The source can finish its first frame while downstream prewarm is
+        still selecting/registering a replica. Retain that frame until the
+        codec owns an output-processor state, then accumulate it before any
+        codec output that omitted it. This preserves FINAL_ONLY/CUMULATIVE
+        waveforms and downstream consumers such as forced alignment.
+        """
+        from vllm_omni.engine import OmniEngineCoreOutputs
+
+        pending = req_state.pending_upstream_first_audio
+        if pending is None or self.request_states.get(req_state.request_id) is not req_state:
+            return
+        source_stage, first_output = pending
+        codec_stage = source_stage + 1
+        pool = self.stage_pools[codec_stage]
+        replica_id = pool.get_bound_replica_id(req_state.request_id)
+        if replica_id is None or req_state.request_id not in pool.output_processor.request_states:
+            return
+        req_state.pending_upstream_first_audio = None
+        req_state.upstream_first_audio = True
+        try:
+            processed = await pool.process_llm_raw_outputs(replica_id, OmniEngineCoreOutputs(outputs=[first_output]))
+            await self._handle_processed_outputs(codec_stage, replica_id, processed)
+        except EngineDeadError as error:
+            await self._handle_dead_replica(codec_stage, replica_id, error)
+            return
+        except Exception as error:
+            # A promised first frame must either enter the codec accumulator
+            # or fail its request; leaving it pending would stall completion.
+            logger.exception("First-audio output processing failed for %s", req_state.request_id)
+            await self._handle_stage_error(codec_stage, first_output, error=str(error))
+            return
+        if self.request_states.get(req_state.request_id) is not req_state:
+            return
+        ready, req_state.pending_first_audio_outputs = req_state.pending_first_audio_outputs, []
         for pending_stage, pending_replica, output in ready:
+            if self.request_states.get(req_state.request_id) is not req_state:
+                break
             terminal: set[str] = set()
             processed = await self._process_llm_stage_outputs(
                 pending_stage, pending_replica, OmniEngineCoreOutputs(outputs=[output]), terminal
@@ -2735,6 +2743,11 @@ class OrchestratorBase:
                 bound_replica_id if bound_replica_id is not None else 0,
                 req_state,
             )
+
+            if req_state.pending_upstream_first_audio is not None or req_state.upstream_first_audio:
+                await self._flush_upstream_first_audio(req_state)
+                if self.request_states.get(request_id) is not req_state:
+                    return False
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in
