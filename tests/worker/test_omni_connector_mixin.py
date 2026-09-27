@@ -1437,6 +1437,58 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         host.shutdown_omni_connectors()
 
+    def test_first_chunk_hook_sees_only_chunk_zero_before_staging(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="gen"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "gen"
+        seen = []
+
+        def hook(req_id, handle, payload):
+            # The chunk is not yet visible to the scheduler when the hook runs.
+            seen.append((req_id, handle.external_req_id, payload["codes"]["audio"], "r1" in host._finished_load_reqs))
+
+        host.set_first_chunk_hook(hook)
+        host.register_chunk_recv(_make_request("r1", "ext-r1"))
+        chunk = {"codes": {"audio": [1, 2]}, "meta": {"finished": torch.tensor(False)}}
+        host._omni_connector.get.return_value = (chunk, 1)
+        self.assertTrue(host._poll_single_request("r1"))
+        self.assertEqual(seen, [("r1", "ext-r1", [1, 2], False)])
+        self.assertIn("r1", host._finished_load_reqs)
+
+        host.get_omni_connector_output()
+        host._local_stage_payload_cache.clear()
+        host._local_request_metadata.clear()
+        host._omni_connector.get.return_value = ({"codes": {"audio": [3, 4]}, "meta": {}}, 1)
+        self.assertTrue(host._poll_single_request("r1"))
+        self.assertEqual(len(seen), 1)
+
+        host.shutdown_omni_connectors()
+
+    def test_first_chunk_hook_skips_terminal_first_chunk(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="gen"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "gen"
+        hook = MagicMock()
+        host.set_first_chunk_hook(hook)
+        host.register_chunk_recv(_make_request("r1"))
+        host._omni_connector.get.return_value = (
+            {"codes": {"audio": [1, 2]}, "meta": {"finished": torch.tensor(True)}},
+            1,
+        )
+        self.assertTrue(host._poll_single_request("r1"))
+        hook.assert_not_called()
+        host.shutdown_omni_connectors()
+
     def test_non_ar_recv_waits_for_scheduler_handoff_before_fetching_next_chunk(self):
         host = MixinHost()
         host.init_omni_connectors(
