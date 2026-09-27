@@ -303,6 +303,50 @@ def _stage_connector(stage_id):
     return SharedMemoryConnector({"stage_id": stage_id})
 
 
+def test_wakeup_discovery_only_scans_deployment_directory(monkeypatch, tmp_path):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    directory = tmp_path / "deployment"
+    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(directory))
+    original_scandir = os.scandir
+    scanned = []
+
+    def scoped_scandir(path):
+        # A parent-directory scan would recreate the performance regression.
+        assert os.fspath(path) == str(directory)
+        scanned.append(path)
+        return original_scandir(path)
+
+    monkeypatch.setattr(module.glob.os, "scandir", scoped_scandir)
+    sender, receiver = _stage_connector(86), _stage_connector(87)
+    try:
+        generation = receiver.get_wakeup_generation()
+        assert generation is not None
+        assert os.path.dirname(receiver._wake_path) == str(directory)
+        sender._wake_receiver(87)
+        assert receiver.wait_for_change(generation, timeout=0.5)
+        assert scanned
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_missing_wakeup_directory_keeps_payload_transport_working(monkeypatch, tmp_path):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    directory = tmp_path / "missing"
+    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(directory))
+    sender, receiver = _stage_connector(88), _stage_connector(89)
+    key = f"wake_{uuid.uuid4().hex}"
+    try:
+        assert sender.put("88", "89", key, {"value": 1})[0]
+        assert not directory.exists()
+        assert receiver.get("88", "89", key)[0] == {"value": 1}
+    finally:
+        sender.close()
+        receiver.close()
+
+
 def test_put_wakes_waiting_receiver():
     sender, receiver = _stage_connector(70), _stage_connector(71)
     try:
