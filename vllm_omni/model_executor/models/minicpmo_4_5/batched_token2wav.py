@@ -4,16 +4,19 @@
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
 
@@ -98,6 +101,62 @@ def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     tensor[..., valid_frames:] = 0.0
 
 
+@dataclass(frozen=True)
+class MergedRows:
+    """Per-row layout of a merged CFM batch.
+
+    ``frames`` are each row's valid mel frames and ``offsets`` its estimator
+    cache length (the rows' chunk positions differ, so their caches do).
+    """
+
+    frames: tuple[int, ...]
+    offsets: tuple[int, ...]
+
+
+class _MergedRowMasks(NamedTuple):
+    keep: torch.Tensor  # (B, 1, width): valid frames of the CFM state
+    keep_cfg: torch.Tensor  # (2B, 1, width): the same for the CFG batch
+    attn_mask: torch.Tensor  # (2B, width, width + cache_len): keys a row attends
+    att_zero: torch.Tensor  # (1, 2B, 1, width + cache_len, 1): padded chunk columns
+    cnn_zero: torch.Tensor  # (1, 2B, 1, cnn_width): padding-derived CNN positions
+
+
+def _merged_row_masks(
+    rows: MergedRows,
+    *,
+    width: int,
+    cache_len: int,
+    cnn_width: int,
+    device: torch.device,
+) -> _MergedRowMasks:
+    """Per-row masks for a merged CFM batch, built on the host and uploaded once.
+
+    Row ``r`` keeps its first ``frames[r]`` chunk columns and its first
+    ``offsets[r]`` cache columns: the same frames its own bucketed call keeps,
+    with the zero padding that aligns it to the longest row and cache masked
+    out of the attention. The chunk-padding columns it writes into the next
+    cache and the CNN positions that padding feeds are cleared, as that call
+    clears them.
+    """
+    frames = torch.tensor(rows.frames, dtype=torch.long)
+    offsets = torch.tensor(rows.offsets, dtype=torch.long)
+    keep = torch.arange(width)[None, :] < frames[:, None]
+    cache_keep = torch.arange(cache_len)[None, :] < offsets[:, None]
+    keys = torch.cat((keep, cache_keep), dim=1).repeat(2, 1)
+    att_zero = torch.cat((~keep, torch.zeros_like(cache_keep)), dim=1).repeat(2, 1)
+    padding = (width - frames).clamp(min=0, max=cnn_width)
+    cnn_zero = (torch.arange(cnn_width)[None, :] >= (cnn_width - padding)[:, None]).repeat(2, 1)
+    keep_cfg = keep.repeat(2, 1)
+    keys = to_device_nonblocking(keys, device)
+    return _MergedRowMasks(
+        keep=to_device_nonblocking(keep, device).unsqueeze(1),
+        keep_cfg=to_device_nonblocking(keep_cfg, device).unsqueeze(1),
+        attn_mask=keys.unsqueeze(1).expand(-1, width, -1).contiguous(),
+        att_zero=to_device_nonblocking(att_zero, device)[None, :, None, :, None],
+        cnn_zero=to_device_nonblocking(cnn_zero, device)[None, :, None, :],
+    )
+
+
 def _zero_padded_cnn_cache(
     cnn_cache: torch.Tensor,
     estimator: nn.Module,
@@ -162,6 +221,20 @@ def plan_token2wav_encode_slices(
         slices.append((start, start + take))
         start += take
     return slices
+
+
+_TIMESTEP_MAX_PERIOD = 10000
+
+
+def _timestep_frequencies(dim: int) -> torch.Tensor:
+    """Host frequency table of ``TimestepEmbedder.timestep_embedding``.
+
+    Built with the same ops, in the same order, as the ``cosyvoice2`` DiT
+    embedder, so moving it to the device once gives the table that embedder
+    would otherwise rebuild and copy on every call.
+    """
+    half = dim // 2
+    return torch.exp(-math.log(_TIMESTEP_MAX_PERIOD) * torch.arange(start=0, end=half) / half)
 
 
 def _autocast_disabled(device: torch.device):
@@ -330,6 +403,12 @@ class BatchedToken2Wav(nn.Module):
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
                     max_graphs=int(cfm_graph_cfg.get("max_graphs", 32)),
+                    cache_policy=str(cfm_graph_cfg.get("cache_policy", "flush")),
+                    optimized_io=bool(cfm_graph_cfg.get("optimized_io", False)),
+                    compile_estimator=bool(cfm_graph_cfg.get("compile_estimator", False)),
+                    compile_mode=str(cfm_graph_cfg.get("compile_mode", "blocks")),
+                    attention_backend=str(cfm_graph_cfg.get("attention_backend", "sdpa")),
+                    channels_last=bool(cfm_graph_cfg.get("channels_last", False)),
                 )
                 logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
             else:
@@ -348,11 +427,11 @@ class BatchedToken2Wav(nn.Module):
                 "CFM CUDA Graph bucketing enabled (bucket_frames=%d)",
                 self._cfm_graph_bucket_frames,
             )
+        # Device copies of the DiT timestep-embedding frequency table.
+        self._timestep_freqs: dict[tuple[Any, ...], torch.Tensor] = {}
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         self._setup_cache_size = setup_cache_size
-        self._setup_cache: OrderedDict[tuple[tuple[str, str], int, int], tuple[BatchedToken2WavState, ...]] = (
-            OrderedDict()
-        )
+        self._setup_cache: OrderedDict[tuple[tuple[str, str], int], BatchedToken2WavState] = OrderedDict()
 
     def _hift_inference(
         self,
@@ -493,6 +572,34 @@ class BatchedToken2Wav(nn.Module):
         att = x.new_empty((depth, batch_size, heads, old_att_len + chunk_size, att_width))
         return cnn, att
 
+    def _time_embedding(self, estimator: nn.Module, time: torch.Tensor) -> torch.Tensor:
+        """``estimator.t_embedder(time)`` without a host sync per call.
+
+        ``TimestepEmbedder.timestep_embedding`` rebuilds its frequency table on
+        the host and moves it with a pageable ``.to(t)``, which blocks the host
+        until the queued GPU work drains -- once per CFM step. The table only
+        depends on the width, dtype and device, so it is built the same way
+        once and kept on the device; the remaining ops are the embedder's own,
+        so the result is bitwise identical.
+        """
+        embedder = estimator.t_embedder
+        dim = getattr(embedder, "frequency_embedding_size", None)
+        scale = getattr(embedder, "scale", None)
+        mlp = getattr(embedder, "mlp", None)
+        if not isinstance(dim, int) or scale is None or mlp is None:
+            return embedder(time)
+        # The host table takes the default dtype before ``.to(t)``, as upstream.
+        key = (time.device, time.dtype, torch.get_default_dtype(), dim)
+        freqs = self._timestep_freqs.get(key)
+        if freqs is None:
+            freqs = _timestep_frequencies(dim).to(time)
+            self._timestep_freqs[key] = freqs
+        args = (time * scale)[:, None] * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return mlp(embedding)
+
     def _estimator_step(
         self,
         estimator: nn.Module,
@@ -507,6 +614,8 @@ class BatchedToken2Wav(nn.Module):
         attn_mask: torch.Tensor | None = None,
         valid_lengths: list[int] | None = None,
         valid_frames: int | None = None,
+        frame_keep: torch.Tensor | None = None,
+        borrow_graph_outputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
@@ -519,7 +628,7 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=att_cache,
             )
             return out.to(mu.dtype), new_cnn, new_att
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        time_embedding = self._time_embedding(estimator, time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         if valid_frames is not None and valid_frames < width:
@@ -529,6 +638,9 @@ class BatchedToken2Wav(nn.Module):
             # chunk-boundary attention/CNN caches padding-derived. Zero them.
             speaker_features = speaker_features.clone()
             _zero_padded_frames(speaker_features, valid_frames)
+        elif frame_keep is not None:
+            # Merged rows pad to their own valid width: zero per row.
+            speaker_features = torch.where(frame_keep, speaker_features, speaker_features.new_zeros(()))
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
@@ -550,6 +662,7 @@ class BatchedToken2Wav(nn.Module):
                 cnn_out,
                 att_out,
                 attn_mask,
+                **({"borrow_outputs": True} if borrow_graph_outputs else {}),
             )
         if valid_lengths is not None:
             if not hasattr(estimator, "in_proj"):
@@ -602,11 +715,7 @@ class BatchedToken2Wav(nn.Module):
         valid_lengths: list[int],
     ) -> torch.Tensor:
         """Run one padded DiT batch while capturing exact per-row CNN state."""
-        lengths = torch.tensor(
-            (*valid_lengths, *valid_lengths),
-            device=estimator_input.device,
-            dtype=torch.long,
-        )
+        lengths = index_to_device((*valid_lengths, *valid_lengths), estimator_input.device)
         x = estimator.in_proj(estimator_input.transpose(1, 2))
         for block_index, block in enumerate(estimator.blocks):
             (
@@ -674,16 +783,29 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
         valid_lengths: list[int] | None = None,
+        rows: MergedRows | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | list[torch.Tensor],
     ]:
+        """Run the CFM Euler loop for one batch.
+
+        ``rows`` describes a merged batch whose rows differ in valid mel frames
+        and estimator-cache length (see ``decode_merged_batch``): ``mu`` spans
+        the longest row and ``att_cache`` the longest cache, both zero-padded
+        at the end. Each row then gets exactly the inputs its own bucketed call
+        would get -- noise from its own cache offset, its own padding zeroed
+        and masked, its cache padding masked -- so its valid frames and the
+        cache layout it carries forward match that call.
+        """
         decoder = self.flow.decoder
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
         mel_frames = int(mu.shape[2])
+        if rows is not None and (valid_lengths is not None or len(rows.frames) != batch_size):
+            raise ValueError("merged rows need one layout entry per row and no ragged lengths")
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
             offset=offset,
@@ -691,10 +813,18 @@ class BatchedToken2Wav(nn.Module):
             bucket_frames=self._cfm_graph_bucket_frames,
             disabled=(
                 valid_lengths is not None
-                or self._cfm_graph_wrapper is None
-                # `_disable` keeps the wrapper object alive, so check the flag
-                # too: padding under a disabled wrapper is pure overhead.
-                or not self._cfm_graph_wrapper.enabled
+                # Merged rows were planned on this grid (``can_merge``); keep
+                # it even if the graph wrapper was disabled since.
+                or (
+                    rows is None
+                    and (
+                        self._cfm_graph_wrapper is None
+                        # `_disable` keeps the wrapper object alive, so check the
+                        # flag too: padding under a disabled wrapper is pure
+                        # overhead.
+                        or not self._cfm_graph_wrapper.enabled
+                    )
+                )
             ),
         )
         if pad_frames:
@@ -710,8 +840,24 @@ class BatchedToken2Wav(nn.Module):
                 f'{{"reason":"noise_capacity","required":{end},'
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
-        x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
-        if pad_frames:
+        masks = None
+        if rows is not None:
+            masks = _merged_row_masks(
+                rows,
+                width=int(mu.shape[2]),
+                cache_len=offset,
+                cnn_width=int(estimator.blocks[0].conv.block[1].causal_padding[0]),
+                device=mu.device,
+            )
+            # A row's noise starts at its own cache offset, as in its own call.
+            x = torch.cat(
+                [decoder.rand_noise[:, :, row_offset : row_offset + int(mu.shape[2])] for row_offset in rows.offsets],
+                dim=0,
+            )
+            x = torch.where(masks.keep, x, x.new_zeros(()))
+        else:
+            x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
+        if pad_frames and masks is None:
             # The padded columns would otherwise carry real noise values. They
             # are excluded from this chunk's attention by ``attn_mask`` below
             # and held at zero here, so the padded region stays inert. Masking
@@ -731,13 +877,12 @@ class BatchedToken2Wav(nn.Module):
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
         attn_mask = None
-        if valid_lengths is not None:
+        if masks is not None:
+            attn_mask = masks.attn_mask
+        elif valid_lengths is not None:
             if len(valid_lengths) != batch_size:
                 raise ValueError(f"valid length count {len(valid_lengths)} != batch {batch_size}")
-            cfg_lengths = torch.tensor(
-                (*valid_lengths, *valid_lengths),
-                device=mu.device,
-            )
+            cfg_lengths = index_to_device((*valid_lengths, *valid_lengths), mu.device)
             positions = torch.arange(int(mu.shape[2]), device=mu.device)
             valid_queries = positions.unsqueeze(0) < cfg_lengths.unsqueeze(1)
             current_keys = valid_queries.unsqueeze(1).expand(-1, int(mu.shape[2]), -1)
@@ -769,6 +914,16 @@ class BatchedToken2Wav(nn.Module):
             for step in range(self.n_timesteps):
                 old_cnn = cnn_cache[step] if cnn_cache is not None else None
                 old_att = att_cache[step] if att_cache is not None else None
+                # Only merged rows pass frame_keep: platform patches of
+                # _estimator_step predate it.
+                row_kwargs = {"frame_keep": masks.keep_cfg} if masks is not None else {}
+                borrow_graph_outputs = (
+                    valid_lengths is None
+                    and self._cfm_graph_wrapper is not None
+                    and getattr(self._cfm_graph_wrapper, "optimized_io", False)
+                )
+                if borrow_graph_outputs:
+                    row_kwargs["borrow_graph_outputs"] = True
                 estimate, step_cnn, step_att = self._estimator_step(
                     estimator,
                     x=torch.cat((x, x), dim=0),
@@ -780,18 +935,24 @@ class BatchedToken2Wav(nn.Module):
                     att_cache=old_att,
                     attn_mask=attn_mask,
                     valid_lengths=valid_lengths,
-                    valid_frames=mel_frames if pad_frames else None,
+                    valid_frames=mel_frames if pad_frames and masks is None else None,
+                    **row_kwargs,
                 )
-                if pad_frames:
+                if masks is not None:
+                    step_cnn.masked_fill_(masks.cnn_zero, 0.0)
+                elif pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
                 conditional, unconditional = estimate.split(batch_size, dim=0)
                 velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
                 x = x + dt * velocity
-                _zero_padded_frames(x, mel_frames if pad_frames else None)
+                if masks is not None:
+                    x = torch.where(masks.keep, x, x.new_zeros(()))
+                else:
+                    _zero_padded_frames(x, mel_frames if pad_frames else None)
                 time = time + dt
                 if step + 1 < self.n_timesteps:
                     dt = timeline[step + 2] - time[0]
-                next_cnn.append(step_cnn)
+                next_cnn.append(step_cnn.clone() if borrow_graph_outputs else step_cnn)
                 if valid_lengths is not None:
                     if ragged_att_cache is None:
                         ragged_att_cache = [
@@ -828,7 +989,9 @@ class BatchedToken2Wav(nn.Module):
                         dtype=self._estimator_att_cache_dtype,
                     )
                 next_att_cache[step].copy_(step_att)
-                if pad_frames:
+                if masks is not None:
+                    next_att_cache[step].masked_fill_(masks.att_zero, 0.0)
+                elif pad_frames:
                     # The padded steps ran but hold no valid content, and each
                     # cache entry becomes the next chunk's keys. Clear the
                     # padded columns so the boundary the next chunk reads is
@@ -941,7 +1104,16 @@ class BatchedToken2Wav(nn.Module):
         ]
 
     def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
-        """Reuse read-only prompt conditioning for the same shape and padding."""
+        """Reuse read-only prompt conditioning for the same prompt and padding.
+
+        Every row of a setup batch conditions on the same prompt, so the
+        initial state is built once for a single row and shared by every
+        request that starts from it, whatever the size of the batch it starts
+        in. Keying the cache by batch size instead rebuilt the prompt encoder
+        and the 10-step prompt CFM on every first chunk whose batch size
+        differed from the previous one. States are read-only: decoding stacks
+        them into new tensors.
+        """
         bucket_frames = (
             self._cfm_graph_bucket_frames
             if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
@@ -949,17 +1121,18 @@ class BatchedToken2Wav(nn.Module):
         )
         # Capture the policy before setup: graph capture may disable the wrapper
         # after padding has already been chosen for these initial states.
-        cache_key = (features.cache_key, batch_size, bucket_frames)
+        cache_key = (features.cache_key, bucket_frames)
         cached = self._setup_cache.get(cache_key)
         if cached is not None:
             self._setup_cache.move_to_end(cache_key)
-            return list(cached)
-        states = self._create_initial_states(features, batch_size)
-        if self._setup_cache_size > 0:
-            self._setup_cache[cache_key] = tuple(states)
-            while len(self._setup_cache) > self._setup_cache_size:
-                self._setup_cache.popitem(last=False)
-        return states
+            return [cached] * batch_size
+        if self._setup_cache_size <= 0:
+            return self._create_initial_states(features, batch_size)
+        (state,) = self._create_initial_states(features, 1)
+        self._setup_cache[cache_key] = state
+        while len(self._setup_cache) > self._setup_cache_size:
+            self._setup_cache.popitem(last=False)
+        return [state] * batch_size
 
     @staticmethod
     def _fade_in_out(
@@ -1305,3 +1478,222 @@ class BatchedToken2Wav(nn.Module):
                 )
 
         return self._require_complete_ragged_outputs(audios, next_states)
+
+    def _merge_bucket_frames(self) -> int:
+        """Frame grid the CFM call pads to, or 0 when bucketing is off."""
+        wrapper = self._cfm_graph_wrapper
+        if wrapper is None or not wrapper.enabled or self._cfm_graph_bucket_frames <= 1:
+            return 0
+        return self._cfm_graph_bucket_frames
+
+    def chunk_mel_frames(self, num_tokens: int, last_chunk: bool) -> int:
+        """Mel frames ``forward_chunk`` produces for ``num_tokens`` codec tokens.
+
+        A non-final chunk spends its pre-lookahead tokens as right context; the
+        final chunk is zero-padded by that width instead. The upsampling
+        encoder then doubles the frame rate.
+        """
+        lookahead = self._pre_lookahead_len() or 0
+        return max(0, num_tokens - (0 if last_chunk else lookahead)) * self._upsample_stride()
+
+    def can_merge(
+        self,
+        token_counts: list[int],
+        last_chunks: list[bool],
+        states: list[BatchedToken2WavState],
+    ) -> bool:
+        """Whether ``decode_merged_batch`` reproduces each row's own bucketed call.
+
+        Rows may sit at different chunk positions (estimator and encoder cache
+        lengths differ) and final chunks may be shorter. Every non-final row
+        must pad to the same CFM frame width it pads to on its own, so the
+        cache it carries forward keeps its own layout; a shorter final row is
+        free, since its caches end with the stream.
+        """
+        bucket = self._merge_bucket_frames()
+        if bucket <= 1 or self._trt_stepper is not None or len(states) < 2:
+            return False
+        if not (len(token_counts) == len(last_chunks) == len(states)):
+            return False
+        frames = [self.chunk_mel_frames(count, last) for count, last in zip(token_counts, last_chunks, strict=True)]
+        if min(frames) <= 0:
+            return False
+        widths = [frame + (bucket - frame % bucket) % bucket for frame in frames]
+        width = max(widths)
+        if any(not last and row_width != width for row_width, last in zip(widths, last_chunks, strict=True)):
+            return False
+        lookahead = self._pre_lookahead_len()
+        if lookahead is not None and any(
+            not last and count <= lookahead for count, last in zip(token_counts, last_chunks, strict=True)
+        ):
+            return False
+        estimator_caches = [state.flow_cache["estimator_att_cache"] for state in states]
+        if len({(tuple(cache.shape[:4]), int(cache.shape[5]), cache.dtype) for cache in estimator_caches}) != 1:
+            return False
+        if len({tuple(state.flow_cache["estimator_cnn_cache"].shape) for state in states}) != 1:
+            return False
+        longest_cache = max(int(cache.shape[4]) for cache in estimator_caches)
+        if longest_cache + width > int(self.flow.decoder.rand_noise.shape[2]):
+            return False
+        return all(
+            count <= self._max_encode_token_frames([state]) for count, state in zip(token_counts, states, strict=True)
+        )
+
+    def decode_merged_batch(
+        self,
+        tokens: list[torch.Tensor],
+        features: PromptFeatures,
+        states: list[BatchedToken2WavState],
+        *,
+        last_chunks: list[bool],
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState | None]]:
+        """Decode requests at different chunk positions through one CFM call.
+
+        Requests sharing a prompt are split by chunk position (their caches
+        differ in length) and by final-chunk length, and each split would run
+        its own 10-step CFM -- a call whose cost is mostly fixed, so a step
+        with first, second, steady and final chunks paid it several times.
+        Here the encoder still runs per cache shape, but the CFM runs once:
+        every row keeps its own noise offset, frame padding and cache, the
+        padding that aligns rows is masked (``MergedRows``), and each row's
+        cache is cut back to its own length afterwards. ``can_merge`` must
+        hold. The next state of a final chunk is ``None``: its stream ends.
+        """
+        batch_size = len(tokens)
+        if not (batch_size == len(states) == len(last_chunks)) or batch_size == 0:
+            raise ValueError("merged token, state, and final-flag batches must have the same non-zero size")
+        logger.info_once("MiniCPM-o Code2Wav decodes mixed chunk positions in merged CFM batches")
+        encoder_groups: dict[tuple[Any, ...], list[int]] = {}
+        for row, (row_tokens, state, last_chunk) in enumerate(zip(tokens, states, last_chunks, strict=True)):
+            key = (
+                tuple(state.flow_cache["conformer_cnn_cache"].shape),
+                tuple(state.flow_cache["conformer_att_cache"].shape),
+                int(row_tokens.numel()),
+                bool(last_chunk),
+            )
+            encoder_groups.setdefault(key, []).append(row)
+        hidden_rows: list[torch.Tensor | None] = [None] * batch_size
+        conformer_cnn_rows: list[torch.Tensor | None] = [None] * batch_size
+        conformer_att_rows: list[torch.Tensor | None] = [None] * batch_size
+        for (*_, last_chunk), rows in encoder_groups.items():
+            group_tokens = torch.stack([tokens[row].reshape(-1) for row in rows], dim=0)
+            with self._autocast(group_tokens.device):
+                hidden, conformer_cnn, conformer_att = self._encode_chunk(
+                    group_tokens,
+                    last_chunk=last_chunk,
+                    cnn_cache=torch.cat([states[row].flow_cache["conformer_cnn_cache"] for row in rows], dim=0),
+                    att_cache=torch.cat([states[row].flow_cache["conformer_att_cache"] for row in rows], dim=1),
+                )
+            for group_row, row in enumerate(rows):
+                hidden_rows[row] = hidden[group_row : group_row + 1]
+                conformer_cnn_rows[row] = conformer_cnn[group_row : group_row + 1]
+                conformer_att_rows[row] = conformer_att[:, group_row : group_row + 1]
+        resolved_hidden = cast(list[torch.Tensor], hidden_rows)
+        frames = [int(hidden.shape[1]) for hidden in resolved_hidden]
+        expected = [
+            self.chunk_mel_frames(int(row_tokens.numel()), last)
+            for row_tokens, last in zip(tokens, last_chunks, strict=True)
+        ]
+        if frames != expected:
+            raise RuntimeError(
+                "MiniCPMO45Code2WavBatchError "
+                f'{{"reason":"merged_frame_mismatch","frames":{frames},"expected":{expected}}}'
+            )
+        padded_hidden = resolved_hidden[0].new_zeros((batch_size, max(frames), int(resolved_hidden[0].shape[2])))
+        for row, hidden in enumerate(resolved_hidden):
+            padded_hidden[row, : frames[row]].copy_(hidden[0])
+
+        estimator_caches = [state.flow_cache["estimator_att_cache"] for state in states]
+        offsets = [int(cache.shape[4]) for cache in estimator_caches]
+        longest = max(offsets)
+        steps, depth, _, heads, _, head_width = estimator_caches[0].shape
+        stacked_att = estimator_caches[0].new_zeros((steps, depth, 2 * batch_size, heads, longest, head_width))
+        for row, cache in enumerate(estimator_caches):
+            stacked_att[:, :, row, :, : offsets[row]].copy_(cache[:, :, 0])
+            stacked_att[:, :, batch_size + row, :, : offsets[row]].copy_(cache[:, :, 1])
+        stacked_cnn = torch.cat(
+            [state.flow_cache["estimator_cnn_cache"][:, :, 0:1] for state in states]
+            + [state.flow_cache["estimator_cnn_cache"][:, :, 1:2] for state in states],
+            dim=2,
+        )
+        speakers = features.speaker_embedding.expand(batch_size, -1)
+        with self._autocast(padded_hidden.device):
+            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
+            cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()
+            chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
+                padded_hidden.transpose(1, 2).contiguous(),
+                projected_speakers,
+                cond,
+                cnn_cache=stacked_cnn,
+                att_cache=stacked_att,
+                rows=MergedRows(frames=tuple(frames), offsets=tuple(offsets)),
+            )
+        assert isinstance(estimator_att, torch.Tensor)
+        width = int(estimator_att.shape[4]) - longest
+        prompt_len = int(features.mels.shape[1])
+        new_flow: list[dict[str, torch.Tensor] | None] = [None] * batch_size
+        for row, last_chunk in enumerate(last_chunks):
+            if last_chunk:
+                continue
+            valid = width + offsets[row]
+            row_att = torch.cat(
+                (
+                    estimator_att[:, :, row : row + 1, :, :valid],
+                    estimator_att[:, :, batch_size + row : batch_size + row + 1, :, :valid],
+                ),
+                dim=2,
+            )
+            if row_att.shape[4] > prompt_len + 100:
+                row_att = torch.cat((row_att[..., :prompt_len, :], row_att[..., -100:, :]), dim=4)
+            conformer_att = cast(torch.Tensor, conformer_att_rows[row])
+            if conformer_att.shape[3] > prompt_len + 100:
+                conformer_att = torch.cat((conformer_att[..., :prompt_len, :], conformer_att[..., -100:, :]), dim=3)
+            new_flow[row] = {
+                "conformer_cnn_cache": cast(torch.Tensor, conformer_cnn_rows[row]).detach().clone(),
+                "conformer_att_cache": conformer_att.detach().clone(),
+                "estimator_cnn_cache": torch.cat(
+                    (
+                        estimator_cnn[:, :, row : row + 1],
+                        estimator_cnn[:, :, batch_size + row : batch_size + row + 1],
+                    ),
+                    dim=2,
+                ).detach(),
+                "estimator_att_cache": row_att.detach(),
+            }
+
+        audios: list[torch.Tensor | None] = [None] * batch_size
+        next_states: list[BatchedToken2WavState | None] = [None] * batch_size
+        vocoder_groups: dict[tuple[Any, ...], list[int]] = {}
+        for row, (state, last_chunk) in enumerate(zip(states, last_chunks, strict=True)):
+            key = (frames[row], last_chunk, *(tuple(value.shape) for value in state.hift_cache.values()))
+            vocoder_groups.setdefault(key, []).append(row)
+        for (row_frames, last_chunk, *_), rows in vocoder_groups.items():
+            old_mel = torch.cat([states[row].hift_cache["mel"] for row in rows], dim=0)
+            old_source = torch.cat([states[row].hift_cache["source"] for row in rows], dim=0)
+            old_speech = torch.cat([states[row].hift_cache["speech"] for row in rows], dim=0)
+            group_mel = torch.cat([chunk_mel[row : row + 1, :, :row_frames] for row in rows], dim=0)
+            mel = torch.cat((old_mel, group_mel), dim=2)
+            speech, source = self._hift_inference(mel, old_source)
+            if old_speech.shape[-1] > 0:
+                window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
+                speech = self._fade_in_out(speech, old_speech, window)
+            next_hift = {
+                "mel": mel[..., -self.mel_cache_len :].detach(),
+                "source": source[..., -self.source_cache_len :].detach(),
+                "speech": speech[..., -self.source_cache_len :].detach(),
+            }
+            emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
+            for group_row, row in enumerate(rows):
+                audios[row] = emitted[group_row].reshape(-1).to(dtype=torch.float32)
+                row_flow = new_flow[row]
+                if row_flow is not None:
+                    next_states[row] = BatchedToken2WavState(
+                        flow_cache=row_flow,
+                        hift_cache={
+                            name: value[group_row : group_row + 1].detach().clone() for name, value in next_hift.items()
+                        },
+                    )
+        missing = [row for row, audio in enumerate(audios) if audio is None]
+        if missing:
+            raise RuntimeError(f'MiniCPMO45Code2WavBatchError {{"reason":"incomplete_merged_output","rows":{missing}}}')
+        return cast(list[torch.Tensor], audios), next_states

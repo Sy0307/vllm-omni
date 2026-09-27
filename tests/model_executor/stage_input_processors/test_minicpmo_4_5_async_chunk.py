@@ -113,6 +113,42 @@ def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
     assert steady.meta.chunk_seq == 1
 
 
+def test_initial_turn_chunk_then_steady_and_final_preserve_every_code() -> None:
+    manager = _manager()
+    manager.connector.config["extra"]["initial_codec_chunk_frames"] = 13
+    request = _request("req")
+    assert tts2code2wav_async_chunk(manager, _delta(*range(12)), request, False) is None
+    first = tts2code2wav_async_chunk(manager, _delta(12), request, False)
+    assert _codes(first) == [4218, 4218, 4218, *range(13)]
+    assert first.meta.codec_chunk_frames == 13
+    assert tts2code2wav_async_chunk(manager, _delta(*range(13, 37)), request, False) is None
+    steady = tts2code2wav_async_chunk(manager, _delta(37), request, False)
+    assert _codes(steady) == [10, 11, 12, *range(13, 38)]
+    assert steady.meta.chunk_seq == 1
+    final = tts2code2wav_async_chunk(manager, _delta(38, 39), request, True)
+    assert _codes(final) == [35, 36, 37, 38, 39]
+    assert final.meta.last_chunk
+    assert final.meta.chunk_seq == 2
+    assert tts2code2wav_async_chunk(manager, None, request, True) is None
+
+
+def test_initial_turn_chunk_option_keeps_duplex_threshold() -> None:
+    manager = _manager()
+    manager.connector.config["extra"]["initial_codec_chunk_frames"] = 13
+    request = _request("req")
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(13)), request, False) is None
+    payload = tts2code2wav_async_chunk(manager, _duplex_delta(*range(13, 25)), request, False)
+    assert payload.meta.codec_chunk_frames == 25
+
+
+@pytest.mark.parametrize("initial", [-1, 1, 4, 26])
+def test_invalid_initial_codec_chunk_rejected(initial) -> None:
+    manager = _manager()
+    manager.connector.config["extra"]["initial_codec_chunk_frames"] = initial
+    with pytest.raises(ValueError, match="initial_codec_chunk_frames"):
+        tts2code2wav_async_chunk(manager, _delta(1), _request("req"), False)
+
+
 def test_exact_boundary_final_flushes_held_lookahead() -> None:
     manager = _manager()
     request = _request("req")

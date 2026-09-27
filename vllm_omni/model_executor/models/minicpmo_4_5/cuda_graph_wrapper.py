@@ -15,6 +15,7 @@ class HiFTGraphWrapper:
         self.graph_fn = token2wav.hift._inference_pre_istft
         self.finalize_fn = token2wav.hift._finalize_decode
         self.codec_chunk_frames = connector_config["codec_chunk_frames"]
+        self.initial_codec_chunk_frames = int(connector_config.get("initial_codec_chunk_frames", 0))
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
         lookahead_layer = getattr(token2wav.flow.encoder, "pre_lookahead_layer", None)
         pre_lookahead_len = getattr(lookahead_layer, "pre_lookahead_len", None)
@@ -34,7 +35,9 @@ class HiFTGraphWrapper:
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
-        self.max_lazy_graphs = 8
+        self.max_lazy_graphs = int(connector_config.get("hift_max_lazy_graphs", 8))
+        if self.max_lazy_graphs < 0:
+            raise ValueError("MiniCPM-o hift_max_lazy_graphs must be >= 0")
         self.lazy_graph_count = 0
 
     def derive_capture_bucket_size(self):
@@ -42,10 +45,17 @@ class HiFTGraphWrapper:
             self.codec_chunk_frames + self.codec_left_context_frames - self.pre_lookahead_len
         ) * self.flow_upsample_rate
 
-        return [chunk_mel_frames, chunk_mel_frames + self.mel_cache_len], [
-            0,
-            self.source_cache_len,
-        ]
+        frames = [chunk_mel_frames, chunk_mel_frames + self.mel_cache_len]
+        cache_lengths = [0, self.source_cache_len]
+        if self.initial_codec_chunk_frames and self.initial_codec_chunk_frames != self.codec_chunk_frames:
+            first_frames = (
+                self.initial_codec_chunk_frames + self.codec_left_context_frames - self.pre_lookahead_len
+            ) * self.flow_upsample_rate
+            if first_frames <= self.mel_cache_len:
+                raise ValueError("MiniCPM-o initial codec chunk must emit audio beyond the HiFT mel cache")
+            frames.append(first_frames)
+            cache_lengths.append(0)
+        return frames, cache_lengths
 
     def capture(self):
         for batch_size in self.capture_batch_sizes:
@@ -204,19 +214,44 @@ class CFMGraphWrapper:
     streaming cache corruption.
     """
 
+    cache_policy: str = "flush"
+    optimized_io: bool = False
+    _compiled_graph_fn = None
+    _graph_pool = None
+
     def __init__(
         self,
         graph_fn,
         *,
         max_graphs: int = 32,
+        cache_policy: str = "flush",
+        optimized_io: bool = False,
+        compile_estimator: bool = False,
+        compile_mode: str = "blocks",
+        attention_backend: str = "sdpa",
+        channels_last: bool = False,
     ) -> None:
         self.graph_fn = graph_fn
         self.max_graphs = int(max_graphs)
+        if cache_policy not in ("flush", "retain"):
+            raise ValueError("CFM graph cache_policy must be 'flush' or 'retain'")
+        self.cache_policy = cache_policy
+        self.optimized_io = optimized_io
         self.device = next(graph_fn.__self__.parameters()).device
         # A non-positive budget means "no graphs", the same as
         # `enable_cfm_graph: false`. Clamping to 1 would instead build a
         # one-entry cache that flushes on every new shape.
         self.enabled = self.max_graphs > 0
+        if compile_mode not in ("full", "blocks"):
+            raise ValueError("CFM compile_mode must be 'full' or 'blocks'")
+        if attention_backend not in ("sdpa", "tiled_fp32"):
+            raise ValueError("CFM attention_backend must be 'sdpa' or 'tiled_fp32'")
+        if (attention_backend != "sdpa" or channels_last) and (not compile_estimator or compile_mode != "blocks"):
+            raise ValueError("CFM optimized attention/convolution requires block compilation")
+        if compile_estimator and self.enabled and self.device.type == "cuda":
+            # CUDA graphs remain owned here; nested Inductor graph pools have
+            # incompatible lifetimes with shape-cache retirement.
+            self._compiled_graph_fn = self._compile_graph_fn(graph_fn, compile_mode, attention_backend, channels_last)
         self._cache: dict[tuple, tuple] = {}
         # Shapes whose key cannot round-trip: eager for those, keep the rest.
         self._unsupported: set[tuple] = set()
@@ -228,17 +263,85 @@ class CFMGraphWrapper:
             "eager": 0,
         }
 
+    @staticmethod
+    def _compile_graph_fn(graph_fn, mode, attention_backend="sdpa", channels_last=False):
+        def compile_function(function):
+            return torch.compile(
+                function,
+                dynamic=True,
+                fullgraph=True,
+                options={"epilogue_fusion": False, "triton.cudagraphs": False},
+            )
+
+        if mode == "full":
+            return compile_function(graph_fn)
+        estimator = graph_fn.__self__
+        if attention_backend == "tiled_fp32" or channels_last:
+            from functools import partial
+
+            from .cfm_attention import block_forward_optimized
+
+            if next(estimator.parameters()).dtype != torch.float32:
+                raise ValueError("CFM optimized attention/convolution requires float32 estimator weights")
+            blocks = []
+            for block in estimator.blocks:
+                weights = None
+                if channels_last:
+                    layers = (block.conv.block[1], block.conv.block[6])
+                    if any(
+                        layer.kernel_size != (3,)
+                        or layer.stride != (1,)
+                        or layer.dilation != (1,)
+                        or layer.groups != 1
+                        or layer.padding != (0,)
+                        for layer in layers
+                    ):
+                        raise ValueError("CFM channels_last requires the native 3-tap causal convolutions")
+                    # Inference-only wrapper is constructed after weight loading.
+                    # Do not replace module methods or mutate checkpoint weights.
+                    weights = tuple(
+                        layer.weight.detach().unsqueeze(2).contiguous(memory_format=torch.channels_last)
+                        for layer in layers
+                    )
+                blocks.append(
+                    compile_function(
+                        partial(
+                            block_forward_optimized, block, attention_backend=attention_backend, conv_weights=weights
+                        )
+                    )
+                )
+        else:
+            blocks = [compile_function(block.forward_chunk) for block in estimator.blocks]
+        final_layer = compile_function(estimator.final_layer)
+
+        def blocks_forward(x, time, mask, cnn_cache, att_cache, cnn_out, att_out):
+            # Keep cache writes outside the compiled blocks. Whole-estimator
+            # compilation functionalizes these writes into a large, expensive
+            # cat/copy kernel. The outer CUDA graph still records every launch.
+            x = estimator.in_proj(x.transpose(1, 2))
+            for index, block in enumerate(blocks):
+                x, cnn, att = block(x, time, cnn_cache[index], att_cache[index], mask)
+                cnn_out[index].copy_(cnn)
+                att_out[index, :, :, : att.shape[2], :].copy_(att)
+            return final_layer(x, time).transpose(1, 2)
+
+        # Original modules stay intact for eager fallback and other callers.
+        return blocks_forward
+
     def stats_snapshot(self) -> dict[str, int]:
         """Bounded cumulative telemetry for the graph cache."""
         return {**self._stats, "cache_size": len(self._cache)}
 
     def _call_graph_fn(self, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        return self.graph_fn(args[0], args[1], args[6], args[2], args[3], args[4], args[5])
+        function = self._compiled_graph_fn or self.graph_fn
+        return function(args[0], args[1], args[6], args[2], args[3], args[4], args[5])
 
     def _eager(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self._stats["eager"] += 1
         with torch.no_grad():
-            result = self._call_graph_fn(inputs)
+            # Unknown shapes beyond a retained cache must not trigger another
+            # compile; this is also the fallback after compilation failure.
+            result = self.graph_fn(inputs[0], inputs[1], inputs[6], inputs[2], inputs[3], inputs[4], inputs[5])
         return result, inputs[4], inputs[5]
 
     def _flush(self) -> None:
@@ -255,6 +358,7 @@ class CFMGraphWrapper:
         for entry in self._cache.values():
             entry[2].reset()
         self._cache.clear()
+        self._graph_pool = None
         self._stats["flushes"] += 1
         logger.info("CFM graph cache flushed; stats=%s", self.stats_snapshot())
 
@@ -300,7 +404,15 @@ class CFMGraphWrapper:
             del warmup_output
 
             graph = CUDAGraph()
-            with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            if self._compiled_graph_fn is not None:
+                # Allocate after compiler warmup, which can clear allocator
+                # state. This wrapper owns and retires the entire pool.
+                if self._graph_pool is None:
+                    self._graph_pool = torch.cuda.graph_pool_handle()
+                pool = self._graph_pool
+            else:
+                pool = current_platform.get_global_graph_pool()
+            with torch.no_grad(), torch.cuda.graph(graph, pool=pool):
                 static_output = self._call_graph_fn(static_inputs)
         except Exception:
             # A failed capture can leave the capture stream current and the
@@ -329,6 +441,8 @@ class CFMGraphWrapper:
         cnn_out: torch.Tensor,
         att_out: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        *,
+        borrow_outputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out, attn_mask)
         self._stats["calls"] += 1
@@ -343,6 +457,9 @@ class CFMGraphWrapper:
 
         if entry is None:
             if len(self._cache) >= self.max_graphs:
+                if self.cache_policy == "retain":
+                    # Preserve the live graph pool; a cold shape runs eagerly.
+                    return self._eager(inputs)
                 self._flush()
             entry = self._capture(key, inputs)
             if entry is None:
@@ -352,10 +469,18 @@ class CFMGraphWrapper:
             self._stats["hits"] += 1
 
         static_inputs, static_output, graph = entry
-        for static, current in zip(static_inputs, inputs, strict=True):
+        for index, (static, current) in enumerate(zip(static_inputs, inputs, strict=True)):
+            if self.optimized_io and index in (4, 5):
+                # The estimator fully overwrites these output buffers. Copying
+                # their uninitialized caller values wastes memory bandwidth.
+                continue
             if static is not None:
                 static.copy_(current)
         graph.replay()
+        if self.optimized_io and borrow_outputs:
+            # Valid only until the next replay. The Euler loop consumes the
+            # estimate and copies each step's cache before invoking us again.
+            return static_output, static_inputs[4], static_inputs[5]
         return (
             static_output.detach().clone(),
             static_inputs[4].detach().clone(),

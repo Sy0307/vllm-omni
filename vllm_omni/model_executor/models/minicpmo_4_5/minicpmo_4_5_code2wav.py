@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import soundfile as sf
 import torch
@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .batched_token2wav import (
     BatchedToken2Wav,
@@ -146,10 +147,12 @@ def _normalize_reference(
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
+    # Codec ids arrive from the connector as host data. A pageable host copy
+    # would block the host once per request per step; stage them pinned.
     if isinstance(value, torch.Tensor):
-        return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
+        return to_device_nonblocking(value.reshape(-1).to(dtype=torch.long), fallback.device)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return torch.as_tensor(value, device=fallback.device, dtype=torch.long).reshape(-1)
+        return to_device_nonblocking(torch.as_tensor(value, dtype=torch.long).reshape(-1), fallback.device)
     return fallback.reshape(-1).to(dtype=torch.long)
 
 
@@ -262,7 +265,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav setup cache capacity must be >= 0")
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
+            "initial_codec_chunk_frames": int(extra.get("initial_codec_chunk_frames", 0)),
             "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
+            "hift_max_lazy_graphs": int(extra.get("hift_max_lazy_graphs", 8)),
         }
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
@@ -276,6 +281,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
+            "cache_policy": str(extra.get("cfm_graph_cache_policy", "flush")),
+            "optimized_io": bool(extra.get("cfm_graph_optimized_io", False)),
+            "compile_estimator": bool(extra.get("cfm_compile_estimator", False)),
+            "compile_mode": str(extra.get("cfm_compile_mode", "blocks")),
+            "attention_backend": str(extra.get("cfm_attention_backend", "sdpa")),
+            "channels_last": bool(extra.get("cfm_channels_last", False)),
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:
@@ -701,6 +712,85 @@ class MiniCPMO45Code2Wav(nn.Module):
             if steady:
                 yield steady
 
+    def _iter_decode_groups(
+        self,
+        buckets: Mapping[tuple[Any, ...], list[_WorkItem]],
+    ) -> Iterable[list[_WorkItem]]:
+        """Decode batches: exact-shape buckets, joined per prompt when they can merge.
+
+        Buckets split one prompt's requests by chunk position, and each bucket
+        costs a full CFM call. Buckets of one prompt and epoch are offered to
+        ``_decode_bucket`` together; it merges them when the backend can, and
+        otherwise decodes them bucket by bucket as before. The initial-wave
+        batching policy keeps its own bucket-by-bucket order.
+        """
+        if self._initial_batch_size:
+            yield from self._iter_decode_batches(buckets.values())
+            return
+        groups: dict[tuple[Any, ...], list[_WorkItem]] = {}
+        for key, bucket in buckets.items():
+            prompt_cache_id, prompt_wav, _, cache_epoch = key
+            groups.setdefault((prompt_cache_id, prompt_wav, cache_epoch), []).extend(bucket)
+        yield from groups.values()
+
+    def _decode_bucket(
+        self,
+        items: list[_WorkItem],
+        features: Any,
+    ) -> tuple[list[torch.Tensor], list[Any]]:
+        assert self.backend is not None
+        fresh = [item for item in items if item.previous is None]
+        setup = iter(self.backend.setup_batch(features, len(fresh)) if fresh else [])
+        states = [item.previous.token2wav if item.previous is not None else next(setup) for item in items]
+        last_chunks = [item.last_chunk for item in items]
+        uniform = (
+            len(
+                {
+                    (state_shape_signature(state), int(item.tokens.numel()), item.last_chunk)
+                    for item, state in zip(items, states, strict=True)
+                }
+            )
+            == 1
+        )
+        if uniform:
+            tokens = torch.stack([item.tokens for item in items], dim=0)
+            return self.backend.decode_batch(tokens, features, states, last_chunk=items[0].last_chunk)
+        token_counts = [int(item.tokens.numel()) for item in items]
+        # Full-duplex streams keep their ragged-kernel batching.
+        turn_mode = all(item.duplex_epoch < 0 for item in items)
+        if turn_mode and self.backend.can_merge(token_counts, last_chunks, states):
+            return self.backend.decode_merged_batch(
+                [item.tokens for item in items],
+                features,
+                states,
+                last_chunks=last_chunks,
+            )
+        audios: list[torch.Tensor | None] = [None] * len(items)
+        next_states: list[Any] = [None] * len(items)
+        buckets: dict[tuple[Any, ...], list[int]] = {}
+        for index, state in enumerate(states):
+            buckets.setdefault(state_shape_signature(state), []).append(index)
+        for rows in buckets.values():
+            row_states = [states[row] for row in rows]
+            if len({(token_counts[row], last_chunks[row]) for row in rows}) > 1:
+                row_audios, row_next = self.backend.decode_ragged_batch(
+                    [items[row].tokens for row in rows],
+                    features,
+                    row_states,
+                    last_chunks=[last_chunks[row] for row in rows],
+                )
+            else:
+                row_audios, row_next = self.backend.decode_batch(
+                    torch.stack([items[row].tokens for row in rows], dim=0),
+                    features,
+                    row_states,
+                    last_chunk=last_chunks[rows[0]],
+                )
+            for row, audio, next_state in zip(rows, row_audios, row_next, strict=True):
+                audios[row] = audio
+                next_states[row] = next_state
+        return cast(list[torch.Tensor], audios), next_states
+
     @torch.inference_mode()
     def forward(
         self,
@@ -871,34 +961,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
                 )
-        for bucket in self._iter_decode_batches(buckets.values()):
+        for bucket in self._iter_decode_groups(buckets):
             batch_size = len(bucket)
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
-                else:
-                    states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                token_lengths = {int(item.tokens.numel()) for item in bucket}
-                last_chunk_values = {item.last_chunk for item in bucket}
-                if len(token_lengths) > 1 or len(last_chunk_values) > 1:
-                    audios, next_states = self.backend.decode_ragged_batch(
-                        [item.tokens for item in bucket],
-                        features,
-                        states,
-                        last_chunks=[item.last_chunk for item in bucket],
-                    )
-                else:
-                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                    audios, next_states = self.backend.decode_batch(
-                        tokens,
-                        features,
-                        states,
-                        last_chunk=bucket[0].last_chunk,
-                    )
+                audios, next_states = self._decode_bucket(bucket, features)
             except Exception as exc:
                 self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -1006,6 +1076,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         use_float16 = bool(extra.get("token2wav_float16", False))
+        if bool(extra.get("token2wav_allow_tf32", False)) and current_omni_platform.is_cuda():
+            # The flow DiT runs its GEMMs in fp32 (FFMA). TF32 tensor cores cut
+            # the vocoder's GPU time ~25% (batch 1-8) and move its output mel
+            # by ~3e-4 relative L2 -- a numerics change, so opt-in. Stage 2's
+            # process holds only this vocoder, and its CUDA graphs are captured
+            # after this point, so the setting covers them too.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            logger.info("MiniCPM-o Code2Wav: TF32 matmuls enabled for the vocoder")
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.

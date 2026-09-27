@@ -213,17 +213,45 @@ def test_setup_cache_reuses_read_only_state_for_the_same_exact_batch():
         torch.testing.assert_close(cache[name], expected)
 
 
-def test_setup_cache_keys_batch_size_and_evicts_least_recent_entry():
+def test_setup_cache_shares_one_row_across_batch_sizes():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav, setup_cache_size=1)
     prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
 
-    adapter.setup_batch(prompt, 1)
-    adapter.setup_batch(prompt, 2)
-    adapter.setup_batch(prompt, 1)
+    single = adapter.setup_batch(prompt, 1)
+    pair = adapter.setup_batch(prompt, 2)
+    again = adapter.setup_batch(prompt, 1)
 
-    assert token2wav.flow.encoder.calls == [1, 2, 1]
-    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
+    # One single-row setup serves every batch size that starts from the prompt.
+    assert token2wav.flow.encoder.calls == [1]
+    assert pair == [single[0], single[0]] and again == single
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 0)]
+
+
+def test_setup_cache_evicts_least_recent_prompt():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=1)
+    first = adapter.prepare_prompt("first", "/fake/first.wav")
+    second = adapter.prepare_prompt("second", "/fake/second.wav")
+
+    adapter.setup_batch(first, 2)
+    adapter.setup_batch(second, 3)
+    adapter.setup_batch(first, 1)
+
+    assert token2wav.flow.encoder.calls == [1, 1, 1]
+    assert list(adapter._setup_cache) == [(first.cache_key, 0)]
+
+
+def test_setup_without_cache_builds_the_whole_batch():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=0)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    states = adapter.setup_batch(prompt, 3)
+
+    assert token2wav.flow.encoder.calls == [3]
+    assert len({id(state) for state in states}) == 3
+    assert not adapter._setup_cache
 
 
 def test_evict_prompt_clears_features_and_setup_state():
@@ -481,9 +509,12 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     )
 
     assert token2wav.prompt_calls == 1
-    assert token2wav.flow.encoder.calls == [2, 2]
-    assert token2wav.flow.decoder.estimator.cfg_batches == [4, 4, 4, 4]
-    assert all(order == [1.0, 1.0, 0.0, 0.0] for order in token2wav.flow.decoder.estimator.speaker_order)
+    # Setup conditions one shared row; the decode runs both requests together.
+    assert token2wav.flow.encoder.calls == [1, 2]
+    assert token2wav.flow.decoder.estimator.cfg_batches == [2, 2, 4, 4]
+    speaker_order = token2wav.flow.decoder.estimator.speaker_order
+    assert all(order == [1.0, 0.0] for order in speaker_order[:2])
+    assert all(order == [1.0, 1.0, 0.0, 0.0] for order in speaker_order[2:])
     assert token2wav.hift.calls == [2]
     assert len(audios) == 2
     cache0 = states[0].flow_cache["estimator_cnn_cache"]
@@ -970,9 +1001,8 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     states = adapter.setup_batch(prompt, 2)
 
     assert all(state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16 for state in states)
-    assert (
-        states[0].flow_cache["estimator_att_cache"].data_ptr() != states[1].flow_cache["estimator_att_cache"].data_ptr()
-    )
+    # Setup rows are one shared read-only state; decoding stacks them anew.
+    assert states[0] is states[1]
 
     stacked = adapter._stack_flow_cache(states)
     assert stacked["estimator_att_cache"].dtype == torch.bfloat16
@@ -991,6 +1021,10 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
         last_chunk=False,
     )
     assert all(state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16 for state in next_states)
+    assert (
+        next_states[0].flow_cache["estimator_att_cache"].data_ptr()
+        != next_states[1].flow_cache["estimator_att_cache"].data_ptr()
+    )
     assert token2wav.flow.decoder.estimator.attention_cache_dtypes[-2:] == [torch.float32, torch.float32]
 
 
@@ -1117,7 +1151,7 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
     assert "duplex" in model._states
 
 
-@pytest.mark.parametrize("setup_cache_size,expected_calls", [(0, [2, 2, 1]), (1, [2, 1])])
+@pytest.mark.parametrize("setup_cache_size,expected_calls", [(0, [2, 2, 1]), (1, [1])])
 def test_initial_empty_segment_markers_respect_initial_batch_limit(setup_cache_size, expected_calls):
     model, token2wav = _model(initial=2, setup_cache_size=setup_cache_size)
     names = ["a", "b", "c", "d", "e"]
@@ -1631,8 +1665,8 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
     assert unpadded[0] is not padded[0]
     assert reused[0] is unpadded[0]
     assert adapter.flow.encoder.calls == [1, 1]
-    assert padded_keys == [(prompt.cache_key, 1, 16)]
-    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
+    assert padded_keys == [(prompt.cache_key, 16)]
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 0)]
 
 
 def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():

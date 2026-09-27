@@ -96,6 +96,68 @@ class _FakeGraph:
         return None
 
 
+def _hift_config_fixture():
+    hift = SimpleNamespace(
+        inference=None,
+        _inference_pre_istft=None,
+        _finalize_decode=None,
+        conv_pre=SimpleNamespace(in_channels=80),
+        parameters=lambda: iter([torch.empty(1)]),
+    )
+    return SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(encoder=SimpleNamespace(), token_mel_ratio=2),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+
+
+@pytest.mark.parametrize("budget", [0, 8, 64])
+def test_hift_lazy_graph_budget_is_configurable(budget):
+    wrapper = HiFTGraphWrapper(
+        _hift_config_fixture(),
+        {"codec_chunk_frames": 25, "codec_left_context_frames": 3, "hift_max_lazy_graphs": budget},
+        [1],
+    )
+    assert wrapper.max_lazy_graphs == budget
+    assert wrapper.lazy_graph_count == 0
+
+
+def test_hift_lazy_graph_budget_rejects_negative():
+    with pytest.raises(ValueError, match="hift_max_lazy_graphs"):
+        HiFTGraphWrapper(
+            _hift_config_fixture(),
+            {"codec_chunk_frames": 25, "codec_left_context_frames": 3, "hift_max_lazy_graphs": -1},
+            [1],
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hift_initial_turn_shape_is_captured_before_first_request():
+    hift = _small_hift()
+    token2wav = SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(encoder=SimpleNamespace(), token_mel_ratio=2),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+    wrapper = HiFTGraphWrapper(
+        token2wav,
+        {"codec_chunk_frames": 25, "codec_left_context_frames": 3, "initial_codec_chunk_frames": 13},
+        [1],
+    )
+    with torch.inference_mode():
+        wrapper.capture()
+        mel = torch.randn(1, 80, 26, device="cuda")
+        cache = torch.empty(1, 1, 0, device="cuda")
+        actual = wrapper.replay(mel, cache)
+        expected = hift.inference(mel, cache)
+        for a, e in zip(actual, expected, strict=True):
+            torch.testing.assert_close(a, e, rtol=1e-4, atol=1e-5)
+        assert (1, 26, 0) in wrapper.graph
+        assert wrapper.lazy_graph_count == 0
+
+
 def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
@@ -197,6 +259,10 @@ class _MiniDiT(nn.Module):
             cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
             dt = x.shape[1]
             att_cache_buffer[b_idx][:, :, :dt, :] = x.unsqueeze(1)
+            if att_b is not None:
+                # Real DiT outputs concatenate current keys with the complete
+                # old cache; every output element must be initialized.
+                att_cache_buffer[b_idx][:, :, dt:, :] = att_b
         x = self.final_layer(x)
         x = x.transpose(1, 2)
         return x
@@ -214,6 +280,123 @@ def _cfm_inputs(
     cnn_out = torch.empty(depth, batch_size, hidden, 2, device=device)
     att_out = torch.empty(depth, batch_size, 1, old_att_len + chunk_size, hidden, device=device)
     return estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_retained_graph_survives_cold_shapes_and_preserves_owned_outputs(monkeypatch):
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(
+        graph_fn=estimator.blocks_forward_chunk, max_graphs=1, cache_policy="retain", optimized_io=True
+    )
+    with torch.inference_mode():
+        inputs = _cfm_inputs(2, 10, 5)
+        owned = wrapper.replay(*inputs)
+        saved = tuple(t.clone() for t in owned)
+        cold = _cfm_inputs(2, 12, 5)
+        wrapper.replay(*cold)
+        # Poison caller output buffers: optimized replay must not read them.
+        inputs[4].fill_(torch.nan)
+        inputs[5].fill_(torch.nan)
+        borrowed = wrapper.replay(*inputs, borrow_outputs=True)
+        for actual, expected in zip(borrowed, saved, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual, expected in zip(owned, saved, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert wrapper._stats["captures"] == 1
+        assert wrapper._stats["flushes"] == 0
+        assert wrapper._stats["eager"] == 1
+        # Borrowed results must be consumed before the next replay.
+        inputs[0].add_(1)
+        wrapper.replay(*inputs, borrow_outputs=True)
+        for actual, expected in zip(owned, saved, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compiled_cfm_cache_replay_and_retirement():
+    torch.manual_seed(18)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(
+        estimator.blocks_forward_chunk, max_graphs=2, optimized_io=True, compile_estimator=True, compile_mode="full"
+    )
+    with torch.inference_mode():
+        for batch, frames, cached in [(2, 10, 0), (4, 12, 5), (2, 10, 0), (2, 14, 5), (4, 12, 5)]:
+            inputs = _cfm_inputs(batch, frames, cached)
+            wrapper.replay(*inputs)
+            inputs[0].add_(0.01)
+            expected = tuple(t.clone() for t in wrapper._eager((*inputs, None)))
+            actual = wrapper.replay(*inputs, borrow_outputs=True)
+            for a, e in zip(actual, expected, strict=True):
+                torch.testing.assert_close(a, e, rtol=2e-4, atol=2e-5)
+            assert wrapper.enabled
+        assert wrapper._stats["flushes"] == 1
+        assert wrapper._stats["captures"] == 4
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("attention_backend", ["sdpa", "tiled_fp32"])
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_block_compiled_real_dit_preserves_masks_caches_and_original_methods(attention_backend, channels_last):
+    DiT = pytest.importorskip("cosyvoice2.flow.decoder_dit").DiT
+    torch.manual_seed(23)
+    estimator = DiT(in_channels=8, out_channels=8, depth=2, hidden_size=32, num_heads=2, head_dim=16)
+    # The checkpoint loader replaces this library's zero-initialized gates.
+    with torch.no_grad():
+        for parameter in estimator.parameters():
+            parameter.uniform_(-0.1, 0.1)
+    estimator = estimator.eval().cuda()
+    original = estimator.blocks[0].forward_chunk.__func__
+    wrapper = CFMGraphWrapper(
+        estimator.blocks_forward_chunk,
+        max_graphs=2,
+        compile_estimator=True,
+        optimized_io=True,
+        attention_backend=attention_backend,
+        channels_last=channels_last,
+    )
+    # Compare the compiled graph's mathematical/cache contract in IEEE mode.
+    # TF32 layout-dependent rounding has a separate convolution error test.
+    with torch.inference_mode(), torch.backends.cudnn.flags(allow_tf32=False):
+        for batch, frames, cached in [(2, 16, 0), (4, 32, 16), (2, 16, 16)]:
+            inputs = (
+                torch.randn(batch, 8, frames, device="cuda"),
+                torch.randn(batch, 1, 32, device="cuda"),
+                torch.randn(2, batch, 64, 2, device="cuda"),
+                torch.randn(2, batch, 2, cached, 32, device="cuda"),
+                torch.empty(2, batch, 64, 2, device="cuda"),
+                torch.empty(2, batch, 2, cached + frames, 32, device="cuda"),
+                torch.ones(batch, frames, cached + frames, device="cuda", dtype=torch.bool),
+            )
+            inputs[-1][:, :, -3:] = False
+            wrapper.replay(*inputs)
+            inputs[0].add_(0.1)
+            inputs[-1][:, :, -4:] = False
+            expected = tuple(t.clone() for t in wrapper._eager(inputs))
+            actual = wrapper.replay(*inputs)
+            for a, e in zip(actual, expected, strict=True):
+                torch.testing.assert_close(a, e, atol=2e-5, rtol=2e-4)
+            assert wrapper.enabled
+        assert wrapper._stats["captures"] == 3
+        assert wrapper._stats["flushes"] == 1
+        assert estimator.blocks[0].forward_chunk.__func__ is original
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_retained_cache_miss_never_calls_compiler():
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(estimator.blocks_forward_chunk, max_graphs=1, cache_policy="retain")
+    with torch.inference_mode():
+        wrapper.replay(*_cfm_inputs(2, 10, 0))
+        wrapper._compiled_graph_fn = Mock(side_effect=AssertionError("must remain eager"))
+        wrapper.replay(*_cfm_inputs(4, 12, 5))
+        wrapper._compiled_graph_fn.assert_not_called()
+        assert wrapper._stats["eager"] == 1
+    wrapper._flush()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
