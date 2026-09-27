@@ -8,7 +8,7 @@
 #
 # FP32 weights/caches are retained, but TF32 and tiled attention change
 # rounding. Quality evidence and limits:
-# docs/design/experiments/other_models_20260926_round4/REPORT_ZH.md
+# docs/design/minicpm_o45_mrv2_performance.md
 base_config: minicpmo_4_5_turn_mrv2.yaml
 
 connectors:
