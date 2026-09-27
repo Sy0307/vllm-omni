@@ -309,6 +309,10 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
     """
     result: dict[str, torch.Tensor] = {}
     for key, val in payload.items():
+        # Sparse per-request conditioning uses None for requests with no
+        # update. Absence is expected, not an unsupported wire value.
+        if val is None:
+            continue
         if isinstance(val, torch.Tensor):
             result[key] = val
         elif isinstance(val, (int, float, bool)):

@@ -1635,6 +1635,21 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             device=device,
         )
 
+    def _embed_multimodal_input_ids(self, num_scheduled_tokens, mm_embeds, is_mm_embed):
+        embedding_kwargs = {}
+        if mm_embeds and getattr(self.model, "supports_embed_input_ids_query_start_loc", False):
+            # The batch has already been reordered. Read host-owned boundaries
+            # so model prompt rearrangement does not assume a request order or
+            # introduce a GPU-to-host transfer on every decode step.
+            num_reqs = self.input_batch.num_reqs
+            embedding_kwargs["query_start_loc"] = self.query_start_loc.cpu[: num_reqs + 1].tolist()
+        return self.model.embed_input_ids(
+            self.input_ids.gpu[:num_scheduled_tokens],
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
+            **embedding_kwargs,
+        )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1671,11 +1686,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.embed_input_ids(
-                self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            inputs_embeds_scheduled = self._embed_multimodal_input_ids(num_scheduled_tokens, mm_embeds, is_mm_embed)
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)

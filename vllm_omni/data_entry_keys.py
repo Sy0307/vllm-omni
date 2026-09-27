@@ -90,6 +90,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
+    resumable: bool
     next_stage_prompt_len: int
     next_stage_generation_tokens: int
     replace_streaming_prompt: bool
@@ -204,6 +205,8 @@ class MetaStruct(_StructBase):
     right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
+    # The model runner sets this when a streaming request is resumed.
+    resumable: bool | None = None
     next_stage_prompt_len: int | None = None
     next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None

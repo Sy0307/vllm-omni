@@ -25,9 +25,15 @@ def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
 
 
-def _wakeup_path(to_stage: Any) -> str:
+def _wakeup_directory() -> str:
     # Stage engine processes of one deployment share their launching parent.
-    return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}_{int(to_stage)}"
+    return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}"
+
+
+def _wakeup_path(to_stage: Any) -> str:
+    # Discover replicas within this small directory. Scanning /dev/shm for
+    # every chunk makes send latency depend on all other deployments' files.
+    return f"{_wakeup_directory()}/{int(to_stage)}"
 
 
 class SharedMemoryConnector(OmniConnectorBase):
@@ -87,6 +93,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         read_fd = hold_fd = None
         created = False
         try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
             os.mkfifo(path, 0o600)
             created = True
             read_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
