@@ -333,6 +333,9 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        # Only this streaming backend opts into cached ISTFT envelopes.
+        # Other consumers of the shared HiFT module retain torch.istft.
+        self.hift._use_cached_istft = True
         encoder = getattr(self.flow, "encoder", None)
         if encoder is not None:
             _undecorate_dynamo(encoder, "forward_chunk")

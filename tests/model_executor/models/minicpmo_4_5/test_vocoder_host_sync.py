@@ -99,6 +99,7 @@ def test_hift_istft_reuses_the_envelope_per_frame_count(monkeypatch):
     n_fft, hop = 16, 4
     window = torch.from_numpy(hifigan.get_window("hann", n_fft, fftbins=True).astype("float32"))
     hift = SimpleNamespace(
+        _use_cached_istft=True,
         istft_params={"n_fft": n_fft, "hop_len": hop},
         _get_stft_window=lambda tensor: window,
     )
@@ -141,3 +142,20 @@ def test_host_copy_batch_matches_blocking_copy_on_cpu():
     assert copied.is_contiguous()
     assert torch.equal(copied, strided)
     assert to_host.copy(base).data_ptr() == base.data_ptr()
+
+
+def test_shared_hift_keeps_native_istft_without_opt_in(monkeypatch):
+    n_fft, hop = 16, 4
+    window = torch.hann_window(n_fft)
+    hift = SimpleNamespace(
+        istft_params={"n_fft": n_fft, "hop_len": hop},
+        _get_stft_window=lambda tensor: window,
+    )
+
+    def unexpected_cache(*args):
+        raise AssertionError("shared HiFT must not opt in implicitly")
+
+    monkeypatch.setattr(hifigan, "_istft_without_host_sync", unexpected_cache)
+    magnitude, phase = _spectrum(2, 20, n_fft, 0)
+    assert HiFTGenerator._istft(hift, magnitude, phase).shape == (2, 76)
+    assert not hasattr(hift, "_istft_envelopes")

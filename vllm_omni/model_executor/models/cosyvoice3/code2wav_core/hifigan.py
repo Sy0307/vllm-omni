@@ -668,7 +668,12 @@ class HiFTGenerator(nn.Module):
         imag = magnitude * torch.sin(phase)
         spec = torch.complex(real, imag)
         window = self._get_stft_window(magnitude)
-        if spec.dim() != 3 or window.dim() != 1 or window.shape[0] != self.istft_params["n_fft"]:
+        if (
+            not getattr(self, "_use_cached_istft", False)
+            or spec.dim() != 3
+            or window.dim() != 1
+            or window.shape[0] != self.istft_params["n_fft"]
+        ):
             return torch.istft(
                 spec,
                 self.istft_params["n_fft"],
