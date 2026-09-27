@@ -4,7 +4,7 @@
 # sampling mask/Gumbel selection. cuDNN searches convolution algorithms
 # during warmup; short-KV attention and convolution selection change rounding.
 # This is not a claim of bitwise audio or universal P99/throughput improvement.
-# Evidence: docs/design/experiments/other_models_20260926_round4/REPORT_ZH.md
+# Evidence: docs/design/qwen3_omni_mrv2_performance.md
 base_config: qwen3_omni_moe_mrv2.yaml
 
 connectors:
