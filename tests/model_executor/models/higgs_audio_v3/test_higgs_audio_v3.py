@@ -24,6 +24,27 @@ from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v3 import HiggsAudioV
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_external_decode_enters_backbone_compile_boundary():
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        HiggsAudioV3TalkerForConditionalGeneration,
+    )
+
+    class Backbone(torch.nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            assert input_ids is None
+            return inputs_embeds + positions[:, None]
+
+        @property
+        def layers(self):
+            pytest.fail("External decode bypassed the Qwen3Model compilation boundary")
+
+    talker = SimpleNamespace(_use_external_decode_cudagraph=True, model=Backbone())
+    hidden = torch.randn(2, 4)
+    positions = torch.tensor([11, 27])
+    actual = HiggsAudioV3TalkerForConditionalGeneration._run_qwen3_layers_eager(talker, positions, hidden)
+    torch.testing.assert_close(actual, hidden + positions[:, None])
+
+
 # ---- AC-1: Configuration ----
 
 
@@ -300,6 +321,7 @@ class TestSamplerMethods:
         class FakeTalker:
             num_codebooks = 8
             codebook_size = 1026
+            config = type("Config", (), {"audio_full_sample_graph": False})()
 
         t = FakeTalker()
         t._decode_last_codes = torch.arange(num_rows * t.num_codebooks, dtype=torch.long).view(
@@ -337,6 +359,7 @@ class TestSamplerMethods:
             "_get_audio_host_staging_buffer",
             "_apply_delay_pattern_masking_batched",
             "_update_delay_state_batched",
+            "_finish_audio_staging",
             "_prefill_row_mask",
             "_audio_seed_mask_from_step_input",
         ):

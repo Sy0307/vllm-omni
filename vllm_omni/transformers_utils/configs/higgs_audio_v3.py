@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration class for higgs-audio v3 (HiggsMultimodalQwen3) in vllm-omni.
 
 ``HiggsAudioV3Config.from_pretrained(model_path)`` returns a config with
@@ -95,6 +95,11 @@ class HiggsAudioV3Config(PretrainedConfig):
         audio_continuation_id: int | None = None,
         enable_flashinfer_api_unwrap: bool = True,
         enable_mlp_cudagraph: bool = True,
+        audio_sampler_no_sync: bool = False,
+        audio_full_sample_graph: bool = False,
+        audio_mixed_direct_sampling: bool = False,
+        codec_cuda_graph: bool = False,
+        audio_skip_text_head: bool = False,
         **kwargs: Any,
     ) -> None:
         # Legacy perf knob removed: Higgs v3 scheduler tokens now come from
@@ -131,6 +136,11 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.audio_continuation_id = audio_continuation_id
         self.enable_flashinfer_api_unwrap = bool(enable_flashinfer_api_unwrap)
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
+        self.audio_sampler_no_sync = bool(audio_sampler_no_sync)
+        self.audio_full_sample_graph = bool(audio_full_sample_graph)
+        self.audio_mixed_direct_sampling = bool(audio_mixed_direct_sampling)
+        self.codec_cuda_graph = bool(codec_cuda_graph)
+        self.audio_skip_text_head = bool(audio_skip_text_head)
 
         super().__init__(**kwargs)
 

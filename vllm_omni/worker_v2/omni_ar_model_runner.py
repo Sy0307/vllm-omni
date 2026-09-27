@@ -35,7 +35,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -186,12 +186,24 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     - self.req_states.prompt_len.gpu[input_batch.idx_mapping]
                 ),
             )
+        sample_omni = getattr(self.model_state, "sample_omni_output", None)
         with sampling_context:
-            sampler_output, num_sampled, num_rejected = self.sample(
-                text_hidden,
-                input_batch,
-                grammar_output,
-            )
+            custom_output = None
+            if sample_omni is not None:
+                custom_output = sample_omni(
+                    text_hidden,
+                    input_batch,
+                    self.req_states,
+                    grammar_output,
+                )
+            if custom_output is None:
+                sampler_output, num_sampled, num_rejected = self.sample(
+                    text_hidden,
+                    input_batch,
+                    grammar_output,
+                )
+            else:
+                sampler_output, num_sampled, num_rejected, multimodal_outputs = custom_output
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
         if multimodal_outputs and run_eager_mtp is not None:
             run_eager_mtp(
@@ -244,11 +256,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            text_hidden=text_hidden if need_pooler else None,
+            text_hidden=text_hidden if need_pooler and sample_omni is None else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
+            finalize_multimodal=(
+                getattr(self.model_state, "finalize_audio_snapshot", None) if sample_omni is not None else None
+            ),
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
         )
@@ -256,7 +271,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=need_pooler,
+            need_pooler=need_pooler and sample_omni is None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
 
@@ -647,6 +662,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         input_batch: Any | None = None,
         async_chunk: bool = False,
         finalize_output: Any | None = None,
+        finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
     ):
@@ -657,10 +673,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
+        self._finalize_multimodal = finalize_multimodal
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
-        self._need_pooler = text_hidden is not None or (self._async_chunk and bool(multimodal_outputs))
+        self._need_pooler = text_hidden is not None or (
+            (self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs)
+        )
         self._query_start_loc_np: np.ndarray | None = None
         self._num_scheduled_tokens: np.ndarray | None = None
         self._num_reqs: int = 0
@@ -734,7 +753,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self._hidden_cpu: torch.Tensor | None = None
             self._mm_cpu: dict[str, Any] = {}
             self._mm_snapshot: dict[str, Any] = {}
-            if self._need_pooler and self._async_chunk:
+            if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
                 # CUDA graph replay reuses the model's output buffers. Take
                 # ownership directly in pinned host memory on the output copy
                 # stream so deferred finalization never performs a blocking
@@ -797,16 +816,27 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
         #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
         #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
-        if self._need_pooler and self._async_chunk:
-            pooler_inter, pooler_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
-                self._mm_snapshot,
-                self._query_start_loc_np,
-                self._num_scheduled_tokens,
-                self._num_reqs,
-                self._total_tokens,
-                self._padded_total_tokens,
-            )
-            self.model_runner_output.pooler_output = None
+        if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
+            if self._finalize_multimodal is not None:
+                self._mm_snapshot = self._finalize_multimodal(self._mm_snapshot, num_sampled_tokens)
+            pooler_inter: list[dict[str, Any] | None] | None
+            pooler_client: list[dict[str, Any] | None] | None
+            if isinstance(self._mm_snapshot, RequestOutputSnapshot):
+                pooler_inter, pooler_client = self._mm_snapshot.inter_stage, self._mm_snapshot.client
+                if len(pooler_inter) != self._num_reqs or (
+                    pooler_client is not None and len(pooler_client) != self._num_reqs
+                ):
+                    raise ValueError("Model-owned output snapshot does not match the request batch")
+            else:
+                pooler_inter, pooler_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+                    self._mm_snapshot,
+                    self._query_start_loc_np,
+                    self._num_scheduled_tokens,
+                    self._num_reqs,
+                    self._total_tokens,
+                    self._padded_total_tokens,
+                )
+            self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
                 [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]

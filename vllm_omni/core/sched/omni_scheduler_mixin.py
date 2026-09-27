@@ -647,6 +647,31 @@ class OmniSchedulerMixin:
         else:
             self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
 
+    @staticmethod
+    def _defer_audio_code_frames(request, multimodal_output, finish_reason):
+        """Hold owned CPU code frames on the request until sync completion.
+
+        The request owns the list, so abort/removal releases it without a
+        scheduler-wide cache. Length stops and normal stops flush identically.
+        Other multimodal fields retain their usual per-step behavior.
+        """
+        payload = dict(multimodal_output or {})
+        codes = payload.pop("codes.audio", None)
+        frames = getattr(request, "_omni_deferred_code_frames", None)
+        if codes is not None:
+            if not isinstance(codes, torch.Tensor) or codes.device.type != "cpu":
+                raise TypeError("Deferred audio codes require owned CPU tensors")
+            if codes.numel():
+                if frames is None:
+                    frames = request._omni_deferred_code_frames = []
+                frames.append(codes)
+        if finish_reason is not None:
+            if frames:
+                payload["codes.audio"] = torch.cat(frames, dim=0)
+            if hasattr(request, "_omni_deferred_code_frames"):
+                del request._omni_deferred_code_frames
+        return payload or None
+
     def _make_omni_engine_output(
         self,
         request: Request,
@@ -668,6 +693,11 @@ class OmniSchedulerMixin:
         num_generation_tokens: int | None = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        if getattr(getattr(model_config, "hf_config", None), "audio_defer_codes_output", False) is True:
+            if getattr(model_config, "async_chunk", False):
+                raise ValueError("Deferred audio codes are only valid for synchronous whole-utterance decoding")
+            multimodal_output = OmniSchedulerMixin._defer_audio_code_frames(request, multimodal_output, finish_reason)
         pooling_output_payload = None
         if isinstance(pooling_output, dict):
             pooling_output_payload = serialize_additional_information(pooling_output)

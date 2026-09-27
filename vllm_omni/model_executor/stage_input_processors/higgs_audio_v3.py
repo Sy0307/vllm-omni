@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processor for higgs-audio v3: Talker -> Code2Wav.
 
 Two adapters:
@@ -385,3 +385,37 @@ def talker2code2wav_async_chunk(
         codes=CodesStruct(audio=codec_codes),
         meta=meta,
     )
+
+
+def talker2code2wav_token_only(source_outputs, prompt=None, _requires_multimodal_data=False):
+    """Control slots for the native full-payload consumer."""
+    result = []
+    for output in source_outputs:
+        if not output.finished:
+            continue
+        mm = getattr(output.outputs[0], "multimodal_output", None)
+        if isinstance(mm, dict) and isinstance(mm.get("codes", {}).get("audio"), torch.Tensor):
+            result.extend(talker2code2wav([output], prompt, _requires_multimodal_data))
+        else:
+            result.append(OmniTokensPrompt(prompt_token_ids=[0]))
+    return result
+
+
+def talker2code2wav_full_payload(transfer_manager, pooling_output, request):
+    """De-delay the accumulated raw rows once before native codec delivery."""
+    del transfer_manager, request
+    audio = pooling_output.get("codes.audio") if isinstance(pooling_output, dict) else None
+    if audio is None and isinstance(pooling_output, dict):
+        audio = pooling_output.get("codes", {}).get("audio")
+    codes = torch.empty(0, dtype=torch.long)
+    if isinstance(audio, torch.Tensor) and audio.numel():
+        if audio.numel() % _NUM_CODEBOOKS:
+            raise ValueError("Higgs payload must contain complete codebook rows")
+        rows = audio.reshape(-1, _NUM_CODEBOOKS).to(device="cpu", dtype=torch.long)
+        if rows.shape[0] >= _NUM_CODEBOOKS:
+            decoded = _revert_delay_pattern(rows.t().contiguous())
+            decoded = torch.where((decoded < 0) | (decoded >= _NUM_REAL_CODES), 0, decoded)
+            if decoded.shape[-1] >= 2:
+                decoded = decoded[:, :-1]
+            codes = decoded.reshape(-1).contiguous()
+    return {"codes": {"audio": codes}, "meta": {"finished": torch.tensor(True)}}

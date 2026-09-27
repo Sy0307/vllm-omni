@@ -1,0 +1,784 @@
+{
+  "base_commit": "817f5d0e4d12751020a2ed8d7886b821eb605467",
+  "hardware": "one H200, physical GPU6",
+  "software": {
+    "vllm": "0.30.0",
+    "torch": "2.13.0",
+    "cuda": "13.0",
+    "transformers": "5.14.1",
+    "triton": "3.7.1"
+  },
+  "protocol": {
+    "base_sha": "817f5d0e4d12751020a2ed8d7886b821eb605467",
+    "physical_gpu": 6,
+    "gpu_uuid": "GPU-62d67334-2671-f5f0-76f8-a9c784c8544c",
+    "order": [
+      [
+        "before",
+        "after"
+      ],
+      [
+        "after",
+        "before"
+      ],
+      [
+        "before",
+        "after"
+      ]
+    ],
+    "concurrencies": [
+      32,
+      64
+    ],
+    "samples_each": 1088,
+    "warmup_each": 64,
+    "sampling": {
+      "seed": 42,
+      "temperature": 1,
+      "top_p": 0.95,
+      "top_k": 50,
+      "max_tokens": 2048
+    },
+    "protocol": "Streaming PCM16 mono24kHz first8 frames, subsequent25, left8/right0. Plain TTS, no reference. Both stage capacities64, prefix cache off, same MPS and resource budget. Before retains upstream V1 eager/synchronous FLASHINFER(use_trtllm_attention=false); after uses submitted MRV2 profile. Entire configuration/code bundle comparison, not isolated single-kernel gain."
+  },
+  "changed_production_sha256": {
+    "vllm_omni/worker/gpu_ar_model_runner.py": "70460dd5205c6bac279be0b89b8ef733b387670b16207112baeb82e802ce601b",
+    "vllm_omni/worker/gpu_model_runner.py": "8d5e11d7cd969d03dd82df326470c6f013a62bd88c07336f7e4d8e8ddf9bfdb3",
+    "vllm_omni/worker_v2/omni_ar_model_runner.py": "1e8a11986c162b57a9d60223d1320f71bfdc857302dcecba2f713cafebb37647",
+    "vllm_omni/worker_v2/output_snapshot.py": "58f59e2109124a3eb614921e49e083b14896bcd5e5233c67a9be87a0c8761702",
+    "vllm_omni/core/sched/omni_scheduler_mixin.py": "68c5e67659ee53d36f3eb009f2ae9ced730167a643ed9d0c6e9130e848c4f016",
+    "vllm_omni/model_executor/stage_input_processors/higgs_audio_v3.py": "fa21d0cb40e76f592e42f879175549cbb03d284ed942454d47e9e54d24776795",
+    "vllm_omni/model_executor/models/higgs_audio_v3/higgs_audio_v3_code2wav.py": "7315a50f5d1ed6244bf38536fe5ddfaa88773ded40ce0c172ee26345e0d00b52",
+    "vllm_omni/model_executor/models/higgs_audio_v3/higgs_audio_v3_talker.py": "29521e18c824dc6f5b14e7d5e1c51aec9d387416188ae288ad571aad40b7368d",
+    "vllm_omni/model_executor/models/higgs_audio_v3/pipeline.py": "0f9a4b2b61ed97b35825068cbd57a27c16fd07e840e903862a8a0bf791624409",
+    "vllm_omni/model_executor/models/higgs_audio_v3/full_sample_graph.py": "8abe64ca5a678bccc37f11b7229b8956f46c2c6194fb45657d1ca2c9d90daa20",
+    "vllm_omni/model_executor/models/higgs_audio_v3/model_state.py": "76ef09673cb3a35e4517abc36b4120b01a558c4e53d416f338b1417afaed8604",
+    "vllm_omni/model_executor/models/higgs_audio_v3/mrv2_rng.py": "c3a0f045894e96f6c58bc0af98499b0d9e41002c4e526cb632475dd8f8f2cac4",
+    "vllm_omni/model_executor/models/higgs_audio_v3/mrv2_state_kernels.py": "e6dab31b0e485a5a7dcff0bcc9ed908a28d23779785ec21d6c3b3780e4292c14",
+    "vllm_omni/transformers_utils/configs/higgs_audio_v3.py": "f4c26a676f4fc6338b77c92a5ae1f7ec0bb6147361fd10bd0e3f4d3104abed25",
+    "vllm_omni/worker_v2/model_states/__init__.py": "d042a26e66239da3bd5a7a80600d5fb8882933018d8ed5eb76db7a7381eb5501",
+    "vllm_omni/worker_v2/model_states/omni_model_state.py": "388b1971a1a2fec4de46891443caf50cd07daf30fece2134a9d589845b10bf55"
+  },
+  "weights": {
+    "model_id": "bosonai/higgs-audio-v3-tts-4b",
+    "files": {
+      "config.json": {
+        "sha256": "2ead4442c079ee35c2123a5b197e126e18eccfc0bdb65d31c94767e75d7864d4",
+        "bytes": 2755,
+        "mtime_unix": 1790450027.4041548
+      },
+      "configuration.json": {
+        "sha256": "30458d769bcf25aa4e8fd30bbde901f817e382a49f7c7da8c4380dd97b616876",
+        "bytes": 72,
+        "mtime_unix": 1790450027.3324828
+      },
+      "model.safetensors": {
+        "sha256": "2f7965264c360b38180885006944aa16bd1de20f4e6cff79f6473bfcf8ae3d5a",
+        "bytes": 9309834930,
+        "mtime_unix": 1790450275.1535194
+      },
+      "model.safetensors.index.json": {
+        "sha256": "cf2689739828b9b77b7c09f66bc400d147541377f0b58fd6871f826cf4c16010",
+        "bytes": 90103,
+        "mtime_unix": 1790450027.4690557
+      },
+      "tokenizer.json": {
+        "sha256": "eb883de2de5adc5113f1f02b54830a0ea7cd6ef191cde65c41aceb3737d4d1c1",
+        "bytes": 11433924,
+        "mtime_unix": 1790450027.9290428
+      },
+      "tokenizer_config.json": {
+        "sha256": "b4d632e1239569fb1829bf0bfa3c674fa54f22c42e9cb2669d77c438d4b4e02c",
+        "bytes": 1937,
+        "mtime_unix": 1790450027.7002134
+      }
+    },
+    "en_meta_sha256": "7cd29f701743e6c7033edbca764ddc0b979de8c4f4907eff5e5454682114661f"
+  },
+  "performance": {
+    "groups": {
+      "before/c32": {
+        "requests": 3264,
+        "failures": 0,
+        "wall_s": 303.10399765428156,
+        "audio_s_per_s": 46.38988633874054,
+        "qps": 10.76858116441901,
+        "ttfa_mean_ms": 409.5971200980393,
+        "ttfa_p50_ms": 403.2,
+        "ttfa_p95_ms": 467.98499999999996,
+        "ttfa_p99_ms": 565.5369999999999,
+        "completion_mean_s": 2.714181096813726,
+        "completion_p95_s": 3.9046749999999997,
+        "max_underrun_mean_s": 0.2531158088235294,
+        "max_underrun_p95_s": 0.2991,
+        "starts": [
+          {
+            "start": 1,
+            "audio_s_per_s": 50.208544719118066,
+            "qps": 11.757327849511526,
+            "ttfa_mean_ms": 405.0622242647059,
+            "ttfa_p95_ms": 439.90000000000003,
+            "wall_s": 92.53803363535553
+          },
+          {
+            "start": 2,
+            "audio_s_per_s": 40.87818464474859,
+            "qps": 9.3853855181663,
+            "ttfa_mean_ms": 412.36783088235296,
+            "ttfa_p95_ms": 477.0849999999993,
+            "wall_s": 115.92491303570569
+          },
+          {
+            "start": 3,
+            "audio_s_per_s": 49.40731269804937,
+            "qps": 11.496068447009323,
+            "ttfa_mean_ms": 411.36130514705883,
+            "ttfa_p95_ms": 483.8049999999995,
+            "wall_s": 94.64105098322034
+          }
+        ]
+      },
+      "before/c64": {
+        "requests": 3264,
+        "failures": 0,
+        "wall_s": 197.83247497491539,
+        "audio_s_per_s": 71.88991595946688,
+        "qps": 16.49880789498219,
+        "ttfa_mean_ms": 551.1854166666667,
+        "ttfa_p50_ms": 533.2,
+        "ttfa_p95_ms": 692.6,
+        "ttfa_p99_ms": 853.1999999999999,
+        "completion_mean_s": 3.5625569240196078,
+        "completion_p95_s": 5.122109999999999,
+        "max_underrun_mean_s": 0.4220046568627451,
+        "max_underrun_p95_s": 0.4758799999999999,
+        "starts": [
+          {
+            "start": 1,
+            "audio_s_per_s": 75.54450437597299,
+            "qps": 17.35144793685741,
+            "ttfa_mean_ms": 548.9477022058824,
+            "ttfa_p95_ms": 686.195,
+            "wall_s": 62.70370080694556
+          },
+          {
+            "start": 2,
+            "audio_s_per_s": 67.2784827093443,
+            "qps": 15.355357496909292,
+            "ttfa_mean_ms": 549.7930147058823,
+            "ttfa_p95_ms": 693.365,
+            "wall_s": 70.85474891867489
+          },
+          {
+            "start": 3,
+            "audio_s_per_s": 73.40819221605787,
+            "qps": 16.927522366617843,
+            "ttfa_mean_ms": 554.8155330882353,
+            "ttfa_p95_ms": 675.1699999999995,
+            "wall_s": 64.27402524929494
+          }
+        ]
+      },
+      "after/c32": {
+        "requests": 3264,
+        "failures": 0,
+        "wall_s": 71.82342074811459,
+        "audio_s_per_s": 197.87862861395504,
+        "qps": 45.444786199293944,
+        "ttfa_mean_ms": 118.08192401960785,
+        "ttfa_p50_ms": 115.8,
+        "ttfa_p95_ms": 135.48499999999999,
+        "ttfa_p99_ms": 178.2699999999999,
+        "completion_mean_s": 0.6915288296568628,
+        "completion_p95_s": 0.9803649999999999,
+        "max_underrun_mean_s": 0.0,
+        "max_underrun_p95_s": 0.0,
+        "starts": [
+          {
+            "start": 1,
+            "audio_s_per_s": 197.52260948674336,
+            "qps": 45.37719894626998,
+            "ttfa_mean_ms": 117.37536764705882,
+            "ttfa_p95_ms": 136.63999999999976,
+            "wall_s": 23.97679947782308
+          },
+          {
+            "start": 2,
+            "audio_s_per_s": 197.34950449075257,
+            "qps": 45.266319704418514,
+            "ttfa_mean_ms": 119.24338235294117,
+            "ttfa_p95_ms": 142.56999999999948,
+            "wall_s": 24.035530325956643
+          },
+          {
+            "start": 3,
+            "audio_s_per_s": 198.77123694435622,
+            "qps": 45.69299250267477,
+            "ttfa_mean_ms": 117.62702205882353,
+            "ttfa_p95_ms": 132.265,
+            "wall_s": 23.811090944334865
+          }
+        ]
+      },
+      "after/c64": {
+        "requests": 3264,
+        "failures": 0,
+        "wall_s": 51.23366874270141,
+        "audio_s_per_s": 277.8563462142843,
+        "qps": 63.70810601895417,
+        "ttfa_mean_ms": 168.88783700980392,
+        "ttfa_p50_ms": 159.3,
+        "ttfa_p95_ms": 253.4,
+        "ttfa_p99_ms": 347.7329999999999,
+        "completion_mean_s": 0.9729700061274509,
+        "completion_p95_s": 1.384385,
+        "max_underrun_mean_s": 0.0001353860294117647,
+        "max_underrun_p95_s": 0.0,
+        "starts": [
+          {
+            "start": 1,
+            "audio_s_per_s": 279.47277569935517,
+            "qps": 64.07872796950569,
+            "ttfa_mean_ms": 166.4826286764706,
+            "ttfa_p95_ms": 231.4,
+            "wall_s": 16.97911357600242
+          },
+          {
+            "start": 2,
+            "audio_s_per_s": 273.8712738383297,
+            "qps": 62.77269634875048,
+            "ttfa_mean_ms": 171.1060661764706,
+            "ttfa_p95_ms": 257.2,
+            "wall_s": 17.332376387901604
+          },
+          {
+            "start": 3,
+            "audio_s_per_s": 280.3161497113737,
+            "qps": 64.2943213295446,
+            "ttfa_mean_ms": 169.07481617647056,
+            "ttfa_p95_ms": 267.7549999999999,
+            "wall_s": 16.922178778797388
+          }
+        ]
+      }
+    },
+    "comparisons": {
+      "c32": {
+        "throughput_gain_pct": 326.55553662933886,
+        "mean_ttfa_reduction_pct": 71.1712025730688,
+        "p95_ttfa_reduction_pct": 71.04928576770624,
+        "completion_reduction_pct": 74.52164004573338,
+        "paired_start_throughput_gains_pct": [
+          293.404370892933,
+          382.77462956297165,
+          302.31137070566444
+        ],
+        "paired_start_mean_ttfa_reductions_pct": [
+          71.0228797908455,
+          71.08324815304013,
+          71.40542375108114
+        ]
+      },
+      "c64": {
+        "throughput_gain_pct": 286.5025330825896,
+        "mean_ttfa_reduction_pct": 69.35916083717069,
+        "p95_ttfa_reduction_pct": 63.4132255269997,
+        "completion_reduction_pct": 72.68899762506376,
+        "paired_start_throughput_gains_pct": [
+          269.9445485914681,
+          307.07112112130284,
+          281.8594917667176
+        ],
+        "paired_start_mean_ttfa_reductions_pct": [
+          69.67240631348312,
+          68.8780938280917,
+          69.52594040845254
+        ]
+      }
+    },
+    "notes": [
+      "All three planned independent starts retained.",
+      "Warmup64 excluded before each full EN1088 C32/C64.",
+      "Percentages describe measured starts; P95 is reported separately."
+    ],
+    "formal_requests": 13056
+  },
+  "quality": {
+    "c32": {
+      "evaluated_each_side": 1088,
+      "skipped": 0,
+      "before_wer_pct": 7.237859818958435,
+      "after_wer_pct": 1.8178068772649678,
+      "mean_difference_pp": -5.420052941693467,
+      "paired_text_bootstrap_95ci_pp": [
+        -6.173521282197518,
+        -4.685217021334058
+      ],
+      "method": "Prespecified first paired start, all1088texts each. 10000 paired resamples by text. Remaining performance repetitions not quality-scored or counted as independent quality evidence. Official Seed-TTS normalization and same Whisper model."
+    },
+    "c64": {
+      "evaluated_each_side": 1088,
+      "skipped": 0,
+      "before_wer_pct": 12.670602656705626,
+      "after_wer_pct": 1.7589007313812677,
+      "mean_difference_pp": -10.911701925324357,
+      "paired_text_bootstrap_95ci_pp": [
+        -11.97409713896111,
+        -9.805179900769827
+      ],
+      "method": "Prespecified first paired start, all1088texts each. 10000 paired resamples by text. Remaining performance repetitions not quality-scored or counted as independent quality evidence. Official Seed-TTS normalization and same Whisper model."
+    },
+    "final_clone128": {
+      "c1": {
+        "count": 128,
+        "success": 128,
+        "long_ge80": 0,
+        "max_duration_s": 8.92,
+        "wer_pct": 0.7835183352187028,
+        "skipped": 0
+      },
+      "c32": {
+        "count": 128,
+        "success": 128,
+        "long_ge80": 0,
+        "max_duration_s": 7.84,
+        "wer_pct": 0.8991391574112162,
+        "skipped": 0
+      }
+    }
+  },
+  "capture_fix_validation": {
+    "physical_gpu": 6,
+    "gpu_uuid": "GPU-62d67334-2671-f5f0-76f8-a9c784c8544c",
+    "arms": {
+      "clone-diag-control-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 3,
+          "max_duration": 81.6,
+          "long_ids": [
+            "common_voice_en_103675-common_voice_en_103677",
+            "common_voice_en_120405-common_voice_en_120402",
+            "common_voice_en_15265-common_voice_en_15268"
+          ]
+        },
+        "finish_including_warmup": {
+          "total": 40,
+          "length": 3,
+          "max_tokens": 2048
+        }
+      },
+      "clone-diag-no-sample-graph-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 3,
+          "max_duration": 81.6,
+          "long_ids": [
+            "common_voice_en_103675-common_voice_en_103677",
+            "common_voice_en_120405-common_voice_en_120402",
+            "common_voice_en_15265-common_voice_en_15268"
+          ]
+        }
+      },
+      "clone-diag-upstream-v1-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 0,
+          "max_duration": 8.44,
+          "long_ids": []
+        }
+      },
+      "clone-diag-eager-mrv2-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 0,
+          "max_duration": 8.44,
+          "long_ids": []
+        }
+      },
+      "clone-diag-decode-only-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 0,
+          "max_duration": 10.8,
+          "long_ids": []
+        }
+      },
+      "clone-diag-compiled-no-graph-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 0,
+          "max_duration": 9.08,
+          "long_ids": []
+        }
+      },
+      "clone-diag-query-bound-start1": {
+        "c1": {
+          "total": 32,
+          "success": 32,
+          "long_ge80": 0,
+          "max_duration": 8.92,
+          "long_ids": []
+        },
+        "finish_including_warmup": {
+          "total": 40,
+          "length": 0,
+          "max_tokens": 232
+        }
+      },
+      "clone-fixed-en1088-start1": {
+        "c1": {
+          "total": 1088,
+          "success": 1088,
+          "long_ge80": 0,
+          "max_duration": 8.92,
+          "long_ids": [],
+          "quality": {
+            "normalization": "vLLM-Omni process_one_official (Seed-TTS run_wer parity); same saved Whisper transcripts; mean conditional on scored outputs, failures explicitly retained",
+            "source_sha256": "5a723185a63673119294ccbddd92337f32f6f1a6323606458307abfa3e691999",
+            "total": 1088,
+            "evaluated": 1088,
+            "skipped": 0,
+            "wer_per_sample_mean": 0.01552325149859752
+          }
+        },
+        "c32": {
+          "total": 1088,
+          "success": 1088,
+          "long_ge80": 0,
+          "max_duration": 8.88,
+          "long_ids": [],
+          "quality": {
+            "normalization": "vLLM-Omni process_one_official (Seed-TTS run_wer parity); same saved Whisper transcripts; mean conditional on scored outputs, failures explicitly retained",
+            "source_sha256": "5a723185a63673119294ccbddd92337f32f6f1a6323606458307abfa3e691999",
+            "total": 1088,
+            "evaluated": 1088,
+            "skipped": 0,
+            "wer_per_sample_mean": 0.016675080044186878
+          }
+        }
+      },
+      "clone-fixed-plain-regression-start1": {
+        "c32": {
+          "total": 1088,
+          "success": 1088,
+          "long_ge80": 0,
+          "max_duration": 10.36,
+          "long_ids": [],
+          "quality": {
+            "normalization": "vLLM-Omni process_one_official (Seed-TTS run_wer parity); same saved Whisper transcripts; mean conditional on scored outputs, failures explicitly retained",
+            "source_sha256": "5a723185a63673119294ccbddd92337f32f6f1a6323606458307abfa3e691999",
+            "total": 1088,
+            "evaluated": 1088,
+            "skipped": 0,
+            "wer_per_sample_mean": 0.01860463357408643
+          }
+        },
+        "c64": {
+          "total": 1088,
+          "success": 1088,
+          "long_ge80": 0,
+          "max_duration": 10.12,
+          "long_ids": [],
+          "quality": {
+            "normalization": "vLLM-Omni process_one_official (Seed-TTS run_wer parity); same saved Whisper transcripts; mean conditional on scored outputs, failures explicitly retained",
+            "source_sha256": "5a723185a63673119294ccbddd92337f32f6f1a6323606458307abfa3e691999",
+            "total": 1088,
+            "evaluated": 1088,
+            "skipped": 0,
+            "wer_per_sample_mean": 0.017041890521291472
+          }
+        }
+      }
+    }
+  },
+  "shadow_summary": {
+    "clone-diag-shadow-prefill-start1": {
+      "count": 40,
+      "min_cos": 0.07891000807285309,
+      "max_rms": 4.655115604400635
+    },
+    "clone-fixed-shadow-start1": {
+      "count": 40,
+      "min_cos": 0.9999808073043823,
+      "max_rms": 0.02644197829067707
+    }
+  },
+  "telemetry": {
+    "pr-before-start1/c32": {
+      "samples_1hz": 93,
+      "sampled_max_memory_mib": 94480.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 39.0,
+      "temperature_max_c": 43.0,
+      "max_power_w": 212.33
+    },
+    "pr-before-start1/c64": {
+      "samples_1hz": 63,
+      "sampled_max_memory_mib": 95398.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 43.0,
+      "temperature_max_c": 44.0,
+      "max_power_w": 215.73
+    },
+    "pr-before-start2/c32": {
+      "samples_1hz": 115,
+      "sampled_max_memory_mib": 138722.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 40.0,
+      "temperature_max_c": 49.0,
+      "max_power_w": 346.11
+    },
+    "pr-before-start2/c64": {
+      "samples_1hz": 70,
+      "sampled_max_memory_mib": 137914.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 43.0,
+      "temperature_max_c": 45.0,
+      "max_power_w": 238.46
+    },
+    "pr-before-start3/c32": {
+      "samples_1hz": 94,
+      "sampled_max_memory_mib": 140294.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 40.0,
+      "temperature_max_c": 45.0,
+      "max_power_w": 276.48
+    },
+    "pr-before-start3/c64": {
+      "samples_1hz": 64,
+      "sampled_max_memory_mib": 137694.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 43.0,
+      "temperature_max_c": 50.0,
+      "max_power_w": 286.86
+    },
+    "pr-after-start1/c32": {
+      "samples_1hz": 24,
+      "sampled_max_memory_mib": 96918.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 44.0,
+      "temperature_max_c": 50.0,
+      "max_power_w": 414.01
+    },
+    "pr-after-start1/c64": {
+      "samples_1hz": 17,
+      "sampled_max_memory_mib": 97600.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 50.0,
+      "temperature_max_c": 52.0,
+      "max_power_w": 427.77
+    },
+    "pr-after-start2/c32": {
+      "samples_1hz": 24,
+      "sampled_max_memory_mib": 96960.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 46.0,
+      "temperature_max_c": 51.0,
+      "max_power_w": 416.37
+    },
+    "pr-after-start2/c64": {
+      "samples_1hz": 17,
+      "sampled_max_memory_mib": 97696.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 51.0,
+      "temperature_max_c": 53.0,
+      "max_power_w": 424.41
+    },
+    "pr-after-start3/c32": {
+      "samples_1hz": 24,
+      "sampled_max_memory_mib": 96912.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 41.0,
+      "temperature_max_c": 50.0,
+      "max_power_w": 414.54
+    },
+    "pr-after-start3/c64": {
+      "samples_1hz": 17,
+      "sampled_max_memory_mib": 97650.0,
+      "sm_clock_mhz": [
+        1980.0
+      ],
+      "memory_clock_mhz": [
+        3201.0
+      ],
+      "temperature_min_c": 50.0,
+      "temperature_max_c": 52.0,
+      "max_power_w": 436.11
+    }
+  },
+  "baseline_long_outputs": [
+    {
+      "id": "common_voice_en_86172-common_voice_en_86171",
+      "concurrency": "c32",
+      "audio_duration_s": 61.64,
+      "official_wer": 0.2777777777777778
+    },
+    {
+      "id": "common_voice_en_648428-common_voice_en_648429",
+      "concurrency": "c64",
+      "audio_duration_s": 30.12,
+      "official_wer": 0.46153846153846156
+    }
+  ],
+  "external_reference": {
+    "role": "Historical separate reference, not before/after denominator",
+    "revision": "7dc8909e78534a07400e86f781a969437ecc70e3",
+    "groups": {
+      "sglang/c32": {
+        "requests": 3264,
+        "failures": 0,
+        "wall_s": 110.12163949850947,
+        "audio_s_per_s": 127.5821906028757,
+        "qps": 29.639951011119656,
+        "ttfa_mean_ms": 155.56780024509803,
+        "ttfa_p50_ms": 155.20000000000002,
+        "ttfa_p95_ms": 183.4,
+        "ttfa_p99_ms": 197.41099999999997,
+        "completion_mean_s": 1.0650983455882355,
+        "completion_p95_s": 1.5351849999999998,
+        "max_underrun_mean_s": 0.0,
+        "max_underrun_p95_s": 0.0,
+        "starts": [
+          {
+            "start": 1,
+            "audio_s_per_s": 128.0001055657007,
+            "qps": 29.6526182908797,
+            "ttfa_mean_ms": 155.20698529411763,
+            "ttfa_p95_ms": 183.865,
+            "wall_s": 36.691532239317894
+          },
+          {
+            "start": 2,
+            "audio_s_per_s": 127.17728567191753,
+            "qps": 29.597116372563953,
+            "ttfa_mean_ms": 155.71332720588236,
+            "ttfa_p95_ms": 183.52499999999995,
+            "wall_s": 36.7603379432112
+          },
+          {
+            "start": 3,
+            "audio_s_per_s": 127.56993259735029,
+            "qps": 29.670216646982254,
+            "ttfa_mean_ms": 155.78308823529414,
+            "ttfa_p95_ms": 182.565,
+            "wall_s": 36.669769315980375
+          }
+        ]
+      },
+      "sglang/c64": {
+        "requests": 3264,
+        "failures": 0,
+        "wall_s": 87.41393460612744,
+        "audio_s_per_s": 161.02375511893885,
+        "qps": 37.33958452627762,
+        "ttfa_mean_ms": 240.6996629901961,
+        "ttfa_p50_ms": 238.9,
+        "ttfa_p95_ms": 286.185,
+        "ttfa_p99_ms": 323.8589999999999,
+        "completion_mean_s": 1.6798647671568627,
+        "completion_p95_s": 2.46394,
+        "max_underrun_mean_s": 0.04428057598039215,
+        "max_underrun_p95_s": 0.09408499999999999,
+        "starts": [
+          {
+            "start": 1,
+            "audio_s_per_s": 161.30812735648647,
+            "qps": 37.46482908750966,
+            "ttfa_mean_ms": 239.51194852941177,
+            "ttfa_p95_ms": 282.565,
+            "wall_s": 29.040570222772658
+          },
+          {
+            "start": 2,
+            "audio_s_per_s": 160.1453271883759,
+            "qps": 36.97909842967719,
+            "ttfa_mean_ms": 242.3231617647059,
+            "ttfa_p95_ms": 288.2399999999998,
+            "wall_s": 29.422026122920215
+          },
+          {
+            "start": 3,
+            "audio_s_per_s": 161.63121572846285,
+            "qps": 37.58030078654018,
+            "ttfa_mean_ms": 240.2638786764706,
+            "ttfa_p95_ms": 287.92499999999995,
+            "wall_s": 28.951338260434568
+          }
+        ]
+      }
+    }
+  },
+  "checks": {
+    "regression": "278 passed, 19 warnings in 7.78s",
+    "mypy": "25 production + 41 test errors, identical to clean baseline; zero additional diagnostics",
+    "other_applicable_precommit": "passed"
+  },
+  "limitations": [
+    "Full configuration/code comparison, not isolated kernel attribution or equal-quality microbenchmark.",
+    "Baseline round2 unusually long outputs retained; all start ranges disclosed.",
+    "Quality evaluated first paired performance start only; all clone validation WAVs scored.",
+    "No speaker similarity, human listening, multi-GPU or long-soak claim."
+  ]
+}
