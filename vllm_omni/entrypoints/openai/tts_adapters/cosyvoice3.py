@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_standard_sampling
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -40,7 +41,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
     ) -> dict[str, Any]:
         """Build the multimodal CosyVoice3 voice-cloning prompt."""
         server = self.ctx.server
-        wav_samples, sr, _ = await server._resolve_ref_audio(request.ref_audio)
+        wav_samples, sr, _ = await server._resolve_ref_audio_array(request.ref_audio)
         ref_text = request.ref_text or ""
         if _PROMPT_DELIMITER not in ref_text:
             ref_text = f"{_PROMPT_PREFIX}{ref_text}"
@@ -52,7 +53,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
                 mm_kwargs["voice_created_at"] = server._voice_created_at(voice_lower)
         return {
             "prompt": request.input,
-            "multi_modal_data": {"audio": (np.asarray(wav_samples, dtype=np.float32), sr)},
+            "multi_modal_data": {"audio": (np.array(wav_samples, dtype=np.float32, copy=True), sr)},
             "mm_processor_kwargs": mm_kwargs,
         }
 
@@ -110,6 +111,11 @@ class CosyVoice3Adapter(ARTTSAdapter):
         server = self.ctx.server
         sampling_params_list = copy.deepcopy(sampling_params_list)
         hf_cfg = server.model_config.hf_config
+        if cosyvoice3_standard_sampling(hf_cfg):
+            first_control = int(hf_cfg.llm["speech_token_size"])
+            controls = list(range(first_control, first_control + 200))
+            sampling_params_list[0].stop_token_ids = controls
+            sampling_params_list[0].all_stop_token_ids.update(controls)
         # Build the Qwen tokenizer once per process (resolving the model dir via
         # snapshot_download at most once) and reuse it across requests.
         tokenizer = self._tokenizer

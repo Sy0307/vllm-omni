@@ -23,6 +23,10 @@ except ImportError:
 from torch.distributions.uniform import Uniform
 
 from vllm_omni.model_executor.models.common.snake_activation import Snake
+from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    cosyvoice3_full_response_enabled,
+    cosyvoice3_packed_streaming_enabled,
+)
 
 """hifigan based generator implementation.
 
@@ -941,8 +945,15 @@ class CausalHiFTGenerator(HiFTGenerator):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move
         # self.f0_predictor to cpu if necessary
-        self.f0_predictor.to("cpu")
-        f0 = self.f0_predictor(speech_feat.cpu(), finalize=finalize).to(speech_feat)
+        if speech_feat.is_cuda and (
+            cosyvoice3_packed_streaming_enabled()
+            or (cosyvoice3_full_response_enabled() and finalize and phase_acc is None)
+        ):
+            self.f0_predictor.to(device=speech_feat.device, dtype=torch.float64)
+            f0 = self.f0_predictor(speech_feat.double(), finalize=finalize).to(speech_feat)
+        else:
+            self.f0_predictor.to(device="cpu", dtype=torch.float32)
+            f0 = self.f0_predictor(speech_feat.float().cpu(), finalize=finalize).to(speech_feat)
         if f0_margin > 0:
             f0 = f0[:, f0_margin:]
             speech_feat = speech_feat[:, :, f0_margin:]
@@ -1083,7 +1094,7 @@ class CausalConv1d(torch.nn.Conv1d):
     def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor]:
         input_timestep = x.shape[2]
         if cache.size(2) == 0:
-            cache = torch.zeros(x.shape[0], x.shape[1], self.causal_padding).to(x)
+            cache = x.new_zeros(x.shape[0], x.shape[1], self.causal_padding)
         assert cache.size(2) == self.causal_padding
         if self.causal_type == "left":
             x = torch.concat([cache, x], dim=2)

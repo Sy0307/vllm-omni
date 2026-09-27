@@ -103,3 +103,56 @@ def test_numeric_waveform_cache_limits(server, entries, budget):
     server._put_resolved_ref_audio("b", np.ones(2, dtype=np.float32), 24000, "artifact-b")
     assert list(server._ref_audio_resolve_cache) == ["b"]
     assert server._ref_audio_resolve_cache_bytes == 8
+
+
+@pytest.mark.asyncio
+async def test_cosyvoice_array_prompt_owns_buffer_without_list_roundtrip(mocker):
+    from types import SimpleNamespace
+
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+
+    waveform = np.linspace(-1, 1, 24000, dtype=np.float32)
+    server = mocker.Mock()
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(waveform, 24000, "key"))
+    server._resolve_ref_audio = mocker.AsyncMock(side_effect=AssertionError("unnecessary list conversion"))
+    adapter = CosyVoice3Adapter(SpeechServingContext(server=server))
+    request = SimpleNamespace(input="Target text.", ref_audio="reference", ref_text="Reference text.", voice=None)
+    prompt = await adapter._build_prompt(request)
+    actual, rate = prompt["multi_modal_data"]["audio"]
+    np.testing.assert_array_equal(actual, waveform)
+    assert rate == 24000 and actual.dtype == np.float32
+    assert not np.shares_memory(actual, waveform)
+    actual[0] = 100
+    assert waveform[0] == -1
+    assert prompt["prompt"] == request.input
+    assert prompt["mm_processor_kwargs"]["prompt_text"].endswith("<|endofprompt|>Reference text.")
+    server._resolve_ref_audio.assert_not_awaited()
+    server._resolve_ref_audio_array.assert_awaited_once_with("reference")
+
+
+@pytest.mark.parametrize("mode", ["ras", "standard"])
+def test_cosyvoice_sampling_mode_sets_control_stops_without_mutating_defaults(mocker, mode):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+    config = CosyVoice3Config()
+    config.cosyvoice3_sampling_mode = mode
+    serving = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    serving.model_config = mocker.Mock(hf_config=config)
+    adapter = CosyVoice3Adapter(SpeechServingContext(server=serving))
+    adapter._tokenizer = mocker.Mock()
+    mocker.patch("vllm_omni.model_executor.models.cosyvoice3.utils.extract_text_token", return_value=(None, 9))
+    defaults = [SamplingParams(stop_token_ids=[6562])]
+    request = OpenAICreateSpeechRequest(input="Example text.", max_new_tokens=2048)
+    result = adapter.apply_sampling_overrides(defaults, request)
+    assert defaults[0].stop_token_ids == [6562]
+    assert result[0].min_tokens == 18
+    assert result[0].max_tokens == 2048
+    expected = set(range(6561, 6761)) if mode == "standard" else {6562}
+    assert set(result[0].stop_token_ids) == expected
+    assert expected <= result[0].all_stop_token_ids

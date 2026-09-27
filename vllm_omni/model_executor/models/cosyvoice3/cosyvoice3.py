@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+import hashlib
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
@@ -42,6 +43,8 @@ from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_enabled,
+    cosyvoice3_packed_inference_enabled,
+    cosyvoice3_standard_sampling,
 )
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
@@ -344,7 +347,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         )
         device = "cpu"
 
-        # Speaker cache: skip 3 ONNX sessions on cache hit
+        # Reuse bounded, process-local audio conditioning artifacts.
         voice_name = mm_kwargs.get("voice_name")
         cache_key = None
         if voice_name and isinstance(voice_name, str):
@@ -353,18 +356,31 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
                 model_type="cosyvoice3",
                 created_at=int(mm_kwargs.get("voice_created_at") or 0),
             )
-            cached = self._speaker_cache.get(cache_key)
-            if cached is not None:
-                ft = BatchFeature(
-                    {
-                        "input_ids": input_ids,
-                        "speech_feat": cached["speech_feat"].clone(),
-                        "speech_token": cached["speech_token"].clone(),
-                        "speech_token_len": [cached["speech_token_len"].clone()],
-                        "embedding": cached["embedding"].clone(),
-                    }
-                )
-                return ft
+        else:
+            # Cache audio artifacts only: reference/target text is tokenized
+            # separately above. Keep dtype and sample rate in the identity to
+            # avoid aliases between numerically distinct preprocessing inputs.
+            waveform, sample_rate = audio
+            waveform = np.ascontiguousarray(waveform)
+            digest = hashlib.sha256()
+            digest.update(str((int(sample_rate), waveform.shape, waveform.dtype.str)).encode())
+            digest.update(memoryview(waveform).cast("B"))
+            backend = "trt" if self.campplus_trt is not None else "onnx"
+            cache_key = self._speaker_cache.make_cache_key(
+                digest.hexdigest(), model_type=f"cosyvoice3-reference:{model_dir}:{backend}"
+            )
+        cached = self._speaker_cache.get(cache_key)
+        if cached is not None:
+            ft = BatchFeature(
+                {
+                    "input_ids": input_ids,
+                    "speech_feat": cached["speech_feat"].clone(),
+                    "speech_token": cached["speech_token"].clone(),
+                    "speech_token_len": [cached["speech_token_len"].clone()],
+                    "embedding": cached["embedding"].clone(),
+                }
+            )
+            return ft
 
         # Speech-token extraction via the S3Tokenizer PyTorch model on GPU
         # (~30x faster than the bundled ``speech_tokenizer_v3.onnx`` CPU ONNX
@@ -383,15 +399,15 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         else:
             embedding = extract_spk_embedding(audio, self.campplus_session, device)
 
-        # Cache the extracted artifacts for named speakers
+        # Cache independent copies so downstream mutation cannot poison a hit.
         if cache_key is not None:
             self._speaker_cache.put(
                 cache_key,
                 {
-                    "speech_feat": speech_feat.detach().cpu(),
-                    "speech_token": speech_token.detach().cpu(),
-                    "speech_token_len": speech_token_len.detach().cpu(),
-                    "embedding": embedding.detach().cpu(),
+                    "speech_feat": speech_feat.detach().cpu().clone(),
+                    "speech_token": speech_token.detach().cpu().clone(),
+                    "speech_token_len": speech_token_len.detach().cpu().clone(),
+                    "embedding": embedding.detach().cpu().clone(),
                 },
             )
 
@@ -487,13 +503,18 @@ class CosyVoice3Model(
     supports_multimodal_raw_input_only = True
     supports_multimodal = True
     requires_raw_input_tokens = True
+    supports_embed_input_ids_query_start_loc = True
     prefer_model_sampler = True
     _sampling_eps = 1e-5
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        standard_sampling = cosyvoice3_standard_sampling(self.config)
+        logger.info("CosyVoice3 sampling policy: %s", "standard" if standard_sampling else "ras")
         self.have_multimodal_outputs = True
+        # Full-response codec consumes tokens and conditioning, not LLM hidden states.
+        self.omni_pooler_payload_include_hidden = not cosyvoice3_packed_inference_enabled()
         self.model_stage = vllm_config.model_config.model_stage
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
@@ -692,6 +713,74 @@ class CosyVoice3Model(
             return False
         return True
 
+    def _ras_sample_batch(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        *,
+        default_top_p: float,
+        default_top_k: int,
+        win_size: int,
+        tau_r: float,
+    ) -> torch.Tensor:
+        """Batch random RAS without per-row scalar parameter/token transfers.
+
+        Rejection flags cross to the host once per batch so only requests that
+        actually reject a token consume a second RNG draw. Per-request seeded
+        generators retain their ownership when rejection compacts the batch.
+        """
+        batch_size = logits.shape[0]
+
+        def parameter(value: torch.Tensor | None, default: float | int) -> torch.Tensor:
+            if value is None or value.numel() == 0:
+                return torch.full((batch_size,), default, device=logits.device)
+            value = value.reshape(-1).to(device=logits.device)
+            if value.numel() < batch_size:
+                value = torch.cat((value, value[-1:].expand(batch_size - value.numel())))
+            return value[:batch_size]
+
+        temperature = parameter(sampling_metadata.temperature, 1.0)
+        top_p = parameter(sampling_metadata.top_p, default_top_p)
+        top_k = parameter(sampling_metadata.top_k, default_top_k)
+        weighted_scores = torch.log_softmax(logits / temperature.clamp_min(self._sampling_eps).unsqueeze(1), dim=1)
+        sorted_probs, sorted_ids = weighted_scores.softmax(dim=1).sort(dim=1, descending=True, stable=True)
+        # Keep top-p based on the full distribution, before top-k masking.
+        keep = (sorted_probs.cumsum(dim=1) - sorted_probs) < top_p.unsqueeze(1)
+        ranks = torch.arange(logits.shape[1], device=logits.device)
+        keep &= (top_k.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_k.unsqueeze(1))
+        weights = sorted_probs * keep.to(sorted_probs.dtype)
+        generators = {i: g for i, g in sampling_metadata.generators.items() if i < batch_size}
+        draws = random_sample(weights, generators).reshape(-1, 1).long()
+        sampled = sorted_ids.gather(1, draws).squeeze(1)
+
+        histories = sampling_metadata.output_token_ids
+        if win_size > 0 and any(histories[:batch_size]):
+            recent = []
+            for i in range(batch_size):
+                row = list(histories[i][-win_size:]) if i < len(histories) else []
+                recent.append([-1] * (win_size - len(row)) + row)
+            history = torch.tensor(recent, dtype=torch.long, device=logits.device)
+            repeated = ((history == sampled.unsqueeze(1)).sum(dim=1) >= win_size * tau_r) & (history >= 0).any(dim=1)
+            rejected_rows = [i for i, reject in enumerate(repeated.tolist()) if reject]
+            if rejected_rows:
+                rows = torch.tensor(rejected_rows, device=logits.device, dtype=torch.long)
+                scores = weighted_scores.index_select(0, rows)
+                rejected_ids = sampled.index_select(0, rows).unsqueeze(1)
+                original = scores.gather(1, rejected_ids)
+                scores.scatter_(1, rejected_ids, float("-inf"))
+                replacement = torch.where(
+                    torch.isfinite(scores).any(dim=1, keepdim=True),
+                    torch.full_like(original, float("-inf")),
+                    original,
+                )
+                scores.scatter_(1, rejected_ids, replacement)
+                compact_generators = {i: generators[row] for i, row in enumerate(rejected_rows) if row in generators}
+                # RAS rejection samples the complete remaining distribution,
+                # without applying top-k/top-p a second time.
+                replacement_ids = random_sample(scores.softmax(dim=1), compact_generators).reshape(-1).long()
+                sampled.index_copy_(0, rows, replacement_ids)
+        return sampled.to(torch.int32)
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -701,6 +790,20 @@ class CosyVoice3Model(
             return None
         if self.model_stage != "cosyvoice3_talker":
             return None
+
+        if cosyvoice3_standard_sampling(self.config):
+            sampler = getattr(self, "_talker_sampler", None)
+            if sampler is None:
+                sampler = Sampler()
+                self._talker_sampler = sampler
+            # SGLang penalizes generated tokens only, never text or reference
+            # speech in the multimodal prompt. Padding is ignored by vLLM.
+            if sampling_metadata.prompt_token_ids is not None:
+                sampling_metadata = replace(
+                    sampling_metadata,
+                    prompt_token_ids=torch.full_like(sampling_metadata.prompt_token_ids, logits.shape[-1]),
+                )
+            return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         if not self._cosyvoice3_ras_enabled(sampling_metadata):
             sampler = getattr(self, "_talker_sampler", None)
@@ -717,6 +820,14 @@ class CosyVoice3Model(
             logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             logits = processor.apply(logits)
+        # The text tokenizer vocabulary is much larger than the speech head.
+        # compute_logits pads its output for the generic sampler/processors;
+        # RAS only needs speech codes and the merged stop token. Keep the
+        # original token indices, and trim only after full-vocabulary masks
+        # and processors have run. The generic sampler fallback above retains
+        # its full-vocabulary contract (including logprobs and bad words).
+        speech_head_size = int(self.config.llm["speech_token_size"]) + 200
+        logits = logits[..., :speech_head_size]
         finite_logits = torch.isfinite(logits)
         if not finite_logits.any(dim=-1).all().item():
             raise ValueError("CosyVoice3 sampling received a row with no finite logits")
@@ -727,6 +838,17 @@ class CosyVoice3Model(
         default_top_k = int(sampling_cfg.get("top_k", 25))
         win_size = int(sampling_cfg.get("win_size", 10))
         tau_r = float(sampling_cfg.get("tau_r", 0.1))
+
+        if sampling_metadata.all_random:
+            sampled = self._ras_sample_batch(
+                logits,
+                sampling_metadata,
+                default_top_p=default_top_p,
+                default_top_k=default_top_k,
+                win_size=win_size,
+                tau_r=tau_r,
+            )
+            return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
         sampled_ids: list[int] = []
         for req_idx in range(int(logits.shape[0])):
@@ -771,10 +893,11 @@ class CosyVoice3Model(
             # fires with the correct aggregate stop probability.
             speech_token_size = self.config.llm["speech_token_size"]
             eos_idx = self.config.llm["eos_token_id"]
-            stop_logits = logits[..., speech_token_size:]  # last 200
-            merged_stop = torch.logsumexp(stop_logits, dim=-1, keepdim=True)
-            logits[..., speech_token_size:] = float("-inf")  # mask all
-            logits[..., eos_idx] = merged_stop.squeeze(-1)  # restore merged
+            if not cosyvoice3_standard_sampling(self.config):
+                stop_logits = logits[..., speech_token_size:]  # last 200
+                merged_stop = torch.logsumexp(stop_logits, dim=-1, keepdim=True)
+                logits[..., speech_token_size:] = float("-inf")  # mask all
+                logits[..., eos_idx] = merged_stop.squeeze(-1)  # restore merged
             # Pad to full vocab_size for vLLM token handling.
             vocab_size = self.config.vocab_size
             pad_size = vocab_size - logits.size(-1)
@@ -809,85 +932,68 @@ class CosyVoice3Model(
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
         is_multimodal=None,
+        query_start_loc: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if self.model_stage == "cosyvoice3_talker":
-            if is_multimodal is not None and any(is_multimodal):
-                # Per-request rearrange for the talker prompt layout
-                # [SOS_ph, TASK_ID_ph, AUDIO_ph * pstoken_len, ...text_tokens...]
-                # → [SOS_emb, ...text_embs..., TASK_ID_emb, AUDIO_embs].
-                #
-                # In batched prefill ``input_ids`` is the flat concatenation of
-                # N sequences and ``multimodal_embeddings`` is a list with one
-                # tensor per multimodal request. Each request's audio
-                # placeholders form one contiguous ``True`` group in
-                # ``is_multimodal``; the 2 positions immediately before each
-                # group are the SOS / TASK_ID placeholders. Walking the groups
-                # lets us locate every request's segment without needing a
-                # ``seq_token_counts`` kwarg (which only the generation runner
-                # injects, not the AR runner used here).
-                embed_tokens = self.model.llm.model.embed_tokens(input_ids)
-                sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
-                task_id = self.model.speech_embedding.weight[self.model.task_id].reshape(1, -1)
+            if is_multimodal is None or not torch.any(is_multimodal):
+                return self.model.speech_embedding.weight[input_ids]
 
-                is_mm = is_multimodal.to(torch.bool).reshape(-1)
-                # vLLM v1's multimodal placeholder range covers the FULL
-                # ``[SOS_ph, TASK_ID_ph, AUDIO_ph * pstoken_len]`` block
-                # (length ``2 + pstoken_len``, see ``_get_prompt_updates``'s
-                # ``insertion_end`` which inserts ``[1] * (1 + 1 + token_len)``
-                # and ``mm_position.length`` matches that). So each contiguous
-                # ``True`` group in ``is_mm`` starts at a request's SOS
-                # placeholder, NOT at its first audio placeholder.
-                prev_false = torch.cat([torch.ones(1, dtype=torch.bool, device=is_mm.device), ~is_mm[:-1]])
-                group_starts = (is_mm & prev_false).nonzero(as_tuple=True)[0].tolist()
-                if len(group_starts) != len(multimodal_embeddings):
-                    raise RuntimeError(
-                        f"cosyvoice3 talker: found {len(group_starts)} placeholder "
-                        f"blocks in is_multimodal but {len(multimodal_embeddings)} "
-                        f"multimodal_embeddings tensors — these must match 1:1."
-                    )
+            # Requests can interleave new prefills and ongoing decodes after
+            # scheduler slot reuse. A placeholder group identifies the start
+            # of a prompt, but cannot identify its end: use runner boundaries.
+            total_tokens = input_ids.numel()
+            boundaries = list(query_start_loc) if query_start_loc is not None else [0, total_tokens]
+            if not boundaries or boundaries[0] != 0 or boundaries[-1] != total_tokens:
+                raise ValueError("CosyVoice3 input embedding boundaries must cover all scheduled tokens")
+            if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
+                raise ValueError("CosyVoice3 input embedding boundaries must be strictly increasing")
+            mm_mask = is_multimodal.reshape(-1).tolist()
+            # Conditioning contains prefill rows only, whereas the downstream
+            # payload splitter indexes the full (prefill + decode) request batch.
+            self._conditioning_request_rows = [
+                i for i, (start, end) in enumerate(zip(boundaries, boundaries[1:])) if any(mm_mask[start:end])
+            ]
+            self._conditioning_request_count = len(boundaries) - 1
 
-                total_tokens = int(embed_tokens.shape[0])
-                # vLLM v1 packs cached (decode) requests first, then new
-                # (prefill) requests. The decode tokens at positions
-                # ``[0:group_starts[0]]`` get a speech_embedding lookup (the
-                # talker is generating codec tokens here, so input ids are
-                # codec ids, not text ids). Positions starting at
-                # ``group_starts[0]`` are the first new prefill request's
-                # SOS placeholder.
-                segments: list[torch.Tensor] = []
-                first_prefill = group_starts[0]
-                if first_prefill > 0:
-                    decode_ids = input_ids[:first_prefill].to(dtype=torch.long)
-                    segments.append(self.model.speech_embedding.weight[decode_ids])
-
-                for i, req_start in enumerate(group_starts):
-                    pstoken_len_i = int(multimodal_embeddings[i].shape[0])
-                    # Real text starts after the 2 + pstoken_len_i leading
-                    # placeholders of this request's prompt.
-                    text_start = req_start + 2 + pstoken_len_i
-                    # Next request's segment starts at its own SOS placeholder,
-                    # which is exactly the next True group's first index.
-                    if i + 1 < len(group_starts):
-                        req_end = group_starts[i + 1]
-                    else:
-                        req_end = total_tokens
-                    segments.append(sos)
-                    segments.append(embed_tokens[text_start:req_end])
-                    segments.append(task_id)
-                    segments.append(multimodal_embeddings[i])
-                embed_tokens = torch.cat(segments, dim=0)
-            else:
-                embed_tokens = self.model.speech_embedding.weight[input_ids]
-            return embed_tokens
+            text_embeds = self.model.llm.model.embed_tokens(input_ids)
+            sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
+            task_id = self.model.speech_embedding.weight[self.model.task_id].reshape(1, -1)
+            segments = []
+            mm_index = 0
+            for start, end in zip(boundaries, boundaries[1:]):
+                request_mask = mm_mask[start:end]
+                if not any(request_mask):
+                    segments.append(self.model.speech_embedding.weight[input_ids[start:end]])
+                    continue
+                if multimodal_embeddings is None or mm_index >= len(multimodal_embeddings):
+                    raise ValueError("CosyVoice3 prefill is missing its speech embedding")
+                speech = multimodal_embeddings[mm_index]
+                mm_index += 1
+                prefix_len = 2 + speech.shape[0]
+                # The processor marks SOS, TASK_ID and all speech placeholders.
+                # Rearrangement needs the complete prompt block in this call.
+                if request_mask != [True] * prefix_len + [False] * (end - start - prefix_len):
+                    raise ValueError("CosyVoice3 requires a complete prefill block within each request boundary")
+                segments.extend((sos, text_embeds[start + prefix_len : end], task_id, speech))
+            if mm_index != len(multimodal_embeddings):
+                raise ValueError("CosyVoice3 speech embeddings must match prefill requests one to one")
+            return torch.cat(segments, dim=0)
         elif self.model_stage == "cosyvoice3_code2wav":
             assert input_ids.dim() == 1
-            hidden = int(self.config.hidden_size)
-            return torch.zeros(
-                (input_ids.shape[0], hidden),
-                device=input_ids.device,
-            )
+            return torch.zeros((input_ids.shape[0], int(self.config.hidden_size)), device=input_ids.device)
         else:
             raise RuntimeError(f"embed_input_ids is not valid for {self.model_stage}.")
+
+    def _align_prompt_conditioning(self, values):
+        rows = getattr(self, "_conditioning_request_rows", None)
+        if values is None or rows is None:
+            return values
+        if len(rows) != len(values):
+            raise ValueError("CosyVoice3 conditioning must match the prefill request rows")
+        aligned = [None] * self._conditioning_request_count
+        for row, value in zip(rows, values):
+            aligned[row] = value
+        return aligned
 
     @staticmethod
     def _split_prompt_conditioning(speech_token, speech_feat, embedding, speech_token_len):
@@ -980,6 +1086,9 @@ class CosyVoice3Model(
             return
         self._code2wav_trt_done = True
 
+        # Packed Flow owns the torch estimator; speaker TRT remains independent.
+        if cosyvoice3_packed_inference_enabled():
+            return
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
         onnx_path = self._resolve_flow_estimator_onnx()
@@ -1005,6 +1114,54 @@ class CosyVoice3Model(
                 exc,
             )
 
+    def make_omni_output(self, hidden_states: torch.Tensor, **kwargs) -> OmniOutput:
+        """Attach live prefill conditioning outside the full-response CUDA graph.
+
+        Graph replay reuses capture-time output containers. Returning conditioning
+        from the captured forward would replay dummy prompt tensors on every
+        decode step. The runner calls this adapter with the current step's kwargs.
+        """
+        multimodal_outputs = {}
+
+        if "speech_token" in kwargs:
+            # Prompt conditioning tensors for code2wav: live under
+            # ``embed.*`` per OmniPayloadStruct schema.
+            #
+            # vLLM hands these mm fields to forward() as collated, padded
+            # batch tensors (speech_token [B, maxT], speech_feat
+            # [B, 2*maxT, F], embedding [B, D]). Emitting them raw makes the
+            # downstream per-request payload split fragile at batch>1: it
+            # intermittently de-batches speech_token to 1-D and leaks the
+            # whole [B, D] embedding to every request, which corrupts voice
+            # conditioning and crashes code2wav (`prompt_token.shape[1]`).
+            # Instead, split into an explicit per-request list of unpadded,
+            # correctly-ranked tensors so ``to_payload_element`` splits them
+            # deterministically by request index (list[idx]).
+            speech_token_list, speech_feat_list, embedding_list, speech_token_len_list = (
+                self._split_prompt_conditioning(
+                    kwargs.get("speech_token"),
+                    kwargs.get("speech_feat"),
+                    kwargs.get("embedding"),
+                    kwargs.get("speech_token_len"),
+                )
+            )
+            speech_token_list = self._align_prompt_conditioning(speech_token_list)
+            speech_feat_list = self._align_prompt_conditioning(speech_feat_list)
+            embedding_list = self._align_prompt_conditioning(embedding_list)
+            speech_token_len_list = self._align_prompt_conditioning(speech_token_len_list)
+            multimodal_outputs = to_dict(
+                OmniPayloadStruct(
+                    embed=EmbeddingsStruct(
+                        speech_token=speech_token_list,
+                        speech_feat=speech_feat_list,
+                        speech_token_len=speech_token_len_list,
+                        embedding=embedding_list,
+                    ),
+                )
+            )
+
+        return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1013,7 +1170,7 @@ class CosyVoice3Model(
         inputs_embeds: torch.Tensor | None = None,
         additional_information: dict[str, object] | None = None,
         **kwargs: object,
-    ) -> OmniOutput:
+    ) -> torch.Tensor | OmniOutput:
         if self.model_stage == "cosyvoice3_talker":
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
@@ -1021,42 +1178,9 @@ class CosyVoice3Model(
             # [total_tokens, hidden]
             hidden_states = self.model.llm(inputs_embeds, positions)
 
-            multimodal_outputs = {}
-
-            if "speech_token" in kwargs:
-                # Prompt conditioning tensors for code2wav: live under
-                # ``embed.*`` per OmniPayloadStruct schema.
-                #
-                # vLLM hands these mm fields to forward() as collated, padded
-                # batch tensors (speech_token [B, maxT], speech_feat
-                # [B, 2*maxT, F], embedding [B, D]). Emitting them raw makes the
-                # downstream per-request payload split fragile at batch>1: it
-                # intermittently de-batches speech_token to 1-D and leaks the
-                # whole [B, D] embedding to every request, which corrupts voice
-                # conditioning and crashes code2wav (`prompt_token.shape[1]`).
-                # Instead, split into an explicit per-request list of unpadded,
-                # correctly-ranked tensors so ``to_payload_element`` splits them
-                # deterministically by request index (list[idx]).
-                speech_token_list, speech_feat_list, embedding_list, speech_token_len_list = (
-                    self._split_prompt_conditioning(
-                        kwargs.get("speech_token"),
-                        kwargs.get("speech_feat"),
-                        kwargs.get("embedding"),
-                        kwargs.get("speech_token_len"),
-                    )
-                )
-                multimodal_outputs = to_dict(
-                    OmniPayloadStruct(
-                        embed=EmbeddingsStruct(
-                            speech_token=speech_token_list,
-                            speech_feat=speech_feat_list,
-                            speech_token_len=speech_token_len_list,
-                            embedding=embedding_list,
-                        ),
-                    )
-                )
-
-            return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
+            if cosyvoice3_packed_inference_enabled():
+                return hidden_states
+            return self.make_omni_output(hidden_states, **kwargs)
         elif self.model_stage == "cosyvoice3_code2wav":
             # Lazily swap the flow-decoder estimator to a TensorRT engine on the
             # first code2wav step (after weights are loaded), gated by the same
@@ -1202,7 +1326,7 @@ class CosyVoice3Model(
                         item_shapes,
                     )
                 if (
-                    len(streaming_flow_items) > 1
+                    (len(streaming_flow_items) > 1 or cosyvoice3_packed_inference_enabled())
                     and cosyvoice3_batch_flow_enabled()
                     and hasattr(self.code2wav, "forward_streaming_batch")
                 ):

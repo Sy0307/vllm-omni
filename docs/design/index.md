@@ -9,6 +9,8 @@ in the active navigation.
 
 - [Architecture Overview](architecture_overview.md)
 
+- [CosyVoice3 Packed Inference](cosyvoice3_packed_inference.md)
+
 ## Feature Design Documents
 
 For user-facing configuration and current compatibility, see the

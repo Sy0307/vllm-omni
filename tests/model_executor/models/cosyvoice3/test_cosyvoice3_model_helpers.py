@@ -511,6 +511,63 @@ def test_sample_keeps_only_finite_token_after_ras_rejection():
     assert out.sampled_token_ids.tolist() == [[1]]
 
 
+def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
+    model = _make_talker_model()
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, 3.0, 1.0, -2.0], [1.0, 0.0, 2.0, -1.0]])
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [], [2] * 10])
+    metadata.temperature = torch.tensor([0.5, 1.0, 1.5])
+    metadata.top_k = torch.tensor([1, 2, 4])
+    metadata.top_p = torch.tensor([0.7, 0.8, 0.9])
+    metadata.generators = {i: torch.Generator().manual_seed(400 + i) for i in range(3)}
+    reference_generators = {i: torch.Generator().manual_seed(400 + i) for i in range(3)}
+    for _ in range(6):
+        expected = []
+        for i in range(3):
+            scores = torch.log_softmax(logits[i] / metadata.temperature[i], dim=0)
+            expected.append(
+                model._ras_sample_one(
+                    scores,
+                    metadata.output_token_ids[i],
+                    top_p=float(metadata.top_p[i]),
+                    top_k=int(metadata.top_k[i]),
+                    win_size=10,
+                    tau_r=0.1,
+                    generator=reference_generators[i],
+                )
+            )
+        actual = model._ras_sample_batch(logits, metadata, default_top_p=0.8, default_top_k=25, win_size=10, tau_r=0.1)
+        assert actual.tolist() == expected
+        for i, token in enumerate(expected):
+            assert torch.equal(metadata.generators[i].get_state(), reference_generators[i].get_state())
+            metadata.output_token_ids[i].append(token)
+
+
+def test_batched_ras_top_p_uses_full_distribution_before_top_k(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
+
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.top_k = torch.tensor([2])
+    metadata.top_p = torch.tensor([0.5])
+    captured = []
+
+    def sample(probs, generators):
+        captured.append(probs.clone())
+        return probs.argmax(dim=-1)
+
+    monkeypatch.setattr(mod, "random_sample", sample)
+    model._ras_sample_batch(
+        torch.tensor([[0.4, 0.3, 0.2, 0.1]]).log(),
+        metadata,
+        default_top_p=0.8,
+        default_top_k=25,
+        win_size=10,
+        tau_r=0.1,
+    )
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0], torch.tensor([[0.4, 0.3, 0.0, 0.0]]))
+
+
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     metadata = _make_sampling_metadata(output_token_ids=[[1, 2, 3]])
     expected = SamplerOutput(
@@ -637,3 +694,242 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
     assert runner.input_batch.async_copy_ready_event.synced is True
     assert runner.input_batch.update_async_called is True
     assert seen_histories == [[[11, 29]]]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [("decode", "short", "decode", "long"), ("short", "decode", "long", "decode"), ("long", "short", "decode")],
+)
+def test_embed_input_ids_preserves_interleaved_request_boundaries(order):
+    model = _make_talker_model()
+    speech = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4))
+    text = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4) + 1000)
+    model.model = SimpleNamespace(
+        speech_embedding=speech, sos=0, task_id=1, llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=text))
+    )
+    requests = {
+        "decode": (torch.tensor([7]), torch.tensor([False]), None, speech.weight[7:8]),
+        "short": (
+            torch.tensor([1, 1, 1, 1, 21]),
+            torch.tensor([True] * 4 + [False]),
+            speech.weight[2:4],
+            torch.cat((speech.weight[0:1], text.weight[21:22], speech.weight[1:2], speech.weight[2:4])),
+        ),
+        "long": (
+            torch.tensor([1, 1, 1, 1, 1, 30, 31]),
+            torch.tensor([True] * 5 + [False] * 2),
+            speech.weight[4:7],
+            torch.cat((speech.weight[0:1], text.weight[30:32], speech.weight[1:2], speech.weight[4:7])),
+        ),
+    }
+    rows = [requests[name] for name in order]
+    boundaries = [0]
+    for ids, *_ in rows:
+        boundaries.append(boundaries[-1] + ids.numel())
+    actual = model.embed_input_ids(
+        torch.cat([r[0] for r in rows]),
+        multimodal_embeddings=[r[2] for r in rows if r[2] is not None],
+        is_multimodal=torch.cat([r[1] for r in rows]),
+        query_start_loc=boundaries,
+    )
+    torch.testing.assert_close(actual, torch.cat([r[3] for r in rows]), rtol=0, atol=0)
+    conditioning = [torch.full((1, 192), i + 1.0) for i in range(sum(name != "decode" for name in order))]
+    aligned = model._align_prompt_conditioning(conditioning)
+    assert len(aligned) == len(order)
+    index = 0
+    for name, value in zip(order, aligned):
+        if name == "decode":
+            assert value is None
+        else:
+            assert value is conditioning[index]
+            index += 1
+    with pytest.raises(ValueError, match="conditioning must match"):
+        model._align_prompt_conditioning(conditioning[:-1])
+
+
+def test_embed_input_ids_rejects_cross_request_placeholder_block():
+    model = _make_talker_model()
+    speech = nn.Embedding(100, 4)
+    model.model = SimpleNamespace(
+        speech_embedding=speech,
+        sos=0,
+        task_id=1,
+        llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=nn.Embedding(100, 4))),
+    )
+    with pytest.raises(ValueError, match="complete prefill block"):
+        model.embed_input_ids(
+            torch.tensor([7, 1, 1, 1, 1, 20]),
+            multimodal_embeddings=[speech.weight[2:4]],
+            is_multimodal=torch.tensor([False, True, True, True, True, False]),
+        )
+
+
+def test_absent_conditioning_is_not_a_wire_warning(caplog):
+    from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
+
+    token = torch.tensor([7])
+    result = _ensure_tensor_values({"embed.embedding": None, "codes.audio": token})
+    assert result == {"codes.audio": token}
+    assert not any("Dropping non-tensor" in record.message for record in caplog.records)
+
+
+def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
+
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    model = _make_code2wav_model()
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2]),
+        positions=torch.arange(3),
+        seq_token_counts=[3],
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[1, 2, 3]]),
+                    "speech_feat": torch.ones(1, 6, 2),
+                    "embedding": torch.ones(1, 2),
+                },
+                "meta": {"req_id": ["single"], "stream_finished": torch.tensor(True), "left_context_size": 0},
+            }
+        ],
+    )
+    assert len(model.code2wav.forward_streaming_batch_calls) == 1
+    assert model.code2wav.forward_streaming_batch_calls[0][0]["finalize"]
+
+
+def test_full_response_graph_returns_only_hidden_states(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
+
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    model = _make_talker_model()
+    hidden = torch.ones(2, 4)
+    model.model = SimpleNamespace(llm=lambda *_args: hidden)
+    result = model.forward(
+        input_ids=torch.tensor([1, 2]),
+        positions=torch.arange(2),
+        inputs_embeds=hidden,
+        speech_token=torch.tensor([[7, 8]]),
+    )
+    # A graph must not retain its capture-time prompt in its output container.
+    assert result is hidden
+
+
+def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    model = _make_talker_model()
+    hidden = torch.ones(2, 4)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._build_model_kwargs_extra = lambda: {}
+    # Replay the same graph tensor while the live conditioning changes.
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: hidden)
+    model._conditioning_request_rows = [1]
+    model._conditioning_request_count = 2
+    prompt = torch.tensor([[7, 8]])
+    output = runner._model_forward(speech_token=prompt)
+    values = output.multimodal_outputs["embed"]["speech_token"]
+    assert values[0] is None
+    torch.testing.assert_close(values[1], prompt)
+    decode = runner._model_forward()
+    assert decode.text_hidden_states is hidden
+    assert decode.multimodal_outputs == {}
+
+
+def test_packed_stream_profile_is_explicit_and_hopper_only(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3 import runtime
+
+    monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
+    monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: (9, 0))
+    assert not runtime.cosyvoice3_packed_inference_enabled()
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
+    assert runtime.cosyvoice3_packed_streaming_enabled()
+    assert runtime.cosyvoice3_packed_inference_enabled()
+    assert not runtime.cosyvoice3_full_response_enabled()
+    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: (8, 0))
+    assert not runtime.cosyvoice3_packed_inference_enabled()
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
+    monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
+    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: (9, 0))
+    assert runtime.cosyvoice3_packed_inference_enabled()
+    monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: False)
+    assert not runtime.cosyvoice3_packed_inference_enabled()
+
+
+def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
+
+    model = _make_code2wav_model()
+    model._code2wav_trt_done = False
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(module, "_cosyvoice3_trt_enabled", lambda: True)
+
+    def unexpected_estimator_resolution():
+        raise AssertionError("Packed Flow must not resolve or replace its torch estimator")
+
+    monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", unexpected_estimator_resolution)
+    model._maybe_enable_code2wav_trt()
+    assert model._code2wav_trt_done
+
+
+def test_standard_sampling_preserves_parameters_and_excludes_prompt_penalties(monkeypatch):
+    model = _make_talker_model()
+    model.config.cosyvoice3_sampling_mode = "standard"
+    metadata = _make_sampling_metadata(output_token_ids=[[2, 3]], repetition_penalty=1.21)
+    metadata.prompt_token_ids = torch.tensor([[2, 4]], dtype=torch.long)
+    metadata.temperature = torch.tensor([0.7])
+    metadata.top_k = torch.tensor([20])
+    captured = {}
+    expected = SamplerOutput(sampled_token_ids=torch.tensor([[5]], dtype=torch.int32), logprobs_tensors=None)
+
+    def standard_sampler(*, logits, sampling_metadata):
+        captured["metadata"] = sampling_metadata
+        return expected
+
+    model._talker_sampler = standard_sampler
+    monkeypatch.setattr(model, "_ras_sample_batch", lambda *a, **k: pytest.fail("RAS must not run in standard mode"))
+    assert model.sample(torch.zeros(1, 8), metadata) is expected
+    actual = captured["metadata"]
+    assert actual is not metadata
+    assert actual.output_token_ids == [[2, 3]]
+    torch.testing.assert_close(actual.prompt_token_ids, torch.tensor([[8, 8]]))
+    torch.testing.assert_close(metadata.prompt_token_ids, torch.tensor([[2, 4]]))
+    assert actual.temperature is metadata.temperature
+    assert actual.top_k is metadata.top_k
+    assert actual.top_p is metadata.top_p
+    assert actual.repetition_penalties is metadata.repetition_penalties
+
+
+@pytest.mark.parametrize("mode", ["ras", "standard"])
+def test_sampling_mode_preserves_or_merges_control_logits(mode):
+    model = _make_talker_model()
+    model.config.cosyvoice3_sampling_mode = mode
+    model.config.vocab_size = 6770
+    model.model = nn.Module()
+    model.model.llm_decoder = lambda hidden: hidden.clone()
+    hidden = torch.linspace(-2, 2, 6761).reshape(1, -1)
+    logits = model.compute_logits(hidden)
+    torch.testing.assert_close(logits[:, :6561], hidden[:, :6561])
+    assert torch.isneginf(logits[:, 6761:]).all()
+    if mode == "standard":
+        torch.testing.assert_close(logits[:, 6561:6761], hidden[:, 6561:])
+    else:
+        torch.testing.assert_close(logits[:, 6562], torch.logsumexp(hidden[:, 6561:], dim=-1))
+        assert torch.isneginf(logits[:, 6561]).all()
+        assert torch.isneginf(logits[:, 6563:6761]).all()
+
+
+def test_sampling_mode_rejects_unknown_policy():
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_standard_sampling
+
+    model = _make_talker_model()
+    assert not cosyvoice3_standard_sampling(model.config)
+    model.config.cosyvoice3_sampling_mode = "unsupported_policy"
+    with pytest.raises(ValueError, match="cosyvoice3_sampling_mode"):
+        cosyvoice3_standard_sampling(model.config)
