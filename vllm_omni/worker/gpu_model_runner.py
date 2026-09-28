@@ -2103,7 +2103,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update_decode_metadata):
             cpu_input_tail_ids = None
             if (
-                getattr(getattr(self.model, "config", None), "audio_mixed_direct_sampling", False)
+                getattr(self.model, "requires_cpu_input_tail_ids", False)
                 and not self.use_async_scheduling
                 and input_ids is not None
                 and input_ids.data_ptr() == self.input_ids.gpu.data_ptr()

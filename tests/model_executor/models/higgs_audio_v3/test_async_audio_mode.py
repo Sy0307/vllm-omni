@@ -28,7 +28,7 @@ def test_prompt_position_eligibility(monkeypatch, prompts, positions, widths, ex
     r = object.__new__(OmniGPUModelRunner)
     seen = {}
     r.model = SimpleNamespace(
-        config=SimpleNamespace(audio_async_prompt_mode=True, audio_mixed_direct_sampling=True),
+        config=SimpleNamespace(audio_async_prompt_mode=True),
         _audio_continuation_id=5,
         supports_omni_decode_step_metadata=True,
         update_decode_step_metadata=lambda **kw: seen.update(kw),
@@ -55,7 +55,7 @@ def test_model_metadata_reset(enabled):
 
     t = C.__new__(C)
     torch.nn.Module.__init__(t)
-    t.config = SimpleNamespace(audio_async_prompt_mode=enabled, audio_mixed_direct_sampling=False)
+    t.config = SimpleNamespace(audio_async_prompt_mode=enabled)
     t._set_last_step_query_start_loc = lambda x: None
     t._sync_decode_state_with_batch = lambda x: None
     t.update_decode_step_metadata(audio_prompt_mode_rows=2)
@@ -82,9 +82,7 @@ def test_actual_state_guard_and_eos(bad_state):
     t._restore_terminal_audio_rows = (
         mod.HiggsAudioV3TalkerForConditionalGeneration._restore_terminal_audio_rows.__get__(t)
     )
-    t.config = SimpleNamespace(
-        audio_mixed_direct_sampling=True, audio_async_prompt_mode=True, audio_full_sample_graph=False
-    )
+    t.config = SimpleNamespace(audio_async_prompt_mode=True, audio_full_sample_graph=False)
     t._resolve_token_ids = lambda: None
     t._audio_continuation_id = 99999
     t._eos_token_id = 151671

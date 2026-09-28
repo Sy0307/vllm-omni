@@ -36,3 +36,19 @@ def test_default_graph_shapes_are_preserved():
 def test_invalid_graph_shape_rejected():
     with pytest.raises(ValueError):
         Codec._decode_graph_shapes(SimpleNamespace(config=SimpleNamespace(codec_graph_batch_sizes=[0])))
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize("sampler", [None, False, True])
+@pytest.mark.parametrize("codec", [None, False, True])
+def test_graph_defaults_follow_runner_and_preserve_explicit_overrides(use_v2, sampler, codec):
+    from vllm_omni.transformers_utils.configs.higgs_audio_v3 import HiggsAudioV3Config
+
+    config = HiggsAudioV3Config(audio_full_sample_graph=sampler, codec_cuda_graph=codec)
+    assert config.resolve_graph_defaults(use_v2_model_runner=use_v2) == (
+        use_v2 if sampler is None else sampler,
+        use_v2 if codec is None else codec,
+    )
+    # Resolving a stage must not bake its defaults into shared model config.
+    assert config.audio_full_sample_graph is sampler
+    assert config.codec_cuda_graph is codec

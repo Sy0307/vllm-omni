@@ -114,6 +114,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     postprocess_uses_multimodal_outputs: bool = False
     postprocess_uses_req_infos: bool = False
     supports_omni_query_start_loc: bool = True
+    requires_cpu_input_tail_ids: bool = True
     # The codec stage consumes audio codes, never backbone hidden states.
     omni_pooler_payload_include_hidden: bool = False
 
@@ -129,6 +130,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config = hf_config
         else:
             self.config = HiggsAudioV3Config(**hf_config.to_dict())
+        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults(
+            use_v2_model_runner=bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
+        )
         self.use_async_omni_output = getattr(self.config, "audio_async_payload", False) is True
         self.supports_async_whole_payload = self.use_async_omni_output
         if self.use_async_omni_output:
@@ -370,7 +374,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             audio_prompt_mode_rows if getattr(self.config, "audio_async_prompt_mode", False) is True else 0
         )
         self._step_audio_tail_rows = 0
-        if getattr(getattr(self, "config", None), "audio_mixed_direct_sampling", False):
+        if cpu_input_tail_ids:
             self._resolve_token_ids()
             if (
                 cpu_input_tail_ids
@@ -697,19 +701,13 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         ids = getattr(self, "_last_step_input_ids", None)
         rows = int(hidden_states.shape[0])
         if (
-            getattr(self.config, "audio_skip_text_head", False)
-            and self._audio_continuation_id is not None
+            self._audio_continuation_id is not None
             and sampling_metadata is not None
             and getattr(sampling_metadata, "no_penalties", False)
             and (
                 (isinstance(ids, torch.Tensor) and ids.numel() == rows and self._fast_audio_direct_rows == rows)
-                or (
-                    getattr(getattr(self, "config", None), "audio_mixed_direct_sampling", False)
-                    and (
-                        getattr(self, "_step_audio_tail_rows", 0) == rows
-                        or getattr(self, "_step_audio_mode_rows", 0) == rows
-                    )
-                )
+                or getattr(self, "_step_audio_tail_rows", 0) == rows
+                or getattr(self, "_step_audio_mode_rows", 0) == rows
             )
             and getattr(sampling_metadata, "max_num_logprobs", None) is None
             and getattr(sampling_metadata, "allowed_token_ids_mask", None) is None
@@ -1141,12 +1139,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         decode_only = isinstance(ids, torch.Tensor) and int(ids.numel()) == num_rows
         if getattr(self, "_step_audio_mode_rows", 0) == num_rows:
             self._restore_terminal_audio_rows(num_rows)
-        graph_forced_audio = getattr(getattr(self, "config", None), "audio_mixed_direct_sampling", False) and (
+        graph_forced_audio = (
             getattr(self, "_step_audio_tail_rows", 0) == num_rows
             or getattr(self, "_step_audio_mode_rows", 0) == num_rows
         )
         if (
-            getattr(self.config, "audio_full_sample_graph", False)
+            getattr(self, "_sample_graph_enabled", False)
             and not getattr(self, "_in_audio_sample_graph", False)
             and hidden.is_cuda
             and (graph_forced_audio or (decode_only and self._fast_audio_direct_rows == num_rows))
@@ -1198,13 +1196,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if fast_fallback_reason is None:
             direct_audio_batch = decode_only and self._fast_audio_direct_rows == num_rows
             mixed_direct = (
-                getattr(getattr(self, "config", None), "audio_mixed_direct_sampling", False)
-                and (
-                    getattr(self, "_step_audio_tail_rows", 0) == num_rows
-                    or getattr(self, "_step_audio_mode_rows", 0) == num_rows
-                )
-                and getattr(sampling_metadata, "no_penalties", False)
-            )
+                getattr(self, "_step_audio_tail_rows", 0) == num_rows
+                or getattr(self, "_step_audio_mode_rows", 0) == num_rows
+            ) and getattr(sampling_metadata, "no_penalties", False)
             if mixed_direct:
                 # Guard the CPU classification against runner/device drift.
                 torch._assert_async(
@@ -1753,7 +1747,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if getattr(self, "_audio_graph_noise", None) is not None:
             torch._assert_async(torch.isfinite(probs).all(), "Audio sampling probabilities must be finite")
             sampled = probs.div(self._audio_graph_noise).argmax(dim=-1)
-        elif probs.is_cuda and getattr(getattr(self, "config", None), "audio_sampler_no_sync", False):
+        elif probs.is_cuda:
             # Match torch.multinomial's single-sample exponential race, but
             # validate the whole batch asynchronously. The original per-request
             # calls each copy validation scalars to the host before drawing.

@@ -42,3 +42,25 @@ def test_runner_closes_metadata_scope_on_return_and_error(monkeypatch, fail):
     else:
         torch.testing.assert_close(r._model_forward(), torch.ones(2))
     assert events == ["begin", "warmup", "capture", "end"]
+
+
+@pytest.mark.parametrize("requires_tails", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_cpu_tail_metadata_requires_model_capability(monkeypatch, requires_tails, async_scheduling):
+    observed = {}
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        requires_cpu_input_tail_ids=requires_tails,
+        update_decode_step_metadata=lambda **kwargs: observed.update(kwargs),
+    )
+    ids = torch.tensor([10, 11, 12])
+    runner.use_async_scheduling = async_scheduling
+    runner.input_ids = SimpleNamespace(gpu=ids, cpu=ids)
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 2, 3]))
+    runner.input_batch = SimpleNamespace(req_ids=["a", "b"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *args, **kwargs: torch.ones(2))
+    runner._model_forward(input_ids=ids)
+    expected = [11, 12] if requires_tails and not async_scheduling else None
+    assert observed["cpu_input_tail_ids"] == expected

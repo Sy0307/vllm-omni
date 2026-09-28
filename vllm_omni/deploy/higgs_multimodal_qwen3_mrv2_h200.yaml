@@ -63,10 +63,6 @@ stages:
     seed: 42
     repetition_penalty: 1.0
   hf_overrides:
-    audio_sampler_no_sync: true
-    audio_skip_text_head: true
-    audio_mixed_direct_sampling: true
-    audio_full_sample_graph: true
     audio_async_prompt_mode: true
     audio_async_payload: true
     audio_mrv2_static_inputs: true
@@ -95,7 +91,6 @@ stages:
     seed: 42
     repetition_penalty: 1.0
   hf_overrides:
-    codec_cuda_graph: true
     codec_graph_single_max_frames: 33
     codec_graph_batch_sizes:
     - 1

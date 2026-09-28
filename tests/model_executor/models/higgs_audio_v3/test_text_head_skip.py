@@ -12,9 +12,7 @@ from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize(
-    "fallback", [None, "prefill", "logprobs", "allowed", "bad_words", "penalty", "inactive", "disabled"]
-)
+@pytest.mark.parametrize("fallback", [None, "prefill", "logprobs", "allowed", "bad_words", "penalty", "inactive"])
 def test_text_head_only_skipped_for_direct_audio_decode(fallback):
     hidden = torch.randn(3, 4)
     calls = []
@@ -24,7 +22,6 @@ def test_text_head_only_skipped_for_direct_audio_decode(fallback):
         return torch.ones(3, 7)
 
     model = SimpleNamespace(
-        config=SimpleNamespace(audio_skip_text_head=fallback != "disabled"),
         _audio_continuation_id=5,
         _last_step_input_ids=torch.ones(4 if fallback == "prefill" else 3, dtype=torch.long),
         _fast_audio_direct_rows=0 if fallback == "inactive" else 3,

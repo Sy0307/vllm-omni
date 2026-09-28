@@ -84,6 +84,11 @@ class HiggsAudioV3Code2Wav(nn.Module):
             self._model_path = None
             self.vllm_config = None
 
+        _, self._codec_graph_enabled = self.config.resolve_graph_defaults(
+            use_v2_model_runner=bool(
+                getattr(getattr(self.vllm_config, "model_config", None), "use_v2_model_runner", False)
+            )
+        )
         self.sample_rate: int = int(self.config.sample_rate)
         self.num_codebooks: int = int(self.config.num_codebooks)
         self.num_real_codes: int = int(self.config.num_real_codes)
@@ -457,7 +462,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
             self._ensure_codec_loaded()
 
         codes = self._validate_codes(audio_codes)
-        if codes.is_cuda and getattr(self.config, "codec_cuda_graph", False):
+        if codes.is_cuda and self._codec_graph_enabled:
             if not self._decode_graphs_initialized:
                 self._capture_decode_graphs(codes.device)
             batch, _, frames = codes.shape
