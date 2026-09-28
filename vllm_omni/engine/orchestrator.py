@@ -892,6 +892,11 @@ class OrchestratorBase:
             req_state = self.request_states.get(request_id) if request_id is not None else None
             if is_first:
                 assert isinstance(mm, dict)
+                if req_state is not None and stage_id == req_state.final_stage_id:
+                    # The source is the final stage (e.g. an in-stage decoding
+                    # Talker): its first audio is an ordinary early output.
+                    kept.append(eco)
+                    continue
                 # Only the dedicated first-frame channel is intercepted.
                 if (
                     req_state is None

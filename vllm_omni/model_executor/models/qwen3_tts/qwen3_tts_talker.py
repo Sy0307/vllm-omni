@@ -36,7 +36,7 @@ from vllm_omni.utils.speaker_cache import (
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
-from .first_audio import talker_first_audio_enabled
+from .first_audio import stream_ref_context_frames, talker_first_audio_enabled, talker_stream_decode_enabled
 from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
@@ -411,7 +411,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # A frame's residual codebooks depend only on the Talker hidden and
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
-        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config)
+        self.stream_decode = talker_stream_decode_enabled(vllm_config)
+        # Reference-code frames that prime a voice-clone stream's decoder,
+        # matching the Code2Wav stage's first-chunk context.
+        self.stream_ref_context_frames = stream_ref_context_frames(vllm_config)
+        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
+        self.stream_decoder = None
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
@@ -718,6 +723,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     # -------------------- Omni multimodal output plumbing --------------------
 
+    @property
+    def mm_outputs_fresh_per_step(self) -> bool:
+        """Stream-decode outputs come from :meth:`_make_eager_omni_output`, allocated per step."""
+        return self.stream_decoder is not None and self.eager_frames_active
+
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
@@ -895,6 +905,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 "first_audio": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device),
             },
         }
+        if self.stream_decoder is not None:
+            # Filled per sampled row by the runner's eager MTP; token-major so
+            # each request's slice is its frames of this step.
+            spf = int(self.stream_decoder.spf)
+            mm["model_outputs"] = torch.zeros((num_tokens, spf), dtype=torch.float32, device=hidden.device)
+            sr = torch.tensor(self.stream_sample_rate, dtype=torch.int32)
+            mm["sr"] = [sr] * len(info_dicts)
         ref_rows = [
             index
             for index, info in enumerate(info_dicts)
@@ -1442,7 +1459,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self.first_frame_decoder = Qwen3TTSFirstFrameDecoder(self.model_path)
             decoder_loaded = self.first_frame_decoder.load(self.vllm_config)
             loaded = set(loaded) | {f"first_frame_decoder.{name}" for name in decoder_loaded}
+        elif self.stream_decode:
+            # Not ``first_frame_decoder``: every frame, including the first,
+            # is decoded here and leaves through the regular step output.
+            from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
+            from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
+
+            holder = Qwen3TTSFirstFrameDecoder(self.model_path)
+            decoder_loaded = holder.load(self.vllm_config)
+            loaded = set(loaded) | {f"stream_decoder.{name}" for name in decoder_loaded}
+            slots = int(self.vllm_config.scheduler_config.max_num_seqs)
+            self.stream_decoder = StreamingCodecDecoder(holder.decoder, num_slots=slots, dtype=torch.bfloat16)
+            self.stream_sample_rate = int(holder.sample_rate)
+            self.stream_graphs = None
+            logger.info("Qwen3-TTS Talker stream decode enabled (%d slots)", slots)
         return loaded
+
+    def capture_stream_decode_graphs(self, batch_sizes: list[int]) -> None:
+        if self.stream_decoder is None or getattr(self, "stream_graphs", None) is not None:
+            return
+        from .tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
+
+        with torch.inference_mode():
+            self.stream_graphs = StreamingDecodeGraphs(self.stream_decoder, batch_sizes)
+        logger.info("Captured Talker stream decode graphs for batch sizes %s", self.stream_graphs.sizes)
 
     def _build_stacked_codec_embed(self) -> None:
         embeds = self.code_predictor.get_input_embeddings()

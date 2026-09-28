@@ -2248,7 +2248,7 @@ class VllmOmniConfig:
                 setattr(deploy, name, _copy_value(cli_overrides[name]))
 
         deploy = _apply_platform_overrides(deploy)
-        if len(pipeline_cfg.stages) <= 1:
+        if len(pipeline_cfg.stages) <= 1 and not getattr(pipeline_cfg, "single_stage_async_chunk", False):
             deploy.async_chunk = False
         _validate_async_chunk_support(pipeline_cfg, deploy)
         validate_stage_async_chunk_edges(pipeline_cfg, deploy)

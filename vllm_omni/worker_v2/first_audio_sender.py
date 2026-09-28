@@ -25,6 +25,11 @@ from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
 logger = init_logger(__name__)
 
 
+# Requests whose first frame an in-stage decoder already delivered directly; the
+# regular output of the same process skips that frame.
+DIRECT_FIRST_FRAME: set[str] = set()
+
+
 class FirstAudioSink(Protocol):
     def prepare(self, request_ids: list[str]) -> _PreparedDelivery:
         """Freeze request routes on the submitting thread before accepting delivery."""

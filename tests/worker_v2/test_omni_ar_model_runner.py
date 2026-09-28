@@ -137,6 +137,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
 def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace()
     runner._async_mm_snapshot_slots, runner._async_mm_snapshot_events = [{}], [None]
     runner._async_mm_snapshot_pending, runner._async_mm_snapshot_cursor = [False], 0
     waited: list[object] = []
@@ -304,3 +305,55 @@ def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
     assert outputs[index]["codes.ref"].data_ptr() != ref.data_ptr()
     for i in range(2):
         assert torch.equal(outputs[i]["codes.audio"], codes[offsets[i] : offsets[i + 1]])
+
+
+def _stream_step(rows: dict[str, list[bool]], samples_per_frame: int) -> tuple[Any, dict[str, Any]]:
+    """One decode step's PCM: each request's rows hold a frame when valid, value = frame index."""
+    req_ids = list(rows)
+    counts = [len(v) for v in rows.values()]
+    qsl = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    valid = torch.tensor([v for flags in rows.values() for v in flags])
+    wav = torch.arange(len(valid), dtype=torch.float32)[:, None].repeat(1, samples_per_frame)
+    part = omni_ar_model_runner._StreamPcm(wav, valid, None, qsl, np.array(counts, dtype=np.int32), req_ids)
+    return part, {"meta": {"codec_frame_valid": valid}}
+
+
+def _deliver(parts, mm, force_end=frozenset()):
+    cur = parts[-1]
+    out = omni_ar_model_runner._stream_client_outputs(
+        mm, parts, set(force_end), cur.query_start_loc, cur.num_scheduled_tokens, len(cur.req_ids), cur.req_ids
+    )
+    return {rid: o["model_outputs"] for rid, o in zip(cur.req_ids, out or []) if o}
+
+
+def test_stream_pcm_waits_for_request_missing_from_batch(monkeypatch) -> None:
+    acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=2)
+    monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
+    spf = acc.SPF
+    first_a, _ = _stream_step({"a": [True], "b": [True]}, spf)
+    first_b, mm = _stream_step({"b": [True]}, spf)
+    # Deferred delivery: the previous step's frames go out with this step,
+    # where "a" is not scheduled (e.g. preempted). Its frame must not be lost.
+    got = _deliver([first_a, first_b], mm)
+    assert set(got) == {"b"}
+    assert "a" in acc.pending and sum(p.numel() for p in acc.pending["a"]) == spf
+
+    back, mm = _stream_step({"a": [False]}, spf)  # "a" returns and ends (EOS frame)
+    got = _deliver([back], mm)
+    assert got["a"].numel() == spf
+    assert "a" not in acc.pending
+
+
+def test_stream_pcm_length_end_flushes_partial_chunk(monkeypatch) -> None:
+    acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=25)
+    monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
+    spf = acc.SPF
+    delivered = 0
+    for step in range(5):
+        part, mm = _stream_step({"a": [True]}, spf)
+        last = step == 4
+        got = _deliver([part], mm, force_end={"a"} if last else ())
+        delivered += got["a"].numel() if "a" in got else 0
+    # First frame at once, the rest (below one chunk) flushed at the length end.
+    assert delivered == 5 * spf
+    assert "a" not in acc.pending

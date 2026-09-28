@@ -1,0 +1,42 @@
+# Single-stage Qwen3-TTS: the Talker decodes every frame with the stateful
+# streaming codec decoder and returns PCM itself (no Code2Wav stage).
+pipeline: qwen3_tts_fused
+model_runner: v2
+async_chunk: true
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.5
+    trust_remote_code: true
+    enable_prefix_caching: false
+    # Model options that multi-stage deployments put on the connector: a
+    # single stage has no connector edge.
+    additional_config:
+      talker_stream_decode: true
+      code_predictor_kv_cache: true
+      code_predictor_fused_sampling: true
+      code_predictor_fused: true
+    # Talker decode contexts are short (~100-700 tokens): FA3 split-KV plus
+    # its combine kernel costs more than one pass per head.
+    attention_config:
+      flash_attn_max_num_splits_for_cuda_graph: 1
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+      max_cudagraph_capture_size: 512
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      min_tokens: 2
+      repetition_penalty: 1.05
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0

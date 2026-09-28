@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
@@ -78,6 +79,9 @@ def _make_safe_get_rope(orig_get_rope):
         return RopeState(num_dims=3, **kwargs)
 
     return _safe_get_rope
+
+
+_NO_SEED = object()
 
 
 class OmniModelState(DefaultModelState):
@@ -139,7 +143,7 @@ class OmniModelState(DefaultModelState):
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
         self._decode_preprocess = self._resolve_decode_preprocess(model)
-        self._mtp_generators: dict[str, torch.Generator] = {}
+        self._mtp_generators: dict[str, torch.Generator | None] = {}
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
         self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
 
@@ -160,6 +164,10 @@ class OmniModelState(DefaultModelState):
         self._mtp_offsets: torch.Tensor | None = None
         self._mtp_sample_uniforms: torch.Tensor | None = None
         self._mtp_runner: Any | None = None
+        # Talker stream decode: each request's next frame position, and the
+        # side-stream event the step's PCM output copy must wait on.
+        self._stream_pos: dict[str, int] = {}
+        self._stream_decode_event: torch.cuda.Event | None = None
         if self._embed_dim > 0 and hasattr(model, "mtp"):
             max_bs = max_num_reqs
             self._mtp_input_ids = torch.zeros(max_bs, dtype=torch.long, device=device)
@@ -393,6 +401,7 @@ class OmniModelState(DefaultModelState):
         req_id = self.intermediate_buffer.buffers[req_index].get("req_id")
         if req_id is not None:
             getattr(self, "_mtp_generators", {}).pop(req_id, None)
+            self._stream_pos.pop(req_id, None)
             getattr(self, "_first_audio_requests", set()).discard(req_id)
         getattr(self, "_eager_ready", {}).pop(req_index, None)
         getattr(self, "_eager_settled", {}).pop(req_index, None)
@@ -685,7 +694,7 @@ class OmniModelState(DefaultModelState):
                 batch_offsets = None
             else:
                 # A pageable host tensor would block on the stream here.
-                batch_offsets = torch.as_tensor(starts, device=input_ids.device, dtype=torch.long)
+                batch_offsets = index_to_device(starts, input_ids.device)
                 batch_ids = input_ids.index_select(0, batch_offsets)
                 batch_embeds = embeds.index_select(0, batch_offsets)
 
@@ -876,7 +885,7 @@ class OmniModelState(DefaultModelState):
             offsets.copy_(query_start_loc[:bsz], non_blocking=True)
             return offsets
 
-        return torch.as_tensor([start for _i, start, _mtp in mtp_batches], device=device, dtype=torch.long)
+        return index_to_device([start for _i, start, _mtp in mtp_batches], device)
 
     def _run_batched_mtp(
         self,
@@ -1067,15 +1076,21 @@ class OmniModelState(DefaultModelState):
         sampling_params: Any,
         device: torch.device,
     ) -> torch.Generator | None:
-        resolve_seed = getattr(self.model, "get_mtp_seed", None)
-        seed = resolve_seed(sampling_params) if resolve_seed is not None else None
-        if seed is None:
-            return None
-
         cache = getattr(self, "_mtp_generators", None)
         if cache is None:
             cache = {}
             self._mtp_generators = cache
+        generator = cache.get(req_id, _NO_SEED)
+        if generator is None:
+            # Resolved earlier: this request has no seed.
+            return None
+        if generator is not _NO_SEED and generator.device == device:
+            return generator
+        resolve_seed = getattr(self.model, "get_mtp_seed", None)
+        seed = resolve_seed(sampling_params) if resolve_seed is not None else None
+        if seed is None:
+            cache[req_id] = None
+            return None
         generator = cache.get(req_id)
         if generator is None or generator.device != device:
             generator = torch.Generator(device=device)

@@ -358,6 +358,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
         if callable(capture_first_frame):
             capture_first_frame()
+        capture_stream = getattr(self.model, "capture_stream_decode_graphs", None)
+        if callable(capture_stream) and getattr(self, "model_state", None) is not None:
+            sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
+            capture_stream(sorted(set(sizes + [1])))
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:

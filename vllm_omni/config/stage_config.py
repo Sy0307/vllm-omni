@@ -294,6 +294,9 @@ class PipelineConfig:
     model_type: str
     model_arch: str = ""
     stages: tuple[StagePipelineConfig, ...] = ()
+    # A single stage that streams its own final output in async-chunk mode
+    # (e.g. a Talker decoding audio in-stage) keeps deploy.async_chunk.
+    single_stage_async_chunk: bool = False
     # HF architecture aliases: used by StageConfigFactory when the model's
     # HF config reports a generic model_type that collides with a different
     # model (e.g. MiMo Audio reports model_type="qwen2"). The factory
@@ -1137,7 +1140,7 @@ def merge_pipeline_deploy(
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # async_chunk is irrelevant for single-stage pipelines, so we always disable it
-    if len(pipeline.stages) <= 1:
+    if len(pipeline.stages) <= 1 and not pipeline.single_stage_async_chunk:
         deploy.async_chunk = False
 
     # async_chunk only applies to multi-stage pipelines: a pipeline with no

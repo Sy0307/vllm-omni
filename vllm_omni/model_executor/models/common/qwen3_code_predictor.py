@@ -792,7 +792,13 @@ class CodePredictorWrapper(nn.Module):
             extra_cfg = connector_cfg.get("extra", connector_cfg)
         else:
             extra_cfg = getattr(connector_cfg, "extra", None)
-        return extra_cfg if isinstance(extra_cfg, dict) else {}
+        extra_cfg = extra_cfg if isinstance(extra_cfg, dict) else {}
+        # A single-stage deployment has no connector edge to carry model
+        # options; it sets them in the stage's ``additional_config``.
+        additional = getattr(vllm_config, "additional_config", None)
+        if isinstance(additional, dict) and additional:
+            return {**additional, **extra_cfg}
+        return extra_cfg
 
     @staticmethod
     def _parse_bool_config(value: object) -> bool:
