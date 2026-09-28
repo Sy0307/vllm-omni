@@ -1,38 +1,3 @@
 # MiniCPM-o 4.5 using the turn-based engine and ordinary HTTP serving.
 base_config: minicpmo_4_5.yaml
 session_mode: turn
-
-connectors:
-  connector_of_shared_memory:
-    extra:
-      # Code2Wav decodes several streams per step; HiFT falls back to eager
-      # (~70 conv launches per call, most of the stage's host time under
-      # load) for any batch without a captured graph. Smaller batches pad to
-      # the next captured size.
-      hift_graph_capture_batch_sizes: [1, 2, 4, 8]
-
-# Deployment sizing for 8 concurrent turn-mode chat requests. The Talker and
-# Code2Wav stages keep a request admitted for its whole utterance (Code2Wav
-# owns per-request vocoder state), so their max_num_seqs caps concurrent
-# streams; requests beyond it wait for admission before their first audio
-# chunk. The Thinker frees its slot once the text is done, so 4 suffices.
-# 16 also fits one H200 (4 GiB Talker KV, ~133 GB peak at 16 concurrent).
-stages:
-  - stage_id: 1
-    max_num_seqs: 8
-  - stage_id: 2
-    max_num_seqs: 8
-    # A chunk arriving while a decode step runs joins the next step. With the
-    # async batch queue that next step is already scheduled, so the first
-    # chunk waited for two steps instead of one.
-    async_scheduling: false
-
-platforms:
-  cuda:
-    stages:
-      - stage_id: 1
-        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
-        # (8 * 4096 = 32768 tokens). Keep the reported CUDA KV token capacity
-        # above that bound because physical-preemption replay is unsupported
-        # (2 GiB reports 34,944 tokens).
-        kv_cache_memory_bytes: 2147483648  # 2 GiB

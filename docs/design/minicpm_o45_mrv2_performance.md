@@ -17,13 +17,4 @@ instead of 2 GiB. Warm representative shapes before serving; lazy compilation
 and graph capture can create large first-use latency. Shared HiFT ISTFT code
 also has consumers outside MiniCPM, so its regression coverage matters.
 
-Historical same-worktree measurements (2026-09-26) used GSM8K-derived EN1088
-short prompts, **not Seed-TTS Eval**. Tiled attention plus channels-last improved
-C16 throughput 36.585 to 43.292 audio-s/s and C32 39.837 to 46.350, compared
-with a baseline already using CFM compilation. One start per condition.
-Separately, repeated Talker 8/16 tests at C32 yielded 45.833/45.677 audio-s/s,
-first-audio P50 703.00/659.21 ms and P99 2032.90/1697.99 ms. Do not add these
-percentages or call them the total gain over upstream. C16 pooled P99 improved
-only 3.41%, with one round regressing. Quality spot checks used 128 English
-prompts; unchanged WER does not establish zero quality cost. The split PR
-needs its own correctness validation; these are historical performance results.
+The existing V1 turn profile retains its original capacities and scheduling defaults.

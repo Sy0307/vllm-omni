@@ -1,3 +1,0 @@
-# Compatibility alias: Talker capacity 16 is now part of the H200 profile.
-# Evidence and limits: docs/design/minicpm_o45_mrv2_performance.md
-base_config: minicpmo_4_5_turn_mrv2_h200.yaml
