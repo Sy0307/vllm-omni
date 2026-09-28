@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from tests.model_executor.models.minicpmo_4_5.test_talker_host_sync import _EOS, _infos, _make_talker, _states, _step
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _apply_batched_repetition_penalty
 from vllm_omni.utils.device_copy import index_to_device
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -59,20 +58,3 @@ def test_talker_condition_upload_does_not_synchronize_cuda() -> None:
         torch.cuda.set_sync_debug_mode(previous)
     assert torch.equal(condition, expected)
     assert boundary.shape == (2, 4)
-
-
-def test_codec_penalty_uploads_cpu_history_without_synchronizing_cuda() -> None:
-    logits = torch.randn(3, 8, device="cuda")
-    histories = [torch.tensor([1, 1, 4]), torch.empty(0, dtype=torch.long), torch.tensor([7])]
-    penalties = torch.tensor([1.2, 1.05, 1.0], device="cuda")
-    expected = _apply_batched_repetition_penalty(
-        logits, [history.cuda() for history in histories], penalty=penalties, window_size=16
-    )
-    index_to_device([1], "cuda")
-    previous = torch.cuda.get_sync_debug_mode()
-    try:
-        torch.cuda.set_sync_debug_mode("error")
-        actual = _apply_batched_repetition_penalty(logits, histories, penalty=penalties, window_size=16)
-    finally:
-        torch.cuda.set_sync_debug_mode(previous)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

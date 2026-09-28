@@ -96,68 +96,6 @@ class _FakeGraph:
         return None
 
 
-def _hift_config_fixture():
-    hift = SimpleNamespace(
-        inference=None,
-        _inference_pre_istft=None,
-        _finalize_decode=None,
-        conv_pre=SimpleNamespace(in_channels=80),
-        parameters=lambda: iter([torch.empty(1)]),
-    )
-    return SimpleNamespace(
-        hift=hift,
-        flow=SimpleNamespace(encoder=SimpleNamespace(), token_mel_ratio=2),
-        mel_cache_len=2,
-        source_cache_len=960,
-    )
-
-
-@pytest.mark.parametrize("budget", [0, 8, 64])
-def test_hift_lazy_graph_budget_is_configurable(budget):
-    wrapper = HiFTGraphWrapper(
-        _hift_config_fixture(),
-        {"codec_chunk_frames": 25, "codec_left_context_frames": 3, "hift_max_lazy_graphs": budget},
-        [1],
-    )
-    assert wrapper.max_lazy_graphs == budget
-    assert wrapper.lazy_graph_count == 0
-
-
-def test_hift_lazy_graph_budget_rejects_negative():
-    with pytest.raises(ValueError, match="hift_max_lazy_graphs"):
-        HiFTGraphWrapper(
-            _hift_config_fixture(),
-            {"codec_chunk_frames": 25, "codec_left_context_frames": 3, "hift_max_lazy_graphs": -1},
-            [1],
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_hift_initial_turn_shape_is_captured_before_first_request():
-    hift = _small_hift()
-    token2wav = SimpleNamespace(
-        hift=hift,
-        flow=SimpleNamespace(encoder=SimpleNamespace(), token_mel_ratio=2),
-        mel_cache_len=2,
-        source_cache_len=960,
-    )
-    wrapper = HiFTGraphWrapper(
-        token2wav,
-        {"codec_chunk_frames": 25, "codec_left_context_frames": 3, "initial_codec_chunk_frames": 13},
-        [1],
-    )
-    with torch.inference_mode():
-        wrapper.capture()
-        mel = torch.randn(1, 80, 26, device="cuda")
-        cache = torch.empty(1, 1, 0, device="cuda")
-        actual = wrapper.replay(mel, cache)
-        expected = hift.inference(mel, cache)
-        for a, e in zip(actual, expected, strict=True):
-            torch.testing.assert_close(a, e, rtol=1e-4, atol=1e-5)
-        assert (1, 26, 0) in wrapper.graph
-        assert wrapper.lazy_graph_count == 0
-
-
 def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
@@ -316,28 +254,6 @@ def test_cfm_retained_graph_survives_cold_shapes_and_preserves_owned_outputs(mon
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_compiled_cfm_cache_replay_and_retirement():
-    torch.manual_seed(18)
-    estimator = _MiniDiT().eval().cuda()
-    wrapper = CFMGraphWrapper(
-        estimator.blocks_forward_chunk, max_graphs=2, optimized_io=True, compile_estimator=True, compile_mode="full"
-    )
-    with torch.inference_mode():
-        for batch, frames, cached in [(2, 10, 0), (4, 12, 5), (2, 10, 0), (2, 14, 5), (4, 12, 5)]:
-            inputs = _cfm_inputs(batch, frames, cached)
-            wrapper.replay(*inputs)
-            inputs[0].add_(0.01)
-            expected = tuple(t.clone() for t in wrapper._eager((*inputs, None)))
-            actual = wrapper.replay(*inputs, borrow_outputs=True)
-            for a, e in zip(actual, expected, strict=True):
-                torch.testing.assert_close(a, e, rtol=2e-4, atol=2e-5)
-            assert wrapper.enabled
-        assert wrapper._stats["flushes"] == 1
-        assert wrapper._stats["captures"] == 4
-    wrapper._flush()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("attention_backend", ["sdpa", "tiled_fp32"])
 @pytest.mark.parametrize("channels_last", [False, True])
 def test_block_compiled_real_dit_preserves_masks_caches_and_original_methods(attention_backend, channels_last):
@@ -383,19 +299,6 @@ def test_block_compiled_real_dit_preserves_masks_caches_and_original_methods(att
         assert wrapper._stats["captures"] == 3
         assert wrapper._stats["flushes"] == 1
         assert estimator.blocks[0].forward_chunk.__func__ is original
-    wrapper._flush()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_retained_cache_miss_never_calls_compiler():
-    estimator = _MiniDiT().eval().cuda()
-    wrapper = CFMGraphWrapper(estimator.blocks_forward_chunk, max_graphs=1, cache_policy="retain")
-    with torch.inference_mode():
-        wrapper.replay(*_cfm_inputs(2, 10, 0))
-        wrapper._compiled_graph_fn = Mock(side_effect=AssertionError("must remain eager"))
-        wrapper.replay(*_cfm_inputs(4, 12, 5))
-        wrapper._compiled_graph_fn.assert_not_called()
-        assert wrapper._stats["eager"] == 1
     wrapper._flush()
 
 

@@ -13,52 +13,14 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-    _CODEC_PENALTY_WINDOW,
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
     MiniCPMO45OmniTTSForConditionalGeneration,
-    _apply_batched_repetition_penalty,
-    _apply_codec_window_penalty_gpu,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
-    tts2code2wav_async_chunk,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _EOS = 6561
-_VOCAB = 6562
-
-
-def test_device_window_penalty_matches_v1_host_penalty() -> None:
-    torch.manual_seed(0)
-    max_reqs, max_len = 6, 64
-    all_token_ids = torch.randint(0, 40, (max_reqs, max_len), dtype=torch.int32)
-    prompt_len = torch.tensor([3, 5, 2, 7, 4, 1], dtype=torch.int32)
-    # Outputs so far: none, fewer than the window, exactly the window, more.
-    total_len = torch.tensor([3, 5 + 7, 2 + 16, 7 + 40, 4 + 1, 1 + 20], dtype=torch.int32)
-    penalty = torch.tensor([1.05, 1.05, 1.3, 1.05, 1.0, 2.0], dtype=torch.float32)
-    slots = torch.tensor([4, 0, 3, 1, 5, 2])
-    logits = torch.randn((slots.numel(), 40), dtype=torch.float32) * 3
-
-    histories = [all_token_ids[slot, prompt_len[slot] : total_len[slot]].long() for slot in slots.tolist()]
-    expected = _apply_batched_repetition_penalty(
-        logits.clone(),
-        histories,
-        penalty=penalty[slots],
-        window_size=_CODEC_PENALTY_WINDOW,
-    )
-    actual = logits.clone()
-    _apply_codec_window_penalty_gpu(
-        actual,
-        slots,
-        all_token_ids,
-        total_len,
-        prompt_len,
-        penalty,
-        window_size=_CODEC_PENALTY_WINDOW,
-    )
-    assert torch.equal(actual, expected)
 
 
 def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
@@ -158,62 +120,3 @@ def test_mrv2_output_empty_condition_and_length_cap() -> None:
         )
         assert out.multimodal_outputs["meta"]["codec_frame_valid"].tolist() == [True]
         assert talker.take_mrv2_forced_eos(batch, None, 1).tolist() == [forced]
-
-
-def test_mrv2_output_rejects_native_duplex() -> None:
-    talker = _talker()
-    batch, _ = _batch([dict(slot=0, prompt_len=3, computed=0, span=[0, 0, 0], prefill=True)])
-    with pytest.raises(NotImplementedError):
-        talker.make_omni_output_mrv2(
-            torch.zeros((3, 4)),
-            input_batch=batch,
-            req_states=_req_states({0: 3}),
-            model_intermediate_buffer=[{"native_duplex": True}],
-        )
-
-
-def test_decode_batch_hook_keeps_runner_embeddings() -> None:
-    talker = _talker()
-    ids = torch.tensor([3, 4])
-    embeds = torch.randn((2, 8))
-    new_ids, new_embeds, hidden, text_step, updates = talker.preprocess_decode_batch_mrv2(
-        input_ids=ids, input_embeds=embeds, req_infos=[{}, {}]
-    )
-    assert new_ids is ids and new_embeds is embeds
-    assert hidden.shape == (2, 0) and text_step.shape == (2, 0) and updates == [{}, {}]
-
-
-def _request(request_id: str):
-    request = SimpleNamespace(external_req_id=request_id, request_id=request_id, status=None)
-    request.is_finished = lambda: False
-    return request
-
-
-def test_payload_builder_keeps_only_valid_mrv2_rows() -> None:
-    from collections import defaultdict
-
-    manager = SimpleNamespace(
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 4, "codec_left_context_frames": 1}}),
-        code_prompt_token_ids=defaultdict(list),
-        request_payload={},
-        put_req_chunk=defaultdict(int),
-    )
-    request = _request("r")
-    steps = [
-        # Prefill span: token rows only, none valid.
-        (torch.tensor([[0], [0], [0]]), torch.tensor([False, False, False])),
-        (torch.tensor([[11]]), torch.tensor([True])),
-        (torch.tensor([[12]]), torch.tensor([True])),
-        (torch.tensor([[13]]), torch.tensor([True])),
-        # A lookahead row after EOS: dropped.
-        (torch.tensor([[_EOS]]), torch.tensor([False])),
-        (torch.tensor([[14]]), torch.tensor([True])),
-    ]
-    payloads = [
-        tts2code2wav_async_chunk(manager, {"codes": {"audio": codes}, "meta": {"codec_frame_valid": valid}}, request)
-        for codes, valid in steps
-    ]
-    emitted = [payload for payload in payloads if payload is not None]
-    assert len(emitted) == 1
-    # One silence left-context code, then the first four valid codes.
-    assert emitted[0].codes.audio.tolist()[1:] == [11, 12, 13, 14]

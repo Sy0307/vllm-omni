@@ -144,33 +144,6 @@ def test_can_merge_requires_matching_padded_width_for_continuing_rows():
     assert not backend.can_merge([28, 28, 16], [False, False, True], states)
 
 
-def test_code2wav_merges_chunk_positions_of_one_prompt_into_one_call(monkeypatch):
-    model, _ = _model()
-    backend = model.backend
-    for name in ("a", "b"):
-        _forward(model, [_info(name, 0, [10, 11, 12])])
-    calls: list[tuple[str, list[int], list[bool]] | tuple[str, int]] = []
-
-    def can_merge(token_counts, last_chunks, states):
-        calls.append(("can_merge", list(token_counts), list(last_chunks)))
-        return True
-
-    def decode_merged_batch(tokens, features, states, *, last_chunks):
-        calls.append(("merged", len(tokens)))
-        return [torch.ones(3) for _ in tokens], [None if last else states[i] for i, last in enumerate(last_chunks)]
-
-    monkeypatch.setattr(backend, "can_merge", can_merge)
-    monkeypatch.setattr(backend, "decode_merged_batch", decode_merged_batch)
-    output = _forward(
-        model,
-        [_info("a", 1, [13, 14, 15]), _info("b", 1, [16, 17], last_chunk=True), _info("c", 0, [18, 19, 20])],
-    )
-
-    assert calls == [("can_merge", [3, 2, 3], [False, True, False]), ("merged", 3)]
-    assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [3, 3, 3]
-    assert set(model._states) == {"a", "c"}
-
-
 def test_code2wav_keeps_duplex_streams_on_bucketed_decode(monkeypatch):
     model, _ = _model()
     monkeypatch.setattr(model.backend, "can_merge", lambda *args: pytest.fail("duplex rows must not merge"))

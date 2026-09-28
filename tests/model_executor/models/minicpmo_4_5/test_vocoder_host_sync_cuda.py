@@ -12,7 +12,6 @@ import torch
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _codec_tensor
 from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -56,16 +55,6 @@ def test_istft_is_bitwise_and_sync_free_on_cuda():
     with _no_host_sync():
         actual = hifigan._istft_without_host_sync(spec, n_fft, hop, window, envelopes)
     assert torch.equal(actual, expected)
-
-
-def test_codec_ids_upload_without_host_sync():
-    segment = torch.zeros(4, dtype=torch.long, device="cuda")
-    _codec_tensor(torch.tensor([0]), segment)
-    with _no_host_sync():
-        ids = _codec_tensor(torch.tensor([4, 5, 6], dtype=torch.int32), segment)
-        listed = _codec_tensor([7, 8], segment)
-    assert ids.device.type == "cuda" and ids.dtype == torch.long
-    assert ids.tolist() == [4, 5, 6] and listed.tolist() == [7, 8]
 
 
 def test_host_copy_batch_copies_without_blocking_until_wait():

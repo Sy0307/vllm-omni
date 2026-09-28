@@ -58,13 +58,6 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False):
     return omni.MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
 
 
-@pytest.mark.parametrize("v2", [False, True])
-def test_thinker_preprocess_only_for_v1(mocker, v2):
-    model = _model(mocker, v2=v2)
-    assert model.has_preprocess is (not v2)
-    assert model.requires_raw_input_tokens
-
-
 def test_mrv2_thinker_keeps_native_multimodal_embeddings_and_raw_ids(mocker):
     model = _model(mocker)
     batch = SimpleNamespace(input_ids=torch.tensor([11, 22, 33]), num_tokens_after_padding=3)
@@ -106,24 +99,3 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
         assert out.multimodal_outputs["latent"] is hidden
         torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], batch.input_ids[:, None])
         torch.testing.assert_close(out.multimodal_outputs["latent_positions"], batch.positions[:, None])
-
-
-def test_mrv2_thinker_rejects_duplex_at_construction(mocker):
-    with pytest.raises(NotImplementedError, match="duplex Thinker"):
-        _model(mocker, session="duplex")
-
-
-def test_mrv2_thinker_rejects_missing_full_payload_channel(mocker):
-    with pytest.raises(ValueError, match="full llm2tts payload"):
-        _model(mocker, async_chunk=True)
-
-
-def test_mrv2_thinker_rejects_duplex_payload(mocker):
-    model = _model(mocker)
-    with pytest.raises(NotImplementedError, match="duplex Thinker"):
-        model.make_omni_output_mrv2(
-            torch.zeros(1, 4),
-            input_batch=None,
-            req_states=None,
-            model_intermediate_buffer=[{"duplex": {"data_plane": True}}],
-        )

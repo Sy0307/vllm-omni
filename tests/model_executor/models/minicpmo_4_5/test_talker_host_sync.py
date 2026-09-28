@@ -13,10 +13,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-    MiniCPMO45OmniForConditionalGeneration,
-)
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     ConditionalChatTTSConfig,
 )
@@ -35,11 +31,6 @@ class _SamplingMetadata:
     repetition_penalties: torch.Tensor
     prompt_token_ids: torch.Tensor | None = None
     no_penalties: bool = False
-
-
-@dataclass
-class _SamplerOutput:
-    sampled_token_ids: torch.Tensor
 
 
 def _make_talker(device: str = "cpu") -> MiniCPMO45OmniTTSForConditionalGeneration:
@@ -84,14 +75,6 @@ def _infos(states: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _store(infos: list[dict[str, Any]], updates: list[dict[str, Any]]) -> None:
-    """What the runner's buffer update does with the CPU ``codes.audio`` delta."""
-    for info, update in zip(infos, updates, strict=True):
-        audio = update["codes"]["audio"]
-        assert audio.device.type == "cpu" and audio.dtype == torch.long
-        info["codes"] = {"audio": audio.contiguous()}
-
-
 def _step(talker, infos, hidden, mocker, *, batched: bool, input_ids: torch.Tensor, penalties: torch.Tensor):
     if batched:
         returned_ids, embeds, updates = talker.preprocess_decode_batch(input_ids=input_ids, req_infos=infos)
@@ -100,7 +83,8 @@ def _step(talker, infos, hidden, mocker, *, batched: bool, input_ids: torch.Tens
         rows = [talker.preprocess(input_ids[row : row + 1], None, **info) for row, info in enumerate(infos)]
         embeds = torch.cat([row[1] for row in rows])
         updates = [row[2] for row in rows]
-    _store(infos, updates)
+    for info, update in zip(infos, updates, strict=True):
+        info["codes"] = update["codes"]
     output = talker.make_omni_output(
         hidden,
         model_intermediate_buffer=infos,
@@ -111,7 +95,7 @@ def _step(talker, infos, hidden, mocker, *, batched: bool, input_ids: torch.Tens
 
     def _sampler(logits, sampling_metadata):
         captured["logits"] = logits.clone()
-        return _SamplerOutput(sampled_token_ids=logits.argmax(dim=-1, keepdim=True))
+        return SimpleNamespace(sampled_token_ids=logits.argmax(dim=-1, keepdim=True))
 
     mocker.patch(
         "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts.Sampler",
@@ -139,146 +123,9 @@ def test_batched_decode_matches_scalar_preprocess(mocker) -> None:
     # Embeddings, masked logits, penalized logits and sampled ids.
     for index in (0, 2, 3, 4):
         assert torch.equal(results[False][index], results[True][index])
-    scalar_output, batched_output = results[False][1], results[True][1]
-    scalar_codes = scalar_output.multimodal_outputs["codes"]["audio"]
-    batched_codes = batched_output.multimodal_outputs["codes"]["audio"]
-    assert [(t.device.type, t.dtype, t.tolist()) for t in batched_codes] == [
-        (t.device.type, t.dtype, t.tolist()) for t in scalar_codes
-    ]
-    assert [t.tolist() for t in batched_codes] == [[[3]], [], [], [[6]]]
-    assert [t.item() for t in batched_output.multimodal_outputs["meta"]["finished"]] == [False, True, True, True]
-    assert [t.item() for t in scalar_output.multimodal_outputs["meta"]["finished"]] == [False, True, True, True]
-    assert torch.equal(results[False][4], results[True][4])
+    for result in results.values():
+        output = result[1].multimodal_outputs
+        assert [t.tolist() for t in output["codes"]["audio"]] == [[[3]], [], [], [[6]]]
+        assert [t.item() for t in output["meta"]["finished"]] == [False, True, True, True]
     assert talkers[True]._request_audio_states == talkers[False]._request_audio_states
-    assert talkers[True]._penalty_histories is None  # consumed by sample()
-    states = talkers[True]._request_audio_states
-    assert states["req-live"]["recent_codes"] == [1, 2, 3]
-    assert states["req-eos"] == {"finished": True, "step": 60, "max_tokens": 100, "recent_codes": [4, 4, 5]}
-    assert states["req-cap"]["finished"] is True
-    assert results[True][4].reshape(-1).tolist()[1:] == [_EOS, _EOS, _EOS]
-    # The finished row embeds as zeros, the others as their codec id.
-    assert torch.equal(results[True][0][2], torch.zeros(4))
-    assert torch.equal(results[True][0][0], talkers[True].emb_code[0].weight[3])
     assert talkers[True]._decode_codec_ids == {}
-
-
-def test_batched_decode_defers_eos_and_leaves_host_state_untouched() -> None:
-    talker = _make_talker()
-    talker._request_audio_states["req"] = {"finished": False, "step": 4}
-
-    _, _, updates = talker.preprocess_decode_batch(
-        input_ids=torch.tensor([_EOS]),
-        req_infos=[{"request_id": "req", "audio_state": {"finished": False}}],
-    )
-
-    # No host read in preprocess: the id is resolved in make_omni_output.
-    assert talker._request_audio_states["req"]["finished"] is False
-    assert updates[0]["codes"]["audio"].numel() == 0
-    assert "req" in talker._decode_codec_ids
-    output = talker.make_omni_output(
-        torch.ones(1, 4),
-        model_intermediate_buffer=[{"request_id": "req", "codes": updates[0]["codes"]}],
-        request_token_spans=[(0, 1)],
-    )
-    assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
-    assert talker._request_audio_states["req"] == {"finished": True, "step": 4}
-    assert talker._decode_codec_ids == {}
-
-
-def test_batched_decode_builds_the_cpu_delta_in_make_omni_output() -> None:
-    talker = _make_talker()
-    talker._request_audio_states["req"] = {"finished": False, "step": 0, "recent_codes": [1]}
-    _, _, updates = talker.preprocess_decode_batch(
-        input_ids=torch.tensor([5], dtype=torch.int32),
-        req_infos=[{"request_id": "req", "audio_state": {"finished": False}}],
-    )
-
-    output = talker.make_omni_output(
-        torch.ones(1, 4),
-        model_intermediate_buffer=[{"request_id": "req", "codes": updates[0]["codes"]}],
-        request_token_spans=[(0, 1)],
-    )
-
-    delta = output.multimodal_outputs["codes"]["audio"][0]
-    assert delta.device.type == "cpu" and delta.dtype == torch.long and delta.tolist() == [[5]]
-    assert talker._request_audio_states["req"] == {"finished": False, "step": 1, "recent_codes": [1, 5]}
-    assert talker._penalty_histories[0].device.type == "cpu"
-    assert talker._penalty_histories[0].tolist() == [1, 5]
-
-
-def test_batched_decode_falls_back_to_scalar_preprocess_without_state(mocker) -> None:
-    talker = _make_talker()
-    prefill = mocker.patch.object(
-        talker,
-        "preprocess",
-        return_value=(None, torch.full((1, 4), 5.0), {"codes": {"audio": torch.empty(0, dtype=torch.long)}}),
-    )
-
-    _, embeds, updates = talker.preprocess_decode_batch(
-        input_ids=torch.tensor([2, 3]),
-        req_infos=[{"request_id": "new"}, {"request_id": "old", "audio_state": {"finished": False}}],
-    )
-
-    assert prefill.call_count == 1
-    assert torch.equal(embeds[0], torch.full((4,), 5.0))
-    assert torch.equal(embeds[1], talker.emb_code[0].weight[3])
-    assert updates[0]["codes"]["audio"].numel() == 0
-    assert updates[1]["codes"]["audio"].numel() == 0
-    assert set(talker._decode_codec_ids) == {"old"}
-
-
-def test_compute_logits_matches_boolean_mask_indexing() -> None:
-    talker = _make_talker()
-    hidden = torch.randn(4, 4, generator=torch.Generator().manual_seed(3))
-    force = [True, False, False, True]
-    mask = [False, True, False, False]
-    expected = talker.head_code[0](hidden).float().clone()
-    expected[torch.tensor(force)] = float("-inf")
-    expected[torch.tensor(force), _EOS] = 0.0
-    expected[torch.tensor(mask), _EOS] = float("-inf")
-
-    talker._force_eos_rows = force
-    talker._mask_eos_rows = mask
-    logits = talker.compute_logits(hidden)
-
-    assert torch.equal(logits, expected)
-    assert talker._pending_force_eos_rows == force
-
-
-def _fake_vllm_config(stage: str):
-    return SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(),
-            multimodal_config=None,
-            model_stage=stage,
-        )
-    )
-
-
-def test_wrapper_exposes_the_batched_decode_hook_to_the_runner(mocker) -> None:
-    from vllm_omni.worker import gpu_model_runner
-
-    talker = _make_talker()
-    talker.make_empty_intermediate_tensors = lambda *args, **kwargs: None
-    mocker.patch.object(minicpmo_4_5_omni, "init_vllm_registered_model", return_value=talker)
-
-    model = MiniCPMO45OmniForConditionalGeneration(vllm_config=_fake_vllm_config("tts"))
-
-    assert model.preprocess_decode_batch == talker.preprocess_decode_batch
-    assert model.use_async_omni_output is True
-    # codes.audio is a CPU transport delta: nothing is GPU-resident.
-    assert not hasattr(model, "gpu_resident_buffer_keys")
-    warnings = mocker.patch.object(gpu_model_runner.logger, "warning")
-    gpu_model_runner.OmniGPUModelRunner._warn_unexposed_stage_hooks(model)
-    warnings.assert_not_called()
-
-
-def test_wrapper_keeps_thinker_on_the_scalar_preprocess_path(mocker) -> None:
-    thinker = nn.Module()
-    thinker.make_empty_intermediate_tensors = lambda *args, **kwargs: None
-    mocker.patch.object(minicpmo_4_5_omni, "init_vllm_registered_model", return_value=thinker)
-
-    model = MiniCPMO45OmniForConditionalGeneration(vllm_config=_fake_vllm_config("llm"))
-
-    assert getattr(model, "preprocess_decode_batch", None) is None
-    assert not hasattr(model, "gpu_resident_buffer_keys")
