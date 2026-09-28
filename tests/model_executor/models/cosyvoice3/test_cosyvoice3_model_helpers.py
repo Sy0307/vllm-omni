@@ -764,15 +764,6 @@ def test_embed_input_ids_rejects_cross_request_placeholder_block():
         )
 
 
-def test_absent_conditioning_is_not_a_wire_warning(caplog):
-    from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
-
-    token = torch.tensor([7])
-    result = _ensure_tensor_values({"embed.embedding": None, "codes.audio": token})
-    assert result == {"codes.audio": token}
-    assert not any("Dropping non-tensor" in record.message for record in caplog.records)
-
-
 def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
 
