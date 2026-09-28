@@ -1,0 +1,3 @@
+[default.extend-identifiers]
+# PyTorch CUDA device property; "optin" is the upstream API spelling.
+shared_memory_per_block_optin = "shared_memory_per_block_optin"

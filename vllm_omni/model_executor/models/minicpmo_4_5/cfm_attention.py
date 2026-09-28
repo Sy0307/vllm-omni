@@ -93,7 +93,7 @@ def cfm_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch
         raise ValueError("CFM tiled attention requires float32 Q/K/V")
     # Strided FP32 tiles can exceed the 99 KiB per-block limit on L4.
     # Keep the original three-stage pipeline on devices with enough SRAM.
-    shared_memory = torch.cuda.get_device_properties(q.device).shared_memory_per_block_option
+    shared_memory = torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
     num_stages = 3 if shared_memory >= 102400 else 2
     out = torch.empty((b, nq, heads, dim), device=q.device, dtype=q.dtype)
     _attention[(b, heads, triton.cdiv(nq, 32))](
