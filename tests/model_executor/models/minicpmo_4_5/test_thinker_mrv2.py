@@ -21,12 +21,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("minicpmo_4_5_turn_mrv2_h200_talker16.yaml", [4, 16, 8], 4),
     ],
 )
-def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib):
+def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, monkeypatch):
     from pathlib import Path
 
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
     from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+    from vllm_omni.platforms import current_omni_platform
 
+    # merge_pipeline_deploy resolves the platform again; test the CUDA profile
+    # consistently even when this CPU test runs on a ROCm host.
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     deploy = Path(__file__).resolve().parents[4] / "vllm_omni/deploy" / profile
     config = _apply_platform_overrides(load_deploy_config(deploy), platform="cuda")
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
