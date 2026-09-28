@@ -1,0 +1,12 @@
+# Opt-in single-H200 native full-duplex codec profile (V1).
+# Inherits the native session/stage capacities, sampling and chunk sizes.
+# Reuse graph buffers without adding lazy block-compilation latency.
+# TF32 changes FP32 GEMM rounding; validate audio quality for your workload.
+base_config: minicpmo_4_5.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      cfm_graph_optimized_io: true
+      cfm_graph_cache_policy: retain
+      token2wav_allow_tf32: true
