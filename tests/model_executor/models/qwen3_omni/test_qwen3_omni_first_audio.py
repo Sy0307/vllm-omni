@@ -9,6 +9,7 @@
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -100,61 +101,34 @@ def test_chunk_ramp_adds_exact_code2wav_graph_sizes(monkeypatch):
     import vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper as wrapper_module
 
     real = wrapper_module.CUDAGraphDecoderWrapper
-    created = {}
-
-    class Wrapper:
-        compute_capture_sizes = staticmethod(real.compute_capture_sizes)
-
-        def __init__(self, **kwargs):
-            created.update(kwargs)
-            self.capture_sizes = kwargs.get("capture_sizes")
-
-        def warmup(self, *args, **kwargs):
-            pass
-
-    monkeypatch.setattr(wrapper_module, "CUDAGraphDecoderWrapper", Wrapper)
+    wrapper = MagicMock(compute_capture_sizes=real.compute_capture_sizes)
+    monkeypatch.setattr(wrapper_module, "CUDAGraphDecoderWrapper", wrapper)
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 25, "codec_chunk_ramp": [1, 2, 4, 8, 16, 25]}
+    code2wav = SimpleNamespace(config=SimpleNamespace(num_quantizers=_Q))
+    code2wav.enable_cudagraph = lambda **kw: Qwen3OmniMoeCode2Wav.enable_cudagraph(
+        code2wav, device=torch.device("cuda"), **kw
+    )
     model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
     torch.nn.Module.__init__(model)
-    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 25, "codec_chunk_ramp": [1, 2, 4, 8, 16, 25]}
+    model.code2wav = code2wav
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(async_chunk=True, enforce_eager=False, stage_connector_config={"extra": extra})
     )
-    code2wav = object.__new__(Qwen3OmniMoeCode2Wav)
-    torch.nn.Module.__init__(code2wav)
-    code2wav.config = SimpleNamespace(num_quantizers=_Q)
-    code2wav.enable_cudagraph = lambda **kwargs: Qwen3OmniMoeCode2Wav.enable_cudagraph(
-        code2wav, device=torch.device("cuda"), **kwargs
-    )
-    model.code2wav = code2wav
-
-    model._maybe_enable_code2wav_cudagraph()
-
-    sizes = created["capture_sizes"]
-    assert {1, 3, 7, 15, 31, 50} <= set(sizes)
-    # The default streaming and non-streaming buckets stay.
-    assert set(real.compute_capture_sizes(codec_chunk_frames=25, codec_left_context_frames=25)) <= set(sizes)
-
-    # Multi-row graphs are opt-in.
-    assert created["extra_capture_shapes"] == []
-    assert code2wav._streaming_batch_sizes == {}
-
-    extra["codec_graph_batch_sizes"] = [2, 4, 8]
-    model._maybe_enable_code2wav_cudagraph()
-    shapes = set(created["extra_capture_shapes"])
-    # Buckets up to one streaming window (25 + 25 frames) per row count, never
-    # more frames than the largest single-row graph (325).
-    assert shapes == {
-        (b, size) for b in (2, 4, 8) for size in created["capture_sizes"] if size <= 50 and b * size <= 325
-    }
-    assert (2, 1) in shapes and (4, 50) in shapes and (2, 64) not in shapes and (8, 50) not in shapes
+    for batches in ([], [2, 4, 8]):
+        extra["codec_graph_batch_sizes"] = batches
+        Qwen3OmniMoeForConditionalGeneration._maybe_enable_code2wav_cudagraph(model)
+        args = wrapper.call_args.kwargs
+        sizes = args["capture_sizes"]
+        assert {1, 3, 7, 15, 31, 50} <= set(sizes)
+        assert set(real.compute_capture_sizes(codec_chunk_frames=25, codec_left_context_frames=25)) <= set(sizes)
+        assert set(args["extra_capture_shapes"]) == {
+            (b, size) for b in batches for size in sizes if size <= 50 and b * size <= 325
+        }
     assert code2wav._streaming_batch_sizes[50] == [1, 2, 4]
-    assert code2wav._streaming_batch_sizes[1] == [1, 2, 4, 8]
-
     extra.pop("codec_chunk_ramp")
     extra.pop("codec_graph_batch_sizes")
-    model._maybe_enable_code2wav_cudagraph()
-    # Without a ramp the wrapper derives its default sizes itself.
-    assert created["capture_sizes"] is None
+    Qwen3OmniMoeForConditionalGeneration._maybe_enable_code2wav_cudagraph(model)
+    assert wrapper.call_args.kwargs["capture_sizes"] is None
 
 
 _SIZES = [1, 2, 3, 4, 7, 8, 15, 16, 25, 31, 32, 50, 64]

@@ -49,8 +49,8 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
-from vllm_omni.model_executor.models.common.talker_first_audio import talker_first_audio_enabled
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_omni.first_frame_decoder import talker_first_audio_enabled
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     apply_outer_quant_config_mapping,
 )

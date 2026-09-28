@@ -15,14 +15,5 @@ cuDNN search restores process settings on exit and has startup cost. Kernel
 arithmetic is not bitwise-equivalent; the first-frame decoder uses additional
 model memory. Full-duplex performance is not established by turn-mode tests.
 
-Historical measurements (2026-09-26) use GSM8K-derived EN1088 short prompts,
-**not Seed-TTS Eval**. Short KV improved repeated C64 throughput from 94.53 to
-108.45 audio-s/s (+14.7%). Relative to an already-short-KV control, fused
-sampling plus cuDNN search improved C32 4096-request throughput 83.469 to
-92.382 and first-audio P50 135.82 to 128.10 ms. Two C64 starts had throughput
-changes -2.59% and +10.08%, and P99 changes -3.80% and +23.36%; neither C64
-throughput nor P99 has a reliable uniform gain. P50 improved 7.13% and 4.91%.
-Do not add sequential percentages or present kernel speedups as service gains.
-Long mathematical replies were retained. 128 English quality prompts showed
-no clear WER/UTMOS regression, but are not a noninferiority test. The split PR
-needs its own correctness validation; these are historical performance results.
+First-frame delivery requires CUDA, a local single-rank Talker and prefix caching disabled.
+Other deployments retain the regular Code2Wav path.

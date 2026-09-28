@@ -20,14 +20,23 @@ the Talker's own graphs may still run.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.common.talker_first_audio import supports_talker_first_audio
+
 logger = init_logger(__name__)
+
+
+def talker_first_audio_enabled(vllm_config: Any) -> bool:
+    """Omni defaults on; Qwen3-TTS requires its connector option. Safety gates are shared."""
+    return os.environ.get("VLLM_OMNI_TALKER_FIRST_AUDIO", "1") == "1" and supports_talker_first_audio(vllm_config)
 
 
 class Qwen3OmniFirstFrameDecoder(nn.Module):
@@ -75,5 +84,6 @@ class Qwen3OmniFirstFrameDecoder(nn.Module):
             static_input.zero_()
             static_input[:rows, :, 0].copy_(chunk)
             graph.replay()
-            outputs.append(static_output[:rows, 0, :].float())
+            # A replay overwrites graph-owned storage; .float() aliases FP32 outputs.
+            outputs.append(static_output[:rows, 0, :].to(dtype=torch.float32, copy=True))
         return torch.cat(outputs, dim=0)
