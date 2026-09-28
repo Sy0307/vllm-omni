@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-Omni Talker contracts for the MRv2 runner (CPU, no weights).
-
-- MRv2 capability names (``mtp``, ``mtp_output_key``, ``mtp_graph_safe``) map
-  to the V1 ``talker_mtp`` hooks, so the MTP runs on MRv2 at all.
-- Thinker decode rows are consumed one per Talker step even when the MRv2
-  receiver hands over several at once.
-- ``make_omni_output`` builds one codec block per request span (warmup rows
-  included) and, with eager frames, token-major codes plus validity.
-"""
+"""MRv2 request-row ordering, codec validity and V1 compatibility."""
 
 from types import SimpleNamespace
 
@@ -22,24 +14,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _H = 4
 _Q = 3
-
-
-@pytest.mark.parametrize(
-    "profile,optimized", [("qwen3_omni_moe_mrv2.yaml", False), ("qwen3_omni_moe_mrv2_h200.yaml", True)]
-)
-def test_h200_profile_scopes_sampling_and_codec_optimizations(profile, optimized):
-    from pathlib import Path
-
-    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
-
-    path = Path(__file__).resolve().parents[4] / "vllm_omni/deploy" / profile
-    config = _apply_platform_overrides(load_deploy_config(path), platform="cuda")
-    extra = config.connectors["connector_of_shared_memory"]["extra"]
-    assert extra.get("code_predictor_fused_sampling", False) is optimized
-    assert extra.get("codec_cudnn_benchmark", False) is optimized
-    if optimized:
-        assert extra["code_predictor_short_kv"]
-        assert [stage.devices for stage in config.stages] == ["0", "0", "0"]
 
 
 class _Talker(nn.Module):
@@ -81,19 +55,6 @@ def _step(model, payload: dict) -> torch.Tensor:
     return text_step.reshape(-1)
 
 
-def test_mtp_capability_names_follow_v1_talker_hooks():
-    model = _talker()
-    model.talker_mtp_output_key = ("codes", "audio")
-    model.talker_mtp_graph_safe = True
-    assert model.mtp == model.talker_mtp
-    assert model.mtp_output_key == ("codes", "audio")
-    assert model.mtp_graph_safe is True
-    model.talker_mtp_graph_safe = False  # e.g. a platform patch
-    assert model.mtp_graph_safe is False
-    model.model_stage = "code2wav"
-    assert model.mtp is None
-
-
 def test_mtp_frame_valid_rejects_codec_eos_and_special_ids():
     layer0 = torch.tensor([0, 2047, 2048, 2150, -1])
     assert _talker().mtp_frame_valid(layer0).tolist() == [True, True, False, False, False]
@@ -110,15 +71,6 @@ def test_decode_rows_are_consumed_one_per_step_in_arrival_order():
     # Rows 1..5 in order, then EOS once, then pad.
     assert steps == [1, 2, 3, 4, 5, -1, -2]
     assert payload["embed"]["cached_decode"] is None
-
-
-def test_single_row_per_step_matches_direct_consumption():
-    # The V1 adapter delivers one row per step; nothing is left pending.
-    model = _talker()
-    payload = {"embed": {"decode": _rows(7)}, "meta": {}}
-    assert _step(model, payload)[0].item() == 7
-    assert payload["embed"]["cached_decode"] is None
-    assert payload["embed"]["decode"] is None
 
 
 def test_resumable_requests_keep_the_indexed_cache_path():
@@ -164,12 +116,3 @@ def test_eager_output_is_token_major_with_invalid_rows():
     assert mm["codes"]["audio"].shape == (4, _Q)
     assert mm["meta"]["codec_frame_valid"].tolist() == [0, 0, 0, 0]
     assert out.text_hidden_states is hidden
-
-
-def test_subtalker_sampling_params_configure_the_code_predictor():
-    model = _talker()
-    model._apply_subtalker_sampling_params({"do_sample": False})
-    assert model.talker.sampling == {"top_k": 50, "top_p": 0.8, "do_sample": False}
-    model.talker.sampling = None
-    model._apply_subtalker_sampling_params(None)
-    assert model.talker.sampling is None

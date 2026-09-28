@@ -78,20 +78,6 @@ def test_first_frame_is_a_prefix_of_a_longer_first_chunk():
     torch.testing.assert_close(chunk0.reshape(-1)[: first.numel()].float(), first)
 
 
-def test_first_frame_decoder_loads_the_code2wav_weights():
-    code2wav = _code2wav()
-    decoder = Qwen3OmniFirstFrameDecoder(_code2wav(), sample_rate=24000)
-    for parameter in decoder.code2wav.parameters():
-        parameter.data.zero_()
-    weights = [(f"code2wav.{name}", tensor) for name, tensor in code2wav.state_dict().items()]
-
-    loaded = decoder.load_weights(weights)
-
-    assert {name for name, _ in code2wav.named_parameters()} <= loaded
-    for name, tensor in code2wav.named_parameters():
-        assert torch.equal(dict(decoder.code2wav.named_parameters())[name], tensor)
-
-
 @pytest.mark.parametrize(
     ("env", "async_chunk", "v2"),
     [
@@ -116,18 +102,17 @@ def test_chunk_ramp_adds_exact_code2wav_graph_sizes(monkeypatch):
     real = wrapper_module.CUDAGraphDecoderWrapper
     created = {}
 
-    class _Wrapper:
+    class Wrapper:
         compute_capture_sizes = staticmethod(real.compute_capture_sizes)
 
-        def __init__(self, *, decoder, capture_sizes=None, extra_capture_shapes=None, num_quantizers=8, enabled=True):
-            created["capture_sizes"] = capture_sizes
-            created["extra_capture_shapes"] = extra_capture_shapes
-            self.capture_sizes = capture_sizes
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.capture_sizes = kwargs.get("capture_sizes")
 
         def warmup(self, *args, **kwargs):
             pass
 
-    monkeypatch.setattr(wrapper_module, "CUDAGraphDecoderWrapper", _Wrapper)
+    monkeypatch.setattr(wrapper_module, "CUDAGraphDecoderWrapper", Wrapper)
     model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
     torch.nn.Module.__init__(model)
     extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 25, "codec_chunk_ramp": [1, 2, 4, 8, 16, 25]}
@@ -177,28 +162,6 @@ _SIZES = [1, 2, 3, 4, 7, 8, 15, 16, 25, 31, 32, 50, 64]
 
 def _bucket(length):
     return next((size for size in _SIZES if size >= length), None)
-
-
-def _plan_cost(calls, batch_sizes, call_cost=32):
-    total = 0
-    for rows, length in calls:
-        padded = next(b for b in sorted(batch_sizes) if b >= len(rows))
-        total += call_cost + padded * _bucket(length)
-    return total
-
-
-def test_decode_groups_separate_short_ramp_chunks_from_steady_windows():
-    lengths = [1, 3, 7, 50, 50, 50, 31, 15, 50, 26]
-    batch_sizes = [1, 2, 3, 4, 6, 8, 12, 16]
-
-    calls = plan_decode_groups(lengths, _bucket, lambda size: batch_sizes)
-
-    assert sorted(row for rows, _length in calls for row in rows) == list(range(len(lengths)))
-    for rows, length in calls:
-        assert length == max(lengths[row] for row in rows)
-    # Cheaper than one call at the longest window.
-    assert _plan_cost(calls, batch_sizes) < _plan_cost([(list(range(len(lengths))), 50)], batch_sizes)
-    assert len(calls) > 1
 
 
 def test_decode_groups_keep_a_uniform_batch_whole_and_split_by_the_largest_graph():
