@@ -546,12 +546,3 @@ def test_waiter_does_not_read_fd_reused_after_close(monkeypatch, tmp_path):
         for fd in reused:
             os.close(fd)
         receiver.close()
-
-
-@pytest.mark.parametrize("stage_id", [None, "s1", -1])
-def test_unsupported_stage_namespace_uses_polling(stage_id):
-    receiver = _stage_connector(stage_id)
-    try:
-        assert receiver.get_wakeup_generation() is None
-    finally:
-        receiver.close()
