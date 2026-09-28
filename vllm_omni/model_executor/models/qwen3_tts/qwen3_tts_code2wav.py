@@ -20,7 +20,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
-from vllm_omni.platforms import current_omni_platform
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -121,15 +120,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._total_upsample = int(self.decoder.total_upsample)
         self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
-        # Stateful streaming decoder (opt-in ``codec_stream_decoder``): one
-        # state slot per active request, CUDA graphs per (batch, frames).
-        self._stream_decoder = None
-        self._stream_slots: dict[str, int] = {}
-        self._stream_free: list[int] = []
-        self._stream_graphs: dict[
-            tuple[int, int], tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = {}
-        self._stream_chunk_frames = 25
         self._decoder_state_cache_warn_entries = 512
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -242,13 +232,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
-            self._drop_state(req_id)
-
-    def _drop_state(self, req_id: str) -> None:
-        self._decoder_state_cache.pop(req_id, None)
-        slot = self._stream_slots.pop(req_id, None)
-        if slot is not None:
-            self._stream_free.append(slot)
+            self._decoder_state_cache.pop(req_id, None)
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
@@ -450,7 +434,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 strict=False,
             ):
                 if req_id is not None and (finished or segment_finished):
-                    self._drop_state(req_id)
+                    self._decoder_state_cache.pop(req_id, None)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -486,61 +470,53 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if state_req_id is not None
             ]
 
-        if self._stream_decoder is not None and request_states is not None:
-            wav_tensors = self._stream_decode(
-                valid_codes_qf,
-                request_states,
-                [ref_context_size[i] for i in valid_indices],
-                [finished_flags[i] or segment_finished_flags[i] for i in valid_indices],
+        request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
+        max_request_length = max(request_lengths)
+        request_codes_shape = (len(valid_codes_qf), q, max_request_length)
+        target_device = ids.device
+        if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
+            staged_codes = torch.zeros(
+                request_codes_shape,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
             )
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+            request_codes = staged_codes.to(device=target_device, non_blocking=True)
         else:
-            request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
-            max_request_length = max(request_lengths)
-            request_codes_shape = (len(valid_codes_qf), q, max_request_length)
-            target_device = ids.device
-            if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
-                staged_codes = torch.zeros(
-                    request_codes_shape,
-                    dtype=torch.long,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                for row, (_, codes_qf) in enumerate(valid_codes_qf):
-                    staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
-                request_codes = staged_codes.to(device=target_device, non_blocking=True)
-            else:
-                request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
-                for row, (_, codes_qf) in enumerate(valid_codes_qf):
-                    request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+            request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
 
-            self._record_decode_batch_stats(
-                group_size=len(valid_codes_qf),
-                bucket_frames=max_request_length,
-                actual_frames=request_lengths,
+        self._record_decode_batch_stats(
+            group_size=len(valid_codes_qf),
+            bucket_frames=max_request_length,
+            actual_frames=request_lengths,
+        )
+        request_wavs = decoder.batched_chunked_decode(
+            request_codes,
+            request_lengths,
+            caches=request_states,
+            chunk_size=self._decode_chunk_frames,
+            left_context_size=self._decode_left_context_frames,
+            max_batch_size=self._decode_batch_max_size,
+        )
+        if len(request_wavs) != len(valid_codes_qf):
+            raise ValueError(
+                f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
             )
-            request_wavs = decoder.batched_chunked_decode(
-                request_codes,
-                request_lengths,
-                caches=request_states,
-                chunk_size=self._decode_chunk_frames,
-                left_context_size=self._decode_left_context_frames,
-                max_batch_size=self._decode_batch_max_size,
-            )
-            if len(request_wavs) != len(valid_codes_qf):
-                raise ValueError(
-                    f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
-                )
-            wav_tensors: list[torch.Tensor] = []
-            for row in range(len(valid_codes_qf)):
-                wav = request_wavs[row]
-                if wav.dim() == 2 and wav.shape[0] == 1:
-                    wav = wav[0]
-                elif wav.dim() != 1:
-                    raise ValueError(f"Qwen3-TTS batched decoder returned unexpected row shape {tuple(wav.shape)}")
-                if request_states is None:
-                    start = left_context_size[valid_indices[row]] * self._total_upsample
-                    wav = wav[start:]
-                wav_tensors.append(wav)
+        wav_tensors: list[torch.Tensor] = []
+        for row in range(len(valid_codes_qf)):
+            wav = request_wavs[row]
+            if wav.dim() == 2 and wav.shape[0] == 1:
+                wav = wav[0]
+            elif wav.dim() != 1:
+                raise ValueError(f"Qwen3-TTS batched decoder returned unexpected row shape {tuple(wav.shape)}")
+            if request_states is None:
+                start = left_context_size[valid_indices[row]] * self._total_upsample
+                wav = wav[start:]
+            wav_tensors.append(wav)
 
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
             self.log_decode_batch_stats()
@@ -568,136 +544,11 @@ class Qwen3TTSCode2Wav(nn.Module):
             strict=False,
         ):
             if req_id is not None and (finished or segment_finished):
-                self._drop_state(req_id)
+                self._decoder_state_cache.pop(req_id, None)
 
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs, FIRST_AUDIO_REQUIRED_KEY: first_audio_required},
-        )
-
-    # ------------------------------------------------------------ streaming decode
-    def _stream_slot(self, req_id: str) -> tuple[int, bool]:
-        slot = self._stream_slots.get(req_id)
-        if slot is not None:
-            return slot, False
-        if not self._stream_free:
-            raise RuntimeError("Qwen3-TTS streaming codec decoder ran out of state slots")
-        slot = self._stream_free.pop()
-        self._stream_slots[req_id] = slot
-        return slot, True
-
-    def _stream_call(self, codes: torch.Tensor, slots: list[int], pos: list[int], frames: int) -> torch.Tensor:
-        """``codes`` [n, frames, Q] on device -> waveform [n, frames * spf] (graph replay when captured)."""
-        sd = self._stream_decoder
-        n = int(codes.shape[0])
-        dev = codes.device
-        sizes = sorted(b for (b, t) in self._stream_graphs if t == frames and b >= n)
-        if not sizes:
-            slot_t = torch.tensor(slots, dtype=torch.int32).to(dev, non_blocking=True)
-            pos_t = torch.tensor(pos, dtype=torch.int32).to(dev, non_blocking=True)
-            return sd(codes, slot_t, pos_t)
-        graph, s_codes, s_slots, s_pos, s_out = self._stream_graphs[(sizes[0], frames)]
-        bsz = sizes[0]
-        host = torch.empty(2, bsz, dtype=torch.int32, pin_memory=True)
-        host[0].fill_(sd.scratch_slot)
-        host[1].zero_()
-        host[0, :n] = torch.tensor(slots, dtype=torch.int32)
-        host[1, :n] = torch.tensor(pos, dtype=torch.int32)
-        s_slots.copy_(host[0], non_blocking=True)
-        s_pos.copy_(host[1], non_blocking=True)
-        s_codes[:n].copy_(codes)
-        graph.replay()
-        # The static output is overwritten by the next replay of this graph.
-        return s_out[:n].clone()
-
-    def _stream_decode(
-        self,
-        valid_codes_qf: list[tuple[str | None, torch.Tensor]],
-        states: list[dict[str, Any]],
-        ref_frames: list[int],
-        done: list[bool],
-    ) -> list[torch.Tensor]:
-        """Decode each request's new frames with the stateful decoder; returns 1-D float32 waveforms."""
-        sd = self._stream_decoder
-        spf = int(self._total_upsample)
-        chunk = self._stream_chunk_frames
-        jobs = []
-        for (req_id, codes_qf), state, ref, fin in zip(valid_codes_qf, states, ref_frames, done, strict=True):
-            dummy = req_id is None or req_id.startswith(_DUMMY_REQUEST_ID)
-            if dummy:
-                slot, new = sd.scratch_slot, True
-            else:
-                slot, new = self._stream_slot(req_id)
-            if new:
-                state["_stream_pos"] = 0
-            drop = 0
-            if new and ref > 0:
-                drop = ref * spf
-            elif new and state.get("skip_first_audio", False):
-                drop = spf
-            jobs.append(
-                dict(codes=codes_qf.t().contiguous(), slot=slot, fin=fin or dummy, state=state, drop=drop, out=[])
-            )
-        cursor = [0] * len(jobs)
-        while True:
-            groups: dict[int, list[tuple[int, int]]] = {}
-            for j, job in enumerate(jobs):
-                left = int(job["codes"].shape[0]) - cursor[j]
-                if left <= 0:
-                    continue
-                n = min(left, chunk)
-                call_t = n
-                if n not in (1, chunk) and job["fin"] and left == n:
-                    call_t = chunk  # final piece: pad, the state after it is never read
-                groups.setdefault(call_t, []).append((j, n))
-            if not groups:
-                break
-            for call_t, members in groups.items():
-                for start in range(0, len(members), 16):
-                    part = members[start : start + 16]
-                    codes = torch.zeros(
-                        len(part), call_t, self._num_quantizers, dtype=torch.int32, device=jobs[0]["codes"].device
-                    )
-                    slots, pos = [], []
-                    for row, (j, n) in enumerate(part):
-                        job = jobs[j]
-                        codes[row, :n] = job["codes"][cursor[j] : cursor[j] + n].to(torch.int32)
-                        slots.append(job["slot"])
-                        pos.append(0 if job["slot"] == sd.scratch_slot else int(job["state"]["_stream_pos"]))
-                    wav = self._stream_call(codes, slots, pos, call_t)
-                    for row, (j, n) in enumerate(part):
-                        job = jobs[j]
-                        job["out"].append(wav[row, : n * spf])
-                        job["state"]["_stream_pos"] = int(job["state"].get("_stream_pos", 0)) + n
-                        cursor[j] += n
-        result = []
-        for job in jobs:
-            wav = torch.cat(job["out"]) if job["out"] else torch.zeros(0, device=jobs[0]["codes"].device)
-            result.append(wav[job["drop"] :].to(torch.float32, copy=True))
-        return result
-
-    def _enable_stream_decoder(self, device: torch.device, slots: int, batch_sizes: list[int]) -> None:
-        from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
-
-        sd = StreamingCodecDecoder(self.decoder, num_slots=slots, dtype=self.vllm_config.model_config.dtype)
-        self._stream_decoder = sd
-        self._stream_free = list(range(slots - 1, -1, -1))
-        pool = torch.cuda.graph_pool_handle()
-        for frames in sorted({1, self._stream_chunk_frames}):
-            for bsz in sorted(set(batch_sizes)):
-                codes = torch.zeros(bsz, frames, self._num_quantizers, dtype=torch.int32, device=device)
-                s_slots = torch.full((bsz,), sd.scratch_slot, dtype=torch.int32, device=device)
-                s_pos = torch.zeros(bsz, dtype=torch.int32, device=device)
-                sd(codes, s_slots, s_pos)
-                current_omni_platform.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool):
-                    out = sd(codes, s_slots, s_pos)
-                self._stream_graphs[(bsz, frames)] = (graph, codes, s_slots, s_pos, out)
-        logger.info(
-            "Qwen3-TTS streaming codec decoder: %d slots, graphs %s",
-            slots,
-            sorted(self._stream_graphs),
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
@@ -878,11 +729,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 "talker_first_audio", False
             )
             decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
-            stream_decoder = self._async_chunk and _get_bool_config("codec_stream_decoder", False)
-            stream_slots = _get_int_config("codec_stream_slots", 256)
-            stream_batches = _get_int_list_config("codec_stream_graph_batch_sizes") or [1, 2, 3, 4, 6, 8, 12, 16]
         else:
-            stream_decoder = False
             codec_chunk_frames = 0
             codec_left_context_frames = 0
             initial_codec_chunk_frames = 1
@@ -915,11 +762,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
-        if stream_decoder and device.type == "cuda":
-            self._stream_chunk_frames = codec_chunk_frames or 25
-            with torch.inference_mode():
-                self._enable_stream_decoder(device, stream_slots, stream_batches)
-        elif hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
+        if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
                 # Autotune only during warmup/capture, then restore the process
                 # flags. The captured convolution algorithms remain in the

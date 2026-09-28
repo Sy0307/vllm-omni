@@ -104,6 +104,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # next step's output (see _StreamPcm).
         self._stream_pcm_prev: _StreamPcm | None = None
 
+    def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # Preempted requests keep their queued PCM until they are scheduled again.
+        for req_id in scheduler_output.finished_req_ids:
+            _STREAM_PCM.drop(req_id)
+        super().finish_requests(scheduler_output)
+
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
             self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
@@ -431,26 +437,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 )
                 for key, value in mm_outputs.items()
             }
-            flat = flatten_payload(payload)
-            waveform = flat.get("model_outputs")
-            if isinstance(waveform, torch.Tensor) and waveform.dim() == 2:
-                # Talker stream decode: token-major PCM rows on the host. Only
-                # rows holding a real frame are audio; frames are released in
-                # chunks so each step returns few tensors.
-                valid = flat.get("meta.codec_frame_valid")
-                ended = False
-                if isinstance(valid, torch.Tensor) and valid.shape[0] == waveform.shape[0]:
-                    mask = valid.bool()
-                    ended = bool(mask.numel()) and not bool(mask[-1])
-                    waveform = waveform[mask]
-                rid = req_ids[i] if req_ids is not None and i < len(req_ids) else None
-                chunk = _STREAM_PCM.push(rid, waveform.reshape(-1), ended)
-                if chunk is not None:
-                    flat["model_outputs"] = chunk
-                else:
-                    flat.pop("model_outputs")
-                    flat.pop("sr", None)
-            inter_stage, client_mm = partition_flat_payload(flat)
+            inter_stage, client_mm = partition_flat_payload(flatten_payload(payload))
             inter_stage_list.append(inter_stage or None)
             client_mm_list.append(client_mm or None)
 
@@ -630,17 +617,11 @@ class _StreamPcmAccumulator:
         self.chunk = chunk_frames
         self.pending: dict[str, list[torch.Tensor]] = {}
         self.emitted: dict[str, int] = {}
-        self.seen: dict[str, int] = {}
-        self.calls = 0
         self.lock = threading.Lock()
 
-    def push(self, req_id: str | None, pcm: torch.Tensor, ended: bool, emit: bool = True) -> torch.Tensor | None:
+    def push(self, req_id: str, pcm: torch.Tensor, ended: bool, emit: bool = True) -> torch.Tensor | None:
         """Queue ``pcm`` for ``req_id``; return a due chunk only if ``emit`` (the caller can deliver it)."""
-        if req_id is None:
-            return pcm if pcm.numel() else None
         with self.lock:
-            self.calls += 1
-            self.seen[req_id] = self.calls
             parts = self.pending.setdefault(req_id, [])
             if req_id not in self.emitted and req_id in DIRECT_FIRST_FRAME and pcm.numel() >= self.SPF:
                 # The first frame already left through the direct channel.
@@ -660,15 +641,14 @@ class _StreamPcmAccumulator:
             if ended:
                 self.pending.pop(req_id, None)
                 self.emitted.pop(req_id, None)
-                self.seen.pop(req_id, None)
-            if self.calls % 4096 == 0:
-                # Requests that stopped without an end frame (abort, length).
-                stale = [r for r, t in self.seen.items() if self.calls - t > 100000]
-                for r in stale:
-                    self.pending.pop(r, None)
-                    self.emitted.pop(r, None)
-                    self.seen.pop(r, None)
             return out
+
+    def drop(self, req_id: str) -> None:
+        """Forget a finished or aborted request (a no-op after its end frame)."""
+        with self.lock:
+            self.pending.pop(req_id, None)
+            self.emitted.pop(req_id, None)
+            DIRECT_FIRST_FRAME.discard(req_id)
 
 
 class _StreamPcm:

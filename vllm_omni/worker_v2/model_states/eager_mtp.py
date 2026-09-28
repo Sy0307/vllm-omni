@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Reference codes prime a voice-clone decoder slot in chunks of this size.
+_PRIME_CHUNK_FRAMES = 25
+
 
 def _has_ref_codes(buffer: dict[str, Any]) -> bool:
     ref = buffer.get("codes", {}).get("ref") if isinstance(buffer.get("codes"), dict) else None
@@ -31,9 +34,10 @@ class EagerMTPState:
         self.owner = owner
         self._first_audio_valid: torch.Tensor | None = None
         self._side_stream: torch.cuda.Stream | None = None
+        self._fast_ok: bool | None = None
 
     @property
-    def _decode_stream(self) -> torch.cuda.Stream | None:
+    def _decode_stream(self) -> torch.cuda.Stream:
         """Side stream for Talker stream decode, so the codec overlaps the next step."""
         if self._side_stream is None:
             self._side_stream = torch.cuda.Stream()
@@ -190,15 +194,14 @@ class EagerMTPState:
         return None
 
     def _fast_path_ok(self, codes_out: torch.Tensor, text_hidden: torch.Tensor) -> bool:
-        ok = getattr(self, "_fast_ok", None)
-        if ok is None:
-            ok = self._fast_ok = (
+        if self._fast_ok is None:
+            self._fast_ok = (
                 text_hidden.is_cuda
                 and not self.owner.vllm_config.cache_config.enable_prefix_caching
                 and self._embedding_weight() is not None
                 and hasattr(self.owner.model, "_codebook_vocab_size")
             )
-        return bool(ok) and codes_out.ndim == 2 and text_hidden.is_contiguous()
+        return self._fast_ok and codes_out.ndim == 2 and text_hidden.is_contiguous()
 
     def _run_eager_mtp_fused(
         self,
@@ -279,29 +282,22 @@ class EagerMTPState:
             owner._eager_ready[req_idx] = req_id
         if pos_list:
             assert isinstance(stream_out, torch.Tensor)
-            graphs = getattr(model, "stream_graphs", None)
-            decode = graphs if graphs is not None else stream
+            decode = model.stream_graphs if model.stream_graphs is not None else stream
             frame_codes = codes[:bsz].reshape(bsz, 1, -1).to(torch.int32)
+            # The next Talker step does not read the PCM, so the codec runs
+            # beside it; only the output copies wait for it.
             side = self._decode_stream
-            if side is None:
+            side.wait_stream(torch.cuda.current_stream())
+            for t in (frame_codes, meta, last_tokens, valid, stream_out):
+                t.record_stream(side)
+            with torch.cuda.stream(side):
                 self._prime_stream(stream, primes)
                 pcm = decode(frame_codes, rows, meta[4 * bsz : 5 * bsz])
                 stream_out.index_copy_(0, last_tokens, pcm.reshape(bsz, -1).to(stream_out.dtype))
                 self._send_stream_first_frames(entries, pcm, valid, first_rows)
-            else:
-                # The next Talker step does not read the PCM, so the codec runs
-                # beside it; only the output copies wait for it.
-                side.wait_stream(torch.cuda.current_stream())
-                for t in (frame_codes, meta, last_tokens, valid, stream_out):
-                    t.record_stream(side)
-                with torch.cuda.stream(side):
-                    self._prime_stream(stream, primes)
-                    pcm = decode(frame_codes, rows, meta[4 * bsz : 5 * bsz])
-                    stream_out.index_copy_(0, last_tokens, pcm.reshape(bsz, -1).to(stream_out.dtype))
-                    self._send_stream_first_frames(entries, pcm, valid, first_rows)
-                    done = torch.cuda.Event()
-                    done.record(side)
-                owner._stream_decode_event = done
+                done = torch.cuda.Event()
+                done.record(side)
+            owner._stream_decode_event = done
         if has_prefill:
             self._publish_first_audio(input_batch, entries, codes[:bsz], valid)
             if isinstance(first_audio, torch.Tensor):
@@ -318,16 +314,11 @@ class EagerMTPState:
     def _stream_ref_context(self, req_idx: int) -> torch.Tensor | None:
         """Last ``ref_code_context_frames`` reference codes [T, Q] of a voice-clone request, if any."""
         info = self.owner.intermediate_buffer.buffers[req_idx]
-        codes = info.get("codes") if isinstance(info, dict) else None
-        ref = codes.get("ref") if isinstance(codes, dict) else None
-        if not isinstance(ref, torch.Tensor) or ref.numel() == 0:
+        if not _has_ref_codes(info):
             return None
-        q = int(self.owner.model.talker_config.num_code_groups)
-        if ref.numel() % q:
-            return None
-        ref = ref.reshape(-1, q)
-        ctx = int(getattr(self.owner.model, "stream_ref_context_frames", 25))
-        return ref[-ctx:] if ctx > 0 else ref
+        ref = info["codes"]["ref"]
+        ref = ref.reshape(-1, int(self.owner.model.talker_config.num_code_groups))
+        return ref[-self.owner.model.stream_ref_context_frames :]
 
     def _prime_stream(self, stream, primes: list[tuple[int, torch.Tensor]]) -> None:
         """Run reference codes through each new voice-clone stream's decoder slot (output discarded)."""
@@ -335,10 +326,9 @@ class EagerMTPState:
             dev = self.owner.device
             codes = ref.to(device=dev, dtype=torch.int32).reshape(1, -1, ref.shape[-1])
             slot = torch.tensor([req_idx], device=dev, dtype=torch.int32)
-            step = 25
-            for t0 in range(0, int(codes.shape[1]), step):
+            for t0 in range(0, int(codes.shape[1]), _PRIME_CHUNK_FRAMES):
                 pos = torch.tensor([t0], device=dev, dtype=torch.int32)
-                stream(codes[:, t0 : t0 + step].contiguous(), slot, pos)
+                stream(codes[:, t0 : t0 + _PRIME_CHUNK_FRAMES].contiguous(), slot, pos)
 
     def _send_stream_first_frames(self, entries, pcm: torch.Tensor, valid: torch.Tensor, first_rows: list[int]) -> None:
         """Deliver each new stream's first decoded frame as soon as its copy completes."""
@@ -354,7 +344,7 @@ class EagerMTPState:
         rows_pcm = pcm.reshape(pcm.shape[0], -1).index_select(0, idx).float()
         rows_valid = valid.index_select(0, idx)
         request_ids = [entries[row][2] for row in first]
-        sr = torch.tensor(int(getattr(self.owner.model, "stream_sample_rate", 24000)), dtype=torch.int32)
+        sr = torch.tensor(self.owner.model.stream_sample_rate, dtype=torch.int32)
         accepted = sender.submit(request_ids, rows_pcm, sr, valid=rows_valid)
         self.owner._first_audio_requests.update(accepted)
         DIRECT_FIRST_FRAME.update(accepted)

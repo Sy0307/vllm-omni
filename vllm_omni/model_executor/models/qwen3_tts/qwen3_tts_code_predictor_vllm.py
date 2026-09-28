@@ -148,7 +148,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
                 layer0_code,
                 layer0_embed,
                 last_talker_hidden,
-                1.0 / max(temperature, 1e-6),
+                1.0 / temperature,
                 int(top_k),
                 sample_uniforms,
             )

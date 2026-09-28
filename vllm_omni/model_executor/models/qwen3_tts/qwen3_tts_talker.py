@@ -417,6 +417,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_ref_context_frames = stream_ref_context_frames(vllm_config)
         self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
         self.stream_decoder = None
+        self.stream_graphs = None
+        self.stream_sample_rate = 0
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
@@ -1471,12 +1473,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             slots = int(self.vllm_config.scheduler_config.max_num_seqs)
             self.stream_decoder = StreamingCodecDecoder(holder.decoder, num_slots=slots, dtype=torch.bfloat16)
             self.stream_sample_rate = int(holder.sample_rate)
-            self.stream_graphs = None
             logger.info("Qwen3-TTS Talker stream decode enabled (%d slots)", slots)
         return loaded
 
     def capture_stream_decode_graphs(self, batch_sizes: list[int]) -> None:
-        if self.stream_decoder is None or getattr(self, "stream_graphs", None) is not None:
+        if self.stream_decoder is None or self.stream_graphs is not None:
             return
         from .tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
 

@@ -344,6 +344,15 @@ def test_stream_pcm_waits_for_request_missing_from_batch(monkeypatch) -> None:
     assert "a" not in acc.pending
 
 
+def test_stream_pcm_drop_forgets_aborted_request(monkeypatch) -> None:
+    acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=25)
+    monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
+    part, mm = _stream_step({"a": [True, True]}, acc.SPF)
+    _deliver([part], mm)
+    acc.drop("a")
+    assert "a" not in acc.pending and "a" not in acc.emitted
+
+
 def test_stream_pcm_length_end_flushes_partial_chunk(monkeypatch) -> None:
     acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=25)
     monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
