@@ -122,6 +122,8 @@ def test_packed_stream_noise_growth_preserves_prefix_and_global_rng():
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_packed_stream_attention_matches_chunk_causal_reference():
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the opt-in packed backend requires Hopper FA3")
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
         RaggedRowAttention,
         pack_rows,
@@ -161,6 +163,8 @@ def test_packed_stream_attention_matches_chunk_causal_reference():
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the opt-in packed backend requires Hopper FA3")
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import PackedDiT
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
