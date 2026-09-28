@@ -28,11 +28,6 @@ class HiggsModelState(OmniModelState):
                 device=device,
             )
         self.direct_payload = bool(getattr(model.config, "audio_mrv2_direct_payload", False))
-        self.rng_seeds = None
-        if getattr(model.config, "audio_mrv2_batched_rng", False):
-            if vllm_config.model_config.max_model_len * model.num_codebooks * model.modality_head.vocab_size >= 2**32:
-                raise ValueError("Higgs MRV2 RNG counter domain exceeds uint32")
-            self.rng_seeds = torch.zeros(self.scheduler_config.max_num_seqs, dtype=torch.int64, device=device)
         self.sampling_slots = None
         self.request_slots = {}
         if getattr(model.config, "audio_mrv2_slot_parameters", False):
@@ -49,11 +44,10 @@ class HiggsModelState(OmniModelState):
         self.metadata_key = None
         self.metadata = None
         logger.info(
-            "Higgs MRV2 options: static=%s slot_parameters=%s direct_payload=%s batched_rng=%s",
+            "Higgs MRV2 options: static=%s slot_parameters=%s direct_payload=%s",
             self._static_inputs_embeds is not None,
             self.sampling_slots is not None,
             self.direct_payload,
-            self.rng_seeds is not None,
         )
         if not model.use_async_omni_output:
             raise ValueError("Higgs MRV2 requires audio_async_payload")
@@ -81,12 +75,6 @@ class HiggsModelState(OmniModelState):
             for name in ("temperature", "top_p", "top_k"):
                 self.sampling_slots[name][req_index : req_index + 1].fill_(getattr(params, name))
         self.metadata_key = None
-        if self.rng_seeds is not None:
-            import secrets
-
-            seed = params.seed if params.seed is not None else secrets.randbits(63)
-            seed = seed % 2**64
-            self.rng_seeds[req_index] = seed if seed < 2**63 else seed - 2**64
         if params.seed is not None:
             self.generators[new_req_data.req_id] = torch.Generator(device=self.device).manual_seed(params.seed)
 
@@ -218,23 +206,7 @@ class HiggsModelState(OmniModelState):
         metadata = self.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
         hidden = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(hidden, metadata)
-        noise = None
-        if self.rng_seeds is not None and self.model._step_audio_mode_rows == input_batch.num_reqs:
-            from .mrv2_rng import exponential_noise
-
-            noise = exponential_noise(
-                self.rng_seeds,
-                input_batch.idx_mapping[: input_batch.num_reqs],
-                input_batch.seq_lens,
-                req_states.prompt_len.gpu,
-                self.model.num_codebooks,
-                self.model.modality_head.vocab_size,
-            )
-        self.model._mrv2_audio_noise = noise
-        try:
-            sampled = self.model.sample(logits, metadata)
-        finally:
-            self.model._mrv2_audio_noise = None
+        sampled = self.model.sample(logits, metadata)
         count, rejected = get_num_sampled_and_rejected(
             torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
             input_batch.seq_lens,

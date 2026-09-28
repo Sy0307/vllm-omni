@@ -16,12 +16,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("rows", [0, 4, 8, 9, 30])
-def test_native_full_payload_preserves_legacy_dedelay_and_tail(rows):
-    audio = torch.arange(rows * 8).reshape(rows, 8) % 1026
+@pytest.mark.parametrize("offset", [0, -16, 1016])
+def test_native_full_payload_preserves_legacy_dedelay_and_tail(rows, offset):
+    audio = torch.arange(rows * 8).reshape(rows, 8) + offset
     out = SimpleNamespace(finished=True, outputs=[SimpleNamespace(multimodal_output={"codes": {"audio": audio}})])
     legacy = talker2code2wav([out])[0]["prompt_token_ids"]
     native = talker2code2wav_full_payload(None, {"codes.audio": audio}, None)
     assert native["codes"]["audio"].tolist() == legacy
+    # Independent expected layout: book q reads delayed rows q + frame.
+    frames = max(rows - 7, 0) if rows >= 8 else 0
+    kept = frames - 1 if frames >= 2 else frames
+    expected = []
+    for q in range(8):
+        for frame in range(kept):
+            value = (q + frame) * 8 + q + offset
+            expected.append(value if 0 <= value < 1024 else 0)
+    assert legacy == expected
     assert native["meta"]["finished"]
     assert talker2code2wav_token_only([out])[0]["prompt_token_ids"] == legacy
 

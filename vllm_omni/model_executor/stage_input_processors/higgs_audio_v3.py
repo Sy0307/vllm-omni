@@ -95,6 +95,18 @@ def _filter_real_code_frames(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     return frames[valid].t().contiguous()
 
 
+def _whole_utterance_codec_codes(audio_rows: torch.Tensor) -> torch.Tensor:
+    """Convert complete delayed [T, Q] rows to flat codebook-major CPU codes."""
+    codes = _revert_delay_pattern(audio_rows.to(device="cpu", dtype=torch.long).t().contiguous())
+    # Substitute special/padding codes after de-delay. Clamping would map EOC
+    # to a valid codec entry and introduce audible artifacts.
+    codes = torch.where((codes < 0) | (codes >= _NUM_REAL_CODES), 0, codes)
+    # Preserve the existing removal of the residual ramp-down frame.
+    if codes.shape[-1] >= 2:
+        codes = codes[:, :-1]
+    return codes.reshape(-1).contiguous()
+
+
 def talker2code2wav(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -133,43 +145,16 @@ def talker2code2wav(
                 f"got {audio_codes.shape[1]}. Audio codes shape: {tuple(audio_codes.shape)}"
             )
 
-        # Transpose to [Q, T] for delay pattern reversal
-        codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
-
-        # Step 1: Revert delay pattern
         try:
-            codes_qt = _revert_delay_pattern(codes_qt)
+            codec_codes = _whole_utterance_codec_codes(audio_codes)
         except ValueError as exc:
             logger.warning("Skipping invalid Higgs Audio v3 code sequence for Stage 1: %s", exc)
             code2wav_inputs.append(_empty_code2wav_prompt())
             continue
 
-        # Step 2: Replace out-of-range codes (BOC=1024, EOC=1025, -1) with 0.
-        # Must use torch.where, NOT clamp: clamp(max=1023) turns 1025→1023
-        # which is a valid codec code and decodes to audio artifacts.
-        # Matches sglang's: torch.where(codes >= codec_vocab, 0, codes)
-        codes_qt = torch.where(
-            (codes_qt >= _NUM_REAL_CODES) | (codes_qt < 0),
-            torch.zeros_like(codes_qt),
-            codes_qt,
-        )
-
-        # Step 3: Trim the last frame. After de-delay, the final frame
-        # contains residual ramp-down codes (EOC→0 substituted) that
-        # decode to a brief noise artifact at the end of the audio.
-        if codes_qt.shape[-1] >= 2:
-            codes_qt = codes_qt[:, :-1]
-
-        if codes_qt.numel() == 0:
-            code2wav_inputs.append(_empty_code2wav_prompt())
-            continue
-
-        # Code2Wav expects codebook-major flat: [Q * num_frames]
-        codec_codes = codes_qt.reshape(-1).tolist()
-
         code2wav_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=codec_codes,
+                prompt_token_ids=codec_codes.tolist(),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
                 additional_information=None,
@@ -413,9 +398,5 @@ def talker2code2wav_full_payload(transfer_manager, pooling_output, request):
             raise ValueError("Higgs payload must contain complete codebook rows")
         rows = audio.reshape(-1, _NUM_CODEBOOKS).to(device="cpu", dtype=torch.long)
         if rows.shape[0] >= _NUM_CODEBOOKS:
-            decoded = _revert_delay_pattern(rows.t().contiguous())
-            decoded = torch.where((decoded < 0) | (decoded >= _NUM_REAL_CODES), 0, decoded)
-            if decoded.shape[-1] >= 2:
-                decoded = decoded[:, :-1]
-            codes = decoded.reshape(-1).contiguous()
+            codes = _whole_utterance_codec_codes(rows)
     return {"codes": {"audio": codes}, "meta": {"finished": torch.tensor(True)}}

@@ -67,11 +67,9 @@ stages:
     audio_skip_text_head: true
     audio_mixed_direct_sampling: true
     audio_full_sample_graph: true
-    audio_defer_codes_output: false
     audio_async_prompt_mode: true
     audio_async_payload: true
     audio_mrv2_static_inputs: true
-    audio_mrv2_batched_rng: false
     audio_mrv2_slot_parameters: true
     audio_mrv2_direct_payload: true
     audio_mrv2_sample_graph_buckets: true

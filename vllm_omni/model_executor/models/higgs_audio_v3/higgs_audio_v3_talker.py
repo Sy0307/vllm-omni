@@ -1750,10 +1750,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         fallback = x.argmax(dim=-1)
         safe_x = torch.where(all_masked.unsqueeze(-1), torch.zeros_like(x), x)
         probs = safe_x.softmax(dim=-1)
-        if getattr(self, "_mrv2_audio_noise", None) is not None and not getattr(self, "_in_audio_sample_graph", False):
-            torch._assert_async(torch.isfinite(probs).all(), "Audio sampling probabilities must be finite")
-            sampled = probs.div(self._mrv2_audio_noise).argmax(dim=-1)
-        elif getattr(self, "_audio_graph_noise", None) is not None:
+        if getattr(self, "_audio_graph_noise", None) is not None:
             torch._assert_async(torch.isfinite(probs).all(), "Audio sampling probabilities must be finite")
             sampled = probs.div(self._audio_graph_noise).argmax(dim=-1)
         elif probs.is_cuda and getattr(getattr(self, "config", None), "audio_sampler_no_sync", False):

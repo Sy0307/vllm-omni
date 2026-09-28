@@ -151,3 +151,15 @@ clone rows at C1/C32: 256 successes, no long outputs or skipped scores, official
 WER 0.784%/0.899%. All 278 regression tests passed on that tree. Detailed settings,
 per-start measurements, source/weight hashes and telemetry are in
 [evidence/higgs_v3_mrv2_h200_20260928.json](evidence/higgs_v3_mrv2_h200_20260928.json).
+
+## Scope cleanup after the measured revision
+
+The performance and audio-quality measurements above belong to commit
+`0e679d523d419470bacd6046d9ceb6c4e151a589`. A subsequent cleanup removes the
+experimental batched RNG and optional scheduler-level deferred-code cache;
+both were disabled in the measured profile. Per-request torch RNG, sampler
+capture parity checks, owned output snapshots and codec output copies remain.
+The legacy and native whole-utterance adapters now share codebook de-delay,
+invalid-code substitution and final-frame trimming. Streaming windows are
+unchanged. These changes are covered by regression tests; the historical
+measurements are not presented as a fresh benchmark of the cleanup revision.

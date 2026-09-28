@@ -67,9 +67,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
     noise = torch.empty((batch * books, vocab), dtype=torch.float32, device=hidden.device)
     if actual < batch:
         noise[actual * books :].fill_(1)
-    if getattr(model, "_mrv2_audio_noise", None) is not None:
-        noise[: actual * books].copy_(model._mrv2_audio_noise)
-    elif metadata.generators:
+    if metadata.generators:
         for i in range(actual):
             noise[i * books : (i + 1) * books].exponential_(generator=metadata.generators.get(i))
     else:

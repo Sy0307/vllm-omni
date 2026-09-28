@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def make_state():
     state = object.__new__(HiggsModelState)
-    state.rng_seeds = state.sampling_slots = None
+    state.sampling_slots = None
     state.request_slots = {}
     state.device = torch.device("cpu")
     state.rope_state = state.prompt_embeds_state = state._static_inputs_embeds = None
