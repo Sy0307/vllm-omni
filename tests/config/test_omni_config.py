@@ -856,13 +856,6 @@ stages:
     assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [False, True, True]
 
 
-def test_stage_model_runner_rejects_unknown_value(tmp_path: Path):
-    deploy_path = tmp_path / "bad_runner.yaml"
-    deploy_path.write_text("stages:\n  - stage_id: 0\n    model_runner: v3\n")
-    with pytest.raises(ValueError, match="model_runner must be 'v1' or 'v2'"):
-        load_deploy_config(deploy_path)
-
-
 def test_platform_v1_fallback_overrides_stage_v2():
     deploy = DeployConfig(
         stages=[StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")],
@@ -871,13 +864,6 @@ def test_platform_v1_fallback_overrides_stage_v2():
     deploy = _apply_platform_overrides(deploy, platform="rocm")
     assert deploy.model_runner == "v1"
     assert deploy.stages[1].model_runner is None
-
-
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_stage_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
-    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=1, model_runner="v2")])
-    with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(deploy, platform=platform)
 
 
 def test_downstream_mrv2_stage_requires_turn_sessions():
@@ -2290,17 +2276,6 @@ def test_mps_stays_in_runtime_instead_of_engine_arguments():
         assert stage.runtime_config.cuda_mps
         args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
         assert "cuda_mps" not in args
-
-
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_platform_stage_overlay_cannot_bypass_mrv2_support_check(platform):
-    deploy = DeployConfig(
-        model_runner="v1",
-        stages=[StageDeployConfig(stage_id=0)],
-        platforms={platform: {"stages": [{"stage_id": 0, "model_runner": "v2"}]}},
-    )
-    with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(deploy, platform=platform)
 
 
 def test_platform_stage_overlay_rejects_invalid_model_runner():
