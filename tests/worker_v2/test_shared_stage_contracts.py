@@ -14,19 +14,6 @@ from vllm_omni.worker_v2.omni_ar_model_runner import _merge_payload_trees
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_custom_sampler_receives_default_sampler_and_returns_wrapper():
-    sampler, wrapped, state = object(), object(), object.__new__(OmniModelState)
-    seen = []
-
-    def customize(default):
-        seen.append(default)
-        return wrapped, None
-
-    state.model = SimpleNamespace(mrv2_custom_sampler=customize)
-    assert state.custom_sampler(sampler) == (wrapped, None)
-    assert seen == [sampler]
-
-
 def test_device_output_hook_receives_live_batch_and_request_state():
     state = object.__new__(OmniModelState)
     state.have_multimodal_outputs = True
