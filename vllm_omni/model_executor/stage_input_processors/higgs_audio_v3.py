@@ -246,6 +246,13 @@ def talker2code2wav_async_chunk(
     elif not finished:
         return None
 
+    return _flush_async_chunk(
+        transfer_manager, request_id, finished, _async_chunk_config(transfer_manager), emitted_frames
+    )
+
+
+def _async_chunk_config(transfer_manager: Any) -> tuple[int, int, int, int]:
+    """Validated (chunk, left context, right holdback, initial chunk) frames."""
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -266,7 +273,18 @@ def talker2code2wav_async_chunk(
             f"codec_right_holdback_frames={right_holdback_size_config}, "
             f"initial_codec_chunk_frames={configured_initial_chunk_size}"
         )
+    return chunk_size, left_context_size_config, right_holdback_size_config, configured_initial_chunk_size
 
+
+def _flush_async_chunk(
+    transfer_manager: Any,
+    request_id: str,
+    finished: bool,
+    config: tuple[int, int, int, int],
+    emitted_frames: dict[str, int],
+) -> OmniPayloadStruct | None:
+    """Emit the next sliding-window codec chunk once enough rows accumulated."""
+    chunk_size, left_context_size_config, right_holdback_size_config, configured_initial_chunk_size = config
     n_rows = len(transfer_manager.code_prompt_token_ids[request_id])
     de_delayed_total = max(0, n_rows - (_NUM_CODEBOOKS - 1))
     emitted = int(emitted_frames.get(request_id, 0))
@@ -370,6 +388,56 @@ def talker2code2wav_async_chunk(
         codes=CodesStruct(audio=codec_codes),
         meta=meta,
     )
+
+
+def talker2code2wav_async_chunk_batch(
+    transfer_manager: Any,
+    pooling_outputs: list[OmniPayload | None],
+    requests: list[Any],
+    is_finished: list[bool],
+) -> list[OmniPayloadStruct | None]:
+    """One talker step of async-chunk payloads with one host conversion per row.
+
+    Same accumulation and flush semantics as ``talker2code2wav_async_chunk``;
+    the chunk config is resolved once per step and each emitted ``[1, Q]``
+    CPU row is converted with a single ``tolist`` instead of several small
+    tensor operations per request.
+    """
+    if not (len(pooling_outputs) == len(requests) == len(is_finished)):
+        raise ValueError("batch codec inputs must have identical lengths")
+    emitted_frames = getattr(transfer_manager, "higgs_v3_emitted_frames", None)
+    if emitted_frames is None:
+        emitted_frames = {}
+        transfer_manager.higgs_v3_emitted_frames = emitted_frames
+    config = None
+    rows_by_request = transfer_manager.code_prompt_token_ids
+    payloads: list[OmniPayloadStruct | None] = []
+    for pooling_output, request, finished_flag in zip(pooling_outputs, requests, is_finished):
+        request_id = request.external_req_id
+        finished = bool(finished_flag or request.is_finished())
+        if isinstance(pooling_output, dict):
+            codes = pooling_output.get("codes")
+            audio = codes.get("audio") if isinstance(codes, dict) else None
+            if isinstance(audio, torch.Tensor) and audio.numel():
+                if audio.ndim == 2 and audio.device.type == "cpu" and not audio.is_floating_point():
+                    row = audio.tolist()[-1]
+                    if len(row) != _NUM_CODEBOOKS:
+                        raise ValueError(
+                            f"talker emit row has {len(row)} codebooks; expected {_NUM_CODEBOOKS} "
+                            "for higgs_audio_v3 async_chunk."
+                        )
+                else:
+                    row = _extract_last_step_row(pooling_output)
+                    row = None if row is None else row.cpu().tolist()
+                if row is not None:
+                    rows_by_request[request_id].append(row)
+        elif not finished:
+            payloads.append(None)
+            continue
+        if config is None:
+            config = _async_chunk_config(transfer_manager)
+        payloads.append(_flush_async_chunk(transfer_manager, request_id, finished, config, emitted_frames))
+    return payloads
 
 
 def talker2code2wav_token_only(source_outputs, prompt=None, _requires_multimodal_data=False):

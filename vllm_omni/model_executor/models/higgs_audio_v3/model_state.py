@@ -4,6 +4,7 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -41,6 +42,7 @@ class HiggsModelState(OmniModelState):
             }
         self.requests = {}
         self.generators = {}
+        self._ensure_slot_capacity(self.scheduler_config.max_num_seqs)
         self.metadata_key = None
         self.metadata = None
         logger.info(
@@ -51,6 +53,19 @@ class HiggsModelState(OmniModelState):
         )
         if not model.use_async_omni_output:
             raise ValueError("Higgs MRV2 requires audio_async_payload")
+
+    def _ensure_slot_capacity(self, slots):
+        """Per-slot prompt facts for vectorized step classification."""
+        current = getattr(self, "prompt_len_np", None)
+        if current is not None and len(current) >= slots:
+            return
+        size = max(slots, 2 * (0 if current is None else len(current)))
+        old_len, old_tail = current, getattr(self, "prompt_audio_tail_np", None)
+        self.prompt_len_np = np.zeros(size, dtype=np.int64)
+        self.prompt_audio_tail_np = np.zeros(size, dtype=bool)
+        if current is not None:
+            self.prompt_len_np[: len(old_len)] = old_len
+            self.prompt_audio_tail_np[: len(old_tail)] = old_tail
 
     def add_request(self, req_index, new_req_data):
         params = new_req_data.sampling_params
@@ -75,6 +90,11 @@ class HiggsModelState(OmniModelState):
             for name in ("temperature", "top_p", "top_k"):
                 self.sampling_slots[name][req_index : req_index + 1].fill_(getattr(params, name))
         self.metadata_key = None
+        prompt = new_req_data.prompt_token_ids or []
+        self._ensure_slot_capacity(req_index + 1)
+        self.prompt_len_np[req_index] = len(prompt)
+        self.model._resolve_token_ids()
+        self.prompt_audio_tail_np[req_index] = bool(prompt) and prompt[-1] == self.model._audio_continuation_id
         if params.seed is not None:
             self.generators[new_req_data.req_id] = torch.Generator(device=self.device).manual_seed(params.seed)
 
@@ -93,13 +113,12 @@ class HiggsModelState(OmniModelState):
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
         model = self.model
         model._resolve_token_ids()
-        audio_mode = True
-        for row, req_id in enumerate(input_batch.req_ids):
-            request = self.requests[req_id]
-            prompt = request.prompt_token_ids
-            slot = int(input_batch.idx_mapping_np[row])
-            end = int(req_states.num_computed_prefill_tokens[slot]) + int(input_batch.num_scheduled_tokens[row])
-            audio_mode &= bool(prompt and prompt[-1] == model._audio_continuation_id and end >= len(prompt))
+        # Every row must have an audio-continuation prompt whose prefill ends
+        # within this step; one vectorized check replaces a per-row loop.
+        n = input_batch.num_reqs
+        slots = input_batch.idx_mapping_np[:n]
+        end = req_states.num_computed_prefill_tokens[slots] + input_batch.num_scheduled_tokens[:n]
+        audio_mode = bool(np.all(self.prompt_audio_tail_np[slots] & (end >= self.prompt_len_np[slots])))
         model.update_decode_step_metadata(
             input_ids=model_inputs["input_ids"][: input_batch.num_tokens],
             positions=input_batch.positions,
@@ -117,6 +136,8 @@ class HiggsModelState(OmniModelState):
         # must not change the one-token-per-request decode classification.
         n = input_batch.num_tokens
         ids = model_inputs["input_ids"][:n]
+        if self._fused_decode_embeddings(input_batch, ids):
+            return
         safe_ids = torch.where(ids < 0, torch.zeros_like(ids), ids)
         embeds = self.model.model.embed_tokens(safe_ids)
         info = model_inputs.get("model_intermediate_buffer")
@@ -131,6 +152,36 @@ class HiggsModelState(OmniModelState):
         self._static_inputs_embeds[:n].copy_(embeds)
         padded = input_batch.num_tokens_after_padding
         self._static_inputs_embeds[n:padded].zero_()
+
+    def _fused_decode_embeddings(self, input_batch, ids) -> bool:
+        """Pure decode steps: token/feedback embeddings and padding in one launch."""
+        model = self.model
+        if (
+            input_batch.has_prefill
+            or input_batch.num_tokens != input_batch.num_reqs
+            or not ids.is_cuda
+            or not getattr(model, "_use_external_decode_cudagraph", False)
+        ):
+            return False
+        text = getattr(model.model.embed_tokens, "weight", None)
+        audio = getattr(model.multimodal_embedding, "weight", None)
+        if text is None or audio is None or text.dtype != self._static_inputs_embeds.dtype:
+            return False
+        from .step_kernels import decode_embeddings
+
+        n = int(ids.numel())
+        model._ensure_decode_state_capacity(n, ids.device)
+        decode_embeddings(
+            self._static_inputs_embeds,
+            ids,
+            text,
+            audio,
+            model._decode_last_codes,
+            model._decode_has_codes,
+            int(input_batch.num_tokens_after_padding),
+            int(model.multimodal_embedding.vocab_size),
+        )
+        return True
 
     def _apply_audio_feedback(self, embeds, ids, input_batch):
         if input_batch.num_tokens == input_batch.num_reqs:
@@ -232,9 +283,12 @@ class HiggsModelState(OmniModelState):
             codes = snapshot[:, : self.model.num_codebooks].clone()
             valid = snapshot[:, self.model.num_codebooks].tolist()
             invalid = set(payload.get("_higgs_invalid_rows", ()))
+            # One split creates every row view; per-row slicing cost one
+            # dispatcher call per request on the output-materialization path.
+            rows = torch.split(codes, 1)
             return RequestOutputSnapshot(
                 [
-                    {"codes.audio": codes[i : i + 1]} if valid[i] and n and i not in invalid else None
+                    {"codes.audio": rows[i]} if valid[i] and n and i not in invalid else None
                     for i, n in enumerate(num_sampled)
                 ]
             )

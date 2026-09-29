@@ -1031,6 +1031,27 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             return None
         return tail_ids == int(audio_id)
 
+    def _step_tail_guard(self, num_rows: int, *, prompt_mode: bool, decode_only: bool) -> None:
+        from .step_kernels import step_tail_guard
+
+        error = getattr(self, "_decode_tail_guard_error", None)
+        device = self._decode_has_codes.device
+        if error is None or error.device != device:
+            error = self._decode_tail_guard_error = torch.zeros(1, dtype=torch.int32, device=device)
+        step_tail_guard(
+            self._last_step_input_ids.reshape(-1),
+            None if decode_only else self._last_step_query_start_loc,
+            self._decode_has_codes[:num_rows],
+            self._decode_generation_done[:num_rows],
+            self._decode_delay_count[:num_rows],
+            self._decode_eoc_countdown[:num_rows],
+            error,
+            audio_id=int(self._audio_continuation_id),
+            eos_id=int(self._eos_token_id),
+            prompt_mode=prompt_mode,
+        )
+        torch._assert_async(error[0] == 0, "CPU/GPU Higgs graph audio tail mismatch")
+
     def _restore_terminal_audio_rows(self, num_rows):
         # Async scheduling can execute one final in-flight EOS row after
         # request retirement has released its state slot. EOS is terminal:
@@ -1137,13 +1158,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._ensure_decode_state_capacity(num_rows, hidden.device)
         ids = getattr(self, "_last_step_input_ids", None)
         decode_only = isinstance(ids, torch.Tensor) and int(ids.numel()) == num_rows
-        if getattr(self, "_step_audio_mode_rows", 0) == num_rows:
-            self._restore_terminal_audio_rows(num_rows)
-        graph_forced_audio = (
-            getattr(self, "_step_audio_tail_rows", 0) == num_rows
-            or getattr(self, "_step_audio_mode_rows", 0) == num_rows
-        )
-        if (
+        prompt_mode_rows = getattr(self, "_step_audio_mode_rows", 0) == num_rows
+        graph_forced_audio = getattr(self, "_step_audio_tail_rows", 0) == num_rows or prompt_mode_rows
+        use_sample_graph = bool(
             getattr(self, "_sample_graph_enabled", False)
             and not getattr(self, "_in_audio_sample_graph", False)
             and hidden.is_cuda
@@ -1153,10 +1170,24 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 logits=logits, sampling_metadata=sampling_metadata, num_rows=num_rows
             )
             is None
-        ):
+        )
+        qsl = self._last_step_query_start_loc
+        fused_guard = (
+            use_sample_graph
+            and graph_forced_audio
+            and self._eos_token_id is not None
+            and (decode_only or (isinstance(qsl, torch.Tensor) and int(qsl.numel()) == num_rows + 1))
+        )
+        if fused_guard:
+            # One launch restores terminal EOS rows, resets new prefill rows
+            # and validates the audio tail (~20 small eager kernels before).
+            self._step_tail_guard(num_rows, prompt_mode=prompt_mode_rows, decode_only=decode_only)
+        elif prompt_mode_rows:
+            self._restore_terminal_audio_rows(num_rows)
+        if use_sample_graph:
             from .full_sample_graph import run_dense_sample
 
-            if graph_forced_audio:
+            if not fused_guard and graph_forced_audio:
                 actual_audio = self._audio_seed_mask_from_step_input(num_rows, hidden.device)
                 if getattr(self, "_step_audio_mode_rows", 0) == num_rows:
                     # Reset new prefill rows before accepting old active state.
@@ -1169,8 +1200,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     )
                 torch._assert_async(actual_audio.all(), "CPU/GPU Higgs graph audio tail mismatch")
             if not decode_only:
-                pfmask = self._prefill_row_mask(num_rows, hidden.device)
-                self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
+                if not fused_guard:
+                    pfmask = self._prefill_row_mask(num_rows, hidden.device)
+                    self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
                 self._fast_audio_direct_rows = num_rows
             return run_dense_sample(self, hidden, logits, sampling_metadata, force_audio_inputs=graph_forced_audio)
         if not decode_only:
@@ -1754,10 +1786,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             torch._assert_async(torch.isfinite(probs).all(), "Audio sampling probabilities must be finite")
             q = torch.empty_like(probs)
             if sampling_metadata.generators:
-                for req_idx in range(int(probs.shape[0]) // num_codebooks):
-                    q[req_idx * num_codebooks : (req_idx + 1) * num_codebooks].exponential_(
-                        generator=sampling_metadata.generators.get(req_idx)
-                    )
+                from vllm_omni.utils.seeded_exponential import fill_exponential_rows
+
+                rows = int(probs.shape[0]) // num_codebooks
+                fill_exponential_rows(q, [sampling_metadata.generators.get(i) for i in range(rows)])
             else:
                 q.exponential_()
             sampled = probs.div(q).argmax(dim=-1)

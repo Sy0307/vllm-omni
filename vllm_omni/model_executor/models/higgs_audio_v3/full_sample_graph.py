@@ -22,8 +22,77 @@ _STATE = (
 )
 
 
+_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128)
+_FIELDS = ("temperature", "top_k", "top_p")
+
+
+def _graph_key(model, batch, hidden, force_audio_inputs, metadata):
+    return (
+        batch,
+        hidden.dtype,
+        hidden.device,
+        bool(force_audio_inputs),
+        bool(metadata.all_greedy),
+        tuple(getattr(metadata, f) is None for f in _FIELDS),
+        tuple(getattr(model, name).data_ptr() for name in _STATE),
+    )
+
+
+def _replay_captured(model, hidden, metadata, force_audio_inputs):
+    """Replay an already captured (bucket) graph writing inputs in place.
+
+    The capture path below pads through temporaries on every call. Once a
+    graph exists, only the live rows are written into its static inputs:
+    padded rows keep finite values from earlier steps and own no request
+    state, forced-audio inputs are constants, sampling parameters are copied
+    only when the cached metadata changes, and request noise is drawn directly
+    into the graph's noise input.
+    """
+    cache = getattr(model, "_dense_sample_graphs", None)
+    if not cache:
+        return None
+    batch = hidden.shape[0]
+    bucket = batch
+    if getattr(model.config, "audio_mrv2_sample_graph_buckets", False):
+        bucket = next((n for n in _BUCKETS if n >= batch), batch)
+    model._ensure_decode_state_capacity(bucket, hidden.device)
+    key = _graph_key(model, bucket, hidden, force_audio_inputs, metadata)
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    graph, static_hidden, static_input_ids, static_noise, static_metadata, output, staging, keepalive = entry
+    books = model.num_codebooks
+    static_hidden[:batch].copy_(hidden)
+    if not force_audio_inputs:
+        static_input_ids[:batch].copy_(model._last_step_input_ids)
+        if batch < bucket:
+            static_input_ids[batch:].fill_(model._audio_continuation_id)
+    if metadata.generators:
+        from vllm_omni.utils.seeded_exponential import fill_exponential_rows
+
+        fill_exponential_rows(static_noise[: batch * books], [metadata.generators.get(i) for i in range(batch)])
+    else:
+        static_noise[: batch * books].exponential_()
+    sources = getattr(model, "_dense_sample_metadata_sources", None)
+    if sources is None:
+        sources = model._dense_sample_metadata_sources = {}
+    if sources.get(key) is not metadata:
+        for name in _FIELDS:
+            value = getattr(metadata, name)
+            if value is not None:
+                getattr(static_metadata, name)[:batch].copy_(value)
+        sources[key] = metadata
+    graph.replay()
+    model._finish_audio_staging(staging[:batch], batch, hidden.device, batch)
+    return SamplerOutput(sampled_token_ids=output.sampled_token_ids[:batch].clone(), logprobs_tensors=None)
+
+
 def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, active_batch=None):
     batch = hidden.shape[0]
+    if active_batch is None:
+        replayed = _replay_captured(model, hidden, metadata, force_audio_inputs)
+        if replayed is not None:
+            return replayed
     if active_batch is None and getattr(model.config, "audio_mrv2_sample_graph_buckets", False):
         bucket = next((n for n in (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128) if n >= batch), batch)
         if bucket != batch:
@@ -68,22 +137,15 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
     if actual < batch:
         noise[actual * books :].fill_(1)
     if metadata.generators:
-        for i in range(actual):
-            noise[i * books : (i + 1) * books].exponential_(generator=metadata.generators.get(i))
+        from vllm_omni.utils.seeded_exponential import fill_exponential_rows
+
+        fill_exponential_rows(noise[: actual * books], [metadata.generators.get(i) for i in range(actual)])
     else:
         noise[: actual * books].exponential_()
-    fields = ("temperature", "top_k", "top_p")
+    fields = _FIELDS
     # force_audio_inputs controls capture-time Python branches (including
     # the mixed-tail assertion). Never reuse that graph for real EOS inputs.
-    key = (
-        batch,
-        hidden.dtype,
-        hidden.device,
-        bool(force_audio_inputs),
-        bool(metadata.all_greedy),
-        tuple(getattr(metadata, f) is None for f in fields),
-        tuple(getattr(model, name).data_ptr() for name in _STATE),
-    )
+    key = _graph_key(model, batch, hidden, force_audio_inputs, metadata)
     cache = getattr(model, "_dense_sample_graphs", None)
     if cache is None:
         cache = model._dense_sample_graphs = {}
