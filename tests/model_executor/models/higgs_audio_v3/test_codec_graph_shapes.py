@@ -4,7 +4,9 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from vllm_omni.model_executor.models.higgs_audio_v3.full_sample_graph import run_dense_sample
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_code2wav import (
     HiggsAudioV3Code2WavForConditionalGeneration as Codec,
 )
@@ -52,3 +54,12 @@ def test_graph_defaults_follow_runner_and_preserve_explicit_overrides(use_v2, sa
     # Resolving a stage must not bake its defaults into shared model config.
     assert config.audio_full_sample_graph is sampler
     assert config.codec_cuda_graph is codec
+
+
+def test_sampler_cache_miss_does_not_capture_or_advance_rng():
+    model = SimpleNamespace(_dense_sample_graphs={})
+    torch.manual_seed(7)
+    before = torch.random.get_rng_state()
+    assert run_dense_sample(model, torch.zeros(2, 4), None, None) is None
+    assert torch.equal(before, torch.random.get_rng_state())
+    assert not model._dense_sample_graphs

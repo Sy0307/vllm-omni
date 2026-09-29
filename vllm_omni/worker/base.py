@@ -13,6 +13,7 @@ from contextlib import AbstractContextManager, nullcontext
 import torch
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
+from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from vllm_omni.diffusion.data import (
@@ -38,6 +39,17 @@ class OmniGPUWorkerBase(GPUWorker):
     It also replaces vLLM's TorchProfilerWrapper with OmniTorchProfilerWrapper
     for custom trace naming, background gzip, and trace path collection.
     """
+
+    def _capture_auxiliary_graphs(self) -> None:
+        """Let opt-in models warm valid inputs before the worker becomes ready."""
+        capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
+        if callable(capture):
+            capture()
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        result = super().compile_or_warm_up_model()
+        self._capture_auxiliary_graphs()
+        return result
 
     def load_model(self, *args, **kwargs):
         with self._maybe_get_memory_pool_context("weights"):

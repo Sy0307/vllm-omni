@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Experimental dense decode sampler graph; preserves request torch RNG draws.
+"""Dense decode sampler graphs captured and parity-checked during startup.
 
-The first use of each exact shape compares eager and captured state transitions
-with identical noise before replaying the actual transition. CPU payload staging
+Capture compares eager and captured state transitions with identical noise.
+Serving only replays warmed shapes and preserves request torch RNG draws. CPU payload staging
 remains outside capture. This module does not handle mixed prefill batches.
 """
 
 import copy
+import time
 
 import torch
 from vllm.logger import init_logger
@@ -96,6 +97,10 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
         replayed = _replay_captured(model, hidden, metadata, force_audio_inputs)
         if replayed is not None:
             return replayed
+    # Serving never captures a new shape. Unsupported shapes/metadata use the
+    # regular sampler; startup owns capture and its parity checks.
+    if not getattr(model, "_warming_sample_graphs", False):
+        return None
     if active_batch is None and getattr(model.config, "audio_mrv2_sample_graph_buckets", False):
         bucket = next((n for n in (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128) if n >= batch), batch)
         if bucket != batch:
@@ -238,3 +243,86 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
     graph.replay()
     model._finish_audio_staging(staging[:actual], actual, hidden.device, actual)
     return SamplerOutput(sampled_token_ids=output.sampled_token_ids.clone(), logprobs_tensors=None)
+
+
+@torch.inference_mode()
+def capture_sample_graphs(model, max_num_reqs):
+    """Warm the MRv2 sampler without consuming request RNG or decode state."""
+    if not model._sample_graph_enabled or getattr(model, "_sample_graphs_ready", False):
+        return
+    from vllm.v1.sample.logits_processor import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+
+    device = model.model.embed_tokens.weight.device
+    if device.type != "cuda":
+        return
+    start = time.perf_counter()
+    memory_before = torch.accelerator.memory_allocated(device)
+    model._resolve_token_ids()
+    buckets = (
+        sorted({next((b for b in _BUCKETS if b >= n), n) for n in range(1, max_num_reqs + 1)})
+        if getattr(model.config, "audio_mrv2_sample_graph_buckets", False)
+        else range(1, max_num_reqs + 1)
+    )
+    model._ensure_decode_state_capacity(max(buckets), device)
+    model._get_audio_gpu_staging_buffer(max(buckets), device)
+    saved_state = {name: getattr(model, name).clone() for name in _STATE}
+    fields = (
+        "_last_step_input_ids",
+        "_last_step_query_start_loc",
+        "_last_logits_hidden",
+        "_step_audio_mode_rows",
+        "_step_audio_tail_rows",
+        "_fast_audio_direct_rows",
+    )
+    saved = {name: getattr(model, name, None) for name in fields}
+    try:
+        model._warming_sample_graphs = True
+        with torch.random.fork_rng(devices=[device.index]):
+            for batch in buckets:
+                hidden = model.model.embed_tokens.weight.new_zeros((batch, model.model.embed_tokens.weight.shape[1]))
+                logits = hidden.new_empty((batch, model.config.text_config.vocab_size))
+                model._last_step_input_ids = torch.full(
+                    (batch,), model._audio_continuation_id, device=device, dtype=torch.long
+                )
+                model._last_step_query_start_loc = torch.arange(batch + 1, device=device, dtype=torch.int32)
+                ones = torch.ones(batch, device=device)
+                zeros = torch.zeros_like(ones)
+                for greedy in (False, True):
+                    metadata = SamplingMetadata(
+                        temperature=zeros if greedy else ones,
+                        all_greedy=greedy,
+                        all_random=not greedy,
+                        top_p=ones,
+                        top_k=torch.full((batch,), -1, device=device, dtype=torch.long),
+                        generators={},
+                        max_num_logprobs=None,
+                        no_penalties=True,
+                        prompt_token_ids=None,
+                        frequency_penalties=zeros,
+                        presence_penalties=zeros,
+                        repetition_penalties=ones,
+                        output_token_ids=[[] for _ in range(batch)],
+                        allowed_token_ids_mask=None,
+                        bad_words_token_ids={},
+                        logitsprocs=LogitsProcessors(),
+                    )
+                    for forced in (False, True):
+                        run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=forced)
+    finally:
+        for name, value in saved_state.items():
+            getattr(model, name).copy_(value)
+        for name, value in saved.items():
+            setattr(model, name, value)
+        model._warming_sample_graphs = False
+        model._clear_last_audio_outputs()
+        model._async_audio_gpu_staging = None
+        model._dense_sample_metadata_sources = {}
+    torch.accelerator.synchronize()
+    model._sample_graphs_ready = True
+    logger.info(
+        "Higgs sampler captured %d CUDA graphs in %.2f s (allocated delta %.1f MiB)",
+        len(model._dense_sample_graphs),
+        time.perf_counter() - start,
+        (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
+    )

@@ -10,6 +10,7 @@ prefix) rather than from a standalone tokenizer repo.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import torch
@@ -463,8 +464,6 @@ class HiggsAudioV3Code2Wav(nn.Module):
 
         codes = self._validate_codes(audio_codes)
         if codes.is_cuda and self._codec_graph_enabled:
-            if not self._decode_graphs_initialized:
-                self._capture_decode_graphs(codes.device)
             batch, _, frames = codes.shape
             entry = self._decode_graphs.get((batch, frames))
             if entry is not None:
@@ -475,6 +474,17 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 # before reusing its storage or shared graph memory pool.
                 return static_audio[:batch].clone()
         return self._decode_codes_impl(codes)
+
+    @torch.inference_mode()
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture exact codec shapes before the generation worker is ready."""
+        if not self._codec_graph_enabled or self._decode_graphs_initialized:
+            return
+        if not self._loaded:
+            self._ensure_codec_loaded()
+        device = self.fc2.weight.device
+        if device.type == "cuda":
+            self._capture_decode_graphs(device)
 
     def _decode_codes_impl(self, codes: torch.Tensor) -> torch.Tensor:
         rvq_codes = codes.transpose(0, 1).long()
@@ -502,6 +512,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
         # Never pad time: convolution boundary conditions must stay exact.
         # Batch size also stays exact: padding can change convolution
         # algorithms and rounding. Uncovered shapes retain the eager path.
+        start = time.perf_counter()
+        memory_before = torch.accelerator.memory_allocated(device)
         shapes = self._decode_graph_shapes()
         previous_device = current_omni_platform.current_device()
         current_omni_platform.set_device(device)
@@ -524,7 +536,13 @@ class HiggsAudioV3Code2Wav(nn.Module):
         finally:
             current_omni_platform.set_device(torch.device(device.type, previous_device))
         self._decode_graphs_initialized = True
-        logger.info("Higgs codec captured %d exact-frame CUDA graphs", len(self._decode_graphs))
+        torch.accelerator.synchronize()
+        logger.info(
+            "Higgs codec captured %d exact-frame CUDA graphs in %.2f s (allocated delta %.1f MiB)",
+            len(self._decode_graphs),
+            time.perf_counter() - start,
+            (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
+        )
 
     @torch.inference_mode()
     def forward_chunk(

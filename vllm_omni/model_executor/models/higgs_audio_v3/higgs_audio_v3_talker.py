@@ -118,6 +118,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     # The codec stage consumes audio codes, never backbone hidden states.
     omni_pooler_payload_include_hidden: bool = False
 
+    def capture_auxiliary_graphs(self) -> None:
+        from .full_sample_graph import capture_sample_graphs
+
+        scheduler = self.vllm_config.scheduler_config
+        capture_sample_graphs(self, scheduler.max_num_seqs)
+
     def create_omni_model_state(self, vllm_config, encoder_cache, device):
         from .model_state import HiggsModelState
 
@@ -1204,7 +1210,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                     pfmask = self._prefill_row_mask(num_rows, hidden.device)
                     self._reset_decode_state_rows(pfmask, num_rows, hidden.device)
                 self._fast_audio_direct_rows = num_rows
-            return run_dense_sample(self, hidden, logits, sampling_metadata, force_audio_inputs=graph_forced_audio)
+            sampled = run_dense_sample(self, hidden, logits, sampling_metadata, force_audio_inputs=graph_forced_audio)
+            if sampled is not None:
+                return sampled
+            self._last_logits_hidden = None
         if not decode_only:
             self._fast_audio_direct_rows = 0
             pfmask = self._prefill_row_mask(num_rows, hidden.device)
