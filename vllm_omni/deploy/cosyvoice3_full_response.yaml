@@ -1,6 +1,5 @@
 # Opt-in single-Hopper full-response throughput profile (not streaming TTFP).
-# Launch with COSYVOICE3_TRT=0 COSYVOICE3_BATCH_FLOW=1
-# COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS=1.
+# Stage 1 selects the packed backend through its environment below.
 # The 4096-frame internal boundary exceeds this profile's 2048-token output cap.
 async_chunk: true
 connectors:
@@ -52,4 +51,9 @@ stages:
   max_num_seqs: 8
   skip_mm_profiling: true
   stage_id: 1
+  env:
+    COSYVOICE3_TRT: "0"
+    COSYVOICE3_BATCH_FLOW: "1"
+    COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS: "1"
+    COSYVOICE3_PACKED_STREAMING: "0"
   trust_remote_code: true

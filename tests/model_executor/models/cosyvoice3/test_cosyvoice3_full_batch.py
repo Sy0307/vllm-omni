@@ -91,7 +91,7 @@ def test_packed_full_response_preserves_request_isolation(monkeypatch):
             )
         )
     monkeypatch.setattr(torch, "randn", lambda shape, **kw: torch.zeros(shape, **kw))
-    expected = [model.forward_batch([item], n_timesteps=3)[0] for item in items]
+    expected = [model.forward(**item, n_timesteps=3) for item in items]
     actual = model.forward_batch(items, n_timesteps=3)
     for output, reference in zip(actual, expected):
         torch.testing.assert_close(output, reference, rtol=0.04, atol=0.04)
@@ -166,16 +166,12 @@ def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monke
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the opt-in packed backend requires Hopper FA3")
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
-    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import PackedDiT
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
     monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
     monkeypatch.setattr(module, "CausalHiFTGenerator", MelOutput)
-    monkeypatch.setattr(
-        PackedDiT, "compile", lambda self, dtype: setattr(self, "compiled_full_forward", self.forward_full)
-    )
     config = CosyVoice3Config()
     config.flow["pre_lookahead_layer"]["channels"] = 32
     config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=4, dim_head=8)

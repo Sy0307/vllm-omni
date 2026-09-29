@@ -573,6 +573,13 @@ class CosyVoice3Model(
         # Use parent's cache config - critical for PagedAttention to work correctly
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
 
+    def on_requests_finished(self, request_ids: set[str]) -> None:
+        """Release per-request vocoder state on completion, cancellation or error."""
+        if hasattr(self, "_stream_vocoder_cache_by_req"):
+            with self._stream_audio_cache_lock:
+                for request_id in request_ids:
+                    self._stream_vocoder_cache_by_req.pop(request_id, None)
+
     def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
         """Pass-through stitching for async_chunk.
 
@@ -796,7 +803,7 @@ class CosyVoice3Model(
             if sampler is None:
                 sampler = Sampler()
                 self._talker_sampler = sampler
-            # SGLang penalizes generated tokens only, never text or reference
+            # Penalize generated tokens only, never text or reference
             # speech in the multimodal prompt. Padding is ignored by vLLM.
             if sampling_metadata.prompt_token_ids is not None:
                 sampling_metadata = replace(

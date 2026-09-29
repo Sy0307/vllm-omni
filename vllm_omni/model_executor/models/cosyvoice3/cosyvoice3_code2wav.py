@@ -379,11 +379,15 @@ class CosyVoice3Code2Wav(nn.Module):
                     for (i, _), value in zip(group, values):
                         results[i] = value
             return results
-        if items and all(
-            item.get("finalize", False)
-            and item.get("cache_state") is None
-            and int(item.get("token_offset_tokens", 0)) == 0
-            for item in items
+        if (
+            items
+            and cosyvoice3_packed_inference_enabled()
+            and all(
+                item.get("finalize", False)
+                and item.get("cache_state") is None
+                and int(item.get("token_offset_tokens", 0)) == 0
+                for item in items
+            )
         ):
             return [(speech, None) for speech in self.forward_batch(items, n_timesteps=n_timesteps)]
         results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)

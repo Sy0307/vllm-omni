@@ -924,3 +924,14 @@ def test_sampling_mode_rejects_unknown_policy():
     model.config.cosyvoice3_sampling_mode = "unsupported_policy"
     with pytest.raises(ValueError, match="cosyvoice3_sampling_mode"):
         cosyvoice3_standard_sampling(model.config)
+
+
+def test_cancelled_stream_releases_only_its_vocoder_state():
+    model_cls, _ = _cosyvoice3_model_and_runner()
+    model = SimpleNamespace(
+        _stream_audio_cache_lock=Lock(),
+        _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
+    )
+    model_cls.on_requests_finished(model, {"cancelled", "unknown"})
+    model_cls.on_requests_finished(model, {"cancelled"})
+    assert set(model._stream_vocoder_cache_by_req) == {"live"}
