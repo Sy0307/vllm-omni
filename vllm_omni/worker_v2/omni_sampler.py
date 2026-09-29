@@ -48,6 +48,13 @@ class OmniSampler:
     def __init__(self, base_sampler: Sampler):
         self.base_sampler = base_sampler
 
+    @property
+    def omni_static_staged_writes(self) -> bool:
+        # Preserve the runner's no-new-requests fast path for the stock sampler.
+        return type(self.base_sampler) is Sampler or bool(
+            getattr(self.base_sampler, "omni_static_staged_writes", False)
+        )
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_sampler, name)
 
