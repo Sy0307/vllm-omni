@@ -563,3 +563,11 @@ def test_deployment_scope_survives_different_worker_parents(monkeypatch):
         receiver.close()
         sender.close()
     assert not os.path.exists(directory)
+
+
+@pytest.mark.parametrize("value,expected", [("bad", 0.005), ("nan", 0.005), ("-1", 0.005), ("20", 0.02)])
+def test_receive_poll_interval_validation(monkeypatch, value, expected):
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import _recv_poll_seconds
+
+    monkeypatch.setenv("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", value)
+    assert _recv_poll_seconds() == expected
