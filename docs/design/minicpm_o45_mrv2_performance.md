@@ -1,20 +1,22 @@
-# MiniCPM-o 4.5 turn-mode MRv2 performance
+# MiniCPM-o 4.5 MRv2 profiles
 
-The three-stage turn pipeline uses stage-level MRv2 contracts from #8184.
-Thinker emits live latent metadata outside graph replay; Talker keeps codec
-history and EOS decisions on device; Code2Wav batches compatible CFM/HiFT work.
-The H200 profile enables block compilation, graph I/O reuse, tiled FP32
-attention, channels-last convolutions and a 4/16/8 stage-capacity split.
-Duplex continues to use its existing V1 path; turn-mode measurements do not
-establish duplex performance.
-The separate opt-in `minicpmo_4_5_duplex_h200.yaml` profile enables native V1
-graph I/O reuse, retained graph caches and TF32 Flow GEMMs. TF32 changes
-rounding; validate quality for the target workload. Block compilation stays off.
+Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
+latent metadata outside graph replay; Talker keeps codec history and EOS
+control on device. Code2Wav reuses mainline Whole-Euler Flow graphs and shared
+prompt state. The previous experimental block compilation, tiled attention,
+channels-last and merged-CFM implementations are removed.
 
-The opt-in H200 YAML is `vllm_omni/deploy/minicpmo_4_5_turn_mrv2_h200.yaml`.
-The generic MRv2 profile keeps 4/8/8 capacities. Talker 16 reserves 4 GiB KV
-instead of 2 GiB. Warm representative shapes before serving; lazy compilation
-and graph capture can create large first-use latency. Shared HiFT ISTFT code
-also has consumers outside MiniCPM, so its regression coverage matters.
+`minicpmo_4_5_turn_mrv2_h200.yaml` selects Talker capacity 16 and 4 GiB KV;
+the generic MRv2 profile selects capacity 8 and 2 GiB KV. These configurations
+require new end-to-end performance measurements after the mainline integration.
+Previously reported numbers do not describe this revised codec backend.
 
-The existing V1 turn profile retains its original capacities and scheduling defaults.
+The generic MRv2 profile and the opt-in native V1 duplex H200 profile enable
+TF32 matmuls within Code2Wav forward/capture only; the previous process policy
+is restored afterwards. cuDNN's TF32 policy is independent. TF32 changes rounding.
+Duplex keeps the mainline V1 session path. Turn results do not establish duplex
+performance or interruption correctness.
+
+The shared asynchronous output snapshot and batched Talker preprocessing also
+apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
+therefore be included in end-to-end regression validation.

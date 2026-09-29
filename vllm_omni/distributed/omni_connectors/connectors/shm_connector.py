@@ -3,6 +3,7 @@
 
 import fcntl
 import glob
+import hashlib
 import os
 import select
 import stat
@@ -30,12 +31,6 @@ def _wakeup_directory() -> str:
     return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}"
 
 
-def _wakeup_path(to_stage: Any) -> str:
-    # Discover replicas within this small directory. Scanning /dev/shm for
-    # every chunk makes send latency depend on all other deployments' files.
-    return f"{_wakeup_directory()}/{int(to_stage)}"
-
-
 class SharedMemoryConnector(OmniConnectorBase):
     """Key-addressed local shared-memory connector.
 
@@ -60,6 +55,12 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
+        scope = config.get("extra", {}).get("wakeup_scope")
+        self._wake_directory = (
+            f"/dev/shm/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
+            if scope is not None
+            else _wakeup_directory()
+        )
         self._pending_keys: OrderedDict[str, None] = OrderedDict()
         self._pending_keys_lock = threading.Lock()
         self._metrics = {
@@ -87,7 +88,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         try:
             if int(self.stage_id) < 0:
                 return False
-            path = f"{_wakeup_path(self.stage_id)}_{uuid.uuid4().hex}"
+            path = f"{self._wake_directory}/{int(self.stage_id)}_{uuid.uuid4().hex}"
         except (TypeError, ValueError):
             return False
         read_fd = hold_fd = None
@@ -150,7 +151,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         if not _wakeup_enabled():
             return
         try:
-            pattern = f"{_wakeup_path(to_stage)}_*"
+            pattern = f"{self._wake_directory}/{int(to_stage)}_*"
         except (TypeError, ValueError):
             return  # non-numeric stage names use the ordinary polling path
         with self._wake_lock:
@@ -185,6 +186,11 @@ class SharedMemoryConnector(OmniConnectorBase):
                 except FileNotFoundError:
                     pass
                 self._wake_path = None
+                try:
+                    os.rmdir(self._wake_directory)
+                except OSError:
+                    # Other receivers may still own FIFOs in this deployment.
+                    pass
 
     def put(
         self,

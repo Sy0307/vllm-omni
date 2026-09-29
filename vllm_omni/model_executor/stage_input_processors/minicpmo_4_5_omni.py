@@ -147,23 +147,20 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any, *, first_turn_chunk: bool = False) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    initial = int(config.get("initial_codec_chunk_frames", 0))
-    if initial and not _MINICPMO45_MIN_STREAM_BODY_FRAMES <= initial <= chunk_frames:
-        raise ValueError("MiniCPM-o initial_codec_chunk_frames must be 0 or between 5 and codec_chunk_frames")
     if chunk_frames <= 0 or left_context_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
             f"codec_left_context_frames={left_context_frames}"
         )
-    return initial if first_turn_chunk and initial else chunk_frames, left_context_frames
+    return chunk_frames, left_context_frames
 
 
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
@@ -342,9 +339,7 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(
-        transfer_manager, first_turn_chunk=not native_duplex and int(state["codec_end"]) == 0
-    )
+    chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:

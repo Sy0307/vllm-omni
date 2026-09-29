@@ -5,13 +5,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -25,20 +23,6 @@ def _no_host_sync():
         yield
     finally:
         torch.cuda.set_sync_debug_mode(previous)
-
-
-def test_time_embedding_is_bitwise_and_sync_free_on_cuda():
-    decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
-    torch.manual_seed(0)
-    estimator = SimpleNamespace(t_embedder=decoder_dit.TimestepEmbedder(64).cuda())
-    backend = SimpleNamespace(_timestep_freqs={})
-    time = torch.full((4,), 0.3, device="cuda")
-    with torch.inference_mode():
-        expected = estimator.t_embedder(time)
-        BatchedToken2Wav._time_embedding(backend, estimator, time)
-        with _no_host_sync():
-            actual = BatchedToken2Wav._time_embedding(backend, estimator, time)
-    assert torch.equal(actual, expected)
 
 
 def test_istft_is_bitwise_and_sync_free_on_cuda():
