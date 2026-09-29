@@ -64,3 +64,33 @@ def test_cpu_tail_metadata_requires_model_capability(monkeypatch, requires_tails
     runner._model_forward(input_ids=ids)
     expected = [11, 12] if requires_tails and not async_scheduling else None
     assert observed["cpu_input_tail_ids"] == expected
+
+
+@pytest.mark.parametrize("generation", [False, True])
+@pytest.mark.parametrize("enabled,fail", [(False, False), (True, False), (True, True)])
+def test_auxiliary_capture_finishes_before_worker_readiness(monkeypatch, generation, enabled, fail):
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+    from vllm_omni.worker.gpu_generation_worker import GPUGenerationWorker
+
+    events = []
+
+    def capture():
+        assert events == ["warmup"]
+        events.append("capture")
+        if fail:
+            raise RuntimeError("auxiliary capture failed")
+
+    monkeypatch.setattr(Worker, "compile_or_warm_up_model", lambda _: events.append("warmup"))
+    worker = object.__new__(GPUGenerationWorker if generation else OmniGPUWorkerBase)
+    worker.use_v2_model_runner = generation
+    model = SimpleNamespace(capture_auxiliary_graphs=capture) if enabled else SimpleNamespace()
+    worker.model_runner = SimpleNamespace(model=model, profile_run=lambda: events.append("warmup"))
+    if fail:
+        with pytest.raises(RuntimeError, match="auxiliary capture failed"):
+            worker.compile_or_warm_up_model()
+    else:
+        worker.compile_or_warm_up_model()
+        events.append("ready")
+    assert events == ["warmup"] + (["capture"] if enabled else []) + ([] if fail else ["ready"])
