@@ -57,3 +57,11 @@ def test_audio_sampler_uses_registered_adapter_without_standard_resampling(paylo
     with pytest.raises(ValueError, match="unsupported grammar"):
         sample_with_output(sampler, standard, torch.zeros(2, 4), object(), sampler.req_states, object())
     standard.assert_not_called()
+
+
+def test_adapter_preserves_stock_sampler_staged_write_fast_path():
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    assert OmniSampler(object.__new__(Sampler)).omni_static_staged_writes
+    assert not OmniSampler(SimpleNamespace()).omni_static_staged_writes
+    assert OmniSampler(SimpleNamespace(omni_static_staged_writes=True)).omni_static_staged_writes
