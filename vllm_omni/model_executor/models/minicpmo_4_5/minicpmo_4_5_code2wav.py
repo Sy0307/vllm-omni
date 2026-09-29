@@ -801,6 +801,33 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
+        # This stage owns the vocoder process. Restore its previous matmul
+        # policy after eager execution/capture; cuDNN's policy is independent.
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self._extra_config().get("token2wav_allow_tf32", False):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return self._forward_impl(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                runtime_additional_information,
+                **kwargs,
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    @torch.inference_mode()
+    def _forward_impl(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
         ids = input_ids if isinstance(input_ids, torch.Tensor) else torch.empty(0, dtype=torch.long)
         segments = self._split_segments(ids, kwargs.get("seq_token_counts"))
@@ -1076,14 +1103,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         use_float16 = bool(extra.get("token2wav_float16", False))
-        if bool(extra.get("token2wav_allow_tf32", False)) and current_omni_platform.is_cuda():
-            # The flow DiT runs its GEMMs in fp32 (FFMA). TF32 tensor cores cut
-            # the vocoder's GPU time ~25% (batch 1-8) and move its output mel
-            # by ~3e-4 relative L2 -- a numerics change, so opt-in. Stage 2's
-            # process holds only this vocoder, and its CUDA graphs are captured
-            # after this point, so the setting covers them too.
-            torch.backends.cuda.matmul.allow_tf32 = True
-            logger.info("MiniCPM-o Code2Wav: TF32 matmuls enabled for the vocoder")
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.

@@ -617,6 +617,10 @@ class HiFTGenerator(nn.Module):
         )
         self.f0_predictor = f0_predictor
 
+    def enable_cached_istft(self) -> None:
+        """Opt into CUDA ISTFT with a cached overlap envelope."""
+        self._use_cached_istft = True
+
     def remove_weight_norm(self):
         for layer in self.ups:
             remove_weight_norm(layer)

@@ -12,7 +12,6 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
-import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from types import SimpleNamespace
@@ -253,8 +252,6 @@ class _CodecWindowPenaltiesState:
         self.base = base
         self.req_states = base.req_states
         self.window_size = int(window_size)
-        self._fused_window = os.environ.get("VLLM_OMNI_FUSED_WINDOW_PENALTY", "0") == "1"
-        self._penalty_powers = None
         max_num_reqs = int(self.req_states.max_num_reqs)
         self.repetition_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.repetition_penalty.np.fill(1.0)
@@ -283,10 +280,6 @@ class _CodecWindowPenaltiesState:
     def apply_staged_writes(self) -> None:
         self.repetition_penalty.copy_to_uva()
         self.base.apply_staged_writes()
-        if self._fused_window and self.repetition_penalty.gpu.is_cuda:
-            from vllm_omni.model_executor.models.common.window_penalty import prepare_window_penalty
-
-            self._penalty_powers = prepare_window_penalty(self.repetition_penalty.gpu, self.window_size)
 
     def apply_penalties(
         self,
@@ -297,14 +290,7 @@ class _CodecWindowPenaltiesState:
         expanded_local_pos: torch.Tensor,
     ) -> None:
         if np.any(self.use_window[idx_mapping_np]):
-            apply_window = _apply_codec_window_penalty_gpu
-            extra = {}
-            if self._fused_window and logits.is_cuda and logits.dtype == torch.float32:
-                from vllm_omni.model_executor.models.common.window_penalty import apply_window_penalty
-
-                apply_window = apply_window_penalty
-                extra["penalty_powers"] = self._penalty_powers
-            apply_window(
+            _apply_codec_window_penalty_gpu(
                 logits,
                 expanded_idx_mapping,
                 self.req_states.all_token_ids.gpu,
@@ -312,7 +298,6 @@ class _CodecWindowPenaltiesState:
                 self.req_states.prompt_len.gpu,
                 self.repetition_penalty.gpu,
                 window_size=self.window_size,
-                **extra,
             )
         self.base.apply_penalties(logits, expanded_idx_mapping, idx_mapping_np, input_ids, expanded_local_pos)
 

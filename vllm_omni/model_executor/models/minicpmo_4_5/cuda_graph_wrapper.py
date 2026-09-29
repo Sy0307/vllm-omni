@@ -339,9 +339,10 @@ class CFMGraphWrapper:
     def _eager(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self._stats["eager"] += 1
         with torch.no_grad():
-            # Unknown shapes beyond a retained cache must not trigger another
-            # compile; this is also the fallback after compilation failure.
-            result = self.graph_fn(inputs[0], inputs[1], inputs[6], inputs[2], inputs[3], inputs[4], inputs[5])
+            # A full cache changes execution mode, not the selected numeric
+            # backend. Cold shapes may compile; failed captures disable it.
+            function = self._compiled_graph_fn or self.graph_fn
+            result = function(inputs[0], inputs[1], inputs[6], inputs[2], inputs[3], inputs[4], inputs[5])
         return result, inputs[4], inputs[5]
 
     def _flush(self) -> None:
@@ -365,6 +366,7 @@ class CFMGraphWrapper:
     def _disable(self, reason: str, key: tuple) -> None:
         logger.warning("Disabling CFM CUDA graphs (%s) for shape=%s; using eager", reason, key, exc_info=True)
         self.enabled = False
+        self._compiled_graph_fn = None
         self._flush()
 
     def _capture(self, key: tuple, inputs: tuple | None = None) -> tuple | None:

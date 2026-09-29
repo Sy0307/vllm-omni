@@ -291,7 +291,10 @@ def test_block_compiled_real_dit_preserves_masks_caches_and_original_methods(att
             wrapper.replay(*inputs)
             inputs[0].add_(0.1)
             inputs[-1][:, :, -4:] = False
-            expected = tuple(t.clone() for t in wrapper._eager(inputs))
+            expected_output = estimator.blocks_forward_chunk(
+                inputs[0], inputs[1], inputs[6], inputs[2], inputs[3], inputs[4], inputs[5]
+            )
+            expected = tuple(t.clone() for t in (expected_output, inputs[4], inputs[5]))
             actual = wrapper.replay(*inputs)
             for a, e in zip(actual, expected, strict=True):
                 torch.testing.assert_close(a, e, atol=2e-5, rtol=2e-4)
@@ -668,3 +671,24 @@ def test_cfm_none_cache_parity_between_graph_and_eager(
     torch.testing.assert_close(graph_result, eager_result, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(graph_cnn, eager_cnn_out, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(graph_att, eager_att_out, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_vocoder_restores_tf32_policy(fail):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+
+    previous = torch.backends.cuda.matmul.allow_tf32
+
+    def forward(*args, **kwargs):
+        assert torch.backends.cuda.matmul.allow_tf32
+        if fail:
+            raise RuntimeError("injected")
+        return "ok"
+
+    model = SimpleNamespace(_extra_config=lambda: {"token2wav_allow_tf32": True}, _forward_impl=forward)
+    if fail:
+        with pytest.raises(RuntimeError, match="injected"):
+            MiniCPMO45Code2Wav.forward(model)
+    else:
+        assert MiniCPMO45Code2Wav.forward(model) == "ok"
+    assert torch.backends.cuda.matmul.allow_tf32 == previous
