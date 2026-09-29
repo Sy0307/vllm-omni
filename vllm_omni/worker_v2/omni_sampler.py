@@ -15,6 +15,8 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
+from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
+
 StandardSample = Callable[
     [torch.Tensor, InputBatch, GrammarOutput | None], tuple[SamplerOutput, torch.Tensor, torch.Tensor]
 ]
@@ -28,6 +30,10 @@ class OmniSamplingOutput:
     # None preserves forward's payload. An empty dict explicitly replaces it.
     # Tensors must remain valid until the runner finishes its output copy.
     multimodal_outputs: dict[str, Any] | None = None
+    include_hidden_states: bool = True
+    owns_multimodal_outputs: bool = False
+    # Invoked on CPU-owned snapshots after D2H, with effective per-request counts.
+    finalize_multimodal: Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot] | None = None
 
 
 class OmniSampler:

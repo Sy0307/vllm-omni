@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
 
@@ -303,7 +304,7 @@ class _CodecWindowPenaltiesState:
 
 
 def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> Any:
-    """Turn the runner's MRv2 ``Sampler`` into the Talker's sampler, in place.
+    """Wrap the runner's MRv2 sampler with codec penalties and EOS control.
 
     The upstream sampler already applies ``min_tokens`` (codec EOS is a stage
     stop token), temperature, top-k/top-p and seeded sampling on the device.
@@ -312,20 +313,7 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
     where V1's ``_force_eos_on_sampled_ids`` does.
     """
 
-    class MiniCPMO45TalkerSampler(type(sampler)):  # type: ignore[misc, valid-type]
-        # Sampler state is staged only in add_request, like the upstream sampler.
-        omni_static_staged_writes = True
-
-        def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
-            forced = talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
-            output = super().__call__(logits, input_batch)
-            if forced is not None:
-                sampled = output.sampled_token_ids
-                sampled.masked_fill_(forced.view(-1, *([1] * (sampled.ndim - 1))), int(talker._codec_eos_id))
-            return output
-
     sampler.penalties_state = _CodecWindowPenaltiesState(sampler.penalties_state, window_size=_CODEC_PENALTY_WINDOW)
-    sampler.__class__ = MiniCPMO45TalkerSampler
     talker._mrv2_empty_speech = torch.zeros(
         int(sampler.req_states.max_num_reqs), dtype=torch.bool, device=sampler.req_states.device
     )
@@ -333,7 +321,23 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
         "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty and EOS control",
         _CODEC_PENALTY_WINDOW,
     )
-    return sampler
+    return MiniCPMO45TalkerSampler(sampler, talker)
+
+
+class MiniCPMO45TalkerSampler(OmniSampler):
+    omni_static_staged_writes = True
+
+    def __init__(self, base_sampler, talker):
+        super().__init__(base_sampler)
+        self.talker = talker
+
+    def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
+        output = self.base_sampler(logits, input_batch)
+        if forced is not None:
+            sampled = output.sampled_token_ids
+            sampled.masked_fill_(forced.view(-1, *([1] * (sampled.ndim - 1))), int(self.talker._codec_eos_id))
+        return output
 
 
 class _MiniCPMTTSProjector(nn.Module):

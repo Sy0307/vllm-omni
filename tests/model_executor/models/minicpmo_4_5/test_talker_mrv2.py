@@ -120,3 +120,21 @@ def test_mrv2_output_empty_condition_and_length_cap() -> None:
         )
         assert out.multimodal_outputs["meta"]["codec_frame_valid"].tolist() == [True]
         assert talker.take_mrv2_forced_eos(batch, None, 1).tolist() == [forced]
+
+
+@pytest.mark.parametrize("forced", [None, [False, True]])
+def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker, forced):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerSampler
+
+    output = SimpleNamespace(sampled_token_ids=torch.tensor([[2], [3]]), num_sampled=torch.tensor([1, 0]))
+    base = mocker.Mock(return_value=output)
+    base.req_states = object()
+    mask = None if forced is None else torch.tensor(forced)
+    talker = SimpleNamespace(_codec_eos_id=7, take_mrv2_forced_eos=mocker.Mock(return_value=mask))
+    sampler = MiniCPMO45TalkerSampler(base, talker)
+    logits, batch = torch.zeros(2, 8), object()
+    assert sampler(logits, batch) is output
+    assert output.sampled_token_ids.tolist() == [[2], [3 if forced is None else 7]]
+    assert output.num_sampled.tolist() == [1, 0]
+    base.assert_called_once_with(logits, batch)
+    talker.take_mrv2_forced_eos.assert_called_once_with(batch, base.req_states, 2)
