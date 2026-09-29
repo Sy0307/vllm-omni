@@ -20,7 +20,6 @@ class _Talker(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Identity-like projection keeps the consumed row visible in the text step.
         self.text_projection = nn.Identity()
         self.code_predictor = SimpleNamespace(
             _top_k=50,
