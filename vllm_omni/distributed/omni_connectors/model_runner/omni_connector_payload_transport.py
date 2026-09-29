@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import math
 import os
 import time
 from collections import deque
@@ -23,8 +24,22 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
 )
 from vllm_omni.outputs import OmniConnectorOutput
 
+
 # No-progress recheck for connectors without a change notification (SHM polls).
-_RECV_POLL_S = float(os.environ.get("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", "5")) / 1000
+def _recv_poll_seconds() -> float:
+    """Resolve a finite positive poll interval, falling back for invalid input."""
+    raw = os.environ.get("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", "5")
+    try:
+        value = float(raw) / 1000
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning("Invalid VLLM_OMNI_CONNECTOR_RECV_POLL_MS=%r; using 5 ms", raw)
+    return 0.005
+
+
+_RECV_POLL_S = _recv_poll_seconds()
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
@@ -962,10 +977,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 # Wait for a *new* arrival: existing future chunks may be
                 # blocked by scheduler ownership of the previous payload.
                 # A key-presence predicate would spin and compete for the
-                # GIL. Keep the existing 5 ms readiness recheck bound.
+                # GIL. Honor the configured readiness recheck interval.
                 wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
                 if generation is not None and callable(wait_for_change):
-                    wait_for_change(generation, timeout=0.005)
+                    wait_for_change(generation, timeout=_RECV_POLL_S)
                 else:
                     self._work_available.wait(timeout=_RECV_POLL_S)
                     self._work_available.clear()
