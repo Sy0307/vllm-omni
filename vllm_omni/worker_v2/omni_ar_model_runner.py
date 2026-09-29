@@ -204,7 +204,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         publish_sampled = getattr(self.model_state, "publish_sampled_embeddings", None)
         extra_outputs = (
             publish_sampled(input_batch, sampler_output.sampled_token_ids)
-            if multimodal_outputs and callable(publish_sampled)
+            if (
+                multimodal_outputs
+                and callable(publish_sampled)
+                and bool(getattr(self.model_config, "async_chunk", False))
+                and getattr(self.model_config, "engine_output_type", "text") != "text"
+            )
             else None
         )
         if self.pp_handler is not None:
@@ -766,8 +771,8 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     pin_memory=pin_memory,
                 )
                 if extra_multimodal_outputs:
-                    # Produced after the packed snapshot was laid out (on a side
-                    # stream); copied on its own once its event completes.
+                    # Produced after sampling on the producer stream; copy only
+                    # once its completion event has been observed.
                     extra_outputs, extra_ready = extra_multimodal_outputs
                     copy_stream.wait_event(extra_ready)
                     self._mm_snapshot = _merge_payload_trees(

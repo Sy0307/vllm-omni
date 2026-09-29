@@ -474,7 +474,7 @@ def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, 
 
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-    monkeypatch.setattr(module, "_wakeup_path", lambda stage: str(tmp_path / f"stage_{stage}"))
+    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(tmp_path))
     receiver = _stage_connector(82)
     peer_path = tmp_path / "stage_82_peer"
     os.mkfifo(peer_path, 0o600)
@@ -502,18 +502,18 @@ def test_partial_receiver_open_closes_fd_and_removes_only_own_fifo(monkeypatch, 
 def test_wakeup_ignores_stale_fifo_and_non_fifo_paths(monkeypatch, tmp_path):
     from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-    monkeypatch.setattr(module, "_wakeup_path", lambda stage: str(tmp_path / f"stage_{stage}"))
+    monkeypatch.setattr(module, "_wakeup_directory", lambda: str(tmp_path))
     sender, receiver = _stage_connector(83), _stage_connector(84)
-    plain = tmp_path / "stage_84_plain"
+    plain = tmp_path / "84_plain"
     plain.write_text("unchanged")
-    (tmp_path / "stage_84_link").symlink_to(plain)
-    os.mkfifo(tmp_path / "stage_84_stale", 0o600)
+    (tmp_path / "84_link").symlink_to(plain)
+    os.mkfifo(tmp_path / "84_stale", 0o600)
     try:
         generation = receiver.get_wakeup_generation()
         sender._wake_receiver(84)
         assert receiver.wait_for_change(generation, timeout=0.5)
         assert plain.read_text() == "unchanged"
-        assert (tmp_path / "stage_84_stale").exists()
+        assert (tmp_path / "84_stale").exists()
     finally:
         sender.close()
         receiver.close()
@@ -546,3 +546,28 @@ def test_waiter_does_not_read_fd_reused_after_close(monkeypatch, tmp_path):
         for fd in reused:
             os.close(fd)
         receiver.close()
+
+
+def test_deployment_scope_survives_different_worker_parents(monkeypatch):
+    config = {"stage_id": 1, "extra": {"wakeup_scope": uuid.uuid4().hex}}
+    monkeypatch.setattr(os, "getppid", lambda: 111)
+    receiver = SharedMemoryConnector(config)
+    monkeypatch.setattr(os, "getppid", lambda: 222)
+    sender = SharedMemoryConnector(config)
+    try:
+        generation = receiver.get_wakeup_generation()
+        sender._wake_receiver(1)
+        assert receiver.wait_for_change(generation, timeout=0.1)
+        directory = receiver._wake_directory
+    finally:
+        receiver.close()
+        sender.close()
+    assert not os.path.exists(directory)
+
+
+@pytest.mark.parametrize("value,expected", [("bad", 0.005), ("nan", 0.005), ("-1", 0.005), ("20", 0.02)])
+def test_receive_poll_interval_validation(monkeypatch, value, expected):
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import _recv_poll_seconds
+
+    monkeypatch.setenv("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", value)
+    assert _recv_poll_seconds() == expected
