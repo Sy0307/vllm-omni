@@ -66,7 +66,6 @@ def test_decode_rows_are_consumed_one_per_step_in_arrival_order():
     for arrival in (None, _rows(5), None, None, None, None):
         payload["embed"]["decode"] = arrival
         steps.append(_step(model, payload)[0].item())
-    # Rows 1..5 in order, then EOS once, then pad.
     assert steps == [1, 2, 3, 4, 5, -1, -2]
     assert payload["embed"]["cached_decode"] is None
 
