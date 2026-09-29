@@ -165,3 +165,36 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
         torch.tensor([7], device=DEVICE, dtype=torch.int32),
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_batched_reference_priming_matches_serial_decoder_continuation():
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    decoder = _make_decoder().to(device=DEVICE, dtype=torch.bfloat16)
+    for name, param in decoder.named_parameters():
+        if name.endswith("embedding_sum"):
+            param.normal_()
+    decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
+    stream = StreamingCodecDecoder(decoder, num_slots=4, dtype=torch.bfloat16)
+    eager = EagerMTPState(SimpleNamespace(device=torch.device(DEVICE)))
+    refs = [torch.randint(0, 32, (length, 2), device=DEVICE) for length in [26, 3, 26]]
+    slots = [2, 0, 3]
+    frame = torch.randint(0, 32, (3, 1, 2), device=DEVICE)
+    slot_tensor = torch.tensor(slots, device=DEVICE, dtype=torch.int32)
+    positions = torch.tensor([len(ref) for ref in refs], device=DEVICE, dtype=torch.int32)
+    for slot, ref in zip(slots, refs, strict=True):
+        for t0 in range(0, len(ref), 25):
+            stream(
+                ref[None, t0 : t0 + 25].to(torch.int32).contiguous(),
+                torch.tensor([slot], device=DEVICE, dtype=torch.int32),
+                torch.tensor([t0], device=DEVICE, dtype=torch.int32),
+            )
+    expected = stream(frame, slot_tensor, positions).clone()
+    # Reuse dirty slots; pos=0 must reset every causal layer for each group.
+    eager._prime_stream(stream, list(zip(slots, refs, strict=True)))
+    actual = stream(frame, slot_tensor, positions)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=3e-5)

@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.states import RequestState
 
-from vllm_omni.utils.device_copy import index_to_device
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
 
 if TYPE_CHECKING:
@@ -480,14 +480,18 @@ class EagerMTPState:
         return ref[-self.owner.model.stream_ref_context_frames :]
 
     def _prime_stream(self, stream, primes: list[tuple[int, torch.Tensor]]) -> None:
-        """Run reference codes through each new voice-clone stream's decoder slot (output discarded)."""
+        """Prime independent slots together when their reference lengths match."""
+        groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
         for req_idx, ref in primes:
-            dev = self.owner.device
-            codes = ref.to(device=dev, dtype=torch.int32).reshape(1, -1, ref.shape[-1])
-            slot = torch.tensor([req_idx], device=dev, dtype=torch.int32)
+            groups.setdefault(int(ref.shape[0]), []).append((req_idx, ref))
+        dev = self.owner.device
+        for items in groups.values():
+            codes = to_device_nonblocking(torch.stack([ref for _idx, ref in items]), dev).to(torch.int32)
+            n = len(items)
+            slots = index_to_device([idx for idx, _ref in items], dev, dtype=torch.int32)
             for t0 in range(0, int(codes.shape[1]), _PRIME_CHUNK_FRAMES):
-                pos = torch.tensor([t0], device=dev, dtype=torch.int32)
-                stream(codes[:, t0 : t0 + _PRIME_CHUNK_FRAMES].contiguous(), slot, pos)
+                pos = index_to_device([t0] * n, dev, dtype=torch.int32)
+                stream(codes[:, t0 : t0 + _PRIME_CHUNK_FRAMES].contiguous(), slots, pos)
 
     def _publish_first_audio(
         self,
