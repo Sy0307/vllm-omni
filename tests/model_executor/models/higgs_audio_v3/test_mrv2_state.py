@@ -125,7 +125,13 @@ def test_upstream_warmup_retains_generic_text_sampling():
     s = make_state()
     s.add_request(0, request("_warmup_0_", 0, repetition_penalty=1.2, logprobs=1))
     batch = SimpleNamespace(req_ids=["_warmup_0_"])
-    assert s.sample_omni_output(None, batch, None, object()) is None
+    sampler, rejection = s.custom_sampler(Mock())
+    expected = (object(), torch.ones(1), torch.zeros(1))
+    standard = Mock(return_value=expected)
+    output = sampler.sample_step(None, batch, None, None, standard)
+    assert output.sampler_output is expected[0] and output.multimodal_outputs is None
+    assert rejection is None
+    standard.assert_called_once_with(None, batch, None)
     s.remove_request("_warmup_0_")
     assert not s.requests
 
@@ -176,3 +182,48 @@ def test_direct_payload_owns_rows_and_filters_partial_prefill():
     snapshot.zero_()
     assert out.inter_stage[0]["codes.audio"].tolist() == [[11, 12]]
     assert out.inter_stage[1:] == [None, None]
+
+
+def test_registered_audio_sampler_preserves_rows_counts_and_owned_output(mocker):
+    state = make_state()
+    metadata, payload = object(), {"_higgs_audio_snapshot": torch.ones(2, 4)}
+    state.sampling_metadata = Mock(return_value=metadata)
+    state.model.compute_logits = Mock(return_value=torch.ones(2, 8))
+    state.model.sample = Mock(
+        return_value=SimpleNamespace(sampled_token_ids=torch.tensor([[9], [8]]), logprobs_tensors=None)
+    )
+    state.model.post_sample_multimodal_outputs = Mock(return_value=payload)
+    count, rejected = torch.tensor([1, 0]), torch.tensor([0, 0])
+    mocker.patch(
+        "vllm_omni.model_executor.models.higgs_audio_v3.model_state.get_num_sampled_and_rejected",
+        return_value=(count, rejected),
+    )
+    batch = SimpleNamespace(
+        req_ids=["b", "a"],
+        num_reqs=2,
+        num_draft_tokens=0,
+        idx_mapping=torch.tensor([3, 1]),
+        logits_indices=torch.tensor([2, 0]),
+        seq_lens=None,
+        cu_num_logits=None,
+    )
+    hidden = torch.arange(12).reshape(3, 4).float()
+    standard = Mock(side_effect=AssertionError("must not sample twice"))
+    sampler, rejection = state.custom_sampler(Mock())
+    result = sampler.sample_step(hidden, batch, SimpleNamespace(prefill_len=SimpleNamespace(gpu=None)), None, standard)
+    state.sampling_metadata.assert_called_once()
+    torch.testing.assert_close(state.model.compute_logits.call_args.args[0], hidden[[2, 0]])
+    assert state.model.compute_logits.call_args.args[1] is metadata
+    assert result.num_sampled is count and result.num_rejected is rejected
+    assert result.multimodal_outputs is payload and result.owns_multimodal_outputs
+    assert not result.include_hidden_states and result.finalize_multimodal == state.finalize_audio_snapshot
+    assert rejection is None
+    standard.assert_not_called()
+
+
+@pytest.mark.parametrize("draft,grammar", [(1, None), (0, object())])
+def test_registered_audio_sampler_rejects_unsupported_modes(draft, grammar):
+    sampler, _ = make_state().custom_sampler(Mock())
+    batch = SimpleNamespace(req_ids=["real-request"], num_draft_tokens=draft)
+    with pytest.raises(ValueError, match="grammar or speculative"):
+        sampler.sample_step(None, batch, None, grammar, Mock())

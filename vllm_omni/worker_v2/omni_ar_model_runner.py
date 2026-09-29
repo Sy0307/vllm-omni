@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 
 logger = init_logger(__name__)
@@ -186,24 +187,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     - self.req_states.prompt_len.gpu[input_batch.idx_mapping]
                 ),
             )
-        sample_omni = getattr(self.model_state, "sample_omni_output", None)
         with sampling_context:
-            custom_output = None
-            if sample_omni is not None:
-                custom_output = sample_omni(
-                    text_hidden,
-                    input_batch,
-                    self.req_states,
-                    grammar_output,
-                )
-            if custom_output is None:
-                sampler_output, num_sampled, num_rejected = self.sample(
-                    text_hidden,
-                    input_batch,
-                    grammar_output,
-                )
-            else:
-                sampler_output, num_sampled, num_rejected, multimodal_outputs = custom_output
+            sampling_output = sample_with_output(
+                self.sampler, self.sample, text_hidden, input_batch, self.req_states, grammar_output
+            )
+        sampler_output = sampling_output.sampler_output
+        num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
+        if sampling_output.multimodal_outputs is not None:
+            multimodal_outputs = sampling_output.multimodal_outputs
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
         if multimodal_outputs and run_eager_mtp is not None:
             run_eager_mtp(
@@ -267,14 +258,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            text_hidden=text_hidden if need_pooler and sample_omni is None else None,
+            text_hidden=text_hidden if need_pooler and sampling_output.include_hidden_states else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
-            finalize_multimodal=(
-                getattr(self.model_state, "finalize_audio_snapshot", None) if sample_omni is not None else None
-            ),
+            finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
             extra_multimodal_outputs=extra_outputs,
@@ -283,7 +272,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=need_pooler and sample_omni is None,
+            need_pooler=need_pooler
+            and (sampling_output.include_hidden_states or not sampling_output.owns_multimodal_outputs),
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
 

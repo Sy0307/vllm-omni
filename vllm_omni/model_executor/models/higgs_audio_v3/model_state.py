@@ -13,6 +13,7 @@ from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
 
 logger = init_logger(__name__)
 
@@ -249,31 +250,8 @@ class HiggsModelState(OmniModelState):
             self.metadata_key = key
         return self.metadata
 
-    def sample_omni_output(self, hidden_states, input_batch, req_states, grammar_output):
-        # Upstream warmup exercises its text sampler, including grammar and
-        # penalties, with synthetic non-audio prompts. Keep that path intact.
-        if all(str(r).startswith("_warmup_") for r in input_batch.req_ids):
-            return None
-        if grammar_output is not None or input_batch.num_draft_tokens:
-            raise ValueError("Higgs MRV2 does not support grammar or speculative sampling")
-        metadata = self.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
-        hidden = hidden_states[input_batch.logits_indices]
-        logits = self.model.compute_logits(hidden, metadata)
-        sampled = self.model.sample(logits, metadata)
-        count, rejected = get_num_sampled_and_rejected(
-            torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
-            input_batch.seq_lens,
-            input_batch.cu_num_logits,
-            input_batch.idx_mapping,
-            req_states.prefill_len.gpu,
-        )
-        output = SamplerOutput(sampled.sampled_token_ids, sampled.logprobs_tensors, None, count, rejected)
-        payload = self.model.post_sample_multimodal_outputs(
-            req_ids=input_batch.req_ids,
-            invalid_req_indices=[],
-            multimodal_outputs=None,
-        )
-        return output, count, rejected, payload
+    def custom_sampler(self, sampler):
+        return HiggsSampler(sampler, self), None
 
     def finalize_audio_snapshot(self, payload: dict[str, Any], num_sampled: list[int]):
         if payload and "_higgs_audio_snapshot" in payload and getattr(self, "direct_payload", False):
@@ -298,3 +276,45 @@ class HiggsModelState(OmniModelState):
             payload = dict(payload)
             payload["_higgs_invalid_rows"] = tuple(i for i, n in enumerate(num_sampled) if n == 0)
         return self.model.finalize_multimodal_outputs_from_cpu_snapshot(payload)
+
+
+class HiggsSampler(OmniSampler):
+    """Higgs audio sampling registered through the upstream sampler factory."""
+
+    def __init__(self, base_sampler, state: HiggsModelState):
+        super().__init__(base_sampler)
+        self.state = state
+
+    def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
+        # Upstream warmup exercises its text sampler, including grammar and
+        # penalties, with synthetic non-audio prompts. Keep that path intact.
+        if all(str(r).startswith("_warmup_") for r in input_batch.req_ids):
+            return super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
+        if grammar_output is not None or input_batch.num_draft_tokens:
+            raise ValueError("Higgs MRV2 does not support grammar or speculative sampling")
+        metadata = self.state.sampling_metadata(input_batch.req_ids, input_batch.idx_mapping[: input_batch.num_reqs])
+        hidden = hidden_states[input_batch.logits_indices]
+        logits = self.state.model.compute_logits(hidden, metadata)
+        sampled = self.state.model.sample(logits, metadata)
+        count, rejected = get_num_sampled_and_rejected(
+            torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            req_states.prefill_len.gpu,
+        )
+        output = SamplerOutput(sampled.sampled_token_ids, sampled.logprobs_tensors, None, count, rejected)
+        payload = self.state.model.post_sample_multimodal_outputs(
+            req_ids=input_batch.req_ids,
+            invalid_req_indices=[],
+            multimodal_outputs=None,
+        )
+        return OmniSamplingOutput(
+            output,
+            count,
+            rejected,
+            payload,
+            include_hidden_states=False,
+            owns_multimodal_outputs=True,
+            finalize_multimodal=self.state.finalize_audio_snapshot,
+        )

@@ -112,6 +112,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
 
     runner.model = SimpleNamespace(compute_logits=None, logitsprocs_need_output_token_ids=needs_history)
     runner.model.mrv2_sampling_context = sampling_context
+    runner.sampler = None
     runner.sample = MagicMock(return_value=sampler_out)
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
