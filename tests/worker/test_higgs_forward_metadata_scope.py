@@ -74,7 +74,7 @@ def test_auxiliary_capture_finishes_before_worker_readiness(monkeypatch, generat
     from vllm_omni.worker.base import OmniGPUWorkerBase
     from vllm_omni.worker.gpu_generation_worker import GPUGenerationWorker
 
-    events = []
+    events: list[str] = []
 
     def capture():
         assert events == ["warmup"]
