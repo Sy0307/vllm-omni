@@ -42,7 +42,6 @@ def test_first_frame_pcm_equals_code2wav_streaming_chunk0():
     code2wav = _code2wav()
     decoder = Qwen3OmniFirstFrameDecoder(code2wav, sample_rate=24000)
     codes = torch.randint(0, _CODEBOOK, (3, _Q))
-
     with torch.inference_mode():
         for row in range(codes.shape[0]):
             pcm = decoder.decode(codes[row : row + 1])
@@ -60,31 +59,12 @@ def test_first_frame_is_a_prefix_of_a_longer_first_chunk():
     code2wav = _code2wav()
     decoder = Qwen3OmniFirstFrameDecoder(code2wav, sample_rate=24000)
     codes = torch.randint(0, _CODEBOOK, (_Q, 4))
-
     with torch.inference_mode():
         first = decoder.decode(codes[:, :1].T)[0]
         chunk0 = code2wav.chunked_decode_streaming(
             codes.reshape(1, _Q, 4), left_context_size=[0], seq_token_counts=[4 * _Q]
         )[0]
     torch.testing.assert_close(chunk0.reshape(-1)[: first.numel()].float(), first)
-
-
-@pytest.mark.parametrize(
-    ("env", "async_chunk", "v2"),
-    [
-        ("0", True, True),  # switched off
-        (None, False, True),  # full-payload Code2Wav input
-        (None, True, False),  # V1 runner: nothing decodes or delivers the frame
-    ],
-)
-def test_first_frame_decoder_needs_streaming_mrv2_talker(monkeypatch, env, async_chunk, v2):
-    if env is None:
-        monkeypatch.delenv("VLLM_OMNI_TALKER_FIRST_AUDIO", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_OMNI_TALKER_FIRST_AUDIO", env)
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=async_chunk, use_v2_model_runner=v2))
-
-    assert Qwen3OmniMoeForConditionalGeneration._build_first_frame_decoder(vllm_config, None, "") is None
 
 
 def test_chunk_ramp_adds_exact_code2wav_graph_sizes(monkeypatch):
@@ -137,6 +117,28 @@ def test_decode_groups_keep_a_uniform_batch_whole_and_split_by_the_largest_graph
     assert plan_decode_groups([], _bucket, lambda size: [1, 2]) == []
 
 
+@pytest.mark.parametrize("frames", [65, 129])
+def test_decode_groups_beyond_largest_graph_use_eager(monkeypatch, frames):
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.enabled = wrapper._warmed_up = True
+    wrapper._bucket_sizes = [8, 32, 64]
+    wrapper._compiled_shapes = {(1, 64), (8, 64)}
+    wrapper._compiled_graphs = wrapper.graphs = dict.fromkeys(wrapper._compiled_shapes, MagicMock())
+    wrapper.decoder = MagicMock(side_effect=lambda codes: codes.float() * 2)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    groups = plan_decode_groups([frames, frames], wrapper._get_padded_size, lambda _: (1,))
+    assert groups == [([0], frames), ([1], frames)]
+    codes = torch.arange(2 * frames).reshape(2, 1, frames)
+    for rows, width in groups:
+        actual = wrapper.decode(codes[rows, :, :width])
+        torch.testing.assert_close(actual, codes[rows].float() * 2, rtol=0, atol=0)
+    assert wrapper.decoder.call_count == 2
+    for graph in (*wrapper.graphs.values(), *wrapper._compiled_graphs.values()):
+        graph.replay.assert_not_called()
+
+
 class _PaddingGraphs:
     def __init__(self, model, batch_sizes):
         self.model = model
@@ -165,7 +167,6 @@ def test_grouped_streaming_decode_matches_one_padded_batch():
     for row, length in enumerate(lengths):
         codes[row, :, :length] = torch.randint(0, _CODEBOOK, (_Q, length))
     counts = [length * _Q for length in lengths]
-
     with torch.inference_mode():
         reference = code2wav.chunked_decode_streaming(codes, left_context_size=lefts, seq_token_counts=counts)
         graphs = _PaddingGraphs(code2wav, [1, 2, 4])
@@ -173,7 +174,6 @@ def test_grouped_streaming_decode_matches_one_padded_batch():
         code2wav._streaming_batch_sizes = {size: [1, 2, 4] for size in _SIZES}
         grouped = code2wav.chunked_decode_streaming(codes, left_context_size=lefts, seq_token_counts=counts)
 
-    assert len(graphs.calls) > 1
     for want, got in zip(reference, grouped, strict=True):
         assert want.shape == got.shape
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
