@@ -204,10 +204,10 @@ def test_load_folds_loaded_generator_and_f0_weights(
     for name, ref_layer in normalized.items():
         layer = model.hift.get_submodule(name)
         assert isinstance(layer.weight, nn.Parameter) and not layer.weight.is_inference()
-        assert layer.weight.device == (torch.device("cpu") if name.startswith("f0_predictor.") else device)
+        assert layer.weight.device == device
         assert layer.weight.dtype == torch.float32
         torch.testing.assert_close(layer.weight, ref_layer.weight, rtol=0, atol=0)
-    assert {p.device for p in model.hift.f0_predictor.parameters()} == {torch.device("cpu")}
+    assert {p.device for p in model.hift.f0_predictor.parameters()} == {device}
     assert {p.dtype for p in model.hift.f0_predictor.parameters()} == {torch.float32}
     assert model.hift.remove_weight_norm() == 0
     assert model.hift.f0_predictor.remove_weight_norm() == 0

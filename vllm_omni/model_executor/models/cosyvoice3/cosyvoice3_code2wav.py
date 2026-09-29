@@ -754,9 +754,10 @@ class CosyVoice3Code2Wav(nn.Module):
         logger.info("Folded %d weight-norm layers in HiFT generator", folded)
         if folded == 0:
             logger.warning("HiFT generator had no weight-norm layers to fold; check config drift")
-        # F0 inference runs on CPU for causal precision. Materialize its
-        # normalized weights there in FP32, not on the generator's device.
-        self.hift.f0_predictor.to(device="cpu", dtype=torch.float32)
+        # Fold on the same device as mainline F0 inference. Folding on CPU
+        # and moving to GPU later changes the normalized FP32 weights.
+        f0_device = device if device.type == "cuda" and os.getenv("COSYVOICE3_F0_ON_CPU", "0") != "1" else "cpu"
+        self.hift.f0_predictor.to(device=f0_device, dtype=torch.float32)
         f0_folded = self.hift.f0_predictor.remove_weight_norm()
         logger.info("Folded %d weight-norm layers in HiFT F0 predictor", f0_folded)
         if f0_folded == 0:
