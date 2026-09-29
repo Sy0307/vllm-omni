@@ -763,7 +763,7 @@ class StreamingCodecDecoder(nn.Module):
 
 
 class StreamingDecodeGraphs:
-    """CUDA graphs of ``StreamingCodecDecoder`` for one frame per row, per batch bucket."""
+    """CUDA graphs of ``StreamingCodecDecoder`` for a fixed frame count per batch bucket."""
 
     def __init__(self, sd: StreamingCodecDecoder, batch_sizes: list[int], frames: int = 1) -> None:
         self.sd, self.frames = sd, frames
