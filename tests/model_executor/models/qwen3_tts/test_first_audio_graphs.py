@@ -19,6 +19,38 @@ DEVICE = torch.device("cuda:0")
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("capacity,model_type", [(1, "base"), (128, "base"), (128, "custom_voice")])
+def test_stream_priming_graph_workspace_respects_token_budget(monkeypatch, capacity, model_type):
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz import streaming_decoder
+
+    captures = []
+
+    def capture(stream, sizes, frames=1):
+        captures.append((sizes, frames))
+        return SimpleNamespace(sizes=sizes, frames=frames)
+
+    monkeypatch.setattr(streaming_decoder, "StreamingDecodeGraphs", capture)
+    model = SimpleNamespace(
+        stream_decoder=SimpleNamespace(max_frames=33),
+        stream_graphs=None,
+        stream_prime_graphs=None,
+        stream_ref_context_frames=25,
+        stream_chunk_frames=25,
+        config=SimpleNamespace(tts_model_type=model_type),
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=512)),
+    )
+    sizes = [size for size in [1, 2, 4, 8, 16, 32, 64, 128] if size <= capacity]
+    Qwen3TTSTalkerForConditionalGeneration.capture_stream_decode_graphs(model, sizes)
+    expected = [(sizes, 1)]
+    if model_type == "base":
+        expected.append(([size for size in sizes if size * 25 <= 512], 25))
+    assert captures == expected
+    Qwen3TTSTalkerForConditionalGeneration.capture_stream_decode_graphs(model, sizes)
+    assert captures == expected
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("skip_flags", [(False, False), (True, True), (False, True), (True, False)])
 @pytest.mark.parametrize("initial_frames", [1, 3])
 @pytest.mark.parametrize("state_only_available", [False, True])
@@ -168,10 +200,14 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("use_graph", [False, True])
 @torch.inference_mode()
-def test_batched_reference_priming_matches_serial_decoder_continuation():
+def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph):
     from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
-    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import (
+        StreamingCodecDecoder,
+        StreamingDecodeGraphs,
+    )
     from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 
     decoder = _make_decoder().to(device=DEVICE, dtype=torch.bfloat16)
@@ -179,11 +215,14 @@ def test_batched_reference_priming_matches_serial_decoder_continuation():
         if name.endswith("embedding_sum"):
             param.normal_()
     decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
-    stream = StreamingCodecDecoder(decoder, num_slots=4, dtype=torch.bfloat16)
-    eager = EagerMTPState(SimpleNamespace(device=torch.device(DEVICE)))
-    refs = [torch.randint(0, 32, (length, 2), device=DEVICE) for length in [26, 3, 26]]
-    slots = [2, 0, 3]
-    frame = torch.randint(0, 32, (3, 1, 2), device=DEVICE)
+    stream = StreamingCodecDecoder(decoder, num_slots=5, dtype=torch.bfloat16)
+    graphs = StreamingDecodeGraphs(stream, [2], frames=25) if use_graph else None
+    eager = EagerMTPState(
+        SimpleNamespace(device=torch.device(DEVICE), model=SimpleNamespace(stream_prime_graphs=graphs))
+    )
+    refs = [torch.randint(0, 32, (length, 2), device=DEVICE) for length in [25, 3, 51, 25]]
+    slots = [2, 0, 3, 4]
+    frame = torch.randint(0, 32, (4, 1, 2), device=DEVICE)
     slot_tensor = torch.tensor(slots, device=DEVICE, dtype=torch.int32)
     positions = torch.tensor([len(ref) for ref in refs], device=DEVICE, dtype=torch.int32)
     for slot, ref in zip(slots, refs, strict=True):
@@ -194,7 +233,10 @@ def test_batched_reference_priming_matches_serial_decoder_continuation():
                 torch.tensor([t0], device=DEVICE, dtype=torch.int32),
             )
     expected = stream(frame, slot_tensor, positions).clone()
+    untouched = stream.save_slot(1)
     # Reuse dirty slots; pos=0 must reset every causal layer for each group.
     eager._prime_stream(stream, list(zip(slots, refs, strict=True)))
     actual = stream(frame, slot_tensor, positions)
     torch.testing.assert_close(actual, expected, rtol=0, atol=3e-5)
+    for got, want in zip(stream.save_slot(1), untouched, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)

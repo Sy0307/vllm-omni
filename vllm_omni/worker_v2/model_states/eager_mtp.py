@@ -485,13 +485,17 @@ class EagerMTPState:
         for req_idx, ref in primes:
             groups.setdefault(int(ref.shape[0]), []).append((req_idx, ref))
         dev = self.owner.device
+        model = getattr(self.owner, "model", None)
+        prime_graphs = getattr(model, "stream_prime_graphs", None)
         for items in groups.values():
             codes = to_device_nonblocking(torch.stack([ref for _idx, ref in items]), dev).to(torch.int32)
             n = len(items)
             slots = index_to_device([idx for idx, _ref in items], dev, dtype=torch.int32)
             for t0 in range(0, int(codes.shape[1]), _PRIME_CHUNK_FRAMES):
                 pos = index_to_device([t0] * n, dev, dtype=torch.int32)
-                stream(codes[:, t0 : t0 + _PRIME_CHUNK_FRAMES].contiguous(), slots, pos)
+                chunk = codes[:, t0 : t0 + _PRIME_CHUNK_FRAMES].contiguous()
+                decode = prime_graphs if prime_graphs is not None and chunk.shape[1] == prime_graphs.frames else stream
+                decode(chunk, slots, pos)
 
     def _publish_first_audio(
         self,

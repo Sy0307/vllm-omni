@@ -418,6 +418,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
         self.stream_decoder = None
         self.stream_graphs = None
+        self.stream_prime_graphs = None
         self.stream_sample_rate = 0
         self.stream_chunk_frames = 25
         # The runners bypass only the outer whole-MTP graph when explicit
@@ -1484,7 +1485,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         with torch.inference_mode():
             self.stream_graphs = StreamingDecodeGraphs(self.stream_decoder, batch_sizes)
+            frames = min(self.stream_ref_context_frames, self.stream_chunk_frames, self.stream_decoder.max_frames)
+            if self.config.tts_model_type == "base" and frames > 1:
+                # Bound the multi-frame graph workspace by the configured
+                # token budget; larger priming groups keep the eager path.
+                budget = max(1, self.vllm_config.scheduler_config.max_num_batched_tokens // frames)
+                prime_sizes = sorted({1, *(size for size in batch_sizes if size <= budget)})
+                self.stream_prime_graphs = StreamingDecodeGraphs(self.stream_decoder, prime_sizes, frames=frames)
         logger.info("Captured Talker stream decode graphs for batch sizes %s", self.stream_graphs.sizes)
+        if self.stream_prime_graphs is not None:
+            logger.info(
+                "Captured Talker reference priming graphs for %d frames and batch sizes %s",
+                self.stream_prime_graphs.frames,
+                self.stream_prime_graphs.sizes,
+            )
 
     def _build_stacked_codec_embed(self) -> None:
         embeds = self.code_predictor.get_input_embeddings()
