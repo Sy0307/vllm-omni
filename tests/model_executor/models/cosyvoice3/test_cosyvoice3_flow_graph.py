@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Replaying the captured Euler solve must match the compiled eager solve."""
 
 import pytest
 import torch
