@@ -21,6 +21,8 @@ class HiggsModelState(OmniModelState):
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
         model._use_external_decode_cudagraph = True
+        # Fix decode-state addresses before any sampling graph can capture them.
+        model._ensure_decode_state_capacity(max(self.max_num_tokens, 128), device)
         logger.info("Higgs MRV2 custom sampler and owned audio snapshots enabled")
         if getattr(model.config, "audio_mrv2_static_inputs", False):
             self._static_inputs_embeds = torch.zeros(
@@ -52,7 +54,7 @@ class HiggsModelState(OmniModelState):
             self.direct_payload,
         )
         if not model.use_async_omni_output:
-            raise ValueError("Higgs MRV2 requires audio_async_payload")
+            raise ValueError("Higgs MRV2 requires audio_async_payload; use higgs_multimodal_qwen3_mrv2_h200.yaml")
 
     def _ensure_slot_capacity(self, slots):
         """Per-slot prompt facts for vectorized step classification."""

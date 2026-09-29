@@ -11,7 +11,10 @@ remains outside capture. This module does not handle mixed prefill batches.
 import copy
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.outputs import SamplerOutput
+
+logger = init_logger(__name__)
 
 _STATE = (
     "_decode_last_codes",
@@ -206,7 +209,7 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
             for name, expected in expected_state.items():
                 torch.testing.assert_close(getattr(model, name), expected, atol=0, rtol=0)
             restore()
-            print(f"HIGGS_DENSE_SAMPLE_GRAPH_PARITY batch={batch} exact=True", flush=True)
+            logger.debug("Higgs sample graph parity checked for batch=%d", batch)
         finally:
             model._in_audio_sample_graph = False
             model._step_audio_mode_rows = original_mode_rows

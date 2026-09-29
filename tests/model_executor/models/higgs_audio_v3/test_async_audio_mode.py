@@ -5,46 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-@pytest.mark.parametrize(
-    "prompts,positions,widths,expected",
-    [
-        ([[1, 2, 5], [5]], [2, 7], [1, 1], 2),
-        ([[1, 2, 5], [5]], [1, 7], [1, 1], 0),
-        ([[1, 2, 7], [5]], [2, 7], [1, 1], 0),
-        ([None, [5]], [2, 7], [1, 1], 0),
-        ([[5], [1, 2, 5]], [7, 2], [1, 1], 2),
-        ([[1, 2, 5], [5]], [0, 12], [3, 1], 2),
-        ([[1, 2, 5], [5]], [0, 12], [2, 1], 0),
-    ],
-)
-def test_prompt_position_eligibility(monkeypatch, prompts, positions, widths, expected):
-    r = object.__new__(OmniGPUModelRunner)
-    seen = {}
-    r.model = SimpleNamespace(
-        config=SimpleNamespace(audio_async_prompt_mode=True),
-        _audio_continuation_id=5,
-        supports_omni_decode_step_metadata=True,
-        update_decode_step_metadata=lambda **kw: seen.update(kw),
-    )
-    r.use_async_scheduling = True
-    r.input_batch = SimpleNamespace(req_ids=["a", "b"], num_computed_tokens_cpu_tensor=torch.tensor(positions))
-    r.requests = {rid: SimpleNamespace(prompt_token_ids=p) for rid, p in zip(["a", "b"], prompts)}
-    ids = torch.full((sum(widths),), 99)
-    r.input_ids = SimpleNamespace(gpu=ids, cpu=ids)
-    r.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, widths[0], sum(widths)]))
-    r.positions = torch.tensor(positions)
-    r._build_model_kwargs_extra = lambda: {}
-    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *a, **kw: torch.ones(2))
-    r._model_forward(input_ids=ids)
-    assert seen["audio_prompt_mode_rows"] == expected
-    assert seen["cpu_input_tail_ids"] is None  # Never trust stale sampled CPU IDs.
 
 
 @pytest.mark.parametrize("enabled", [False, True])

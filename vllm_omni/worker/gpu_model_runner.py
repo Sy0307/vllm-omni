@@ -2112,34 +2112,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 tails = self.query_start_loc.cpu[1 : count + 1].to(torch.long) - 1
                 if count and bool((tails >= 0).all()) and bool((tails < input_ids.numel()).all()):
                     cpu_input_tail_ids = self.input_ids.cpu.index_select(0, tails).tolist()
-            audio_prompt_mode_rows = 0
-            if (
-                getattr(getattr(self.model, "config", None), "audio_async_prompt_mode", False) is True
-                and self.use_async_scheduling
-                and input_ids is not None
-                and input_ids.data_ptr() == self.input_ids.gpu.data_ptr()
-                and not getattr(self, "use_async_spec_decode", False)
-            ):
-                # Positions are CPU-owned, unlike asynchronously sampled token
-                # IDs. Admit only prompts ending in the audio control token,
-                # after the final prompt position has actually been scheduled.
-                count = len(self.input_batch.req_ids)
-                tails = self.query_start_loc.cpu[1 : count + 1].to(torch.long) - 1
-                if count and bool((tails >= 0).all()) and bool((tails < input_ids.numel()).all()):
-                    # Matches vLLM 0.30 _prepare_inputs: GPU positions =
-                    # CPU-owned num_computed_tokens + within-query offsets.
-                    # Spec decode may correct these counts on GPU: excluded.
-                    widths = self.query_start_loc.cpu[1 : count + 1] - self.query_start_loc.cpu[:count]
-                    positions_cpu = (self.input_batch.num_computed_tokens_cpu_tensor[:count] + widths - 1).tolist()
-                    audio_id = getattr(self.model, "_audio_continuation_id", None)
-                    prompts = [self.requests[rid].prompt_token_ids for rid in self.input_batch.req_ids]
-                    if audio_id is not None and all(
-                        prompt and prompt[-1] == audio_id and position >= len(prompt) - 1
-                        for prompt, position in zip(prompts, positions_cpu)
-                    ):
-                        audio_prompt_mode_rows = count
             update_decode_metadata(
-                audio_prompt_mode_rows=audio_prompt_mode_rows,
                 cpu_input_tail_ids=cpu_input_tail_ids,
                 input_ids=input_ids,
                 positions=positions,
