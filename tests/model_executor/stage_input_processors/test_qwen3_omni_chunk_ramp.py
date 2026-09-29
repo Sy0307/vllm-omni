@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-Omni Talker -> Code2Wav chunking with ``codec_chunk_ramp`` (stateless Code2Wav)."""
 
 from __future__ import annotations
 
@@ -34,7 +33,6 @@ def _request(request_id="req"):
 
 
 def _frame(index: int) -> dict:
-    """One MRv2 eager-frame step output: a single valid [1, Q] row."""
     return {
         "codes": {"audio": torch.tensor([[index, 1000 + index]], dtype=torch.long)},
         "meta": {"codec_frame_valid": torch.ones(1, dtype=torch.int8)},
@@ -42,7 +40,6 @@ def _frame(index: int) -> dict:
 
 
 def _stream(manager, num_frames, finish_after_last=True):
-    """Feed frames one per step like the Talker; returns (window frame ids, left context) per chunk."""
     request = _request()
     chunks = []
 
@@ -106,3 +103,14 @@ def test_without_ramp_the_initial_chunk_setting_is_unchanged():
     chunks = _stream(_manager(), 29 + 3)
 
     assert [(len(window), left) for window, left, _finished in chunks] == [(4, 0), (29, 4), (28, 25)]
+
+
+def test_first_audio_marker_only_reaches_initial_codec_chunk():
+    manager = _manager(codec_chunk_ramp=[1, 1])
+    for index in range(2):
+        frame = _frame(index)
+        frame["meta"]["first_audio"] = torch.tensor([True])
+        payload = q3.talker2code2wav_async_chunk(manager, frame, _request())
+        assert bool(payload.meta.first_audio) is (index == 0)
+        manager.put_req_chunk["req"] += 1
+        manager.ramp_chunk_count["req"] += 1

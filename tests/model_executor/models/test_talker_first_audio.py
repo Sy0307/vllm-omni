@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Talker first-frame audio is on by default for streaming MRv2 Talkers."""
 
 from types import SimpleNamespace
 

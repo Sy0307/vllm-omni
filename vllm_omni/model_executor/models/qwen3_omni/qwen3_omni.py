@@ -204,7 +204,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             # MRv2: the Talker's prompt ends with the first generated token's
             # embedding; publishing it with the prefill output lets the first
             # Thinker->Talker chunk leave one decode step earlier.
-            self.publishes_sampled_embeddings = self.is_staged_run
+            # Speculative sampling can change the token width between steps.
+            # Keep the existing capture-stream handoff for the entire request.
+            self.publishes_sampled_embeddings = self.is_staged_run and vllm_config.speculative_config is None
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -647,6 +649,36 @@ class Qwen3OmniMoeForConditionalGeneration(
                 logger.debug("No additional_information provided to code2wav stage.")
             audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
 
+            # Keep the skip decision attached to this forward's output, not
+            # mutable model state: asynchronous materialization can overlap steps.
+            from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
+            flags = [
+                bool(info.get("meta", {}).get("first_audio", False)) for info in (runtime_additional_information or [])
+            ]
+            if flags and any(flags):
+                if len(flags) != len(audio_tensors):
+                    raise ValueError("First-audio flags must align with Code2Wav requests")
+                sample_rate = defs.resolve_audio_sample_rate(self.code2wav_config)
+                frame_counts = [count // 16 for count in seq_token_counts] if seq_token_counts else [codes.shape[-1]]
+                # The causal decoder withholds a right-edge tail. The first
+                # frame has fewer samples than total_upsample; trim its actual
+                # prefix length, including when chunk 0 contains several frames.
+                prefix_lengths = [
+                    max(0, audio.numel() - (frames - 1) * int(self.code2wav.total_upsample)) if skip else 0
+                    for audio, frames, skip in zip(audio_tensors, frame_counts, flags, strict=True)
+                ]
+                return OmniOutput(
+                    text_hidden_states=None,
+                    multimodal_outputs={
+                        "model_outputs": [
+                            audio.reshape(1, -1)[..., prefix:]
+                            for audio, prefix in zip(audio_tensors, prefix_lengths, strict=True)
+                        ],
+                        "sr": [torch.tensor(sample_rate, dtype=torch.int32) for _ in audio_tensors],
+                        FIRST_AUDIO_REQUIRED_KEY: [torch.tensor(skip) for skip in flags],
+                    },
+                )
             return audio_tensors
 
         # Fallback (shouldn't reach here)
@@ -770,7 +802,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         q = int(self.talker.num_code_groups)
         mm: OmniPayload = {
             "codes": {"audio": torch.zeros((num_tokens, q), dtype=torch.long, device=hidden.device)},
-            "meta": {"codec_frame_valid": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device)},
+            "meta": {
+                "codec_frame_valid": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device),
+                "first_audio": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device),
+            },
         }
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 

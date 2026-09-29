@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-Omni Code2Wav decoder blocks use the shared fused SnakeBeta."""
 
 import copy
 

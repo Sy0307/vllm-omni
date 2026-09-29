@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Thinker->Talker text from each step's sample (MRv2) instead of the next step's capture."""
 
 from __future__ import annotations
 
@@ -66,11 +65,6 @@ def _output(token_ids, sampled=None):
 
 
 def _run_turn(tokens, *, publish, max_tokens=64, prefill_chunks=(len(PROMPT),)):
-    """Drive one Thinker turn; return the Talker-visible text rows and chunk count.
-
-    Prefill (possibly chunked) then decode steps; the step that samples the
-    last token ends the turn, as the scheduler does.
-    """
     manager = _Manager()
     rows, chunks, start = [], 0, 0
     for i, size in enumerate(prefill_chunks):

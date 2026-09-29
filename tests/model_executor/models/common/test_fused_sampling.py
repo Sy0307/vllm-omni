@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fixed-uniform sampling, boundary ties and graph replay regression."""
 
 import pytest
 import torch
@@ -62,7 +61,6 @@ def test_threshold_ties_and_degenerate_rows(top_k, top_p):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_native_nucleus_boundaries(dtype):
-    """Force selection of a boundary token so a mask difference is observable."""
     from vllm_omni.model_executor.models.common.fused_sampling import sample_top_k_top_p_gumbel
 
     torch.manual_seed(1923)

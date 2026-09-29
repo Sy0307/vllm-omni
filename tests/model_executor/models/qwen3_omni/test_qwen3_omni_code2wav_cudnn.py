@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Codec autotuning is scoped and remains usable under CUDA graph replay."""
 
 from types import SimpleNamespace
 

@@ -349,7 +349,12 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
                 deterministic=cudnn.deterministic,
                 allow_tf32=cudnn.allow_tf32,
             )
-            if self._cudnn_benchmark and hidden.is_cuda and torch.version.hip is None
+            if (
+                self._cudnn_benchmark
+                and hidden.is_cuda
+                and torch.version.hip is None
+                and not torch.cuda.is_current_stream_capturing()
+            )
             else nullcontext()
         )
         with context:

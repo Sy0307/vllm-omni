@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MRv2 request-row ordering, codec validity and V1 compatibility."""
 
 from types import SimpleNamespace
 
@@ -47,7 +46,6 @@ def _rows(*values: float) -> torch.Tensor:
 
 
 def _step(model, payload: dict) -> torch.Tensor:
-    """One decode step: returns the text step and applies the buffer update."""
     update: dict = {}
     text_step = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), update)
     for key, value in update.items():

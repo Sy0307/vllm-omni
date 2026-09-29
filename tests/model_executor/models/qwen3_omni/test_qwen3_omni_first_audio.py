@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen3-Omni Talker first-frame audio (CPU, tiny random Code2Wav).
-
-- The Talker's first-frame decoder computes exactly Code2Wav's streaming
-  chunk 0 for a one-frame first chunk (no left context).
-- The decoder is opt-in and only exists for a streaming Talker.
-- A chunk ramp adds its decode windows to Code2Wav's graph sizes.
-"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -28,11 +21,11 @@ _Q = 4
 _CODEBOOK = 16
 
 
-def _code2wav() -> Qwen3OmniMoeCode2Wav:
+def _code2wav(quantizers=_Q) -> Qwen3OmniMoeCode2Wav:
     torch.manual_seed(0)
     config = Qwen3OmniMoeCode2WavConfig(
         codebook_size=_CODEBOOK,
-        num_quantizers=_Q,
+        num_quantizers=quantizers,
         hidden_size=32,
         intermediate_size=64,
         num_hidden_layers=2,
@@ -53,20 +46,17 @@ def test_first_frame_pcm_equals_code2wav_streaming_chunk0():
     with torch.inference_mode():
         for row in range(codes.shape[0]):
             pcm = decoder.decode(codes[row : row + 1])
-            # What the Code2Wav stage returns for a lone one-frame chunk 0.
             chunk0 = code2wav.chunked_decode_streaming(
                 codes[row].reshape(1, _Q, 1), left_context_size=[0], seq_token_counts=[_Q]
             )[0]
             assert pcm.dtype == torch.float32
             assert torch.equal(pcm[0], chunk0.reshape(-1).float())
-            # One frame minus the causal right-edge trim.
             assert 0 < pcm.shape[-1] < int(code2wav.total_upsample)
         batched = decoder.decode(codes)
     assert batched.shape == (3, pcm.shape[-1])
 
 
 def test_first_frame_is_a_prefix_of_a_longer_first_chunk():
-    """Trimming the delivered samples from a longer chunk 0 keeps the stream contiguous."""
     code2wav = _code2wav()
     decoder = Qwen3OmniFirstFrameDecoder(code2wav, sample_rate=24000)
     codes = torch.randint(0, _CODEBOOK, (_Q, 4))
@@ -142,15 +132,12 @@ def test_decode_groups_keep_a_uniform_batch_whole_and_split_by_the_largest_graph
     assert plan_decode_groups([50] * 6, _bucket, lambda size: [1, 2, 4, 8]) == [(list(range(6)), 50)]
     calls = plan_decode_groups([25] * 20, _bucket, lambda size: [1, 2, 4, 8, 16])
     assert [len(rows) for rows, _length in calls] == [16, 4]
-    # Row counts are captured per graph size: long windows split into smaller calls.
     calls = plan_decode_groups([1] * 8 + [50] * 8, _bucket, lambda size: [1, 2, 4, 8] if size < 50 else [1, 2, 4])
     assert [(len(rows), length) for rows, length in calls] == [(8, 1), (4, 50), (4, 50)]
     assert plan_decode_groups([], _bucket, lambda size: [1, 2]) == []
 
 
 class _PaddingGraphs:
-    """Replays like CUDAGraphDecoderWrapper: pads rows/frames to a captured shape, trims the output."""
-
     def __init__(self, model, batch_sizes):
         self.model = model
         self.batch_sizes = sorted(batch_sizes)
@@ -180,7 +167,6 @@ def test_grouped_streaming_decode_matches_one_padded_batch():
     counts = [length * _Q for length in lengths]
 
     with torch.inference_mode():
-        # One call padded to the longest row (the default path).
         reference = code2wav.chunked_decode_streaming(codes, left_context_size=lefts, seq_token_counts=counts)
         graphs = _PaddingGraphs(code2wav, [1, 2, 4])
         code2wav._cudagraph_wrapper, code2wav._cudagraph_enabled = graphs, True
@@ -191,3 +177,32 @@ def test_grouped_streaming_decode_matches_one_padded_batch():
     for want, got in zip(reference, grouped, strict=True):
         assert want.shape == got.shape
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("frames", [1, 4])
+def test_delivered_first_frame_is_removed_from_code2wav_output(frames):
+    from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
+    codec = _code2wav(16)
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage, model.code2wav, model.code2wav_config = "code2wav", codec, codec.config
+    model.generate_audio = lambda codes, left, counts: codec.chunked_decode_streaming(
+        codes, left_context_size=left, seq_token_counts=counts
+    )
+    codes = torch.randint(0, _CODEBOOK, (2, 16, frames))
+    with torch.inference_mode():
+        reference = model.generate_audio(codes, [0, 0], [16 * frames] * 2)
+        first = Qwen3OmniFirstFrameDecoder(codec, sample_rate=24000).decode(codes[0, :, :1].T)[0]
+        out = model.forward(
+            input_ids=codes.flatten(),
+            positions=None,
+            seq_token_counts=[16 * frames] * 2,
+            runtime_additional_information=[
+                {"meta": {"left_context_size": 0, "first_audio": True}},
+                {"meta": {"left_context_size": 0, "first_audio": False}},
+            ],
+        ).multimodal_outputs
+    torch.testing.assert_close(torch.cat([first, out["model_outputs"][0].flatten()]), reference[0].flatten())
+    torch.testing.assert_close(out["model_outputs"][1], reference[1].reshape(1, -1))
+    assert [bool(flag) for flag in out[FIRST_AUDIO_REQUIRED_KEY]] == [True, False]

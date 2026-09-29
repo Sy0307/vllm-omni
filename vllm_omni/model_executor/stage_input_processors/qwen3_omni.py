@@ -712,6 +712,7 @@ def talker2code2wav_async_chunk(
     request_id = request.external_req_id
     code_predictor_codes = None
     frame_valid = None
+    first_audio = False
     if isinstance(multimodal_output, Mapping):
         talker_codes = multimodal_output.get("codes", {})
         if isinstance(talker_codes, dict):
@@ -719,6 +720,10 @@ def talker2code2wav_async_chunk(
         meta = multimodal_output.get("meta", {})
         if isinstance(meta, Mapping):
             frame_valid = meta.get("codec_frame_valid")
+            flag = meta.get("first_audio", False)
+            first_audio = (
+                bool(flag.numel() and flag.reshape(-1)[-1].item()) if isinstance(flag, torch.Tensor) else bool(flag)
+            )
 
     if isinstance(frame_valid, torch.Tensor) and frame_valid.numel() > 0:
         # Token-major codes with explicit per-row validity (MRv2 eager
@@ -788,6 +793,7 @@ def talker2code2wav_async_chunk(
         return OmniPayloadStruct(
             codes=CodesStruct(audio=codes),
             meta=MetaStruct(
+                first_audio=torch.tensor(first_audio and chunk_id == 0),
                 left_context_size=left_context_size,
                 finished=torch.tensor(is_finished, dtype=torch.bool),
             ),
@@ -822,6 +828,7 @@ def talker2code2wav_async_chunk(
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
         meta=MetaStruct(
+            first_audio=torch.tensor(first_audio and chunk_id == 0),
             left_context_size=left_context_size,
             finished=torch.tensor(is_finished, dtype=torch.bool),
         ),
