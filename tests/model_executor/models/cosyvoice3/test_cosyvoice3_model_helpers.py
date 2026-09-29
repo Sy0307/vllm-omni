@@ -987,3 +987,20 @@ def test_cancelled_stream_releases_only_its_vocoder_state():
     model_cls.on_requests_finished(model, {"cancelled", "unknown"})
     model_cls.on_requests_finished(model, {"cancelled"})
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
+
+
+@pytest.mark.parametrize("mrv2", [False, True])
+def test_talker_output_contract_without_packed_flow(monkeypatch, mrv2):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
+
+    monkeypatch.setattr(mod, "cosyvoice3_packed_inference_enabled", lambda: False)
+    model = _make_talker_model()
+    hidden = torch.zeros(2, 4)
+    model.model = SimpleNamespace(llm=lambda embeddings, positions: embeddings)
+    sentinel = object()
+    model.make_omni_output = lambda *args, **kwargs: sentinel
+    if mrv2:
+        model._sampling_eps = 1e-6
+        model.mrv2_custom_sampler(SimpleNamespace(penalties_state=None))
+    output = model.forward(torch.ones(2, dtype=torch.long), torch.arange(2), inputs_embeds=hidden)
+    assert output is (hidden if mrv2 else sentinel)
