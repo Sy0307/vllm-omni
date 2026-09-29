@@ -1970,7 +1970,8 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(monkeypatch: 
         (_whole_euler_chunk(1, 16), 16, 0),  # consumes the narrow chunk's cache
     ]
     caches: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = {
-        "exact": (None, None), "bucketed": (None, None)
+        "exact": (None, None),
+        "bucketed": (None, None),
     }
     for chunk, mel_frames, pad_frames in chunks:
         chunk["x"][:, :, mel_frames:] = 0.0
