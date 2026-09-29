@@ -6,23 +6,10 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from tests.model_executor.models.cosyvoice3.test_cosyvoice3_full_batch import MelOutput
+from tests.model_executor.models.cosyvoice3.test_cosyvoice3_full_batch import MelOutput, _items
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
-
-
-def _items(shapes, **extra):
-    return [
-        dict(
-            token=torch.randint(0, 64, (1, length), device="cuda"),
-            prompt_token=torch.randint(0, 64, (1, prompt)),
-            prompt_feat=torch.randn(1, prompt * 2, 80, device="cuda"),
-            embedding=torch.randn(1, 192, device="cuda"),
-            **extra,
-        )
-        for prompt, length in shapes
-    ]
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

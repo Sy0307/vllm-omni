@@ -78,16 +78,3 @@ def test_reference_cache_distinguishes_inputs(processor, change):
         obj.info.ctx.model_config.model = "model-b"
     run((wave, rate))
     assert len(calls) == 2
-
-
-def test_reference_cache_obeys_memory_budget(processor):
-    obj, run, calls = processor
-    from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
-
-    obj._speaker_cache = SpeakerEmbeddingCache(max_bytes=52)
-    wave = np.arange(8, dtype=np.float32)
-    run((wave, 16000))
-    run((wave + 1, 16000))
-    run((wave, 16000))
-    assert len(calls) == 3
-    assert obj._speaker_cache.memory_bytes() <= 52

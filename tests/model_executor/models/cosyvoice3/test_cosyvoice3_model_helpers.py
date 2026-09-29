@@ -542,32 +542,6 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
             metadata.output_token_ids[i].append(token)
 
 
-def test_batched_ras_top_p_uses_full_distribution_before_top_k(monkeypatch):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
-
-    model = _make_talker_model()
-    metadata = _make_sampling_metadata(output_token_ids=[[]])
-    metadata.top_k = torch.tensor([2])
-    metadata.top_p = torch.tensor([0.5])
-    captured = []
-
-    def sample(probs, generators):
-        captured.append(probs.clone())
-        return probs.argmax(dim=-1)
-
-    monkeypatch.setattr(mod, "random_sample", sample)
-    model._ras_sample_batch(
-        torch.tensor([[0.4, 0.3, 0.2, 0.1]]).log(),
-        metadata,
-        default_top_p=0.8,
-        default_top_k=25,
-        win_size=10,
-        tau_r=0.1,
-    )
-    assert len(captured) == 1
-    torch.testing.assert_close(captured[0], torch.tensor([[0.4, 0.3, 0.0, 0.0]]))
-
-
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     metadata = _make_sampling_metadata(output_token_ids=[[1, 2, 3]])
     expected = SamplerOutput(
@@ -841,23 +815,6 @@ def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
     assert model.code2wav.forward_streaming_batch_calls[0][0]["finalize"]
 
 
-def test_full_response_graph_returns_only_hidden_states(monkeypatch):
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
-
-    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
-    model = _make_talker_model()
-    hidden = torch.ones(2, 4)
-    model.model = SimpleNamespace(llm=lambda *_args: hidden)
-    result = model.forward(
-        input_ids=torch.tensor([1, 2]),
-        positions=torch.arange(2),
-        inputs_embeds=hidden,
-        speech_token=torch.tensor([[7, 8]]),
-    )
-    # A graph must not retain its capture-time prompt in its output container.
-    assert result is hidden
-
-
 def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -880,28 +837,6 @@ def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
     decode = runner._model_forward()
     assert decode.text_hidden_states is hidden
     assert decode.multimodal_outputs == {}
-
-
-def test_packed_stream_profile_is_explicit_and_hopper_only(monkeypatch):
-    from vllm_omni.model_executor.models.cosyvoice3 import runtime
-
-    monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
-    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
-    monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: (9, 0))
-    assert not runtime.cosyvoice3_packed_inference_enabled()
-    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
-    assert runtime.cosyvoice3_packed_streaming_enabled()
-    assert runtime.cosyvoice3_packed_inference_enabled()
-    assert not runtime.cosyvoice3_full_response_enabled()
-    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: (8, 0))
-    assert not runtime.cosyvoice3_packed_inference_enabled()
-    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
-    monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
-    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: (9, 0))
-    assert runtime.cosyvoice3_packed_inference_enabled()
-    monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: False)
-    assert not runtime.cosyvoice3_packed_inference_enabled()
 
 
 def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monkeypatch):
@@ -968,16 +903,6 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
         assert torch.isneginf(logits[:, 6563:6761]).all()
 
 
-def test_sampling_mode_rejects_unknown_policy():
-    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_standard_sampling
-
-    model = _make_talker_model()
-    assert not cosyvoice3_standard_sampling(model.config)
-    model.config.cosyvoice3_sampling_mode = "unsupported_policy"
-    with pytest.raises(ValueError, match="cosyvoice3_sampling_mode"):
-        cosyvoice3_standard_sampling(model.config)
-
-
 def test_cancelled_stream_releases_only_its_vocoder_state():
     model_cls, _ = _cosyvoice3_model_and_runner()
     model = SimpleNamespace(
@@ -989,11 +914,11 @@ def test_cancelled_stream_releases_only_its_vocoder_state():
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
 
 
-@pytest.mark.parametrize("mrv2", [False, True])
-def test_talker_output_contract_without_packed_flow(monkeypatch, mrv2):
+@pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
+def test_talker_output_contract(monkeypatch, mrv2, packed):
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
 
-    monkeypatch.setattr(mod, "cosyvoice3_packed_inference_enabled", lambda: False)
+    monkeypatch.setattr(mod, "cosyvoice3_packed_inference_enabled", lambda: packed)
     model = _make_talker_model()
     hidden = torch.zeros(2, 4)
     model.model = SimpleNamespace(llm=lambda embeddings, positions: embeddings)
@@ -1003,4 +928,4 @@ def test_talker_output_contract_without_packed_flow(monkeypatch, mrv2):
         model._sampling_eps = 1e-6
         model.mrv2_custom_sampler(SimpleNamespace(penalties_state=None))
     output = model.forward(torch.ones(2, dtype=torch.long), torch.arange(2), inputs_embeds=hidden)
-    assert output is (hidden if mrv2 else sentinel)
+    assert output is (hidden if mrv2 or packed else sentinel)

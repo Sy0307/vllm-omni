@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Ragged reference conditioning must agree with independent Flow solves."""
 
 from types import SimpleNamespace
 
@@ -25,11 +24,20 @@ class MelOutput(nn.Module):
         return speech_feat, None, None
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("offset", [0, 3])
-@pytest.mark.parametrize("count", [3, 11])
-@torch.inference_mode()
-def test_full_batch_ragged_prompt_matches_independent_flow(monkeypatch, offset, count):
+def _items(shapes, **extra):
+    return [
+        dict(
+            token=torch.randint(0, 64, (1, length), device="cuda"),
+            prompt_token=torch.randint(0, 64, (1, prompt)),
+            prompt_feat=torch.randn(1, prompt * 2, 80, device="cuda"),
+            embedding=torch.randn(1, 192, device="cuda"),
+            **extra,
+        )
+        for prompt, length in shapes
+    ]
+
+
+def tiny_flow(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
@@ -38,18 +46,16 @@ def test_full_batch_ragged_prompt_matches_independent_flow(monkeypatch, offset, 
     config = CosyVoice3Config()
     config.flow["pre_lookahead_layer"]["channels"] = 32
     config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=4, dim_head=8)
-    model = module.CosyVoice3Code2Wav(config).cuda().eval()
-    items = []
-    for prompt_length, length in ([(7, 17), (13, 9), (3, 31)] * 4)[:count]:
-        items.append(
-            dict(
-                token=torch.randint(0, 64, (1, length), device="cuda"),
-                prompt_token=torch.randint(0, 64, (1, prompt_length)),
-                prompt_feat=torch.randn(1, prompt_length * 2, 80, device="cuda"),
-                embedding=torch.randn(1, 192, device="cuda"),
-                token_offset_tokens=offset,
-            )
-        )
+    return module.CosyVoice3Code2Wav(config).cuda().eval()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("offset", [0, 3])
+@pytest.mark.parametrize("count", [3, 11])
+@torch.inference_mode()
+def test_full_batch_ragged_prompt_matches_independent_flow(monkeypatch, offset, count):
+    model = tiny_flow(monkeypatch)
+    items = _items(([(7, 17), (13, 9), (3, 31)] * 4)[:count], token_offset_tokens=offset)
     # Fix Flow noise so scheduling changes do not change the comparison input.
     monkeypatch.setattr(torch, "randn", lambda shape, **kw: torch.zeros(shape, **kw))
     expected = [model.forward(**item, n_timesteps=3) for item in items]
@@ -68,28 +74,11 @@ def test_full_batch_ragged_prompt_matches_independent_flow(monkeypatch, offset, 
 def test_packed_full_response_preserves_request_isolation(monkeypatch):
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the opt-in packed backend requires Hopper FA3")
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
-    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
-
-    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
-    monkeypatch.setattr(module, "CausalHiFTGenerator", MelOutput)
-    config = CosyVoice3Config()
-    config.flow["pre_lookahead_layer"]["channels"] = 32
-    config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=4, dim_head=8)
-    model = module.CosyVoice3Code2Wav(config).cuda().bfloat16().eval()
+    model = tiny_flow(monkeypatch).bfloat16()
     model.hift.upsample_rates = [1]
     model.hift.istft_params = {"hop_len": 1}
-    items = []
-    for prompt_length, length in [(7, 17), (13, 9), (3, 31)]:
-        items.append(
-            dict(
-                token=torch.randint(0, 64, (1, length), device="cuda"),
-                prompt_token=torch.randint(0, 64, (1, prompt_length)),
-                prompt_feat=torch.randn(1, prompt_length * 2, 80, device="cuda"),
-                embedding=torch.randn(1, 192, device="cuda"),
-            )
-        )
+    items = _items([(7, 17), (13, 9), (3, 31)])
     monkeypatch.setattr(torch, "randn", lambda shape, **kw: torch.zeros(shape, **kw))
     expected = [model.forward(**item, n_timesteps=3) for item in items]
     actual = model.forward_batch(items, n_timesteps=3)
@@ -165,17 +154,9 @@ def test_packed_stream_attention_matches_chunk_causal_reference():
 def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch):
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the opt-in packed backend requires Hopper FA3")
-    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
-    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
-
-    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
-    monkeypatch.setattr(module, "CausalHiFTGenerator", MelOutput)
-    config = CosyVoice3Config()
-    config.flow["pre_lookahead_layer"]["channels"] = 32
-    config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=4, dim_head=8)
-    model = module.CosyVoice3Code2Wav(config).cuda().bfloat16().eval()
+    model = tiny_flow(monkeypatch).bfloat16()
     monkeypatch.setattr(
         model, "_stream_hift_from_feat", lambda mel, cache_state, finalize: (mel, None if finalize else cache_state)
     )
