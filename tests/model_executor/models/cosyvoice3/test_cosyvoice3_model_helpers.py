@@ -747,6 +747,58 @@ def test_embed_input_ids_preserves_interleaved_request_boundaries(order):
         model._align_prompt_conditioning(conditioning[:-1])
 
 
+def test_mrv2_conditioning_follows_encoded_prompts_to_batch_rows():
+    from collections import OrderedDict
+
+    model = _make_talker_model()
+    speech = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4))
+    text = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4) + 1000)
+    model.model = SimpleNamespace(
+        speech_embedding=speech, sos=0, task_id=1, llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=text))
+    )
+    model._mrv2_encoded_conditioning = OrderedDict()
+    tokens = [torch.tensor([2, 3]), torch.tensor([4, 5, 6])]
+    feats = [torch.full((4, 2), 1.0), torch.full((6, 2), 2.0)]
+    speakers = [torch.full((1, 3), 1.0), torch.full((1, 3), 2.0)]
+    encoded = model.embed_multimodal(speech_token=tokens, speech_feat=feats, embedding=speakers)
+    # Batch: decode, short prompt, decode, long prompt, short again (same
+    # reference: the encoder cache hands back the same tensor).
+    ids = torch.tensor([7, 1, 1, 1, 1, 21, 8, 1, 1, 1, 1, 1, 30, 1, 1, 1, 1, 22])
+    is_mm = torch.tensor([False] + [True] * 4 + [False, False] + [True] * 5 + [False] + [True] * 4 + [False])
+    model.embed_input_ids(
+        ids,
+        multimodal_embeddings=[encoded[0], encoded[1], encoded[0]],
+        is_multimodal=is_mm,
+        query_start_loc=[0, 1, 6, 7, 13, 18],
+    )
+    output = model.make_omni_output(torch.zeros(18, 4), model_intermediate_buffer=[None] * 5)
+    embed = output.multimodal_outputs["embed"]
+    assert [value is None for value in embed["speech_token"]] == [True, False, True, False, False]
+    for row, item in ((1, 0), (3, 1), (4, 0)):
+        torch.testing.assert_close(embed["speech_token"][row], tokens[item][None])
+        torch.testing.assert_close(embed["speech_feat"][row], feats[item][None])
+        torch.testing.assert_close(embed["embedding"][row], speakers[item])
+    # A following decode step carries no conditioning.
+    model.embed_input_ids(
+        torch.tensor([9, 10]), multimodal_embeddings=[], is_multimodal=torch.zeros(2, dtype=torch.bool)
+    )
+    assert model.make_omni_output(torch.zeros(2, 4)).multimodal_outputs == {}
+    with pytest.raises(ValueError, match="lost its prompt conditioning"):
+        model.embed_input_ids(
+            torch.tensor([1, 1, 1, 1, 21]),
+            multimodal_embeddings=[speech.weight[2:4].clone()],
+            is_multimodal=torch.tensor([True] * 4 + [False]),
+            query_start_loc=[0, 5],
+        )
+
+
+def test_talker_declares_its_narrow_logits_head():
+    model = _make_talker_model()
+    assert model.logits_vocab_size == 6561 + 200
+    model.model_stage = "cosyvoice3_code2wav"
+    assert model.logits_vocab_size is None
+
+
 def test_embed_input_ids_rejects_cross_request_placeholder_block():
     model = _make_talker_model()
     speech = nn.Embedding(100, 4)

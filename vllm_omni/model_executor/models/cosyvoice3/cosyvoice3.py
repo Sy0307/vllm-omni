@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import hashlib
 import os
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
 from math import gcd
 from threading import Lock
+from types import MethodType
+from typing import Any
 
 import numpy as np
 import onnxruntime
@@ -40,6 +43,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_enabled,
@@ -93,6 +97,267 @@ def _campplus_onnx_providers() -> list[str]:
     if "MUSAExecutionProvider" in onnxruntime.get_available_providers():
         return ["MUSAExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
+
+
+def _audio_conditioning(proc, audio, model_dir: str, config, mm_kwargs: Mapping[str, object]) -> dict:
+    """Reference-audio conditioning (speech tokens, mel, speaker embedding).
+
+    Reuses bounded, process-local artifacts keyed by voice name or by the
+    waveform content, and returns independent tensors so downstream mutation
+    cannot poison a cache hit.
+    """
+    device = "cpu"
+    voice_name = mm_kwargs.get("voice_name")
+    cache_key = None
+    if voice_name and isinstance(voice_name, str):
+        cache_key = proc._speaker_cache.make_cache_key(
+            voice_name,
+            model_type="cosyvoice3",
+            created_at=int(mm_kwargs.get("voice_created_at") or 0),
+        )
+    else:
+        # Cache audio artifacts only: reference/target text is tokenized
+        # separately. Keep dtype and sample rate in the identity to avoid
+        # aliases between numerically distinct preprocessing inputs.
+        waveform, sample_rate = audio
+        waveform = np.ascontiguousarray(waveform)
+        digest = hashlib.sha256()
+        digest.update(str((int(sample_rate), waveform.shape, waveform.dtype.str)).encode())
+        digest.update(memoryview(waveform).cast("B"))
+        backend = "trt" if proc.campplus_trt is not None else "onnx"
+        cache_key = proc._speaker_cache.make_cache_key(
+            digest.hexdigest(), model_type=f"cosyvoice3-reference:{model_dir}:{backend}"
+        )
+    cached = proc._speaker_cache.get(cache_key)
+    if os.environ.get("COSYVOICE3_REFERENCE_CACHE_DEBUG") == "1":
+        _REFERENCE_CACHE_DEBUG[cached is not None] += 1
+        if sum(_REFERENCE_CACHE_DEBUG.values()) % 128 == 0:
+            logger.info(
+                "CosyVoice3 reference cache lookups: hits=%d misses=%d model_dir=%s",
+                _REFERENCE_CACHE_DEBUG[True],
+                _REFERENCE_CACHE_DEBUG[False],
+                model_dir,
+            )
+    if cached is None:
+        # Speech-token extraction via the S3Tokenizer PyTorch model on GPU
+        # (~30x faster than the bundled ``speech_tokenizer_v3.onnx`` CPU path).
+        speech_token, speech_token_len = proc._extract_speech_token_via_s3(audio, device)
+        speech_feat, speech_feat_len = extract_speech_feat(audio, proc.feat_extractor, device)
+        if config.sample_rate == 24000:
+            token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
+            speech_feat, speech_feat_len[:] = speech_feat[:, : 2 * token_len], 2 * token_len
+            speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
+        if proc.campplus_trt is not None:
+            embedding = extract_spk_embedding_trt(audio, proc.campplus_trt, device)
+        else:
+            embedding = extract_spk_embedding(audio, proc.campplus_session, device)
+        cached = {
+            "speech_feat": speech_feat.detach().cpu().clone(),
+            "speech_token": speech_token.detach().cpu().clone(),
+            "speech_token_len": speech_token_len.detach().cpu().clone(),
+            "embedding": embedding.detach().cpu().clone(),
+        }
+        proc._speaker_cache.put(cache_key, cached)
+    return {key: value.clone() for key, value in cached.items()}
+
+
+_PROMPT_SCRATCH_TOKENS = 1 << 20
+_MRV2_CONDITIONING_ENTRIES = 4096
+
+
+def _generated_only_penalty_writes(state) -> None:
+    """``PenaltiesState.apply_staged_writes`` that leaves the prompt unpenalized."""
+    if state._new_penalties_reqs:
+        from vllm.utils.torch_utils import async_tensor_h2d
+        from vllm.v1.worker.gpu.sample.penalties import bincount
+
+        scratch = getattr(state, "_prompt_scratch_mask", None)
+        if scratch is None:
+            columns = max(state.prompt_bin_mask.shape[1], _PROMPT_SCRATCH_TOKENS // 32)
+            scratch = state._prompt_scratch_mask = torch.zeros(
+                state.prompt_bin_mask.shape[0], columns, dtype=torch.int32, device=state.device
+            )
+        rows = async_tensor_h2d(state._new_penalties_reqs, dtype=torch.int32, device=state.device)
+        prefill_lens = state.req_states.prefill_len.np[state._new_penalties_reqs]
+        # Prompt bits land in the scratch mask; resumed output tokens (between
+        # prompt_len and prefill_len) still seed the output counts.
+        bincount(
+            rows,
+            state.req_states.all_token_ids.gpu,
+            state.req_states.prompt_len.gpu,
+            state.req_states.prefill_len.gpu,
+            scratch,
+            state.output_bin_counts,
+            int(prefill_lens.max()),
+        )
+        state.prompt_bin_mask.index_fill_(0, rows.long(), 0)
+        state._new_penalties_reqs.clear()
+    state.repetition_penalty.copy_to_uva()
+    state.frequency_penalty.copy_to_uva()
+    state.presence_penalty.copy_to_uva()
+
+
+def _ras_mrv2_sample(
+    sampler,
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    pos: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    return_logprobs: bool = False,
+    *,
+    default_top_p: float,
+    default_top_k: int,
+    win_size: int,
+    tau_r: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``Sampler.sample`` for MRv2: CosyVoice3 repetition-aware sampling on the GPU.
+
+    Same distribution as ``CosyVoice3Model._ras_sample_batch`` (V1): top-p over
+    the full distribution capped at top-k; a draw repeating within the last
+    ``win_size`` generated tokens is replaced by a draw from the full remaining
+    distribution. History is read from the runner's token table and rejection
+    is resolved per row on the device, so no step waits on the host. Penalties
+    are not applied, as in V1 RAS. Draws use the request seed and position; the
+    replacement draw uses a disjoint noise stream.
+    """
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+    logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+    sampler.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    states = sampler.sampling_states
+    temperature = states.temperature.gpu
+    req_states = sampler.req_states
+    top_k_np = states.top_k.np[idx_mapping_np]
+    use_top_k = bool((top_k_np != states.vocab_size).any())
+    if logits.is_cuda and not return_logprobs and (top_k_np.max() if use_top_k else default_top_k) <= MAX_FUSED_TOP_K:
+        # One kernel per step instead of ~70 (see ras_sampler.py).
+        use_top_p = bool((states.top_p.np[idx_mapping_np] != 1.0).any())
+        sampled = fused_ras_sample(
+            logits,
+            expanded_idx_mapping,
+            temperature,
+            states.top_k.gpu if use_top_k else None,
+            states.top_p.gpu if use_top_p else None,
+            states.seeds.gpu,
+            pos,
+            req_states.all_token_ids.gpu,
+            req_states.total_len.gpu,
+            req_states.prompt_len.gpu,
+            default_top_k=default_top_k,
+            default_top_p=default_top_p,
+            win_size=win_size,
+            tau_r=tau_r,
+            eps=eps,
+        )
+        return sampled, logits
+    rows = expanded_idx_mapping.long()
+    row_temperature = temperature[rows]
+    scores = torch.log_softmax(logits / row_temperature.clamp_min(eps).unsqueeze(1), dim=1)
+    num_rows, vocab = scores.shape
+    top_k, top_p = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+    if top_p is None:
+        top_p = scores.new_full((num_rows,), default_top_p)
+    if top_k is None:
+        top_k = torch.full((num_rows,), default_top_k, dtype=torch.int32, device=scores.device)
+    sorted_scores, sorted_ids = scores.sort(dim=1, descending=True, stable=True)
+    sorted_probs = sorted_scores.exp()
+    # Top-p is decided on the full distribution, before the top-k cap.
+    keep = (sorted_probs.cumsum(dim=1) - sorted_probs) < top_p.unsqueeze(1)
+    ranks = torch.arange(vocab, device=scores.device)
+    keep &= (top_k.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_k.unsqueeze(1))
+    nucleus = sorted_scores.masked_fill(~keep, float("-inf"))
+    seeds = states.seeds.gpu
+    draws = gumbel_sample(nucleus, expanded_idx_mapping, temperature, seeds, pos, False, False)
+    sampled = sorted_ids.gather(1, draws.unsqueeze(1))
+    if win_size <= 0:
+        return sampled.squeeze(1), scores
+
+    total_len = req_states.total_len.gpu[rows].long()
+    prompt_len = req_states.prompt_len.gpu[rows].long()
+    offsets = total_len.unsqueeze(1) - 1 - torch.arange(win_size, device=scores.device).unsqueeze(0)
+    in_output = offsets >= prompt_len.unsqueeze(1)
+    history = req_states.all_token_ids.gpu[rows.unsqueeze(1), offsets.clamp_min(0)]
+    repeats = ((history == sampled) & in_output).sum(dim=1)
+    rejected = (repeats >= win_size * tau_r) & in_output.any(dim=1) & (row_temperature > 0)
+    remaining = scores.scatter(1, sampled, float("-inf"))
+    remaining = torch.where(torch.isfinite(remaining).any(dim=1, keepdim=True), remaining, scores)
+    # Without top-k/top-p, from a noise stream independent of the first draw.
+    replacement = gumbel_sample(remaining, expanded_idx_mapping, temperature, seeds, pos, False, True)
+    return torch.where(rejected, replacement, sampled.squeeze(1)), scores
+
+
+class _SpeechTokenBatcher:
+    """Run concurrent reference speech-token extractions as one S3 batch.
+
+    Cold references are conditioned by several worker threads. One S3 call per
+    reference runs batch-1 FP32 GEMMs, which cost ~3x more GPU time per
+    reference than a batch of 8 and compete with the talker and codec stages.
+    A single thread drains every request already queued into one padded
+    ``quantize`` call; it never waits for more, so an idle server adds no
+    latency. Padding changes ~0.1% of prompt tokens versus batch-1 extraction.
+    """
+
+    def __init__(self, model, s3, device, max_batch: int = 16) -> None:
+        import queue
+        import threading
+
+        self._model, self._s3, self._device, self._max_batch = model, s3, device, max_batch
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._empty = queue.Empty
+        threading.Thread(target=self._run, name="cosyvoice3-s3-batch", daemon=True).start()
+
+    def tokens(self, mel: torch.Tensor) -> torch.Tensor:
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        self._queue.put((mel, future))
+        return future.result()
+
+    def _run(self) -> None:
+        while True:
+            items = [self._queue.get()]
+            while len(items) < self._max_batch:
+                try:
+                    items.append(self._queue.get_nowait())
+                except self._empty:
+                    break
+            try:
+                mels, lens = self._s3.padding([mel for mel, _ in items])
+                with torch.inference_mode():
+                    codes, codes_lens = self._model.quantize(mels.to(self._device), lens.to(self._device))
+                codes = codes.cpu()
+                for (_, future), row, n in zip(items, codes, codes_lens.tolist()):
+                    future.set_result(row[:n].clone())
+            except BaseException as exc:  # noqa: BLE001 - surfaced to every waiting caller
+                for _, future in items:
+                    if not future.done():
+                        future.set_exception(exc)
+
+
+_REFERENCE_CONDITIONERS: dict[str, "CosyVoice3MultiModalProcessor"] = {}
+_REFERENCE_CACHE_DEBUG = {True: 0, False: 0}
+_REFERENCE_CONDITIONERS_LOCK = Lock()
+
+
+def prefetch_reference_conditioning(model_dir: str, config, audio) -> None:
+    """Warm the reference cache for ``audio`` (already at ``target_sr``).
+
+    Runs in a worker thread before the request enters the synchronous input
+    processor, so concurrent cold references are prepared in parallel (the
+    ONNX/TensorRT/torch work releases the GIL) and the processor hits the
+    cache instead of blocking the serving event loop.
+    """
+    with _REFERENCE_CONDITIONERS_LOCK:
+        conditioner = _REFERENCE_CONDITIONERS.get(model_dir)
+        if conditioner is None:
+            conditioner = object.__new__(CosyVoice3MultiModalProcessor)
+            conditioner._ensure_cached_runtime_components(model_dir, config)
+            _REFERENCE_CONDITIONERS[model_dir] = conditioner
+    _audio_conditioning(conditioner, audio, model_dir, config, {})
 
 
 class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
@@ -247,7 +512,13 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
     def _ensure_s3_model(cls):
         if cls._s3_model is not None:
             return cls._s3_model
+        with _REFERENCE_CONDITIONERS_LOCK:
+            if cls._s3_model is None:
+                cls._s3_model = cls._load_s3_model()
+        return cls._s3_model
 
+    @classmethod
+    def _load_s3_model(cls):
         # s3tokenizer is imported lazily (kept off the module top level) so
         # callers that don't use the CosyVoice3 talker need not install it.
         try:
@@ -261,8 +532,18 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         model = _s3.load_model("speech_tokenizer_v3_25hz")
         device = current_omni_platform.get_torch_device()
         model = model.to(device).eval()
-        cls._s3_model = (model, _s3, device)
-        return cls._s3_model
+        return (model, _s3, device)
+
+    _s3_batcher: "_SpeechTokenBatcher | None" = None
+
+    @classmethod
+    def _ensure_s3_batcher(cls) -> "_SpeechTokenBatcher":
+        if cls._s3_batcher is None:
+            model, s3, device = cls._ensure_s3_model()
+            with _REFERENCE_CONDITIONERS_LOCK:
+                if cls._s3_batcher is None:
+                    cls._s3_batcher = _SpeechTokenBatcher(model, s3, device)
+        return cls._s3_batcher
 
     def _extract_speech_token_via_s3(self, audio, return_device):
         """Drop-in replacement for ``extract_speech_token`` that uses the
@@ -283,12 +564,15 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         audio_t = torch.from_numpy(wav)
 
         mel = _s3.log_mel_spectrogram(audio_t)
-        mels_p, mels_lens = _s3.padding([mel])
-        with torch.inference_mode():
-            codes, codes_lens = model.quantize(mels_p.to(dev), mels_lens.to(dev))
-        n = int(codes_lens[0].item())
-        speech_token = codes[:1, :n].to(dtype=torch.int32, device=return_device)
-        speech_token_len = torch.tensor([n], dtype=torch.int32, device=return_device)
+        if torch.device(dev).type == "cuda":
+            codes = self._ensure_s3_batcher().tokens(mel)
+        else:
+            mels_p, mels_lens = _s3.padding([mel])
+            with torch.inference_mode():
+                codes, codes_lens = model.quantize(mels_p.to(dev), mels_lens.to(dev))
+            codes = codes[0, : int(codes_lens[0].item())]
+        speech_token = codes.reshape(1, -1).to(dtype=torch.int32, device=return_device)
+        speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32, device=return_device)
         return speech_token, speech_token_len
 
     def _call_hf_processor(
@@ -345,83 +629,16 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
             int(text_token_len),
             int(input_len),
         )
-        device = "cpu"
-
-        # Reuse bounded, process-local audio conditioning artifacts.
-        voice_name = mm_kwargs.get("voice_name")
-        cache_key = None
-        if voice_name and isinstance(voice_name, str):
-            cache_key = self._speaker_cache.make_cache_key(
-                voice_name,
-                model_type="cosyvoice3",
-                created_at=int(mm_kwargs.get("voice_created_at") or 0),
-            )
-        else:
-            # Cache audio artifacts only: reference/target text is tokenized
-            # separately above. Keep dtype and sample rate in the identity to
-            # avoid aliases between numerically distinct preprocessing inputs.
-            waveform, sample_rate = audio
-            waveform = np.ascontiguousarray(waveform)
-            digest = hashlib.sha256()
-            digest.update(str((int(sample_rate), waveform.shape, waveform.dtype.str)).encode())
-            digest.update(memoryview(waveform).cast("B"))
-            backend = "trt" if self.campplus_trt is not None else "onnx"
-            cache_key = self._speaker_cache.make_cache_key(
-                digest.hexdigest(), model_type=f"cosyvoice3-reference:{model_dir}:{backend}"
-            )
-        cached = self._speaker_cache.get(cache_key)
-        if cached is not None:
-            ft = BatchFeature(
-                {
-                    "input_ids": input_ids,
-                    "speech_feat": cached["speech_feat"].clone(),
-                    "speech_token": cached["speech_token"].clone(),
-                    "speech_token_len": [cached["speech_token_len"].clone()],
-                    "embedding": cached["embedding"].clone(),
-                }
-            )
-            return ft
-
-        # Speech-token extraction via the S3Tokenizer PyTorch model on GPU
-        # (~30x faster than the bundled ``speech_tokenizer_v3.onnx`` CPU ONNX
-        # path in this venv).
-        speech_token, speech_token_len = self._extract_speech_token_via_s3(audio, device)
-
-        speech_feat, speech_feat_len = extract_speech_feat(audio, self.feat_extractor, device)
-
-        if config.sample_rate == 24000:
-            token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
-            speech_feat, speech_feat_len[:] = speech_feat[:, : 2 * token_len], 2 * token_len
-            speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
-
-        if self.campplus_trt is not None:
-            embedding = extract_spk_embedding_trt(audio, self.campplus_trt, device)
-        else:
-            embedding = extract_spk_embedding(audio, self.campplus_session, device)
-
-        # Cache independent copies so downstream mutation cannot poison a hit.
-        if cache_key is not None:
-            self._speaker_cache.put(
-                cache_key,
-                {
-                    "speech_feat": speech_feat.detach().cpu().clone(),
-                    "speech_token": speech_token.detach().cpu().clone(),
-                    "speech_token_len": speech_token_len.detach().cpu().clone(),
-                    "embedding": embedding.detach().cpu().clone(),
-                },
-            )
-
-        ft = BatchFeature(
+        conditioning = _audio_conditioning(self, audio, model_dir, config, mm_kwargs)
+        return BatchFeature(
             {
                 "input_ids": input_ids,
-                "speech_feat": speech_feat,
-                "speech_token": speech_token,
-                "speech_token_len": [speech_token_len],
-                "embedding": embedding,
+                "speech_feat": conditioning["speech_feat"],
+                "speech_token": conditioning["speech_token"],
+                "speech_token_len": [conditioning["speech_token_len"]],
+                "embedding": conditioning["embedding"],
             }
         )
-
-        return ft
 
     def _get_mm_fields_config(
         self,
@@ -506,6 +723,19 @@ class CosyVoice3Model(
     supports_embed_input_ids_query_start_loc = True
     prefer_model_sampler = True
     _sampling_eps = 1e-5
+
+    @property
+    def logits_vocab_size(self) -> int | None:
+        """Width of the logits ``compute_logits`` returns (the speech head).
+
+        The runners drop stop ids beyond it from min-tokens masking: vLLM folds
+        the text tokenizer's EOS into every request's stop set, which this
+        head can never emit (and MRv2's unchecked mask kernel would write past
+        the logits row).
+        """
+        if self.model_stage != "cosyvoice3_talker":
+            return None
+        return int(self.config.llm["speech_token_size"]) + 200
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -817,9 +1047,12 @@ class CosyVoice3Model(
             if sampler is None:
                 sampler = Sampler()
                 self._talker_sampler = sampler
-            return sampler(logits=logits, sampling_metadata=sampling_metadata)
+            return sampler(logits=self._full_vocab_logits(logits), sampling_metadata=sampling_metadata)
 
         logits = logits.to(torch.float32)
+        mask = sampling_metadata.allowed_token_ids_mask
+        if mask is not None and mask.shape[-1] != logits.shape[-1]:
+            sampling_metadata = replace(sampling_metadata, allowed_token_ids_mask=mask[..., : logits.shape[-1]])
         # Apply logits processors directly — RAS handles its own repetition
         # logic.  We avoid instantiating Sampler() here because its import
         # chain pulls in flashinfer / GPU deps that fail in CPU-only tests.
@@ -888,6 +1121,45 @@ class CosyVoice3Model(
         sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
+    def mrv2_custom_sampler(self, sampler: Any) -> None:
+        """Model Runner V2: the V1 sampling policies on the MRv2 sampler.
+
+        RAS replaces the sampling step (``_ras_mrv2_sample``). Standard
+        sampling penalizes generated speech tokens only: the V1 path hides the
+        prompt from penalties (SGLang parity: text and reference speech are
+        never penalized), while MRv2 keeps penalty statistics on the GPU and
+        bins every prompt token of a new request, whose text ids also lie
+        outside the narrow speech head. Bin the prompt into a scratch mask
+        instead, keeping resumed output tokens counted.
+        """
+        if self.model_stage != "cosyvoice3_talker":
+            return None
+        if not cosyvoice3_standard_sampling(self.config):
+            sampling_cfg = dict(self.config.llm.get("sampling", {}))
+            ras = partial(
+                _ras_mrv2_sample,
+                default_top_p=float(sampling_cfg.get("top_p", 0.8)),
+                default_top_k=int(sampling_cfg.get("top_k", 25)),
+                win_size=int(sampling_cfg.get("win_size", 10)),
+                tau_r=float(sampling_cfg.get("tau_r", 0.1)),
+                eps=self._sampling_eps,
+            )
+            sampler.sample = MethodType(ras, sampler)
+        state = getattr(sampler, "penalties_state", None)
+        if state is not None:
+            state.apply_staged_writes = MethodType(_generated_only_penalty_writes, state)
+        # MRv2 hands make_omni_output no multimodal kwargs; carry each prompt's
+        # conditioning from the encoder call to its batch row instead.
+        self._mrv2_encoded_conditioning = OrderedDict()
+        return None
+
+    def _full_vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Pad the speech head to the text vocabulary for the generic sampler contract."""
+        pad_size = int(self.config.vocab_size) - logits.size(-1)
+        if pad_size <= 0:
+            return logits
+        return torch.cat([logits, logits.new_full(logits.shape[:-1] + (pad_size,), float("-inf"))], dim=-1)
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -905,13 +1177,10 @@ class CosyVoice3Model(
                 merged_stop = torch.logsumexp(stop_logits, dim=-1, keepdim=True)
                 logits[..., speech_token_size:] = float("-inf")  # mask all
                 logits[..., eos_idx] = merged_stop.squeeze(-1)  # restore merged
-            # Pad to full vocab_size for vLLM token handling.
-            vocab_size = self.config.vocab_size
-            pad_size = vocab_size - logits.size(-1)
-            if pad_size > 0:
-                pad_shape = logits.shape[:-1] + (pad_size,)
-                pad = logits.new_full(pad_shape, float("-inf"))
-                logits = torch.cat([logits, pad], dim=-1)
+            # The model owns sampling and the runner accepts a narrow codec
+            # head, so keep only the speech head: padding every decode step to
+            # the ~152k text vocabulary multiplied sampler and penalty work.
+            # The generic-sampler fallback pads on demand (_full_vocab_logits).
             return logits
         else:
             raise RuntimeError(f"compute_logits is only valid for {self.model_stage}.")
@@ -929,8 +1198,25 @@ class CosyVoice3Model(
             # [1, T, emb] tensor (the caller's extend() iterates dim 0).
             if isinstance(speech_token, (list, tuple)):
                 emb_dim = self.model.speech_embedding.weight.shape[1]
-                return [self.model.speech_embedding(t).reshape(-1, emb_dim) for t in speech_token]
-            return self.model.speech_embedding(speech_token)
+                embeddings = [self.model.speech_embedding(t).reshape(-1, emb_dim) for t in speech_token]
+            else:
+                embeddings = self.model.speech_embedding(speech_token)
+            encoded = getattr(self, "_mrv2_encoded_conditioning", None)
+            if encoded is not None:
+                conditioning = self._split_prompt_conditioning(
+                    speech_token, kwargs.get("speech_feat"), kwargs.get("embedding"), kwargs.get("speech_token_len")
+                )
+                for item, embedding in enumerate(embeddings):
+                    # The encoder cache hands this item's tensor back (whole) to
+                    # embed_input_ids, where its storage identifies the prompt.
+                    # Identical references share one cached tensor, so entries
+                    # stay until a newer encoding reuses the storage.
+                    key = embedding.data_ptr()
+                    encoded[key] = tuple(None if values is None else values[item] for values in conditioning)
+                    encoded.move_to_end(key)
+                while len(encoded) > _MRV2_CONDITIONING_ENTRIES:
+                    encoded.popitem(last=False)
+            return embeddings
         else:
             raise RuntimeError(f"embed_multimodal is only valid for {self.model_stage}.")
 
@@ -942,7 +1228,9 @@ class CosyVoice3Model(
         query_start_loc: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if self.model_stage == "cosyvoice3_talker":
-            if is_multimodal is None or not torch.any(is_multimodal):
+            # Decode-only steps carry no speech embeddings; checking the
+            # (device) placeholder mask would synchronize every step.
+            if not multimodal_embeddings or is_multimodal is None or not torch.any(is_multimodal):
                 return self.model.speech_embedding.weight[input_ids]
 
             # Requests can interleave new prefills and ongoing decodes after
@@ -961,6 +1249,7 @@ class CosyVoice3Model(
                 i for i, (start, end) in enumerate(zip(boundaries, boundaries[1:])) if any(mm_mask[start:end])
             ]
             self._conditioning_request_count = len(boundaries) - 1
+            self._mrv2_step_conditioning = []
 
             text_embeds = self.model.llm.model.embed_tokens(input_ids)
             sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
@@ -976,6 +1265,14 @@ class CosyVoice3Model(
                     raise ValueError("CosyVoice3 prefill is missing its speech embedding")
                 speech = multimodal_embeddings[mm_index]
                 mm_index += 1
+                encoded = getattr(self, "_mrv2_encoded_conditioning", None)
+                if encoded is not None:
+                    key = speech.data_ptr()
+                    conditioning = encoded.get(key)
+                    if conditioning is None:
+                        raise ValueError("CosyVoice3 MRv2 prefill lost its prompt conditioning")
+                    encoded.move_to_end(key)
+                    self._mrv2_step_conditioning.append(conditioning)
                 prefix_len = 2 + speech.shape[0]
                 # The processor marks SOS, TASK_ID and all speech placeholders.
                 # Rearrangement needs the complete prompt block in this call.
@@ -1130,7 +1427,23 @@ class CosyVoice3Model(
         """
         multimodal_outputs = {}
 
-        if "speech_token" in kwargs:
+        step_conditioning = getattr(self, "_mrv2_step_conditioning", None)
+        if "speech_token" not in kwargs and step_conditioning:
+            self._mrv2_step_conditioning = None
+            speech_token, speech_feat, embedding, speech_token_len = (
+                list(values) for values in zip(*step_conditioning)
+            )
+            multimodal_outputs = to_dict(
+                OmniPayloadStruct(
+                    embed=EmbeddingsStruct(
+                        speech_token=self._align_prompt_conditioning(speech_token),
+                        speech_feat=self._align_prompt_conditioning(speech_feat),
+                        speech_token_len=self._align_prompt_conditioning(speech_token_len),
+                        embedding=self._align_prompt_conditioning(embedding),
+                    ),
+                )
+            )
+        elif "speech_token" in kwargs:
             # Prompt conditioning tensors for code2wav: live under
             # ``embed.*`` per OmniPayloadStruct schema.
             #

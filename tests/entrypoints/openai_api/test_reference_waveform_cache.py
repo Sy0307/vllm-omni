@@ -109,12 +109,13 @@ def test_numeric_waveform_cache_limits(server, entries, budget):
 
 
 @pytest.mark.asyncio
-async def test_cosyvoice_array_prompt_owns_buffer_without_list_roundtrip(mocker):
+async def test_cosyvoice_array_prompt_owns_buffer_without_list_roundtrip(mocker, monkeypatch):
     from types import SimpleNamespace
 
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
     from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
 
+    monkeypatch.setenv("COSYVOICE3_REFERENCE_PREFETCH", "0")
     waveform = np.linspace(-1, 1, 24000, dtype=np.float32)
     server = mocker.Mock()
     server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(waveform, 24000, "key"))
@@ -132,6 +133,35 @@ async def test_cosyvoice_array_prompt_owns_buffer_without_list_roundtrip(mocker)
     assert prompt["mm_processor_kwargs"]["prompt_text"].endswith("<|endofprompt|>Reference text.")
     server._resolve_ref_audio.assert_not_awaited()
     server._resolve_ref_audio_array.assert_awaited_once_with("reference")
+
+
+@pytest.mark.asyncio
+async def test_cosyvoice_reference_prefetch_resamples_and_warms_conditioning(mocker):
+    from types import SimpleNamespace
+
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+
+    waveform = np.linspace(-1, 1, 24000, dtype=np.float32)
+    server = mocker.Mock()
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(waveform, 24000, "key"))
+    server.model_config.hf_config = SimpleNamespace(target_sr=16000)
+    server.model_config.model = "model-dir"
+    warm = mocker.patch.object(cosyvoice3, "prefetch_reference_conditioning")
+    adapter = CosyVoice3Adapter(SpeechServingContext(server=server))
+    request = SimpleNamespace(input="Target text.", ref_audio="reference", ref_text="Reference text.", voice=None)
+    prompt = await adapter._build_prompt(request)
+    audio, rate = prompt["multi_modal_data"]["audio"]
+    # The processor receives samples at its own rate, so its resampling is a
+    # no-op and its content-addressed cache lookup hits the warmed entry.
+    assert rate == 16000 and prompt["mm_processor_kwargs"]["sample_rate"] == 16000
+    assert audio.shape == (16000,) and audio.dtype == np.float32
+    warm.assert_called_once()
+    model_dir, config, (warmed, warmed_rate) = warm.call_args.args
+    assert model_dir == "model-dir" and config is server.model_config.hf_config
+    assert warmed is audio and warmed_rate == 16000
+    assert waveform[0] == -1
 
 
 @pytest.mark.parametrize("mode", ["ras", "standard"])
