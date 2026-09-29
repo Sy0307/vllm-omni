@@ -58,20 +58,22 @@ def test_generated_only_penalty_writes_skip_prompt_and_keep_resumed_outputs():
 
 
 class _States:
-    def __init__(self, temperature, top_k, top_p, seeds):
+    def __init__(self, temperature, top_k, top_p, seeds, vocab):
+        self.vocab_size = vocab
         self.temperature = SimpleNamespace(gpu=temperature)
         self.seeds = SimpleNamespace(gpu=seeds)
-        self._top_k, self._top_p = top_k, top_p
+        self.top_k = SimpleNamespace(gpu=top_k, np=top_k.cpu().numpy())
+        self.top_p = SimpleNamespace(gpu=top_p, np=top_p.cpu().numpy())
 
     def get_top_k_top_p(self, expanded_idx_mapping, idx_mapping_np):
         rows = expanded_idx_mapping.long()
-        return self._top_k[rows], self._top_p[rows]
+        return self.top_k.gpu[rows], self.top_p.gpu[rows]
 
 
-def _ras_sampler(tokens, prompt_len, total_len, temperature, top_k, top_p, seeds):
+def _ras_sampler(tokens, prompt_len, total_len, temperature, top_k, top_p, seeds, vocab):
     return SimpleNamespace(
         logit_bias_state=SimpleNamespace(apply_logit_bias=lambda *args: None),
-        sampling_states=_States(temperature, top_k, top_p, seeds),
+        sampling_states=_States(temperature, top_k, top_p, seeds, vocab),
         req_states=SimpleNamespace(
             all_token_ids=SimpleNamespace(gpu=tokens),
             prompt_len=SimpleNamespace(gpu=prompt_len),
@@ -80,10 +82,33 @@ def _ras_sampler(tokens, prompt_len, total_len, temperature, top_k, top_p, seeds
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_ras_mrv2_sample_rejects_recent_repeats_on_device():
+def _sample(sampler, logits, pos, fused):
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _ras_mrv2_sample
 
+    rows = logits.shape[0]
+    idx = torch.arange(rows, dtype=torch.int32, device=logits.device)
+    sampled, _ = _ras_mrv2_sample(
+        sampler,
+        logits,
+        idx,
+        idx,
+        np.arange(rows),
+        pos,
+        None,
+        None,
+        not fused,  # logprobs keep the tensor path
+        default_top_p=0.8,
+        default_top_k=25,
+        win_size=10,
+        tau_r=0.1,
+        eps=1e-5,
+    )
+    return sampled
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("fused", [True, False])
+def test_ras_mrv2_sample_rejects_recent_repeats_on_device(fused):
     dev, vocab, rows = "cuda", 64, 4
     logits = torch.full((rows, vocab), -4.0, device=dev)
     logits[:, 7] = 8.0  # token 7 dominates every row
@@ -95,70 +120,66 @@ def test_ras_mrv2_sample_rejects_recent_repeats_on_device():
     tokens[3, :4] = torch.tensor([1, 7, 7, 7])
     prompt_len = torch.tensor([3, 2, 5, 1], dtype=torch.int32, device=dev)
     total_len = torch.tensor([6, 3, 5, 4], dtype=torch.int32, device=dev)
-    temperature = torch.tensor([1.0, 1.0, 1.0, 0.0], device=dev)
-    top_k = torch.full((rows,), 1, dtype=torch.int32, device=dev)
-    top_p = torch.full((rows,), 0.8, device=dev)
-    seeds = torch.arange(rows, dtype=torch.int64, device=dev)
-    sampler = _ras_sampler(tokens, prompt_len, total_len, temperature, top_k, top_p, seeds)
-    idx = torch.arange(rows, dtype=torch.int32, device=dev)
-    sampled, _ = _ras_mrv2_sample(
-        sampler,
-        logits,
-        idx,
-        idx,
-        np.arange(rows),
-        torch.full((rows,), 11, dtype=torch.int64, device=dev),
-        None,
-        None,
-        default_top_p=0.8,
-        default_top_k=25,
-        win_size=10,
-        tau_r=0.1,
-        eps=1e-5,
+    sampler = _ras_sampler(
+        tokens,
+        prompt_len,
+        total_len,
+        torch.tensor([1.0, 1.0, 1.0, 0.0], device=dev),
+        torch.full((rows,), 1, dtype=torch.int32, device=dev),
+        torch.full((rows,), 0.8, device=dev),
+        torch.arange(rows, dtype=torch.int64, device=dev),
+        vocab,
     )
-    sampled = sampled.tolist()
+    sampled = _sample(sampler, logits, torch.full((rows,), 11, dtype=torch.int64, device=dev), fused).tolist()
     assert sampled[0] != 7 and 0 <= sampled[0] < vocab
     assert sampled[1:] == [7, 7, 7]
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_ras_mrv2_sample_draws_from_top_p_capped_by_top_k():
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _ras_mrv2_sample
-
-    dev, vocab, rows = "cuda", 32, 2048
+@pytest.mark.parametrize("fused", [True, False])
+def test_ras_mrv2_sample_draws_from_top_p_capped_by_top_k(fused):
+    dev, vocab, rows = "cuda", 32, 4096
     probs = torch.tensor([0.4, 0.3, 0.2, 0.1] + [0.0] * (vocab - 4), device=dev) + 1e-9
     logits = probs.log().expand(rows, vocab).contiguous()
-    tokens = torch.zeros(rows, 4, dtype=torch.int32, device=dev)
     no_history = torch.zeros(rows, dtype=torch.int32, device=dev)
     # Row halves: top-p 0.6 keeps {0, 1}; top-p 0.95 with top-k 3 keeps {0, 1, 2}.
     top_p = torch.where(torch.arange(rows, device=dev) < rows // 2, 0.6, 0.95).float()
-    top_k = torch.full((rows,), 3, dtype=torch.int32, device=dev)
     sampler = _ras_sampler(
-        tokens,
+        torch.zeros(rows, 4, dtype=torch.int32, device=dev),
         no_history,
         no_history,
         torch.ones(rows, device=dev),
-        top_k,
+        torch.full((rows,), 3, dtype=torch.int32, device=dev),
         top_p,
         torch.arange(rows, dtype=torch.int64, device=dev),
+        vocab,
     )
-    idx = torch.arange(rows, dtype=torch.int32, device=dev)
-    sampled, _ = _ras_mrv2_sample(
-        sampler,
-        logits,
-        idx,
-        idx,
-        np.arange(rows),
-        torch.zeros(rows, dtype=torch.int64, device=dev),
-        None,
-        None,
-        default_top_p=0.8,
-        default_top_k=25,
-        win_size=10,
-        tau_r=0.1,
-        eps=1e-5,
-    )
+    sampled = _sample(sampler, logits, torch.zeros(rows, dtype=torch.int64, device=dev), fused)
     low, high = sampled[: rows // 2], sampled[rows // 2 :]
     assert set(low.tolist()) == {0, 1} and set(high.tolist()) == {0, 1, 2}
     # Kept tokens are renormalized: 0.4 / 0.7 of the top-p 0.6 rows pick token 0.
-    assert abs((low == 0).float().mean().item() - 4 / 7) < 0.06
+    assert abs((low == 0).float().mean().item() - 4 / 7) < 0.04
+    assert abs((high == 0).float().mean().item() - 4 / 9) < 0.04
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_fused_ras_replacement_follows_the_remaining_distribution():
+    dev, vocab, rows = "cuda", 16, 8192
+    probs = torch.tensor([0.5, 0.25, 0.125, 0.125] + [0.0] * (vocab - 4), device=dev) + 1e-12
+    logits = probs.log().expand(rows, vocab).contiguous()
+    tokens = torch.zeros(rows, 4, dtype=torch.int32, device=dev)  # every row just generated token 0
+    sampler = _ras_sampler(
+        tokens,
+        torch.zeros(rows, dtype=torch.int32, device=dev),
+        torch.ones(rows, dtype=torch.int32, device=dev),
+        torch.ones(rows, device=dev),
+        torch.full((rows,), 1, dtype=torch.int32, device=dev),  # nucleus is always token 0
+        torch.full((rows,), 0.8, device=dev),
+        torch.arange(rows, dtype=torch.int64, device=dev),
+        vocab,
+    )
+    sampled = _sample(sampler, logits, torch.zeros(rows, dtype=torch.int64, device=dev), True)
+    freq = torch.bincount(sampled, minlength=vocab).float() / rows
+    assert freq[0] == 0
+    for token, want in ((1, 0.5), (2, 0.25), (3, 0.25)):
+        assert abs(freq[token].item() - want) < 0.03

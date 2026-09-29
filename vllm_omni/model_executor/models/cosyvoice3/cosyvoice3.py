@@ -43,6 +43,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_enabled,
@@ -229,6 +230,30 @@ def _ras_mrv2_sample(
     sampler.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
     states = sampler.sampling_states
     temperature = states.temperature.gpu
+    req_states = sampler.req_states
+    top_k_np = states.top_k.np[idx_mapping_np]
+    use_top_k = bool((top_k_np != states.vocab_size).any())
+    if logits.is_cuda and not return_logprobs and (top_k_np.max() if use_top_k else default_top_k) <= MAX_FUSED_TOP_K:
+        # One kernel per step instead of ~70 (see ras_sampler.py).
+        use_top_p = bool((states.top_p.np[idx_mapping_np] != 1.0).any())
+        sampled = fused_ras_sample(
+            logits,
+            expanded_idx_mapping,
+            temperature,
+            states.top_k.gpu if use_top_k else None,
+            states.top_p.gpu if use_top_p else None,
+            states.seeds.gpu,
+            pos,
+            req_states.all_token_ids.gpu,
+            req_states.total_len.gpu,
+            req_states.prompt_len.gpu,
+            default_top_k=default_top_k,
+            default_top_p=default_top_p,
+            win_size=win_size,
+            tau_r=tau_r,
+            eps=eps,
+        )
+        return sampled, logits
     rows = expanded_idx_mapping.long()
     row_temperature = temperature[rows]
     scores = torch.log_softmax(logits / row_temperature.clamp_min(eps).unsqueeze(1), dim=1)
@@ -251,7 +276,6 @@ def _ras_mrv2_sample(
     if win_size <= 0:
         return sampled.squeeze(1), scores
 
-    req_states = sampler.req_states
     total_len = req_states.total_len.gpu[rows].long()
     prompt_len = req_states.prompt_len.gpu[rows].long()
     offsets = total_len.unsqueeze(1) - 1 - torch.arange(win_size, device=scores.device).unsqueeze(0)
