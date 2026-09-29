@@ -643,6 +643,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     rows,
                     cfg_rate=flow.decoder.inference_cfg_rate,
                     streaming=stream_items and not items[0].get("finalize", False),
+                    modulation_key=(n_timesteps, flow.decoder.t_scheduler, mu.dtype, mu.device),
                 )
             feat = scatter_rows(packed, rows, width).transpose(1, 2)
 
@@ -670,6 +671,11 @@ class CosyVoice3Code2Wav(nn.Module):
             width = max(mel.shape[-1] for mel in mels)
             if width == 0:
                 return [mel.new_zeros((1, 1, 0)) for mel in mels]
+            from .code2wav_core.packed_dit import bucketed_width
+
+            # Recurring shapes let cuDNN/cuFFT reuse plans; rows are already
+            # right padded to the batch maximum and trimmed below.
+            width = bucketed_width(width)
             padded = torch.cat([torch.nn.functional.pad(mel, (0, width - mel.shape[-1])) for mel in mels])
             speech, _, _ = self.hift.inference(speech_feat=padded, finalize=True)
             stride = int(np.prod(self.hift.upsample_rates) * self.hift.istft_params["hop_len"])

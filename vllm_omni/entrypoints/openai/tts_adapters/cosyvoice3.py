@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CosyVoice3 TTS serving adapter."""
 
+import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -35,6 +37,42 @@ class CosyVoice3Adapter(ARTTSAdapter):
         # Rebuilding it would repeat snapshot resolution and add ~100 ms to the
         # TTFP-critical sampling override on every request.
         self._tokenizer = None
+        # Cold references are resampled and conditioned here, in parallel
+        # workers, instead of serially inside the input processor.
+        self._reference_executor: ThreadPoolExecutor | None = None
+        self._reference_resampler = None
+
+    async def _prefetch_reference(self, wav: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
+        """Resample to the processor rate and warm its content-addressed cache.
+
+        Uses the processor's own resampler, so the processor receives exactly
+        these samples (its resampling becomes a no-op) and its cache lookup for
+        the same bytes hits instead of recomputing on the serving event loop.
+        """
+        from vllm.multimodal.parse import MultiModalDataParser
+
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import prefetch_reference_conditioning
+
+        server = self.ctx.server
+        hf_cfg = server.model_config.hf_config
+        target_sr = getattr(hf_cfg, "target_sr", None)
+        if target_sr is None:
+            return wav, sr
+        if self._reference_executor is None:
+            workers = int(os.environ.get("COSYVOICE3_REFERENCE_WORKERS", "16"))
+            self._reference_executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cosyvoice3-ref")
+            self._reference_resampler = MultiModalDataParser(target_sr=target_sr).audio_resampler
+        model_dir = server.model_config.model
+        resampler = self._reference_resampler
+        assert resampler is not None
+
+        def prepare() -> np.ndarray:
+            audio = resampler.resample(wav, orig_sr=sr)
+            prefetch_reference_conditioning(model_dir, hf_cfg, (audio, target_sr))
+            return audio
+
+        audio = await asyncio.get_running_loop().run_in_executor(self._reference_executor, prepare)
+        return audio, int(target_sr)
 
     async def _build_prompt(
         self, request: "OpenAICreateSpeechRequest", *, has_inline_ref_audio: bool = False
@@ -51,9 +89,13 @@ class CosyVoice3Adapter(ARTTSAdapter):
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
                 mm_kwargs["voice_name"] = voice_lower
                 mm_kwargs["voice_created_at"] = server._voice_created_at(voice_lower)
+        wav = np.array(wav_samples, dtype=np.float32, copy=True)
+        if "voice_name" not in mm_kwargs and os.environ.get("COSYVOICE3_REFERENCE_PREFETCH", "1") != "0":
+            wav, sr = await self._prefetch_reference(wav, sr)
+            mm_kwargs["sample_rate"] = sr
         return {
             "prompt": request.input,
-            "multi_modal_data": {"audio": (np.array(wav_samples, dtype=np.float32, copy=True), sr)},
+            "multi_modal_data": {"audio": (wav, sr)},
             "mm_processor_kwargs": mm_kwargs,
         }
 
