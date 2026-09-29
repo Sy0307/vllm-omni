@@ -237,7 +237,7 @@ class OmniGPUWorkerBase(GPUWorker):
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
 
-    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
+    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK | None:
         "Handle deterministic Sleep command from the main process"
         try:
             if isinstance(task, dict):
@@ -291,7 +291,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
-    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK | None:
         "Handle deterministic Wakeup command from the main process"
         try:
             if isinstance(task, dict):
