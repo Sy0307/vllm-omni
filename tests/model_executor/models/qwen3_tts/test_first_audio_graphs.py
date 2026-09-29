@@ -133,6 +133,9 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
 
     decoder = _make_decoder().to(device=DEVICE, dtype=torch.bfloat16)
+    for name, param in decoder.named_parameters():
+        if name.endswith("embedding_sum"):
+            param.normal_()
     decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
     stream = StreamingCodecDecoder(decoder, num_slots=2, dtype=torch.bfloat16)
     codes = torch.randint(0, 32, (1, 8, 2), device=DEVICE)
@@ -141,8 +144,20 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
         stream(codes[:, pos : pos + 1], slot, torch.tensor([pos], device=DEVICE, dtype=torch.int32))
     saved = stream.save_slot(0)
     expected = stream(codes[:, 7:], slot, torch.tensor([7], device=DEVICE, dtype=torch.int32)).clone()
-    # The old slot can be reused by an unrelated request while this one waits.
-    stream(codes[:, :1], slot, torch.zeros(1, device=DEVICE, dtype=torch.int32))
+    # Both the freed slot and the destination can hold an unrelated request.
+    other_codes = (codes[:, :3] + 1) % 32
+    for pos in range(3):
+        stream(
+            other_codes[:, pos : pos + 1].expand(2, -1, -1).contiguous(),
+            torch.tensor([0, 1], device=DEVICE, dtype=torch.int32),
+            torch.full((2,), pos, device=DEVICE, dtype=torch.int32),
+        )
+    without_restore = stream(
+        codes[:, 7:],
+        torch.tensor([1], device=DEVICE, dtype=torch.int32),
+        torch.tensor([7], device=DEVICE, dtype=torch.int32),
+    ).clone()
+    assert not torch.equal(without_restore, expected)
     stream.restore_slot(1, saved)
     actual = stream(
         codes[:, 7:],

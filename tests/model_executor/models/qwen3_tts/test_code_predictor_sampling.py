@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Supplied-uniform samples must match the existing ATen path exactly."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,6 +12,40 @@ pytestmark = [
     pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="requires CUDA"),
 ]
+
+
+@torch.inference_mode()
+def test_fused_predictor_warmup_with_capacity_one():
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+        Qwen3TTSTalkerCodePredictorConfig,
+        Qwen3TTSTalkerConfig,
+    )
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code_predictor_vllm import (
+        Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM,
+    )
+
+    cp = Qwen3TTSTalkerCodePredictorConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, num_code_groups=4,
+    )  # fmt: skip
+    talker = Qwen3TTSTalkerConfig(hidden_size=64, num_code_groups=4)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={}),
+        additional_config={"code_predictor_kv_cache": True, "code_predictor_fused": True},
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+    predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(
+        vllm_config=config, config=cp, talker_config=talker
+    ).to(device="cuda", dtype=torch.bfloat16)
+    predictor._setup_compile()
+    assert predictor._fused is not None
+    hidden = torch.randn(1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    result = predictor(
+        torch.zeros(1, 1, device="cuda", dtype=torch.long), hidden, hidden,
+        sample_uniforms=torch.full((1, 3, 64), 0.5, device="cuda"),
+    )  # fmt: skip
+    assert result.shape == (1, 4)
+    assert ((result >= 0) & (result < 64)).all()
 
 
 @pytest.mark.parametrize("batch", [1, 64])
