@@ -58,3 +58,44 @@ def test_talker_condition_upload_does_not_synchronize_cuda() -> None:
         torch.cuda.set_sync_debug_mode(previous)
     assert torch.equal(condition, expected)
     assert boundary.shape == (2, 4)
+
+
+@torch.inference_mode()
+def test_v1_batched_decode_and_async_snapshot_match_scalar(mocker):
+    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
+
+    ids = torch.tensor([3, _EOS, _EOS, 6], dtype=torch.int32, device="cuda")
+    hidden = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
+    penalties = torch.tensor([1.05, 1.2, 1.05, 1.0], device="cuda")
+    results, states = [], []
+    for batched in (False, True):
+        talker = _make_talker("cuda")
+        talker._request_audio_states = copy.deepcopy(_states())
+        results.append(
+            _step(talker, _infos(_states()), hidden, mocker, batched=batched, input_ids=ids, penalties=penalties)
+        )
+        states.append(copy.deepcopy(talker._request_audio_states))
+    for index in (0, 2, 3, 4):
+        torch.testing.assert_close(results[0][index], results[1][index], rtol=0, atol=0)
+    assert states[0] == states[1]
+    reference, candidate = [result[1].multimodal_outputs for result in results]
+    for group in ("codes", "meta"):
+        for key in reference[group]:
+            for left, right in zip(reference[group][key], candidate[group][key], strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+    snapshot = _snapshot_tensor_payload_to_cpu_async(
+        {"hidden_states": hidden, "multimodal_outputs": candidate},
+        copy_stream=torch.cuda.Stream(),
+        pin_memory=True,
+    )
+    expected_hidden = hidden.cpu().clone()
+    snapshot.wait()
+    torch.testing.assert_close(snapshot.payload["hidden_states"], expected_hidden, rtol=0, atol=0)
+    for group in ("codes", "meta"):
+        for key in reference[group]:
+            for left, right in zip(
+                reference[group][key], snapshot.payload["multimodal_outputs"][group][key], strict=True
+            ):
+                torch.testing.assert_close(left.cpu(), right, rtol=0, atol=0)
+    hidden.fill_(-1)
+    torch.testing.assert_close(snapshot.payload["hidden_states"], expected_hidden, rtol=0, atol=0)
