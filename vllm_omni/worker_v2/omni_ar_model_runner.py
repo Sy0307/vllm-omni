@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 
 logger = init_logger(__name__)
@@ -187,11 +188,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 ),
             )
         with sampling_context:
-            sampler_output, num_sampled, num_rejected = self.sample(
-                text_hidden,
-                input_batch,
-                grammar_output,
+            sampling_output = sample_with_output(
+                self.sampler, self.sample, text_hidden, input_batch, self.req_states, grammar_output
             )
+        sampler_output = sampling_output.sampler_output
+        num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
+        if sampling_output.multimodal_outputs is not None:
+            multimodal_outputs = sampling_output.multimodal_outputs
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
         if multimodal_outputs and run_eager_mtp is not None:
             run_eager_mtp(
