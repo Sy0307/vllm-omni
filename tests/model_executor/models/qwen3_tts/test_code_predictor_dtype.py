@@ -663,6 +663,8 @@ class TestCodePredictorGraphReplay:
 
         predictor = object.__new__(code_predictor_wrapper)
         torch.nn.Module.__init__(predictor)
+        predictor._fused_requested = False
+        predictor._fused = None
         predictor._num_groups = 3
         predictor._model_dtype = torch.float32
         predictor._setup_compile = mocker.Mock()

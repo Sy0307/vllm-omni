@@ -42,7 +42,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
 from vllm_omni.utils.audio import mel_filter_bank
-from vllm_omni.utils.device_copy import index_to_device, tensor_to_device
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 if TYPE_CHECKING:
     from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
@@ -161,7 +161,7 @@ def coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | N
         ids = ids.unsqueeze(0)
     if ids.ndim != 2 or ids.numel() == 0:
         return None
-    return tensor_to_device(ids.to(dtype=torch.long).contiguous(), device)
+    return to_device_nonblocking(ids.to(dtype=torch.long).contiguous(), device)
 
 
 # ---------------------------------------------------------------------------
@@ -1028,7 +1028,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         dev = self._device()
         input_ids = coerce_token_ids(info_dict.pop(PRECOMPUTED_TEXT_IDS_KEY, None), device=dev)
         if input_ids is None:
-            input_ids = tensor_to_device(
+            input_ids = to_device_nonblocking(
                 tok(build_assistant_text(text), return_tensors="pt", padding=False)["input_ids"], dev
             )
 

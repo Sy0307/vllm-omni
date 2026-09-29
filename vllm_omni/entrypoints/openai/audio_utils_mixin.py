@@ -102,6 +102,7 @@ class AudioMixin:
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 
+        audio_data: bytes | str
         if response_format == "pcm" and isinstance(audio_tensor, np.ndarray) and audio_tensor.dtype == np.float32:
             # Through BytesIO, soundfile makes a Python callback per block;
             # streamed chunks made that the API workers' largest cost.

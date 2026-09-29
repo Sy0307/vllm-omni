@@ -16,15 +16,28 @@ def talker_stream_decode_enabled(vllm_config: Any) -> bool:
     extra = Predictor._stage_connector_extra_config(vllm_config)
     model = vllm_config.model_config
     parallel = vllm_config.parallel_config
-    return (
-        Predictor._parse_bool_config(extra.get("talker_stream_decode"))
-        and current_omni_platform.is_cuda()
+    requested = Predictor._parse_bool_config(extra.get("talker_stream_decode"))
+    if not requested:
+        if getattr(model, "engine_output_type", None) == "audio":
+            raise ValueError("The single-stage Qwen3-TTS pipeline requires talker_stream_decode=True")
+        return False
+    if not (
+        current_omni_platform.is_cuda()
         and bool(getattr(model, "use_v2_model_runner", False))
         and bool(getattr(model, "async_chunk", False))
         and parallel.tensor_parallel_size == 1
         and parallel.pipeline_parallel_size == 1
+        and parallel.distributed_executor_backend in (None, "uni")
         and not vllm_config.cache_config.enable_prefix_caching
-    )
+    ):
+        raise ValueError(
+            "talker_stream_decode requires CUDA, MRv2, async_chunk=True, TP=PP=1, "
+            "an in-process worker and enable_prefix_caching=False; "
+            "use qwen3_tts_fused_single_gpu.yaml"
+        )
+    if Predictor._parse_bool_config(extra.get("talker_first_audio")):
+        raise ValueError("talker_stream_decode and talker_first_audio are mutually exclusive")
+    return True
 
 
 def stream_ref_context_frames(vllm_config: Any) -> int:

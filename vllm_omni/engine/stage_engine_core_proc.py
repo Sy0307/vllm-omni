@@ -87,10 +87,7 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     model_runner = getattr(worker, "model_runner", None)
     model_state = getattr(model_runner, "model_state", None)
     model = getattr(model_runner, "model", None)
-    decodes_first = (
-        getattr(model, "first_frame_decoder", None) is not None or getattr(model, "stream_decoder", None) is not None
-    )
-    if not decodes_first or not hasattr(model_state, "set_first_audio_sink"):
+    if getattr(model, "first_frame_decoder", None) is None or not hasattr(model_state, "set_first_audio_sink"):
         return False
     from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
 

@@ -307,62 +307,129 @@ def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
         assert torch.equal(outputs[i]["codes.audio"], codes[offsets[i] : offsets[i + 1]])
 
 
-def _stream_step(rows: dict[str, list[bool]], samples_per_frame: int) -> tuple[Any, dict[str, Any]]:
-    """One decode step's PCM: each request's rows hold a frame when valid, value = frame index."""
-    req_ids = list(rows)
-    counts = [len(v) for v in rows.values()]
-    qsl = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
-    valid = torch.tensor([v for flags in rows.values() for v in flags])
-    wav = torch.arange(len(valid), dtype=torch.float32)[:, None].repeat(1, samples_per_frame)
-    part = omni_ar_model_runner._StreamPcm(wav, valid, None, qsl, np.array(counts, dtype=np.int32), req_ids)
-    return part, {"meta": {"codec_frame_valid": valid}}
+def test_stream_audio_cancel_rejects_inflight_output_and_id_reuse() -> None:
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
+
+    buffer = StreamingAudioBuffer(samples_per_frame=4, chunk_frames=3)
+    cancelled = buffer.add("request")
+    buffer.finish({"request"})
+    replacement = buffer.add("request")
+    assert cancelled.push(torch.ones(4), False) is None
+    assert not cancelled.pending
+    assert replacement.push(torch.full((4,), 2.0), False).tolist() == [2.0] * 4
+    buffer.finish({"request"})
+    assert not buffer.requests
 
 
-def _deliver(parts, mm, force_end=frozenset()):
-    cur = parts[-1]
-    out = omni_ar_model_runner._stream_client_outputs(
-        mm, parts, set(force_end), cur.query_start_loc, cur.num_scheduled_tokens, len(cur.req_ids), cur.req_ids
+def test_stream_audio_length_end_flushes_first_and_partial_chunks() -> None:
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
+
+    buffer = StreamingAudioBuffer(samples_per_frame=4, chunk_frames=3)
+    state = buffer.add("request")
+    output = StreamingAudioOutput(
+        torch.ones(1, 4),
+        torch.tensor([True]),
+        torch.tensor(24000),
+        None,
+        np.array([0, 1]),
+        [state],
+        np.array([True]),
     )
-    return {rid: o["model_outputs"] for rid, o in zip(cur.req_ids, out or []) if o}
+    assert output.get_output()[0]["model_outputs"].numel() == 4
+    assert not state.active
+    state = buffer.add("another")
+    assert state.push(torch.ones(4), False).numel() == 4
+    assert state.push(torch.ones(4), False) is None
+    assert state.push(torch.ones(4), True).numel() == 8
 
 
-def test_stream_pcm_waits_for_request_missing_from_batch(monkeypatch) -> None:
-    acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=2)
-    monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
-    spf = acc.SPF
-    first_a, _ = _stream_step({"a": [True], "b": [True]}, spf)
-    first_b, mm = _stream_step({"b": [True]}, spf)
-    # Deferred delivery: the previous step's frames go out with this step,
-    # where "a" is not scheduled (e.g. preempted). Its frame must not be lost.
-    got = _deliver([first_a, first_b], mm)
-    assert set(got) == {"b"}
-    assert "a" in acc.pending and sum(p.numel() for p in acc.pending["a"]) == spf
+def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.states import RequestState
 
-    back, mm = _stream_step({"a": [False]}, spf)  # "a" returns and ends (EOS frame)
-    got = _deliver([back], mm)
-    assert got["a"].numel() == spf
-    assert "a" not in acc.pending
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
+
+    owner = mocker.Mock()
+    owner.vllm_config.model_config.max_model_len = 4096
+    owner._stream_decode_event = None
+    eager = EagerMTPState(owner)
+    eager._audio_buffer = StreamingAudioBuffer(4, 25)
+    eager._audio_buffer.add("request")
+    eager._frame_requests = {"request"}
+    batch = InputBatch.__new__(InputBatch)
+    batch.num_reqs, batch.req_ids = 1, ["request"]
+    batch.num_computed_tokens_np = np.array([0])
+    batch.num_scheduled_tokens = np.array([3])
+    batch.idx_mapping_np = np.array([0])
+    batch.query_start_loc_np = np.array([0, 3])
+    batch.is_prefilling_np = np.array([True])
+    states = RequestState.__new__(RequestState)
+    states.max_seq_len = np.array([4])
+    mm = {
+        "model_outputs": torch.ones(3, 4),
+        "meta": {"codec_frame_valid": torch.tensor([0, 0, 1])},
+        "sr": [torch.tensor(24000)],
+    }
+    output = eager.prepare_audio_output(batch, states, mm)
+    assert output.get_output()[0]["model_outputs"].numel() == 4
+    assert "model_outputs" not in mm
 
 
-def test_stream_pcm_drop_forgets_aborted_request(monkeypatch) -> None:
-    acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=25)
-    monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
-    part, mm = _stream_step({"a": [True, True]}, acc.SPF)
-    _deliver([part], mm)
-    acc.drop("a")
-    assert "a" not in acc.pending and "a" not in acc.emitted
+def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) -> None:
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, TalkerInputs
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
+
+    owner = mocker.Mock()
+    owner._stream_pos = {"request": 37}
+    owner._eager_embeds = torch.arange(18).reshape(6, 3).float()
+    owner._eager_ready = {}
+    owner.intermediate_buffer.buffers = [{} for _ in range(6)]
+    generator = torch.Generator().manual_seed(42)
+    owner._mtp_generators = {"request": generator}
+    saved = [torch.arange(6)]
+    owner.model.stream_decoder.save_slot.return_value = saved
+    eager = EagerMTPState(owner)
+    eager._talker_inputs["request"] = TalkerInputs(torch.ones(20, 3), 10)
+    eager._side_stream = mocker.Mock()
+    eager._audio_buffer = StreamingAudioBuffer(4, 25)
+    request = eager._audio_buffer.add("request")
+    request.push(torch.ones(4), False)
+    request.push(torch.ones(4), False)
+    eager.suspend_audio("request", 2)
+    owner._stream_pos.clear()
+    owner._mtp_generators.clear()
+    eager.resume_audio("request", 5)
+    assert owner._stream_pos["request"] == 37
+    assert owner._mtp_generators["request"] is generator
+    assert eager._restore_audio["request"] is saved
+    assert sum(part.numel() for part in request.pending) == 4
+    # A second preemption can happen before the restored slot is used.
+    eager.suspend_audio("request", 5)
+    owner.model.stream_decoder.save_slot.assert_called_once_with(2)
+    eager.finish_audio({"request"})
+    assert not eager._suspended_audio and not eager._restore_audio
+    assert not eager._audio_buffer.requests and not request.active
 
 
-def test_stream_pcm_length_end_flushes_partial_chunk(monkeypatch) -> None:
-    acc = omni_ar_model_runner._StreamPcmAccumulator(chunk_frames=25)
-    monkeypatch.setattr(omni_ar_model_runner, "_STREAM_PCM", acc)
-    spf = acc.SPF
-    delivered = 0
-    for step in range(5):
-        part, mm = _stream_step({"a": [True]}, spf)
-        last = step == 4
-        got = _deliver([part], mm, force_end={"a"} if last else ())
-        delivered += got["a"].numel() if "a" in got else 0
-    # First frame at once, the rest (below one chunk) flushed at the length end.
-    assert delivered == 5 * spf
-    assert "a" not in acc.pending
+def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mocker):
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, TalkerInputs
+
+    owner = mocker.Mock()
+    owner._eager_embeds = torch.tensor([[20.0, 30.0]])
+    owner.model.preprocess.return_value = (None, None, {"mtp_inputs": (None, torch.tensor([[2.0, 3.0]]))})
+    owner.intermediate_buffer.buffers = [{"req_id": "request"}]
+    eager = EagerMTPState(owner)
+    eager._restore_audio["request"] = []
+    history = torch.arange(8).reshape(4, 2).float()
+    eager._talker_inputs["request"] = TalkerInputs(history, 4)
+    first = torch.empty(2, 2)
+    assert eager.replay_inputs("request", 0, 0, torch.ones(2), first)
+    torch.testing.assert_close(first, history[:2])
+    owner.model.preprocess.assert_not_called()
+    last = torch.empty(3, 2)
+    assert eager.replay_inputs("request", 0, 2, torch.ones(3), last)
+    torch.testing.assert_close(last, torch.cat((history[2:], torch.tensor([[22.0, 33.0]]))))
+    owner.model.preprocess.assert_called_once()
+    with pytest.raises(RuntimeError, match="exceeds saved inputs"):
+        eager.replay_inputs("request", 0, 4, torch.ones(2), torch.empty(2, 2))

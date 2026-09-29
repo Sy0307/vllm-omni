@@ -106,7 +106,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     return sched
 
 
-def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: int) -> bool:
+def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: int, spec=None) -> bool:
     """Feed one model-runner frame through update_from_output.
 
     Returns True when the frame's tokens were delivered (the append ran),
@@ -114,7 +114,7 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     """
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: num_scheduled}
-    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.scheduled_spec_decode_tokens = {session.request_id: spec} if spec else {}
     scheduler_output.num_invalid_spec_tokens = 0
 
     model_runner_output = MagicMock(spec=ModelRunnerOutput)
@@ -225,3 +225,30 @@ def test_in_flight_prefill_chunk_drains_exactly_without_underflow() -> None:
     assert _run_step(sched, session, num_scheduled=5, token=42) is False  # late prefill chunk dropped
     assert session.num_stale_output_tokens == 0
     assert _run_step(sched, session, num_scheduled=1, token=43) is True  # new segment survives
+
+
+@pytest.mark.parametrize("drop", [False, True])
+def test_preemption_stale_output_follows_upstream_delivery_policy(drop):
+    request = _make_session()
+    request.status = RequestStatus.PREEMPTED
+    request.num_stale_output_tokens = 1
+    request.num_in_flight_tokens = 1
+    request.drop_stale_output = drop
+    sched = _make_drain_sched(request)
+    assert _run_step(sched, request, num_scheduled=1, token=42) is (not drop)
+    assert request.num_stale_output_tokens == 0
+    if not drop:
+        sched._update_request_with_output.assert_called_once_with(request, [42], is_stale=True)
+
+
+def test_preemption_stale_spec_rejection_does_not_roll_back_resumed_counters():
+    request = _make_session()
+    request.num_stale_output_tokens = 2
+    request.num_in_flight_tokens = 2
+    request.num_computed_tokens = 3
+    request.num_output_placeholders = 2
+    request.drop_stale_output = False
+    sched = _make_drain_sched(request)
+    assert _run_step(sched, request, num_scheduled=2, token=42, spec=[41])
+    assert request.num_computed_tokens == 3
+    assert request.num_output_placeholders == 2

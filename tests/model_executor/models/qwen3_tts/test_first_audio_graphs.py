@@ -124,3 +124,29 @@ def test_xvec_graphs_follow_request_first_audio_flags(initial_frames, time_major
             torch.testing.assert_close(got, want, atol=1e-4, rtol=1e-4)
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
                 torch.testing.assert_close(cache[key], expected_cache[key], atol=1e-5, rtol=1e-5)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
+
+    decoder = _make_decoder().to(device=DEVICE, dtype=torch.bfloat16)
+    decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
+    stream = StreamingCodecDecoder(decoder, num_slots=2, dtype=torch.bfloat16)
+    codes = torch.randint(0, 32, (1, 8, 2), device=DEVICE)
+    slot = torch.tensor([0], device=DEVICE, dtype=torch.int32)
+    for pos in range(7):
+        stream(codes[:, pos : pos + 1], slot, torch.tensor([pos], device=DEVICE, dtype=torch.int32))
+    saved = stream.save_slot(0)
+    expected = stream(codes[:, 7:], slot, torch.tensor([7], device=DEVICE, dtype=torch.int32)).clone()
+    # The old slot can be reused by an unrelated request while this one waits.
+    stream(codes[:, :1], slot, torch.zeros(1, device=DEVICE, dtype=torch.int32))
+    stream.restore_slot(1, saved)
+    actual = stream(
+        codes[:, 7:],
+        torch.tensor([1], device=DEVICE, dtype=torch.int32),
+        torch.tensor([7], device=DEVICE, dtype=torch.int32),
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

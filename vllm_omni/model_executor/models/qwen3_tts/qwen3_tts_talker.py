@@ -419,6 +419,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_decoder = None
         self.stream_graphs = None
         self.stream_sample_rate = 0
+        self.stream_chunk_frames = 25
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.

@@ -13,8 +13,8 @@ Extends ``OmniGPUModelRunner`` with:
 
 from __future__ import annotations
 
-import threading
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, cast
 
 import numpy as np
@@ -37,6 +37,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -100,15 +101,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_pending = [False] * 4
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
-        # Talker stream decode: the previous step's PCM, delivered with the
-        # next step's output (see _StreamPcm).
-        self._stream_pcm_prev: _StreamPcm | None = None
-
-    def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
-        # Preempted requests keep their queued PCM until they are scheduled again.
-        for req_id in scheduler_output.finished_req_ids:
-            _STREAM_PCM.drop(req_id)
-        super().finish_requests(scheduler_output)
 
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
@@ -211,6 +203,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 multimodal_outputs,
                 self._dispatch_mtp_batch_descriptor,
             )
+        publish_sampled = getattr(self.model_state, "publish_sampled_embeddings", None)
+        extra_outputs = (
+            publish_sampled(input_batch, sampler_output.sampled_token_ids)
+            if (
+                multimodal_outputs
+                and callable(publish_sampled)
+                and bool(getattr(self.model_config, "async_chunk", False))
+                and getattr(self.model_config, "engine_output_type", "text") != "text"
+            )
+            else None
+        )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
@@ -246,38 +249,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
-        # --- Talker stream decode PCM ---
-        stream_pcm: tuple[list[_StreamPcm], set[str]] | None = None
-        decode_event = getattr(self.model_state, "_stream_decode_event", None)
-        if decode_event is not None:
-            self.model_state._stream_decode_event = None
-        wav = multimodal_outputs.get("model_outputs") if (need_pooler and multimodal_outputs) else None
-        if isinstance(wav, torch.Tensor) and wav.dim() == 2:
-            meta = multimodal_outputs.get("meta", {})
-            cur = _StreamPcm(
-                wav=multimodal_outputs.pop("model_outputs"),
-                valid=meta.get("codec_frame_valid"),
-                event=decode_event,
-                query_start_loc=input_batch.query_start_loc_np[: input_batch.num_reqs + 1].copy(),
-                num_scheduled_tokens=np.array(input_batch.num_scheduled_tokens[: input_batch.num_reqs], dtype=np.int32),
-                req_ids=list(input_batch.req_ids),
-            )
-            n = input_batch.num_reqs
-            # Requests whose token sampled now is their last by length (no EOS
-            # frame follows): their final frames must go out with this output.
-            total_after = input_batch.num_computed_tokens_np[:n] + np.asarray(input_batch.num_scheduled_tokens[:n]) + 1
-            limit = np.minimum(self.req_states.max_seq_len[input_batch.idx_mapping_np[:n]], self.max_model_len)
-            length_end = np.nonzero((total_after >= limit) & ~input_batch.is_prefilling_np[:n])[0]
-            force_end = {input_batch.req_ids[i] for i in length_end.tolist()}
-            prev = self._stream_pcm_prev or _StreamPcm.empty()
-            if force_end:
-                parts, self._stream_pcm_prev = [prev, cur], None
-            else:
-                # This step's codec runs on the side stream past the output
-                # copy; ship the previous step's (long finished) PCM instead,
-                # so waiting on this step's output never waits on the codec.
-                parts, self._stream_pcm_prev = [prev], cur
-            stream_pcm = (parts, force_end)
+        prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)
+        streaming_audio = (
+            prepare_streaming(input_batch, self.req_states, multimodal_outputs)
+            if need_pooler and multimodal_outputs and callable(prepare_streaming)
+            else None
+        )
 
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
@@ -294,7 +271,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
-            stream_pcm=stream_pcm,
+            streaming_audio=streaming_audio,
+            extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -408,18 +386,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_reqs: int,
         total_tokens: int,
         padded_total_tokens: int | None = None,
-        req_ids: list[str] | None = None,
-        stream_pcm: tuple[list[_StreamPcm], set[str]] | None = None,
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
         """Build async-chunk payloads without materializing hidden on CPU."""
         if not mm_outputs:
             return None, None
-
-        if stream_pcm is not None and req_ids is not None:
-            parts, force_end = stream_pcm
-            return None, _stream_client_outputs(
-                mm_outputs, parts, force_end, query_start_loc_np, num_scheduled_tokens, num_reqs, req_ids
-            )
 
         inter_stage_list: list[dict[str, Any] | None] = []
         client_mm_list: list[dict[str, Any] | None] = []
@@ -605,155 +575,16 @@ def _async_copy_mm(
     }
 
 
-from vllm_omni.worker_v2.first_audio_sender import DIRECT_FIRST_FRAME  # noqa: E402
-
-
-class _StreamPcmAccumulator:
-    """Host-side chunking of per-step Talker PCM (first frame, then every ``chunk`` frames, flush on end)."""
-
-    SPF = 1920
-
-    def __init__(self, chunk_frames: int = 25) -> None:
-        self.chunk = chunk_frames
-        self.pending: dict[str, list[torch.Tensor]] = {}
-        self.emitted: dict[str, int] = {}
-        self.lock = threading.Lock()
-
-    def push(self, req_id: str, pcm: torch.Tensor, ended: bool, emit: bool = True) -> torch.Tensor | None:
-        """Queue ``pcm`` for ``req_id``; return a due chunk only if ``emit`` (the caller can deliver it)."""
-        with self.lock:
-            parts = self.pending.setdefault(req_id, [])
-            if req_id not in self.emitted and req_id in DIRECT_FIRST_FRAME and pcm.numel() >= self.SPF:
-                # The first frame already left through the direct channel.
-                DIRECT_FIRST_FRAME.discard(req_id)
-                pcm = pcm[self.SPF :]
-                self.emitted[req_id] = 1
-            if pcm.numel():
-                parts.append(pcm)
-            frames = sum(p.numel() for p in parts) // self.SPF
-            first = req_id not in self.emitted
-            due = emit and frames and (ended or (first and frames >= 1) or frames >= self.chunk)
-            out = None
-            if due:
-                out = torch.cat(parts) if len(parts) > 1 else parts[0]
-                self.pending[req_id] = []
-                self.emitted[req_id] = self.emitted.get(req_id, 0) + frames
-            if ended:
-                self.pending.pop(req_id, None)
-                self.emitted.pop(req_id, None)
-            return out
-
-    def drop(self, req_id: str) -> None:
-        """Forget a finished or aborted request (a no-op after its end frame)."""
-        with self.lock:
-            self.pending.pop(req_id, None)
-            self.emitted.pop(req_id, None)
-            DIRECT_FIRST_FRAME.discard(req_id)
-
-
-class _StreamPcm:
-    """One step's Talker stream-decode PCM rows with the batch layout that indexes them."""
-
-    def __init__(self, wav, valid, event, query_start_loc, num_scheduled_tokens, req_ids) -> None:
-        self.wav = wav
-        self.valid = valid
-        self.event = event
-        self.query_start_loc = query_start_loc
-        self.num_scheduled_tokens = num_scheduled_tokens
-        self.req_ids = req_ids
-
-    @classmethod
-    def empty(cls) -> _StreamPcm:
-        return cls(None, None, None, np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.int32), [])
-
-    def to_cpu(self, copy_stream: torch.cuda.Stream, pin_memory: bool) -> _StreamPcm:
-        if self.wav is None:
-            return self
-        if self.event is not None:
-            copy_stream.wait_event(self.event)
-        wav = _async_copy_tensor(self.wav, copy_stream=copy_stream, pin_memory=pin_memory)
-        valid = None
-        if isinstance(self.valid, torch.Tensor):
-            valid = _async_copy_tensor(self.valid, copy_stream=copy_stream, pin_memory=pin_memory)
-        return _StreamPcm(wav, valid, None, self.query_start_loc, self.num_scheduled_tokens, self.req_ids)
-
-
-def _stream_client_outputs(
-    mm_outputs: dict[str, Any],
-    parts: list[_StreamPcm],
-    force_end: set[str],
-    query_start_loc_np: np.ndarray,
-    num_scheduled_tokens: np.ndarray,
-    num_reqs: int,
-    req_ids: list[str],
-) -> list[dict[str, Any] | None] | None:
-    """Talker stream decode on a final stage: only PCM chunks reach the client.
-
-    ``parts`` hold steps' frames in order (this step's, or the previous
-    step's when delivery is deferred), each in its own step's layout. A
-    request ends when this step's ``codec_frame_valid`` is off (its EOS frame
-    carries no audio, so all its frames are already in ``parts``) or when it
-    is in ``force_end`` (its last token by length; ``parts`` then include this
-    step). Frames of a request with no row in this step's output (preempted
-    or not scheduled since) stay queued until it is scheduled again. The
-    codes and frame metadata have no downstream stage to feed.
-    """
-    live = {req_ids[i] for i in range(min(num_reqs, len(req_ids))) if int(num_scheduled_tokens[i]) > 0}
-    chunks: dict[str, torch.Tensor] = {}
-    for pcm in parts:
-        if pcm.wav is None:
-            continue
-        pvalid = pcm.valid.numpy() if isinstance(pcm.valid, torch.Tensor) else None
-        for j, rid in enumerate(pcm.req_ids):
-            start = int(pcm.query_start_loc[j])
-            end = start + int(pcm.num_scheduled_tokens[j])
-            if end <= start:
-                continue
-            if pvalid is None:
-                rows = pcm.wav[start:end]
-            elif end - start == 1:
-                if not pvalid[start]:
-                    continue
-                rows = pcm.wav[start:end]
-            else:
-                mask = pvalid[start:end].astype(bool)
-                if not mask.any():
-                    continue
-                rows = pcm.wav[start:end][torch.from_numpy(mask)]
-            chunk = _STREAM_PCM.push(rid, rows.reshape(-1), False, emit=rid in live)
-            if chunk is not None:
-                chunks[rid] = chunk if rid not in chunks else torch.cat([chunks[rid], chunk])
-    valid = mm_outputs.get("meta", {}).get("codec_frame_valid")
-    valid_np = valid.numpy() if isinstance(valid, torch.Tensor) else None
-    sr = mm_outputs.get("sr")
-    out: list[dict[str, Any] | None] = [None] * num_reqs
-    any_chunk = False
-    for i in range(min(num_reqs, len(req_ids))):
-        start = int(query_start_loc_np[i])
-        end = start + int(num_scheduled_tokens[i])
-        if end <= start:
-            continue
-        rid = req_ids[i]
-        chunk = chunks.pop(rid, None)
-        if rid in force_end or (valid_np is not None and not bool(valid_np[end - 1])):
-            tail = _STREAM_PCM.push(rid, _EMPTY_PCM, True)
-            if tail is not None:
-                chunk = tail if chunk is None else torch.cat([chunk, tail])
-        if chunk is None:
-            continue
-        payload: dict[str, Any] = {"model_outputs": chunk}
-        if sr is not None:
-            payload["sr"] = _slice_pooler_value(sr, req_index=i, start=start, end=end, total_tokens=end)
-        _inter, client = partition_flat_payload(flatten_payload(payload))
-        out[i] = client or None
-        any_chunk = any_chunk or bool(client)
-    return out if any_chunk else None
-
-
-_EMPTY_PCM = torch.empty(0)
-
-
-_STREAM_PCM = _StreamPcmAccumulator()
+def _merge_payload_trees(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """``base`` with ``extra`` merged in; nested mappings merge key by key."""
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_payload_trees(current, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _slice_pooler_value(
@@ -862,7 +693,8 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_output: Any | None = None,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
-        stream_pcm: tuple[list[_StreamPcm], set[str]] | None = None,
+        streaming_audio: StreamingAudioOutput | None = None,
+        extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -948,10 +780,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self._hidden_cpu: torch.Tensor | None = None
             self._mm_cpu: dict[str, Any] = {}
             self._mm_snapshot: dict[str, Any] = {}
-            self._stream_pcm = None
-            if stream_pcm is not None:
-                parts, force_end = stream_pcm
-                self._stream_pcm = ([part.to_cpu(copy_stream, pin_memory) for part in parts], force_end)
+            self._streaming_audio = (
+                streaming_audio.to_cpu(
+                    copy_stream, partial(_async_copy_tensor, copy_stream=copy_stream, pin_memory=pin_memory)
+                )
+                if streaming_audio is not None
+                else None
+            )
             if self._need_pooler and self._async_chunk:
                 # CUDA graph replay reuses the model's output buffers. Take
                 # ownership directly in pinned host memory on the output copy
@@ -963,6 +798,20 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     copy_stream=copy_stream,
                     pin_memory=pin_memory,
                 )
+                if extra_multimodal_outputs:
+                    # Produced after sampling on the producer stream; copy only
+                    # once its completion event has been observed.
+                    extra_outputs, extra_ready = extra_multimodal_outputs
+                    copy_stream.wait_event(extra_ready)
+                    self._mm_snapshot = _merge_payload_trees(
+                        self._mm_snapshot,
+                        _async_copy_mm(
+                            extra_outputs,
+                            self._total_tokens,
+                            copy_stream=copy_stream,
+                            pin_memory=pin_memory,
+                        ),
+                    )
             elif self._need_pooler and text_hidden is not None:
                 self._hidden_cpu = _async_copy_tensor(
                     text_hidden,
@@ -1023,9 +872,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._num_reqs,
                 self._total_tokens,
                 self._padded_total_tokens,
-                req_ids=list(self.model_runner_output.req_ids),
-                stream_pcm=self._stream_pcm,
             )
+            if self._streaming_audio is not None:
+                pooler_inter, pooler_client = None, self._streaming_audio.get_output()
             self.model_runner_output.pooler_output = None
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (

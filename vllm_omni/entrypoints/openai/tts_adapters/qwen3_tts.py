@@ -410,6 +410,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         kwargs: dict[str, Any] = dict(trust_remote_code=True, use_fast=True, padding_side="left")
         if transformers.__version__ < "5":
             kwargs["fix_mistral_regex"] = True
+        assert self.ctx.engine_client is not None
         model_name = self.ctx.engine_client.model_config.model
         server._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
 
@@ -424,6 +425,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
             server = self.ctx.server
             self._load_text_tokenizer()
+            assert self.ctx.engine_client is not None
             hf_config = self.ctx.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]

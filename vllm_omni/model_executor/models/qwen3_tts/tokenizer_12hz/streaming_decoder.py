@@ -36,7 +36,6 @@ state reset.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -599,6 +598,29 @@ class StreamingCodecDecoder(nn.Module):
         self.parity = torch.zeros(S, device=dev, dtype=torch.int32)
         self._dummy = torch.zeros(1, device=dev, dtype=dtype)
 
+    def _slot_state(self, slot: int) -> list[torch.Tensor]:
+        state = [self.parity[slot : slot + 1]]
+        for layer in self.layers:
+            state.extend((layer["k_ring"][slot], layer["v_ring"][slot]))
+        for spec in (self.pre, self.conv_in, self.conv_out):
+            assert spec.hist is not None
+            state.append(spec.hist[:, slot])
+        for up in self.ups:
+            state.append(up["hist"][:, slot])
+        for block in self.blocks:
+            state.append(block["prev"][:, slot])
+            for unit in block["units"]:
+                state.append(unit["conv1"].hist[:, slot])
+        return state
+
+    def save_slot(self, slot: int) -> list[torch.Tensor]:
+        """Offload a preempted request before its runner slot is recycled."""
+        return [tensor.to(device="cpu", copy=True) for tensor in self._slot_state(slot)]
+
+    def restore_slot(self, slot: int, state: list[torch.Tensor]) -> None:
+        for target, saved in zip(self._slot_state(slot), state, strict=True):
+            target.copy_(saved)
+
     # ------------------------------------------------------------------ helpers
     def _im2col(self, x, spec: _ConvSpec, T, slots, pos, bias=None, snake=None, ext=False):
         k = spec.k
@@ -738,28 +760,6 @@ class StreamingCodecDecoder(nn.Module):
         )  # fmt: skip
         _flip_kernel[(B,)](self.parity, slots)
         return wav
-
-
-def exactness_report(decoder: nn.Module, codes: torch.Tensor, chunks: list[int], dtype=torch.float32) -> dict:
-    """Stream ``codes`` [1, NQ, T] in ``chunks`` and compare with the whole-utterance decode."""
-    ref = decoder._forward_exact(codes)[0, 0].float()
-    sd = StreamingCodecDecoder(decoder, num_slots=2, dtype=dtype)
-    slots = torch.zeros(1, device=codes.device, dtype=torch.int32)
-    outs, s = [], 0
-    for n in chunks:
-        if s >= codes.shape[-1]:
-            break
-        e = min(codes.shape[-1], s + n)
-        pos = torch.tensor([s], device=codes.device, dtype=torch.int32)
-        outs.append(sd(codes[0, :, s:e].t()[None], slots, pos)[0])
-        s = e
-    out = torch.cat(outs)
-    n = min(len(out), len(ref))
-    err = (out[:n] - ref[:n]).double()
-    return dict(
-        max_abs=err.abs().max().item(),
-        snr_db=10 * math.log10(ref[:n].double().pow(2).sum().item() / max(err.pow(2).sum().item(), 1e-30)),
-    )
 
 
 class StreamingDecodeGraphs:
