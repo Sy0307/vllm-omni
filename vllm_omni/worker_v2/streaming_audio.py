@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
 
 @dataclass
 class AudioRequest:
@@ -18,13 +20,26 @@ class AudioRequest:
     chunk_frames: int
     active: bool = True
     emitted: bool = False
+    direct_first_pending: bool = False
+    first_audio_required: bool = False
     pending: list[torch.Tensor] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def accept_first_audio(self) -> None:
+        with self.lock:
+            if self.active:
+                self.direct_first_pending = True
 
     def push(self, pcm: torch.Tensor, ended: bool) -> torch.Tensor | None:
         with self.lock:
             if not self.active:
                 return None
+            if self.direct_first_pending:
+                self.direct_first_pending = False
+                if pcm.numel():
+                    pcm = pcm[self.samples_per_frame :]
+                    self.emitted = True
+                    self.first_audio_required = True
             if pcm.numel():
                 self.pending.append(pcm)
             frames = sum(part.numel() for part in self.pending) // self.samples_per_frame
@@ -94,14 +109,24 @@ class StreamingAudioOutput:
     def get_output(self) -> list[dict[str, torch.Tensor] | None]:
         valid = self.valid.numpy().astype(bool)
         output: list[dict[str, torch.Tensor] | None] = []
+        required_marker = None
         for i, state in enumerate(self.requests):
             payload = None
             start, end = self.query_start_loc[i : i + 2]
             if state is not None and end > start:
-                pcm = self.wav[start:end][torch.from_numpy(valid[start:end])].reshape(-1)
+                if end - start == 1:
+                    pcm = self.wav[start:end].reshape(-1) if valid[start] else self.wav.new_empty(0)
+                else:
+                    pcm = self.wav[start:end][torch.from_numpy(valid[start:end])].reshape(-1)
                 ended = bool(self.length_end[i]) or not valid[end - 1]
                 chunk = state.push(pcm, ended)
                 if chunk is not None:
                     payload = {"model_outputs": chunk, "sr": self.sample_rate}
+                if state.first_audio_required and (chunk is not None or ended):
+                    if required_marker is None:
+                        required_marker = torch.tensor(True)
+                    if payload is None:
+                        payload = {}
+                    payload[FIRST_AUDIO_REQUIRED_KEY] = required_marker
             output.append(payload)
         return output

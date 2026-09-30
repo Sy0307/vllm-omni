@@ -493,6 +493,121 @@ def test_model_owned_audio_finalizer_runs_after_copy_without_hidden(monkeypatch,
     assert (result.pooler_output is None) == streaming
 
 
+def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker):
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    owner = mocker.Mock()
+    owner.vllm_config.model_config.max_model_len = 12
+    eager = EagerMTPState(owner)
+    first = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+    second = torch.arange(9, 18, dtype=torch.float32).reshape(3, 3)
+    expected = {"a": torch.cat((first[:2], second[2:])), "b": torch.cat((first[2:], second[:2]))}
+    batch = InputBatch.__new__(InputBatch)
+    batch.req_ids = ["a", "b"]
+    batch.query_start_loc_np = np.array([0, 2, 3])
+    batch.num_computed_tokens_np = np.array([0, 0])
+    eager.record_inputs(batch, first)
+    batch.req_ids = ["b", "a"]
+    batch.num_computed_tokens_np = np.array([1, 2])
+    eager.record_inputs(batch, second)
+    # Later input-buffer reuse must not change the conditioned replay history.
+    first.fill_(-1)
+    second.fill_(-2)
+    for request_id, wanted in expected.items():
+        eager._restore_audio[request_id] = []
+        replayed = torch.empty_like(wanted)
+        assert eager.replay_inputs(request_id, 0, 0, torch.zeros(3, dtype=torch.long), replayed)
+        torch.testing.assert_close(replayed, wanted)
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_stream_audio_direct_first_requires_only_real_pcm_on_terminal(valid):
+    from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
+
+    buffer = StreamingAudioBuffer(samples_per_frame=4, chunk_frames=3)
+    state = buffer.add("r")
+    state.accept_first_audio()
+    first = StreamingAudioOutput(
+        torch.arange(4).reshape(1, 4),
+        torch.tensor([valid]),
+        torch.tensor(24000),
+        None,
+        np.array([0, 1]),
+        [state],
+        np.array([True]),
+    )
+    payload = first.get_output()[0]
+    if valid:
+        assert payload == {FIRST_AUDIO_REQUIRED_KEY: torch.tensor(True)}
+    else:
+        assert payload is None  # EOS has no promised first PCM to wait for.
+    assert not state.active and not state.pending
+    buffer.finish({"r"})
+    replacement = buffer.add("r")
+    assert replacement.push(torch.full((4,), 99), False).tolist() == [99] * 4
+
+
+def test_stream_audio_direct_first_drops_one_frame_and_retains_partial_suffix():
+    from vllm_omni.worker_v2.streaming_audio import AudioRequest
+
+    state = AudioRequest(samples_per_frame=4, chunk_frames=3)
+    state.accept_first_audio()
+    assert state.push(torch.arange(4), False) is None
+    assert state.first_audio_required and state.emitted
+    assert state.push(torch.arange(4, 8), False) is None
+    chunk = state.push(torch.arange(8, 12), True)
+    assert chunk.tolist() == list(range(4, 12))
+    assert not state.active and not state.pending
+
+
+def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch):
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    monkeypatch.setattr(
+        OmniARModelRunner,
+        "_build_async_chunk_outputs_from_mm",
+        lambda *args: pytest.fail("in-stage PCM unnecessarily partitioned code outputs"),
+    )
+    batch = InputBatch.__new__(InputBatch)
+    batch.num_reqs = 3
+    batch.query_start_loc_np = np.array([0, 1, 2, 4])
+    batch.num_scheduled_tokens = np.array([1, 1, 2])
+    batch.num_tokens_after_padding = 4
+    buffer = StreamingAudioBuffer(samples_per_frame=4, chunk_frames=3)
+    states = [buffer.add(request_id) for request_id in ["frame", "eos", "prefill"]]
+    wav = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    streaming_audio = StreamingAudioOutput(
+        wav,
+        torch.tensor([True, False, True, False]),
+        torch.tensor(24000),
+        None,
+        batch.query_start_loc_np.copy(),
+        states,
+        np.array([False, False, True]),
+    )
+    result = _async_output(
+        req_ids=["frame", "eos", "prefill"],
+        sampler_output=SamplerOutput(torch.tensor([[1], [2], [3]]), None, None, None),
+        num_sampled_tokens=torch.tensor([1, 1, 1]),
+        multimodal_outputs={"codes": {"audio": torch.ones(4, 2)}},
+        input_batch=batch,
+        async_chunk=True,
+        streaming_audio=streaming_audio,
+    ).get_output()
+    wav.fill_(-1)
+    assert result.inter_stage_outputs is None
+    assert result.multimodal_outputs[0]["model_outputs"].tolist() == [0, 1, 2, 3]
+    assert result.multimodal_outputs[1] == {}
+    assert result.multimodal_outputs[2]["model_outputs"].tolist() == [8, 9, 10, 11]
+    assert not states[1].active and not states[2].active
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot

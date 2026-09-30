@@ -884,7 +884,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     pooler_client is not None and len(pooler_client) != self._num_reqs
                 ):
                     raise ValueError("Model-owned output snapshot does not match the request batch")
-            else:
+            elif self._streaming_audio is None:
+                # In-stage PCM already owns its request partition. Building
+                # generic code payloads here would immediately discard them.
                 pooler_inter, pooler_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
                     self._mm_snapshot,
                     self._query_start_loc_np,

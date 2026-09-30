@@ -412,6 +412,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
+        predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+        extra = predictor._stage_connector_extra_config(vllm_config)
+        self.stream_first_audio = self.stream_decode and predictor._parse_bool_config(
+            extra.get("talker_stream_first_audio")
+        )
         # Reference-code frames that prime a voice-clone stream's decoder,
         # matching the Code2Wav stage's first-chunk context.
         self.stream_ref_context_frames = stream_ref_context_frames(vllm_config)
@@ -1464,8 +1469,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             decoder_loaded = self.first_frame_decoder.load(self.vllm_config)
             loaded = set(loaded) | {f"first_frame_decoder.{name}" for name in decoder_loaded}
         elif self.stream_decode:
-            # Not ``first_frame_decoder``: every frame, including the first,
-            # is decoded here and leaves through the regular step output.
+            # The in-stage decoder owns every frame. Optional first-audio
+            # delivery uses its PCM; later chunks use regular step outputs.
             from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
             from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
 

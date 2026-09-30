@@ -15,6 +15,9 @@ stages:
     # single stage has no connector edge.
     additional_config:
       talker_stream_decode: true
+      # Opt in to first-frame delivery on its own queue for lower first-audio
+      # latency; leave disabled when prioritizing peak throughput.
+      talker_stream_first_audio: false
       code_predictor_kv_cache: true
       code_predictor_fused_sampling: true
       code_predictor_fused: true

@@ -140,6 +140,8 @@ class EagerMTPState:
     def record_inputs(self, input_batch: InputBatch, embeds: torch.Tensor) -> None:
         if getattr(self.owner.model, "stream_decoder", None) is None:
             return
+        history_slices: list[torch.Tensor] = []
+        input_slices: list[torch.Tensor] = []
         for i, req_id in enumerate(input_batch.req_ids):
             start, end = input_batch.query_start_loc_np[i : i + 2]
             offset = int(input_batch.num_computed_tokens_np[i])
@@ -156,8 +158,12 @@ class EagerMTPState:
                     storage[: history.length].copy_(history.embeds)
                 history = TalkerInputs(storage, history.length if history else 0)
                 self._talker_inputs[req_id] = history
-            history.embeds[offset:length].copy_(embeds[start:end])
+            history_slices.append(history.embeds[offset:length])
+            input_slices.append(embeds[start:end])
             history.length = max(history.length, length)
+        if history_slices:
+            # Keep exact inputs for replay without launching one copy per row.
+            torch._foreach_copy_(history_slices, input_slices)
 
     def prepare_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
@@ -378,6 +384,7 @@ class EagerMTPState:
         stream = getattr(model, "stream_decoder", None)
         stream_out = multimodal_outputs.get("model_outputs") if stream is not None else None
         pos_list: list[int] = []
+        first_rows: list[int] = []
         primes: list[tuple[int, torch.Tensor]] = []
         if isinstance(stream_out, torch.Tensor):
             assert stream is not None
@@ -389,10 +396,11 @@ class EagerMTPState:
                 self._audio_buffer = StreamingAudioBuffer(int(stream.spf), int(model.stream_chunk_frames))
             self._frame_requests = {req_id for _i, _idx, req_id, _p in entries}
             positions = owner._stream_pos
-            for _i, req_idx, req_id, _p in entries:
+            for row, (_i, req_idx, req_id, _p) in enumerate(entries):
                 self._audio_buffer.add(req_id)
                 p = positions.get(req_id)
                 if p is None:
+                    first_rows.append(row)
                     ref = self._stream_ref_context(req_idx)
                     p = 0
                     if ref is not None:
@@ -454,6 +462,7 @@ class EagerMTPState:
                 self._prime_stream(stream, primes)
                 pcm = decode(frame_codes, rows, meta[4 * bsz : 5 * bsz])
                 stream_out.index_copy_(0, last_tokens, pcm.reshape(bsz, -1).to(stream_out.dtype))
+                self._send_stream_first_frames(entries, pcm, valid, first_rows)
                 done = torch.cuda.Event()
                 done.record(side)
             owner._stream_decode_event = done
@@ -469,6 +478,29 @@ class EagerMTPState:
                 else:
                     scheduled *= self._first_audio_valid.index_select(0, rows)
                 first_audio.index_copy_(0, last_tokens, scheduled.to(first_audio.dtype))
+
+    def _send_stream_first_frames(
+        self,
+        entries: list[tuple[int, int, str, bool]],
+        pcm: torch.Tensor,
+        valid: torch.Tensor,
+        first_rows: list[int],
+    ) -> None:
+        sender = self.owner._first_audio_sender
+        if sender is None or not first_rows:
+            return
+        rows = index_to_device(first_rows, pcm.device)
+        request_ids = [entries[row][2] for row in first_rows]
+        sample_rate = torch.tensor(int(self.owner.model.stream_sample_rate), dtype=torch.int32)
+        accepted = sender.submit(
+            request_ids,
+            pcm.reshape(pcm.shape[0], -1).index_select(0, rows).float(),
+            sample_rate,
+            valid=valid.index_select(0, rows),
+        )
+        assert self._audio_buffer is not None
+        for request_id in accepted:
+            self._audio_buffer.requests[request_id].accept_first_audio()
 
     def _stream_ref_context(self, req_idx: int) -> torch.Tensor | None:
         """Last ``ref_code_context_frames`` reference codes [T, Q] of a voice-clone request, if any."""
