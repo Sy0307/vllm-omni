@@ -514,6 +514,7 @@ class HiggsAudioV3Code2Wav(nn.Module):
         # algorithms and rounding. Uncovered shapes retain the eager path.
         start = time.perf_counter()
         memory_before = torch.accelerator.memory_allocated(device)
+        reserved_before = torch.accelerator.memory_reserved(device)
         shapes = self._decode_graph_shapes()
         previous_device = current_omni_platform.current_device()
         current_omni_platform.set_device(device)
@@ -538,10 +539,12 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self._decode_graphs_initialized = True
         torch.accelerator.synchronize()
         logger.info(
-            "Higgs codec captured %d exact-frame CUDA graphs in %.2f s (allocated delta %.1f MiB)",
+            "Higgs codec captured %d exact-frame CUDA graphs in %.2f s (allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
             len(self._decode_graphs),
             time.perf_counter() - start,
             (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
+            (torch.accelerator.memory_reserved(device) - reserved_before) / 2**20,
+            torch.accelerator.memory_reserved(device) / 2**20,
         )
 
     @torch.inference_mode()

@@ -11,15 +11,20 @@ from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
     talker2code2wav_full_payload,
     talker2code2wav_token_only,
 )
+from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("rows", [0, 4, 8, 9, 30])
 @pytest.mark.parametrize("offset", [0, -16, 1016])
-def test_native_full_payload_preserves_legacy_dedelay_and_tail(rows, offset):
+def test_native_full_payload_preserves_legacy_dedelay_and_tail(rows, offset, wrapped):
     audio = torch.arange(rows * 8).reshape(rows, 8) + offset
-    out = SimpleNamespace(finished=True, outputs=[SimpleNamespace(multimodal_output={"codes": {"audio": audio}})])
+    payload = {"codes": {"audio": audio}}
+    if wrapped:
+        payload = MultimodalPayload(metadata=payload)
+    out = SimpleNamespace(finished=True, outputs=[SimpleNamespace(multimodal_output=payload)])
     legacy = talker2code2wav([out])[0]["prompt_token_ids"]
     native = talker2code2wav_full_payload(None, {"codes.audio": audio}, None)
     assert native["codes"]["audio"].tolist() == legacy

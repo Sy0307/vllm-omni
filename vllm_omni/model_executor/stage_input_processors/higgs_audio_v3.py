@@ -21,6 +21,7 @@ to avoid corrupting valid tail content.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -447,7 +448,7 @@ def talker2code2wav_token_only(source_outputs, prompt=None, _requires_multimodal
         if not output.finished:
             continue
         mm = getattr(output.outputs[0], "multimodal_output", None)
-        if isinstance(mm, dict) and isinstance(mm.get("codes", {}).get("audio"), torch.Tensor):
+        if isinstance(mm, Mapping) and isinstance(mm.get("codes", {}).get("audio"), torch.Tensor):
             result.extend(talker2code2wav([output], prompt, _requires_multimodal_data))
         else:
             result.append(OmniTokensPrompt(prompt_token_ids=[0]))

@@ -258,6 +258,7 @@ def capture_sample_graphs(model, max_num_reqs):
         return
     start = time.perf_counter()
     memory_before = torch.accelerator.memory_allocated(device)
+    reserved_before = torch.accelerator.memory_reserved(device)
     model._resolve_token_ids()
     buckets = (
         sorted({next((b for b in _BUCKETS if b >= n), n) for n in range(1, max_num_reqs + 1)})
@@ -321,8 +322,10 @@ def capture_sample_graphs(model, max_num_reqs):
     torch.accelerator.synchronize()
     model._sample_graphs_ready = True
     logger.info(
-        "Higgs sampler captured %d CUDA graphs in %.2f s (allocated delta %.1f MiB)",
+        "Higgs sampler captured %d CUDA graphs in %.2f s (allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
         len(model._dense_sample_graphs),
         time.perf_counter() - start,
         (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
+        (torch.accelerator.memory_reserved(device) - reserved_before) / 2**20,
+        torch.accelerator.memory_reserved(device) / 2**20,
     )

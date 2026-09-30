@@ -1430,7 +1430,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         done = staging[:, self.num_codebooks + 1].tolist()
         invalid = set(invalid_req_indices)
         self._fast_audio_direct_rows = len(req_ids) if not invalid and all(v or d for v, d in zip(valid, done)) else 0
-        empty = torch.empty(0, dtype=codes.dtype)
+        # Keep the codec-row rank on terminal/invalid steps: a 1-D empty
+        # value would replace previously accumulated full-response rows.
+        empty = codes.new_empty((0, self.num_codebooks))
         rows = [codes[i : i + 1] if valid[i] and i not in invalid else empty for i in range(len(req_ids))]
         return {"codes": {"audio": rows}}
 
@@ -1444,7 +1446,9 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         codes = staging[:, : self.num_codebooks].clone()
         valid = staging[:, self.num_codebooks].tolist()
         invalid = set(payload["_higgs_invalid_rows"])
-        empty = torch.empty(0, dtype=codes.dtype)
+        # Keep the codec-row rank on terminal/invalid steps: a 1-D empty
+        # value would replace previously accumulated full-response rows.
+        empty = codes.new_empty((0, self.num_codebooks))
         return {
             "codes": {
                 "audio": [codes[i : i + 1] if valid[i] and i not in invalid else empty for i in range(staging.shape[0])]
