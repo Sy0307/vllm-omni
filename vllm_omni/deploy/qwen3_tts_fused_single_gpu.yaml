@@ -1,5 +1,7 @@
 # Single-stage Qwen3-TTS: the Talker decodes every frame with the stateful
 # streaming codec decoder and returns PCM itself (no Code2Wav stage).
+# reset_prefix_cache(reset_running_requests=True) returns False while requests
+# are running; wait for completion or abort them before resetting the cache.
 pipeline: qwen3_tts_fused
 model_runner: v2
 async_chunk: true

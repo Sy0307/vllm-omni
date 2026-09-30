@@ -14,6 +14,45 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("top_k", [0, 1, 50, 2048])
+@torch.inference_mode()
+def test_fused_sample_kernel_preserves_signed_zero_cutoff_ties(top_k):
+    from vllm_omni.model_executor.models.qwen3_tts.fused_code_predictor import _cp_sample_kernel
+
+    vocab, hidden, groups = 2048, 64, 4
+    logits = torch.zeros(2, vocab, device="cuda", dtype=torch.bfloat16)
+    logits[0, 1] = -0.0
+    logits[1, ::2] = -0.0
+    uniforms = torch.full((2, groups - 1, vocab), 0.01, device="cuda")[:, 1, :]
+    uniforms[0, 1] = uniforms[1, 2] = 0.99
+    codes = torch.full((2, groups), -1, device="cuda", dtype=torch.int64)
+    table = torch.randn(vocab, hidden, device="cuda", dtype=torch.bfloat16)
+    next_input = torch.empty(2, hidden, device="cuda", dtype=table.dtype)
+
+    def sample():
+        _cp_sample_kernel[(2,)](
+            logits, uniforms, uniforms.stride(0), codes, 1, groups, table, next_input, 1.0,
+            V=vocab, TOPK=top_k, HID=hidden, HAS_NEXT=True, num_warps=4,
+        )  # fmt: skip
+
+    scaled = logits.float()
+    if top_k > 0:
+        scaled = scaled.masked_fill(scaled < scaled.topk(top_k).values[:, -1:], -torch.inf)
+    expected = (scaled - torch.log(-torch.log(uniforms))).argmax(-1)
+    assert expected.tolist() == [1, 2]
+    sample()
+    torch.testing.assert_close(codes[:, 1], expected)
+    torch.testing.assert_close(next_input, table[expected])
+    assert (codes[:, [0, 2, 3]] == -1).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sample()
+    codes.fill_(-1)
+    graph.replay()
+    torch.testing.assert_close(codes[:, 1], expected)
+    torch.testing.assert_close(next_input, table[expected])
+
+
 @torch.inference_mode()
 def test_fused_predictor_warmup_with_capacity_one():
     from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (

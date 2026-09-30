@@ -25,6 +25,9 @@ class _FakeStream:
     def wait_stream(self, _stream) -> None:
         pass
 
+    def wait_event(self, _event) -> None:
+        pass
+
 
 class _FakeEvent:
     def record(self, _stream) -> None:
@@ -563,9 +566,11 @@ def test_stream_audio_direct_first_drops_one_frame_and_retains_partial_suffix():
     assert not state.active and not state.pending
 
 
-def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch):
+@pytest.mark.parametrize("consumer", ["pcm_only", "finalizer", "extra"])
+def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch, mocker, consumer):
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
+    from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
 
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
@@ -591,6 +596,14 @@ def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch):
         states,
         np.array([False, False, True]),
     )
+    copy_mm = mocker.spy(omni_ar_model_runner, "_async_copy_mm")
+
+    def finalize(payload, counts):
+        assert payload["codes"]["audio"].shape == (4, 2)
+        return RequestOutputSnapshot([None] * batch.num_reqs)
+
+    finalizer = mocker.Mock(side_effect=finalize) if consumer == "finalizer" else None
+    extra = ({"extra": torch.tensor([7])}, _FakeEvent()) if consumer == "extra" else None
     result = _async_output(
         req_ids=["frame", "eos", "prefill"],
         sampler_output=SamplerOutput(torch.tensor([[1], [2], [3]]), None, None, None),
@@ -599,7 +612,12 @@ def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch):
         input_batch=batch,
         async_chunk=True,
         streaming_audio=streaming_audio,
+        finalize_multimodal=finalizer,
+        extra_multimodal_outputs=extra,
     ).get_output()
+    assert copy_mm.call_count == {"pcm_only": 0, "finalizer": 1, "extra": 2}[consumer]
+    if finalizer is not None:
+        finalizer.assert_called_once()
     wav.fill_(-1)
     assert result.inter_stage_outputs is None
     assert result.multimodal_outputs[0]["model_outputs"].tolist() == [0, 1, 2, 3]

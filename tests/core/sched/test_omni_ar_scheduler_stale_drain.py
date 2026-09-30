@@ -252,3 +252,56 @@ def test_preemption_stale_spec_rejection_does_not_roll_back_resumed_counters():
     assert _run_step(sched, request, num_scheduled=2, token=42, spec=[41])
     assert request.num_computed_tokens == 3
     assert request.num_output_placeholders == 2
+
+
+@pytest.mark.parametrize(
+    "arch,output_type,v2,async_chunk,running,reset_running,blocked",
+    [
+        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, True, True, True, True),
+        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, True, False, True, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, True, True, False, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", "latent", True, True, True, True, False),
+        ("MossTTSLocalModel", "audio", True, True, True, True, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", "audio", False, True, True, True, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, False, True, True, False),
+    ],
+)
+def test_reset_running_streaming_codec_is_rejected_before_preemption(
+    mocker, arch, output_type, v2, async_chunk, running, reset_running, blocked
+):
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from vllm_omni.config.model import OmniModelConfig
+
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.vllm_config = mocker.Mock(
+        spec=VllmConfig,
+        model_config=mocker.Mock(
+            spec=OmniModelConfig,
+            model_arch=arch,
+            engine_output_type=output_type,
+            use_v2_model_runner=v2,
+            async_chunk=async_chunk,
+        ),
+    )
+    request = _make_session()
+    request.num_in_flight_tokens = 1
+    request.num_output_placeholders = 1
+    scheduler.running = [request] if running else []
+
+    def reset_cache(_self, reset_running_requests=False, reset_connector=False):
+        assert reset_running_requests is reset_running and reset_connector is True
+        return True
+
+    reset = mocker.patch.object(Scheduler, "reset_prefix_cache", autospec=True, side_effect=reset_cache)
+
+    assert scheduler.reset_prefix_cache(reset_running, reset_connector=True) is (not blocked)
+    if blocked:
+        reset.assert_not_called()
+        assert scheduler.running == [request]
+        assert request.status == RequestStatus.RUNNING
+        assert request.num_in_flight_tokens == request.num_output_placeholders == 1
+        assert not request.drop_stale_output
+    else:
+        reset.assert_called_once()

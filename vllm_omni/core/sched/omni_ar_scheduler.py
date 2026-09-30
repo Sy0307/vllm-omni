@@ -101,6 +101,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     max_num_running_reqs: int
 
+    def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
+        model_config = self.vllm_config.model_config
+        if (
+            reset_running_requests
+            and self.running
+            and getattr(model_config, "model_arch", None) == "Qwen3TTSTalkerForConditionalGeneration"
+            and getattr(model_config, "engine_output_type", None) == "audio"
+            and getattr(model_config, "use_v2_model_runner", False)
+            and getattr(model_config, "async_chunk", False)
+        ):
+            # Reset preempts and resumes in the same step while discarding
+            # in-flight tokens. The stateful codec and queued PCM have already
+            # consumed those frames and cannot roll back to that boundary.
+            logger.warning(
+                "Cannot reset running Qwen3-TTS streaming requests; wait for "
+                "completion or abort them before resetting the prefix cache."
+            )
+            return False
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished

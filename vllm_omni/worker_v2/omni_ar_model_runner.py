@@ -801,12 +801,19 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 # ownership directly in pinned host memory on the output copy
                 # stream so deferred finalization never performs a blocking
                 # D2H copy on the runner thread.
-                self._mm_snapshot = _async_copy_mm(
-                    multimodal_outputs,
-                    self._total_tokens,
-                    copy_stream=copy_stream,
-                    pin_memory=pin_memory,
-                )
+                if (
+                    streaming_audio is None
+                    or self._finalize_multimodal is not None
+                    or extra_multimodal_outputs is not None
+                ):
+                    # PCM owns its request partition. Generic codes/meta are
+                    # discarded unless a finalizer or extra payload needs them.
+                    self._mm_snapshot = _async_copy_mm(
+                        multimodal_outputs,
+                        self._total_tokens,
+                        copy_stream=copy_stream,
+                        pin_memory=pin_memory,
+                    )
                 if extra_multimodal_outputs:
                     # Produced after sampling on the producer stream; copy only
                     # once its completion event has been observed.

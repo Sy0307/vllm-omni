@@ -164,6 +164,8 @@ def _cp_sample_kernel(
     if TOPK > 0:
         # order-preserving 16-bit keys of the BF16 values
         bits = scaled.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        # Top-k keeps all numeric ties at the cutoff, including both zeros.
+        bits = tl.where((bits & 0x7FFF) == 0, 0, bits)
         key = tl.where(bits >= 0x8000, 0xFFFF - bits, bits | 0x8000)
         the = 0
         for bit in tl.static_range(15, -1, -1):
