@@ -539,7 +539,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self._decode_graphs_initialized = True
         torch.accelerator.synchronize()
         logger.info(
-            "Higgs codec captured %d exact-frame CUDA graphs in %.2f s (allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
+            "Higgs codec captured %d exact-frame CUDA graphs in %.2f s "
+            "(allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
             len(self._decode_graphs),
             time.perf_counter() - start,
             (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,

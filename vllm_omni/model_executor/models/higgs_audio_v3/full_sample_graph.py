@@ -322,7 +322,8 @@ def capture_sample_graphs(model, max_num_reqs):
     torch.accelerator.synchronize()
     model._sample_graphs_ready = True
     logger.info(
-        "Higgs sampler captured %d CUDA graphs in %.2f s (allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
+        "Higgs sampler captured %d CUDA graphs in %.2f s "
+        "(allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
         len(model._dense_sample_graphs),
         time.perf_counter() - start,
         (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
