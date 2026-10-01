@@ -18,55 +18,6 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _record_inputs_kernel(
-    embeds_ptr,
-    history_ptr,
-    slots_ptr,
-    starts_ptr,
-    positions_ptr,
-    num_reqs,
-    EMBED_STRIDE: tl.constexpr,
-    SLOT_STRIDE: tl.constexpr,
-    HIDDEN: tl.constexpr,
-    MAX_LEN: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    token = tl.program_id(0)
-    hidden = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    # Locate the request owning this token. A token grid avoids padding every
-    # decode request to the longest prefill span in a mixed batch.
-    low, high = 0, num_reqs
-    while low + 1 < high:
-        mid = (low + high) // 2
-        start = tl.load(starts_ptr + mid)
-        low = tl.where(start <= token, mid, low)
-        high = tl.where(start <= token, high, mid)
-    slot = tl.load(slots_ptr + low)
-    position = tl.load(positions_ptr + token)
-    value = tl.load(embeds_ptr + token * EMBED_STRIDE + hidden, mask=hidden < HIDDEN, other=0)
-    tl.store(
-        history_ptr + slot * SLOT_STRIDE + position * HIDDEN + hidden,
-        value,
-        mask=(hidden < HIDDEN) & (position >= 0) & (position < MAX_LEN),
-    )
-
-
-def record_talker_inputs(
-    embeds: torch.Tensor,
-    history: torch.Tensor,
-    slots: torch.Tensor,
-    starts: torch.Tensor,
-    positions: torch.Tensor,
-    num_tokens: int,
-    num_reqs: int,
-) -> None:
-    _record_inputs_kernel[(num_tokens, triton.cdiv(embeds.shape[-1], 256))](
-        embeds, history, slots, starts, positions, num_reqs, embeds.stride(0), history.stride(0),
-        embeds.shape[-1], history.shape[1], 256,
-    )  # fmt: skip
-
-
-@triton.jit
 def _pre_kernel(
     meta_ptr,  # int64 [4, n]: batch row, request index, prefill flag, first-audio scheduled
     n,

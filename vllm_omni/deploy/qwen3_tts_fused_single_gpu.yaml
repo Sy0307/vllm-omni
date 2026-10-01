@@ -10,10 +10,9 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 128
-    # Exact conditioned Talker inputs for preemption replay are reserved
-    # after KV profiling on the first input batch: 16 MiB per configured slot
-    # at 1.7B/max_model_len=4096 (~2 GiB at capacity 128), in addition to codec
-    # state and output buffers, even when fewer requests are active.
+    # Exact conditioned Talker inputs for preemption replay are allocated
+    # after KV profiling: 16 MiB per active request at 1.7B/max_model_len=4096
+    # (~2 GiB at 128 requests), in addition to codec state and output buffers.
     # Keep headroom when increasing gpu_memory_utilization or capacity.
     gpu_memory_utilization: 0.5
     trust_remote_code: true
