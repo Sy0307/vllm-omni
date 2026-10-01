@@ -11,16 +11,21 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    ("env", "async_chunk", "v2", "expected"),
+    ("env", "extra", "async_chunk", "v2", "expected"),
     [
-        (None, True, True, True),  # default
-        ("1", True, True, True),
-        ("0", True, True, False),
-        (None, False, True, False),
-        (None, True, False, False),
+        (None, {}, True, True, False),
+        ("1", {}, True, True, False),
+        (None, {"talker_first_audio": True, "codec_chunk_ramp": [1, 2]}, True, True, True),
+        ("0", {"talker_first_audio": True, "codec_chunk_ramp": [1, 2]}, True, True, False),
+        (None, {"talker_first_audio": True, "codec_chunk_ramp": [4, 8]}, True, True, False),
+        (None, {"talker_first_audio": True, "initial_codec_chunk_frames": 1}, True, True, True),
+        (None, {"talker_first_audio": True, "initial_codec_chunk_frames": 4}, True, True, False),
+        (None, {"talker_first_audio": True, "codec_chunk_ramp": [1]}, True, True, False),
+        (None, {"talker_first_audio": True, "codec_chunk_ramp": [1, 2]}, False, True, False),
+        (None, {"talker_first_audio": True, "codec_chunk_ramp": [1, 2]}, True, False, False),
     ],
 )
-def test_talker_first_audio_default_and_conditions(monkeypatch, env, async_chunk, v2, expected):
+def test_talker_first_audio_default_and_conditions(monkeypatch, env, extra, async_chunk, v2, expected):
     if env is None:
         monkeypatch.delenv("VLLM_OMNI_TALKER_FIRST_AUDIO", raising=False)
     else:
@@ -29,7 +34,9 @@ def test_talker_first_audio_default_and_conditions(monkeypatch, env, async_chunk
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(async_chunk=async_chunk, use_v2_model_runner=v2),
+        model_config=SimpleNamespace(
+            async_chunk=async_chunk, use_v2_model_runner=v2, stage_connector_config={"extra": extra}
+        ),
         device_config=SimpleNamespace(device="cuda"),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1, pipeline_parallel_size=1, distributed_executor_backend=None

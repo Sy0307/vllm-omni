@@ -29,14 +29,24 @@ import torch.nn as nn
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorWrapper
 from vllm_omni.model_executor.models.common.talker_first_audio import supports_talker_first_audio
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 logger = init_logger(__name__)
 
 
 def talker_first_audio_enabled(vllm_config: Any) -> bool:
-    """Omni defaults on; Qwen3-TTS requires its connector option. Safety gates are shared."""
-    return os.environ.get("VLLM_OMNI_TALKER_FIRST_AUDIO", "1") == "1" and supports_talker_first_audio(vllm_config)
+    """Opt in only when chunk 0 carries the first frame in the same step."""
+    extra = CodePredictorWrapper._stage_connector_extra_config(vllm_config)
+    ramp = parse_chunk_ramp(extra)
+    initial_frames = ramp[0] if ramp is not None else int(extra.get("initial_codec_chunk_frames") or 0)
+    return (
+        CodePredictorWrapper._parse_bool_config(extra.get("talker_first_audio"))
+        and initial_frames == 1
+        and os.environ.get("VLLM_OMNI_TALKER_FIRST_AUDIO", "1") == "1"
+        and supports_talker_first_audio(vllm_config)
+    )
 
 
 class Qwen3OmniFirstFrameDecoder(nn.Module):

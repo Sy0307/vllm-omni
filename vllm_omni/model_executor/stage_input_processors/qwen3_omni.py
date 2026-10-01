@@ -511,6 +511,11 @@ def thinker2talker_async_chunk(
             # This step's capture was already sent as the previous step's sample.
             sampled = _sampled_token_embed(thinker_embed, request)
             if sampled is None:
+                # A partial (including resumed) prefill has no accepted sample.
+                # Its captures replay text already sent before preemption.
+                raw_sample = thinker_embed.get("sampled")
+                if isinstance(raw_sample, torch.Tensor) and raw_sample.numel() == 0:
+                    return None
                 if _is_final_token(request) is not True and not is_finished:
                     raise RuntimeError(f"Thinker sample embedding missing for request {request_id}")
                 # The final token is never part of the text; a finish goes out

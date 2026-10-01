@@ -15,5 +15,8 @@ cuDNN search restores process settings on exit and has startup cost. Kernel
 arithmetic is not bitwise-equivalent; the first-frame decoder uses additional
 model memory. Full-duplex performance is not established by turn-mode tests.
 
-First-frame delivery requires CUDA, a local single-rank Talker and prefix caching disabled.
+First-frame delivery requires `talker_first_audio: true` in connector extra,
+a one-frame initial codec chunk, CUDA, a local single-rank Talker and prefix caching disabled.
 Other deployments retain the regular Code2Wav path.
+`codec_fused_snake` explicitly opts CUDA profiles into fused decoder blocks;
+the base V1 profile retains its original blocks and indexed text cache.

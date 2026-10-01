@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,7 +13,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
-from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import use_fused_snake
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav, use_fused_snake
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -53,3 +54,26 @@ def test_fused_snake_blocks_match_hf_blocks():
             expected = ref_block(expected)
             actual = fused_block(actual)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("option", "device", "fused"), [(False, "cuda", False), (True, "cuda", True), (True, "cpu", False)]
+)
+def test_decoder_block_fusion_requires_cuda_opt_in(option, device, fused):
+    config = Qwen3OmniMoeCode2WavConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        decoder_dim=32,
+    )
+    model = Qwen3OmniMoeCode2Wav(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=config, stage_connector_config={"extra": {"codec_fused_snake": option}}
+            ),
+            device_config=SimpleNamespace(device=device),
+        )
+    )
+    assert any(isinstance(m, Qwen3OmniMoeSnakeBeta) for m in model.decoder.modules()) is (not fused)

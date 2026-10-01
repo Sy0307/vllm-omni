@@ -127,8 +127,20 @@ def test_terminal_first_token_keeps_captured_stream():
     assert q3._SAMPLED_TEXT_STREAM not in manager.request_payload["r"]
 
 
-def test_missing_sample_on_sampled_stream_fails_loudly():
+@pytest.mark.parametrize("prefill_rows", [0, 1, 3])
+def test_missing_sample_on_sampled_stream(prefill_rows):
     manager = _Manager()
     manager.process(_output(PROMPT, sampled=_embed(11)), _request([11]))
-    with pytest.raises(RuntimeError, match="sample embedding missing"):
-        manager.process(_output([11]), _request([11, 12], history=False))
+    chunk = manager.process(_output([11], sampled=_embed(12)), _request([11, 12], history=False))
+    assert torch.equal(chunk.embed.decode, _embed(12))
+    if not prefill_rows:
+        with pytest.raises(RuntimeError, match="sample embedding missing"):
+            manager.process(_output([12]), _request([11, 12], history=False))
+    else:
+        before = manager.put_req_chunk["r"]
+        for tokens in (PROMPT[:prefill_rows], [11]):
+            partial = _output(tokens, sampled=torch.empty(0))
+            assert manager.process(partial, _request([11, 12], history=False)) is None
+        assert manager.put_req_chunk["r"] == before
+        chunk = manager.process(_output([12], sampled=_embed(13)), _request([11, 12, 13], history=False))
+        assert torch.equal(chunk.embed.decode, _embed(13))

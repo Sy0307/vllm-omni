@@ -215,7 +215,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             Qwen3OmniMoeCausalConvNet(output_dim, 1, kernel_size=7),
         ]
         self.decoder = nn.ModuleList(decoder)
-        use_fused_snake(self.decoder)
+        # Keep existing V1 and non-CUDA decoder blocks unchanged.
+        if (extra or {}).get("codec_fused_snake", False) and torch.device(
+            vllm_config.device_config.device
+        ).type == "cuda":
+            use_fused_snake(self.decoder)
 
         # CUDA Graph support — reuses CUDAGraphDecoderWrapper from Qwen3-TTS
         self._cudagraph_enabled = False

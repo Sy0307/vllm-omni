@@ -33,7 +33,7 @@ def _talker(*, async_chunk: bool = True) -> Qwen3OmniMoeForConditionalGeneration
     nn.Module.__init__(model)
     model.model_stage = "talker"
     model.talker = _Talker()
-    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=async_chunk))
+    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=async_chunk, use_v2_model_runner=True))
     model.tts_eos_embed = torch.full((_H,), -1.0)
     model.tts_pad_embed = torch.full((_H,), -2.0)
     model._codec_codebook_size = 2048
@@ -69,9 +69,11 @@ def test_decode_rows_are_consumed_one_per_step_in_arrival_order():
     assert payload["embed"]["cached_decode"] is None
 
 
-def test_resumable_requests_keep_the_indexed_cache_path():
+@pytest.mark.parametrize(("v2", "resumable"), [(True, True), (False, False), (False, True)])
+def test_v1_and_resumable_requests_keep_the_indexed_cache_path(v2, resumable):
     model = _talker()
-    payload = {"embed": {"cached_decode": _rows(1, 2, 3), "decode": None}, "meta": {"resumable": True}}
+    model.vllm_config.model_config.use_v2_model_runner = v2
+    payload = {"embed": {"cached_decode": _rows(1, 2, 3), "decode": None}, "meta": {"resumable": resumable}}
     payload["meta"]["num_processed_tokens"] = 2
     assert _step(model, payload)[0].item() == 3
 

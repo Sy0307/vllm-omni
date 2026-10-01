@@ -604,38 +604,47 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 3: Code2Wav ==========
         elif self.model_stage == "code2wav":
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
+            num_quantizers = int(self.code2wav.config.num_quantizers)
 
             # Extract codec codes from input
-            if input_ids.shape[0] % 16 == 0:
+            if input_ids.shape[0] % num_quantizers == 0:
                 if seq_token_counts is not None:
-                    max_seq_len = max(seq_token_counts) // 16
+                    max_seq_len = max(seq_token_counts) // num_quantizers
                     batch_size = len(seq_token_counts)
                     split_codes = torch.split(input_ids, seq_token_counts, dim=0)
-                    codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
+                    codes = torch.zeros(
+                        (batch_size, num_quantizers, max_seq_len), device=input_ids.device, dtype=input_ids.dtype
+                    )
                     for idx, code in enumerate(split_codes):
-                        seq_len = code.shape[0] // 16
-                        codes[idx, :, :seq_len] = code.reshape(16, seq_len)
+                        seq_len = code.shape[0] // num_quantizers
+                        codes[idx, :, :seq_len] = code.reshape(num_quantizers, seq_len)
                 else:
-                    codes = input_ids.reshape(1, 16, -1)
+                    codes = input_ids.reshape(1, num_quantizers, -1)
             else:
                 if seq_token_counts is None:
                     logger.debug(
-                        "Code2Wav warmup input length %s is not divisible by 16; padding with zeros.",
+                        "Code2Wav warmup input length %s is not divisible by %s; padding with zeros.",
                         input_ids.shape[0],
+                        num_quantizers,
                     )
                 else:
                     logger.warning_once(
-                        "Code2Wav input length is not divisible by 16; padding with zeros. "
-                        "This is expected only during cudagraph warmup."
+                        "Code2Wav input length is not divisible by %s; padding with zeros. "
+                        "This is expected only during cudagraph warmup.",
+                        num_quantizers,
                     )
                 input_ids_flatten = input_ids.reshape(-1)
                 input_ids_flatten = torch.cat(
                     [
                         input_ids_flatten,
-                        torch.zeros(16 - input_ids.shape[0] % 16, dtype=torch.long, device=input_ids.device),
+                        torch.zeros(
+                            num_quantizers - input_ids.shape[0] % num_quantizers,
+                            dtype=torch.long,
+                            device=input_ids.device,
+                        ),
                     ]
                 )
-                codes = input_ids_flatten.reshape(1, 16, -1)
+                codes = input_ids_flatten.reshape(1, num_quantizers, -1)
 
             # Generate audio from codec codes
             # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
@@ -660,7 +669,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 if len(flags) != len(audio_tensors):
                     raise ValueError("First-audio flags must align with Code2Wav requests")
                 sample_rate = defs.resolve_audio_sample_rate(self.code2wav_config)
-                frame_counts = [count // 16 for count in seq_token_counts] if seq_token_counts else [codes.shape[-1]]
+                frame_counts = (
+                    [count // num_quantizers for count in seq_token_counts] if seq_token_counts else [codes.shape[-1]]
+                )
                 # The causal decoder withholds a right-edge tail. The first
                 # frame has fewer samples than total_upsample; trim its actual
                 # prefix length, including when chunk 0 contains several frames.
@@ -1293,7 +1304,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         cached_thinker_decode_embeds = embed.get("cached_decode", None)
         thinker_decode_embed = embed.get("decode", None)
-        if not meta.get("resumable", False):
+        if getattr(self.vllm_config.model_config, "use_v2_model_runner", False) and not meta.get("resumable", False):
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )

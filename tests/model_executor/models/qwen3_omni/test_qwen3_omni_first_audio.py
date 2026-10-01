@@ -179,25 +179,25 @@ def test_grouped_streaming_decode_matches_one_padded_batch():
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
-@pytest.mark.parametrize("frames", [1, 4])
-def test_delivered_first_frame_is_removed_from_code2wav_output(frames):
+@pytest.mark.parametrize(("frames", "quantizers"), [(1, 16), (4, 16), (4, 4)])
+def test_delivered_first_frame_is_removed_from_code2wav_output(frames, quantizers):
     from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 
-    codec = _code2wav(16)
+    codec = _code2wav(quantizers)
     model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model.model_stage, model.code2wav, model.code2wav_config = "code2wav", codec, codec.config
     model.generate_audio = lambda codes, left, counts: codec.chunked_decode_streaming(
         codes, left_context_size=left, seq_token_counts=counts
     )
-    codes = torch.randint(0, _CODEBOOK, (2, 16, frames))
+    codes = torch.randint(0, _CODEBOOK, (2, quantizers, frames))
     with torch.inference_mode():
-        reference = model.generate_audio(codes, [0, 0], [16 * frames] * 2)
+        reference = model.generate_audio(codes, [0, 0], [quantizers * frames] * 2)
         first = Qwen3OmniFirstFrameDecoder(codec, sample_rate=24000).decode(codes[0, :, :1].T)[0]
         out = model.forward(
             input_ids=codes.flatten(),
             positions=None,
-            seq_token_counts=[16 * frames] * 2,
+            seq_token_counts=[quantizers * frames] * 2,
             runtime_additional_information=[
                 {"meta": {"left_context_size": 0, "first_audio": True}},
                 {"meta": {"left_context_size": 0, "first_audio": False}},
