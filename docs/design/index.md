@@ -117,3 +117,4 @@ The pre-#5137 pages are preserved in the
 are not active design contracts.
 
 - [Qwen3-Omni MRv2 performance](qwen3_omni_mrv2_performance.md)
+- [MiniCPM-o 4.5 turn-mode MRv2 performance](minicpm_o45_mrv2_performance.md)
