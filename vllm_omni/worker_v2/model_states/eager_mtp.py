@@ -68,6 +68,8 @@ class EagerMTPState:
         self._suspended_audio: dict[str, SuspendedAudio] = {}
         self._restore_audio: dict[str, list[torch.Tensor]] = {}
         self._talker_inputs: dict[str, TalkerInputs] = {}
+        self._history_storage: torch.Tensor | None = None
+        self._history_slots: dict[str, int] = {}
 
     def suspend_audio(self, req_id: str, req_idx: int) -> None:
         decoder = getattr(self.owner.model, "stream_decoder", None)
@@ -108,6 +110,7 @@ class EagerMTPState:
             self._restore_audio.pop(req_id, None)
             self.owner._stream_pos.pop(req_id, None)
             self._talker_inputs.pop(req_id, None)
+            self._history_slots.pop(req_id, None)
         if self._audio_buffer is not None:
             self._audio_buffer.finish(req_ids)
 
@@ -137,6 +140,9 @@ class EagerMTPState:
     def record_inputs(self, input_batch: InputBatch, embeds: torch.Tensor) -> None:
         if getattr(self.owner.model, "stream_decoder", None) is None:
             return
+        if embeds.is_cuda and embeds.stride(-1) == 1:
+            self._record_cuda_inputs(input_batch, embeds)
+            return
         history_slices: list[torch.Tensor] = []
         input_slices: list[torch.Tensor] = []
         for i, req_id in enumerate(input_batch.req_ids):
@@ -161,6 +167,56 @@ class EagerMTPState:
         if history_slices:
             # Keep exact inputs for replay without launching one copy per row.
             torch._foreach_copy_(history_slices, input_slices)
+
+    def _record_cuda_inputs(self, input_batch: InputBatch, embeds: torch.Tensor) -> None:
+        """Save exact inputs in slot-owned storage without per-request views per step."""
+        from vllm_omni.worker_v2.model_states.eager_mtp_kernels import record_talker_inputs
+
+        n = len(input_batch.req_ids)
+        if not n:
+            return
+        starts = input_batch.query_start_loc_np[: n + 1]
+        if not starts[-1]:
+            return
+        counts = np.diff(starts)
+        offsets = input_batch.num_computed_tokens_np[:n]
+        lengths = offsets + counts
+        max_len = self.owner.vllm_config.model_config.max_model_len
+        capacity = self.owner.scheduler_config.max_num_seqs
+        slots = input_batch.idx_mapping_np[:n]
+        # The foreach fallback rejects incompatible slices before copying.
+        # Preserve that contract when dispatching to the fused device write.
+        total = int(starts[-1])
+        if embeds.ndim != 2 or starts[0] != 0 or (counts < 0).any() or total > embeds.shape[0]:
+            raise ValueError("Invalid Talker history input spans")
+        if input_batch.positions.ndim != 1 or input_batch.positions.numel() < total:
+            raise ValueError("Invalid Talker history input positions")
+        if self._history_storage is not None and self._history_storage.shape[-1] != embeds.shape[-1]:
+            raise ValueError("Talker history embedding width changed")
+        if (lengths > max_len).any() or (offsets < 0).any():
+            raise ValueError("Talker input history exceeds configured length")
+        if (slots < 0).any() or (slots >= capacity).any() or len(set(slots.tolist())) != n:
+            raise ValueError("Invalid or duplicate Talker history slot")
+        if self._history_storage is None:
+            # Allocated after KV profiling. Suspended histories are copied to
+            # CPU before slot reuse; resumed requests restore into their new slot.
+            self._history_storage = torch.empty(
+                capacity, max_len, embeds.shape[-1], device=embeds.device, dtype=embeds.dtype
+            )
+        for req_id, slot, length in zip(input_batch.req_ids, slots, lengths):
+            history = self._talker_inputs.get(req_id)
+            if history is None or history.embeds.device != embeds.device or self._history_slots.get(req_id) != slot:
+                storage = self._history_storage[int(slot)]
+                if history is not None:
+                    storage[: history.length].copy_(history.embeds[: history.length])
+                history = TalkerInputs(storage, history.length if history else 0)
+                self._talker_inputs[req_id] = history
+                self._history_slots[req_id] = int(slot)
+            history.length = max(history.length, int(length))
+        record_talker_inputs(
+            embeds, self._history_storage, input_batch.idx_mapping, input_batch.query_start_loc,
+            input_batch.positions, total, n,
+        )  # fmt: skip
 
     def prepare_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]

@@ -347,6 +347,62 @@ def test_stream_audio_length_end_flushes_first_and_partial_chunks() -> None:
     assert state.push(torch.ones(4), True).numel() == 8
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.bfloat16])
+def test_stream_audio_batch_views_retain_pcm_after_output_release(dtype):
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
+
+    buffer = StreamingAudioBuffer(samples_per_frame=4, chunk_frames=3)
+    states = [buffer.add("a"), buffer.add("b")]
+    expected: list[list[torch.Tensor]] = [[], []]
+    emitted: list[list[torch.Tensor]] = [[], []]
+    for step in range(5):
+        # Mixed prefill/decode spans, invalid rows, and a final partial chunk.
+        wav = (torch.arange(16).reshape(4, 4) + 100 * step).to(dtype)
+        valid = torch.tensor([False, True, True, step != 4])
+        output = StreamingAudioOutput(
+            wav,
+            valid,
+            torch.tensor(24000),
+            None,
+            np.array([0, 3, 4]),
+            states,
+            np.array([step == 4, step == 4]),
+        )
+        for i, (start, end) in enumerate([(0, 3), (3, 4)]):
+            expected[i].append(wav[start:end][valid[start:end]].reshape(-1).clone())
+        for i, payload in enumerate(output.get_output()):
+            if payload is not None:
+                emitted[i].append(payload["model_outputs"])
+        del output, wav  # Pending views must keep the old host allocation alive.
+    for i in range(2):
+        assert torch.equal(torch.cat(emitted[i]), torch.cat(expected[i]))
+        assert torch.cat(emitted[i]).dtype == dtype
+        assert not states[i].active and not states[i].pending
+        assert states[i].pending_samples == 0
+
+
+def test_stream_audio_numpy_direct_first_cancel_and_mixed_fallback():
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
+
+    buffer = StreamingAudioBuffer(samples_per_frame=4, chunk_frames=3)
+    state = buffer.add("r")
+    state.accept_first_audio()
+    assert state.push(np.arange(8, dtype=np.float32), False) is None
+    assert state.pending_samples == 4
+    # A dtype fallback can arrive while a NumPy frame is pending.
+    chunk = state.push(torch.arange(8, 12, dtype=torch.bfloat16), True)
+    assert chunk.tolist() == list(range(4, 12))
+    assert state.pending_samples == 0
+    buffer.finish({"r"})
+    replacement = buffer.add("r")
+    assert state.push(np.ones(4, dtype=np.float32), False) is None
+    assert replacement.push(np.full(4, 99, dtype=np.float32), False).tolist() == [99] * 4
+    replacement.push(np.ones(4, dtype=np.float32), False)
+    assert replacement.pending_samples == 4
+    buffer.finish({"r"})
+    assert replacement.pending_samples == 0 and not replacement.pending
+
+
 def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
