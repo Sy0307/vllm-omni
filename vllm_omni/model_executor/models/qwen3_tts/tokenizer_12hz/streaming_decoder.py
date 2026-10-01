@@ -50,6 +50,16 @@ _KERNEL = 7
 # --------------------------------------------------------------------------- kernels
 
 
+# Launch shapes of the data-movement kernels, from a bit-exact sweep on H200
+# at batch 96 (2463 -> 2141 us per decode call). Only tiling changes; every
+# output element is computed by the same operations in the same order.
+_IM2COL_BU, _IM2COL_BC, _IM2COL_WARPS = 32, 128, 8
+_SNAKE_BU, _SNAKE_BC, _SNAKE_WARPS = 64, 64, 8
+_COL2IM_BR, _COL2IM_BC, _COL2IM_WARPS = 8, 128, 4
+# 256 rows per program needed 255 registers per thread (12% occupancy).
+_CONV_OUT_BT = 32
+
+
 @triton.jit
 def _rvq_gather_kernel(codes_ptr, books_ptr, out_ptr, NQ: tl.constexpr, CB: tl.constexpr, HALF: tl.constexpr):
     row = tl.program_id(0)
@@ -345,30 +355,40 @@ def _col2im_kernel(
     out_ptr,  # [B * T * R, C]
     T,
     S,
+    NROWS,  # B * T
     R: tl.constexpr,
     C: tl.constexpr,
+    BR: tl.constexpr,
     BC: tl.constexpr,
 ):
-    row = tl.program_id(0)  # b * T + t
+    row = tl.program_id(0) * BR + tl.arange(0, BR)  # b * T + t
     j = tl.program_id(1)  # 0 .. R - 1
     c = tl.program_id(2) * BC + tl.arange(0, BC)
+    rm = row < NROWS
     cm = c < C
+    m = rm[:, None] & cm[None, :]
     b = row // T
     t = row % T
-    slot = tl.load(slots_ptr + b).to(tl.int64)
-    live = tl.load(pos_ptr + b) != 0
-    par = tl.load(par_ptr + slot).to(tl.int64)
-    zr = z_ptr + row.to(tl.int64) * 2 * R * C
-    cur = tl.load(zr + j * C + c, mask=cm).to(tl.float32)
-    prev_in = tl.load(zr - 2 * R * C + (R + j) * C + c, mask=cm & (t > 0), other=0.0).to(tl.float32)
-    prev_st = tl.load(prev_ptr + ((par * S + slot) * R + j) * C + c, mask=cm & (t == 0) & live, other=0.0).to(
-        tl.float32
-    )
-    y = cur + tl.where(t > 0, prev_in, prev_st) + tl.load(bias_ptr + c, mask=cm).to(tl.float32)
+    slot = tl.load(slots_ptr + b, mask=rm, other=0).to(tl.int64)
+    live = tl.load(pos_ptr + b, mask=rm, other=0) != 0
+    par = tl.load(par_ptr + slot, mask=rm, other=0).to(tl.int64)
+    zr = row.to(tl.int64) * 2 * R * C
+    cur = tl.load(z_ptr + (zr + j * C)[:, None] + c[None, :], mask=m).to(tl.float32)
+    prev_in = tl.load(
+        z_ptr + (zr - 2 * R * C + (R + j) * C)[:, None] + c[None, :], mask=m & (t > 0)[:, None], other=0.0
+    ).to(tl.float32)
+    prev_st = tl.load(
+        prev_ptr + (((par * S + slot) * R + j) * C)[:, None] + c[None, :],
+        mask=m & ((t == 0) & live)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    bias = tl.load(bias_ptr + c, mask=cm).to(tl.float32)
+    y = cur + tl.where((t > 0)[:, None], prev_in, prev_st) + bias[None, :]
     dt = out_ptr.dtype.element_ty
-    tl.store(out_ptr + (row.to(tl.int64) * R + j) * C + c, y.to(dt), mask=cm)
-    last = tl.load(zr + (R + j) * C + c, mask=cm & (t == T - 1))
-    tl.store(prev_ptr + (((1 - par) * S + slot) * R + j) * C + c, last, mask=cm & (t == T - 1))
+    tl.store(out_ptr + ((row.to(tl.int64) * R + j) * C)[:, None] + c[None, :], y.to(dt), mask=m)
+    lm = m & (t == T - 1)[:, None]
+    last = tl.load(z_ptr + (zr + (R + j) * C)[:, None] + c[None, :], mask=lm)
+    tl.store(prev_ptr + ((((1 - par) * S + slot) * R + j) * C)[:, None] + c[None, :], last, mask=lm)
 
 
 @triton.jit
@@ -632,8 +652,8 @@ class StreamingCodecDecoder(nn.Module):
             col = torch.empty(B * (h + T), c, device=x.device, dtype=self.dtype)
         else:
             col = torch.empty(B * T, k * c, device=x.device, dtype=self.dtype)
-        bu = 32
-        bc = min(128, triton.next_power_of_2(c))
+        bu = _IM2COL_BU
+        bc = min(_IM2COL_BC, triton.next_power_of_2(c))
         grid = (B, triton.cdiv(h + T, bu), triton.cdiv(c, bc))
         a, ib = snake if snake is not None else (self._dummy, self._dummy)
         _im2col_kernel[grid](
@@ -641,6 +661,7 @@ class StreamingCodecDecoder(nn.Module):
             spec.hist if h > 0 else self._dummy, slots, pos, self.parity, col,
             T, self.num_slots, C=c, K=k, D=d, H=h,
             HAS_BIAS=bias is not None, HAS_SNAKE=snake is not None, BU=bu, BC=bc, EXT=ext,
+            num_warps=_IM2COL_WARPS,
         )  # fmt: skip
         return col
 
@@ -661,11 +682,12 @@ class StreamingCodecDecoder(nn.Module):
     def _snake(self, x, snake, bias):
         n, c = x.shape
         out = torch.empty_like(x)
-        bu, bc = 32, min(128, triton.next_power_of_2(c))
+        bu, bc = _SNAKE_BU, min(_SNAKE_BC, triton.next_power_of_2(c))
         one = torch.zeros(1, device=x.device, dtype=torch.int32)
         _im2col_kernel[(1, triton.cdiv(n, bu), triton.cdiv(c, bc))](
             x, bias, snake[0], snake[1], self._dummy, one, one, self.parity, out,
             n, self.num_slots, C=c, K=1, D=1, H=0, HAS_BIAS=True, HAS_SNAKE=True, BU=bu, BC=bc,
+            num_warps=_SNAKE_WARPS,
         )  # fmt: skip
         return out
 
@@ -737,10 +759,10 @@ class StreamingCodecDecoder(nn.Module):
             zt = torch.mm(s, blk["w"])  # [rows, 2 * rate * c_out]
             r, c_out = blk["rate"], blk["c_out"]
             x = torch.empty(rows * r, c_out, device=dev, dtype=dt)
-            bc = min(128, triton.next_power_of_2(c_out))
-            _col2im_kernel[(rows, r, triton.cdiv(c_out, bc))](
-                zt, blk["b"], blk["prev"], slots, pos, self.parity, x, t_rows, self.num_slots,
-                R=r, C=c_out, BC=bc,
+            bc = min(_COL2IM_BC, triton.next_power_of_2(c_out))
+            _col2im_kernel[(triton.cdiv(rows, _COL2IM_BR), r, triton.cdiv(c_out, bc))](
+                zt, blk["b"], blk["prev"], slots, pos, self.parity, x, t_rows, self.num_slots, rows,
+                R=r, C=c_out, BR=_COL2IM_BR, BC=bc, num_warps=_COL2IM_WARPS,
             )  # fmt: skip
             rows, t_rows = rows * r, t_rows * r
             for u in blk["units"]:
@@ -754,9 +776,9 @@ class StreamingCodecDecoder(nn.Module):
 
         ext = self._im2col(x, self.conv_out, t_rows, slots, pos, bias=self.out_pb, snake=self.out_snake, ext=True)
         wav = torch.empty(B, t_rows, device=dev, dtype=torch.float32)
-        _conv_out_kernel[(B, triton.cdiv(t_rows, 256))](
+        _conv_out_kernel[(B, triton.cdiv(t_rows, _CONV_OUT_BT))](
             ext, self.conv_out_w, self.conv_out_b, wav, t_rows,
-            C=self.out_c, K=_KERNEL, BT=256, CP=triton.next_power_of_2(self.out_c),
+            C=self.out_c, K=_KERNEL, BT=_CONV_OUT_BT, CP=triton.next_power_of_2(self.out_c),
         )  # fmt: skip
         _flip_kernel[(B,)](self.parity, slots)
         return wav
