@@ -111,6 +111,10 @@ class EagerMTPState:
         if self._audio_buffer is not None:
             self._audio_buffer.finish(req_ids)
 
+    def has_pending_replay(self) -> bool:
+        """Whether any preempted request still has saved inputs to replay."""
+        return bool(self._restore_audio)
+
     def replay_inputs(self, req_id: str, req_idx: int, offset: int, ids: torch.Tensor, embeds: torch.Tensor) -> bool:
         """Rebuild freed Talker KV from the exact conditioned inputs, without rerunning MTP."""
         if req_id not in self._restore_audio:
@@ -405,13 +409,15 @@ class EagerMTPState:
                         p = int(ref.shape[0])
                 pos_list.append(p)
                 positions[req_id] = p + 1
-        meta_list = (
-            [i for i, _r, _q, _p in entries]
-            + [r for _i, r, _q, _p in entries]
-            + [int(p) for _i, _r, _q, p in entries]
-            + [int(q in fa_requests) for _i, _r, q, _p in entries]
-            + pos_list
-        )
+        # One transpose of the entry tuples instead of a Python pass per field.
+        rows_i, rows_req_idx, rows_req_id, rows_prefill = zip(*entries) if entries else ((), (), (), ())
+        meta_list = [
+            *rows_i,
+            *rows_req_idx,
+            *map(int, rows_prefill),
+            *[int(req_id in fa_requests) for req_id in rows_req_id],
+            *pos_list,
+        ]
         meta = index_to_device(meta_list, device)
         rows = meta[bsz : 2 * bsz]
         sampled = sampled_token_ids.reshape(input_batch.num_reqs, -1)
@@ -430,7 +436,7 @@ class EagerMTPState:
             req_indices, batch_ids, batch_emb, batch_hidden, batch_step, mtp_batch_descriptor_dispatcher
         )
         assert codes is not None
-        has_prefill = any(p for _i, _r, _q, p in entries)
+        has_prefill = any(rows_prefill)
         fa_in_kernel = isinstance(first_audio, torch.Tensor) and not has_prefill
         valid = eager_post(
             meta, bsz, last_tokens, layer0, frame_embeds.reshape(frame_embeds.shape[0], -1).contiguous(),
@@ -438,8 +444,7 @@ class EagerMTPState:
             first_audio if fa_in_kernel else None, self._first_audio_valid if fa_in_kernel else None,
             owner.model._codebook_vocab_size,
         )  # fmt: skip
-        for _i, req_idx, req_id, _prefill in entries:
-            owner._eager_ready[req_idx] = req_id
+        owner._eager_ready.update(zip(rows_req_idx, rows_req_id))
         if pos_list:
             assert stream is not None
             assert isinstance(stream_out, torch.Tensor)

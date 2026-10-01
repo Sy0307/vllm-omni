@@ -636,6 +636,26 @@ def test_publish_sampled_embeddings_is_opt_in() -> None:
     assert state.publish_sampled_embeddings(SimpleNamespace(num_reqs=1), torch.tensor([[1]])) is None
 
 
+def test_split_settled_rows_matches_per_row_check():
+    batch = SimpleNamespace(
+        num_reqs=5,
+        idx_mapping_np=np.array([3, 0, 2, 1, 4]),
+        req_ids=["c", "a", "x", "b", "e"],
+        num_scheduled_tokens=np.array([1, 1, 1, 4, 1]),
+        query_start_loc_np=np.array([0, 1, 2, 3, 7]),
+    )
+    req_indices = batch.idx_mapping_np.tolist()
+    # Slot 2 still names a finished request, slot 1 schedules a prefill
+    # chunk, slot 4 is not settled and slot 7 is not scheduled.
+    settled = {3: "c", 0: "a", 2: "old", 1: "b", 7: "z"}
+    split = OmniModelState._split_settled_rows(batch, req_indices, settled)
+    assert split is not None
+    settled_rows, remaining = split
+    assert settled_rows == [(0, 3, 0, "c"), (1, 0, 1, "a")]
+    assert remaining == [(2, 2), (3, 1), (4, 4)]
+    assert OmniModelState._split_settled_rows(batch, req_indices, {2: "old"}) is None
+
+
 @pytest.mark.parametrize("prefilling", [False, True])
 def test_identity_preprocess_skips_only_decode_rows(prefilling):
     state = _make_state(has_preprocess=True)
