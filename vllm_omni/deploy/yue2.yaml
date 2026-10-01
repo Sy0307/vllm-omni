@@ -1,5 +1,5 @@
 # YuE2-3B deploy: single-stage native-AR text-to-music (~3.6B bf16 + VAE).
-# Target 1x 24 GB card; verified on a single RTX 4090.
+# Starting configuration for 1x 24 GB card; remeasure the target workload.
 #
 # The architectures pin is required: the checkpoint's config.json names
 # "YuE2ForCausalLM" with an auto_map that only makes sense under
@@ -13,17 +13,26 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
+    # Sized for a 24 GB card. A finishing song keeps its slot while it is
+    # synthesized on a side stream (emitting HOLD tokens meanwhile). On one
+    # H200 the synthesis pass saturates the GPU at about 32 songs in flight,
+    # and more slots only add hold steps (120 s songs, gpu_memory_utilization
+    # 0.5: 54 audio s/s at 32 concurrent requests; at 64 concurrent, 56 with
+    # 32 slots vs 50 with 64), so raise this to 32 there, not higher.
     max_num_seqs: 4
-    # Measured on a 24 GB RTX 4090 with 4 concurrent requests pinned to the
-    # 9000-frame cap (worst case): the engine reserves ~15.8 GiB at 0.70 and
-    # peak usage during the terminal NAR/VAE finishing pass reaches 20.9 GiB,
-    # leaving ~3 GiB of headroom. 0.85 reserves ~19.4 GiB and the same
-    # workload OOMs inside the finishing pass.
+    # Reserve synthesis headroom: NAR K/V, acoustic graph buffers and VAE
+    # activations are allocated beyond the engine budget. The earlier 4090
+    # memory measurement predates async/compiled synthesis; 0.70 is a starting
+    # point, not a guarantee for 9000 frames or long ABC prefixes. Lower it if
+    # the target workload needs more synthesis memory (see the model recipe).
     gpu_memory_utilization: 0.70
-    # Phase 1 keeps the backbone eager: the model-owned sampler runs after the
-    # forward, and the terminal NAR/VAE pass runs inside the finishing step.
-    # CUDA-graph capture of the standard Qwen3 backbone is a perf follow-up.
-    enforce_eager: true
+    # Capture the AR backbone: a batch-1 decode step is launch-bound, and the
+    # model creates request state in prepare_runner_inputs, which also runs
+    # on a replayed step. The model-owned sampler (itself a captured graph)
+    # and the terminal NAR/VAE pass run after the forward, outside the graph.
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
     # Prefix caching stays off: the omni prefix-cache save snapshots the
     # step's mm payload before the model-owned sampler runs, but YuE2
     # appends the decoded waveform inside sample() (the terminal NAR/VAE

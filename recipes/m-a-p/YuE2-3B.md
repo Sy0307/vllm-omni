@@ -40,9 +40,11 @@ user-downloaded weights and bundles none.
 | Output | 48 kHz stereo, whole song delivered when the semantic request finishes |
 
 Generation is one or two requests on a single AR stage: the abc phase writes
-the score, the semantic phase generates codec frames and, on its last step,
-solves the ODE and decodes the whole song in-engine (weights load once; the
-VAE loads at startup from `$YUE2_VAE` or the hub id).
+the score, the semantic phase generates codec frames, then queues the ODE and VAE on a
+high-priority CUDA stream. Other requests keep decoding while the finishing
+request emits HOLD tokens (up to 4096 steps, within its token/context budget).
+The scheduler is unchanged. Weights load once; the VAE loads at startup from
+`$YUE2_VAE` or the hub id.
 
 ## Running
 
@@ -67,15 +69,27 @@ ending.
 
 ## Notes
 
-- **Memory (RTX 4090, 24 GB, `gpu_memory_utilization: 0.70`):** the engine
-  reserves ~15.8 GiB after startup; with 4 concurrent requests pinned to the
-  9000-frame cap (worst case), peak usage during the terminal NAR/VAE
-  finishing pass reaches ~20.9 GiB, leaving ~3 GiB of headroom. At 0.85 the
-  same workload OOMs inside the finishing pass, so the deploy yaml pins 0.70.
-- **Known limitations:** 4 concurrent full-length requests are the verified
-  shape (`max_num_seqs: 4`); CUDA graph capture is a
-  follow-up; the abc phase runs eagerly
-  after prefill (its tokens are the product, not audio).
+- **Memory:** `gpu_memory_utilization` budgets the vLLM engine; NAR K/V,
+  acoustic graph buffers and VAE activations also need room during synthesis.
+  The 0.70 / 4-slot defaults are a starting point for 24 GB cards. The earlier
+  RTX 4090 measurement (15.8 GiB after startup, 20.9 GiB peak at 9000 frames)
+  predates the async/compiled implementation; it does not validate this
+  version or long ABC prefixes on a 4090. Reduce the fraction if the target
+  workload needs more synthesis memory, especially for long ABC prefixes and
+  the 9000-frame cap. Releasing completed chunks bounds live NAR buffers,
+  while the shared graph allocator retains reserved storage for reuse.
+- **CUDA graphs:** the AR backbone uses FULL_AND_PIECEWISE graphs; both ABC
+  and semantic sampling use prewarmed power-of-two graph buckets. Custom
+  sampler captures have a bounded cache and fall back to eager sampling when
+  it fills. The NAR velocity pass uses a chunk graph on the serialized synthesis
+  stream. Chunk graphs share one allocator pool; completed chunks release
+  their engines and buffers after their own events. FA3 runs on Hopper; other
+  CUDA cards use SDPA, which is also warmed at startup.
+- **Serving:** H200 throughput testing uses `max_num_seqs: 32` and
+  `gpu_memory_utilization: 0.5`. The default remains 4 slots for smaller cards.
+  Audio is delivered as a whole song; time to first audio equals completion
+  latency. Aborting a running song stops future work units and waits only for
+  the at-most-two submitted units before releasing its buffers.
 - Audio is not expected to match the upstream torch reference bit-for-bit
   (fused vs eager kernels). Measured against the upstream torch reference
   (bd90e4c, same style/lyrics/seed 831001, cot=off, 200 frames): prompt token

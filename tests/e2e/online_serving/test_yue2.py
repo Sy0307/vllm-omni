@@ -60,8 +60,7 @@ DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 900.0
 # 400 frames = 16 s of song. The byte floor sits far below the observed
 # payload (~3.0 MB of 48 kHz stereo 16-bit) to leave room for an early EOS.
 _FRAMES = 400
-# Concurrent pair stays short: it exists to exercise row re-indexing, not
-# to double the wall time.
+# Short concurrent requests exercise row re-indexing as budgets differ.
 _CONCURRENT_FRAMES = 250
 _MIN_BYTES = 1_000_000
 
@@ -173,7 +172,7 @@ def test_yue2_metal_twinkle_001(omni_server, openai_client, tmp_path) -> None:
     # CI runs without the verification assets, so the structural checks below
     # are the only guard against the two real bugs this PR fixed during review:
     # mono/half-speed output (WAV header + duration bounds) and the int32
-    # crash under concurrent row re-indexing (two simultaneous requests).
+    # crash under concurrent row re-indexing (simultaneous requests).
     # Duration bounds: the end token is masked for the first 200 steps
     # (min_tokens), and the 400-frame budget caps the song, so a healthy
     # request lands in [8, 16.5] s; the half-speed bug produced ~32 s.
@@ -190,13 +189,15 @@ def test_yue2_metal_twinkle_001(omni_server, openai_client, tmp_path) -> None:
     # (see _http_speech); the OpenAI SDK response does not expose headers.
     _http_speech(omni_server, seed=SEED, frames=_FRAMES)
 
-    # Two concurrent requests with different seeds: both must succeed and
-    # produce different songs (the model-owned sampler re-indexes rows across
-    # concurrent requests; a dtype mismatch here crashed the engine before).
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(_http_speech, omni_server, seed=SEED + i, frames=_CONCURRENT_FRAMES) for i in range(2)]
-        pair = [f.result() for f in futures]
-    assert pair[0] != pair[1], "different seeds produced identical audio"
+    # Different budgets exercise row re-indexing as shorter requests finish.
+    # Compare the same-budget pair so length cannot hide an ignored seed.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(_http_speech, omni_server, seed=SEED + i, frames=frames)
+            for i, frames in enumerate((_CONCURRENT_FRAMES, _FRAMES, _CONCURRENT_FRAMES))
+        ]
+        audios = [f.result() for f in futures]
+    assert audios[0] != audios[2], "different seeds produced identical audio at the same frame budget"
 
     # Without the verification assets the structural assertions above
     # (non-empty payload, byte floor) are the whole test — pass on them.
@@ -235,3 +236,30 @@ def test_yue2_metal_twinkle_001(omni_server, openai_client, tmp_path) -> None:
     assert melody_score > control_score, (
         f"calibration: ABC-conditioned {melody_score:.3f} not above control {control_score:.3f}"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
+    """A client disconnect must release its request and preserve serving."""
+    # The chosen seed and budget time out on the tested cards. Require the
+    # timeout so this cannot silently become another successful request;
+    # whether it lands in AR or synthesis depends on the card.
+    with pytest.raises(httpx.TimeoutException):
+        httpx.post(
+            f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech",
+            json={
+                "model": omni_server.model,
+                "input": LYRICS,
+                "instructions": CAPTION,
+                "seed": SEED + 2,
+                "max_new_tokens": 3000,
+                "stream": False,
+                "response_format": "wav",
+                "extra_params": {"cot": "off"},
+            },
+            timeout=1.0,
+        )
+    _http_speech(omni_server, seed=SEED + 3, frames=_CONCURRENT_FRAMES)
