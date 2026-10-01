@@ -57,9 +57,18 @@ def test_fused_snake_blocks_match_hf_blocks():
 
 
 @pytest.mark.parametrize(
-    ("option", "device", "fused"), [(False, "cuda", False), (True, "cuda", True), (True, "cpu", False)]
+    ("option", "device", "cuda", "fused"),
+    [
+        (False, "cuda", True, False),
+        (True, "cuda", True, True),
+        (True, "cpu", True, False),
+        (True, "cuda", False, False),
+    ],
 )
-def test_decoder_block_fusion_requires_cuda_opt_in(option, device, fused):
+def test_decoder_block_fusion_requires_cuda_opt_in(monkeypatch, option, device, cuda, fused):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
     config = Qwen3OmniMoeCode2WavConfig(
         hidden_size=32,
         intermediate_size=64,

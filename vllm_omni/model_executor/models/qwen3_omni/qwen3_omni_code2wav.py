@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -216,9 +217,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         ]
         self.decoder = nn.ModuleList(decoder)
         # Keep existing V1 and non-CUDA decoder blocks unchanged.
-        if (extra or {}).get("codec_fused_snake", False) and torch.device(
-            vllm_config.device_config.device
-        ).type == "cuda":
+        if (
+            (extra or {}).get("codec_fused_snake", False)
+            and current_omni_platform.is_cuda()
+            and torch.device(vllm_config.device_config.device).type == "cuda"
+        ):
             use_fused_snake(self.decoder)
 
         # CUDA Graph support — reuses CUDAGraphDecoderWrapper from Qwen3-TTS
