@@ -106,16 +106,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if (
             reset_running_requests
             and self.running
-            and getattr(model_config, "model_arch", None) == "Qwen3TTSTalkerForConditionalGeneration"
-            and getattr(model_config, "engine_output_type", None) == "audio"
-            and getattr(model_config, "use_v2_model_runner", False)
-            and getattr(model_config, "async_chunk", False)
+            and not getattr(model_config, "supports_running_prefix_cache_reset", True)
         ):
             # Reset preempts and resumes in the same step while discarding
             # in-flight tokens. The stateful codec and queued PCM have already
             # consumed those frames and cannot roll back to that boundary.
             logger.warning(
-                "Cannot reset running Qwen3-TTS streaming requests; wait for "
+                "This stage cannot reset running requests; wait for "
                 "completion or abort them before resetting the prefix cache."
             )
             return False

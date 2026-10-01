@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Prefix graphs must follow per-request first-audio delivery, not a capture hint."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -204,11 +205,11 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
 @torch.inference_mode()
 def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph):
     from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import (
         StreamingCodecDecoder,
         StreamingDecodeGraphs,
     )
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 
     decoder = _make_decoder().to(device=DEVICE, dtype=torch.bfloat16)
     for name, param in decoder.named_parameters():
@@ -217,9 +218,11 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
     decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
     stream = StreamingCodecDecoder(decoder, num_slots=5, dtype=torch.bfloat16)
     graphs = StreamingDecodeGraphs(stream, [2], frames=25) if use_graph else None
-    eager = EagerMTPState(
-        SimpleNamespace(device=torch.device(DEVICE), model=SimpleNamespace(stream_prime_graphs=graphs))
-    )
+    model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.stream_decoder = stream
+    model.stream_prime_graphs = graphs
+    model.stream_chunk_frames = 25
     refs = [torch.randint(0, 32, (length, 2), device=DEVICE) for length in [25, 3, 51, 25]]
     slots = [2, 0, 3, 4]
     frame = torch.randint(0, 32, (4, 1, 2), device=DEVICE)
@@ -235,8 +238,53 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
     expected = stream(frame, slot_tensor, positions).clone()
     untouched = stream.save_slot(1)
     # Reuse dirty slots; pos=0 must reset every causal layer for each group.
-    eager._prime_stream(stream, list(zip(slots, refs, strict=True)))
+    model.prime_stream_decoder(list(zip(slots, refs, strict=True)))
     actual = stream(frame, slot_tensor, positions)
     torch.testing.assert_close(actual, expected, rtol=0, atol=3e-5)
     for got, want in zip(stream.save_slot(1), untouched, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_stream_frames_match_fp32_exact_decoder(use_graph, dtype):
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import (
+        StreamingCodecDecoder,
+        StreamingDecodeGraphs,
+    )
+
+    decoder = _make_decoder().to(device=DEVICE, dtype=dtype)
+    # The tiny HF default initialization shrinks the deep conv stack to
+    # near-zero PCM. Keep the oracle signal large enough to catch lost state.
+    for module in decoder.modules():
+        if isinstance(module, (torch.nn.Conv1d, torch.nn.ConvTranspose1d, torch.nn.Linear)):
+            torch.nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+            if module.bias is not None:
+                module.bias.uniform_(-0.01, 0.01)
+    for name, param in decoder.named_parameters():
+        if name.endswith("embedding_sum"):
+            param.normal_()
+    decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
+    reference = _make_decoder().to(device=DEVICE, dtype=torch.float32)
+    reference.load_state_dict(decoder.state_dict())
+    reference.precompute_snake_caches()
+    # Cross both the attention window and KV ring wrap, checking every frame.
+    codes = torch.randint(0, 32, (2, 136, 2), device=DEVICE)
+    expected = reference._forward_exact(codes.transpose(1, 2))[:, 0]
+    assert expected.square().sum() > 1e-3
+    stream = StreamingCodecDecoder(decoder, num_slots=3, dtype=dtype)
+    decode = StreamingDecodeGraphs(stream, [2]) if use_graph else stream
+    slots = torch.tensor([2, 0], device=DEVICE, dtype=torch.int32)
+    spf = int(stream.spf)
+    for frame in range(codes.shape[1]):
+        positions = torch.full((2,), frame, device=DEVICE, dtype=torch.int32)
+        actual = decode(codes[:, frame : frame + 1].contiguous().to(torch.int32), slots, positions).reshape(2, -1)
+        exact_frame = expected[:, frame * spf : (frame + 1) * spf]
+        relative_rms = (actual - exact_frame).square().mean(1).sqrt() / exact_frame.square().mean(1).sqrt()
+        # BF16 kernels are approximate; compare every frame to the independent
+        # FP32 full decoder, not only one streaming implementation to itself.
+        tolerance = 0.05 if dtype == torch.bfloat16 else 5e-4
+        assert torch.all(relative_rms < tolerance), (frame, relative_rms)

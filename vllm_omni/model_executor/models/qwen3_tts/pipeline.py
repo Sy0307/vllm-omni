@@ -93,6 +93,7 @@ QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
             final_output_type="audio",
             # The API output processor tags ``model_outputs`` by this modality.
             engine_output_type="audio",
+            supports_running_prefix_cache_reset=False,
             supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,

@@ -141,3 +141,47 @@ def test_topk_gumbel_accepts_strided_supplied_uniforms(top_k):
     expected = (scaled.float() - torch.log(-torch.log(uniforms))).argmax(-1, keepdim=True)
     actual = sample_code_topk_gumbel(logits, uniforms, top_k, 1 / 0.9)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("top_k", [1, 50])
+@torch.inference_mode()
+def test_fused_predictor_matches_full_reference_with_fixed_uniforms(mocker, batch, top_k):
+    from vllm.config import VllmConfig
+
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+        Qwen3TTSTalkerCodePredictorConfig,
+        Qwen3TTSTalkerConfig,
+    )
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code_predictor_vllm import (
+        Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM,
+    )
+
+    torch.manual_seed(42)
+    cp = Qwen3TTSTalkerCodePredictorConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, num_code_groups=4,
+    )  # fmt: skip
+    config = mocker.Mock(
+        spec=VllmConfig,
+        model_config=mocker.Mock(stage_connector_config={}),
+        additional_config={"code_predictor_kv_cache": True, "code_predictor_fused": True},
+        scheduler_config=mocker.Mock(max_num_seqs=4),
+    )
+    predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(
+        vllm_config=config, config=cp, talker_config=Qwen3TTSTalkerConfig(hidden_size=64, num_code_groups=4)
+    ).to(device="cuda", dtype=torch.bfloat16)
+    predictor._setup_compile()
+    assert predictor._fused is not None
+    ids = torch.randint(0, 64, (batch, 1), device="cuda")
+    embeds = torch.randn(batch, 1, 64, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn_like(embeds)
+    uniforms = torch.rand(batch, 3, 64, device="cuda").clamp_(1e-6, 1 - 1e-6)
+    actual = predictor(ids, embeds, hidden, top_k=top_k, sample_uniforms=uniforms).clone()
+    # Use identical parameters through the full re-prefill and ATen sampling
+    # path, bypassing both the fused predictor and its frame-local KV cache.
+    predictor._fused_requested = False
+    predictor._fused = None
+    predictor._frame_cache = None
+    expected = predictor(ids, embeds, hidden, top_k=top_k, sample_uniforms=uniforms)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -14,16 +14,13 @@ from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.states import RequestState
 
-from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
 
 if TYPE_CHECKING:
     from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
-
-# Reference codes prime a voice-clone decoder slot in chunks of this size.
-_PRIME_CHUNK_FRAMES = 25
 
 
 def _has_ref_codes(buffer: dict[str, Any]) -> bool:
@@ -401,7 +398,7 @@ class EagerMTPState:
                 p = positions.get(req_id)
                 if p is None:
                     first_rows.append(row)
-                    ref = self._stream_ref_context(req_idx)
+                    ref = model.get_stream_ref_context(owner.intermediate_buffer.buffers[req_idx])
                     p = 0
                     if ref is not None:
                         primes.append((req_idx, ref))
@@ -459,7 +456,7 @@ class EagerMTPState:
                     saved = self._restore_audio.pop(req_id, None)
                     if saved is not None:
                         stream.restore_slot(req_idx, saved)
-                self._prime_stream(stream, primes)
+                model.prime_stream_decoder(primes)
                 pcm = decode(frame_codes, rows, meta[4 * bsz : 5 * bsz])
                 stream_out.index_copy_(0, last_tokens, pcm.reshape(bsz, -1).to(stream_out.dtype))
                 self._send_stream_first_frames(entries, pcm, valid, first_rows)
@@ -501,33 +498,6 @@ class EagerMTPState:
         assert self._audio_buffer is not None
         for request_id in accepted:
             self._audio_buffer.requests[request_id].accept_first_audio()
-
-    def _stream_ref_context(self, req_idx: int) -> torch.Tensor | None:
-        """Last ``ref_code_context_frames`` reference codes [T, Q] of a voice-clone request, if any."""
-        info = self.owner.intermediate_buffer.buffers[req_idx]
-        if not _has_ref_codes(info):
-            return None
-        ref = info["codes"]["ref"]
-        ref = ref.reshape(-1, int(self.owner.model.talker_config.num_code_groups))
-        return ref[-self.owner.model.stream_ref_context_frames :]
-
-    def _prime_stream(self, stream, primes: list[tuple[int, torch.Tensor]]) -> None:
-        """Prime independent slots together when their reference lengths match."""
-        groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
-        for req_idx, ref in primes:
-            groups.setdefault(int(ref.shape[0]), []).append((req_idx, ref))
-        dev = self.owner.device
-        model = getattr(self.owner, "model", None)
-        prime_graphs = getattr(model, "stream_prime_graphs", None)
-        for items in groups.values():
-            codes = to_device_nonblocking(torch.stack([ref for _idx, ref in items]), dev).to(torch.int32)
-            n = len(items)
-            slots = index_to_device([idx for idx, _ref in items], dev, dtype=torch.int32)
-            for t0 in range(0, int(codes.shape[1]), _PRIME_CHUNK_FRAMES):
-                pos = index_to_device([t0] * n, dev, dtype=torch.int32)
-                chunk = codes[:, t0 : t0 + _PRIME_CHUNK_FRAMES].contiguous()
-                decode = prime_graphs if prime_graphs is not None and chunk.shape[1] == prime_graphs.frames else stream
-                decode(chunk, slots, pos)
 
     def _publish_first_audio(
         self,

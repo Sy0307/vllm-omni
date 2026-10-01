@@ -134,6 +134,27 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     return sched._update_request_with_output.called
 
 
+def test_connector_prompt_replacement_drops_old_frame_and_delivers_new_frame() -> None:
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+    session = _make_session()
+    session.num_computed_tokens = 6
+    session.num_in_flight_tokens = 1
+    session.num_output_placeholders = 1
+    sched = _make_drain_sched(session)
+    sched.chunk_transfer_adapter.replaced_streaming_prompt_ids = {session.request_id}
+    sched.chunk_transfer_adapter.requests_with_ready_chunks = {session.request_id}
+    sched.chunk_transfer_adapter.requests_num_chunks_sent = {session.external_req_id: 2}
+
+    OmniSchedulerMixin._reset_ready_async_chunk_replacements(sched)
+    assert session.num_stale_output_tokens == 1 and session.drop_stale_output
+    assert session.num_output_placeholders == 0
+    sched._release_replaced_streaming_prompt_cache.assert_called_once_with(session)
+    assert _run_step(sched, session, num_scheduled=1, token=42) is False
+    assert session.num_stale_output_tokens == 0
+    assert _run_step(sched, session, num_scheduled=1, token=43) is True
+
+
 def test_exact_drain_delivers_new_segment_frame() -> None:
     """One in-flight decode frame at replacement: its late output drains the
     counter exactly and the new segment's first frame is delivered."""
@@ -255,19 +276,18 @@ def test_preemption_stale_spec_rejection_does_not_roll_back_resumed_counters():
 
 
 @pytest.mark.parametrize(
-    "arch,output_type,v2,async_chunk,running,reset_running,blocked",
+    "arch,supports_reset,running,reset_running,blocked",
     [
-        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, True, True, True, True),
-        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, True, False, True, False),
-        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, True, True, False, False),
-        ("Qwen3TTSTalkerForConditionalGeneration", "latent", True, True, True, True, False),
-        ("MossTTSLocalModel", "audio", True, True, True, True, False),
-        ("Qwen3TTSTalkerForConditionalGeneration", "audio", False, True, True, True, False),
-        ("Qwen3TTSTalkerForConditionalGeneration", "audio", True, False, True, True, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", False, True, True, True),
+        ("Qwen3TTSTalkerForConditionalGeneration", False, False, True, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", False, True, False, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", True, True, True, False),
+        ("AnotherStatefulAudioModel", False, True, True, True),
+        ("AnotherStatefulAudioModel", True, True, True, False),
     ],
 )
 def test_reset_running_streaming_codec_is_rejected_before_preemption(
-    mocker, arch, output_type, v2, async_chunk, running, reset_running, blocked
+    mocker, arch, supports_reset, running, reset_running, blocked
 ):
     from vllm.config import VllmConfig
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -280,9 +300,7 @@ def test_reset_running_streaming_codec_is_rejected_before_preemption(
         model_config=mocker.Mock(
             spec=OmniModelConfig,
             model_arch=arch,
-            engine_output_type=output_type,
-            use_v2_model_runner=v2,
-            async_chunk=async_chunk,
+            supports_running_prefix_cache_reset=supports_reset,
         ),
     )
     request = _make_session()

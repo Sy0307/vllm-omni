@@ -27,6 +27,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -36,9 +37,10 @@ from vllm_omni.utils.speaker_cache import (
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
-from .first_audio import stream_ref_context_frames, talker_first_audio_enabled, talker_stream_decode_enabled
+from .first_audio import talker_first_audio_enabled
 from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
 
@@ -417,9 +419,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_first_audio = self.stream_decode and predictor._parse_bool_config(
             extra.get("talker_stream_first_audio")
         )
-        # Reference-code frames that prime a voice-clone stream's decoder,
-        # matching the Code2Wav stage's first-chunk context.
-        self.stream_ref_context_frames = stream_ref_context_frames(vllm_config)
+        # Model-local voice-clone priming boundary; each deployment selects
+        # its reference context independently of the two-stage codec profile.
+        self.stream_ref_context_frames = stream_ref_context_frames(vllm_config) if self.stream_decode else 0
         self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
         self.stream_decoder = None
         self.stream_graphs = None
@@ -1504,6 +1506,35 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 self.stream_prime_graphs.frames,
                 self.stream_prime_graphs.sizes,
             )
+
+    def get_stream_ref_context(self, info: OmniPayload) -> torch.Tensor | None:
+        """Model-owned reference-code layout and context boundary for a PCM slot."""
+        codes = info.get("codes")
+        ref = codes.get("ref") if isinstance(codes, dict) else None
+        if not isinstance(ref, torch.Tensor) or not ref.numel():
+            return None
+        return ref.reshape(-1, int(self.talker_config.num_code_groups))[-self.stream_ref_context_frames :]
+
+    def prime_stream_decoder(self, primes: list[tuple[int, torch.Tensor]]) -> None:
+        """Prime equal-length reference groups without padding or aliasing live slots."""
+        if not primes:
+            return
+        stream = self.stream_decoder
+        if stream is None:
+            raise RuntimeError("Reference priming requires the single-stage PCM decoder")
+        groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
+        for req_idx, ref in primes:
+            groups.setdefault(int(ref.shape[0]), []).append((req_idx, ref))
+        for items in groups.values():
+            codes = to_device_nonblocking(torch.stack([ref for _idx, ref in items]), stream.device).to(torch.int32)
+            n = len(items)
+            slots = index_to_device([idx for idx, _ref in items], stream.device, dtype=torch.int32)
+            for t0 in range(0, int(codes.shape[1]), self.stream_chunk_frames):
+                pos = index_to_device([t0] * n, stream.device, dtype=torch.int32)
+                chunk = codes[:, t0 : t0 + self.stream_chunk_frames].contiguous()
+                graphs = self.stream_prime_graphs
+                decode = graphs if graphs is not None and chunk.shape[1] == graphs.frames else stream
+                decode(chunk, slots, pos)
 
     def _build_stacked_codec_embed(self) -> None:
         embeds = self.code_predictor.get_input_embeddings()

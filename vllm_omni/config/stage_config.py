@@ -245,6 +245,8 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # Some stateful audio stages cannot roll back already consumed frames.
+    supports_running_prefix_cache_reset: bool = True
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -1109,6 +1111,8 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    if not ps.supports_running_prefix_cache_reset:
+        engine_args["supports_running_prefix_cache_reset"] = False
     return engine_args
 
 
@@ -1355,6 +1359,8 @@ class StageConfig:
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output
+        if self.yaml_engine_args.get("supports_running_prefix_cache_reset") is False:
+            engine_args["supports_running_prefix_cache_reset"] = False
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

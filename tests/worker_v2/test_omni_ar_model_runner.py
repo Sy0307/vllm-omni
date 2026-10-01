@@ -439,17 +439,18 @@ def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mock
         eager.replay_inputs("request", 0, 4, torch.ones(2), torch.empty(2, 2))
 
 
-def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasing():
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasing(mocker):
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
 
-    eager = EagerMTPState(SimpleNamespace(device=torch.device("cpu")))
     primes = [(4, torch.full((26, 2), 4)), (1, torch.full((3, 2), 1)), (7, torch.full((26, 2), 7))]
     calls = []
 
     def stream(codes, slots, pos):
         calls.append((codes.clone(), slots.clone(), pos.clone()))
 
-    eager._prime_stream(stream, primes)
+    decoder = mocker.Mock(side_effect=stream, device=torch.device("cpu"))
+    model = mocker.Mock(stream_decoder=decoder, stream_prime_graphs=None, stream_chunk_frames=25)
+    Qwen3TTSTalkerForConditionalGeneration.prime_stream_decoder(model, primes)
     assert len(calls) == 3
     for (codes, slots, pos), frames, indices, position in zip(
         calls, [25, 1, 3], [[4, 7], [4, 7], [1]], [0, 25, 0], strict=True
@@ -459,8 +460,24 @@ def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasin
         assert slots.tolist() == indices and pos.tolist() == [position] * len(indices)
         for row, idx in enumerate(indices):
             assert torch.all(codes[row] == idx)
-    eager._prime_stream(stream, [])
+    Qwen3TTSTalkerForConditionalGeneration.prime_stream_decoder(model, [])
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("context_frames", [25, 72])
+def test_model_owned_reference_context_respects_configured_boundary(mocker, context_frames):
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
+
+    model = mocker.Mock(stream_ref_context_frames=context_frames, talker_config=mocker.Mock(num_code_groups=16))
+    reference = torch.arange(100 * 16).reshape(100, 16)
+    info = {"codes": {"ref": reference}}
+    got = Qwen3TTSTalkerForConditionalGeneration.get_stream_ref_context(model, info)
+    torch.testing.assert_close(got, reference[-context_frames:])
+    assert info["codes"]["ref"] is reference
+    assert Qwen3TTSTalkerForConditionalGeneration.get_stream_ref_context(model, {}) is None
+    assert (
+        Qwen3TTSTalkerForConditionalGeneration.get_stream_ref_context(model, {"codes": {"ref": torch.empty(0)}}) is None
+    )
 
 
 @pytest.mark.parametrize("streaming", [False, True])
