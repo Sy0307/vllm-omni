@@ -1535,6 +1535,39 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host.shutdown_omni_connectors()
 
 
+@pytest.mark.parametrize("cancel_at", ["connector_get", "first_chunk_hook"])
+def test_cancelled_chunk_receive_does_not_recreate_delivery_state(mocker, cancel_at):
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=True, worker_type="gen"))
+    host._stage_id = 1
+    host._omni_connector = mocker.MagicMock()
+    host.register_chunk_recv(_make_request("r1"))
+    seen = []
+    payload = {"codes": {"audio": [1, 2]}, "meta": {"finished": torch.tensor(False)}}
+
+    def get(*args, **kwargs):
+        if cancel_at == "connector_get":
+            host.cleanup_finished_request("r1")
+        return payload, 1
+
+    def hook(req_id, handle, chunk):
+        seen.append(req_id)
+        host.cleanup_finished_request(req_id)
+
+    host._omni_connector.get.side_effect = get
+    host.set_first_chunk_hook(hook)
+    try:
+        assert not host._poll_single_request("r1")
+        assert seen == (["r1"] if cancel_at == "first_chunk_hook" else [])
+        assert host.get_local_stage_payload("r1") is None
+        assert "r1" not in host._get_req_chunk
+        assert "r1" not in host._pending_load_reqs
+        output = host.get_omni_connector_output()
+        assert output.chunk_ready_req_ids == set() and output.request_metadata == {}
+    finally:
+        host.shutdown_omni_connectors()
+
+
 class TestRankAwareKVRouting(unittest.TestCase):
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
         host = MixinHost()

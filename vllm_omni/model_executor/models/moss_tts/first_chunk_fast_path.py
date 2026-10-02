@@ -175,6 +175,17 @@ class MossFirstChunkFastPath:
     # ------------------------------------------------------------------
     # Main (engine) thread
     # ------------------------------------------------------------------
+    def get_request_slot(self, request_key: str, req_slots: dict[str, int]) -> int | None:
+        """Observe a completed admission before deciding whether cleanup is needed.
+
+        The scheduler removes cancelled routes before the runner's finish hook.
+        A submit that already froze its route must finish leasing its slot
+        before that hook checks it. Waiting for decode happens outside this
+        lock, so the worker can still complete the slot handoff.
+        """
+        with self._lock:
+            return req_slots.get(request_key)
+
     def take_decoded(self, request_key: str) -> bool:
         """True once per request whose first chunk this path already decoded."""
         with self._lock:

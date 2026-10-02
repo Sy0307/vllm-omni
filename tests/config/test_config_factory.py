@@ -2934,6 +2934,7 @@ class TestPlatformOverrides:
             ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
             ("moss_tts_local_mrv2.yaml", "moss_tts_local"),
             ("moss_tts_local_mrv2_high_concurrency.yaml", "moss_tts_local"),
+            ("moss_tts_local_mrv2_low_latency.yaml", "moss_tts_local"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])

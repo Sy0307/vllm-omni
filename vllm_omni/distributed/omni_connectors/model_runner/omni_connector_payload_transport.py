@@ -1169,7 +1169,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._payload_finished(payload_data),
             )
 
-        self._get_req_chunk[req_id] += 1
+        with self._lock:
+            if self._async_chunk and request is not None and req_id not in self._pending_load_reqs:
+                # A connector get can return after cancellation removed its
+                # receiver. Do not recreate delivery state for that request.
+                return False
+            self._get_req_chunk[req_id] += 1
 
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
@@ -1185,6 +1190,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     first_chunk_hook(req_id, request, payload_data)
 
             with self._lock:
+                if request is not None and req_id not in self._pending_load_reqs:
+                    # The first-chunk hook may have overlapped cancellation.
+                    # Its slot cleanup is ordered by the model; this payload
+                    # must not republish readiness after receive teardown.
+                    return False
                 if self._model_mode == "ar":
                     # Accumulation, staging, and model-side consume/ack share
                     # this lock. Keeping the transition atomic prevents the

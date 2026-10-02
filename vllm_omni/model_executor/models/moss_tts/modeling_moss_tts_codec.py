@@ -1015,10 +1015,14 @@ class MossTTSCodecDecoder(nn.Module):
             session = self._stream_session
             for req_id in finished_req_ids:
                 request_id = str(req_id)
-                slot = self._stream_req_slots.get(request_id)
+                fast = self._first_chunk_fast_path
+                slot = (
+                    fast.get_request_slot(request_id, self._stream_req_slots)
+                    if fast is not None
+                    else self._stream_req_slots.get(request_id)
+                )
                 if slot is None:
                     continue
-                fast = self._first_chunk_fast_path
                 if fast is not None:
                     fast.order_after(slot)
                     fast.forget(request_id)

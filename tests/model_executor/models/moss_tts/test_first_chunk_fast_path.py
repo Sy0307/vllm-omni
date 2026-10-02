@@ -31,6 +31,9 @@ class _Session:
     def order_after_reset(self, slot, stream):
         self.reset_waits.append(slot)
 
+    def release(self, slot, **kwargs):
+        self.free.append(slot)
+
 
 class _Wrapper:
     batch_sizes = [1, 2, 4, 8]
@@ -178,6 +181,9 @@ class _FakeFast:
             self.decoded.remove(key)
             return True
         return False
+
+    def get_request_slot(self, key, slots):
+        return slots.get(key)
 
     def order_after(self, slot):
         self.ordered.append(slot)
@@ -359,6 +365,97 @@ def _cpu_fast(monkeypatch, *, scheduler=None):
     scheduler = scheduler or SimpleNamespace(requests={"r": SimpleNamespace(client_index=3)})
     sink = engine_output_queue_sink(outputs, scheduler, upstream_first_audio=False)
     return fast, session, sink, outputs
+
+
+def _cancel_during_admission(fast, session, scheduler, sink):
+    entered, release = threading.Event(), threading.Event()
+
+    class PausedSink:
+        def prepare(self, ids):
+            delivery = sink.prepare(ids)
+            if delivery.routes:
+                entered.set()
+                assert release.wait(5)
+            return delivery
+
+    fast.bind(PausedSink())
+    decoder = _decoder(session, fast)
+    errors = []
+    finished = threading.Event()
+    finishing = threading.Event()
+
+    def submit():
+        try:
+            assert fast.submit("r", "r", [1, 2], decoder._stream_req_slots)
+        except BaseException as error:
+            errors.append(error)
+
+    def cancel():
+        try:
+            finishing.set()
+            decoder.on_requests_finished({"r"})
+            finished.set()
+        except BaseException as error:
+            errors.append(error)
+
+    producer = threading.Thread(target=submit)
+    cleaner = threading.Thread(target=cancel)
+    producer.start()
+    try:
+        assert entered.wait(5)
+        assert decoder._stream_req_slots == {}
+        # Scheduler cancellation retires the route before the runner hook.
+        scheduler.requests.pop("r")
+        cleaner.start()
+        assert finishing.wait(5)
+        assert not finished.wait(0.1)
+        release.set()
+        producer.join(5)
+        cleaner.join(5)
+        assert not producer.is_alive() and not cleaner.is_alive()
+        assert not errors, errors
+        assert finished.is_set()
+        assert decoder._stream_req_slots == {}
+        assert fast._decoded == {} and fast._handoffs == {}
+        assert sorted(session.free) == [0, 1]
+        assert not fast.submit("r", "r", [1, 2], decoder._stream_req_slots)
+
+        # A fresh request can use and return the same capacity immediately.
+        scheduler.requests["reuse"] = SimpleNamespace(client_index=3)
+        release.set()
+        assert fast.submit("reuse", "reuse", [1, 2], decoder._stream_req_slots)
+        scheduler.requests.pop("reuse")
+        decoder.on_requests_finished({"reuse"})
+        assert decoder._stream_req_slots == {} and sorted(session.free) == [0, 1]
+    finally:
+        release.set()
+        producer.join(5)
+        if cleaner.ident is not None:
+            cleaner.join(5)
+        fast.close()
+
+
+@pytest.mark.cpu
+def test_cancel_waits_for_first_chunk_admission_and_reclaims_slot(monkeypatch):
+    scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=3)})
+    fast, session, sink, _ = _cpu_fast(monkeypatch, scheduler=scheduler)
+
+    # Keep the actual queue/worker/handoff lifecycle, omitting CUDA decode.
+    def decode(jobs):
+        for job in jobs:
+            job.handoff.done.set()
+
+    monkeypatch.setattr(fast, "_decode", decode)
+    fast._handoff_timeout_s = 5.0
+    _cancel_during_admission(fast, session, scheduler, sink)
+
+
+@pytest.mark.cuda
+def test_cancel_during_first_chunk_admission_orders_cuda_handoff_and_reuse(cuda):
+    fast, session, _ = _fast(cuda, capacity=2)
+    scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=3)})
+    sink = engine_output_queue_sink(queue.Queue(), scheduler, upstream_first_audio=False)
+    _cancel_during_admission(fast, session, scheduler, sink)
 
 
 @pytest.mark.cpu

@@ -80,17 +80,28 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("generation_max_wait_ms must be finite and nonnegative")
         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
             parallel = self.vllm_config.parallel_config
-            if not (
-                self._native_data_plane
-                and self._retains_state_across_chunks
+            if not self._native_data_plane:
+                # CUDA-oriented profiles can inherit a platform's V1 runner.
+                # Their connector extras survive that override, but batching
+                # must revert to the fallback runner's default scheduling.
+                logger.warning(
+                    "Generation batch waiting and regular-batch limit ignored: "
+                    "requires native MRV2; using default generation scheduling."
+                )
+                self._generation_min_batch_size = 1
+                self._generation_max_wait_s = 0.0
+                self._generation_max_regular_batch = 0
+            elif not (
+                self._retains_state_across_chunks
                 and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
             ):
                 raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
-            logger.info(
-                "Generation input coalescing: target batch=%d, max wait=%.3f ms",
-                self._generation_min_batch_size,
-                self._generation_max_wait_s * 1000,
-            )
+            else:
+                logger.info(
+                    "Generation input coalescing: target batch=%d, max wait=%.3f ms",
+                    self._generation_min_batch_size,
+                    self._generation_max_wait_s * 1000,
+                )
         self._first_chunk_express = os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS") == "1"
         self._last_step_express = False
         # Streams that already had a chunk scheduled; the rest await their first.
