@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -19,6 +20,11 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 import anyio
 import numpy as np
@@ -269,6 +275,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._speaker_cache = get_speaker_cache(max_bytes=config.speaker_max_bytes)
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
+        # The speaker directory is the registry shared by every API process.
+        # Per voice file: (mtime_ns, size, metadata or None when unreadable).
+        self._voice_files: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+        # Voices whose registry entry came from the directory, by file path.
+        self._disk_voices: dict[str, str] = {}
+        self._voice_dir_mtime_ns: int | None = None
+        self._voice_lock_fd: int | None = None
         self._restore_uploaded_speakers()
         logger.info(
             "Speaker storage: dir=%s, max_speakers=%d, restored=%d",
@@ -321,33 +334,143 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return data
 
     def _restore_uploaded_speakers(self) -> None:
-        """Scan ``uploaded_speakers_dir`` for safetensors files and rebuild state."""
+        """Rebuild the uploaded-voice registry from ``uploaded_speakers_dir``."""
+        self._refresh_uploaded_speakers(force=True)
+        if self.uploaded_speakers:
+            logger.info(
+                "Restored %d uploaded voice(s) from %s", len(self.uploaded_speakers), self.uploaded_speakers_dir
+            )
+
+    def _read_speaker_file(self, path: Path, safe_open: Any, size: int) -> dict[str, Any] | None:
+        try:
+            with safe_open(str(path), framework="pt") as f:
+                header = dict(f.metadata() or {})
+        except Exception as e:
+            logger.warning("Could not read voice file %s: %s", path, e)
+            return None
+        voice_name_lower = header.get("voice_name_lower") or header.get("name", "").lower()
+        if not voice_name_lower:
+            logger.warning("Voice file %s has no voice name in metadata; skipping", path)
+            return None
+        speaker_data = self._speaker_metadata_from_header(header, str(path))
+        speaker_data.setdefault("name", voice_name_lower)
+        speaker_data.setdefault("file_size", size)
+        speaker_data["voice_name_lower"] = voice_name_lower
+        return speaker_data
+
+    def _refresh_uploaded_speakers(self, *, force: bool = False) -> None:
+        """Bring the uploaded-voice registry in line with ``uploaded_speakers_dir``.
+
+        Every API process of a deployment registers voices in the same
+        directory, so uploads and deletions handled by another process appear
+        here as directory changes. An unchanged directory costs one ``stat``;
+        a changed one re-reads only new or modified voice files.
+        """
+        directory = getattr(self, "uploaded_speakers_dir", None)
+        if directory is None:
+            return
+        try:
+            mtime_ns = directory.stat().st_mtime_ns
+        except OSError as e:
+            logger.warning("Could not read speaker directory %s: %s", directory, e)
+            return
+        if not force and mtime_ns == getattr(self, "_voice_dir_mtime_ns", None):
+            return
+        # Record the stamp first: a change during the scan triggers another refresh.
+        self._voice_dir_mtime_ns = mtime_ns
         try:
             from safetensors import safe_open
         except ImportError:
             logger.warning("safetensors unavailable; uploaded voices will not persist across restarts")
             return
 
-        restored = 0
-        for path in sorted(self.uploaded_speakers_dir.glob("*.safetensors")):
+        files: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+        for path in sorted(directory.glob("*.safetensors")):
             try:
-                with safe_open(str(path), framework="pt") as f:
-                    header = dict(f.metadata() or {})
-            except Exception as e:
-                logger.warning("Could not read voice file %s: %s", path, e)
+                stat = path.stat()
+            except OSError:
+                continue  # removed by another process during the scan
+            key = str(path)
+            known = getattr(self, "_voice_files", {}).get(key)
+            if known is not None and known[:2] == (stat.st_mtime_ns, stat.st_size):
+                files[key] = known
+            else:
+                files[key] = (stat.st_mtime_ns, stat.st_size, self._read_speaker_file(path, safe_open, stat.st_size))
+        self._voice_files = files
+
+        latest: dict[str, dict[str, Any]] = {}
+        for _mtime, _size, data in files.values():
+            if data is None or self._is_builtin_voice_name(data["voice_name_lower"]):
                 continue
-            voice_name_lower = header.get("voice_name_lower") or header.get("name", "").lower()
-            if not voice_name_lower:
-                logger.warning("Voice file %s has no voice name in metadata; skipping", path)
+            name = data["voice_name_lower"]
+            if name not in latest or int(data.get("created_at", 0) or 0) >= int(latest[name].get("created_at", 0) or 0):
+                latest[name] = data
+        for name, path in getattr(self, "_disk_voices", {}).items():
+            if latest.get(name, {}).get("file_path") == path:
                 continue
-            speaker_data = self._speaker_metadata_from_header(header, str(path))
-            speaker_data.setdefault("name", voice_name_lower)
-            speaker_data.setdefault("file_size", int(path.stat().st_size))
-            self.uploaded_speakers[voice_name_lower] = speaker_data
-            self._last_upload_ts = max(self._last_upload_ts, int(speaker_data.get("created_at", 0)))
-            restored += 1
-        if restored:
-            logger.info("Restored %d uploaded voice(s) from %s", restored, self.uploaded_speakers_dir)
+            # Deleted or replaced through another API process.
+            current = self.uploaded_speakers.get(name)
+            if current is not None and current.get("file_path") == path:
+                del self.uploaded_speakers[name]
+            self._forget_voice_caches(name)
+        for name, data in latest.items():
+            current = self.uploaded_speakers.get(name)
+            if current is None or current.get("file_path") != data["file_path"]:
+                if current is not None:
+                    self._forget_voice_caches(name)
+                self.uploaded_speakers[name] = dict(data)
+            self._last_upload_ts = max(self._last_upload_ts, int(data.get("created_at", 0) or 0))
+        self._disk_voices = {name: data["file_path"] for name, data in latest.items()}
+
+    def _remember_written_voice(self, voice_name_lower: str, file_path: Path, speaker_data: dict[str, Any]) -> None:
+        """Record a voice file this process just wrote, so a refresh does not re-read it."""
+        stat = file_path.stat()
+        self._voice_files[str(file_path)] = (stat.st_mtime_ns, stat.st_size, dict(speaker_data))
+        self._disk_voices[voice_name_lower] = str(file_path)
+
+    def _forget_voice_caches(self, voice_name_lower: str) -> None:
+        getattr(self, "_ref_audio_data_url_cache", {}).pop(voice_name_lower, None)
+        speaker_cache = getattr(self, "_speaker_cache", None)
+        if speaker_cache is not None:
+            speaker_cache.clear(voice_name_lower)
+
+    @contextlib.asynccontextmanager
+    async def _voice_registry_lock(self):
+        """Serialize voice registration in this process and across API processes.
+
+        Holds an exclusive ``flock`` on the speaker directory's lock file and
+        refreshes the registry, so upload caps, the registration policy and
+        upload timestamps see every process's voices.
+        """
+        async with self._upload_lock:
+            fd = self._voice_lock_fd
+            if fd is None and fcntl is not None:
+                fd = self._voice_lock_fd = os.open(
+                    self.uploaded_speakers_dir / ".voices.lock", os.O_RDWR | os.O_CREAT, 0o600
+                )
+            if fd is not None:
+                await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+            try:
+                self._refresh_uploaded_speakers(force=True)
+                yield
+            finally:
+                if fd is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _save_voice_file(
+        save_file: Any, tensors: dict[str, torch.Tensor], file_path: Path, metadata: dict[str, str]
+    ) -> None:
+        """Write a voice file under a temporary name and rename it into place.
+
+        Other API processes scan the directory; they never see a partial file.
+        """
+        tmp_path = file_path.with_name(f".{file_path.name}.tmp")
+        try:
+            save_file(tensors, str(tmp_path), metadata=metadata)
+            os.replace(tmp_path, file_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     @classmethod
     def for_diffusion(
@@ -470,6 +593,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _get_available_speakers(self) -> set[str]:
         """Return all built-in, precomputed, and runtime-uploaded speakers."""
+        self._refresh_uploaded_speakers()
         available_speakers = set(self.uploaded_speakers)
         if self._adapter is not None:
             available_speakers.update(self._adapter.capabilities.supported_speakers)
@@ -844,6 +968,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"the cap via SPEAKER_MAX_UPLOADED."
             )
 
+    def _is_builtin_voice_name(self, voice_name_lower: str) -> bool:
+        adapter = getattr(self, "_adapter", None)
+        caps = adapter.capabilities if adapter is not None else None
+        return caps is not None and (
+            voice_name_lower in caps.supported_speakers or voice_name_lower in caps.precomputed_speakers
+        )
+
     def _drop_shadowing_uploads(self) -> None:
         """Uploads are restored from disk before the adapter exists, so a name
         registered under a built-in speaker before the collision guard would
@@ -882,6 +1013,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if voice_name_lower not in self.uploaded_speakers:
             return
         old = self.uploaded_speakers.pop(voice_name_lower)
+        self._disk_voices.pop(voice_name_lower, None)
         self._ref_audio_data_url_cache.pop(voice_name_lower, None)
         old_path = old.get("file_path")
         if old_path:
@@ -957,7 +1089,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Read content before acquiring the lock; decode happens inside.
         content = await audio_file.read()
 
-        async with self._upload_lock:
+        async with self._voice_registry_lock():
             voice_name_lower = name.lower()
             self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
@@ -1015,15 +1147,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("safetensors is required for voice upload") from exc
             try:
                 audio_tensor = torch.from_numpy(np.asarray(wav_np, dtype=np.float32)).contiguous()
-                save_file(
+                self._save_voice_file(
+                    save_file,
                     {"audio": audio_tensor},
-                    str(file_path),
-                    metadata=self._speaker_metadata_to_header(speaker_data),
+                    file_path,
+                    self._speaker_metadata_to_header(speaker_data),
                 )
             except Exception as e:
                 raise ValueError(f"Failed to save voice file: {e}")
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
+            self._remember_written_voice(voice_name_lower, file_path, speaker_data)
 
         logger.info("Uploaded new voice '%s' with consent ID '%s'", name, consent)
 
@@ -1078,7 +1212,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if dim_err is not None:
             raise ValueError(dim_err)
 
-        async with self._upload_lock:
+        async with self._voice_registry_lock():
             voice_name_lower = name.lower()
             self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
@@ -1109,14 +1243,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 from safetensors.torch import save_file
             except ImportError as exc:
                 raise ValueError("safetensors is required for embedding upload") from exc
-            save_file(
+            self._save_voice_file(
+                save_file,
                 {"speaker_embedding": tensor},
-                str(file_path),
-                metadata=self._speaker_metadata_to_header(speaker_data),
+                file_path,
+                self._speaker_metadata_to_header(speaker_data),
             )
             speaker_data["file_size"] = file_path.stat().st_size
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
+            self._remember_written_voice(voice_name_lower, file_path, speaker_data)
 
         logger.info("Uploaded voice '%s' from speaker embedding (%d-dim)", name, emb_dim)
 
@@ -1135,7 +1271,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Args:
             name: Voice name to delete
         """
-        async with self._upload_lock:
+        async with self._voice_registry_lock():
             voice_name_lower = name.lower()
             built_in_speakers = self._get_available_voices() - set(self.uploaded_speakers)
 
@@ -1148,6 +1284,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise InvalidVoiceReferenceError(err)
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
+            self._disk_voices.pop(voice_name_lower, None)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
 
             file_path = speaker_info.get("file_path")
@@ -1167,6 +1304,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        self._refresh_uploaded_speakers()
         sample_rate_error = self._validate_speech_sample_rate(request)
         if sample_rate_error is not None:
             return sample_rate_error
@@ -1969,6 +2107,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+        # Voices may have been uploaded or deleted through another API process.
+        self._refresh_uploaded_speakers()
 
         sample_rate_error = self._validate_speech_sample_rate(request)
         if sample_rate_error is not None:
