@@ -115,6 +115,9 @@ def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | No
 # payloads and must fail the request, never serialize as a successful empty
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
 _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
+# A shared speaker directory whose mtime is unchanged is trusted once a scan
+# started this long after it, which covers coarse filesystem timestamp ticks.
+_VOICE_DIR_SETTLE_NS = 50_000_000
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
@@ -276,11 +279,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
         # The speaker directory is the registry shared by every API process.
-        # Per voice file: (mtime_ns, size, metadata or None when unreadable).
-        self._voice_files: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+        # Per voice file: (inode, metadata or None when unreadable). Voice files
+        # are never rewritten in place (each upload renames a new file in).
+        self._voice_files: dict[str, tuple[int, dict[str, Any] | None]] = {}
         # Voices whose registry entry came from the directory, by file path.
         self._disk_voices: dict[str, str] = {}
         self._voice_dir_mtime_ns: int | None = None
+        self._voice_scan_ns = 0
+        self._voice_listing: list[tuple[str, int]] | None = None
         self._voice_lock_fd: int | None = None
         self._restore_uploaded_speakers()
         logger.info(
@@ -364,7 +370,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Every API process of a deployment registers voices in the same
         directory, so uploads and deletions handled by another process appear
         here as directory changes. An unchanged directory costs one ``stat``;
-        a changed one re-reads only new or modified voice files.
+        a changed one costs one directory listing plus a header read per new
+        voice file.
         """
         directory = getattr(self, "uploaded_speakers_dir", None)
         if directory is None:
@@ -374,32 +381,52 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except OSError as e:
             logger.warning("Could not read speaker directory %s: %s", directory, e)
             return
-        if not force and mtime_ns == getattr(self, "_voice_dir_mtime_ns", None):
+        # Two changes within one filesystem timestamp tick share an mtime, so an
+        # unchanged mtime is trusted only once a scan started after that tick.
+        if (
+            not force
+            and mtime_ns == getattr(self, "_voice_dir_mtime_ns", None)
+            and getattr(self, "_voice_scan_ns", 0) - mtime_ns > _VOICE_DIR_SETTLE_NS
+        ):
             return
-        # Record the stamp first: a change during the scan triggers another refresh.
         self._voice_dir_mtime_ns = mtime_ns
+        self._voice_scan_ns = time.time_ns()
         try:
             from safetensors import safe_open
         except ImportError:
             logger.warning("safetensors unavailable; uploaded voices will not persist across restarts")
             return
 
-        files: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
-        for path in sorted(directory.glob("*.safetensors")):
+        try:
+            entries = sorted(
+                (entry.name, entry.inode())
+                for entry in os.scandir(directory)
+                if entry.name.endswith(".safetensors") and not entry.name.startswith(".")
+            )
+        except OSError as e:
+            logger.warning("Could not list speaker directory %s: %s", directory, e)
+            return
+        if not force and entries == getattr(self, "_voice_listing", None):
+            return
+        self._voice_listing = entries
+        known_files = getattr(self, "_voice_files", {})
+        files: dict[str, tuple[int, dict[str, Any] | None]] = {}
+        directory_str = str(directory)
+        for name, inode in entries:
+            key = os.path.join(directory_str, name)
+            known = known_files.get(key)
+            if known is not None and known[0] == inode:
+                files[key] = known
+                continue
             try:
-                stat = path.stat()
+                size = os.stat(key).st_size
             except OSError:
                 continue  # removed by another process during the scan
-            key = str(path)
-            known = getattr(self, "_voice_files", {}).get(key)
-            if known is not None and known[:2] == (stat.st_mtime_ns, stat.st_size):
-                files[key] = known
-            else:
-                files[key] = (stat.st_mtime_ns, stat.st_size, self._read_speaker_file(path, safe_open, stat.st_size))
+            files[key] = (inode, self._read_speaker_file(Path(key), safe_open, size))
         self._voice_files = files
 
         latest: dict[str, dict[str, Any]] = {}
-        for _mtime, _size, data in files.values():
+        for _inode, data in files.values():
             if data is None or self._is_builtin_voice_name(data["voice_name_lower"]):
                 continue
             name = data["voice_name_lower"]
@@ -424,8 +451,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _remember_written_voice(self, voice_name_lower: str, file_path: Path, speaker_data: dict[str, Any]) -> None:
         """Record a voice file this process just wrote, so a refresh does not re-read it."""
-        stat = file_path.stat()
-        self._voice_files[str(file_path)] = (stat.st_mtime_ns, stat.st_size, dict(speaker_data))
+        self._voice_files[str(file_path)] = (file_path.stat().st_ino, dict(speaker_data))
+        self._voice_listing = None  # the next refresh rebuilds from the directory
         self._disk_voices[voice_name_lower] = str(file_path)
 
     def _forget_voice_caches(self, voice_name_lower: str) -> None:

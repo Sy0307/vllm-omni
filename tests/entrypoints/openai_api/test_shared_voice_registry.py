@@ -9,6 +9,7 @@ Every frontend of a multi-API deployment is modelled as its own
 import asyncio
 import io
 import json
+import os
 from unittest.mock import patch
 
 import numpy as np
@@ -128,6 +129,24 @@ def test_unchanged_directory_costs_no_file_reads(frontend):
         asyncio.run(a.upload_voice_embedding(_EMBEDDING, "c", "Gil"))
         b._refresh_uploaded_speakers()
         assert reads.call_count == 1  # only the new file
+
+
+def test_change_within_one_timestamp_tick_is_not_missed(frontend, tmp_path):
+    a, b = frontend(), frontend()
+    asyncio.run(a.upload_voice_embedding(_EMBEDDING, "c", "Ivy"))
+    b._refresh_uploaded_speakers()
+    stamp = b._voice_dir_mtime_ns
+    asyncio.run(a.upload_voice_embedding(_EMBEDDING, "c", "Jay"))
+    # Coarse filesystem timestamps can give both changes the same directory mtime.
+    os.utime(tmp_path, ns=(stamp, stamp))
+    b._voice_scan_ns = stamp + 1  # b's last scan started within that tick
+    assert "jay" in b._get_available_speakers()
+
+    # Once a scan started well after the mtime, an unchanged directory is not listed.
+    b._voice_scan_ns = stamp + 10**9
+    with patch("os.scandir", wraps=os.scandir) as listing:
+        b._get_available_speakers()
+        assert listing.call_count == 0
 
 
 def test_partial_files_and_manual_entries_are_left_alone(frontend, tmp_path):

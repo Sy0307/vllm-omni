@@ -22,7 +22,9 @@ expert parallelism, sleep mode, or runtime LoRA updating. Runtime voice upload
 and deletion work with any number of API processes: the speaker directory
 (`SPEAKER_SAMPLES_DIR`) is the registry they share, mutations hold a file lock
 on it, and every process picks up the other processes' changes before it
-resolves a voice. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes
+resolves a voice. Keep that directory on a local filesystem: client-side
+attribute caching on network filesystems delays when other processes see a
+change. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes
 return HTTP 409 because their bookkeeping is process-local while stage engines
 are shared.
 
