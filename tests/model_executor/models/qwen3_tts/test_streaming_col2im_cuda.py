@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The tiled streaming col2im preserves PCM inputs and ping-pong slot state."""
+"""Streaming col2im preserves PCM inputs and ping-pong slot state."""
 
 import pytest
 import torch
@@ -38,7 +38,7 @@ def test_col2im_partial_tiles_and_reordered_slot_state(batch: int, frames: int, 
     actual = torch.empty_like(expected, device="cuda")
     width = min(128, triton.next_power_of_2(channels))
     rows = batch * frames
-    _col2im_kernel[(triton.cdiv(rows, 8), rate, triton.cdiv(channels, width))](
+    _col2im_kernel[(rows, rate, triton.cdiv(channels, width))](
         z_gpu,
         bias_gpu,
         state_gpu,
@@ -48,10 +48,8 @@ def test_col2im_partial_tiles_and_reordered_slot_state(batch: int, frames: int, 
         actual,
         frames,
         capacity,
-        rows,
         R=rate,
         C=channels,
-        BR=8,
         BC=width,
         num_warps=4,
     )
