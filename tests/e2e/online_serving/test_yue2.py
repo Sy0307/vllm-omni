@@ -32,9 +32,9 @@ above the byte floor) and passes on that alone, following the MiniMax Music 3
 precedent.
 
 Weekly rather than per-PR: each request is a 16 s song and the verification
-checkpoints add ~5.5 GB of downloads. Validated on a single RTX 4090
-(24 GB); the hardware mark targets an H100 because the CI fleet has no
-consumer cards.
+checkpoints add ~5.5 GB of downloads. The async/graph implementation was
+validated on H200; the hardware mark targets the CI fleet's H100. The older
+RTX 4090 result does not establish this implementation's memory requirements.
 """
 
 import concurrent.futures
@@ -243,7 +243,7 @@ def test_yue2_metal_twinkle_001(omni_server, openai_client, tmp_path) -> None:
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
-    """A client disconnect must release its request and preserve serving."""
+    """Serving smoke check after a client timeout, not proof of job cleanup."""
     # The chosen seed and budget time out on the tested cards. Require the
     # timeout so this cannot silently become another successful request;
     # whether it lands in AR or synthesis depends on the card.
@@ -263,3 +263,161 @@ def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
             timeout=1.0,
         )
     _http_speech(omni_server, seed=SEED + 3, frames=_CONCURRENT_FRAMES)
+
+
+@pytest.mark.slow
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunked", [True, False], ids=["chunked", "unchunked"])
+async def test_yue2_preemption_and_synthesis_abort(chunked, monkeypatch) -> None:
+    """Force real preemption and abort only after NAR work has been submitted."""
+    import asyncio
+    from pathlib import Path
+
+    import torch
+    from vllm import SamplingParams
+
+    from tests.helpers.runtime import get_model_prefix
+    from tests.helpers.stage_config import modify_stage_config
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.model_executor.models.yue2.yue2 import (
+        ABC_END,
+        EOD,
+        KEY_MAX_AUDIO_FRAMES,
+        KEY_MAX_HOLD_STEPS,
+        KEY_MIN_TOKENS,
+        KEY_PHASE,
+        KEY_PREFIX_IDS,
+        KEY_SEED,
+        KEY_SKIP_SYNTHESIS,
+        STOP_TOKEN_IDS,
+    )
+    from vllm_omni.tokenizers.yue2_prompt import abc_prefix_ids, semantic_frames, semantic_prefix_ids
+    from vllm_omni.tokenizers.yue2_tokenizer import YuE2TextTokenizer
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    model_path = Path(os.environ.get("YUE2_MODEL_DIR", get_model_prefix() + MODEL))
+    if not model_path.is_dir():
+        model_path = Path(hf_api().snapshot_download(str(model_path)))
+    tokenizer = YuE2TextTokenizer(model_path / "qwen.tiktoken")
+    prefix = semantic_prefix_ids(tokenizer.encode, CAPTION, LYRICS, "off")
+    frames = 256
+    # Each song fits alone, but four full songs cannot fit in 64 KV blocks.
+    # Chunked recompute also replays output tokens past the original prompt.
+    deploy = modify_stage_config(
+        get_deploy_config_path("yue2.yaml"),
+        updates={
+            "stages": {
+                0: {
+                    "enable_chunked_prefill": chunked,
+                    "async_scheduling": True,
+                    "max_num_batched_tokens": 256 if chunked else 1024,
+                    "max_model_len": 1000,
+                    "num_gpu_blocks_override": 64,
+                    "block_size": 16,
+                    "max_num_seqs": 4,
+                    "tokenizer": str(model_path),
+                }
+            }
+        },
+    )
+    engine = AsyncOmni(
+        model=str(model_path),
+        deploy_config=deploy,
+        worker_extension_cls="tests.e2e.features.yue2.worker_extension.Yue2LifecycleWorkerExtension",
+        stage_init_timeout=600,
+        init_timeout=900,
+    )
+
+    async def probe():
+        return (await engine.collective_rpc("get_yue2_probe", stage_ids=[0]))[0][0]
+
+    async def song(request_id, seed):
+        params = SamplingParams(
+            max_tokens=1000 - len(prefix),
+            stop_token_ids=STOP_TOKEN_IDS,
+            detokenize=False,
+            extra_args={
+                KEY_PREFIX_IDS: prefix,
+                KEY_SEED: seed,
+                KEY_MAX_AUDIO_FRAMES: frames,
+                KEY_MIN_TOKENS: frames,
+                KEY_MAX_HOLD_STEPS: 1000 - len(prefix) - frames - 1,
+            },
+        )
+        audio = []
+        tokens = []
+        async for output in engine.generate(
+            {"prompt_token_ids": prefix}, request_id=request_id, sampling_params_list=[params]
+        ):
+            tokens = list(output.outputs[0].token_ids)
+            multimodal = getattr(output.outputs[0], "multimodal_output", None)
+            if multimodal is not None and "audio" in multimodal:
+                data = multimodal["audio"]
+                audio.extend(data if isinstance(data, list) else [data])
+        assert audio, "request completed without audio"
+        waveform = torch.cat([part.detach().cpu().reshape(-1) for part in audio])
+        assert torch.isfinite(waveform).all() and waveform.abs().max() > 0
+        assert len(semantic_frames(tokens)) == frames
+        # The VAE convolution trims a small number of boundary samples.
+        assert waveform.numel() == pytest.approx(frames * 1920 * 2, abs=256)
+
+    async def plan():
+        abc_prefix = abc_prefix_ids(tokenizer.encode, CAPTION, LYRICS, "melody")
+        params = SamplingParams(
+            max_tokens=64,
+            stop_token_ids=STOP_TOKEN_IDS,
+            detokenize=False,
+            extra_args={
+                KEY_PHASE: "abc",
+                KEY_PREFIX_IDS: abc_prefix,
+                KEY_SEED: SEED,
+                KEY_SKIP_SYNTHESIS: True,
+            },
+        )
+        tokens = []
+        async for output in engine.generate(
+            {"prompt_token_ids": abc_prefix}, request_id="abc-plan", sampling_params_list=[params]
+        ):
+            tokens = list(output.outputs[0].token_ids)
+        assert tokens and all(t < EOD or t == ABC_END for t in tokens)
+
+    tasks = []
+    try:
+        assert await engine.collective_rpc("start_yue2_probe", stage_ids=[0]) == [[True]]
+        tasks = [asyncio.create_task(plan())]
+        tasks.extend(asyncio.create_task(song(f"preempt-{i}", SEED + i)) for i in range(4))
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=600)
+        observations = await probe()
+        assert observations["preemptions"] > 0, observations
+        assert observations["rollbacks"] > 0, observations
+        assert observations["checked_rows"] >= 4 * frames, observations
+        assert observations["mixed_steps"] > 0, observations
+
+        cancelled = asyncio.create_task(song("cancel-synthesis", SEED + 7))
+        tasks.append(cancelled)
+        deadline = asyncio.get_running_loop().time() + 120
+        while not (await probe())["synthesis_started"]:
+            assert not cancelled.done(), "song finished before the active-job cancellation probe"
+            assert asyncio.get_running_loop().time() < deadline, "NAR job never started"
+            await asyncio.sleep(0.05)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            observations = await probe()
+            if observations.get("removed"):
+                assert observations["cancelled"] and observations["released"], observations
+                break
+            assert asyncio.get_running_loop().time() < deadline, observations
+            await asyncio.sleep(0.05)
+        await asyncio.wait_for(song("after-cancel", SEED + 8), timeout=120)
+        assert (await probe())["released"]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        engine.shutdown()

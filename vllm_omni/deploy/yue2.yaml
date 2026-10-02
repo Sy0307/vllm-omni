@@ -1,5 +1,5 @@
 # YuE2-3B deploy: single-stage native-AR text-to-music (~3.6B bf16 + VAE).
-# Starting configuration for 1x 24 GB card; remeasure the target workload.
+# Four-slot CUDA configuration; validate memory on the target card/workload.
 #
 # The architectures pin is required: the checkpoint's config.json names
 # "YuE2ForCausalLM" with an auto_map that only makes sense under
@@ -13,8 +13,8 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    # Sized for a 24 GB card. A finishing song keeps its slot while it is
-    # synthesized on a side stream (emitting HOLD tokens meanwhile). On one
+    # A finishing song keeps its slot during side-stream synthesis (emitting
+    # HOLD tokens meanwhile). On one
     # H200 the synthesis pass saturates the GPU at about 32 songs in flight,
     # and more slots only add hold steps (120 s songs, gpu_memory_utilization
     # 0.5: 54 audio s/s at 32 concurrent requests; at 64 concurrent, 56 with
@@ -53,12 +53,15 @@ stages:
     default_sampling_params:
       # Placeholder values: the model's own sampler overrides everything from
       # extra_args. Their presence turns on has_sampling_extra_args, which is
-      # what threads the per-request yue2_* keys into the model's forward.
+      # what threads the per-request yue2_* keys into prepare_runner_inputs.
       extra_args:
         yue2_phase: "semantic"
         yue2_seed: 831001
         yue2_max_audio_frames: 200
+        yue2_max_hold_steps: 4096
       detokenize: false
-      # Engine-side backstop; the model stops on its own end token first.
-      max_tokens: 9000
+      stop_token_ids: [151848, 151852]  # ABC_END, MUSIC_END
+      # 200 frames + 4096 synthesis holds + the final end token. Callers
+      # changing the frame budget must also reserve this token headroom.
+      max_tokens: 4297
       temperature: 1.0

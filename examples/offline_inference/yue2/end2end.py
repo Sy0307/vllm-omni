@@ -80,8 +80,8 @@ def sampling_params(engine, *, phase, seed, max_frames, prompt_ids):
     else:
         # The song is synthesized on a side stream while the request is held;
         # leave max_tokens headroom for the hold tokens.
-        params.extra_args[KEY_MAX_HOLD_STEPS] = SYNTHESIS_HOLD_STEPS
         params.max_tokens = min(max_frames + 1 + SYNTHESIS_HOLD_STEPS, CONTEXT - len(prompt_ids))
+        params.extra_args[KEY_MAX_HOLD_STEPS] = max(0, params.max_tokens - max_frames - 1)
     params.stop_token_ids = list(STOP_TOKEN_IDS)
     params.detokenize = False
     return params

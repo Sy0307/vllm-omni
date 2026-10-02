@@ -216,9 +216,9 @@ class Yue2Adapter(ARTTSAdapter):
         # Synthesize on a side stream while other songs keep decoding; the
         # request may emit up to SYNTHESIS_HOLD_STEPS hold tokens meanwhile
         # (see the model), so max_tokens leaves that much headroom.
-        params.extra_args[KEY_MAX_HOLD_STEPS] = SYNTHESIS_HOLD_STEPS
         prompt_len = len(prompt["prompt_token_ids"])
         params.max_tokens = min(max_frames + 1 + SYNTHESIS_HOLD_STEPS, CONTEXT - prompt_len)
+        params.extra_args[KEY_MAX_HOLD_STEPS] = max(0, params.max_tokens - max_frames - 1)
         params.stop_token_ids = list(STOP_TOKEN_IDS)
         params.detokenize = False
         return sampling_params_list

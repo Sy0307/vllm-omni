@@ -69,9 +69,24 @@ ending.
 
 ## Notes
 
+The lifecycle e2e regression forces KV-cache preemption with chunked and
+unchunked recompute, mixes ABC and semantic sampling, and cancels a request
+after NAR work has started. It checks history alignment, released synthesis
+buffers, and successful generation after cancellation. Run with one H100/H200
+and cached YuE2-3B and YuE2-Vae weights:
+
+```bash
+export YUE2_MODEL_DIR=/path/to/YuE2-3B
+export YUE2_VAE=/path/to/YuE2-Vae
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_yue2.py \
+    -k preemption_and_synthesis_abort -m 'slow and tts' --run-level full_model -q -s
+```
+
+The test retains the module's weekly TTS routing; it is not a per-PR CI gate.
+
 - **Memory:** `gpu_memory_utilization` budgets the vLLM engine; NAR K/V,
   acoustic graph buffers and VAE activations also need room during synthesis.
-  The 0.70 / 4-slot defaults are a starting point for 24 GB cards. The earlier
+  The 0.70 / 4-slot defaults require validation on the target card. The earlier
   RTX 4090 measurement (15.8 GiB after startup, 20.9 GiB peak at 9000 frames)
   predates the async/compiled implementation; it does not validate this
   version or long ABC prefixes on a 4090. Reduce the fraction if the target
@@ -86,7 +101,8 @@ ending.
   their engines and buffers after their own events. FA3 runs on Hopper; other
   CUDA cards use SDPA, which is also warmed at startup.
 - **Serving:** H200 throughput testing uses `max_num_seqs: 32` and
-  `gpu_memory_utilization: 0.5`. The default remains 4 slots for smaller cards.
+  `gpu_memory_utilization: 0.5`. The default remains 4 slots; this does not
+  establish 24 GB capacity with the async/graph implementation.
   Audio is delivered as a whole song; time to first audio equals completion
   latency. Aborting a running song stops future work units and waits only for
   the at-most-two submitted units before releasing its buffers.

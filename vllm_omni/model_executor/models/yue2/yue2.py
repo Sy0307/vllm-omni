@@ -1665,6 +1665,7 @@ class _RequestState:
     # drew its end token or filled its frame budget; the next scheduled step
     # runs the finishing pass and emits the end token.
     finish_ready: bool = False
+    end_drawn: bool = False  # the engine counts a drawn end (or its HOLD) too
     job: _SynthesisJob | None = None  # async synthesis in flight
     hold_steps: int = 0  # HOLD_TOKEN steps emitted while it runs
 
@@ -2333,7 +2334,7 @@ class Yue2ForCausalLM(nn.Module):
             if row >= rows:
                 break
             state = self._states.get(req_id)
-            if state is None or state.finished:
+            if state is None:
                 continue
             if self._step_discard is not None and row < len(self._step_discard):
                 discarded = self._step_discard[row]
@@ -2342,6 +2343,9 @@ class Yue2ForCausalLM(nn.Module):
                 # when a prefix-cache hit left comp > 0.
                 discarded = comp + span < state.prompt_len
             if discarded:
+                continue
+            self._reconcile_history(state, max(0, comp + span - state.prompt_len))
+            if state.finished:
                 continue
             c = state.constants
             end = ABC_END if c.phase == "abc" else MUSIC_END
@@ -2406,8 +2410,11 @@ class Yue2ForCausalLM(nn.Module):
         self._stage[: len(flat)].copy_(torch.as_tensor(flat))
         staged = self._stage[: len(flat)].to(logits.device, non_blocking=True)
 
-        drawn: list[torch.Tensor] = []
-        flags: list[torch.Tensor] = []
+        # Graphs share a pool and may replay in a different order from capture.
+        # Preserve each group's outputs outside that pool before replaying the
+        # next graph: its intermediates may alias the previous graph's outputs.
+        count = sum(len(members) for members in groups.values())
+        drawn = torch.empty((2, count), dtype=torch.long, device=logits.device)
         emitted: list[torch.Tensor] = []
         drawn_rows: list[int] = []
         states: list[_RequestState] = []
@@ -2433,8 +2440,9 @@ class Yue2ForCausalLM(nn.Module):
                     block_end=block_end,
                     generators=generators,
                 )
-            drawn.append(ids)
-            flags.append(bad)
+            offset = len(drawn_rows)
+            drawn[0, offset : offset + n].copy_(ids)
+            drawn[1, offset : offset + n].copy_(bad)
             emitted.append(torch.where(ids == staged[base + 2 * n : base + 3 * n], HOLD_TOKEN, ids))
             drawn_rows += [row for row, _ in members]
             states += [state for _, state in members]
@@ -2445,13 +2453,11 @@ class Yue2ForCausalLM(nn.Module):
             index = torch.cat([staged[base : base + len(m)] for _, _, m, base, _, _ in plans])
             token_ids.view(-1).index_copy_(0, index, out)
 
-        count = len(drawn_rows)
         if self._pinned is None or self._pinned.shape[1] < count:
             self._pinned = torch.empty((2, max(count, 64)), dtype=torch.long, pin_memory=True)
         host = self._pinned[:, :count]
         # Async into pinned memory; the next sample() call resolves it.
-        host[0].copy_(torch.cat(drawn), non_blocking=True)
-        host[1].copy_(torch.cat(flags), non_blocking=True)
+        host.copy_(drawn, non_blocking=True)
         event = torch.Event()
         event.record()
         self._pending = (event, host, states)
@@ -2552,6 +2558,25 @@ class Yue2ForCausalLM(nn.Module):
         )
         self._ship_audio(state.request_id, audio, state.truncated, error=failed)
 
+    def _reconcile_history(self, state: _RequestState, accepted: int) -> None:
+        """Drop in-flight draws the scheduler discarded on preemption.
+
+        Only a non-discarded row has replayed the complete accepted sequence;
+        partial recompute chunks cannot establish this boundary. A drawn EOS
+        occupies one engine token even though it is not in the codec history.
+        """
+        if accepted >= len(state.history) + int(state.end_drawn):
+            return
+        if state.job is not None:
+            self._synthesis.cancel(state.job)
+            state.job = None
+        del state.history[accepted:]
+        state.end_drawn = False
+        state.finished = False
+        state.hold_steps = 0
+        state.truncated = state.constants.phase == "semantic" and len(state.history) >= state.constants.max_audio_frames
+        state.finish_ready = state.truncated
+
     def _resolve_pending(self) -> None:
         """Apply the previous step's draws to the host-side request state."""
         if self._pending is None:
@@ -2565,6 +2590,7 @@ class Yue2ForCausalLM(nn.Module):
         for state, token in zip(states, ids):
             constants = state.constants
             if token == (ABC_END if constants.phase == "abc" else MUSIC_END):
+                state.end_drawn = True
                 state.truncated = False
                 if constants.skip_synthesis:
                     # Emitted as drawn: the engine has already stopped it.
