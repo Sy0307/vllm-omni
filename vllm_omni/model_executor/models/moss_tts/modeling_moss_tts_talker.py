@@ -1520,7 +1520,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             embeds = self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
-            ref_offset = int(info_dict.get("ref_offset", 0))
+            # Cached prompt tokens already consumed their reference rows even
+            # though this request's preprocessing hook never saw those tokens.
+            ref_offset = int(info_dict.get("_omni_num_computed_tokens", info_dict.get("ref_offset", 0)))
             if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
                 if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
                     ref_codes = ref_codes.view(-1, self.n_vq)

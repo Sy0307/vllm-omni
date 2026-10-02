@@ -54,9 +54,7 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     # actual platform a second time.
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = load_deploy_config(
-        get_deploy_config_path(
-            "moss_tts_local.yaml" if profile == "default" else f"moss_tts_local_mrv2_{profile}.yaml"
-        )
+        get_deploy_config_path("moss_tts_local.yaml" if profile == "default" else f"moss_tts_local_mrv2_{profile}.yaml")
     )
     pipeline = resolve_pipeline_config("moss_tts_local")
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
