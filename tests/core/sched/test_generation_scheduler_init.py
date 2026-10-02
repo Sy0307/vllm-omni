@@ -43,11 +43,23 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
     )
 
 
-@pytest.mark.parametrize("profile", ["high_concurrency", "low_latency"])
+@pytest.mark.parametrize("profile", ["high_concurrency", "low_latency", "default"])
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-def test_moss_profile_generation_constructor_after_platform_resolution(construct_scheduler, mocker, profile, platform):
+def test_moss_profile_generation_constructor_after_platform_resolution(
+    construct_scheduler, mocker, monkeypatch, profile, platform
+):
+    from vllm_omni.platforms import current_omni_platform
+
+    # merge_pipeline_deploy resolves the active platform again. Keep it equal
+    # to the platform under test, even when this CPU test runs on a CUDA host.
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = _apply_platform_overrides(
-        load_deploy_config(get_deploy_config_path(f"moss_tts_local_mrv2_{profile}.yaml")), platform=platform
+        load_deploy_config(
+            get_deploy_config_path(
+                "moss_tts_local.yaml" if profile == "default" else f"moss_tts_local_mrv2_{profile}.yaml"
+            )
+        ),
+        platform=platform,
     )
     pipeline = resolve_pipeline_config("moss_tts_local")
     codec = merge_pipeline_deploy(pipeline, deploy)[1]

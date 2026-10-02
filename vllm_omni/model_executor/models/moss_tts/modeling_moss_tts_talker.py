@@ -1820,6 +1820,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
+        self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
 
