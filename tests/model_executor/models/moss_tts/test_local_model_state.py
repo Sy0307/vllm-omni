@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 from vllm_omni.worker_v2.model_states import init_omni_model_state
+from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
@@ -69,6 +70,9 @@ def _state(cls, device):
         setattr(state, name, torch.zeros(5, 4, device=device, dtype=state.dtype))
     state._mtp_runner = state._mtp_sample_uniforms = None
     state._mtp_generators = {}
+    state._stream_pos = {}
+    state._stream_decode_event = None
+    state._eager_state = EagerMTPState(state)
     if cls is MossLocalModelState:
         state._init_slot_buffers(5, 4, device, state.dtype)
     return state

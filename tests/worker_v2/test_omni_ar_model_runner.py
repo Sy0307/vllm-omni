@@ -166,6 +166,7 @@ def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
 def test_producer_snapshot_is_not_repacked() -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace()
     runner._async_mm_snapshot_slots, runner._async_mm_snapshot_events = [{}], [None]
     runner._async_mm_snapshot_pending, runner._async_mm_snapshot_cursor = [False], 0
     runner._last_multimodal_snapshot_slot = None
@@ -178,6 +179,17 @@ def test_producer_snapshot_is_not_repacked() -> None:
     assert retained is snapshot
     assert runner._last_multimodal_snapshot_slot is None
     assert runner._async_mm_snapshot_pending == [False]
+
+
+def test_fresh_per_step_outputs_are_not_repacked() -> None:
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.model_config = SimpleNamespace(async_chunk=True)
+    runner.model = SimpleNamespace(mm_outputs_fresh_per_step=True)
+    runner._last_multimodal_snapshot_slot = None
+    outputs = {"model_outputs": torch.ones(2, 4)}
+
+    assert runner._retain_multimodal_outputs(outputs) is outputs
+    assert runner._last_multimodal_snapshot_slot is None
 
 
 def test_snapshot_slots_bounded_by_shape_and_packed_grouping_isolation(monkeypatch) -> None:

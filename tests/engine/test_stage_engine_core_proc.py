@@ -39,7 +39,6 @@ def test_first_audio_sink_preserves_first_decoder_and_opts_in_stream_decoder(
     assert runner.model_state.set_first_audio_sink.call_count == int(expected)
 
 
-
 def test_preprocess_add_request_preserves_omni_fields():
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
     request = SimpleNamespace(
