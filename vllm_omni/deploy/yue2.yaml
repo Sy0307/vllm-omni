@@ -43,9 +43,9 @@ stages:
     hf_overrides:
       architectures: ["Yue2ForCausalLM"]
     default_sampling_params:
-      # Placeholder values: the model's own sampler overrides everything from
-      # extra_args. Their presence turns on has_sampling_extra_args, which is
-      # what threads the per-request yue2_* keys into prepare_runner_inputs.
+      # Defaults for callers that omit model-owned sampling options. The
+      # opt-in prepare_runner_inputs hook reads each request's extra_args;
+      # it does not depend on the forward's has_sampling_extra_args flag.
       extra_args:
         yue2_phase: "semantic"
         yue2_seed: 831001

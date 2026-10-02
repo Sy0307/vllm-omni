@@ -12,6 +12,12 @@ class Yue2LifecycleWorkerExtension:
     model_runner: "GPUARModelRunner"
 
     def start_yue2_probe(self):
+        from unittest.mock import patch
+
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
         from vllm_omni.model_executor.models.yue2.yue2 import ABC_END, HOLD_TOKEN, MUSIC_END
 
         model = self.model_runner.get_model()
@@ -21,7 +27,27 @@ class Yue2LifecycleWorkerExtension:
             "checked_rows": 0,
             "mixed_steps": 0,
             "synthesis_started": False,
+            "ar_full_replays": 0,
+            "ar_piecewise_replays": 0,
         }
+        graph_call = CUDAGraphWrapper.__call__
+
+        def count_ar_replays(wrapper, *args, **kwargs):
+            if is_forward_context_available():
+                context = get_forward_context()
+                mode = context.cudagraph_runtime_mode
+                entry = wrapper.concrete_cudagraph_entries.get(context.batch_descriptor)
+                if mode == wrapper.runtime_mode and entry is not None and entry.cudagraph is not None:
+                    if mode == CUDAGraphMode.FULL:
+                        self.yue2_probe["ar_full_replays"] += 1
+                    elif mode == CUDAGraphMode.PIECEWISE:
+                        self.yue2_probe["ar_piecewise_replays"] += 1
+            return graph_call(wrapper, *args, **kwargs)
+
+        # This worker is created for this test and exits with the engine.
+        # Count vLLM AR replays, separately from model-owned sampler/NAR graphs.
+        self.yue2_graph_patch = patch.object(CUDAGraphWrapper, "__call__", count_ar_replays)
+        self.yue2_graph_patch.start()
         self.yue2_cancel_job = None
         previous: dict[str, int] = {}
         prepare = model.prepare_runner_inputs

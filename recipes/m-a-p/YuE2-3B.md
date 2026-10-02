@@ -103,6 +103,10 @@ The test retains the module's weekly TTS routing; it is not a per-PR CI gate.
 - **Serving:** run `vllm serve m-a-p/YuE2-3B --omni` with the default
   `yue2.yaml`, which uses eager AR with 4 slots. Validate memory capacity
   for the target card and workload.
+  For the tested single-H200 graph settings, reuse this deploy with
+  `--stage-overrides '{"0":{"max_num_seqs":32,"gpu_memory_utilization":0.5,"enforce_eager":false,"compilation_config":{"cudagraph_mode":"FULL_AND_PIECEWISE"}}}'`.
+  Decode uses FULL and mixed prefill uses PIECEWISE; VAE and the Python
+  synthesis queue remain outside these graphs.
   Audio is delivered as a whole song; time to first audio equals completion
   latency. Aborting a running song stops future work units and waits only for
   the at-most-two submitted units before releasing its buffers.

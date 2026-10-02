@@ -1856,9 +1856,7 @@ class _SynthesisQueue:
         Once several songs are in flight the synthesis pass, not the decode,
         bounds throughput, and its kernels leave no room to co-schedule the
         decode's anyway: they fill every SM. So synthesis goes first and the
-        decode fills the gaps (+3.5% over equal priority at 16 concurrent
-        songs on H200; reserving SMs for the decode with a green context cost
-        up to 20%, by slowing the bottleneck).
+        decode fills the gaps.
         """
         if self._stream is None:
             self._stream = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])

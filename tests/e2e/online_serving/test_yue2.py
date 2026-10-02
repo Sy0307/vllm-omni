@@ -270,7 +270,8 @@ def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chunked", [True, False], ids=["chunked", "unchunked"])
-async def test_yue2_preemption_and_synthesis_abort(chunked, monkeypatch) -> None:
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "ar-graphs"])
+async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monkeypatch) -> None:
     """Force real preemption and abort only after NAR work has been submitted."""
     import asyncio
     from pathlib import Path
@@ -311,6 +312,10 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, monkeypatch) -> None
         updates={
             "stages": {
                 0: {
+                    "enforce_eager": enforce_eager,
+                    "compilation_config": {
+                        "cudagraph_mode": "NONE" if enforce_eager else "FULL_AND_PIECEWISE",
+                    },
                     "enable_chunked_prefill": chunked,
                     "async_scheduling": True,
                     "max_num_batched_tokens": 256 if chunked else 1024,
@@ -395,6 +400,10 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, monkeypatch) -> None
         assert observations["rollbacks"] > 0, observations
         assert observations["checked_rows"] >= 4 * frames, observations
         assert observations["mixed_steps"] > 0, observations
+        if enforce_eager:
+            assert observations["ar_full_replays"] == 0, observations
+        else:
+            assert observations["ar_full_replays"] > 0, observations
 
         cancelled = asyncio.create_task(song("cancel-synthesis", SEED + 7))
         tasks.append(cancelled)
@@ -415,7 +424,9 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, monkeypatch) -> None
             assert asyncio.get_running_loop().time() < deadline, observations
             await asyncio.sleep(0.05)
         await asyncio.wait_for(song("after-cancel", SEED + 8), timeout=120)
-        assert (await probe())["released"]
+        observations = await probe()
+        assert observations["released"]
+        print("YuE2 lifecycle:", observations)
     finally:
         for task in tasks:
             task.cancel()
