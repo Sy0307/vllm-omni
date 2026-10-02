@@ -128,8 +128,11 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.execute_model_state = SimpleNamespace(
-        input_batch=batch, hidden_states=torch.zeros(2, 4), finished_req_ids=set(),
-        ec_connector_output=None, routed_experts=None,
+        input_batch=batch,
+        hidden_states=torch.zeros(2, 4),
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        routed_experts=None,
     )
     runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
@@ -144,9 +147,13 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
     runner.main_stream = runner.output_copy_stream = mocker.Mock()
     runner.eplb = runner._finalize_native_data_plane_output = runner._reserve_native_data_plane_outputs = mocker.Mock()
     runner.sampler = None
-    runner.sample = mocker.Mock(return_value=(
-        SimpleNamespace(sampled_token_ids=torch.tensor([[2]])), torch.ones(1), torch.zeros(1),
-    ))
+    runner.sample = mocker.Mock(
+        return_value=(
+            SimpleNamespace(sampled_token_ids=torch.tensor([[2]])),
+            torch.ones(1),
+            torch.zeros(1),
+        )
+    )
     runner.prompt_logprobs_worker = SimpleNamespace(compute_prompt_logprobs=mocker.Mock(return_value={}))
     runner.postprocess_sampled = mocker.Mock()
     runner.kv_connector = SimpleNamespace(post_forward=mocker.Mock(return_value=None))

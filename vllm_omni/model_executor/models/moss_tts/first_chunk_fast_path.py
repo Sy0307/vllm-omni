@@ -13,8 +13,8 @@ already decoded, and continues the stream from the state written here.
 
 from __future__ import annotations
 
-import queue
 import math
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -27,6 +27,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker_v2.first_audio_sender import FirstAudioSink, _PreparedDelivery
 
 logger = init_logger(__name__)
+
 
 class _SlotHandoff:
     """Orders the main path's first use of a slot after the fast decode."""

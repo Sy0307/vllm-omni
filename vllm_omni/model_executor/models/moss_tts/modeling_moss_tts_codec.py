@@ -44,6 +44,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+from vllm_omni.worker_v2.first_audio_sender import FirstAudioSink
 
 logger = init_logger(__name__)
 
@@ -482,12 +483,8 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_max_step_frames = max(
             self._stream_max_step_frames, self._initial_stream_chunk_frames, *(ramp or [])
         )
-        self._streaming_graph_frame_sizes = sorted(
-            {
-                frames
-                for frames in (self._initial_stream_chunk_frames, *(ramp or []), self._stream_chunk_frames)
-                if frames > 0
-            }
+        self._streaming_graph_frame_sizes = _resolve_streaming_graph_frame_sizes(
+            self._initial_stream_chunk_frames, self._stream_chunk_frames, self._connector_extra()
         )
 
     # ------------------------------------------------------------------

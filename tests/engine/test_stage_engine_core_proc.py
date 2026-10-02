@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
-
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
@@ -70,11 +70,15 @@ def test_codec_uses_generic_first_audio_binding(monkeypatch):
     from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
     from vllm_omni.engine import stage_engine_core_proc as module
 
-    calls = {}
-    hook = lambda *args: False
+    calls: dict[str, Any] = {}
+
+    def hook(*args):
+        return False
+
     def bind(sink):
         calls["sink"] = sink
         return hook
+
     plane = SimpleNamespace(set_first_chunk_hook=lambda value: calls.update(hook=value))
     model = SimpleNamespace(bind_first_chunk_fast_path=bind)
     runner = SimpleNamespace(model=model, get_model=lambda: model, _omni_data_plane=plane)
@@ -83,7 +87,7 @@ def test_codec_uses_generic_first_audio_binding(monkeypatch):
         driver_worker=SimpleNamespace(worker=SimpleNamespace(model_runner=runner)),
     )
     monkeypatch.setattr(module, "UniProcExecutor", SimpleNamespace)
-    outputs = queue.Queue()
+    outputs: queue.Queue = queue.Queue()
     scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=2)})
     assert module._bind_first_audio_sink(executor, outputs, scheduler)
     assert calls["hook"] is hook
@@ -100,7 +104,7 @@ def test_first_audio_binding_preserves_talker_marker(monkeypatch):
     from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
     from vllm_omni.engine import stage_engine_core_proc as module
 
-    calls = {}
+    calls: dict[str, Any] = {}
     runner = SimpleNamespace(
         model=SimpleNamespace(first_frame_decoder=object()),
         model_state=SimpleNamespace(set_first_audio_sink=lambda sink: calls.update(sink=sink)),
@@ -110,7 +114,7 @@ def test_first_audio_binding_preserves_talker_marker(monkeypatch):
         driver_worker=SimpleNamespace(worker=SimpleNamespace(model_runner=runner)),
     )
     monkeypatch.setattr(module, "UniProcExecutor", SimpleNamespace)
-    outputs = queue.Queue()
+    outputs: queue.Queue = queue.Queue()
     scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=0)})
     assert module._bind_first_audio_sink(executor, outputs, scheduler)
     calls["sink"].prepare(["r"])(["r"], [torch.ones(2)], torch.tensor(24000))

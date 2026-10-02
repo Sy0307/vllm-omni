@@ -96,6 +96,7 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
 
     if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
+        assert model_state is not None
         model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
         return True
     data_plane = getattr(model_runner, "_omni_data_plane", None)
@@ -128,7 +129,6 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
         return False
     data_plane.set_omni_connector_output_sink(sink)
     return True
-
 
 
 class StageEngineCoreProc(EngineCoreProc):

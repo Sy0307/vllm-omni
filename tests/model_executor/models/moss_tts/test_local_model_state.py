@@ -257,7 +257,7 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
 @pytest.mark.cpu
 def test_factory_requires_explicit_class_capability_and_valid_state(monkeypatch):
     monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
-    dynamic = MagicMock(has_preprocess=True)
+    dynamic = MagicMock(has_preprocess=True, create_omni_model_state=None)
     assert isinstance(init_omni_model_state(None, dynamic, None, torch.device("cpu")), OmniModelState)
     dynamic.create_mrv2_model_state.assert_not_called()
 

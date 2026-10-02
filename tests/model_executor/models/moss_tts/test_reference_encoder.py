@@ -650,8 +650,9 @@ async def test_inline_index_requires_matching_resolve_key(make_encoder):
     assert audio.resolve_calls == [ref, ref]
 
 
-async def test_inline_reference_shared_across_encoders(make_encoder, tmp_path, monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR", str(tmp_path))
+async def test_inline_reference_shared_across_encoders(make_encoder, tmp_path_factory, monkeypatch):
+    shared_dir = tmp_path_factory.mktemp("ref")
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR", str(shared_dir))
     ref = "data:audio/wav;base64,R0hJ"
     first_audio, second_audio = _DigestAudio(), _DigestAudio()
     first_audio.register(ref, 9)

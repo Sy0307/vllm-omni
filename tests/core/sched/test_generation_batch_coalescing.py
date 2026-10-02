@@ -251,5 +251,3 @@ def test_deferred_schedule_keeps_pending_request_and_allocates_nothing(monkeypat
     assert list(s.waiting) == [request]
     assert request.num_computed_tokens == request.num_in_flight_tokens == 0
     assert s.chunk_transfer_adapter.restore_called
-
-

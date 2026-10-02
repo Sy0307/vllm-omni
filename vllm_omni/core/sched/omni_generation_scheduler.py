@@ -81,12 +81,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
             parallel = self.vllm_config.parallel_config
             if not (
-                self._native_data_plane and self._retains_state_across_chunks
+                self._native_data_plane
+                and self._retains_state_across_chunks
                 and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
             ):
                 raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
-            logger.info("Generation input coalescing: target batch=%d, max wait=%.3f ms",
-                        self._generation_min_batch_size, self._generation_max_wait_s * 1000)
+            logger.info(
+                "Generation input coalescing: target batch=%d, max wait=%.3f ms",
+                self._generation_min_batch_size,
+                self._generation_max_wait_s * 1000,
+            )
         self._first_chunk_express = os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS") == "1"
         self._last_step_express = False
         # Streams that already had a chunk scheduled; the rest await their first.
@@ -199,7 +203,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 new_outputs.append(output)
         self._generation_batch_deadline = None
         return outputs
-
 
     def _build_generation_scheduler_output(
         self,

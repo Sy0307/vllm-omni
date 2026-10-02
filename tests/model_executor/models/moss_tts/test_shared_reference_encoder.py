@@ -30,9 +30,10 @@ class _Recorder:
 
 
 @pytest.fixture
-def host_dir(tmp_path, monkeypatch):
+def host_dir(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(shared, "_host_lock_handle", None)
-    return str(tmp_path)
+    # AF_UNIX limits the full socket path, including pytest directory names.
+    return str(tmp_path_factory.mktemp("ref"))
 
 
 def test_only_one_process_per_directory_hosts(host_dir):

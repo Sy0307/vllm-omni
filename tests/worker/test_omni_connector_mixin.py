@@ -39,6 +39,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class MockConnector:
+    sender_host: str | None = None
+    sender_zmq_port: int | None = None
+
     """In-memory connector for testing (mimics OmniConnectorBase)."""
 
     def __init__(self, stage_id: int = 0):
@@ -187,7 +190,7 @@ def test_init_payload_connector_ownership(role, custom_func, expected):
 
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
+def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank, mocker):
     host = MixinHost()
     host.init_omni_connectors(_make_model_config(async_chunk=async_chunk))
     # No background threads: deterministic interleaved polling.
@@ -196,7 +199,7 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
     connector = host._omni_connector
     connector.sender_host = "configured-host"
     connector.sender_zmq_port = 50051
-    connector.get = MagicMock(return_value=None)
+    get = mocker.patch.object(connector, "get", return_value=None)
     first = _make_request("r1", "external1")
     first.payload_sender_info = {"host": "producer-a", "zmq_port": "50101"}
     second = _make_request("r2", "external2")
@@ -209,14 +212,14 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
             for req_id in ("r2", "r1", "r2"):
                 assert not host._poll_single_request(req_id)
             if rank == 1:
-                connector.get.assert_not_called()
+                get.assert_not_called()
             else:
-                assert connector.get.call_args_list == [
+                assert get.call_args_list == [
                     unittest.mock.call("0", "1", "external2_0_0", {"source_host": "producer-b", "source_port": 51101}),
                     unittest.mock.call("0", "1", "external1_0_0", {"source_host": "producer-a", "source_port": 50101}),
                     unittest.mock.call("0", "1", "external2_0_0", {"source_host": "producer-b", "source_port": 51101}),
                 ]
-                connector.get.return_value = ({"ids": {"output": [1]}, "meta": {"finished": True}}, 1)
+                get.return_value = ({"ids": {"output": [1]}, "meta": {"finished": True}}, 1)
                 assert host._poll_single_request("r2")
                 assert "r2" not in host._pending_load_reqs
                 assert "r1" in host._pending_load_reqs
@@ -225,14 +228,14 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
             assert not host._pending_load_reqs
             # Reused internal ID without sender info cannot inherit either endpoint.
             replacement = _make_request("r1", "external-new")
-            connector.get.reset_mock(return_value=True)
-            connector.get.return_value = None
+            get.reset_mock(return_value=True)
+            get.return_value = None
             host.register_chunk_recv(replacement)
             assert not host._poll_single_request("r1")
             if rank == 0:
-                connector.get.assert_called_once_with("0", "1", "external-new_0_0")
+                get.assert_called_once_with("0", "1", "external-new_0_0")
             else:
-                connector.get.assert_not_called()
+                get.assert_not_called()
             assert connector.sender_host == "configured-host"
             assert connector.sender_zmq_port == 50051
             assert first.payload_sender_info == {"host": "producer-a", "zmq_port": "50101"}

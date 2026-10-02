@@ -12,8 +12,8 @@ from torch import nn
 
 from tests.model_executor.models.moss_tts.test_streaming_terminal_batch import session as cpu_session
 from vllm_omni.model_executor.models.moss_tts.first_chunk_fast_path import MossFirstChunkFastPath, _SlotHandoff
-from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
+from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
 
 pytestmark = pytest.mark.core_model
 
@@ -80,16 +80,21 @@ class _CallbackSink:
 
     def prepare(self, request_ids):
         callback = self.callback
+
         class Delivery:
             routes = {rid: (3 if rid == "r0" else 0) for rid in request_ids}
+
             def __call__(self, ids, rows, sr):
                 for rid, row in zip(ids, rows, strict=True):
                     callback(self.routes[rid], rid, {"model_outputs": row, "sr": sr})
+
             def fail(self, ids):
                 pass
+
         return Delivery()
 
 
+@pytest.mark.cuda
 def test_emits_each_first_chunk_and_hands_slot_to_main_path(cuda):
     fast, session, wrapper = _fast(cuda)
     emitted = {}
@@ -128,6 +133,7 @@ def test_emits_each_first_chunk_and_hands_slot_to_main_path(cuda):
     assert wrapper.state[:2].tolist() == [1, 1]
 
 
+@pytest.mark.cuda
 def test_order_after_blocks_until_decode_finishes(cuda):
     fast, _, wrapper = _fast(cuda)
     fast.bind(_CallbackSink(lambda *args: None))
@@ -148,6 +154,7 @@ def test_order_after_blocks_until_decode_finishes(cuda):
     fast.close()
 
 
+@pytest.mark.cuda
 def test_no_free_slot_leaves_chunk_to_main_path(cuda):
     fast, _, _ = _fast(cuda, capacity=0)
     fast.bind(_CallbackSink(lambda *args: None))
@@ -270,6 +277,7 @@ def test_oldest_acquire_reuses_least_recently_released_slot():
     assert s._free_stream_slots[-1] == a
 
 
+@pytest.mark.cuda
 def test_failed_decode_reports_error_without_replaying_state(cuda):
     fast, _, wrapper = _fast(cuda)
 
@@ -286,6 +294,7 @@ def test_failed_decode_reports_error_without_replaying_state(cuda):
     fast.close()
 
 
+@pytest.mark.cuda
 def test_failed_output_handoff_retains_decoded_samples(cuda):
     fast, _, _ = _fast(cuda)
 
@@ -303,6 +312,7 @@ def test_failed_output_handoff_retains_decoded_samples(cuda):
     fast.close()
 
 
+@pytest.mark.cuda
 def test_gate_orders_main_stream_after_inflight_fast_decode(cuda):
     fast, _, _ = _fast(cuda)
     side = torch.cuda.Stream()
@@ -327,17 +337,25 @@ def test_gate_orders_main_stream_after_inflight_fast_decode(cuda):
 def _cpu_fast(monkeypatch, *, scheduler=None):
     # Replace only CUDA allocations, retaining the real lifecycle and worker.
     import vllm_omni.model_executor.models.moss_tts.first_chunk_fast_path as module
+
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: None)
     monkeypatch.setattr(torch.cuda, "Event", lambda: None)
     monkeypatch.setattr(module, "current_omni_platform", SimpleNamespace(set_device=lambda device: None))
     session = _Session(2)
     fast = MossFirstChunkFastPath(
-        session, SimpleNamespace(batch_sizes=[1, 2]), n_vq=2, frames=1,
-        codebook_size=1024, samples_per_frame=4, n_channels=1,
-        sample_rate=torch.tensor(24000), device=torch.device("cpu:0"), handoff_timeout_s=0.01,
+        session,
+        SimpleNamespace(batch_sizes=[1, 2]),
+        n_vq=2,
+        frames=1,
+        codebook_size=1024,
+        samples_per_frame=4,
+        n_channels=1,
+        sample_rate=torch.tensor(24000),
+        device=torch.device("cpu:0"),
+        handoff_timeout_s=0.01,
     )
-    outputs = queue.Queue()
+    outputs: queue.Queue = queue.Queue()
     scheduler = scheduler or SimpleNamespace(requests={"r": SimpleNamespace(client_index=3)})
     sink = engine_output_queue_sink(outputs, scheduler, upstream_first_audio=False)
     return fast, session, sink, outputs
@@ -362,7 +380,7 @@ def test_closed_decoder_rejects_jobs_and_cannot_restart(monkeypatch):
     fast, session, sink, _ = _cpu_fast(monkeypatch)
     fast.bind(sink)
     fast.close()
-    slots = {}
+    slots: dict[str, int] = {}
     assert not fast.submit("r", "external", [1, 2], slots)
     assert slots == {} and session.free == [0, 1]
     with pytest.raises(RuntimeError, match="closed"):
@@ -383,15 +401,18 @@ def test_missing_route_does_not_claim_slot(monkeypatch):
 @pytest.mark.cpu
 def test_decode_failure_wakes_current_and_queued_handoffs(monkeypatch):
     from vllm.v1.engine import FinishReason
+
     fast, _, sink, outputs = _cpu_fast(monkeypatch)
     entered, release = threading.Event(), threading.Event()
+
     def fail(jobs):
         entered.set()
         assert release.wait(2)
         raise RuntimeError("partial replay failed")
+
     fast._decode = fail
     fast.bind(sink)
-    slots = {}
+    slots: dict[str, int] = {}
     try:
         assert fast.submit("r", "a", [1, 2], slots)
         assert entered.wait(2)
@@ -415,10 +436,13 @@ def test_decode_failure_wakes_current_and_queued_handoffs(monkeypatch):
 @pytest.mark.cpu
 def test_platform_failure_wakes_pending_handoff(monkeypatch):
     import vllm_omni.model_executor.models.moss_tts.first_chunk_fast_path as module
+
     fast, _, _, _ = _cpu_fast(monkeypatch)
     fast._handoffs[0] = _SlotHandoff()
+
     def fail(device):
         raise RuntimeError("device unavailable")
+
     monkeypatch.setattr(module, "current_omni_platform", SimpleNamespace(set_device=fail))
     fast._run()
     assert fast._closed

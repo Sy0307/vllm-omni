@@ -240,7 +240,7 @@ def test_sender_copy_failure_reports_all_prepared_routes():
 def test_final_codec_delivery_omits_upstream_marker_and_freezes_route():
     from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
 
-    outputs = queue.Queue()
+    outputs: queue.Queue = queue.Queue()
     scheduler = _scheduler(r=3)
     delivery = engine_output_queue_sink(outputs, scheduler, upstream_first_audio=False).prepare(["r"])
     scheduler.requests.clear()
