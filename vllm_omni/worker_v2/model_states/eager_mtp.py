@@ -143,12 +143,15 @@ class EagerMTPState:
             return
         history_slices: list[torch.Tensor] = []
         input_slices: list[torch.Tensor] = []
+        histories = self._talker_inputs
+        on_cpu = embeds.is_cpu
         for i, req_id in enumerate(input_batch.req_ids):
             start, end = input_batch.query_start_loc_np[i : i + 2]
             offset = int(input_batch.num_computed_tokens_np[i])
             length = offset + int(end - start)
-            history = self._talker_inputs.get(req_id)
-            if history is None or history.embeds.device != embeds.device:
+            history = histories.get(req_id)
+            # A suspended request's inputs wait on the host; bring them back.
+            if history is None or history.embeds.is_cpu != on_cpu:
                 storage = torch.empty(
                     self.owner.vllm_config.model_config.max_model_len,
                     embeds.shape[-1],
@@ -457,10 +460,11 @@ class EagerMTPState:
             for t in (frame_codes, meta, last_tokens, valid, stream_out):
                 t.record_stream(side)
             with torch.cuda.stream(side):
-                for _i, req_idx, req_id, _p in entries:
-                    saved = self._restore_audio.pop(req_id, None)
-                    if saved is not None:
-                        stream.restore_slot(req_idx, saved)
+                if self._restore_audio:
+                    for _i, req_idx, req_id, _p in entries:
+                        saved = self._restore_audio.pop(req_id, None)
+                        if saved is not None:
+                            stream.restore_slot(req_idx, saved)
                 model.prime_stream_decoder(primes)
                 pcm = decode(frame_codes, rows, meta[4 * bsz : 5 * bsz])
                 stream_out.index_copy_(0, last_tokens, pcm.reshape(bsz, -1).to(stream_out.dtype))
