@@ -25,6 +25,7 @@ def _step(manager, frames, finished=False):
     payload = talker2codec_raw_async_chunk(manager, {"codes": {"audio": frames}}, request, is_finished=finished)
     if payload is not None and payload.codes is not None:
         manager.put_req_chunk["r"] += 1
+        manager.ramp_chunk_count["r"] += 1
     return payload
 
 

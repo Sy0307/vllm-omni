@@ -213,11 +213,11 @@ def test_workers_encode_concurrently_after_their_warmups(host_dir):
 
 
 def test_client_requests_in_flight_use_their_own_connections(host_dir):
-    inside, release = threading.Barrier(3, timeout=5), threading.Event()
+    entered, release = threading.Semaphore(0), threading.Event()
 
     def worker():
         def encode(wavs):
-            inside.wait()
+            entered.release()
             release.wait(5)
             return [_codes(w) for w in wavs]
 
@@ -232,8 +232,10 @@ def test_client_requests_in_flight_use_their_own_connections(host_dir):
         ]
         for thread in threads:
             thread.start()
-        inside.wait()  # both requests reached the host at once
-        release.set()
+            # A worker holds this request, still unanswered, before the next is
+            # sent. Sent together, one free worker may take both as one batch.
+            assert entered.acquire(timeout=5)
+        release.set()  # both requests reached the host at once
         for thread in threads:
             thread.join(5)
         assert sorted(int(o[0][0, 0]) for o in out) == [1, 2]

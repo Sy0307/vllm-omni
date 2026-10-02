@@ -715,7 +715,10 @@ async def test_processor_prepare_resamples_to_the_tokenizer_rate(make_encoder):
     enc = make_encoder(proc)  # works at 24 kHz, the Local-v1.5 reference rate
     wav = torch.randn(1, 2400)
     expected = torchaudio.functional.resample(wav.repeat(2, 1), 24000, 48000) * 2.0
-    torch.testing.assert_close(enc._processor_prepare(wav), expected, rtol=0, atol=0)
+    # The encoder resamples the mono clip before duplicating it. Some CPU conv
+    # kernels round a one-row batch differently from a two-row one, so the two
+    # orders agree to float32 precision, not bit for bit.
+    torch.testing.assert_close(enc._processor_prepare(wav), expected, rtol=0, atol=1e-5)
 
 
 @pytest.mark.parametrize("role", ["", "host", "client"])

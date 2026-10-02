@@ -250,6 +250,8 @@ def talker2codec_raw_async_chunk(
         transfer_manager.request_payload = {}
     if not hasattr(transfer_manager, "put_req_chunk"):
         transfer_manager.put_req_chunk = defaultdict(int)
+    if not hasattr(transfer_manager, "ramp_chunk_count"):
+        transfer_manager.ramp_chunk_count = defaultdict(int)
 
     pending_frames = transfer_manager.code_prompt_token_ids[req_id]
 
@@ -300,7 +302,10 @@ def talker2codec_raw_async_chunk(
         transfer_manager._moss_chunk_ramp = parse_chunk_ramp(cfg, steady=chunk_frames)
     ramp = transfer_manager._moss_chunk_ramp
     if ramp is not None:
-        threshold = ramp_chunk_size(emitted_chunks, ramp, chunk_frames)
+        # The ladder is indexed by the connector's segment-local counter, which
+        # restarts at each segment boundary; put_req_chunk is request-global.
+        ramp_index = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
+        threshold = ramp_chunk_size(ramp_index, ramp, chunk_frames)
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)

@@ -29,6 +29,7 @@ class _TransferManager:
     code_prompt_token_ids: dict[str, list[object]] = field(default_factory=lambda: defaultdict(list))
     request_payload: dict[str, object] = field(default_factory=dict)
     put_req_chunk: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    ramp_chunk_count: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
 
 @dataclass
@@ -48,6 +49,7 @@ def _emit(
     payload = talker2codec_raw_async_chunk(manager, output, _Request(req_id), finished)
     if payload is not None:
         manager.put_req_chunk[req_id] += 1
+        manager.ramp_chunk_count[req_id] += 1
     return payload
 
 
