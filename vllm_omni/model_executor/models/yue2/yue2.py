@@ -1668,6 +1668,11 @@ class _RequestState:
     end_drawn: bool = False  # the engine counts a drawn end (or its HOLD) too
     job: _SynthesisJob | None = None  # async synthesis in flight
     hold_steps: int = 0  # HOLD_TOKEN steps emitted while it runs
+    # Engine output count once the emitted end token is accepted, and the
+    # shipped (audio, truncated, error). A preemption can drop the step that
+    # delivered both; the resumed request then delivers them again.
+    end_len: int | None = None
+    delivered: tuple[torch.Tensor, bool, bool] | None = None
 
 
 SongWork = Callable[[list], Generator[None, None, torch.Tensor]]
@@ -2344,11 +2349,22 @@ class Yue2ForCausalLM(nn.Module):
                 discarded = comp + span < state.prompt_len
             if discarded:
                 continue
-            self._reconcile_history(state, max(0, comp + span - state.prompt_len))
-            if state.finished:
-                continue
+            accepted = max(0, comp + span - state.prompt_len)
+            self._reconcile_history(state, accepted)
             c = state.constants
             end = ABC_END if c.phase == "abc" else MUSIC_END
+            if state.finished:
+                # Normally an async lookahead row the engine discards. If the
+                # scheduler dropped the step that emitted the end token (the
+                # request was preempted with it in flight), that step's audio
+                # was dropped too: deliver both again.
+                if state.end_len is not None and accepted < state.end_len:
+                    if state.delivered is not None:
+                        audio, truncated, error = state.delivered
+                        self._ship_audio(state.request_id, audio, truncated, error=error)
+                    state.end_len = accepted + 1
+                    host_token_ids[row, 0] = end
+                continue
             if state.finish_ready:
                 state.finish_ready = False
                 if self._hold_allowed(state):
@@ -2356,12 +2372,14 @@ class Yue2ForCausalLM(nn.Module):
                     host_token_ids[row, 0] = HOLD_TOKEN
                     continue
                 state.finished = True
+                state.end_len = accepted + 1
                 self._finish_request_safely(state, hit_end=not state.truncated)
                 host_token_ids[row, 0] = end
                 continue
             if state.job is not None:
                 if state.job.done() or not self._hold_allowed(state):
                     self._complete_synthesis(state)
+                    state.end_len = accepted + 1
                     host_token_ids[row, 0] = end
                 else:
                     state.hold_steps += 1
@@ -2573,6 +2591,8 @@ class Yue2ForCausalLM(nn.Module):
         del state.history[accepted:]
         state.end_drawn = False
         state.finished = False
+        state.end_len = None
+        state.delivered = None
         state.hold_steps = 0
         state.truncated = state.constants.phase == "semantic" and len(state.history) >= state.constants.max_audio_frames
         state.finish_ready = state.truncated
@@ -2664,7 +2684,12 @@ class Yue2ForCausalLM(nn.Module):
         sparse routing on the request's last step in the output batch. Leaving
         the payload for a later step would drop it: the request is gone by
         then (gepard_talker flushes at its last step for the same reason).
+        The request keeps a reference until the engine finishes it, in case
+        the scheduler drops this step (see ``_RequestState.end_len``).
         """
+        state = self._states.get(req_id)
+        if state is not None:
+            state.delivered = (audio, truncated, error)
         mm = self._last_mm
         if mm is None:
             # No forward built a payload this step; fall back to the queue.

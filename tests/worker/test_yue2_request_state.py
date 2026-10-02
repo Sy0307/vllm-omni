@@ -28,6 +28,7 @@ def model(mocker):
     model._step_discard = None
     model._decode_t0 = {}
     model._last_mm = None
+    model._audio_queue = []
     model._max_model_len = 4096
     model._stage = torch.empty(1024, dtype=torch.long)
     model._pinned = torch.empty((2, 64), dtype=torch.long)
@@ -98,6 +99,8 @@ def test_recompute_clears_terminal_state_and_cancels_stale_job(model) -> None:
     state.end_drawn = True
     state.finished = state.finish_ready = True
     state.hold_steps = 3
+    state.end_len = 6
+    state.delivered = (torch.zeros((2, 0)), False, False)
 
     def song(keep):
         yield
@@ -109,6 +112,44 @@ def test_recompute_clears_terminal_state_and_cancels_stale_job(model) -> None:
     model._synthesis.cancel.assert_called_once_with(job)
     assert state.job is None and state.hold_steps == 0
     assert not state.finished and not state.finish_ready and not state.truncated and not state.end_drawn
+    assert state.end_len is None and state.delivered is None
+
+
+def test_dropped_end_step_redelivers_song_and_end(model, mocker) -> None:
+    """A preemption that drops the step emitting the end token also drops
+    that step's audio; the resumed request must deliver both again."""
+    state = model._states["r"]
+    state.history = [y.CODEC_OFFSET + 2] * 3  # at the 3-frame budget
+    state.truncated = True
+    state.hold_steps = 2
+    audio = torch.ones((2, 5))
+    job = mocker.Mock(t_start=1.0, t_done=2.0)
+    job.done.return_value = True
+    state.job = job
+    model._synthesis.complete.return_value = (audio, False, False)
+    logits = torch.zeros((1, y.VOCAB_SIZE))
+
+    # Engine holds 3 frames + 2 HOLDs; this step ships the song and its end.
+    model._step_rows = [("r", 7, 1)]
+    out = model.sample(logits, None)
+    assert out.sampled_token_ids.tolist() == [[y.MUSIC_END]]
+    assert state.finished and state.end_len == 6
+    assert [entry[:2] for entry in model._audio_queue] == [("r", audio)]
+
+    # An async lookahead row (end token in flight) delivers nothing again.
+    model._step_rows = [("r", 8, 1)]
+    model.sample(logits, None)
+    assert len(model._audio_queue) == 1
+
+    # Preempted with the end step in flight: the resumed row lacks it.
+    model._step_rows = [("r", 0, 8)]
+    model._step_discard = [False]
+    out = model.sample(logits, None)
+    assert out.sampled_token_ids.tolist() == [[y.MUSIC_END]]
+    assert [entry[:2] for entry in model._audio_queue] == [("r", audio), ("r", audio)]
+    assert model._audio_queue[1][2:] == (True, False)  # truncated, not failed
+    assert state.end_len == 6
+    model._synthesis.complete.assert_called_once()
 
 
 def test_accepted_draw_still_reaches_frame_limit(model) -> None:
