@@ -24,7 +24,9 @@ and deletion work with any number of API processes: the speaker directory
 on it, and every process picks up the other processes' changes before it
 resolves a voice. Keep that directory on a local filesystem: client-side
 attribute caching on network filesystems delays when other processes see a
-change. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes
+change. It defaults to `~/.cache/vllm-omni/speakers`, which every server run by
+the same user shares; set `SPEAKER_SAMPLES_DIR` per deployment to keep their
+voices apart. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes
 return HTTP 409 because their bookkeeping is process-local while stage engines
 are shared.
 

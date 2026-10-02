@@ -164,3 +164,16 @@ def test_partial_files_and_manual_entries_are_left_alone(frontend, tmp_path):
     assert set(a.uploaded_speakers) == {"manual"}
     # The failed write left no voice file and removed its temporary file.
     assert sorted(p.name for p in tmp_path.iterdir()) == [".half.safetensors.tmp", ".voices.lock"]
+
+
+def test_failed_reupload_keeps_the_previous_voice(frontend, tmp_path):
+    a, b = frontend(), frontend()
+    asyncio.run(a.upload_voice_embedding(_EMBEDDING, "c", "Kim"))
+    previous = a.uploaded_speakers["kim"]["file_path"]
+
+    with patch("safetensors.torch.save_file", side_effect=OSError("disk full")), pytest.raises(OSError):
+        asyncio.run(b.upload_voice_embedding(json.dumps([0.5] * 8), "c", "Kim"))
+    # The replacement never landed, so the old voice stays registered everywhere.
+    assert b.uploaded_speakers["kim"]["file_path"] == previous
+    assert "kim" in a._get_available_speakers()
+    assert [p.name for p in tmp_path.glob("*.safetensors")] == [previous.rsplit("/", 1)[-1]]

@@ -21,17 +21,13 @@ from typing import Any, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX platforms
-    fcntl = None  # type: ignore[assignment]
-
 import anyio
 import numpy as np
 import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from filelock import AsyncFileLock
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
@@ -287,7 +283,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._voice_dir_mtime_ns: int | None = None
         self._voice_scan_ns = 0
         self._voice_listing: list[tuple[str, int]] | None = None
-        self._voice_lock_fd: int | None = None
+        # Serializes voice registration across every API process sharing the directory.
+        self._voice_file_lock = AsyncFileLock(str(self.uploaded_speakers_dir / ".voices.lock"))
         self._restore_uploaded_speakers()
         logger.info(
             "Speaker storage: dir=%s, max_speakers=%d, restored=%d",
@@ -465,24 +462,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _voice_registry_lock(self):
         """Serialize voice registration in this process and across API processes.
 
-        Holds an exclusive ``flock`` on the speaker directory's lock file and
-        refreshes the registry, so upload caps, the registration policy and
-        upload timestamps see every process's voices.
+        Holds the speaker directory's file lock and refreshes the registry, so
+        upload caps, the registration policy and upload timestamps see every
+        process's voices.
         """
-        async with self._upload_lock:
-            fd = self._voice_lock_fd
-            if fd is None and fcntl is not None:
-                fd = self._voice_lock_fd = os.open(
-                    self.uploaded_speakers_dir / ".voices.lock", os.O_RDWR | os.O_CREAT, 0o600
-                )
-            if fd is not None:
-                await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
-            try:
-                self._refresh_uploaded_speakers(force=True)
-                yield
-            finally:
-                if fd is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+        async with self._upload_lock, self._voice_file_lock:
+            self._refresh_uploaded_speakers(force=True)
+            yield
 
     @staticmethod
     def _save_voice_file(
@@ -1119,8 +1105,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async with self._voice_registry_lock():
             voice_name_lower = name.lower()
             self._check_registration_allowed(voice_name_lower, name)
-            self._evict_existing_upload(voice_name_lower, name)
-            self._check_upload_cap()
+            if voice_name_lower not in self.uploaded_speakers:
+                self._check_upload_cap()
 
             sanitized_name = _sanitize_filename(name)
             sanitized_consent = _sanitize_filename(consent)
@@ -1183,6 +1169,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             except Exception as e:
                 raise ValueError(f"Failed to save voice file: {e}")
 
+            # Retire a previous upload only once its replacement is in place, so
+            # other API processes never see the voice missing.
+            self._evict_existing_upload(voice_name_lower, name)
             self.uploaded_speakers[voice_name_lower] = speaker_data
             self._remember_written_voice(voice_name_lower, file_path, speaker_data)
 
@@ -1242,8 +1231,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async with self._voice_registry_lock():
             voice_name_lower = name.lower()
             self._check_registration_allowed(voice_name_lower, name)
-            self._evict_existing_upload(voice_name_lower, name)
-            self._check_upload_cap()
+            if voice_name_lower not in self.uploaded_speakers:
+                self._check_upload_cap()
 
             sanitized_name = _sanitize_filename(name)
             sanitized_consent = _sanitize_filename(consent)
@@ -1278,6 +1267,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             speaker_data["file_size"] = file_path.stat().st_size
 
+            # Retire a previous upload only once its replacement is in place, so
+            # other API processes never see the voice missing.
+            self._evict_existing_upload(voice_name_lower, name)
             self.uploaded_speakers[voice_name_lower] = speaker_data
             self._remember_written_voice(voice_name_lower, file_path, speaker_data)
 
