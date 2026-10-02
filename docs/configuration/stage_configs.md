@@ -5,6 +5,12 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
+YuE2 defaults to `yue2.yaml` with four slots and eager AR execution. Select
+`--deploy-config vllm_omni/deploy/yue2_h200.yaml` for the tested single-H200
+32-slot profile with `FULL_AND_PIECEWISE` AR graphs. Model-owned sampler/NAR
+graphs also need memory beyond the engine budget; the H200 profile does not
+establish a 24 GB card's worst-case song capacity. See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md).
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions
