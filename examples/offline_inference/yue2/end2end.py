@@ -98,7 +98,6 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=200, help="semantic frame budget (25 frames = 1 s)")
     parser.add_argument("--abc-file", default=None, help="external ABC score (requires cot=melody/full)")
     parser.add_argument("--output", default="yue2_song.wav")
-    parser.add_argument("--deploy-config", default=None, help="optional deploy YAML, e.g. yue2_h200.yaml")
     parser.add_argument(
         "--dump-tokens",
         default=None,
@@ -122,8 +121,6 @@ def main() -> None:
 
     tokenizer = YuE2TextTokenizer(Path(args.model) / "qwen.tiktoken")
     engine_kwargs: dict = {}
-    if args.deploy_config is not None:
-        engine_kwargs["deploy_config"] = args.deploy_config
     if args.gpu_memory_utilization is not None:
         engine_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
     engine = Omni(model=args.model, **engine_kwargs)

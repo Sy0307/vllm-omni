@@ -93,20 +93,16 @@ The test retains the module's weekly TTS routing; it is not a per-PR CI gate.
   workload needs more synthesis memory, especially for long ABC prefixes and
   the 9000-frame cap. Releasing completed chunks bounds live NAR buffers,
   while the shared graph allocator retains reserved storage for reuse.
-- **CUDA graphs:** the default deploy keeps the AR backbone eager. The explicit
-  `yue2_h200.yaml` profile uses FULL_AND_PIECEWISE graphs; both ABC
+- **CUDA graphs:** the default deploy keeps the AR backbone eager. Both ABC
   and semantic sampling use prewarmed power-of-two graph buckets. Custom
   sampler captures have a bounded cache and fall back to eager sampling when
   it fills. The NAR velocity pass uses a chunk graph on the serialized synthesis
   stream. Chunk graphs share one allocator pool; completed chunks release
   their engines and buffers after their own events. FA3 runs on Hopper; other
   CUDA cards use SDPA, which is also warmed at startup.
-- **Serving:** select the tested H200 profile with
-  `vllm serve m-a-p/YuE2-3B --omni --deploy-config vllm_omni/deploy/yue2_h200.yaml`.
-  It uses `max_num_seqs: 32` and `gpu_memory_utilization: 0.5`. The offline
-  example accepts the same `--deploy-config` option. The default remains
-  eager AR with 4 slots; this does not
-  establish 24 GB capacity with the async/graph implementation.
+- **Serving:** run `vllm serve m-a-p/YuE2-3B --omni` with the default
+  `yue2.yaml`, which uses eager AR with 4 slots. Validate memory capacity
+  for the target card and workload.
   Audio is delivered as a whole song; time to first audio equals completion
   latency. Aborting a running song stops future work units and waits only for
   the at-most-two submitted units before releasing its buffers.

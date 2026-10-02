@@ -13,12 +13,8 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    # A finishing song keeps its slot during side-stream synthesis (emitting
-    # HOLD tokens meanwhile). On one
-    # H200 the synthesis pass saturates the GPU at about 32 songs in flight,
-    # and more slots only add hold steps (120 s songs, gpu_memory_utilization
-    # 0.5: 54 audio s/s at 32 concurrent requests; at 64 concurrent, 56 with
-    # 32 slots vs 50 with 64), so raise this to 32 there, not higher.
+    # A finishing song keeps its slot during side-stream synthesis,
+    # emitting HOLD tokens until its audio is ready.
     max_num_seqs: 4
     # Reserve synthesis headroom: NAR K/V, acoustic graph buffers and VAE
     # activations are allocated beyond the engine budget. The earlier 4090
@@ -26,9 +22,8 @@ stages:
     # point, not a guarantee for 9000 frames or long ABC prefixes. Lower it if
     # the target workload needs more synthesis memory (see the model recipe).
     gpu_memory_utilization: 0.70
-    # Keep AR capture off in the smaller-card default. Sampler/NAR graphs
-    # still need separate synthesis headroom. Use yue2_h200.yaml for the
-    # tested 32-slot FULL_AND_PIECEWISE AR profile.
+    # Keep AR capture off by default. Sampler/NAR graphs still need
+    # separate synthesis headroom.
     enforce_eager: true
     # Prefix caching stays off: the omni prefix-cache save snapshots the
     # step's mm payload before the model-owned sampler runs, but YuE2
