@@ -1,7 +1,7 @@
 # Experimental opt-in CUDA profile for MOSS-TTS-Local-Transformer-v1.5.
 # Requires H200-class memory and nvidia-cuda-mps-control on PATH.
 # The combined kernels/sampler have an unresolved WER regression signal.
-# Keep moss_tts_local.yaml as the V1 default; see recipes/OpenMOSS/MOSS-TTS.md.
+# CUDA defaults to MRV2 with the original sampler; see recipes/OpenMOSS/MOSS-TTS.md.
 # The throughput baseline remains moss_tts_local_mrv2_high_concurrency.yaml.
 base_config: moss_tts_local_mrv2_high_concurrency.yaml
 model_runner: v1

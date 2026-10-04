@@ -159,9 +159,24 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ## Local 1.5 MRV2 and slot attention
 
-`MOSS-TTS-Local-Transformer-v1.5` keeps the V1 deployment as its default on
-all platforms. The default uses capacities of 64, utilization-based memory
-budgets, the original Local projection and sampler, and no MPS requirement.
+`MOSS-TTS-Local-Transformer-v1.5` defaults to the native MRV2 pipeline on
+CUDA, with the original Local projection and sampler. When
+`nvidia-cuda-mps-control` is on `PATH`, it starts private full-quota MPS.
+GPUs with at least 140 GiB total memory use the capped-C128 throughput
+profile with a 32 GiB Talker KV budget; smaller GPUs or a failed memory
+query use C64 with utilization-based memory budgets. When the MPS executable
+is unavailable, the automatic default is C64 MRV2 without MPS. NPU, XPU,
+ROCm and MUSA retain V1. Explicit deploy configs override automatic selection.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --stage-init-timeout 1200 --init-timeout 1500
+```
+
+Use `--deploy-config vllm_omni/deploy/moss_tts_local_v1.yaml` to select the
+previous V1 profile explicitly. C128's batch-prefill and direct-token switches
+remain confined to the throughput profile; they are not enabled in C64.
 
 The experimental `moss_tts_local_mrv2_optimized.yaml` profile explicitly
 selects the native CUDA MRV2 pipeline on a single large-memory GPU. It enables GPU request slots,
