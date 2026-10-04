@@ -52,6 +52,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     InteractionMessage,
     OutputMessage,
+    OutputQueueWriter,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
     StageMetricsMessage,
@@ -306,7 +307,7 @@ class OrchestratorBase:
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        output_async_queue: OutputQueueWriter,
         rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
