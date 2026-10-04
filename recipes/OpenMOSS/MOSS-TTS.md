@@ -178,15 +178,12 @@ Use `--deploy-config vllm_omni/deploy/moss_tts_local_v1.yaml` to select the
 previous V1 profile explicitly. C128's batch-prefill and direct-token switches
 remain confined to the throughput profile; they are not enabled in C64.
 
-The experimental `moss_tts_local_mrv2_optimized.yaml` profile explicitly
-selects the native CUDA MRV2 pipeline on a single large-memory GPU. It enables GPU request slots,
-batch prefill, direct tokens, prefix caching, codec first-chunk decode and
-private CUDA MPS. It uses the Triton backbone attention backend, precomputed
-frame-local QKV tables and fused audio-channel sampling, with dense codec
-graph buckets through 128. Both stage capacities are 128, with a 32 GiB
-Talker KV budget; this profile requires H200-class memory and
-`nvidia-cuda-mps-control` on `PATH`. It is not selected automatically, even
-on H200. NPU, XPU, ROCm and MUSA retain V1 and do not start MPS.
+The explicit `moss_tts_local_mrv2_optimized.yaml` system profile adds prefix
+caching, Triton backbone attention, codec first-chunk decode and dense codec
+graph buckets through 128 to C128 MRV2/MPS. It retains the original Local
+depth projection and sampler. Both stages share one GPU, with a 32 GiB Talker
+KV budget; this profile requires H200-class memory and
+`nvidia-cuda-mps-control` on `PATH`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
@@ -195,24 +192,11 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
 
-This combination remains experimental because quality checks have shown a
-positive WER regression signal, including repeated-reference traffic. The
-checks used unseeded requests and do not establish which optimization caused
-the difference. Speaker similarity has not been validated. Evaluate WER and
-speaker similarity on your workload before choosing this profile; throughput
-gains do not establish quality equivalence.
-
-The lookup table is derived after loading weights and before graph capture.
-Fused attention and a differently sized projection can change rounding;
-fused sampling uses inverse CDF and consumes RNG differently from PyTorch
-multinomial, with lower token IDs breaking ties. Explicit per-request seeds,
-unsupported sampling settings and non-CUDA devices keep the original sampler.
-Set `VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP=0` or
-`VLLM_OMNI_MOSS_LOCAL_FUSED_SAMPLING=0` in a stage-0 environment override to
-disable either optimization. Do not apply partial MPS SM quotas: BF16 GEMM
-outputs were observed incomplete in that configuration on the validation
-environment. MPS uses an owned control socket or an explicitly supplied
-operator socket; only the owned daemon is stopped at shutdown.
+Evaluate WER, speaker similarity and streaming latency for your workload;
+throughput gains do not establish quality equivalence. Do not apply partial
+MPS SM quotas: BF16 GEMM outputs were observed incomplete in that configuration
+on the validation environment. MPS uses an owned control socket or an
+explicitly supplied operator socket; only the owned daemon is stopped at shutdown.
 
 The explicit C64 MRV2 and capped-C128 throughput profiles remain available.
 Both profiles below preserve 1-frame initial and 15-frame steady codec chunks

@@ -1,7 +1,7 @@
-# Experimental opt-in CUDA profile for MOSS-TTS-Local-Transformer-v1.5.
+# Opt-in CUDA system profile for MOSS-TTS-Local-Transformer-v1.5.
 # Requires H200-class memory and nvidia-cuda-mps-control on PATH.
-# The combined kernels/sampler have an unresolved WER regression signal.
-# CUDA defaults to MRV2 with the original sampler; see recipes/OpenMOSS/MOSS-TTS.md.
+# Adds prefix caching, Triton backbone attention and faster codec dispatch;
+# keeps the original Local depth projection and sampler.
 # The throughput baseline remains moss_tts_local_mrv2_high_concurrency.yaml.
 base_config: moss_tts_local_mrv2_high_concurrency.yaml
 model_runner: v1
@@ -20,9 +20,6 @@ platforms:
         enable_prefix_caching: true
         attention_config:
           backend: TRITON_ATTN
-        env:
-          VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP: "1"
-          VLLM_OMNI_MOSS_LOCAL_FUSED_SAMPLING: "1"
       - stage_id: 1
         compilation_config:
           mode: 3

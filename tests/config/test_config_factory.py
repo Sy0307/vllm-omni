@@ -2988,8 +2988,7 @@ class TestPlatformOverrides:
             assert stage.model_config.use_v2_model_runner
             assert stage.runtime_config.cuda_mps is mps_available
             assert not stage.cache_config.enable_prefix_caching
-            assert "VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP" not in (stage.runtime_config.env or {})
-            assert "VLLM_OMNI_MOSS_LOCAL_FUSED_SAMPLING" not in (stage.runtime_config.env or {})
+            assert not stage.runtime_config.env
         overrides = talker.model_config.hf_overrides or {}
         assert overrides.get("mrv2_batch_prefill", False) is high_capacity
         assert overrides.get("mrv2_direct_tokens", False) is high_capacity
@@ -3056,7 +3055,7 @@ class TestPlatformOverrides:
             assert stage.yaml_engine_args["max_num_seqs"] == capacity
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_moss_local_opt_in_reaches_native_runner_and_cuda_only_mps(self, platform):
+    def test_moss_local_system_profile_reaches_native_runner_and_cuda_only_mps(self, platform):
         pipeline = resolve_pipeline_config("moss_tts_local")
         path = Path(get_deploy_config_path("moss_tts_local_mrv2_optimized.yaml"))
         deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
@@ -3072,11 +3071,10 @@ class TestPlatformOverrides:
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
             assert deploy.connectors["shm"]["extra"]["codec_first_chunk_fast_path"] == 1
-            env = stages[0].yaml_runtime["env"]
-            assert env["VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP"] == env["VLLM_OMNI_MOSS_LOCAL_FUSED_SAMPLING"] == "1"
+            assert not stages[0].yaml_runtime.get("env")
         else:
             assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages)
-            assert all("VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP" not in stage.yaml_runtime.get("env", {}) for stage in stages)
+            assert all(not stage.yaml_runtime.get("env") for stage in stages)
 
     def test_platform_mps_rejects_non_boolean(self):
         deploy = load_deploy_config(get_deploy_config_path("moss_tts_local_mrv2_optimized.yaml"))
