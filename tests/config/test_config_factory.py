@@ -2935,7 +2935,7 @@ class TestPlatformOverrides:
             ("moss_tts_local_mrv2.yaml", "moss_tts_local"),
             ("moss_tts_local_mrv2_high_concurrency.yaml", "moss_tts_local"),
             ("moss_tts_local_mrv2_low_latency.yaml", "moss_tts_local"),
-            ("moss_tts_local.yaml", "moss_tts_local"),
+            ("moss_tts_local_mrv2_optimized.yaml", "moss_tts_local"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -2955,10 +2955,48 @@ class TestPlatformOverrides:
             # v2 only engages the native plane on stages declaring support.
             assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
 
-    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_moss_local_default_reaches_native_runner_and_cuda_only_mps(self, platform):
+    @pytest.mark.parametrize("memory_gib", [24, 80, 141])
+    @pytest.mark.parametrize("mps_available", [False, True])
+    def test_moss_local_default_keeps_v1_without_optimized_prerequisites(self, monkeypatch, memory_gib, mps_available):
+        from vllm.platforms import current_platform
+        from vllm.platforms.interface import DeviceCapability
+
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(current_platform, "get_device_capability", lambda: DeviceCapability(9, 0))
+        monkeypatch.setattr(current_platform, "get_device_total_memory", lambda: memory_gib * 1024**3)
+        monkeypatch.setattr(
+            "shutil.which", lambda command: "/usr/bin/nvidia-cuda-mps-control" if mps_available else None
+        )
         pipeline = resolve_pipeline_config("moss_tts_local")
-        path = Path(get_deploy_config_path(pipeline.default_deploy_config_name))
+        config = VllmOmniConfig.from_pipeline_config(pipeline)
+        talker, codec = config.stage_configs
+        assert talker.scheduler_config.max_num_seqs == codec.scheduler_config.max_num_seqs == 64
+        assert talker.cache_config.kv_cache_memory_bytes is None
+        assert talker.cache_config.gpu_memory_utilization == 0.60
+        assert codec.cache_config.gpu_memory_utilization == 0.30
+        for stage in config.stage_configs:
+            assert not stage.model_config.use_v2_model_runner
+            assert not stage.runtime_config.cuda_mps
+            assert not stage.cache_config.enable_prefix_caching
+            assert stage.model_config.hf_overrides is None
+            assert "VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP" not in (stage.runtime_config.env or {})
+            assert "VLLM_OMNI_MOSS_LOCAL_FUSED_SAMPLING" not in (stage.runtime_config.env or {})
+
+        # The serving engine still consumes the legacy representation.
+        stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {})
+        for stage in stages:
+            assert stage.yaml_engine_args["max_num_seqs"] == 64
+            assert not stage.yaml_engine_args["use_v2_model_runner"]
+            assert "kv_cache_memory_bytes" not in stage.yaml_engine_args
+            assert not stage.yaml_runtime.get("cuda_mps", False)
+
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_moss_local_opt_in_reaches_native_runner_and_cuda_only_mps(self, platform):
+        pipeline = resolve_pipeline_config("moss_tts_local")
+        path = Path(get_deploy_config_path("moss_tts_local_mrv2_optimized.yaml"))
         deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
         stages = merge_pipeline_deploy(pipeline, deploy)
         is_cuda = platform == "cuda"
@@ -2979,14 +3017,14 @@ class TestPlatformOverrides:
             assert all("VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP" not in stage.yaml_runtime.get("env", {}) for stage in stages)
 
     def test_platform_mps_rejects_non_boolean(self):
-        deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
+        deploy = load_deploy_config(get_deploy_config_path("moss_tts_local_mrv2_optimized.yaml"))
         deploy.platforms["cuda"]["cuda_mps"] = "true"
         with pytest.raises(ValueError, match="platform cuda_mps must be a boolean"):
             _apply_platform_overrides(deploy, platform="cuda")
 
     def test_moss_local_mrv2_preserves_base_profile_and_variant_scope(self):
         pipeline = resolve_pipeline_config("moss_tts_local")
-        base_path = Path(get_deploy_config_path("moss_tts_local_v1.yaml"))
+        base_path = Path(get_deploy_config_path("moss_tts_local.yaml"))
         candidate_path = Path(get_deploy_config_path("moss_tts_local_mrv2.yaml"))
         base = load_deploy_config(base_path)
         candidate = load_deploy_config(candidate_path)
@@ -3032,7 +3070,7 @@ class TestPlatformOverrides:
         assert compilation["cudagraph_mode"] == "FULL"
         assert compilation["cudagraph_capture_sizes"] == [1, 2, 4, 6, 8, 12, 16, 24, 32, 64, 128]
         assert compilation["inductor_compile_config"] == {"combo_kernels": False, "benchmark_combo_kernel": False}
-        base_path = Path(get_deploy_config_path("moss_tts_local_v1.yaml"))
+        base_path = Path(get_deploy_config_path("moss_tts_local.yaml"))
         for platform in ("npu", "xpu", "rocm", "musa"):
             actual = _apply_platform_overrides(load_deploy_config(path), platform=platform)
             expected = _apply_platform_overrides(load_deploy_config(base_path), platform=platform)

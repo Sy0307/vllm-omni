@@ -159,21 +159,33 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ## Local 1.5 MRV2 and slot attention
 
-`MOSS-TTS-Local-Transformer-v1.5` defaults to the native CUDA MRV2 pipeline
-on a single large-memory GPU. The default profile enables GPU request slots,
+`MOSS-TTS-Local-Transformer-v1.5` keeps the V1 deployment as its default on
+all platforms. The default uses capacities of 64, utilization-based memory
+budgets, the original Local projection and sampler, and no MPS requirement.
+
+The experimental `moss_tts_local_mrv2_optimized.yaml` profile explicitly
+selects the native CUDA MRV2 pipeline on a single large-memory GPU. It enables GPU request slots,
 batch prefill, direct tokens, prefix caching, codec first-chunk decode and
 private CUDA MPS. It uses the Triton backbone attention backend, precomputed
 frame-local QKV tables and fused audio-channel sampling, with dense codec
 graph buckets through 128. Both stage capacities are 128, with a 32 GiB
-Talker KV budget; this profile targets H200-class memory. For smaller GPUs
-or an explicit V1 fallback, select `moss_tts_local_v1.yaml`. NPU, XPU, ROCm
-and MUSA retain V1 and do not start MPS.
+Talker KV budget; this profile requires H200-class memory and
+`nvidia-cuda-mps-control` on `PATH`. It is not selected automatically, even
+on H200. NPU, XPU, ROCm and MUSA retain V1 and do not start MPS.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2_optimized.yaml \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
+
+This combination remains experimental because quality checks have shown a
+positive WER regression signal, including repeated-reference traffic. The
+checks used unseeded requests and do not establish which optimization caused
+the difference. Speaker similarity has not been validated. Evaluate WER and
+speaker similarity on your workload before choosing this profile; throughput
+gains do not establish quality equivalence.
 
 The lookup table is derived after loading weights and before graph capture.
 Fused attention and a differently sized projection can change rounding;

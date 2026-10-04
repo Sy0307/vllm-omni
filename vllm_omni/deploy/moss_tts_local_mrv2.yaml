@@ -1,6 +1,6 @@
 # Opt-in CUDA MRV2 for MOSS-TTS-Local-Transformer-v1.5.
-# Keep the explicit V1 profile's batching and chunk geometry.
-base_config: moss_tts_local_v1.yaml
+# Keep the default profile's batching and chunk geometry.
+base_config: moss_tts_local.yaml
 model_runner: v2
 
 platforms:
