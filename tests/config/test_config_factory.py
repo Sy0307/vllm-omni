@@ -2984,10 +2984,11 @@ class TestPlatformOverrides:
         assert talker.cache_config.kv_cache_memory_bytes == (32 * 1024**3 if high_capacity else None)
         assert talker.cache_config.gpu_memory_utilization == 0.60
         assert codec.cache_config.gpu_memory_utilization == 0.30
+        assert talker.cache_config.enable_prefix_caching is high_capacity
+        assert not codec.cache_config.enable_prefix_caching
         for stage in config.stage_configs:
             assert stage.model_config.use_v2_model_runner
             assert stage.runtime_config.cuda_mps is mps_available
-            assert not stage.cache_config.enable_prefix_caching
             assert not stage.runtime_config.env
         overrides = talker.model_config.hf_overrides or {}
         assert overrides.get("mrv2_batch_prefill", False) is high_capacity
@@ -3000,6 +3001,7 @@ class TestPlatformOverrides:
             assert stage.yaml_engine_args["use_v2_model_runner"]
             assert stage.yaml_runtime.get("cuda_mps", False) is mps_available
         assert stages[0].yaml_engine_args.get("kv_cache_memory_bytes") == (32 * 1024**3 if high_capacity else None)
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is high_capacity
 
     @pytest.mark.parametrize("platform", ["cpu", "npu", "xpu", "rocm", "musa"])
     def test_moss_local_non_cuda_default_preserves_v1(self, monkeypatch, platform):

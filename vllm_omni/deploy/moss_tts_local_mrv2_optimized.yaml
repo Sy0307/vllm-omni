@@ -1,4 +1,5 @@
-# Opt-in CUDA system profile for MOSS-TTS-Local-Transformer-v1.5.
+# CUDA system profile for MOSS-TTS-Local-Transformer-v1.5.
+# Selected automatically with at least 140 GiB GPU memory and MPS available.
 # Requires H200-class memory and nvidia-cuda-mps-control on PATH.
 # Adds prefix caching, Triton backbone attention and faster codec dispatch;
 # keeps the original Local depth projection and sampler.

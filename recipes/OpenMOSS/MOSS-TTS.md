@@ -35,9 +35,9 @@ the requested `input` speech. Without a nonblank `ref_text`, Local uses
 audio-reference generation. Reference transcripts must match the reference
 audio; they are not style instructions.
 
-For the optional CUDA MRV2 runner, see the
+For the CUDA MRV2 runner and platform fallbacks, see the
 [Local 1.5 deployment profile](../../docs/configuration/stage_configs.md#moss-tts-local-15-with-model-runner-v2).
-The default Local deployment continues to use V1.
+Local 1.5 defaults to MRV2 on CUDA and retains V1 on other platforms.
 
 ## References
 
@@ -162,8 +162,9 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 `MOSS-TTS-Local-Transformer-v1.5` defaults to the native MRV2 pipeline on
 CUDA, with the original Local projection and sampler. When
 `nvidia-cuda-mps-control` is on `PATH`, it starts private full-quota MPS.
-GPUs with at least 140 GiB total memory use the capped-C128 throughput
-profile with a 32 GiB Talker KV budget; smaller GPUs or a failed memory
+GPUs with at least 140 GiB total memory use the C128 system profile with
+prefix caching, Triton backbone attention, codec first-chunk decode and dense
+codec graph buckets through 128. Its Talker KV budget is 32 GiB; smaller GPUs or a failed memory
 query use C64 with utilization-based memory budgets. When the MPS executable
 is unavailable, the automatic default is C64 MRV2 without MPS. NPU, XPU,
 ROCm and MUSA retain V1. Explicit deploy configs override automatic selection.
@@ -178,11 +179,9 @@ Use `--deploy-config vllm_omni/deploy/moss_tts_local_v1.yaml` to select the
 previous V1 profile explicitly. C128's batch-prefill and direct-token switches
 remain confined to the throughput profile; they are not enabled in C64.
 
-The explicit `moss_tts_local_mrv2_optimized.yaml` system profile adds prefix
-caching, Triton backbone attention, codec first-chunk decode and dense codec
-graph buckets through 128 to C128 MRV2/MPS. It retains the original Local
-depth projection and sampler. Both stages share one GPU, with a 32 GiB Talker
-KV budget; this profile requires H200-class memory and
+The same `moss_tts_local_mrv2_optimized.yaml` system profile can be selected
+explicitly. It retains the original Local depth projection and sampler.
+Both stages share one GPU, with a 32 GiB Talker KV budget; this profile requires H200-class memory and
 `nvidia-cuda-mps-control` on `PATH`.
 
 ```bash

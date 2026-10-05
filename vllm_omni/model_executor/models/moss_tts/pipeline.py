@@ -144,7 +144,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
 
 
 def resolve_moss_tts_local_pipeline(hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
-    """Select CUDA MRV2, with MPS and C128 when their prerequisites are met.
+    """Select CUDA MRV2, with the C128 system profile when prerequisites are met.
 
     The platform memory query uses NVML, avoiding CUDA initialization before
     workers spawn. Explicit deploy configs override this pipeline default.
@@ -168,7 +168,7 @@ def resolve_moss_tts_local_pipeline(hf_config: PretrainedConfig | None = None) -
     if memory_bytes >= 140 * 1024**3:
         return replace(
             MOSS_TTS_LOCAL_PIPELINE,
-            default_deploy_config_name="moss_tts_local_mrv2_high_concurrency_mps.yaml",
+            default_deploy_config_name="moss_tts_local_mrv2_optimized.yaml",
         )
     return MOSS_TTS_LOCAL_PIPELINE
 
