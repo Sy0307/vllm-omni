@@ -40,14 +40,18 @@ def _model(device):
     model.audio_assistant_slot_token_id, model.im_end_token_id = 2, 3
     model.talker_mtp_output_key = ("audio_codes", "current")
     model.talker_mtp_graph_safe = False
+    model.talker_mtp_accepts_per_row_generators = True
     model.gpu_resident_buffer_keys = {("hidden_states", "last"), ("audio_codes", "current")}
     model.audio_lm_heads = model.audio_embeddings = model.local_text_lm_head = None
     model._audio_embed = lambda codes: codes[:, :1].expand(-1, 4).to(dtype) / 8
     model.force_stop = False
 
-    def frame(hidden, *_args, generator=None, temperature=None, top_k=None, top_p=None, **_kwargs):
+    def frame(hidden, *_args, generator=None, generators=None, temperature=None, top_k=None, top_p=None, **_kwargs):
         assert (temperature, top_k, top_p) == (1.7, 25, 0.8)
-        noise = torch.randint(0, 8, (hidden.shape[0], 2), device=device, generator=generator)
+        if generators is not None:
+            noise = torch.cat([torch.randint(0, 8, (1, 2), device=device, generator=g) for g in generators])
+        else:
+            noise = torch.randint(0, 8, (hidden.shape[0], 2), device=device, generator=generator)
         codes = (hidden[:, :2].mul(16).long() + noise) % 8
         return torch.full((hidden.shape[0],), not model.force_stop, device=device), codes
 
@@ -188,6 +192,23 @@ def test_slot_honors_external_stopping_control(device):
         output = _step(state, _batch(device, [0], [1]), req)
         assert output[2].tolist() == [3]
         assert output[1]["codes"]["audio"][0].tolist() == [[8, 8]]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("state_cls", [OmniModelState, MossLocalModelState])
+def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch(state_cls):
+    state = _state(state_cls, torch.device("cpu"))
+    generators = [torch.Generator().manual_seed(seed) for seed in (17, 29)]
+    inputs = [torch.zeros(2, dtype=torch.long), *[torch.ones(2, 4) for _ in range(3)]]
+    frame = MagicMock(wraps=state.model.local_transformer.generate_frame)
+    state.model.local_transformer.generate_frame = frame
+
+    state._call_mtp_with_sampling(*inputs, buffers=[{}, {}], req_ids=["first", "second"], generators=generators)
+
+    frame.assert_called_once()
+    assert frame.call_args.args[0].shape[0] == 2
+    assert frame.call_args.kwargs["generators"] == generators
+    assert frame.call_args.kwargs["generator"] is None
 
 
 @pytest.mark.cuda

@@ -1703,6 +1703,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         """Honor the same platform graph-safety override as the V1 runner."""
         return self.talker_mtp_graph_safe
 
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return self.talker_mtp_accepts_per_row_generators
+
     # Package runner-generated audio frames
     # ------------------------------------------------------------------
 
