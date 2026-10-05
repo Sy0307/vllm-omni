@@ -79,6 +79,33 @@ def test_scalar_prefill_uses_cached_prompt_position():
     assert updates["ref_offset"] == 3
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("batch_prefill", [False, True])
+@pytest.mark.parametrize("omit_trailing_pad", [False, True])
+def test_prefill_chunk_crosses_reference_end(batch_prefill, omit_trailing_pad):
+    state = _state(MossLocalModelState, torch.device("cpu"))
+    state._batch_prefill = batch_prefill
+    # codes.ref uses prompt coordinates, including PAD rows for text tokens.
+    codes = torch.tensor([[8, 8], [1, 2], [3, 4], [5, 6], [8, 8], [8, 8]])
+    if omit_trailing_pad:
+        codes = codes[:4]
+    state.model._audio_embed = lambda rows: rows[:, :1].masked_fill(rows[:, :1] == 8, 0).expand(-1, 4) / 8
+    state.intermediate_buffer.buffers[0] = {"req_id": "reference-boundary", "codes": {"ref": codes}}
+    req = _PrefillPositions(prompt_len=np.full(5, 6), num_computed_tokens=np.zeros(5))
+    outputs = []
+    with torch.inference_mode():
+        for start, count in [(0, 2), (2, 4)]:
+            req.num_computed_tokens[0] = start
+            batch = _batch(torch.device("cpu"), [0], [count])
+            embeds = state._static_inputs_embeds[:count]
+            state.run_preprocess(batch, {"input_ids": batch.input_ids, "inputs_embeds": embeds}, req)
+            outputs.append(embeds.clone())
+    expected = state.model.embed_input_ids(torch.full((6,), 2))
+    expected[1:4] += torch.tensor([1, 3, 5]).reshape(-1, 1) / 8
+    torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
+    assert state.intermediate_buffer.buffers[0]["ref_offset"] == 6
+
+
 @pytest.mark.cuda
 def test_pending_reference_uploads_survive_staging_reuse_and_overflow():
     if not torch.cuda.is_available():

@@ -254,7 +254,7 @@ class MossLocalModelState(OmniModelState):
                             ref = ref.view(-1, self.model.n_vq)
                         if ref.dim() == 2:
                             chunk = ref[ref_offset : ref_offset + count]
-                            if chunk.numel() and chunk.shape[0] == count:
+                            if chunk.numel():
                                 references.append((start, chunk))
                     # Text embeddings have already been computed for all input
                     # tokens. Match the canonical prefill state transition.

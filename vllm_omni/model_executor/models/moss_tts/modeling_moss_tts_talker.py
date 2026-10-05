@@ -1529,9 +1529,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 if isinstance(ref_codes, torch.Tensor) and ref_codes.dim() == 2:
                     end_off = ref_offset + span_len
                     chunk = ref_codes[ref_offset:end_off]
-                    if chunk.numel() > 0 and chunk.shape[0] == span_len:
+                    if chunk.numel() > 0:
                         codes = chunk.to(device=device, dtype=torch.long)
-                        embeds = embeds + self._audio_embed(codes)
+                        embeds[: chunk.shape[0]] += self._audio_embed(codes)
 
             info_update: dict[str, Any] = {
                 "audio_state": {"is_stopping": False},
