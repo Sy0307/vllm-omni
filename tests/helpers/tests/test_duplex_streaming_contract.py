@@ -15,11 +15,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         (True, "completed", 1, True),
         (True, "cancelled", 1, False),
         (True, "completed", 0, False),
+        (True, "completed", None, False),
     ],
 )
-def test_rollover_requires_completed_audio_from_new_response(new_audio, status, epoch, accepted):
+@pytest.mark.parametrize("realtime_wire", [False, True])
+def test_rollover_requires_completed_audio_from_new_response(new_audio, status, epoch, accepted, realtime_wire):
     from tests.helpers.assertions import assert_duplex_response_audio
     from vllm_omni.clients.duplex import EventCollector
+    from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState, project_internal_event
 
     collector = EventCollector()
     collector.add({"type": "response.created", "response": {"id": "old"}})
@@ -28,6 +31,13 @@ def test_rollover_requires_completed_audio_from_new_response(new_audio, status, 
     if new_audio:
         collector.add({"type": "response.output_audio.delta", "response_id": "new", "delta": "AAAA"})
     done = {"type": "response.done", "response": {"id": "new", "status": status}, "epoch": epoch}
+    if realtime_wire:
+        projected = project_internal_event(
+            RealtimeProjectionState(session_id="test"),
+            {"type": "response.done", "response_id": "new", "status": status, "epoch": epoch},
+        )
+        done = next(event.to_realtime() for event in projected if event.type == "response.done")
+        assert "epoch" not in done
     collector.add(done)
     assert collector.audio_bytes(), "old audio is present in every case"
     if accepted:

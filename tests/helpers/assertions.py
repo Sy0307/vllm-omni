@@ -59,7 +59,9 @@ def assert_duplex_response_audio(
     response = response_done.get("response")
     response = response if isinstance(response, dict) else {}
     assert response_done.get("status", response.get("status")) == "completed", response_done
-    epoch = response_done.get("epoch")
+    metadata = response.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    epoch = response_done.get("epoch", metadata.get("epoch"))
     assert isinstance(epoch, int) and epoch >= min_epoch, response_done
     assert collector.audio_bytes(response_id), "inference after context rollover produced no new response audio"
     return response_id
