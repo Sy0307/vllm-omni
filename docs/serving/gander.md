@@ -116,6 +116,11 @@ Gander-specific cases exercise real model-generated function calls, result
 feedback, progress observations, slate replacement and a spoken query of the
 latest slate, pending-result delivery immediately after reconnect, historical event insertion, pin/unpin/move/delete, retry
 deduplication, invalid-edit preservation, and small/default-window rollover.
+Another case holds a tool result while the model interrupts a separate spoken
+reply and answers a follow-up. It requires a native interrupt action, cleared
+playback, unchanged tool epoch, and successful delivery of the original result
+without another call. Tool-result checks require audio received after the result;
+earlier acknowledgement speech cannot satisfy them.
 They check continued inference, cancellation of old playback, and absence of
 duplicate tool calls during reconstruction. These tests supply deterministic
 external tool results; business-tool execution and task modification/cancellation

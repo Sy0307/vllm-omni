@@ -1441,12 +1441,16 @@ def send_duplex_tool_context_request(
     history_event=None,
     require_cancelled_response=False,
     resume_before_result=False,
+    pending_interrupt_wav=None,
+    expected_interrupt_text=None,
     timeout_s=90,
 ):
     """Run a real-model function call and feed deterministic client observations.
 
     Schemas, prompts, fixture data, and semantic expectations belong to callers.
     Saves wire events and PCM so tool delivery and spoken output are reviewable.
+    When supplied, pending_interrupt_wav exercises native speech interruption
+    before delivering the application result; it must preserve the tool epoch.
     """
     import asyncio
     import json
@@ -1482,6 +1486,11 @@ def send_duplex_tool_context_request(
             async def wait_for(predicate, start=0):
                 deadline = time.monotonic() + timeout_s
                 while time.monotonic() < deadline:
+                    if consumer.done():
+                        consumer.result()
+                        raise AssertionError("Event reader ended before the expected tool/context event")
+                    if feeder is not None and feeder.done() and not feeder.cancelled():
+                        feeder.result()
                     errors = collector.errors()
                     assert not errors, errors
                     for event in collector.events[start:]:
@@ -1589,6 +1598,70 @@ def send_duplex_tool_context_request(
                     await context(payload)
                     # Exact custom retries must never create another prefill.
                     assert (await context(payload))["duplicate"] is True
+                interrupted_response = None
+                if pending_interrupt_wav is not None:
+                    from vllm_omni.clients.duplex import acknowledge_collected_playback
+
+                    await acknowledge_collected_playback(client, collector)
+                    interrupt_start = len(collector.events)
+                    feeder = asyncio.create_task(
+                        client.stream_pcm(
+                            read_pcm16_wav(Path(pending_interrupt_wav)) + bytes(32000 * 15),
+                            chunk_ms=200,
+                            realtime=True,
+                        )
+                    )
+                    # No response.cancel or output clear is sent by this driver.
+                    # Require the model's action, cancellation of an audio-bearing
+                    # reply, and a completed new answer while the tool is pending.
+                    await wait_for(
+                        lambda e: (
+                            e.get("type") == "response.listen"
+                            and e.get("response", {}).get("metadata", {}).get("reason") == "model_interrupt"
+                        ),
+                        interrupt_start,
+                    )
+                    cancelled = await wait_for(
+                        lambda e: (
+                            e.get("type") == "response.done" and e.get("response", {}).get("status") == "cancelled"
+                        ),
+                        interrupt_start,
+                    )
+                    interrupted_response = collector.response_id(cancelled)
+                    assert interrupted_response and collector.audio_bytes(interrupted_response), (
+                        "Native interrupt did not cancel an audio-bearing response"
+                    )
+                    clear = await wait_for(
+                        lambda e: (
+                            e.get("type") == "output_audio_buffer.cleared"
+                            and collector.response_id(e) == interrupted_response
+                        ),
+                        interrupt_start,
+                    )
+                    clear_index = collector.events.index(clear)
+                    completed = await wait_for(
+                        lambda e: (
+                            e.get("type") == "response.done"
+                            and collector.response_id(e) != interrupted_response
+                            and e.get("response", {}).get("status") == "completed"
+                        ),
+                        clear_index + 1,
+                    )
+                    new_response = collector.response_id(completed)
+                    assert new_response and collector.audio_bytes(new_response), "No audio after the native interrupt"
+                    if expected_interrupt_text is not None:
+                        assert expected_interrupt_text in collector.response_text(new_response), (
+                            collector.response_text(new_response)
+                        )
+                    feeder.cancel()
+                    await asyncio.gather(feeder, return_exceptions=True)
+                    snapshot_start = len(collector.events)
+                    await client.send({"type": "input.context.get"})
+                    pending = native(
+                        await wait_for(lambda e: native(e).get("type") == "input.context.snapshot", snapshot_start)
+                    )
+                    assert int(pending["epoch"]) == context_epoch, "Native interrupt invalidated the pending tool epoch"
+                    await acknowledge_collected_playback(client, collector)
                 start = len(collector.events)
                 await client.send(
                     {
@@ -1629,7 +1702,17 @@ def send_duplex_tool_context_request(
                     for e in collector.events[start:]
                     if e.get("type") in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}
                 )
-                assert collector.audio_bytes(), "No audio from the real model"
+                result_response_ids = {
+                    collector.response_id(e)
+                    for e in collector.events[start:]
+                    if e.get("type") == "response.output_item.done" and e.get("item", {}).get("type") == "message"
+                }
+                result_audio = EventCollector()
+                for event in collector.events[start:]:
+                    result_audio.add(event)
+                assert any(
+                    response_id and result_audio.audio_bytes(response_id) for response_id in result_response_ids
+                ), "No audio in the reply after the tool result"
                 assert "<tool_call>" not in transcript and '"arguments"' not in transcript, transcript
                 if expected_text is not None:
                     assert expected_text in transcript, transcript
@@ -1687,12 +1770,15 @@ def send_duplex_tool_context_request(
                     "call": call,
                     "transcript": transcript,
                     "followup_text": followup_text,
+                    "interrupted_response": interrupted_response,
                     "event_count": len(collector.events),
                 }
             finally:
                 if feeder is not None:
                     feeder.cancel()
                     await asyncio.gather(feeder, return_exceptions=True)
+                consumer.cancel()
+                await asyncio.gather(consumer, return_exceptions=True)
                 destination.joinpath("events.json").write_text(
                     json.dumps(collector.events, ensure_ascii=False, indent=2)
                 )
@@ -1700,8 +1786,6 @@ def send_duplex_tool_context_request(
                     audio = collector.audio_bytes(response_id)
                     if audio:
                         write_pcm16_wav(destination / f"response-{index}.wav", audio, sample_rate_hz=24000)
-                consumer.cancel()
-                await asyncio.gather(consumer, return_exceptions=True)
 
     return asyncio.run(run())
 

@@ -98,6 +98,17 @@ def _tool_context_request(omni_server, tmp_path, **overrides):
         temperature=0,
         extra_body={"realtime_tools": tools, "gander_task_slate": "当前没有后台任务。"},
     )
+    options = {
+        "context_before": [
+            {"kind": "runtime_event", "output": {"status": "running", "progress": "本地查询已开始"}},
+            {"kind": "task_slate", "version": 1, "slate": "取货暗号查询：进行中。"},
+        ],
+        "context_after": [
+            {"kind": "task_slate", "version": 2, "slate": "取货暗号查询：已完成。当前没有进行中的任务。"}
+        ],
+        "require_cancelled_response": True,
+        **overrides,
+    }
     result = send_duplex_tool_context_request(
         url=f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1",
         model=omni_server.model,
@@ -106,14 +117,8 @@ def _tool_context_request(omni_server, tmp_path, **overrides):
         output_dir=tmp_path / "tools",
         expected_tool="task_start",
         tool_output={"status": "completed", "answer": "蓝鲸四七二"},
-        context_before=[
-            {"kind": "runtime_event", "output": {"status": "running", "progress": "本地查询已开始"}},
-            {"kind": "task_slate", "version": 1, "slate": "取货暗号查询：进行中。"},
-        ],
-        context_after=[{"kind": "task_slate", "version": 2, "slate": "取货暗号查询：已完成。当前没有进行中的任务。"}],
         expected_text="蓝鲸",
-        require_cancelled_response=True,
-        **overrides,
+        **options,
     )
     return result
 
@@ -124,6 +129,25 @@ def _tool_context_request(omni_server, tmp_path, **overrides):
 def test_gander_tool_result_and_task_slate(omni_server, tmp_path):
     result = _tool_context_request(omni_server, tmp_path)
     assert result["call"]["name"] == "task_start"
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_pending_tool_survives_native_speech_interrupt(omni_server, tmp_path):
+    # The application deliberately withholds the result until the model has
+    # interrupted a separate spoken answer and answered the arithmetic follow-up.
+    # Only playback is interrupted; the original call must still accept its result.
+    result = _tool_context_request(
+        omni_server,
+        tmp_path,
+        context_before=(),
+        context_after=(),
+        require_cancelled_response=False,
+        pending_interrupt_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/soft_interrupt_16k.wav",
+        expected_interrupt_text="二",
+    )
+    assert result["interrupted_response"]
 
 
 @pytest.mark.advanced_model
