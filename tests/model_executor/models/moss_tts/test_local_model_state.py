@@ -89,11 +89,11 @@ def _admit(state, slot, name, seed):
     state.intermediate_buffer.buffers[slot]["codes"] = {"ref": torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])}
 
 
-def _batch(device, slots, counts):
+def _batch(device, slots, counts, index_dtype=torch.int32):
     starts = np.array([0, *np.cumsum(counts)], dtype=np.int32)
     return SimpleNamespace(
         idx_mapping_np=np.array(slots),
-        idx_mapping=torch.tensor(slots, device=device),
+        idx_mapping=torch.tensor(slots, device=device, dtype=index_dtype),
         num_reqs=len(slots),
         num_tokens=int(starts[-1]),
         num_scheduled_tokens=np.array(counts),
@@ -126,7 +126,8 @@ def _step(state, batch, req_states, dispatcher=None):
 
 @pytest.mark.parametrize("seed", [None, 17])
 @pytest.mark.parametrize("batch_prefill", [False, True])
-def test_slot_matches_canonical_mixed_prefill_reorder_stop_and_reuse(device, seed, batch_prefill):
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_slot_matches_canonical_mixed_prefill_reorder_stop_and_reuse(device, seed, batch_prefill, index_dtype):
     reference, candidate = (_state(cls, device) for cls in (OmniModelState, MossLocalModelState))
     candidate._batch_prefill = batch_prefill
     for state in (reference, candidate):
@@ -158,7 +159,7 @@ def test_slot_matches_canonical_mixed_prefill_reorder_stop_and_reuse(device, see
         for state in (reference, candidate):
             state.model.force_stop = index == 3
             torch.manual_seed(91 + index)
-            outputs.append(_step(state, _batch(device, slots, counts), req_states))
+            outputs.append(_step(state, _batch(device, slots, counts, index_dtype), req_states))
         a, b = outputs
         torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
         torch.testing.assert_close(a[2], b[2], rtol=0, atol=0)

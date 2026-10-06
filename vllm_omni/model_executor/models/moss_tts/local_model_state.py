@@ -196,9 +196,12 @@ class MossLocalModelState(OmniModelState):
 
     def _select_rows(self, tensor, rows):
         if rows == list(range(len(rows))):
-            return tensor[: len(rows)]
-        indices = _metadata_to_device(np.asarray(rows, dtype=np.int64), tensor.device)
-        return tensor.index_select(0, indices)
+            selected = tensor[: len(rows)]
+        else:
+            indices = _metadata_to_device(np.asarray(rows, dtype=np.int64), tensor.device)
+            selected = tensor.index_select(0, indices)
+        # vLLM 0.31 uses int32 slot mappings; index_copy_ requires int64.
+        return selected.long()
 
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
         input_ids = model_inputs.get("input_ids")
@@ -409,7 +412,7 @@ class MossLocalModelState(OmniModelState):
         # mixed/chunked-prefill batches. index_copy snapshots graph outputs.
         last = input_batch.query_start_loc[1 : input_batch.num_reqs + 1] - 1
         self._hidden_pool.index_copy_(
-            0, input_batch.idx_mapping[: input_batch.num_reqs], hidden_states.index_select(0, last)
+            0, input_batch.idx_mapping[: input_batch.num_reqs].long(), hidden_states.index_select(0, last)
         )
         if self._local_eager_mtp:
             completing = self._completing_rows
