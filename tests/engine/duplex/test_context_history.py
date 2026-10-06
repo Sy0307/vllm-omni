@@ -12,6 +12,8 @@ from vllm.v1.engine import FinishReason
 from tests.engine.duplex.test_session_runner import append_audio, close_harness, open_harness, pcm_f32
 from vllm_omni.engine.duplex.commands import SignalTurn
 from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.engine.duplex.events import ErrorEvent
+from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
@@ -280,6 +282,39 @@ async def test_effective_cancel_rejects_late_tool_result_and_allows_next_input(m
         complete(h, seq=1)
         await h.runner.ctx.history.wait_applied()
         assert not h.runner.ctx.run.closing
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleanup_failure_retains_gander_requests_for_close_retry(monkeypatch):
+    h = await initialized()
+    cleanup = h.port.cleanup
+    attempts = []
+
+    async def fail_once(request_ids: list[str], *, abort: bool = False) -> None:
+        attempts.append((list(request_ids), abort))
+        if len(attempts) == 1:
+            raise RuntimeError("injected cleanup failure")
+        await cleanup(request_ids, abort=abort)
+
+    try:
+        epoch = h.session.epoch
+        request_ids = h.session.resource_request_ids()
+        assert request_ids
+        monkeypatch.setattr(h.port, "cleanup", fail_once)
+        h.session.begin_response()
+        events = await h.run(SignalTurn(event="input.cancel", signal_payload={}))
+        assert h.session.epoch > epoch
+        assert any(isinstance(event, ErrorEvent) and event.code == "runtime_signal_failed" for event in events)
+        assert h.session.resource_request_ids() == request_ids
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="close-after-failure", session_id=h.session.session_id)
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2)
+        assert result.ok
+        assert attempts == [(request_ids, True), (request_ids, True)]
+        assert not h.session.resource_request_ids()
     finally:
         await close_harness(h)
 
