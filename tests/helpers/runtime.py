@@ -1776,12 +1776,18 @@ def send_duplex_context_edit_request(
                 after_unpin = await snapshot()
                 assert unpinned["epoch"] == rolled["epoch"] + 1
                 assert any(u["unit_id"] == ids[0] and not u["pinned"] for u in after_unpin["units"])
+                from tests.helpers.assertions import assert_duplex_response_audio
+
                 start = len(collector.events)
+                previous_responses = set(collector.response_ids)
                 await client.stream_pcm(
                     read_pcm16_wav(Path(input_wav)) + bytes(32000 * 20), chunk_ms=200, realtime=True
                 )
-                await wait(lambda e: e.get("type") == "response.done", start)
-                assert collector.audio_bytes(), "inference after context rollover produced no audio"
+                done = await wait(
+                    lambda e: e.get("type") == "response.done" and collector.response_id(e) not in previous_responses,
+                    start,
+                )
+                assert_duplex_response_audio(collector, done, min_epoch=after_unpin["epoch"])
                 result = {"before": before, "replacement": applied, "after_rollovers": rolled}
                 destination.joinpath("summary.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
                 return result

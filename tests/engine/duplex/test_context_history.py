@@ -7,12 +7,15 @@ import base64
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.engine import FinishReason
 
 from tests.engine.duplex.test_session_runner import append_audio, close_harness, open_harness, pcm_f32
 from vllm_omni.engine.duplex.commands import SignalTurn
+from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
+from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import GanderContextPolicy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -216,7 +219,8 @@ async def test_rollover_preserves_queued_inputs_but_cancel_invalidates_them(canc
                 )
             )
         complete(h, seq=2)
-        async with asyncio.timeout(2):
+
+        async def finish_inputs():
             while len(h.port.submissions) < 3:
                 await asyncio.sleep(0)
             assert h.session.epoch == 1
@@ -233,6 +237,8 @@ async def test_rollover_preserves_queued_inputs_but_cancel_invalidates_them(canc
                         complete(h, seq=history.prompts[-1]["model_intermediate_buffer"]["duplex"]["seq"])
                     await asyncio.sleep(0)
             await asyncio.gather(*tasks)
+
+        await asyncio.wait_for(finish_inputs(), timeout=2)
         submitted = [
             d["payload"]["probe"]
             for entry in h.port.submissions
@@ -262,8 +268,9 @@ async def test_cancel_pending_model_unit_then_query_context_without_new_audio(ev
         assert pending.done(), "epoch invalidation must wake existing waiters"
         assert history.pending is None
         assert not history.prompts
-        async with asyncio.timeout(1):
-            await h.runner._on_command(SignalTurn(event="input.context.get", signal_payload={}))
+        await asyncio.wait_for(
+            h.runner._on_command(SignalTurn(event="input.context.get", signal_payload={})), timeout=1
+        )
         await h.settle()
         assert any(e.to_realtime().get("error", {}).get("code") == "context_not_initialized" for e in h.events)
         assert not h.runner.ctx.run.closing
@@ -391,5 +398,67 @@ async def test_stage_request_error_fails_pending_and_closes_session():
             await pending
         await h.settle()
         assert h.runner.ctx.run.closing
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_old_request_error_does_not_fail_new_epoch_journal():
+    h = await initialized()
+    try:
+        old_request_id = h.stage0_request_id()
+        old_fence = h.session.fence
+        await h.runner._on_command(SignalTurn(event="input.cancel", signal_payload={}))
+        await h.run(append_audio())
+        history = h.runner.ctx.history
+        pending = history.pending
+        assert pending is not None and not pending.done()
+
+        orchestrator = object.__new__(DuplexOrchestrator)
+        orchestrator.session_manager = h.manager
+        orchestrator.output_async_queue = asyncio.Queue()
+        # Old resources remain addressable until their asynchronous abort finishes.
+        state = DuplexOrchestratorRequestState(
+            request_id=old_request_id,
+            session_owned=True,
+            fence=h.session.fence,
+            stage_fences={0: old_fence},
+        )
+        await orchestrator._report_duplex_session_request_error(
+            0, 0, SimpleNamespace(finish_reason=FinishReason.ERROR, stop_reason="old input failed"), state
+        )
+        await h.settle()
+        assert not pending.done()
+        assert not h.runner.ctx.run.closing
+        assert orchestrator.output_async_queue.empty()
+        complete(h, seq=1)
+        await history.wait_applied()
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_current_epoch_error_from_previous_turn_still_closes_session():
+    h = await initialized()
+    try:
+        await h.run(append_audio())
+        pending = h.runner.ctx.history.pending
+        h.session.complete_model_turn(h.session.turn_id)
+        orchestrator = object.__new__(DuplexOrchestrator)
+        orchestrator.session_manager = h.manager
+        orchestrator.output_async_queue = asyncio.Queue()
+        state = DuplexOrchestratorRequestState(
+            request_id=h.stage0_request_id(),
+            session_owned=True,
+            fence=DuplexFence(h.session.session_id, epoch=h.session.epoch, turn_id=h.session.turn_id - 1),
+        )
+        await orchestrator._report_duplex_session_request_error(
+            0, 0, SimpleNamespace(finish_reason=FinishReason.ERROR, stop_reason="current input failed"), state
+        )
+        with pytest.raises(DuplexRuntimeConfigError):
+            await pending
+        await h.settle()
+        assert h.runner.ctx.run.closing
+        assert not orchestrator.output_async_queue.empty()
     finally:
         await close_harness(h)

@@ -8,6 +8,35 @@ from tests.helpers.runtime import send_duplex_soft_interrupt_request
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize(
+    "new_audio,status,epoch,accepted",
+    [
+        (False, "completed", 1, False),
+        (True, "completed", 1, True),
+        (True, "cancelled", 1, False),
+        (True, "completed", 0, False),
+    ],
+)
+def test_rollover_requires_completed_audio_from_new_response(new_audio, status, epoch, accepted):
+    from tests.helpers.assertions import assert_duplex_response_audio
+    from vllm_omni.clients.duplex import EventCollector
+
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "old"}})
+    collector.add({"type": "response.output_audio.delta", "response_id": "old", "delta": "AAAA"})
+    collector.add({"type": "response.created", "response": {"id": "new"}})
+    if new_audio:
+        collector.add({"type": "response.output_audio.delta", "response_id": "new", "delta": "AAAA"})
+    done = {"type": "response.done", "response": {"id": "new", "status": status}, "epoch": epoch}
+    collector.add(done)
+    assert collector.audio_bytes(), "old audio is present in every case"
+    if accepted:
+        assert assert_duplex_response_audio(collector, done, min_epoch=1) == "new"
+    else:
+        with pytest.raises(AssertionError):
+            assert_duplex_response_audio(collector, done, min_epoch=1)
+
+
 @pytest.mark.parametrize("packet_counts,accepted", [([7, 1], True), ([1, 1], False)])
 def test_mixed_long_short_response_packet_contract(monkeypatch, tmp_path, packet_counts, accepted):
     async def run(args):

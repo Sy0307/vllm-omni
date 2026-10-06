@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
     from tests.helpers.client import DiffusionResponse
+    from vllm_omni.clients.duplex import EventCollector
 
 import av
 import numpy as np
@@ -45,6 +46,21 @@ _GENDER_PIPELINE_LOCK = threading.Lock()
 AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
 GENDER_MISMATCH_MESSAGE = "estimated gender is"
 _QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE)
+
+
+def assert_duplex_response_audio(
+    collector: "EventCollector", response_done: dict[str, object], *, min_epoch: int
+) -> str:
+    """Require completed audio from this response after a context transition."""
+    response_id = collector.response_id(response_done)
+    assert response_id, "completed response has no identity"
+    response = response_done.get("response")
+    response = response if isinstance(response, dict) else {}
+    assert response_done.get("status", response.get("status")) == "completed", response_done
+    epoch = response_done.get("epoch")
+    assert isinstance(epoch, int) and epoch >= min_epoch, response_done
+    assert collector.audio_bytes(response_id), "inference after context rollover produced no new response audio"
+    return response_id
 
 
 @dataclass(frozen=True)

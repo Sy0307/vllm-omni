@@ -158,7 +158,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
-        state.gander_tools_enabled = bool((runtime_config or {}).get("gander_tools"))
+        runtime_config = runtime_config or {}
+        state.gander_tools_enabled = bool(runtime_config.get("gander_tools")) and (
+            runtime_config.get("gander_tool_choice", "auto") != "none"
+        )
         state.gander_context_version = int((runtime_config or {}).get("gander_context_version", 0))
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             (runtime_config or {}).get("gander_instructions", session_config.get("instructions")),

@@ -142,6 +142,37 @@ def test_gander_final_unit_drains_remaining_context():
     )
 
 
+@pytest.mark.parametrize("choice", ["auto", "none"])
+def test_tool_choice_reaches_stage0_sampler(ids, choice):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    helper = object.__new__(MiniCPMO45Stage0DuplexRuntime)
+    helper._stage_runtime_ready = lambda: True
+    helper._require_special_token_ids = lambda: None
+    helper._decode_ref_audio_from_session_config = lambda config: None
+    helper._encode_text = lambda text: []
+    state = _MiniCPMO45Stage0SessionState(session_id="s")
+    helper._prepare_session_context(state, {}, runtime_config={"gander_tools": [{}], "gander_tool_choice": choice})
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.config = SimpleNamespace(gander_unit8=True)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    sampling = SimpleNamespace(all_greedy=True, output_token_ids=[[]])
+    logits = torch.zeros(1, 128)
+    logits[0, ids["tool_call_token_id"]] = 100
+    logits[0, ids["speak_token_id"]] = 90
+    sampled = model._sample_gander_dialogue_row(logits, sampling, row_idx=0, token_ids=ids)
+    assert sampled == ids["tool_call_token_id" if choice == "auto" else "speak_token_id"]
+
+
 def test_gander_closes_turn_and_unit_before_next_audio(monkeypatch):
     from types import SimpleNamespace
 

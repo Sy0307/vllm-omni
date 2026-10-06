@@ -214,6 +214,14 @@ def current_unit(tokens: list[int], ids: dict[str, int], *, finished: bool = Fal
     return body[start:]
 
 
+def normalize_tool_choice(value: object) -> str:
+    if value is None:
+        return "auto"
+    if isinstance(value, str) and value in {"auto", "none"}:
+        return value
+    raise error("Gander supports only tool_choice auto or none", "unsupported_tool_choice")
+
+
 def tool_constraint(tokens: list[int], ids: dict[str, int], *, enabled: bool) -> tuple[bool, set[int]]:
     from .gander import CONTROL_TOKENS, dialogue_constraint
 

@@ -41,6 +41,8 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "gander_tool_parse_error": "invalid_request_error",
     "gander_tool_schema_error": "invalid_request_error",
     "invalid_tools": "invalid_request_error",
+    "unsupported_tool_choice": "invalid_request_error",
+    "tool_choice_update_unsupported": "invalid_request_error",
     "context_input_unsupported": "invalid_request_error",
     "context_replacement_unsupported": "invalid_request_error",
     "runtime_input_failed": "server_error",

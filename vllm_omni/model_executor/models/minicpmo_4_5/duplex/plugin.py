@@ -87,6 +87,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "initial_user_text",
         "gander_enabled",
         "gander_tools",
+        "gander_tool_choice",
         "gander_instructions",
         "gander_tokenizer_path",
         "duplex_context_version",
@@ -809,6 +810,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import window_config
             from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import (
                 instructions_with_tools,
+                normalize_tool_choice,
                 normalize_tools,
             )
 
@@ -826,6 +828,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                 {
                     "gander_enabled": True,
                     "gander_tools": tools,
+                    "gander_tool_choice": normalize_tool_choice(extra_body.get("realtime_tool_choice")),
                     "gander_instructions": instructions_with_tools(config.instructions, tools, slate),
                     "gander_tokenizer_path": model_config.model,
                     "gander_task_slate": slate,
@@ -916,7 +919,19 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if runtime_config.get("gander_enabled"):
             if config.extra_body.get("gander_history", {}) != runtime_config.get("gander_history", {}):
                 raise MiniCPMO45ClientRuntimeConfigError("History window policy cannot change within a session")
-            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import normalize_tools, tokenizer_for
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import (
+                normalize_tool_choice,
+                normalize_tools,
+                tokenizer_for,
+            )
+
+            reject_changed_runtime_value(
+                normalize_tool_choice(config.extra_body.get("realtime_tool_choice")),
+                runtime_config.get("gander_tool_choice", "auto"),
+                message="tool_choice cannot change within a Gander session",
+                code="tool_choice_update_unsupported",
+                error_cls=MiniCPMO45ClientRuntimeConfigError,
+            )
 
             tools = normalize_tools(
                 config.extra_body.get("realtime_tools"), tokenizer_for(str(runtime_config["gander_tokenizer_path"]))

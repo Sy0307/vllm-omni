@@ -349,3 +349,49 @@ def test_dialogue_without_tools_uses_gander_interaction_prompt():
     assert "Gander" in text and "interrupt" in text
     assert "{{运行时动态注入的 JSON Schema}}" not in text
     assert "<tools>\n[]\n</tools>" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["auto", "none", "required", {"type": "function", "name": "task_start"}])
+async def test_session_tool_choice_is_applied_or_rejected(mocker, choice):
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex import plugin as plugin_module
+
+    config = DuplexSessionConfig.from_realtime(
+        {
+            "model": "fake",
+            "modalities": ["text"],
+            "tools": [{"type": "function", "name": "task_start", "parameters": {"type": "object"}}],
+            "tool_choice": choice,
+        }
+    )
+    plugin = plugin_module.MiniCPMO45DuplexPlugin(lambda *args: None)
+    mocker.patch.object(plugin, "_tokenizer_for", return_value=Tokenizer())
+    mocker.patch.object(plugin_module, "_apply_default_scheduler_policy")
+    model_config = SimpleNamespace(model="fake", hf_config=SimpleNamespace(gander_unit8=True))
+    if choice not in ("auto", "none"):
+        with pytest.raises(ServingRuntimeConfigError) as exc:
+            await plugin.prepare_runtime_config(config, model_config=model_config)
+        assert exc.value.code == "unsupported_tool_choice"
+        return
+    runtime = await plugin.prepare_runtime_config(config, model_config=model_config)
+    assert runtime["gander_tool_choice"] == choice
+    assert config.extra_body["realtime_tool_choice"] == choice
+
+
+@pytest.mark.parametrize("choice", ["auto", "none"])
+def test_session_tool_choice_cannot_change_silently(monkeypatch, runtime, choice):
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+
+    runtime.update(instructions=None, gander_tool_choice=choice)
+    config = DuplexSessionConfig.from_realtime(
+        {"tools": [{"type": "function", **runtime["gander_tools"][0]}], "tool_choice": choice}
+    )
+    plugin = MiniCPMO45DuplexPlugin(lambda *args: None)
+    assert plugin.runtime_config_for_update(config, runtime)["gander_tool_choice"] == choice
+    config.apply_realtime_update({"tool_choice": "none" if choice == "auto" else "auto"})
+    with pytest.raises(ServingRuntimeConfigError) as exc:
+        plugin.runtime_config_for_update(config, runtime)
+    assert exc.value.code == "tool_choice_update_unsupported"
+    assert runtime["gander_tool_choice"] == choice
