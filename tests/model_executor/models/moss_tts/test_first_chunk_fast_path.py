@@ -545,3 +545,41 @@ def test_platform_failure_wakes_pending_handoff(monkeypatch):
     assert fast._closed
     with pytest.raises(RuntimeError, match="decode failed"):
         fast.order_after(0)
+
+
+@pytest.mark.cpu
+@pytest.mark.tts
+@pytest.mark.parametrize("limit", [1, 2])
+def test_congested_admission_preserves_routes_and_slots_then_recovers(monkeypatch, limit):
+    import sys
+    from functools import partial
+
+    helpers = sys.modules[__name__]
+    from vllm_omni.model_executor.models.moss_tts.first_chunk_fast_path import MossFirstChunkFastPath
+
+    monkeypatch.setattr(helpers, "MossFirstChunkFastPath", partial(MossFirstChunkFastPath, max_active_streams=limit))
+    fast, session, sink, _ = helpers._cpu_fast(monkeypatch)
+    calls = []
+
+    class Sink:
+        def prepare(self, ids):
+            calls.append(ids)
+            return sink.prepare(ids)
+
+    fast._sink = Sink()
+    thread = threading.Thread()
+    monkeypatch.setattr(thread, "is_alive", lambda: True)
+    fast._thread = thread
+    slots = {f"busy{i}": session.acquire() for i in range(limit)}
+    before_slots, before_free = slots.copy(), session.free.copy()
+    codes = torch.tensor([1, 2])
+    assert not fast.submit("r", "r", codes, slots)
+    assert slots == before_slots and session.free == before_free
+    assert not calls and not fast._decoded and not fast._handoffs and fast._jobs.empty()
+    released = slots.pop("busy0")
+    session.release(released)
+    assert fast.submit("r", "r", codes, slots)
+    codes.fill_(99)
+    job = fast._jobs.get_nowait()
+    assert job.slot == slots["r"] and calls == [["r"]]
+    assert job.codes.tolist() == [[1], [2]]

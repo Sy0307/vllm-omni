@@ -1349,7 +1349,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
         )
         self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
-        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
+        self.local_transformer = MossTTSLocalDepthTransformer(
+            self.config.gpt2_config,
+            hidden_size=hidden_size,
+            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
+        )
 
         self._batch_state: list[dict[str, Any]] | None = None
         # Stacked embedding cache built after load_weights() for vectorised

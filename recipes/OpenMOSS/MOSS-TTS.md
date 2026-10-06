@@ -163,8 +163,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 CUDA, with the original Local projection and sampler. When
 `nvidia-cuda-mps-control` is on `PATH`, it starts private full-quota MPS.
 GPUs with at least 140 GiB total memory use the C128 system profile with
-prefix caching, Triton backbone attention, codec first-chunk decode and dense
-codec graph buckets through 128. Its Talker KV budget is 32 GiB; smaller GPUs or a failed memory
+prefix caching, Triton backbone attention, bounded codec first-chunk decode,
+native Torch sampler compilation and dense codec graph buckets through 128. Its Talker KV budget is 32 GiB; smaller GPUs or a failed memory
 query use C64 with utilization-based memory budgets. When the MPS executable
 is unavailable, the automatic default is C64 MRV2 without MPS. NPU, XPU,
 ROCm and MUSA retain V1. Explicit deploy configs override automatic selection.
@@ -180,7 +180,14 @@ previous V1 profile explicitly. C128's batch-prefill and direct-token switches
 remain confined to the throughput profile; they are not enabled in C64.
 
 The same `moss_tts_local_mrv2_optimized.yaml` system profile can be selected
-explicitly. It retains the original Local depth projection and sampler.
+explicitly. It retains the original Local depth projection and sampling algorithm.
+The codec admits fast first chunks below 32 active streams; crowded streams use
+the regular decoder with a dispatch target of 16 and a maximum wait of 6 ms.
+This preserves the low-load first-audio path while coalescing high-load work.
+`local_compile_audio_sampler: true` in the Talker HF overrides compiles the native
+Torch sampler; explicit request generators use the original helper. Set the
+override to `false` in a deployment file to disable that compilation. The setting
+is specific to this C128 system profile.
 Both stages share one GPU, with a 32 GiB Talker KV budget; this profile requires H200-class memory and
 `nvidia-cuda-mps-control` on `PATH`.
 

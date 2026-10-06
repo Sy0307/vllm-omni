@@ -3043,6 +3043,7 @@ class TestPlatformOverrides:
         overrides = talker.model_config.hf_overrides or {}
         assert overrides.get("mrv2_batch_prefill", False) is high_capacity
         assert overrides.get("mrv2_direct_tokens", False) is high_capacity
+        assert overrides.get("local_compile_audio_sampler", False) is high_capacity
 
         # The serving engine still consumes the legacy representation.
         stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {})
@@ -3123,6 +3124,11 @@ class TestPlatformOverrides:
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
             assert deploy.connectors["shm"]["extra"]["codec_first_chunk_fast_path"] == 1
+            assert args["hf_overrides"]["local_compile_audio_sampler"] is True
+            extra = deploy.connectors["shm"]["extra"]
+            assert extra["codec_first_chunk_max_active_streams"] == 32
+            assert extra["generation_min_batch_size"] == 16
+            assert extra["generation_max_wait_ms"] == 6
             assert not stages[0].yaml_runtime.get("env")
         else:
             assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages)
