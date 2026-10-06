@@ -318,26 +318,45 @@ def test_failed_output_handoff_retains_decoded_samples(cuda):
     fast.close()
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("enabled,complete", [(False, False), (True, False), (True, True), (True, None)])
+def test_gate_waits_only_for_enabled_inflight_decode(mocker, enabled, complete):
+    # A fixed GPU sleep cannot prove that an event is still pending when the
+    # host reaches gate(), particularly across CUDA and ROCm implementations.
+    fast = object.__new__(MossFirstChunkFastPath)
+    fast._device = torch.device("cuda")
+    fast._gate_main = enabled
+    event = None if complete is None else mocker.Mock()
+    if event is not None:
+        event.query.return_value = complete
+    fast._inflight = event
+    stream = mocker.Mock()
+    current_stream = mocker.patch("torch.cuda.current_stream", return_value=stream)
+    fast.gate()
+    if enabled and complete is False:
+        current_stream.assert_called_once_with(fast._device)
+        stream.wait_event.assert_called_once_with(event)
+    else:
+        current_stream.assert_not_called()
+        stream.wait_event.assert_not_called()
+
+
 @pytest.mark.cuda
-def test_gate_orders_main_stream_after_inflight_fast_decode(cuda):
+def test_gate_hands_inflight_gpu_output_to_main_stream(cuda):
     fast, _, _ = _fast(cuda)
     side = torch.cuda.Stream()
+    output = torch.zeros(16, device=cuda)
+    side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        torch.cuda._sleep(200_000_000)
+        output.fill_(7)
         pending = torch.cuda.Event()
         pending.record(side)
     fast._inflight = pending
-    fast.gate()  # disabled: no wait
-    unordered = torch.cuda.Event()
-    unordered.record()
     fast._gate_main = True
     fast.gate()
-    ordered = torch.cuda.Event()
-    ordered.record()
-    unordered.synchronize()
-    assert not pending.query() and not ordered.query()
-    ordered.synchronize()
-    assert pending.query()
+    received = output.clone()
+    torch.testing.assert_close(received, torch.full_like(received, 7))
+    fast.close()
 
 
 def _cpu_fast(monkeypatch, *, scheduler=None):
