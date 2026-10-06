@@ -23,9 +23,20 @@ class DuplexSamplingRow:
     payload: dict[str, object] | None
     max_tokens: int | None
     sampling_enabled: bool = True
+    # Host copies of the row's sampling parameters (None when the runner has none).
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
+
+
+def _host_value(values: Any, row_idx: int, cast: type) -> Any:
+    """``values[row_idx]`` of a host array as ``cast``, or None when there is none."""
+    if values is None:
+        return None
+    try:
+        return cast(values[row_idx])
+    except (IndexError, TypeError, ValueError):
+        return None
 
 
 class DuplexSamplingHelper:
@@ -57,16 +68,20 @@ class DuplexSamplingHelper:
         else:
             self.active_request_ids.discard(req_id)
 
-    def update_states(self, runner: object, scheduler_output: object) -> None:
+    def update_states(self, runner: Any, scheduler_output: Any) -> None:
         self.active_request_ids.difference_update(str(req_id) for req_id in scheduler_output.finished_req_ids)
         for request in scheduler_output.scheduled_new_reqs:
             self.refresh_active_request(runner, str(request.req_id))
 
-    def rows(self, runner: object) -> tuple[DuplexSamplingRow, ...]:
+    def rows(self, runner: Any) -> tuple[DuplexSamplingRow, ...]:
         rows: list[DuplexSamplingRow] = []
-        req_ids = [str(req_id) for req_id in getattr(runner.input_batch, "req_ids", [])]
+        input_batch = runner.input_batch
+        req_ids = [str(req_id) for req_id in getattr(input_batch, "req_ids", [])]
         requests = getattr(runner, "requests", {})
         discard_mask = getattr(getattr(runner, "discard_request_mask", None), "np", None)
+        temperature_cpu = getattr(input_batch, "temperature_cpu", None)
+        top_k_cpu = getattr(input_batch, "top_k_cpu", None)
+        top_p_cpu = getattr(input_batch, "top_p_cpu", None)
         for row_idx, req_id in enumerate(req_ids):
             if req_id not in self.active_request_ids:
                 continue
@@ -78,7 +93,8 @@ class DuplexSamplingHelper:
             if not isinstance(session_id, str) or not session_id:
                 session_id = None
             try:
-                seq = int(duplex.get("seq"))
+                seq_raw = duplex.get("seq")
+                seq = int(seq_raw) if seq_raw is not None else None
             except (TypeError, ValueError):
                 seq = None
             payload = duplex.get("payload")
@@ -102,9 +118,21 @@ class DuplexSamplingHelper:
                         (discard_mask is None or not bool(discard_mask[row_idx]))
                         and req_id not in getattr(runner, "_omni_failed_input_requests", {})
                     ),
-                    temperature=getattr(sampling_params, "temperature", None),
-                    top_k=getattr(sampling_params, "top_k", None),
-                    top_p=getattr(sampling_params, "top_p", None),
+                    temperature=(
+                        _host_value(temperature_cpu, row_idx, float)
+                        if temperature_cpu is not None
+                        else getattr(sampling_params, "temperature", None)
+                    ),
+                    top_k=(
+                        _host_value(top_k_cpu, row_idx, int)
+                        if top_k_cpu is not None
+                        else getattr(sampling_params, "top_k", None)
+                    ),
+                    top_p=(
+                        _host_value(top_p_cpu, row_idx, float)
+                        if top_p_cpu is not None
+                        else getattr(sampling_params, "top_p", None)
+                    ),
                 )
             )
         return tuple(rows)
@@ -154,8 +182,9 @@ class DuplexSamplingRunnerMixin:
             return
         helper = getattr(self, "_duplex_sampling_helper", None)
         rows = helper.rows(self) if helper is not None and helper.active_request_ids else ()
-        if rows or (helper is not None and helper.hook_active):
-            prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
+        # Publish the row set even when empty, so the model skips its per-row
+        # prompt-token scan (a host sync per row) in turn-based serving.
+        prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
         if helper is not None:
             helper.hook_active = bool(rows)
 

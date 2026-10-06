@@ -253,12 +253,14 @@ def test_slate_prefill_is_silent_without_ending_active_speech(runtime):
         {"kind": "task_slate", "epoch": 0, "event_id": "s1", "version": 1, "slate": "lookup running"}, runtime, epoch=0
     )
     assert payload["force_listen"] is True
-    state = SimpleNamespace(current_turn_ended=False)
-    model = SimpleNamespace(
-        config=SimpleNamespace(gander_unit8=True),
-        _minicpmo45_duplex_state_for_row=lambda row: state,
-        _minicpmo45_duplex_payload_for_row=lambda row: payload,
-    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    state = _MiniCPMO45Stage0SessionState(session_id="s", current_turn_ended=False)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(gander_unit8=True)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_duplex_payload_for_row = lambda row: payload
     MiniCPMO45OmniForConditionalGeneration._record_minicpmo45_duplex_terminator(model, 0, 7, {"listen_token_id": 7})
     assert state.current_turn_ended is False
     assert state.pending_terminator_token == 7
@@ -385,6 +387,7 @@ def test_session_tool_choice_cannot_change_silently(monkeypatch, runtime, choice
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
     runtime.update(instructions=None, gander_tool_choice=choice)
+    runtime["gander_tools"] = gt.normalize_tools(runtime["gander_tools"], Tokenizer())
     config = DuplexSessionConfig.from_realtime(
         {"tools": [{"type": "function", **runtime["gander_tools"][0]}], "tool_choice": choice}
     )

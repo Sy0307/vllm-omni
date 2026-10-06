@@ -14,6 +14,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input_history import DuplexPromptHistory
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.output_templates import ModelInputError
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -24,7 +25,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _model_with_prepared_units():
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
     model.model_stage = "llm"
+    model.config = SimpleNamespace(gander_unit8=False)
+    model._sample_minicpmo45_native_duplex_rows_deferred = lambda *a, **kw: None
     model.get_input_embeddings = lambda ids: ids.float().unsqueeze(-1) * 10
 
     def prepare(*args, seq, **kwargs):
@@ -36,7 +40,9 @@ def _model_with_prepared_units():
         }
 
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(
-        sessions={"sid": SimpleNamespace()},
+        sessions={"sid": _MiniCPMO45Stage0SessionState(session_id="sid")},
+        take_staged_prefill=lambda *a: None,
+        frame_kwargs=lambda *a: {},
         _decode_audio_payload=lambda payload: [1.0],
         _decode_video_frames_payload=lambda payload: [],
         _stage_prefill_embeddings_only=prepare,
@@ -241,7 +247,13 @@ def test_native_sampler_does_not_advance_discarded_prefill_policy(monkeypatch):
         sampled.append(row_idx)
         return 2
 
-    monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_row", sample)
+    monkeypatch.setattr(
+        model,
+        "_sample_minicpmo45_native_duplex_rows",
+        lambda logits, metadata, *, row_idxs, token_ids, row_params: [
+            sample(logits[row : row + 1], metadata, row_idx=row, token_ids=token_ids) for row in row_idxs
+        ],
+    )
     monkeypatch.setattr(model, "_record_minicpmo45_duplex_terminator", lambda row, *args: recorded.append(row))
     result = model.sample(torch.zeros(2, 4), SimpleNamespace())
     assert result.sampled_token_ids.tolist() == [[0], [2]]
@@ -280,7 +292,13 @@ def test_mixed_chat_batch_preserves_native_policy_and_request_rng(monkeypatch):
 
     model.__dict__["sampler"] = standard_sample
     monkeypatch.setattr(model, "_minicpmo45_native_duplex_token_ids", lambda: {"unit_token_id": 1})
-    monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_row", native_sample)
+    monkeypatch.setattr(
+        model,
+        "_sample_minicpmo45_native_duplex_rows",
+        lambda logits, metadata, *, row_idxs, token_ids, row_params: [
+            native_sample(logits[row : row + 1], metadata, row_idx=row, token_ids=token_ids) for row in row_idxs
+        ],
+    )
     monkeypatch.setattr(model, "_record_minicpmo45_duplex_terminator", lambda *a: None)
     result = model.sample(logits, metadata)
     assert result is not None, "mixed chat batch bypassed MiniCPM native policy"
@@ -310,7 +328,13 @@ def test_greedy_native_row_never_randomizes_boundary_in_mixed_batch(monkeypatch)
         raise AssertionError("greedy request used multinomial for a chunk boundary")
 
     monkeypatch.setattr(torch, "multinomial", no_random)
-    assert model._sample_minicpmo45_native_duplex_row(logits, metadata, row_idx=0, token_ids=token_ids) == 6
+    assert model._sample_minicpmo45_native_duplex_rows(
+        logits,
+        metadata,
+        row_idxs=[0],
+        token_ids=token_ids,
+        row_params=model._minicpmo45_duplex_row_params(metadata, logits.shape[0]),
+    ) == [6]
 
 
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
@@ -344,7 +368,13 @@ def test_native_sampling_uses_cpu_request_snapshot_without_gpu_scalar_reads(monk
     logits = torch.full((1, 8), -100.0)
     logits[0, 6] = 100.0
     model.prepare_duplex_sampling(logits, metadata, rows)
-    assert model._sample_minicpmo45_native_duplex_row(logits, metadata, row_idx=0, token_ids=token_ids) == 6
+    assert model._sample_minicpmo45_native_duplex_rows(
+        logits,
+        metadata,
+        row_idxs=[0],
+        token_ids=token_ids,
+        row_params=model._minicpmo45_duplex_row_params(metadata, logits.shape[0]),
+    ) == [6]
     # A later append may update sampling on the same physical request.
     runner.requests["req"].sampling_params = SamplingParams(temperature=0.6, top_k=3, top_p=0.9)
     refreshed = helper.rows(runner)
@@ -391,7 +421,12 @@ def test_native_async_lookahead_cannot_overwrite_unit_terminator(monkeypatch, te
         calls.append(1)
         return terminator
 
-    monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_row", sample)
+    if terminator == 6:
+        monkeypatch.setattr(model, "_sample_gander_dialogue_row", sample)
+    else:
+        monkeypatch.setattr(
+            model, "_sample_minicpmo45_native_duplex_rows", lambda *a, row_idxs, **kw: [sample() for _ in row_idxs]
+        )
     model.prepare_duplex_sampling(torch.zeros(1, 8), metadata, (row,))
     assert model.sample(torch.zeros(1, 8), metadata).sampled_token_ids.item() == terminator
     before = vars(state).copy()
@@ -421,7 +456,7 @@ def test_turn_eos_does_not_fence_required_following_chunk_eos(monkeypatch):
     }
     row = DuplexSamplingRow(0, "req", "sid", 1, {"is_speech": False}, 20)
     samples = iter([5, 3])
-    monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_row", lambda *a, **kw: next(samples))
+    monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_rows", lambda *a, **kw: [next(samples)])
     for expected in (5, 3):
         model.prepare_duplex_sampling(torch.zeros(1, 8), SimpleNamespace(), (row,))
         assert model.sample(torch.zeros(1, 8), SimpleNamespace()).sampled_token_ids.item() == expected

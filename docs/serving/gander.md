@@ -2,7 +2,7 @@
 
 [Gander](https://github.com/Omni-Interaction-Gander/Omni-Interaction-Agent)
 uses the MiniCPM-o 4.5 Thinker, Talker and Code2Wav pipeline. This integration
-uses the repository's vLLM 0.29 environment. It provides model inference and context management, not
+uses the repository's vLLM 0.31 environment. It provides model inference and context management, not
 external tool execution, trusted ASR binding or a Brain/Gateway service.
 
 ## Prepare and serve
@@ -34,6 +34,10 @@ cancels the active response; clients must honor playback-clear events.
 ## Tools and context
 
 Tools are optional function schemas in `session.update.session.tools`.
+Initial `tool_choice` supports `auto` (the default) and `none`; `none` disables
+tool-call sampling even when tools are declared. `required` and named choices
+return `unsupported_tool_choice`. Tools and `tool_choice` remain fixed after
+session creation; changing the choice returns `tool_choice_update_unsupported`.
 The model emits Realtime function-call events; the application executes calls
 and returns results using `conversation.item.create` with a
 `function_call_output` item. No tool is executed by KV replay.
@@ -73,7 +77,9 @@ Default history rollover starts at 128 units and retains 96; configure
 `extra_body.gander_history.max_units/retain_units` for a smaller window.
 Automatic rollover waits for active responses and acknowledged audio playback.
 Hard context and replay byte/token limits still apply; each session has a
-256 MiB prompt journal limit. The configured admission limit is four sessions, not a
+256 MiB prompt journal limit, at most 64 registered calls, and 128 context
+receipts. These bounds are admission limits, not a long-session garbage
+collection policy; reopen the session when a limit is reached. The configured admission limit is four sessions, not a
 hardware-independent capacity or latency guarantee.
 
 ## Full-duplex validation
@@ -83,6 +89,7 @@ H100/H200-class CUDA GPU from the repository root:
 
 ```bash
 export GANDER_MODEL=/path/to/composed/gander-model
+export VLLM_USE_V2_MODEL_RUNNER=0
 # Session lifecycle and streaming speech smoke.
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
   -sv -m 'core_model and cuda' --run-level core_model
@@ -105,3 +112,15 @@ They check continued inference, cancellation of old playback, and absence of
 duplicate tool calls during reconstruction. These tests supply deterministic
 external tool results; business-tool execution and task modification/cancellation
 semantics belong to the application.
+
+After reconstruction, the history tests require a new response ID, completed
+status, an epoch at least as recent as the replacement, and non-empty audio for
+that response. Earlier audio cannot satisfy the continuation assertion.
+Request errors from a retired epoch cannot fail the current context journal;
+errors from the current epoch still close the session, including a draining
+request from an earlier turn.
+
+Timeout/cancel recovery remains follow-up work in
+[RFC #8542](https://github.com/vllm-project/vllm-omni/issues/8542).
+Performance optimization and reference-based speech-quality evaluation are
+separate follow-ups; the functional suite does not establish either result.

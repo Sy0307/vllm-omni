@@ -20,6 +20,7 @@ import json
 import sys
 import wave
 from pathlib import Path
+from typing import TypedDict
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
@@ -165,12 +166,28 @@ def _compact_sequence(events: list[dict[str, object]]) -> list[str]:
     return sequence
 
 
+class ResponseSummary(TypedDict):
+    response_id: str
+    created_index: int | None
+    done_indices: list[int]
+    created_offset_ms: float | None
+    done_offset_ms: float | None
+    audio_delta_count: int
+    transcript_delta_count: int
+    audio_delta_offsets_ms: list[float | None]
+    audio_duration_ms: list[float | None]
+    transcript: str
+    one_done: bool
+    audio_before_done_ok: bool
+    stale_audio_count: int
+
+
 def _response_summary(
     events: list[dict[str, object]],
     response_id: str,
     *,
     t0: float | None,
-) -> dict[str, object]:
+) -> ResponseSummary:
     created_indices = [
         index
         for index, event in enumerate(events)
@@ -238,7 +255,7 @@ def summarize_artifacts(
     response_summaries = [_response_summary(events, response_id, t0=t0) for response_id in response_ids]
     commit_index = _first_event_index(events, "input_audio_buffer.committed")
     first_created_index = next(
-        (summary["created_index"] for summary in response_summaries if isinstance(summary.get("created_index"), int)),
+        (summary["created_index"] for summary in response_summaries if summary["created_index"] is not None),
         None,
     )
     first_done_index = (
@@ -304,9 +321,7 @@ def summarize_artifacts(
     followup_response_transcripts = [
         str(summary.get("transcript") or "")
         for summary in response_summaries[1:]
-        if commit_index is not None
-        and isinstance(summary.get("created_index"), int)
-        and summary["created_index"] < commit_index
+        if commit_index is not None and summary["created_index"] is not None and summary["created_index"] < commit_index
     ]
     followup_response_transcript_ok = any(
         bool(_normalize_text(transcript)) for transcript in followup_response_transcripts
@@ -326,8 +341,8 @@ def summarize_artifacts(
         1
         for event in events
         if event.get("type") == "response.done"
-        and isinstance(event.get("response"), dict)
-        and event["response"].get("status") == "cancelled"
+        and isinstance(response := event.get("response"), dict)
+        and response.get("status") == "cancelled"
     )
     model_interrupt_count = sum(
         bool(

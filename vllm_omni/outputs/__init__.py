@@ -4,6 +4,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -61,6 +62,10 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
     model_input_errors: dict[str, str] = field(default_factory=dict)
+    # True when sampled_token_ids has already been materialized on the host.
+    # MRv2 consumers must treat the value as immutable and must not perform
+    # another device-to-host conversion or rebuild it from sampler tensors.
+    sampled_token_ids_materialized: bool = False
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":
@@ -83,6 +88,7 @@ _REQUEST_OUTPUT_CONTENT_ATTRS = (
     "prompt",
     "prompt_token_ids",
     "prompt_logprobs",
+    "prompt_token_id_logprobs",
     "outputs",
     "finished",
     "lora_request",
@@ -146,6 +152,7 @@ class OmniRequestOutput(RequestOutput):
     prompt: OmniPromptType | None = None
     prompt_token_ids: list[int] | None = None
     prompt_logprobs: Any = None
+    prompt_token_id_logprobs: np.ndarray | None = None
     outputs: list[CompletionOutput] = field(default_factory=list)
     finished: bool = True
     metrics: Any = field(default_factory=dict)

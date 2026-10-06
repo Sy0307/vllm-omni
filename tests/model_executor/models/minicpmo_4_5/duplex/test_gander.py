@@ -120,17 +120,12 @@ def test_gander_sampler_keeps_controls_out_of_speech(ids):
     logits[0, 100] = 100
     logits[0, ids["tool_call_token_id"]] = 99
     logits[0, ids["speak_token_id"]] = 90
-    assert (
-        model._sample_minicpmo45_native_duplex_row(logits, metadata, row_idx=0, token_ids=ids) == ids["speak_token_id"]
-    )
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["speak_token_id"]
     metadata.output_token_ids = [[ids["speak_token_id"]]]
-    assert model._sample_minicpmo45_native_duplex_row(logits, metadata, row_idx=0, token_ids=ids) == 100
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == 100
     metadata.output_token_ids = [[ids["listen_token_id"], ids["speak_token_id"], *range(100, 108)]]
     logits[0, ids["turn_eos_token_id"]] = 50
-    assert (
-        model._sample_minicpmo45_native_duplex_row(logits, metadata, row_idx=0, token_ids=ids)
-        == ids["turn_eos_token_id"]
-    )
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["turn_eos_token_id"]
 
 
 def test_gander_final_unit_drains_remaining_context():
@@ -192,7 +187,7 @@ def test_gander_closes_turn_and_unit_before_next_audio(monkeypatch):
     base: dict = {}
     _apply_default_scheduler_policy(base, config=config, tokenizer=tokenizer)
     base_stop = base["duplex_stage_sampling_params"]["0"]["stop_token_ids"]
-    assert token_ids["<|turn_eos|>"] in base_stop
+    assert token_ids["<|turn_eos|>"] not in base_stop
     assert token_ids["<|interrupt|>"] not in base_stop
 
 

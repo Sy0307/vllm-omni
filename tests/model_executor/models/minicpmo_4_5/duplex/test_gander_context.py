@@ -208,15 +208,18 @@ def test_replay_budget_counts_output_once_across_repeated_edits(output_length, r
         units.append(p)
     policy = GanderContextPolicy()
     for epoch in (1, 2):
+        context: dict[str, object] = (
+            {"reason": "context_rollover"}
+            if rollover and epoch == 1
+            else {"edits": [{"op": "pin", "unit_id": unit_id(units[0])}]}
+        )
         rebuilt = make_plan(
             prompts=units,
             runtime_config=runtime,
             session_config={},
             request_id="new",
             fence=DuplexFence("s", epoch=epoch),
-            context={"reason": "context_rollover"}
-            if rollover and epoch == 1
-            else {"edits": [{"op": "pin", "unit_id": unit_id(units[0])}]},
+            context=context,
         )
         replay = [dict(unit.prompt) for unit in rebuilt.units]
         assert len(replay) == 96

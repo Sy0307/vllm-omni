@@ -40,6 +40,11 @@ from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as buil
 from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
 )
+from vllm_omni.model_extras.kandinsky6 import (
+    KANDINSKY6_EXTRA_BODY_PARAMS,
+    KANDINSKY6_EXTRA_OUTPUT_PARAMS,
+    get_kandinsky6_video_generation_defaults,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
@@ -74,6 +79,17 @@ from vllm_omni.model_extras.ming_flash_omni import (
 )
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_image import (
+    MING_IMAGE_EXTRA_BODY_PARAMS,
+    MING_IMAGE_EXTRA_OUTPUT_PARAMS,
+    MING_IMAGE_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.ming_image import (
+    build_image_to_image_prompt as build_ming_image_image_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_image import (
+    build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
@@ -230,6 +246,13 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
     },
+    "Kandinsky6TI2VAPipeline": {
+        "extra_body_params": KANDINSKY6_EXTRA_BODY_PARAMS,
+        "extra_output_params": KANDINSKY6_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_kandinsky6_video_generation_defaults,
+        # forward() returns uint8 frames already; declared for completeness.
+        "output_tensor_range": "zero_to_one",
+    },
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -299,7 +322,15 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
+    "MingImageDiffusionPipeline": {
+        "extra_body_params": MING_IMAGE_EXTRA_BODY_PARAMS,
+        "extra_output_params": MING_IMAGE_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MING_IMAGE_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_ming_image_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_ming_image_image_to_image_prompt,
+    },
 }
+_EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
 
 for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder

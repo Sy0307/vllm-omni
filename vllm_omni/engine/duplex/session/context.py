@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from vllm.logger import init_logger
 
@@ -63,6 +63,10 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
+    #: Plugin signaled that the next user commit may start while the current
+    #: assistant audio is still draining. Cleared on barge-in/cancel, or when
+    #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
+    concurrent_turn_requests_released: bool = False
 
 
 class RunnerServices(Protocol):
@@ -119,6 +123,10 @@ class DuplexSessionTasks:
     append_tasks: dict[asyncio.Task[bool], DuplexAppendTaskMeta] = field(default_factory=dict)
     append_tail: asyncio.Task[bool] | None = None
     active_response_task: asyncio.Task[None] | None = None
+    #: Appends the runner cancelled on purpose (a cancel, barge-in or close).
+    #: The runner ends the response such an append precreated, so the append
+    #: leaves it alone on its way out instead of failing it.
+    runner_cancelled: set[asyncio.Task[bool]] = field(default_factory=set)
 
     def track_append_task(
         self,
@@ -129,21 +137,37 @@ class DuplexSessionTasks:
         response_bound: bool,
     ) -> None:
         self.append_tasks[task] = DuplexAppendTaskMeta(epoch, final, response_bound)
-        task.add_done_callback(self.append_tasks.pop)
+        task.add_done_callback(self._forget_append_task)
+
+    def _forget_append_task(self, task: asyncio.Task[bool]) -> None:
+        self.append_tasks.pop(task, None)
+        self.runner_cancelled.discard(task)
+
+    def cancelled_by_runner(self, task: asyncio.Task[Any] | None) -> bool:
+        """Whether ``task`` is an append the runner cancelled through ``cancel_append_tasks``."""
+        return task is not None and task in self.runner_cancelled
 
     def has_response_bound_append_tasks(self) -> bool:
         return any(meta.response_bound for meta in self.append_tasks.values())
 
     async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
+        """Cancel the tracked appends; the caller owns their responses from here on.
+
+        Every caller ends the active response itself right after (with the
+        cancel status, or silently as part of a close), so the cancelled
+        appends are told not to fail the response they precreated.
+        """
         tasks = [task for task, meta in self.append_tasks.items() if not response_bound_only or meta.response_bound]
         if not tasks:
             return False
         cancelled_tail = self.append_tail if self.append_tail in tasks else None
+        self.runner_cancelled.update(tasks)
         for task in tasks:
             task.cancel()
         try:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
-        except TimeoutError:
+        # asyncio.TimeoutError is separate before Python 3.11.
+        except (TimeoutError, asyncio.TimeoutError):
             survivors = [task for task in tasks if not task.done()]
             if survivors:
                 logger.warning(

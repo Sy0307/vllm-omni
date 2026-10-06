@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 import websockets
@@ -341,8 +342,8 @@ def test_duplex_seeded_text_to_audio(omni_server, locale: str, text: str) -> Non
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
-    assert int(result["audio_bytes"]) > 0, f"{locale} seeded text produced no audio"
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
+    assert cast(int, result["audio_bytes"]) > 0, f"{locale} seeded text produced no audio"
     assert str(result["transcript"]).strip(), f"{locale} seeded text produced audio with no transcript"
 
 
@@ -368,7 +369,7 @@ def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> Non
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
     produced_text = str(result["output_text"]) or str(result["transcript"])
     assert produced_text.strip(), f"text-only session produced nothing: {result['event_types']}"
 
@@ -394,10 +395,10 @@ def test_duplex_seeded_text_to_long_audio_output(omni_server) -> None:
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
     # 24 kHz mono pcm16: 2 s of speech is 96000 bytes, comfortably more than a
     # single Code2Wav frame and well under a 40-word answer.
-    assert int(result["audio_bytes"]) > 96_000, f"expected a long answer, got {result['audio_bytes']} bytes"
+    assert cast(int, result["audio_bytes"]) > 96_000, f"expected a long answer, got {result['audio_bytes']} bytes"
     assert str(result["transcript"]).strip()
 
 
@@ -417,8 +418,8 @@ def test_duplex_seeded_long_form_generation(omni_server) -> None:
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
-    assert int(result["audio_bytes"]) > 96_000, f"expected long-form audio, got {result['audio_bytes']} bytes"
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
+    assert cast(int, result["audio_bytes"]) > 96_000, f"expected long-form audio, got {result['audio_bytes']} bytes"
     assert str(result["transcript"]).strip()
 
 
@@ -450,8 +451,8 @@ def test_duplex_sequential_sessions_are_independent(omni_server) -> None:
     )
 
     for result in (first, second):
-        assert "response.done" in result["event_types"], result["event_types"]
-        assert int(result["audio_bytes"]) > 0
+        assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
+        assert cast(int, result["audio_bytes"]) > 0
         assert str(result["transcript"]).strip()
 
     # Different prompts must not produce the same answer: that would mean the
@@ -541,12 +542,13 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) ->
     )
     assert result["ok"] is True
     assert result["session_count"] == 2
-    assert result["resume"]["ok"] is True
-    assert result["takeover"]["ok"] is True
+    assert cast(dict[str, object], result["resume"])["ok"] is True
+    assert cast(dict[str, object], result["takeover"])["ok"] is True
     assert not result["failures"]
-    assert all(session["audio_delta_count"] > 0 for session in result["sessions"])
-    assert all(session["done_count"] == 1 for session in result["sessions"])
-    assert all(session["error_count"] == 0 for session in result["sessions"])
-    for session in result["sessions"]:
+    sessions = cast(list[dict[str, object]], result["sessions"])
+    assert all(cast(int, session["audio_delta_count"]) > 0 for session in sessions)
+    assert all(session["done_count"] == 1 for session in sessions)
+    assert all(session["error_count"] == 0 for session in sessions)
+    for session in sessions:
         _assert_request_metrics(session["request_metrics"], expected_count=1)
         _assert_session_metrics(session["session_metrics"], expected_count=1)
