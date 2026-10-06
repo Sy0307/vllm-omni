@@ -2158,6 +2158,7 @@ async def run_duplex_seeded_text_to_audio(
     import json
 
     import websockets
+    from websockets.exceptions import ConnectionClosed
 
     from vllm_omni.clients.duplex import build_realtime_url, reference_audio_data_url
 
@@ -2209,6 +2210,7 @@ async def run_duplex_seeded_text_to_audio(
         reader_task = asyncio.create_task(reader())
         silence = bytes(2 * 16_000 * 200 // 1000)
         sent_ms = 0
+        close_sent = False
         try:
             while sent_ms < silence_seconds * 1000 and "response.done" not in seen:
                 if reader_task.done():
@@ -2239,12 +2241,22 @@ async def run_duplex_seeded_text_to_audio(
             # disconnect grace, where it keeps holding an admission slot and
             # starves the tests that follow.
             await ws.send(json.dumps({"type": "session.close"}))
+            close_sent = True
             deadline = loop.time() + 30
             while loop.time() < deadline and "session.closed" not in seen:
                 await asyncio.sleep(0.25)
         finally:
-            reader_task.cancel()
-            await asyncio.gather(reader_task, return_exceptions=True)
+            try:
+                if not close_sent:
+                    # A reader/input failure must release admission too.
+                    # Closing only the socket leaves a resumable session.
+                    try:
+                        await ws.send(json.dumps({"type": "session.close"}))
+                    except ConnectionClosed:
+                        pass
+            finally:
+                reader_task.cancel()
+                await asyncio.gather(reader_task, return_exceptions=True)
     return {
         "audio_bytes": audio_bytes,
         "transcript": "".join(transcript),

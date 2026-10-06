@@ -66,11 +66,16 @@ async def test_live_session_cleans_up_after_input_or_output_failure(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_seeded_session_reader_failure_is_observed_and_settled(monkeypatch):
+@pytest.mark.parametrize("failure", ["reader", "input", "cancel"])
+async def test_seeded_session_failure_is_observed_and_settled(monkeypatch, failure):
+    import json
+
     import websockets
 
     tasks_before = asyncio.all_tasks()
     closed = []
+    sent = []
+    blocked = asyncio.Event()
 
     class Socket:
         async def __aenter__(self):
@@ -80,16 +85,27 @@ async def test_seeded_session_reader_failure_is_observed_and_settled(monkeypatch
             closed.append(True)
 
         async def send(self, data):
-            pass
+            event = json.loads(data)
+            sent.append(event)
+            if failure == "input" and event["type"] == "input_audio_buffer.append":
+                raise RuntimeError("injected input failure")
 
         async def recv(self):
-            return '{"type":"error","message":"injected failure"}'
+            if failure == "reader":
+                return '{"type":"error","message":"injected failure"}'
+            await blocked.wait()
 
     monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: Socket())
-    with pytest.raises(AssertionError, match="injected failure"):
+    exception, message = {
+        "reader": (AssertionError, "injected failure"),
+        "input": (RuntimeError, "injected input failure"),
+        "cancel": (TimeoutError, None),
+    }[failure]
+    with pytest.raises(exception, match=message):
         await asyncio.wait_for(
             run_duplex_seeded_text_to_audio(url="ws://example", model="model", ref_audio=None, text="question"),
             timeout=1,
         )
     assert closed == [True]
+    assert sent[-1]["type"] == "session.close"
     assert asyncio.all_tasks() == tasks_before
