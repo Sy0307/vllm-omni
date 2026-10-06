@@ -19,7 +19,6 @@ from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder, StreamingDe
 
 @dataclass
 class _Stream:
-    cache: dict[str, Any]
     slot: int
     position: int = 0
 
@@ -80,9 +79,6 @@ class StreamingCode2Wav:
         outputs = [codes.new_empty((1, 0), dtype=torch.float32) for _ in lengths]
         for row, (request_id, cache, length) in enumerate(zip(request_ids, caches, lengths, strict=True)):
             stream = self.streams.get(request_id)
-            if stream is not None and stream.cache is not cache:
-                self.release([request_id])
-                stream = None
             # ICL keeps a reference anchor outside the rolling attention
             # window. Ordinary sliding-window state cannot replace it.
             if (
@@ -97,7 +93,7 @@ class StreamingCode2Wav:
                     self.fallback_ids.add(request_id)
                     fallback_rows.append(row)
                     continue
-                stream = _Stream(cache, self.free_slots.popleft())
+                stream = _Stream(self.free_slots.popleft())
                 self.streams[request_id] = stream
             frames = length
             # Padding is safe only on terminal chunks: no later call may
