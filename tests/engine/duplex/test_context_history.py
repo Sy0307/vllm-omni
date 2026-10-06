@@ -86,6 +86,126 @@ async def test_invalid_edit_preserves_request_and_accepts_next_audio():
 
 
 @pytest.mark.asyncio
+async def test_invalid_edit_waits_for_accepted_append_reply(monkeypatch):
+    h = await initialized()
+    accepted = asyncio.Event()
+    reply = asyncio.Event()
+    tasks = []
+    original_submit = h.port.submit
+
+    async def hold_reply(submission):
+        result = await original_submit(submission)
+        accepted.set()
+        await reply.wait()
+        return result
+
+    try:
+        ids = h.session.resource_request_ids()
+        epoch = h.session.epoch
+        monkeypatch.setattr(h.port, "submit", hold_reply)
+        append = await h.runner._start_append({"audio": "", "sample_rate": 16000}, final=False)
+        tasks.append(append)
+        await asyncio.wait_for(accepted.wait(), 2)
+        validation = asyncio.Event()
+        original_prepare = h.runner.ctx.history.policy.prepare_replacement
+
+        def prepare(*args, **kwargs):
+            validation.set()
+            return original_prepare(*args, **kwargs)
+
+        monkeypatch.setattr(h.runner.ctx.history.policy, "prepare_replacement", prepare)
+        rejected = asyncio.create_task(h.runner._on_command(edit(h, [{"op": "delete", "unit_id": "missing"}])))
+        tasks.append(rejected)
+        await asyncio.sleep(0)
+        assert not rejected.done()
+        assert not validation.is_set(), "validation must wait for the accepted append's receipt"
+        assert not append.cancelled()
+        complete(h, seq=2)
+        reply.set()
+        assert await asyncio.wait_for(append, 2)
+        await asyncio.wait_for(rejected, 2)
+        assert validation.is_set()
+        assert h.session.epoch == epoch
+        assert h.session.resource_request_ids() == ids
+        assert not h.port.cleanups
+        await h.run(append_audio())
+        complete(h, seq=3)
+        await h.runner.ctx.history.wait_applied()
+        assert len(h.port.submissions) == 3
+        assert len(h.runner.ctx.history.prompts) == 3
+    finally:
+        reply.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_call_registered_during_result_append_accepts_its_result(monkeypatch):
+    from tests.model_executor.models.minicpmo_4_5.duplex.test_gander_tools import Tokenizer
+    from vllm_omni.model_executor.models.minicpmo_4_5 import gander_tools
+
+    h = await initialized()
+    accepted = asyncio.Event()
+    reply = asyncio.Event()
+    task = None
+    original_append = h.runner.model.append_runtime_input
+
+    async def hold_reply(*args, **kwargs):
+        result = await original_append(*args, **kwargs)
+        accepted.set()
+        await reply.wait()
+        return result
+
+    async def register(call_id):
+        await h.runner.model._send_one_model_output_event(
+            {"function_call": True, "name": "lookup", "arguments": "{}", "call_id": call_id},
+            expected_epoch=h.session.epoch,
+        )
+
+    def result(call_id):
+        return {"kind": "tool_result", "event_id": f"result-{call_id}", "epoch": 0, "call_id": call_id, "output": "ok"}
+
+    try:
+        monkeypatch.setattr(gander_tools, "tokenizer_for", lambda path: Tokenizer())
+        h.session.replace_runtime_config(
+            {
+                **h.session.runtime_config,
+                "gander_tokenizer_path": "fake",
+                "gander_tools": [{"name": "lookup", "parameters": {"type": "object"}}],
+            }
+        )
+        await register("c1")
+        assert "c1" in h.session.runtime_config["gander_calls"]
+        monkeypatch.setattr(h.runner.model, "append_runtime_input", hold_reply)
+        task = asyncio.create_task(h.runner.ctx.history.handle("input.context.append", result("c1")))
+        await asyncio.wait_for(accepted.wait(), 2)
+        assert not task.done()
+        await register("c2")
+        complete(h, seq=2)
+        reply.set()
+        assert await asyncio.wait_for(task, 2)
+        assert h.session.runtime_config["gander_calls"]["c2"]["result"] is None
+        task = asyncio.create_task(h.runner.ctx.history.handle("input.context.append", result("c2")))
+        for _ in range(100):
+            if len(h.port.submissions) == 3:
+                break
+            await asyncio.sleep(0.005)
+        assert len(h.port.submissions) == 3
+        complete(h, seq=3)
+        assert await asyncio.wait_for(task, 2)
+        assert all(call["result"] is not None for call in h.session.runtime_config["gander_calls"].values())
+    finally:
+        reply.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_replacement_waits_for_model_completion_and_suppresses_replay():
     h = await initialized()
     task = None
