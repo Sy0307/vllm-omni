@@ -92,6 +92,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
     pending_speech_context: bool = False
+    pending_user_text: str | None = None
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     pending_turn_end_identity: tuple[int | None, int | None] | None = None
@@ -137,7 +138,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         self.stage_model = stage_model
         self.model_path = model_path
         self.device = device
-        self.sessions: dict[tuple[str, int], _MiniCPMO45Stage0SessionState] = {}
+        self.sessions: dict[str, _MiniCPMO45Stage0SessionState] = {}
         # (session_id, epoch, seq) -> (frame payload, per-frame embeddings) of this runner step.
         self._prefetched_vision: dict[tuple[str, int | None, int], tuple[tuple[object, ...], list[Any]]] = {}
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
@@ -285,10 +286,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         )
         state.gander_context_version = int((runtime_config or {}).get("gander_context_version", 0))
         initial_user_text = (runtime_config or {}).get("initial_user_text")
+        user_text_in_unit = bool(runtime_config.get("gander_enabled"))
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             (runtime_config or {}).get("gander_instructions", session_config.get("instructions")),
             ref_audio is not None,
             initial_user_text,
+            user_text_in_unit=user_text_in_unit,
         )
         for token_id in self._encode_text(prefix):
             embed = self._embed_token(token_id)
@@ -312,6 +315,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.context_suffix_embeds.append(embed)
             state.context_suffix_token_ids.append(token_id)
         if isinstance(initial_user_text, str) and initial_user_text:
+            if user_text_in_unit:
+                # Native Gander training places typed input after the audio
+                # inside a unit, before its action, without a ChatML turn.
+                state.pending_user_text = initial_user_text
             # Seeded text is pending user content just like a speech append.
             # Otherwise the turn-ended latch forces its silent input clock to
             # listen before the model can answer. Generated content clears it.
@@ -564,6 +571,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
             )
+            if state.pending_user_text is not None:
+                for token_id in self._encode_text(state.pending_user_text):
+                    embed_parts.append(self._embed_token(token_id))
+                    token_ids.append(token_id)
+                state.pending_user_text = None
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             if gander:
@@ -650,6 +662,9 @@ class MiniCPMO45Stage0DuplexRuntime:
         if terminator is None:
             terminator = self.chunk_eos_token_id
         first = state.gander_unit_count == 0 and replay
+        if first and state.pending_user_text is not None:
+            token_ids = [*self._encode_text(state.pending_user_text), *token_ids]
+            state.pending_user_text = None
         ids = (
             [self.unit_token_id, *token_ids]
             if first

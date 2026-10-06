@@ -493,18 +493,27 @@ def _apply_first_append_context_tokens(
     """
     if "duplex_first_append_context_tokens" in runtime_config or tokenizer is None:
         return
+    user_text_in_unit = bool(runtime_config.get("gander_enabled"))
     prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
         runtime_config.get("gander_instructions", instructions),
         ref_sample_count is not None,
         initial_user_text,
+        user_text_in_unit=user_text_in_unit,
     )
     try:
         prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
         suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        user_ids = (
+            tokenizer.encode(initial_user_text, add_special_tokens=False)
+            if user_text_in_unit and isinstance(initial_user_text, str)
+            else []
+        )
     except Exception:
         return
     ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
-    runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+    runtime_config["duplex_first_append_context_tokens"] = (
+        len(prefix_ids) + ref_tokens + len(suffix_ids) + len(user_ids)
+    )
     runtime_config["duplex_window_prefix_tokens"] = len(prefix_ids) + ref_tokens
     runtime_config["duplex_window_suffix_token_ids"] = [int(token_id) for token_id in suffix_ids]
     marker_ids = tokenizer.encode("\n\nprevious: ", add_special_tokens=False)
@@ -820,9 +829,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             )
         elif extra_body.get("realtime_tools") or extra_body.get("gander_task_slate"):
             raise MiniCPMO45ClientRuntimeConfigError("Tools/task slate require Gander")
-        duplex_window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
-        if not runtime_config.get("gander_enabled"):
-            runtime_config["duplex_window_config"] = duplex_window_config.as_dict()
+        duplex_window_config = self._pop_window_config(extra_body)
+        if runtime_config.get("gander_enabled"):
+            if duplex_window_config is not None:
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "MiniCPM sliding-window options are not supported by Gander; use gander_history",
+                    code="unsupported_sliding_window_config",
+                )
+        else:
+            runtime_config["duplex_window_config"] = (duplex_window_config or MiniCPMO45DuplexWindowConfig()).as_dict()
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
@@ -892,6 +907,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         extra_body = dict(config.extra_body)
         requested_window = self._pop_window_config(extra_body)
         if requested_window is not None:
+            if runtime_config.get("gander_enabled"):
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "MiniCPM sliding-window options are not supported by Gander; use gander_history",
+                    code="unsupported_sliding_window_config",
+                )
             reject_changed_runtime_value(
                 requested_window.as_dict(),
                 runtime_config.get("duplex_window_config"),

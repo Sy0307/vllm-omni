@@ -5,6 +5,8 @@
 Set GANDER_MODEL to a directory composed with minicpmo_4_5.gander.
 """
 
+import base64
+import io
 import os
 import wave
 from pathlib import Path
@@ -251,3 +253,142 @@ def test_gander_resume_and_takeover(omni_server, tmp_path):
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_gander_pending_tool_result_after_resume(omni_server, tmp_path):
     _tool_context_request(omni_server, tmp_path, resume_before_result=True)
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_public_client_live_session(omni_server):
+    from tests.helpers.runtime import send_duplex_client_session_request
+
+    send_duplex_client_session_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+    )
+
+
+def _jpeg_frame(image):
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (
+            "Please say exactly: the quick brown fox jumps over the lazy dog.",
+            r"the quick brown fox jumps over the lazy dog",
+        ),
+        ("请朗读：今天天气很好，我们一起去公园散步。", r"今天天气很好[，,\s]*我们一起去公园散步"),
+    ],
+)
+def test_gander_seeded_text_to_audio(omni_server, text, expected):
+    from tests.helpers.runtime import send_duplex_seeded_text_request
+
+    send_duplex_seeded_text_request(
+        server=omni_server,
+        text=text,
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        expected_text_pattern=expected,
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_seeded_text_without_reference_voice(omni_server):
+    from tests.helpers.runtime import send_duplex_seeded_text_request
+
+    send_duplex_seeded_text_request(
+        server=omni_server,
+        text="What is the capital of France? Answer in one short sentence.",
+        ref_audio=None,
+        modalities=("text",),
+        expected_text_pattern=r"\bParis\b|巴黎",
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("color,wrong", [("red", "blue"), ("blue", "red")])
+def test_gander_image_color_semantics(omni_server, tmp_path, color, wrong):
+    from PIL import Image, ImageDraw
+
+    from tests.helpers.runtime import send_duplex_multimodal_request
+
+    image = Image.new("RGB", (448, 448), "white")
+    ImageDraw.Draw(image).rectangle((64, 64, 384, 384), fill=color)
+    send_duplex_multimodal_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/gander/color_question_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        output_dir=tmp_path / color,
+        video_frames=[_jpeg_frame(image)],
+        repeat_last_frame=True,
+        expected_text_pattern=rf"\b{color}\b",
+        forbidden_text_pattern=rf"\b{wrong}\b",
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("number,spoken", [("472", "four seven two"), ("815", "eight one five")])
+def test_gander_image_ocr_semantics(omni_server, tmp_path, number, spoken):
+    from PIL import Image, ImageDraw, ImageFont
+
+    from tests.helpers.runtime import send_duplex_multimodal_request
+
+    image = Image.new("RGB", (448, 448), "white")
+    ImageDraw.Draw(image).text((224, 224), number, fill="black", font=ImageFont.load_default(size=96), anchor="mm")
+    spoken_pattern = spoken.replace(" ", r"[\s,-]+")
+    send_duplex_multimodal_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/gander/ocr_question_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        output_dir=tmp_path / number,
+        video_frames=[_jpeg_frame(image)],
+        repeat_last_frame=True,
+        expected_text_pattern=rf"\b{number}\b|\b{spoken_pattern}\b",
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("direction", ["left", "right"])
+def test_gander_video_motion_semantics(omni_server, tmp_path, direction):
+    from PIL import Image, ImageDraw
+
+    from tests.helpers.runtime import send_duplex_multimodal_request
+    from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
+
+    positions = list(range(70, 361, 10))
+    if direction == "left":
+        positions.reverse()
+    frames = []
+    for x in positions:
+        image = Image.new("RGB", (448, 448), "white")
+        ImageDraw.Draw(image).ellipse((x - 24, 200, x + 24, 248), fill="red")
+        frames.append(_jpeg_frame(image))
+    opposite = "right" if direction == "left" else "left"
+    pattern = r"(?:^DIRECTION[.!。]?$|\bDIRECTIONwards?\b|(?:to|towards?|mov(?:e[sd]?|ing)|went|going)\s+(?:the\s+)?DIRECTION\b)"
+    send_duplex_multimodal_request(
+        server=omni_server,
+        input_wav=Path(__file__).resolve().parents[2] / "assets/gander/motion_question_16k.wav",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        output_dir=tmp_path / direction,
+        video_frames=frames[::3],
+        stacked_frames=[concat_frames_b64(frames[i + 1 : i + 3]) for i in range(0, len(frames), 3)],
+        # Ask after the entire clip. A full-duplex model may answer while the
+        # question is still being spoken, before later frames have arrived.
+        video_lead_in_seconds=len(frames[::3]),
+        expected_text_pattern=pattern.replace("DIRECTION", direction),
+        forbidden_text_pattern=pattern.replace("DIRECTION", opposite),
+    )

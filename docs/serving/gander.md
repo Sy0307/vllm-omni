@@ -23,7 +23,7 @@ vllm serve /path/to/new/gander-model --omni --trust-remote-code \
 Keep the source snapshot available: the composed directory links to its weights
 and reference voice in `assets/ref_audio.wav`. Connect through
 `WS /v1/realtime?duplex=1` or `WS /v1/duplex`; see
-[Realtime API](realtime_api.md) for session setup and audio events.
+[Realtime Duplex API](realtime_duplex_api.md) for session setup and audio events.
 
 Input is mono PCM16 at 16 kHz. Model input units are one second; upload packets
 may be smaller. Continue microphone input, including silence, while awaiting
@@ -41,6 +41,11 @@ session creation; changing the choice returns `tool_choice_update_unsupported`.
 The model emits Realtime function-call events; the application executes calls
 and returns results using `conversation.item.create` with a
 `function_call_output` item. No tool is executed by KV replay.
+The current grammar allows one call per unit. Tool execution, deadlines and
+application task cancellation belong to the client. A native model interrupt
+clears speech playback without cancelling an application task. An effective
+client cancellation advances the session epoch and invalidates results from
+the cancelled epoch; targeting an unrelated response is a no-op.
 
 Custom context events use stable `event_id` and the current `epoch`:
 
@@ -75,6 +80,8 @@ resynchronization.
 
 Default history rollover starts at 128 units and retains 96; configure
 `extra_body.gander_history.max_units/retain_units` for a smaller window.
+MiniCPM's `duplex_window_config` and sliding-window parameters are rejected for
+Gander; use `gander_history` so rollover preserves Gander's protected context.
 Automatic rollover waits for active responses and acknowledged audio playback.
 Hard context and replay byte/token limits still apply; each session has a
 256 MiB prompt journal limit, at most 64 registered calls, and 128 context
@@ -93,7 +100,7 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 # Session lifecycle and streaming speech smoke.
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
   -sv -m 'core_model and cuda' --run-level core_model
-# All twelve scenarios; pytest starts and stops its own three-stage server.
+# All registered scenarios; pytest starts and stops its own three-stage server.
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
   -sv -m 'advanced_model and cuda' --run-level advanced_model
 ```
@@ -102,7 +109,8 @@ The suite reuses MiniCPM's protocol, audio/video and multi-session drivers with
 continuous microphone input. It covers two audio/video turns with a finite camera clip, playback
 acknowledgements, reconnect/takeover, four-session admission, native interrupt
 and follow-up speech. Vision assertions check input delivery and response
-completion, not visual-answer accuracy.
+completion. Paired color, number-reading and motion cases additionally check
+visual answers with identical spoken questions and opposing visual inputs.
 
 Gander-specific cases exercise real model-generated function calls, result
 feedback, progress observations, slate replacement and a spoken query of the
@@ -120,7 +128,29 @@ Request errors from a retired epoch cannot fail the current context journal;
 errors from the current epoch still close the session, including a draining
 request from an earlier turn.
 
-Timeout/cancel recovery remains follow-up work in
+## Multimodal benchmark
+
+The OmniInteract configuration uses the shared Realtime benchmark runner and
+a separate Qwen2.5-7B-Instruct judge. It selects four videos from each of
+`1q1a`, `1q1a_math` and `1qna`, at concurrency two. The dataset and judge
+revisions are pinned in the configuration. This is a small regression sample;
+increase the sample count for a broader quality evaluation.
+
+Compose the release at `Gander-Unit8-vllm` in the repository root, cache the
+dataset and judge weights, and allocate two available CUDA GPUs. The second
+device in `CUDA_VISIBLE_DEVICES` is reserved for the judge:
+
+```bash
+export BENCHMARK_DIR=tests/dfx/perf/results
+CUDA_VISIBLE_DEVICES=0,1 python -m pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_gander_omniinteract.json
+```
+
+Nightly CI composes the same pinned release and uploads benchmark artifacts.
+The configuration checks request success and aggregate IA/QTF1. Functional
+E2E success alone does not establish benchmark quality or a performance gain.
+
+Automatic tool-timeout recovery remains follow-up work in
 [RFC #8542](https://github.com/vllm-project/vllm-omni/issues/8542).
-Performance optimization and reference-based speech-quality evaluation are
-separate follow-ups; the functional suite does not establish either result.
+Reference-based speech-quality evaluation remains separate from these visual
+and conversational checks.

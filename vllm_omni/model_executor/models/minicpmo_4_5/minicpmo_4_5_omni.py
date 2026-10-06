@@ -482,30 +482,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
         if gander:
             physical_owner = str(kwargs.get("request_id") or f"{session_id}:{duplex.get('epoch', 0)}")
-            gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
-            session_key = physical_owner if gander else session_id
-            state = helper.sessions.get(session_key)
-            if state is None:
-                from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
-                    _MiniCPMO45Stage0SessionState,
-                )
-
-                state = _MiniCPMO45Stage0SessionState(session_id=session_id)
-                helper.sessions[session_key] = state
-                session_config = duplex.get("session_config")
-                session_config = dict(session_config) if isinstance(session_config, dict) else {}
-                runtime_config = duplex.get("runtime_config")
-                runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
-                if hasattr(helper.thinker, "audio_past_key_values"):
-                    helper.thinker.audio_past_key_values = None
-                helper._configure_streaming_processor(state)
-                helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            state = self._minicpmo45_duplex_session_state(helper, session_id, duplex, state_key=physical_owner)
 
             try:
                 audio_waveform = (
                     None if payload.get("gander_control") is True else helper._decode_audio_payload(payload)
                 )
-                video_frames = helper._decode_video_frames_payload(payload)
             except ValueError as exc:
                 raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
             seq = duplex.get("seq")
@@ -531,16 +513,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 except ValueError as exc:
                     raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
             else:
-                result = helper._stage_prefill_embeddings_only(
-                    state,
-                    audio_waveform,
-                    video_frames=video_frames,
-                    epoch=epoch,
-                    turn_id=turn_id,
-                    seq=seq,
-                    is_speech=bool(payload.get("is_speech", False)),
-                    final=bool(duplex.get("final")),
-                )
+                result = helper.take_staged_prefill(state, epoch, seq)
+                if result is None:
+                    try:
+                        frame_kwargs = helper.frame_kwargs(duplex, payload)
+                    except ValueError as exc:
+                        raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
+                    result = helper._stage_prefill_embeddings_only(
+                        state,
+                        audio_waveform,
+                        epoch=epoch,
+                        turn_id=turn_id,
+                        seq=seq,
+                        is_speech=bool(payload.get("is_speech", False)),
+                        final=bool(duplex.get("final")),
+                        **frame_kwargs,
+                    )
             if payload.get("gander_replay") and result.get("success") and not result.get("gander_history_embedded"):
                 history = payload.get("gander_replay_output_ids", [])
                 if history:
@@ -732,13 +720,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         takes the staged results and builds or reports anything skipped here.
         """
         del device
-        if self.model_stage != "llm" or getattr(getattr(self, "config", None), "gander_unit8", False):
+        if self.model_stage != "llm":
             return
-        infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]
-        duplexes = [info.get("duplex") for info in infos if isinstance(info, dict)]
-        appends = [duplex for duplex in duplexes if isinstance(duplex, dict) and duplex.get("data_plane") is True]
+        gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
+        appends = []
+        for request_id in req_ids:
+            info = model_intermediate_buffer.get(request_id)
+            duplex = info.get("duplex") if isinstance(info, dict) else None
+            if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+                continue
+            payload = duplex.get("payload")
+            if isinstance(payload, dict) and (payload.get("gander_control") or payload.get("gander_replay")):
+                continue  # Control and journal replay retain their ordered single-request path.
+            appends.append((request_id, duplex))
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
-        frame_appends = [d for d in appends if isinstance(d.get("payload"), dict) and d["payload"].get("video_frames")]
+        frame_appends = [
+            d for _, d in appends if isinstance(d.get("payload"), dict) and d["payload"].get("video_frames")
+        ]
         if len(frame_appends) >= 2:
             try:
                 helper = self._duplex_data_plane_helper()
@@ -751,7 +749,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return
         candidates: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         seen: set[str] = set()
-        for duplex in appends:
+        for request_id, duplex in appends:
             session_id = str(duplex.get("session_id") or "")
             payload = duplex.get("payload")
             repeated = session_id in seen
@@ -759,32 +757,39 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if not session_id or not isinstance(payload, dict) or repeated:
                 continue  # a second append of one session keeps its order: preprocess
             kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
-            if helper.needs_prefill(helper.sessions.get(session_id), kwargs["epoch"], kwargs["seq"]):
-                candidates.append((session_id, duplex, payload, kwargs))
+            state_key = request_id if gander else session_id
+            if helper.needs_prefill(helper.sessions.get(state_key), kwargs["epoch"], kwargs["seq"]):
+                candidates.append((state_key, duplex, payload, kwargs))
         if len(candidates) < 2:
             return
         self._commit_minicpmo45_duplex_pending_samples(session_ids={candidate[0] for candidate in candidates})
         staged = []
-        for session_id, duplex, payload, kwargs in candidates:
+        for state_key, duplex, payload, kwargs in candidates:
             try:
                 audio_waveform = helper._decode_audio_payload(payload)
                 kwargs.update(helper.frame_kwargs(duplex, payload))
             except ValueError:
                 continue
-            staged.append((self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs))
+            state = self._minicpmo45_duplex_session_state(
+                helper, str(duplex["session_id"]), duplex, state_key=state_key
+            )
+            staged.append((state, audio_waveform, kwargs))
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
 
-    def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
-        """The Stage-0 state of ``session_id``, created with its session context on first use."""
-        state = helper.sessions.get(session_id)
+    def _minicpmo45_duplex_session_state(
+        self, helper, session_id: str, duplex: dict[str, Any], *, state_key: str | None = None
+    ):
+        """Initialize Stage-0 context under the model's cache owner (physical request for replay)."""
+        state_key = state_key or session_id
+        state = helper.sessions.get(state_key)
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
                 _MiniCPMO45Stage0SessionState,
             )
 
             state = _MiniCPMO45Stage0SessionState(session_id=session_id)
-            helper.sessions[session_id] = state
+            helper.sessions[state_key] = state
             session_config = duplex.get("session_config")
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
             runtime_config = duplex.get("runtime_config")
@@ -803,6 +808,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         window, reanchor = duplex.get("stage0_window"), duplex.get("stage0_reanchor")
         return {
             "epoch": _optional_int(duplex.get("epoch")),
+            "turn_id": _optional_int(duplex.get("turn_id")),
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
             "final": bool(duplex.get("final")),
@@ -1117,7 +1123,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     # a token the runner will discard.
                     sampled_ids.append(0)
                     continue
-                row_logits = logits[row_idx : row_idx + 1].clone()
+                # The grammar sampler clones before masking; keep this slice
+                # as a view to avoid a second vocabulary-sized copy per row.
+                row_logits = logits[row_idx : row_idx + 1]
                 sampled = self._sample_gander_dialogue_row(
                     row_logits,
                     sampling_metadata,

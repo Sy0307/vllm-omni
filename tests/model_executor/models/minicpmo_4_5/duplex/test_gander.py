@@ -7,6 +7,65 @@ from vllm_omni.model_executor.models.minicpmo_4_5.gander import CONTROL_TOKENS, 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_gander_batches_live_audio_under_physical_request_owners(mocker):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.config = SimpleNamespace(gander_unit8=True)
+    retired_state = object()
+    helper = SimpleNamespace(
+        sessions={"s1": retired_state},
+        thinker=SimpleNamespace(),
+        batches_audio_encoder=lambda: True,
+        needs_prefill=lambda state, epoch, seq: state is None,
+        frame_kwargs=lambda duplex, payload: {},
+        _decode_audio_payload=lambda payload: payload["audio"],
+        _configure_streaming_processor=lambda state: None,
+        _prepare_session_context=lambda state, config, runtime_config: None,
+        prefetch_vision=mocker.Mock(),
+        stage_prefill_batch=mocker.Mock(),
+    )
+    model._minicpmo45_duplex_data_plane_helper = helper
+    model._commit_minicpmo45_duplex_pending_samples = mocker.Mock()
+    buffers = {
+        request_id: {
+            "duplex": {
+                "data_plane": True,
+                "session_id": session_id,
+                "epoch": 2,
+                "turn_id": 3,
+                "seq": 1,
+                "payload": {"audio": audio},
+            }
+        }
+        for request_id, session_id, audio in [("r1", "s1", "audio1"), ("r2", "s2", "audio2")]
+    }
+    # Replay and controls must not get mixed into live encoder batching.
+    for request_id, flag in [("replay", "gander_replay"), ("control", "gander_control")]:
+        buffers[request_id] = {
+            "duplex": {
+                "data_plane": True,
+                "session_id": request_id,
+                "epoch": 2,
+                "seq": 1,
+                "payload": {flag: True, "audio": "historical"},
+            }
+        }
+    model.preprocess_batch(req_ids=list(buffers), model_intermediate_buffer=buffers, device=torch.device("cpu"))
+    helper.stage_prefill_batch.assert_called_once()
+    staged = helper.stage_prefill_batch.call_args.args[0]
+    assert [(state.session_id, audio) for state, audio, _ in staged] == [("s1", "audio1"), ("s2", "audio2")]
+    assert staged[0][0] is helper.sessions["r1"] and staged[1][0] is helper.sessions["r2"]
+    assert helper.sessions["s1"] is retired_state
+    assert all(kwargs["turn_id"] == 3 for _, _, kwargs in staged)
+    assert "replay" not in helper.sessions and "control" not in helper.sessions
+
+
 @pytest.fixture
 def ids():
     names = ["listen_token_id", "speak_token_id", "chunk_eos_token_id", "turn_eos_token_id", *CONTROL_TOKENS]
@@ -116,11 +175,14 @@ def test_gander_sampler_keeps_controls_out_of_speech(ids):
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.config = SimpleNamespace(gander_unit8=True)
     metadata = SimpleNamespace(all_greedy=True, output_token_ids=[[]], temperature=torch.tensor([0.0]))
-    logits = torch.zeros(1, 128)
+    batch_logits = torch.zeros(2, 128)
+    logits = batch_logits[:1]
     logits[0, 100] = 100
     logits[0, ids["tool_call_token_id"]] = 99
     logits[0, ids["speak_token_id"]] = 90
+    original_logits = batch_logits.clone()
     assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["speak_token_id"]
+    assert torch.equal(batch_logits, original_logits), "grammar masks must not change shared batch logits"
     metadata.output_token_ids = [[ids["speak_token_id"]]]
     assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == 100
     metadata.output_token_ids = [[ids["listen_token_id"], ids["speak_token_id"], *range(100, 108)]]

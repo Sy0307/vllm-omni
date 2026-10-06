@@ -205,6 +205,108 @@ async def test_call_registered_during_result_append_accepts_its_result(monkeypat
         await close_harness(h)
 
 
+async def pending_tool_call(monkeypatch):
+    from tests.model_executor.models.minicpmo_4_5.duplex.test_gander_tools import Tokenizer
+    from vllm_omni.model_executor.models.minicpmo_4_5 import gander_tools
+
+    h = await initialized()
+    monkeypatch.setattr(gander_tools, "tokenizer_for", lambda path: Tokenizer())
+    h.session.replace_runtime_config(
+        {
+            **h.session.runtime_config,
+            "gander_tokenizer_path": "fake",
+            "gander_tools": [{"name": "lookup", "parameters": {"type": "object"}}],
+        }
+    )
+    await h.runner.model._send_one_model_output_event(
+        {"function_call": True, "name": "lookup", "arguments": "{}", "call_id": "pending"},
+        expected_epoch=h.session.epoch,
+    )
+    return h
+
+
+@pytest.mark.asyncio
+async def test_targeted_cancel_does_not_invalidate_pending_tool_or_input(monkeypatch):
+    h = await pending_tool_call(monkeypatch)
+    try:
+        epoch, requests = h.session.epoch, h.session.resource_request_ids()
+        # An inactive response ID is a no-op while the native session listens.
+        await h.runner._on_cancel({"type": "response.cancel", "response_id": "unrelated"})
+        response = h.session.begin_response()
+        # A different active response must also survive the wrong target.
+        await h.runner._on_cancel({"type": "response.cancel", "response_id": "unrelated"})
+        assert h.session.active_response_id == response
+        assert h.session.epoch == epoch
+        assert h.session.resource_request_ids() == requests
+        assert not h.port.aborts
+        runtime, payload = h.runner.ctx.history.policy.prepare_input(
+            {"kind": "tool_result", "event_id": "result", "epoch": epoch, "call_id": "pending", "output": "ok"},
+            dict(h.session.runtime_config),
+            epoch=epoch,
+        )
+        assert payload is not None and runtime["gander_calls"]["pending"]["result"] is not None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_effective_cancel_rejects_late_tool_result_and_allows_next_input(monkeypatch):
+    h = await pending_tool_call(monkeypatch)
+    try:
+        epoch = h.session.epoch
+        h.session.begin_response()
+        await h.run(SignalTurn(event="input.cancel", signal_payload={}))
+        assert h.session.epoch > epoch
+        before = len(h.port.submissions)
+        receipts = dict(h.session.runtime_config.get("gander_context_receipts", {}))
+        for result_epoch in (epoch, h.session.epoch):
+            await h.run(
+                SignalTurn(
+                    event="input.context.append",
+                    signal_payload={
+                        "kind": "tool_result",
+                        "event_id": "late-result",
+                        "epoch": result_epoch,
+                        "call_id": "pending",
+                        "output": "obsolete",
+                    },
+                )
+            )
+        assert len(h.port.submissions) == before
+        assert h.session.runtime_config.get("gander_context_receipts", {}) == receipts
+        assert h.session.runtime_config["gander_calls"]["pending"]["result"] is None
+        await h.run(append_audio())
+        assert len(h.port.submissions) == before + 1
+        complete(h, seq=1)
+        await h.runner.ctx.history.wait_applied()
+        assert not h.runner.ctx.run.closing
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_native_speech_interrupt_preserves_pending_application_tool(monkeypatch):
+    h = await pending_tool_call(monkeypatch)
+    try:
+        epoch = h.session.epoch
+        response = h.session.begin_response()
+        await h.runner.model._send_one_model_output_event(
+            {"is_interrupt": True, "is_listen": True}, expected_epoch=epoch
+        )
+        events = await h.settle()
+        assert any(event.type == "output_audio_buffer.cleared" and event.response_id == response for event in events)
+        assert h.session.epoch == epoch
+        assert h.session.active_response_id is None
+        runtime, payload = h.runner.ctx.history.policy.prepare_input(
+            {"kind": "tool_result", "event_id": "result", "epoch": epoch, "call_id": "pending", "output": "ok"},
+            dict(h.session.runtime_config),
+            epoch=epoch,
+        )
+        assert payload is not None and runtime["gander_calls"]["pending"]["result"] is not None
+    finally:
+        await close_harness(h)
+
+
 @pytest.mark.asyncio
 async def test_replacement_waits_for_model_completion_and_suppresses_replay():
     h = await initialized()

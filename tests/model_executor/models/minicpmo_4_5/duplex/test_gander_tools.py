@@ -381,6 +381,31 @@ async def test_session_tool_choice_is_applied_or_rejected(mocker, choice):
     assert config.extra_body["realtime_tool_choice"] == choice
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options",
+    [{"sliding_window_mode": mode} for mode in ("off", "basic", "context")]
+    + [{"context_max_units": 8}, {"basic_window_high_tokens": 9000}],
+)
+async def test_gander_rejects_unapplied_minicpm_window_options(mocker, options):
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex import plugin as plugin_module
+
+    plugin = plugin_module.MiniCPMO45DuplexPlugin(lambda *args: None)
+    mocker.patch.object(plugin, "_tokenizer_for", return_value=Tokenizer())
+    model_config = SimpleNamespace(model="fake", hf_config=SimpleNamespace(gander_unit8=True))
+    config = DuplexSessionConfig(modalities=("text",), extra_body=options.copy())
+    with pytest.raises(ServingRuntimeConfigError) as exc:
+        await plugin.prepare_runtime_config(config, model_config=model_config)
+    assert exc.value.code == "unsupported_sliding_window_config"
+    assert config.extra_body == options
+    current = {"gander_enabled": True, "gander_history": {}}
+    with pytest.raises(ServingRuntimeConfigError) as exc:
+        plugin.runtime_config_for_update(config, current)
+    assert exc.value.code == "unsupported_sliding_window_config"
+    assert current == {"gander_enabled": True, "gander_history": {}}
+
+
 @pytest.mark.parametrize("choice", ["auto", "none"])
 def test_session_tool_choice_cannot_change_silently(monkeypatch, runtime, choice):
     from vllm_omni.engine.duplex.config import DuplexSessionConfig

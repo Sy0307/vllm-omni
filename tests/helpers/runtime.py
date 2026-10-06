@@ -1938,3 +1938,316 @@ def send_duplex_video_turns_request(*, server, input_wav: Path, ref_audio: Path,
     assert result["all_audio_responses_have_transcript"] and result["transcript_delta_done_ok"]
     assert result["continuous_input_ok"]
     return result
+
+
+def send_duplex_multimodal_request(
+    *,
+    server,
+    input_wav: Path,
+    ref_audio: Path,
+    output_dir: Path,
+    video_frames: list[str],
+    stacked_frames: list[str | None] | None = None,
+    repeat_last_frame: bool = False,
+    video_lead_in_seconds: int = 0,
+    expected_text_pattern: str | None = None,
+    forbidden_text_pattern: str | None = None,
+):
+    """Run one complete spoken question and caller-provided visual observations.
+
+    The same strict streaming driver records transcripts, PCM and latency
+    metrics. Semantic expectations belong to the test's visual fixture.
+    """
+    import asyncio
+
+    from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import demo_args
+    from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import run_demo
+    from tests.helpers.assertions import assert_duplex_multimodal_response
+    from vllm_omni.clients.duplex import read_pcm16_wav, write_pcm16_wav
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    full_turn = output_dir / "question_and_silence.wav"
+    write_pcm16_wav(
+        full_turn,
+        bytes(32000 * video_lead_in_seconds) + read_pcm16_wav(input_wav) + bytes(32000 * 20),
+        sample_rate_hz=16000,
+    )
+    args = demo_args(omni_server=server, input_wav=full_turn, ref_audio=ref_audio, output_dir=output_dir)
+    args.first_turn_ms = 0
+    args.turn_duration_ms = [0]
+    args.continuous_input = True
+    args.omit_transcript_hints = True
+    args.video_frames_b64 = video_frames
+    args.video_stacked_frames_b64 = stacked_frames or []
+    args.repeat_last_video_frame = repeat_last_frame
+    result = asyncio.run(run_demo(args))
+    assert_duplex_multimodal_response(
+        result, expected_text_pattern=expected_text_pattern, forbidden_text_pattern=forbidden_text_pattern
+    )
+    return result
+
+
+async def run_duplex_client_session(
+    *, url: str, model: str, ref_audio: Path, input_wav: Path, silence_seconds: float = 20.0
+) -> dict[str, object]:
+    """Exercise simultaneous microphone/playback, automatic resume and close.
+
+    Native models may keep listening after the utterance; trailing silence
+    advances their clock while the response consumer acknowledges playback.
+    Commit follows those acknowledgements so it cannot supersede the response.
+    """
+    import asyncio
+
+    from vllm_omni.clients.duplex import (
+        DuplexClient,
+        EventCollector,
+        ReconnectPolicy,
+        audio_data_url,
+        read_pcm16_wav,
+    )
+    from vllm_omni.clients.minicpmo_4_5 import create_duplex_session_config
+
+    # temperature 0.0 keeps the response-required reply short and
+    # deterministic (same as the validated demo driver).
+    config = create_duplex_session_config(ref_audio=audio_data_url(ref_audio), temperature=0.0)
+    client = DuplexClient(
+        url,
+        model=model,
+        config=config,
+        reconnect=ReconnectPolicy(max_attempts=5, backoff_s=(0.25, 1.0)),
+        # Short interval so the periodic heartbeat path runs during the
+        # session — including across the forced transport drop below.
+        heartbeat_interval_s=5.0,
+    )
+    collector = EventCollector()
+    pcm = read_pcm16_wav(input_wav) + bytes(round(32000 * silence_seconds))
+    summary: dict[str, object] = {}
+    async with client:
+        tasks: list[asyncio.Task] = []
+        collector_task = asyncio.create_task(collector.consume(client))
+        tasks.append(collector_task)
+        summary["session_id"] = client.session_id
+        summary["resume_token_issued"] = client.resume_token is not None
+
+        async def consume_response():
+            listens = 0
+            async for response in client.responses():
+                if response.decision == "listen":
+                    listens += 1
+                    if listens > 30:
+                        raise AssertionError(f"no speak response after {listens} listen decisions")
+                    continue
+                chunk_count = 0
+                audio_byte_count = 0
+                async for chunk in response.audio():
+                    chunk_count += 1
+                    audio_byte_count += len(chunk)
+                    await client.ack_playback(response.played_ms, response_id=response.response_id)
+                summary.update(
+                    decision=response.decision,
+                    listen_rounds=listens,
+                    audio_chunks=chunk_count,
+                    audio_bytes=audio_byte_count,
+                    played_ms=response.played_ms,
+                    transcript=response.transcript,
+                )
+                return
+            raise AssertionError("session closed before a speak response")
+
+        try:
+            microphone = asyncio.create_task(client.stream_pcm(pcm, chunk_ms=200))
+            response_task = asyncio.create_task(consume_response())
+            tasks.extend([microphone, response_task])
+            await asyncio.wait([microphone, response_task], return_when=asyncio.FIRST_COMPLETED)
+            if microphone.done():
+                await microphone  # propagate an input failure before waiting for output
+            await response_task
+            if not microphone.done():
+                microphone.cancel()
+            await asyncio.gather(microphone, return_exceptions=True)
+            await client.commit()
+
+            resumed_waiter = asyncio.create_task(client.wait_for("session.resumed", timeout_s=90.0))
+            tasks.append(resumed_waiter)
+            await asyncio.sleep(0.1)
+            assert client._ws is not None
+            await client._ws.close()
+            resumed = await resumed_waiter
+            summary["resumed_session_id"] = resumed.session_id or client.session_id
+
+            ack_waiter = asyncio.create_task(client.wait_for("session.heartbeat_ack", timeout_s=30.0))
+            tasks.append(ack_waiter)
+            await asyncio.sleep(0.1)
+            await client.send({"type": "session.heartbeat"})
+            await ack_waiter
+            summary["post_resume_heartbeat_ok"] = True
+            await client.close()
+            await asyncio.wait_for(collector_task, timeout=10.0)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    summary["error_events"] = collector.errors()
+    summary["closed_cleanly"] = collector.count("session.closed") > 0
+    summary["timing"] = collector.timing_summary(after_s=0.0)
+    return summary
+
+
+def send_duplex_client_session_request(*, server, input_wav, ref_audio, silence_seconds=20.0, timeout_s=180.0):
+    import asyncio
+
+    from tests.helpers.assertions import assert_duplex_client_session
+
+    summary = asyncio.run(
+        asyncio.wait_for(
+            run_duplex_client_session(
+                url=f"ws://{server.host}:{server.port}/v1/realtime?duplex=1",
+                model=server.model,
+                ref_audio=Path(ref_audio),
+                input_wav=Path(input_wav),
+                silence_seconds=silence_seconds,
+            ),
+            timeout=timeout_s,
+        )
+    )
+    assert_duplex_client_session(summary)
+    return summary
+
+
+def send_duplex_seeded_text_request(*, server, text, ref_audio, expected_text_pattern, modalities=("audio", "text")):
+    import asyncio
+
+    from tests.helpers.assertions import assert_duplex_seeded_text_response
+
+    result = asyncio.run(
+        run_duplex_seeded_text_to_audio(
+            url=f"ws://{server.host}:{server.port}/v1/realtime?duplex=1",
+            model=server.model,
+            ref_audio=ref_audio,
+            text=text,
+            modalities=modalities,
+        )
+    )
+    assert_duplex_seeded_text_response(
+        result, require_audio="audio" in modalities, expected_text_pattern=expected_text_pattern
+    )
+    return result
+
+
+async def run_duplex_seeded_text_to_audio(
+    *,
+    url: str,
+    model: str,
+    ref_audio: Path | None,
+    text: str,
+    modalities: tuple[str, ...] = ("audio", "text"),
+    silence_seconds: float = 12.0,
+    timeout_s: float = 180.0,
+) -> dict[str, object]:
+    """Speak a seeded text: the duplex route's text-to-speech shape.
+
+    A model-native session takes its text once, in the session context
+    (``duplex_initial_user_text``), and then generates per audio unit. Silence
+    carries no content of its own, so it only advances the clock and lets the
+    model answer the seeded turn.
+    """
+    import asyncio
+    import base64
+    import json
+
+    import websockets
+
+    from vllm_omni.clients.duplex import build_realtime_url, reference_audio_data_url
+
+    websocket_url = build_realtime_url(url, model, autostart=False)
+    audio_bytes = 0
+    transcript: list[str] = []
+    output_text: list[str] = []
+    seen: list[str] = []
+    session_payload: dict[str, object] = {
+        "model": model,
+        "modalities": list(modalities),
+        "input_audio_format": "pcm16",
+        "output_audio_format": "pcm16",
+        "turn_detection": None,
+        "temperature": 0.0,
+        "extra_body": {
+            "auto_response": True,
+            "force_listen_count": 0,
+            "duplex_initial_user_text": text,
+        },
+    }
+    if ref_audio is not None:
+        session_payload["ref_audio"] = reference_audio_data_url(ref_audio)
+    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
+        await ws.send(json.dumps({"type": "session.update", "session": session_payload}))
+
+        async def reader() -> None:
+            nonlocal audio_bytes
+            while True:
+                raw = await ws.recv()
+                if not isinstance(raw, str):
+                    continue
+                event = json.loads(raw)
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                if isinstance(event_type, str):
+                    seen.append(event_type)
+                delta = event.get("delta")
+                if event_type == "response.output_audio.delta" and isinstance(delta, str):
+                    audio_bytes += len(base64.b64decode(delta))
+                elif event_type == "response.output_audio_transcript.delta" and isinstance(delta, str):
+                    transcript.append(delta)
+                elif event_type == "response.output_text.delta" and isinstance(delta, str):
+                    output_text.append(delta)
+                elif event_type == "error":
+                    raise AssertionError(f"seeded text turn received an error: {event}")
+
+        reader_task = asyncio.create_task(reader())
+        silence = bytes(2 * 16_000 * 200 // 1000)
+        sent_ms = 0
+        try:
+            while sent_ms < silence_seconds * 1000 and "response.done" not in seen:
+                if reader_task.done():
+                    await reader_task
+                sent_ms += 200
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(silence).decode("ascii"),
+                            "input_audio_format": "pcm16",
+                            "sample_rate_hz": 16_000,
+                            "duration_ms": 200,
+                            "audio_end_ms": sent_ms,
+                        }
+                    )
+                )
+                await asyncio.sleep(0.2)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_s
+            while loop.time() < deadline and "response.done" not in seen:
+                if reader_task.done():
+                    await reader_task
+                await asyncio.sleep(0.5)
+            if reader_task.done():
+                await reader_task
+            # Close explicitly. Dropping the socket parks the session in its
+            # disconnect grace, where it keeps holding an admission slot and
+            # starves the tests that follow.
+            await ws.send(json.dumps({"type": "session.close"}))
+            deadline = loop.time() + 30
+            while loop.time() < deadline and "session.closed" not in seen:
+                await asyncio.sleep(0.25)
+        finally:
+            reader_task.cancel()
+            await asyncio.gather(reader_task, return_exceptions=True)
+    return {
+        "audio_bytes": audio_bytes,
+        "transcript": "".join(transcript),
+        "output_text": "".join(output_text),
+        "event_types": seen,
+    }
