@@ -1644,6 +1644,10 @@ def send_duplex_tool_context_request(
                             e.get("type") == "response.done"
                             and collector.response_id(e) != interrupted_response
                             and e.get("response", {}).get("status") == "completed"
+                            and (
+                                expected_interrupt_text is None
+                                or expected_interrupt_text in collector.response_text(collector.response_id(e))
+                            )
                         ),
                         clear_index + 1,
                     )

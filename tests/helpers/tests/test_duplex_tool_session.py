@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture
 def tool_peer(monkeypatch):
-    state = SimpleNamespace(result_audio=True, interrupt_epoch=40, reader_error=False, client=None)
+    state = SimpleNamespace(result_audio=True, interrupt_epoch=40, reader_error=False, early_ack=False, client=None)
 
     class Client:
         session_info = {"epoch": 40}
@@ -72,6 +72,9 @@ def tool_peer(monkeypatch):
                 self.response("interrupted", status="cancelled")
                 self.emit({"type": "output_audio_buffer.cleared", "response_id": "interrupted"})
                 self.emit({"type": "response.listen", "response": {"metadata": {"reason": "model_interrupt"}}})
+                if state.early_ack:
+                    self.response("ack", text="Tell me the new question")
+                    await asyncio.sleep(0.1)
                 self.response("followup", text="二")
             await asyncio.sleep(0)
 
@@ -135,6 +138,13 @@ def test_pending_tool_native_interrupt_rejects_epoch_change(tool_peer, tmp_path)
     with pytest.raises(AssertionError, match="Native interrupt invalidated the pending tool epoch"):
         probe(tmp_path, pending_interrupt_wav=tmp_path / "interrupt.wav", expected_interrupt_text="二")
     assert not any(event["type"] == "conversation.item.create" for event in tool_peer.client.sent)
+
+
+def test_pending_tool_interrupt_keeps_input_after_early_ack(tool_peer, tmp_path):
+    tool_peer.early_ack = True
+    result = probe(tmp_path, pending_interrupt_wav=tmp_path / "interrupt.wav", expected_interrupt_text="二")
+    assert result["interrupted_response"] == "interrupted"
+    assert tool_peer.client.sent[-1]["item"]["call_id"] == "call-1"
 
 
 def test_tool_probe_observes_reader_failure(tool_peer, tmp_path):
