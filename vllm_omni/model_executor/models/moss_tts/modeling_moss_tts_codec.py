@@ -1176,11 +1176,9 @@ class MossTTSCodecDecoder(nn.Module):
                 )
 
                 skip_empty_tiles = bool(self._connector_int("codec_skip_empty_attention_tiles", default=0))
-                fused_slots = bool(self._connector_int("codec_fused_slot_attention", default=0))
-                if skip_empty_tiles and fused_slots:
-                    raise ValueError("codec_skip_empty_attention_tiles requires unfused slot attention")
                 if skip_empty_tiles:
                     slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
+                    slot_ring_attention_rows = partial(slot_ring_attention_rows, skip_empty_tiles=True)
                     logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
 
             for module in codec.decoder.modules():

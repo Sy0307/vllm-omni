@@ -20,6 +20,16 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _bthd_out(q: torch.Tensor) -> torch.Tensor:
+    """(B, H, T, D) output backed by (B, T, H, D) storage.
+
+    The codec immediately transposes attention output back to (B, T, H*D), so
+    this layout makes that reshape a view instead of a copy kernel.
+    """
+    b, h, t, d = q.shape
+    return torch.empty((b, t, h, d), device=q.device, dtype=q.dtype).transpose(1, 2)
+
+
 @triton.jit
 def _write(
     k_ptr,
@@ -79,6 +89,9 @@ def _attend(
     qs1: tl.constexpr,
     qs2: tl.constexpr,
     qs3: tl.constexpr,
+    os0: tl.constexpr,
+    os1: tl.constexpr,
+    os2: tl.constexpr,
     end_stride: tl.constexpr,
     slot_stride: tl.constexpr,
     length_stride: tl.constexpr,
@@ -161,7 +174,7 @@ def _attend(
             maximum = next_max
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
-        out_ptr + ((batch * num_heads + head) * num_frames + rows[:, None]) * head_dim + dims[None, :],
+        out_ptr + batch * os0 + head * os1 + rows[:, None] * os2 + dims[None, :],
         out,
         rows[:, None] < num_frames,
     )
@@ -208,6 +221,9 @@ def _write_attend(
     vs1: tl.constexpr,
     vs2: tl.constexpr,
     vs3: tl.constexpr,
+    os0: tl.constexpr,
+    os1: tl.constexpr,
+    os2: tl.constexpr,
     start_stride: tl.constexpr,
     slot_stride: tl.constexpr,
     length_stride: tl.constexpr,
@@ -221,6 +237,7 @@ def _write_attend(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_w: tl.constexpr,
+    skip_empty_tiles: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
     bh = tl.program_id(1)
@@ -254,11 +271,23 @@ def _write_attend(
     acc = tl.full((block_m, head_dim), 0.0, tl.float32)
     maximum = tl.full((block_m,), -float("inf"), tl.float32)
     denominator = tl.full((block_m,), 0.0, tl.float32)
-    if length > 0:
+    # Same exact tile skipping as _attend: omitted tiles are wholly masked, so
+    # their online-softmax update is the identity.
+    if skip_empty_tiles:
+        block_start = tl.program_id(0) * block_m
+        live = (length > 0) & (block_start < length)
+        live = live & (block_start + block_m > tl.maximum(length - ring_capacity, 0))
+    else:
+        live = length > 0
+    if live:
         last = end - 1
         last_index = last % ring_capacity
-        for first in range(tl.cdiv(ring_capacity, block_n)):
-            cols = first * block_n + tl.arange(0, block_n)
+        if skip_empty_tiles:
+            key_blocks = tl.cdiv(tl.minimum(end, ring_capacity), block_n)
+        else:
+            key_blocks = tl.cdiv(ring_capacity, block_n)
+        for block in range(key_blocks):
+            cols = block * block_n + tl.arange(0, block_n)
             delta = cols - last_index
             positions = tl.where(delta <= 0, last + delta, last + delta - ring_capacity)
             distance = start + rows[:, None] - positions[None, :]
@@ -288,7 +317,7 @@ def _write_attend(
             maximum = next_max
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
-        out_ptr + ((batch * num_heads + head) * num_frames + rows[:, None]) * head_dim + dims[None, :],
+        out_ptr + batch * os0 + head * os1 + rows[:, None] * os2 + dims[None, :],
         out,
         rows[:, None] < num_frames,
     )
@@ -335,7 +364,7 @@ def slot_ring_attention(
         raise ValueError("all tensors must share one CUDA device")
     if context == 0 or context < -1:
         raise ValueError("context must be -1 or positive")
-    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    out = _bthd_out(q)
     if b == 0:
         return out
     strides = (end_offset.stride(0), slot_ids.stride(0), valid_lengths.stride(0))
@@ -351,6 +380,7 @@ def slot_ring_attention(
         valid_lengths,
         out,
         *q.stride(),
+        *out.stride()[:3],
         *strides,
         s,
         h,
@@ -380,7 +410,7 @@ def _(
     context: int = -1,
     skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
-    return torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    return _bthd_out(q)
 
 
 def _check_inputs(q, k, v, cache, metadata, context):
@@ -413,6 +443,7 @@ def slot_ring_attention_rows(
     slot_ids: torch.Tensor,
     valid_lengths: torch.Tensor,
     context: int = -1,
+    skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
     """``slot_ring_attention`` as one launch, with per-row start positions.
 
@@ -425,7 +456,7 @@ def slot_ring_attention_rows(
     _check_inputs(q, k, v, cache, (starts, slot_ids, valid_lengths), context)
     if starts.shape != (b,) or slot_ids.shape != (b,) or valid_lengths.shape != (b,):
         raise ValueError("invalid metadata shapes")
-    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    out = _bthd_out(q)
     if b == 0:
         return out
     s, c = cache.shape[1], cache.shape[3]
@@ -442,6 +473,7 @@ def slot_ring_attention_rows(
         *q.stride(),
         *k.stride(),
         *v.stride(),
+        *out.stride()[:3],
         starts.stride(0),
         slot_ids.stride(0),
         valid_lengths.stride(0),
@@ -455,6 +487,7 @@ def slot_ring_attention_rows(
         bm,
         64,
         16,
+        skip_empty_tiles=skip_empty_tiles and t <= 32,
         num_warps=8 if c <= 256 else 4,
         num_stages=2,
     )
@@ -471,5 +504,6 @@ def _(
     slot_ids: torch.Tensor,
     valid_lengths: torch.Tensor,
     context: int = -1,
+    skip_empty_tiles: bool = False,
 ) -> torch.Tensor:
-    return torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    return _bthd_out(q)
