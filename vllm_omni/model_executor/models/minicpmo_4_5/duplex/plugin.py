@@ -90,6 +90,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_scheduler_token_id",
         "duplex_vision_tile_pixels",
         "duplex_first_append_context_tokens",
+        "duplex_initial_user_text_token_ids",
         "ref_audio_data",
         "ref_audio_format",
         "ref_audio_sample_rate_hz",
@@ -253,11 +254,20 @@ def build_duplex_data_plane_prompt(
     final: bool,
 ) -> dict[str, object]:
     control = isinstance(payload, dict) and payload.get("gander_control") is True
-    if control:
+    text_unit = isinstance(payload, dict) and payload.get("type") == "text"
+    if control or text_unit:
         ids = payload.get("token_ids")
         replay = payload.get("gander_replay") is True
         wake = payload.get("gander_wake") is True
-        if not isinstance(ids, list) or len(ids) > 1500 or (not replay and ((not ids and not wake) or seq <= 1)):
+        if text_unit and not runtime_config.get("gander_enabled"):
+            raise ValueError("Native text units require Gander")
+        if text_unit and not replay and seq != 1:
+            raise ValueError("Opening text must precede audio input")
+        if (
+            not isinstance(ids, list)
+            or (not text_unit and len(ids) > 1500)
+            or (not replay and ((not ids and not wake) or (not text_unit and seq <= 1)))
+        ):
             raise ValueError("Gander context append requires initialized session and bounded token ids")
         token_budget = len(ids) + (1 if seq == 1 else 3)
         if seq == 1:
@@ -265,7 +275,7 @@ def build_duplex_data_plane_prompt(
     else:
         vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
         token_budget = _duplex_audio_token_budget(payload) + vision_tokens
-    if not control and seq <= 1:
+    if not control and not text_unit and seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
@@ -511,9 +521,9 @@ def _apply_first_append_context_tokens(
     except Exception:
         return
     ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
-    runtime_config["duplex_first_append_context_tokens"] = (
-        len(prefix_ids) + ref_tokens + len(suffix_ids) + len(user_ids)
-    )
+    runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+    if user_text_in_unit:
+        runtime_config["duplex_initial_user_text_token_ids"] = [int(token_id) for token_id in user_ids]
     runtime_config["duplex_window_prefix_tokens"] = len(prefix_ids) + ref_tokens
     runtime_config["duplex_window_suffix_token_ids"] = [int(token_id) for token_id in suffix_ids]
     marker_ids = tokenizer.encode("\n\nprevious: ", add_special_tokens=False)
@@ -650,6 +660,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                         all_stop_token_ids.update(int(token_id) for token_id in value)
             configured.append(params)
         return tuple(configured)
+
+    def initial_input_payload(self, *, runtime_config: Mapping[str, object]) -> dict[str, object] | None:
+        if not runtime_config.get("gander_enabled"):
+            return None
+        ids = runtime_config.get("duplex_initial_user_text_token_ids")
+        if not isinstance(ids, list) or not ids:
+            return None
+        return {"type": "text", "token_ids": list(ids), "context_version": 0}
 
     def plan_append(
         self,

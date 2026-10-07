@@ -45,7 +45,7 @@ def describe(prompt):
     p = d.get("payload", {})
     return {
         "unit_id": unit_id(prompt),
-        "kind": "event" if p.get("gander_control") else "audio",
+        "kind": "text" if p.get("type") == "text" else "event" if p.get("gander_control") else "audio",
         "pinned": bool(d.get("gander_pinned")),
         "completed": bool(d.get("gander_output_ids")),
         "input_tokens": len(prompt.get("prompt_token_ids", [])),

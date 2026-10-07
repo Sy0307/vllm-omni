@@ -486,7 +486,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             try:
                 audio_waveform = (
-                    None if payload.get("gander_control") is True else helper._decode_audio_payload(payload)
+                    None
+                    if payload.get("gander_control") is True or payload.get("type") == "text"
+                    else helper._decode_audio_payload(payload)
                 )
             except ValueError as exc:
                 raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
@@ -505,7 +507,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 turn_id = int(turn_id) if turn_id is not None else None
             except (TypeError, ValueError):
                 turn_id = None
-            if payload.get("gander_control") is True:
+            if payload.get("gander_control") is True or payload.get("type") == "text":
                 if not getattr(self.config, "gander_unit8", False):
                     raise ModelInputError("native_duplex_prefill_failed: Gander context payload on a non-Gander model")
                 try:
@@ -730,7 +732,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
                 continue
             payload = duplex.get("payload")
-            if isinstance(payload, dict) and (payload.get("gander_control") or payload.get("gander_replay")):
+            if isinstance(payload, dict) and (
+                payload.get("gander_control") or payload.get("gander_replay") or payload.get("type") == "text"
+            ):
                 continue  # Control and journal replay retain their ordered single-request path.
             appends.append((request_id, duplex))
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)

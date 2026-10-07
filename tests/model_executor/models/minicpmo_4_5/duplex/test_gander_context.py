@@ -120,6 +120,80 @@ def test_first_control_replay_embeds_prefix_and_preserves_audio_frontend():
     assert state.audio_buffer.size == 0
 
 
+def test_opening_text_unit_has_exact_slots_and_does_not_consume_audio():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    helper = object.__new__(MiniCPMO45Stage0DuplexRuntime)
+    helper.unit_token_id, helper.unit_end_token_id, helper.chunk_eos_token_id = 10, 11, 12
+    helper._embed_token = lambda token: torch.tensor([[float(token)]])
+    helper._special_token_ids = lambda: {}
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="s", context_token_ids=[1, 2], context_embeds=[torch.tensor([[1.0], [2.0]])]
+    )
+    payload = {"type": "text", "token_ids": [20, 21], "context_version": 0}
+    p = build_duplex_data_plane_prompt(
+        request_id="r",
+        fence=DuplexFence("s"),
+        session_config={},
+        runtime_config={"gander_enabled": True, "duplex_first_append_context_tokens": 2},
+        seq=1,
+        turn_seq=1,
+        payload=payload,
+        final=False,
+    )
+    result = helper._stage_control_embeddings(state, payload, epoch=0, seq=1)
+    assert result["input_token_ids"] == [1, 2, 10, 20, 21]
+    assert result["inputs_embeds"].flatten().tolist() == [1, 2, 10, 20, 21]
+    assert len(p["prompt_token_ids"]) == result["num_input_tokens"] == 5
+    assert state.audio_chunk_idx == 0 and state.audio_buffer.size == 0
+    assert state.gander_unit_count == 1 and state.gander_context_version == 0
+    retry = helper._stage_control_embeddings(state, payload, epoch=0, seq=1)
+    assert retry["input_token_ids"] == result["input_token_ids"]
+    assert state.gander_unit_count == 1
+    with pytest.raises(ValueError, match="precede audio"):
+        helper._stage_control_embeddings(state, payload, epoch=0, seq=2)
+
+
+def test_seeded_text_is_counted_in_its_own_unit_and_not_in_the_system_prefix():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
+        MiniCPMO45DuplexPlugin,
+        _apply_first_append_context_tokens,
+    )
+
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return list(text.encode())
+
+    runtime = {"gander_enabled": True}
+    _apply_first_append_context_tokens(
+        runtime, tokenizer=Tokenizer(), instructions="system", initial_user_text="原中文", ref_sample_count=3200
+    )
+    plugin = MiniCPMO45DuplexPlugin(lambda *args: None)
+    payload = plugin.initial_input_payload(runtime_config=runtime)
+    assert payload is not None
+    assert payload["token_ids"] == list("原中文".encode())
+    assert (
+        runtime["duplex_first_append_context_tokens"]
+        == len(b"<|im_start|>system\nsystem\n<|audio_start|><|audio_end|><|im_end|>") + 2
+    )
+    assert plugin.initial_input_payload(runtime_config={"initial_user_text": "MiniCPM"}) is None
+
+
+def test_text_replay_keeps_its_tokens_without_reseeding_dropped_opening_text():
+    seed = prompt(1)
+    metadata(seed)["payload"] = {"type": "text", "token_ids": [51, 52], "context_version": 0}
+    result = plan([seed, prompt(2)])
+    assert metadata(result.units[0].prompt)["payload"]["token_ids"] == [51, 52]
+    assert len(result.units[0].prompt["prompt_token_ids"]) == 12  # prefix 7 + unit 1 + text 2 + history 2
+    result = plan([seed, prompt(2)], [{"op": "delete", "unit_id": "u0-1"}])
+    assert result.retained_unit_ids == ("u0-2",)
+    assert metadata(result.units[0].prompt)["payload"].get("type") != "text"
+    assert "token_ids" not in metadata(result.units[0].prompt)["payload"]
+
+
 def test_old_physical_request_cleanup_cannot_delete_replacement_state():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 

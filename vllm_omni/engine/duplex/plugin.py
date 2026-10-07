@@ -349,6 +349,14 @@ class DuplexModelPlugin(ABC):
 
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
+    def initial_input_payload(self, *, runtime_config: Mapping[str, object]) -> dict[str, object] | None:
+        """An optional native opening input, submitted before client appends.
+
+        The runner owns its ordering and cleanup just like any later input.
+        Models that seed their opening text in the session prefix return None.
+        """
+        return None
+
     @abstractmethod
     def configure_sampling_params(
         self,

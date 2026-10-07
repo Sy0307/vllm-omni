@@ -92,7 +92,6 @@ class _MiniCPMO45Stage0SessionState:
     pending_terminator_token: int | None = None
     last_terminator_token: int | None = None
     pending_speech_context: bool = False
-    pending_user_text: str | None = None
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     pending_turn_end_identity: tuple[int | None, int | None] | None = None
@@ -315,10 +314,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.context_suffix_embeds.append(embed)
             state.context_suffix_token_ids.append(token_id)
         if isinstance(initial_user_text, str) and initial_user_text:
-            if user_text_in_unit:
-                # Native Gander training places typed input after the audio
-                # inside a unit, before its action, without a ChatML turn.
-                state.pending_user_text = initial_user_text
             # Seeded text is pending user content just like a speech append.
             # Otherwise the turn-ended latch forces its silent input clock to
             # listen before the model can answer. Generated content clears it.
@@ -571,11 +566,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
             )
-            if state.pending_user_text is not None:
-                for token_id in self._encode_text(state.pending_user_text):
-                    embed_parts.append(self._embed_token(token_id))
-                    token_ids.append(token_id)
-                state.pending_user_text = None
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             if gander:
@@ -644,27 +634,27 @@ class MiniCPMO45Stage0DuplexRuntime:
             }
         replay = payload.get("gander_replay") is True
         wake = payload.get("gander_wake") is True
-        if state.audio_chunk_idx == 0 and state.gander_unit_count == 0 and not replay:
+        text_unit = payload.get("type") == "text"
+        first = state.gander_unit_count == 0 and (replay or text_unit)
+        if text_unit and not replay and not first:
+            raise ValueError("Opening text must precede audio input")
+        if state.audio_chunk_idx == 0 and state.gander_unit_count == 0 and not replay and not text_unit:
             raise ValueError("Gander context input requires an initialized audio session")
         token_ids = payload.get("token_ids")
         if (
             not isinstance(token_ids, list)
             or (not token_ids and not replay and not wake)
-            or len(token_ids) > 1500
+            or (not text_unit and len(token_ids) > 1500)
             or any(type(token) is not int or token < 0 for token in token_ids)
         ):
             raise ValueError("Invalid Gander context token input")
         version = payload.get("context_version")
-        expected_version = state.gander_context_version if wake else state.gander_context_version + 1
+        expected_version = state.gander_context_version if wake or text_unit else state.gander_context_version + 1
         if type(version) is not int or (not replay and version != expected_version):
             raise ValueError("Gander context version is stale or skipped")
         terminator = state.pending_terminator_token
         if terminator is None:
             terminator = self.chunk_eos_token_id
-        first = state.gander_unit_count == 0 and replay
-        if first and state.pending_user_text is not None:
-            token_ids = [*self._encode_text(state.pending_user_text), *token_ids]
-            state.pending_user_text = None
         ids = (
             [self.unit_token_id, *token_ids]
             if first

@@ -247,6 +247,9 @@ class DuplexSessionRunner:
         # the ACK-only playback ledger for that path.
         session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
         self.control.init_turn_detection()
+        initial_payload = self.plugin.initial_input_payload(runtime_config=session.runtime_config)
+        if initial_payload is not None:
+            self._mailbox.put_nowait(_Internal("initial_input", initial_payload))
         self._worker = self._loop.create_task(self._run(), name=f"duplex-session-{session.session_id}")
         self.emit({"type": "session.created", "session": session.as_public_dict()})
 
@@ -562,6 +565,13 @@ class DuplexSessionRunner:
         await self._on_command(item)
 
     async def _on_internal(self, item: _Internal) -> None:
+        if item.kind == "initial_input":
+            if self.closing:
+                return
+            if not self.session.unanswered_user_items():
+                self.session.notify_new_user_item()
+            await self._start_append(dict(item.payload), final=False)
+            return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
             if isinstance(stage_metrics, Mapping):

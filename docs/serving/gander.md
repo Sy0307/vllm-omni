@@ -31,6 +31,11 @@ the model's response. Input-unit length does not determine output audio length.
 The model chooses listen, speak, backchannel or interrupt. A model interrupt
 cancels the active response; clients must honor playback-clear events.
 
+To open a session with typed input, set `session.initial_user_text`. Gander
+feeds it as a native TEXT unit before the first microphone unit. Continue
+microphone input while awaiting the answer, as for speech turns. The opening
+text participates in the same history and replay rules as other input units.
+
 ## Tools and context
 
 Tools are optional function schemas in `session.update.session.tools`.
