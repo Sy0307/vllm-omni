@@ -34,11 +34,11 @@ SERVER_PARAMS = [
 ]
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_gander_streaming_speech(omni_server, tmp_path):
+    # Natural speech and completion require real Thinker/Talker weights.
     # A recorded speech question followed by microphone silence gives the
     # native model time to finish without a text prompt or transcript hint.
     source = Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav"
