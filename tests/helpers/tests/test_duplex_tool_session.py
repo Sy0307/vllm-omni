@@ -16,7 +16,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture
 def tool_peer(monkeypatch):
-    state = SimpleNamespace(result_audio=True, interrupt_epoch=40, reader_error=False, early_ack=False, client=None)
+    state = SimpleNamespace(
+        result_audio=True,
+        interrupt_epoch=40,
+        reader_error=False,
+        early_ack=False,
+        client=None,
+        followup_text="一加一等于二",
+    )
 
     class Client:
         session_info = {"epoch": 40}
@@ -75,7 +82,7 @@ def tool_peer(monkeypatch):
                 if state.early_ack:
                     self.response("ack", text="Tell me the new question")
                     await asyncio.sleep(0.1)
-                self.response("followup", text="二")
+                self.response("followup", text=state.followup_text)
             await asyncio.sleep(0)
 
         async def ack_playback(self, *args, **kwargs):
@@ -126,8 +133,14 @@ def test_tool_reply_accepts_audio_after_result(tool_peer, tmp_path):
     assert probe(tmp_path)["transcript"] == "Result: 472"
 
 
-def test_pending_tool_native_interrupt_preserves_epoch(tool_peer, tmp_path):
-    result = probe(tmp_path, pending_interrupt_wav=tmp_path / "interrupt.wav", expected_interrupt_text="二")
+@pytest.mark.parametrize("answer", ["一加一等于二", "答案是2。"])
+def test_pending_tool_native_interrupt_preserves_epoch(tool_peer, tmp_path, answer):
+    tool_peer.followup_text = answer
+    result = probe(
+        tmp_path,
+        pending_interrupt_wav=tmp_path / "interrupt.wav",
+        expected_interrupt_text_pattern=r"(?:一加一(?:等于|是)(?:二|2)|(?:答案|结果|結果)是(?:二|2))(?=[。.!！\s]|$)",
+    )
     assert result["interrupted_response"] == "interrupted"
     assert not any(event["type"] in {"response.cancel", "output_audio_buffer.clear"} for event in tool_peer.client.sent)
     assert tool_peer.client.sent[-1]["item"]["call_id"] == "call-1"
@@ -136,13 +149,21 @@ def test_pending_tool_native_interrupt_preserves_epoch(tool_peer, tmp_path):
 def test_pending_tool_native_interrupt_rejects_epoch_change(tool_peer, tmp_path):
     tool_peer.interrupt_epoch = 41
     with pytest.raises(AssertionError, match="Native interrupt invalidated the pending tool epoch"):
-        probe(tmp_path, pending_interrupt_wav=tmp_path / "interrupt.wav", expected_interrupt_text="二")
+        probe(
+            tmp_path,
+            pending_interrupt_wav=tmp_path / "interrupt.wav",
+            expected_interrupt_text_pattern=r"(?:一加一(?:等于|是)(?:二|2)|(?:答案|结果|結果)是(?:二|2))(?=[。.!！\s]|$)",
+        )
     assert not any(event["type"] == "conversation.item.create" for event in tool_peer.client.sent)
 
 
 def test_pending_tool_interrupt_keeps_input_after_early_ack(tool_peer, tmp_path):
     tool_peer.early_ack = True
-    result = probe(tmp_path, pending_interrupt_wav=tmp_path / "interrupt.wav", expected_interrupt_text="二")
+    result = probe(
+        tmp_path,
+        pending_interrupt_wav=tmp_path / "interrupt.wav",
+        expected_interrupt_text_pattern=r"(?:一加一(?:等于|是)(?:二|2)|(?:答案|结果|結果)是(?:二|2))(?=[。.!！\s]|$)",
+    )
     assert result["interrupted_response"] == "interrupted"
     assert tool_peer.client.sent[-1]["item"]["call_id"] == "call-1"
 
@@ -151,3 +172,15 @@ def test_tool_probe_observes_reader_failure(tool_peer, tmp_path):
     tool_peer.reader_error = True
     with pytest.raises(RuntimeError, match="injected reader failure"):
         probe(tmp_path)
+
+
+@pytest.mark.parametrize("answer", ["答案是12。", "一加一等于三"])
+def test_pending_tool_native_interrupt_rejects_wrong_answer(tool_peer, tmp_path, answer):
+    tool_peer.followup_text = answer
+    with pytest.raises(AssertionError, match="Timed out awaiting tool/context event"):
+        probe(
+            tmp_path,
+            pending_interrupt_wav=tmp_path / "interrupt.wav",
+            expected_interrupt_text_pattern=r"(?:一加一(?:等于|是)(?:二|2)|(?:答案|结果|結果)是(?:二|2))(?=[。.!！\s]|$)",
+        )
+    assert not any(event["type"] == "conversation.item.create" for event in tool_peer.client.sent)

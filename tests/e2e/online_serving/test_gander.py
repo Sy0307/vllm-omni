@@ -145,7 +145,7 @@ def test_gander_pending_tool_survives_native_speech_interrupt(omni_server, tmp_p
         context_after=(),
         require_cancelled_response=False,
         pending_interrupt_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/soft_interrupt_16k.wav",
-        expected_interrupt_text="二",
+        expected_interrupt_text_pattern=r"(?:一加一(?:等于|是)(?:二|2)|(?:答案|结果|結果)是(?:二|2))(?=[。.!！\s]|$)",
     )
     assert result["interrupted_response"]
 

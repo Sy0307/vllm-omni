@@ -14,10 +14,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["input", "output"])
+@pytest.mark.parametrize("failure", ["input", "output", "input_tail"])
 async def test_live_session_cleans_up_after_input_or_output_failure(monkeypatch, failure):
     settled = set()
     blocked = asyncio.Event()
+    input_chunks = []
 
     class Client:
         session_id = "session"
@@ -32,8 +33,13 @@ async def test_live_session_cleans_up_after_input_or_output_failure(monkeypatch,
         async def __aexit__(self, *args):
             settled.add("client")
 
-        async def stream_pcm(self, *args, **kwargs):
+        async def stream_pcm(self, pcm, **kwargs):
+            input_chunks.append(pcm)
             try:
+                if failure == "input_tail":
+                    if len(input_chunks) == 1:
+                        return 0
+                    raise RuntimeError("input_tail failed")
                 if failure == "input":
                     raise RuntimeError("input failed")
                 await blocked.wait()
@@ -63,6 +69,8 @@ async def test_live_session_cleans_up_after_input_or_output_failure(monkeypatch,
             timeout=1,
         )
     assert settled == {"client", "microphone", "collector"}
+    if failure == "input_tail":
+        assert input_chunks[1] == bytes(6400), "ongoing native input must be microphone silence"
 
 
 @pytest.mark.asyncio

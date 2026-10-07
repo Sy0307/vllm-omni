@@ -1442,7 +1442,7 @@ def send_duplex_tool_context_request(
     require_cancelled_response=False,
     resume_before_result=False,
     pending_interrupt_wav=None,
-    expected_interrupt_text=None,
+    expected_interrupt_text_pattern=None,
     timeout_s=90,
 ):
     """Run a real-model function call and feed deterministic client observations.
@@ -1454,9 +1454,12 @@ def send_duplex_tool_context_request(
     """
     import asyncio
     import json
+    import re
     from contextlib import suppress
 
     from vllm_omni.clients.duplex import DuplexClient, EventCollector, ReconnectPolicy, read_pcm16_wav, write_pcm16_wav
+
+    interrupt_matcher = re.compile(expected_interrupt_text_pattern) if expected_interrupt_text_pattern else None
 
     async def run():
         collector = EventCollector()
@@ -1645,17 +1648,17 @@ def send_duplex_tool_context_request(
                             and collector.response_id(e) != interrupted_response
                             and e.get("response", {}).get("status") == "completed"
                             and (
-                                expected_interrupt_text is None
-                                or expected_interrupt_text in collector.response_text(collector.response_id(e))
+                                interrupt_matcher is None
+                                or interrupt_matcher.search(collector.response_text(collector.response_id(e)))
                             )
                         ),
                         clear_index + 1,
                     )
                     new_response = collector.response_id(completed)
                     assert new_response and collector.audio_bytes(new_response), "No audio after the native interrupt"
-                    if expected_interrupt_text is not None:
-                        assert expected_interrupt_text in collector.response_text(new_response), (
-                            collector.response_text(new_response)
+                    if interrupt_matcher is not None:
+                        assert interrupt_matcher.search(collector.response_text(new_response)), collector.response_text(
+                            new_response
                         )
                     feeder.cancel()
                     await asyncio.gather(feeder, return_exceptions=True)
@@ -2082,7 +2085,8 @@ async def run_duplex_client_session(
 
     Native models may keep listening after the utterance; trailing silence
     advances their clock while the response consumer acknowledges playback.
-    Commit follows those acknowledgements so it cannot supersede the response.
+    Keep that clock running until the reply completes, including a cold codec
+    startup that outlasts the initial silence. Commit follows playback acks.
     """
     import asyncio
 
@@ -2142,8 +2146,15 @@ async def run_duplex_client_session(
                 return
             raise AssertionError("session closed before a speak response")
 
+        async def stream_microphone():
+            await client.stream_pcm(pcm, chunk_ms=200)
+            # A live microphone does not end at the fixture's padded tail.
+            # Native output needs further input units until its response ends.
+            while True:
+                await client.stream_pcm(bytes(6400), chunk_ms=200)
+
         try:
-            microphone = asyncio.create_task(client.stream_pcm(pcm, chunk_ms=200))
+            microphone = asyncio.create_task(stream_microphone())
             response_task = asyncio.create_task(consume_response())
             tasks.extend([microphone, response_task])
             await asyncio.wait([microphone, response_task], return_when=asyncio.FIRST_COMPLETED)
