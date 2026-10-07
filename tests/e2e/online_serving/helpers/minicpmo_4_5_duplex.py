@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 import wave
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -180,8 +181,8 @@ def multi_session_args(
     ref_audio: Path,
     output_dir: Path,
     response_required: bool,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> Namespace:
+    return Namespace(
         url=realtime_url(omni_server),
         model=omni_server.model,
         sessions=2,
