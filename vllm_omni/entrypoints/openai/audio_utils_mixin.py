@@ -50,7 +50,14 @@ def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
     """PCM_16 bytes of float32 samples, bit-identical to libsndfile's RAW writer.
 
     libsndfile (1.2) converts with ``floor(x * 0x8000)`` clipped to int16.
+    Scaling by a power of two is exact in float32, so float32 input needs no
+    float64 copy; the result is identical with one fewer full-size pass.
     """
+    if audio.dtype == np.float32:
+        scaled = np.multiply(audio, np.float32(32768.0), dtype=np.float32)
+        np.floor(scaled, out=scaled)
+        np.clip(scaled, -32768, 32767, out=scaled)
+        return scaled.astype("<i2").tobytes()
     scaled = np.floor(audio.astype(np.float64) * 32768.0)
     return np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
 
