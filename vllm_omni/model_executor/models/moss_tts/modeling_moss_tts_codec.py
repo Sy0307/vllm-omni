@@ -1191,6 +1191,16 @@ class MossTTSCodecDecoder(nn.Module):
                         if self._connector_int("codec_fused_slot_attention", default=0):
                             module._slot_attention_rows = slot_ring_attention_rows
             logger.info("Enabled codec attention backend=%s", attention_backend)
+        if self._connector_int("codec_shared_rope", default=0):
+            # One RoPE table per decoder transformer and step, shared by its layers.
+            from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
+
+            shared = 0
+            for module in codec.decoder.modules():
+                if isinstance(module, MossAudioTokenizerTransformer) and module.rope is not None:
+                    module._shared_rope = True
+                    shared += 1
+            logger.info("MOSS codec shared RoPE table: %d decoder transformers", shared)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
             lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
