@@ -24,9 +24,9 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 MODEL = "openbmb/MiniCPM-o-4_5"
 DEPLOY_CONFIG_REL = "minicpmo_4_5.yaml"
 DEPLOY_CONFIG = get_deploy_config_path(DEPLOY_CONFIG_REL)
-# Eager-execution variant for fast-startup core-tier probes (e.g. the duplex
-# client live test): skips CUDA-graph capture on the LLM and Talker stages.
-CORE_DEPLOY_CONFIG = modify_stage_config(
+# Eager-execution variant for the real-weight duplex client live test:
+# skips CUDA-graph capture on the LLM and Talker stages.
+EAGER_DEPLOY_CONFIG = modify_stage_config(
     DEPLOY_CONFIG,
     updates={
         "stages": {
@@ -54,11 +54,11 @@ SERVER_PARAMS = [
     )
 ]
 
-CORE_SERVER_PARAMS = [
+EAGER_SERVER_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=CORE_DEPLOY_CONFIG,
+            stage_config_path=EAGER_DEPLOY_CONFIG,
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),

@@ -7,6 +7,9 @@ Drives a real MiniCPM-o 4.5 duplex session end to end through
 streaming, a speak response consumed via :class:`ResponseHandle` with
 incremental playback acks, a forced transport drop recovered by automatic
 ``session.resume``, and a clean close.
+
+This requires real Thinker/Talker weights: core-model dummy weights cannot
+produce a natural reply or its terminal decision.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
-    CORE_SERVER_PARAMS,
+    EAGER_SERVER_PARAMS,
     resolve_ref_audio,
     validated_input_wav,
 )
@@ -24,9 +27,9 @@ from tests.helpers.runtime import send_duplex_client_session_request
 pytestmark = pytest.mark.omni
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", CORE_SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", EAGER_SERVER_PARAMS, indirect=True)
 def test_duplex_client_live_session(omni_server) -> None:
     send_duplex_client_session_request(
         server=omni_server,
