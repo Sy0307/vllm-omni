@@ -42,7 +42,8 @@ Stage0 and Stage1 use eager execution and synchronous scheduling in this
 profile. Code2Wav inherits the shared MiniCPM deployment settings.
 
 Stop the manual server before running the suite below: pytest starts and stops
-its own server. All twelve scenarios are selected by the advanced-model level.
+its own server. The advanced-model level selects all registered scenarios,
+including the paired visual-answer and pending-tool interruption regressions.
 
 ```bash
 python -m pytest tests/e2e/online_serving/test_gander.py -sv \
