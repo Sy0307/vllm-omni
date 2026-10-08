@@ -50,6 +50,9 @@ class DuplexContextHistory:
         self._close_from_runtime = close_from_runtime
         self.policy = policy
         self.prompts: list[dict] = []
+        self._prompt_costs: list[tuple[int, int]] = []
+        self._journal_tokens = 0
+        self._journal_bytes = 2  # The empty JSON array.
         self.pending: asyncio.Future[None] | None = None
         self.pending_request: str | None = None
         self.replaying = False
@@ -71,15 +74,36 @@ class DuplexContextHistory:
 
     def check_budget(self, prompts: list[dict]) -> None:
         tokens = sum(self.policy.token_count(p) for p in prompts)
-        if tokens >= self.max_tokens or self._size(prompts) > self.max_bytes:
+        self._check_cost(tokens, self._size(prompts))
+
+    def _check_cost(self, tokens: int, encoded_bytes: int) -> None:
+        if tokens >= self.max_tokens or encoded_bytes > self.max_bytes:
             raise ValueError("context replacement exceeds token/byte budget")
+
+    def _prompt_cost(self, prompt: dict) -> tuple[int, int]:
+        # JSON arrays add only brackets and ", " between encoded entries.
+        # Stored prompts are owned snapshots; completion replaces the last
+        # snapshot. Account for that unit without re-encoding its older media.
+        return self.policy.token_count(prompt), self._size([prompt]) - 2
+
+    def _clear_journal(self) -> None:
+        self.prompts = []
+        self._prompt_costs.clear()
+        self._journal_tokens = 0
+        self._journal_bytes = 2
 
     def record(self, request_id: str, prompt: dict) -> None:
         """Reserve journal space before submitting a model input."""
         # The submission and model hooks mutate metadata; the journal owns a stable snapshot.
         candidate = deepcopy(prompt)
-        self.check_budget([*self.prompts, candidate])
+        tokens, encoded_bytes = self._prompt_cost(candidate)
+        total_tokens = self._journal_tokens + tokens
+        total_bytes = self._journal_bytes + encoded_bytes + (2 if self.prompts else 0)
+        self._check_cost(total_tokens, total_bytes)
         self.prompts.append(candidate)
+        self._prompt_costs.append((tokens, encoded_bytes))
+        self._journal_tokens = total_tokens
+        self._journal_bytes = total_bytes
         self.pending_request = request_id
         self.pending = asyncio.get_running_loop().create_future()
 
@@ -93,10 +117,16 @@ class DuplexContextHistory:
                     updated = self.policy.complete(self.prompts[-1], output, context)
                     if updated is None:
                         raise RuntimeError("context completion has no matching model unit")
-                    candidate = [*self.prompts[:-1], updated]
-                    self.check_budget(candidate)
+                    tokens, encoded_bytes = self._prompt_cost(updated)
+                    old_tokens, old_bytes = self._prompt_costs[-1]
+                    total_tokens = self._journal_tokens - old_tokens + tokens
+                    total_bytes = self._journal_bytes - old_bytes + encoded_bytes
+                    self._check_cost(total_tokens, total_bytes)
                     if not self.replaying:
                         self.prompts[-1] = updated
+                        self._prompt_costs[-1] = (tokens, encoded_bytes)
+                        self._journal_tokens = total_tokens
+                        self._journal_bytes = total_bytes
                     self.pending.set_result(None)
                 except Exception as exc:
                     self.pending.set_exception(exc)
@@ -124,7 +154,7 @@ class DuplexContextHistory:
             return
         self._epoch = self.session.epoch
         self._input_epoch_floor = self._epoch
-        self.prompts.clear()
+        self._clear_journal()
         if self.pending is not None and not self.pending.done():
             self.pending.set_exception(
                 DuplexRuntimeConfigError("Context epoch was cancelled", code="context_not_initialized")
@@ -314,7 +344,7 @@ class DuplexContextHistory:
             for old_request in old_requests:
                 self._ctx.plugin.data_plane.close_stream(old_request)
             session.release_all_requests()
-            self.prompts = []
+            self._clear_journal()
             self.pending = None
             for index, unit in enumerate(plan.units):
                 if session.epoch != new_fence.epoch:

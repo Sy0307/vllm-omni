@@ -375,6 +375,39 @@ async def test_replacement_waits_for_model_completion_and_suppresses_replay():
         await close_harness(h)
 
 
+@pytest.mark.asyncio
+async def test_replacement_releases_dropped_journal_budget():
+    h = await initialized()
+    task = None
+    try:
+        history = h.runner.ctx.history
+        await h.run(append_audio())
+        complete(h, seq=2)
+        await history.wait_applied()
+        removed = history.snapshot()["units"][0]["unit_id"]
+        task = asyncio.create_task(h.runner._on_command(edit(h, [{"op": "delete", "unit_id": removed}])))
+        for _ in range(100):
+            if len(h.port.submissions) == 3:
+                break
+            await asyncio.sleep(0.005)
+        assert len(h.port.submissions) == 3
+        complete(h, seq=1)
+        await asyncio.wait_for(task, 2)
+        assert len(history.prompts) == 1
+        next_input = {"prompt_token_ids": [1]}
+        history.max_bytes = history._size([*history.prompts, next_input])
+        history.max_tokens = sum(history.policy.token_count(p) for p in history.prompts) + 2
+        history.record("budget-probe", next_input)
+        assert len(history.prompts) == 2
+        with pytest.raises(ValueError, match="budget"):
+            history.record("over-budget", next_input)
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
 def test_context_wire_command_uses_engine_command_parser():
     command = translate_realtime_command({"type": "input.context.replace", "context": {"event_id": "x"}})
     assert isinstance(command, SignalTurn)
