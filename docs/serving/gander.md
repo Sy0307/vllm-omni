@@ -102,10 +102,11 @@ H100/H200-class CUDA GPU from the repository root:
 ```bash
 export GANDER_MODEL=/path/to/composed/gander-model
 export VLLM_USE_V2_MODEL_RUNNER=0
-# Session lifecycle and streaming speech smoke.
+# Session lifecycle and protocol smoke with dummy Thinker/Talker weights.
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
   -sv -m 'core_model and cuda' --run-level core_model
-# All registered scenarios; pytest starts and stops its own three-stage server.
+# All scenarios, including speech content, with real Thinker/Talker weights.
+# Pytest starts and stops its own three-stage server.
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_gander.py \
   -sv -m 'advanced_model and cuda' --run-level advanced_model
 ```
@@ -153,7 +154,8 @@ device in `CUDA_VISIBLE_DEVICES` is reserved for the judge:
 ```bash
 export BENCHMARK_DIR=tests/dfx/perf/results
 CUDA_VISIBLE_DEVICES=0,1 python -m pytest -sv tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_gander_omniinteract.json
+  --test-config-file tests/dfx/perf/tests/test_gander_omniinteract.json \
+  -m 'full_model and cuda and omni' --run-level full_model
 ```
 
 Nightly CI composes the same pinned release and uploads benchmark artifacts.
