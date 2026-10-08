@@ -423,7 +423,8 @@ def test_native_duplex_tts_bos_aligns_after_window_rebuild(folded_decisions, bos
     torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[-3:-1])
 
 
-def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
+@pytest.mark.parametrize("runner_version", ["v1", "v2"])
+def test_native_duplex_continuation_appends_only_new_talker_condition(runner_version: str) -> None:
     prompt_ids = [101, 102]
     token_ids = {
         "tts_bos_token_id": 9301,
@@ -510,13 +511,34 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     assert third_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 2
     assert restarted_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 0
     assert first_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
-    assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
+    assert second_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is False
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_prompt_len"] == 3
     assert first_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert third_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["prompt_token_ids"] == [0, 0, 0]
+
+    # The shared runners merge metadata on resume. An omitted false flag would
+    # leave the first handoff's replacement boundary active on the next chunk.
+    if runner_version == "v1":
+        from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+        runner = SimpleNamespace(
+            model=SimpleNamespace(),
+            model_intermediate_buffer={"req-1": {}},
+            requests={"req-1": SimpleNamespace()},
+        )
+        for handoff, expected_replace in [(first_input, True), (second_input, False), (third_input, True)]:
+            OmniGPUModelRunner._update_streaming_input_additional_info(runner, SimpleNamespace(**handoff), "req-1")
+            assert runner.model_intermediate_buffer["req-1"]["meta"]["replace_streaming_prompt"] is expected_replace
+    else:
+        from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+
+        buffer = OmniIntermediateBuffer(max_num_reqs=1)
+        for handoff, expected_replace in [(first_input, True), (second_input, False), (third_input, True)]:
+            buffer.update(0, handoff["model_intermediate_buffer"])
+            assert buffer.buffers[0]["meta"]["replace_streaming_prompt"] is expected_replace
 
 
 def test_native_duplex_transcript_decodes_the_talker_condition_slice() -> None:
