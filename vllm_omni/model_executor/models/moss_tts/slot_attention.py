@@ -55,11 +55,13 @@ def _write(
     ring_capacity: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    row_starts: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     slot = tl.load(slots_ptr + row * slot_stride)
     length = tl.load(lengths_ptr + row * length_stride)
-    start = tl.load(end_ptr + slot * end_stride)
+    # end_ptr holds per-slot end offsets, or with row_starts per-row starts.
+    start = tl.load(end_ptr + (row if row_starts else slot) * end_stride)
     x = tl.program_id(1) * block_size + tl.arange(0, block_size)
     dim = x % head_dim
     token = (x // head_dim) % num_frames
@@ -104,13 +106,14 @@ def _attend(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     skip_empty_tiles: tl.constexpr = False,
+    row_starts: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * block_m + tl.arange(0, block_m)
     bh = tl.program_id(1)
     batch, head = bh // num_heads, bh % num_heads
     slot = tl.load(slots_ptr + batch * slot_stride)
     length = tl.load(lengths_ptr + batch * length_stride)
-    start = tl.load(end_ptr + slot * end_stride)
+    start = tl.load(end_ptr + (batch if row_starts else slot) * end_stride)
     end = start + length
     dims = tl.arange(0, head_dim)
     q = tl.load(
@@ -433,6 +436,11 @@ def _check_inputs(q, k, v, cache, metadata, context):
         raise ValueError("context must be -1 or positive")
 
 
+# Measured crossover on H200 (codec stages, B=8..32): the single fused launch
+# wins up to T=120 frames, the write + attend pair from T=240.
+_FUSED_ROWS_MAX_FRAMES = 128
+
+
 @torch.library.custom_op("vllm_omni::moss_slot_ring_attention_rows", mutates_args=("cache",))
 def slot_ring_attention_rows(
     q: torch.Tensor,
@@ -461,6 +469,53 @@ def slot_ring_attention_rows(
         return out
     s, c = cache.shape[1], cache.shape[3]
     bm = 16 if t <= 32 else 64
+    if t > _FUSED_ROWS_MAX_FRAMES:
+        # Long chunks: every fused program would rewrite the whole chunk for
+        # its head. One write launch, then the attention launch, is faster
+        # there and computes the identical ring and output.
+        strides = (starts.stride(0), slot_ids.stride(0), valid_lengths.stride(0))
+        _write[(b, triton.cdiv(h * t * d, 256))](
+            k,
+            v,
+            cache,
+            starts,
+            slot_ids,
+            valid_lengths,
+            *k.stride(),
+            *v.stride(),
+            *strides,
+            s,
+            h,
+            t,
+            c,
+            d,
+            256,
+            row_starts=True,
+        )
+        _attend[(triton.cdiv(t, bm), b * h)](
+            q,
+            cache,
+            starts,
+            slot_ids,
+            valid_lengths,
+            out,
+            *q.stride(),
+            *out.stride()[:3],
+            *strides,
+            s,
+            h,
+            t,
+            c,
+            d,
+            context,
+            bm,
+            64,
+            skip_empty_tiles=False,
+            row_starts=True,
+            num_warps=8 if c <= 256 else 4,
+            num_stages=2,
+        )
+        return out
     _write_attend[(triton.cdiv(t, bm), b * h)](
         q,
         k,
