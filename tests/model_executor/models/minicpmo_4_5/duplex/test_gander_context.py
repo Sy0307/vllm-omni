@@ -9,6 +9,7 @@ import torch
 
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt
+from vllm_omni.model_executor.models.minicpmo_4_5.gander import REPLAY_SAMPLED_KEY
 from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import make_plan, metadata, select_units, unit_id
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +76,17 @@ def test_active_response_output_is_invalidated_but_closed_turn_history_remains()
     assert metadata(result.units[1].prompt)["payload"]["gander_replay_output_ids"] == []
 
 
+def test_repeated_replay_preserves_original_sampled_and_forced_listen_distinction():
+    units = [prompt(1), prompt(2)]
+    metadata(units[1])["payload"]["force_listen"] = True
+    first = plan(units)
+    second = plan([unit.prompt for unit in first.units])
+    for rebuilt in [first, second]:
+        assert metadata(rebuilt.units[0].prompt)["payload"][REPLAY_SAMPLED_KEY] is True
+        assert metadata(rebuilt.units[1].prompt)["payload"][REPLAY_SAMPLED_KEY] is False
+        assert all(metadata(unit.prompt)["payload"]["force_listen"] for unit in rebuilt.units)
+
+
 def test_pin_protects_against_delete_and_window_eviction():
     units = [prompt(i) for i in range(1, 7)]
     metadata(units[0])["gander_pinned"] = True
@@ -118,6 +130,57 @@ def test_first_control_replay_embeds_prefix_and_preserves_audio_frontend():
     assert result["inputs_embeds"].flatten().tolist() == [1, 2, 10, 20, 21]
     assert state.audio_chunk_idx == 0 and state.gander_unit_count == 1
     assert state.audio_buffer.size == 0
+
+
+@pytest.mark.parametrize("sampled", [True, False])
+def test_replay_prefill_restores_sampled_history_once_on_retry(sampled):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    helper = object.__new__(MiniCPMO45Stage0DuplexRuntime)
+    helper.unit_token_id, helper.unit_end_token_id, helper.chunk_eos_token_id = 10, 11, 13
+    helper.listen_token_id, helper.turn_eos_token_id = 12, 14
+    helper._embed_token = lambda token: torch.tensor([[float(token)]])
+    helper._special_token_ids = lambda: {}
+    retained = [100] * MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="s",
+        context_token_ids=[1, 2],
+        context_embeds=[torch.tensor([[1.0], [2.0]])],
+        generated_tokens=retained.copy(),
+    )
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.config = SimpleNamespace(gander_unit8=True)
+    model._duplex_data_plane_helper = lambda: helper
+    model._minicpmo45_duplex_session_state = lambda *args, **kwargs: state
+    model.get_input_embeddings = lambda ids: ids.float().unsqueeze(-1)
+    duplex = {
+        "data_plane": True,
+        "session_id": "s",
+        "epoch": 1,
+        "seq": 1,
+        "payload": {
+            "gander_control": True,
+            "gander_replay": True,
+            "force_listen": True,
+            REPLAY_SAMPLED_KEY: sampled,
+            "token_ids": [20],
+            "context_version": 0,
+            "gander_replay_output_ids": [12, 40, 13],
+        },
+    }
+    expected = [*retained[2:], 12, 40] if sampled else retained
+    for _ in range(2):
+        tokens, embeds, _ = model.preprocess(torch.zeros(6, dtype=torch.long), request_id="new", duplex=duplex)
+        assert tokens.tolist() == [1, 2, 10, 20, 12, 40]
+        assert embeds.flatten().tolist() == tokens.tolist()
+        assert state.generated_tokens == expected
+        assert state.gander_unit_count == 1
 
 
 def test_opening_text_unit_has_exact_slots_and_does_not_consume_audio():

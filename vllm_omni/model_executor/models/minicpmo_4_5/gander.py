@@ -20,6 +20,7 @@ CONTROL_TOKENS = {
     "tool_response_token_id": "<tool_response>",
     "tool_response_end_token_id": "</tool_response>",
 }
+REPLAY_SAMPLED_KEY = "gander_replay_sampled"
 
 
 def control_token_ids(tokenizer) -> dict[str, int]:

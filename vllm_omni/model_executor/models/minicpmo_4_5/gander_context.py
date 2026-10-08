@@ -13,6 +13,8 @@ from copy import deepcopy
 
 from vllm_omni.engine.duplex.contracts import DuplexContextPlan, DuplexContextUnit
 
+from .gander import REPLAY_SAMPLED_KEY
+
 DEFAULT_MAX_UNITS = 128
 DEFAULT_RETAIN_UNITS = 96
 MAX_PINNED_UNITS = 16
@@ -157,6 +159,9 @@ def make_plan(*, prompts, runtime_config, session_config, request_id, fence, con
     for seq, old in enumerate(units, 1):
         d = metadata(old)
         payload = deepcopy(d.get("payload", {}))
+        # Remember whether the original output passed through the decoder,
+        # before replay itself forces LISTEN. Preserve this on later rebuilds.
+        payload[REPLAY_SAMPLED_KEY] = payload.get(REPLAY_SAMPLED_KEY, payload.get("force_listen") is not True)
         payload["gander_replay"] = True
         payload["force_listen"] = True
         payload["context_version"] = int(runtime_config.get("gander_context_version", 0))

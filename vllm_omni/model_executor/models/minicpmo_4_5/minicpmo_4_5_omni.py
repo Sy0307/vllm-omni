@@ -532,6 +532,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                         **frame_kwargs,
                     )
             if payload.get("gander_replay") and result.get("success") and not result.get("gander_history_embedded"):
+                from .gander import REPLAY_SAMPLED_KEY
+
                 history = payload.get("gander_replay_output_ids", [])
                 if history:
                     past_ids = list(history[:-1])
@@ -548,6 +550,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                             helper._special_token_ids().get("tool_call_token_id"),
                         )
                     )
+                    if payload.get(REPLAY_SAMPLED_KEY, True):
+                        # Rebuild decoder history from retained sampled outputs,
+                        # once per prefill. Forced LISTEN and chunk boundaries
+                        # bypass the released decoder's repetition history.
+                        state.generated_tokens.extend(t for t in history if t != helper.chunk_eos_token_id)
+                        del state.generated_tokens[: -MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE]
                 result["gander_history_embedded"] = True
                 state.prepared_inputs_embeds = result["inputs_embeds"]
                 state.prepared_input_token_ids = list(result["input_token_ids"])
@@ -1337,13 +1345,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         forbidden_index = self._minicpmo45_duplex_forbidden_index(token_ids, vocab, device)
         if forbidden_index is not None:
             stage2_logits.index_fill_(1, forbidden_index, float("-inf"))
-        history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
         penalty_rows: list[int] = []
         penalty_cols: list[int] = []
         for local_idx, row_idx in enumerate(rows):
-            state = self._minicpmo45_duplex_state_for_row(row_idx)
-            repetition_tokens = getattr(state, "generated_tokens", None) or recent[row_idx]
-            penalized = [token_id for token_id in set(repetition_tokens[-history_size:]) if 0 <= token_id < vocab]
+            penalized = self._minicpmo45_duplex_repetition_tokens(row_idx, recent[row_idx], vocab)
             penalty_rows.extend([local_idx] * len(penalized))
             penalty_cols.extend(penalized)
         if penalty_rows:
@@ -1559,8 +1564,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import current_unit, tool_constraint
 
         history = getattr(sampling_metadata, "output_token_ids", None) or []
-        recent = list(history[row_idx]) if row_idx < len(history) else []
-        recent = current_unit(recent, token_ids)
+        row_history = list(history[row_idx]) if row_idx < len(history) else []
+        recent = current_unit(row_history, token_ids)
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         allow, constrained = tool_constraint(
             recent, token_ids, enabled=bool(getattr(state, "gander_tools_enabled", False))
@@ -1577,15 +1582,47 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if isinstance(eos_id, int) and 0 <= eos_id < logits.shape[-1]:
             logits[:, eos_id] = float("-inf")
         temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
-        if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
-            return int(logits.argmax(dim=-1).item())
-        logits = self._top_k_top_p_filter(
-            logits / temperature,
-            top_k=int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 20)),
-            top_p=float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8)),
-        )
+        greedy = bool(getattr(sampling_metadata, "all_greedy", False)) or temperature <= 0
         generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
-        return int(torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).item())
+        chunk_eos_id = token_ids["chunk_eos_token_id"]
+        boundary_allowed = chunk_eos_id in constrained if allow else chunk_eos_id not in constrained
+        if boundary_allowed:
+            # The released decoder decides the boundary before repetition,
+            # temperature or nucleus filtering, using the grammar-masked logits.
+            if greedy:
+                boundary = int(logits.argmax(dim=-1).item()) == chunk_eos_id
+            else:
+                boundary = bool(
+                    (
+                        torch.rand((), generator=generator, device=logits.device)
+                        < self._duplex_boundary_chunk_eos_probs(logits, chunk_eos_id)[0]
+                    ).item()
+                )
+            if boundary:
+                return chunk_eos_id
+        logits[:, chunk_eos_id] = float("-inf")
+        # Gander keeps decoder history in the state, including across replay.
+        # Scheduler output also contains forced LISTEN units, so it cannot
+        # supply a fallback when no token has been sampled yet.
+        penalized = self._minicpmo45_duplex_repetition_tokens(row_idx, [], logits.shape[-1])
+        if penalized:
+            logits[:, penalized] /= 1.05
+        if greedy:
+            sampled = int(logits.argmax(dim=-1).item())
+        else:
+            logits = self._top_k_top_p_filter(
+                logits / temperature,
+                top_k=int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 20)),
+                top_p=float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8)),
+            )
+            sampled = int(torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).item())
+        self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
+        return sampled
+
+    def _minicpmo45_duplex_repetition_tokens(self, row_idx: int, recent: list[int], vocab: int) -> list[int]:
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        history = getattr(state, "generated_tokens", None) or recent
+        return [t for t in set(history[-MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :]) if 0 <= t < vocab]
 
     def _maybe_cut_minicpmo45_native_duplex_text_chunk(
         self,

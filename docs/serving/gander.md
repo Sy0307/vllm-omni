@@ -78,6 +78,12 @@ assistant tokens; it does not splice raw KV tensors, and stored historical
 payloads are re-encoded through a fresh prefill rather than replayed to the
 client as audio. The system, tools, reference voice and latest slate remain
 protected.
+Sampling applies the native repetition penalty across input units to the most
+recent 512 sampled tokens. Reconstruction restores this history from retained
+outputs once per prefill; forced LISTEN units and chunk boundaries do not add
+sampling history.
+Chunk-end decisions use the grammar-constrained logits before repetition,
+temperature or top-k/top-p filtering, matching the native decoder.
 Identical committed replacement IDs are deduplicated; conflicting IDs fail.
 Validation failure preserves old KV. Failure after replacement begins closes
 the session and requires reopening. Older reconnect cursors require

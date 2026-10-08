@@ -190,6 +190,145 @@ def test_gander_sampler_keeps_controls_out_of_speech(ids):
     assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["turn_eos_token_id"]
 
 
+@pytest.mark.parametrize(
+    "listen_logit,speak_logit,expected", [(10.0, 9.8, "speak_token_id"), (-9.0, -8.8, "listen_token_id")]
+)
+def test_gander_actions_use_native_cross_unit_repetition_penalty(ids, listen_logit, speak_logit, expected):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    state = SimpleNamespace(generated_tokens=[ids["listen_token_id"]], gander_tools_enabled=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    metadata = SimpleNamespace(all_greedy=True, output_token_ids=[[]])
+    logits = torch.full((1, 128), -100.0)
+    logits[0, ids["listen_token_id"]] = listen_logit
+    logits[0, ids["speak_token_id"]] = speak_logit
+    before = logits.clone()
+    # Released StreamDecoder divides repeated logits of either sign by 1.05.
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids[expected]
+    assert torch.equal(logits, before)
+
+
+def test_gander_sampling_records_action_history_across_units(ids):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    state = SimpleNamespace(generated_tokens=[], gander_tools_enabled=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    metadata = SimpleNamespace(all_greedy=True, output_token_ids=[[]])
+    logits = torch.zeros(1, 128)
+    logits[0, ids["listen_token_id"]] = 20
+    for _ in range(MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE + 1):
+        assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["listen_token_id"]
+    assert state.generated_tokens == [ids["listen_token_id"]] * MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
+
+
+def test_gander_forced_scheduler_history_does_not_penalize_first_sample(ids):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    state = SimpleNamespace(generated_tokens=[], gander_tools_enabled=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    metadata = SimpleNamespace(all_greedy=True, output_token_ids=[[ids["listen_token_id"]]])
+    logits = torch.full((1, 128), -100.0)
+    logits[0, ids["listen_token_id"]] = 10
+    logits[0, ids["speak_token_id"]] = 9.8
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["listen_token_id"]
+    assert state.generated_tokens == [ids["listen_token_id"]]
+
+
+def test_gander_chunk_boundaries_and_replay_do_not_add_repetition_history(ids):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    state = SimpleNamespace(generated_tokens=[100], gander_tools_enabled=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    metadata = SimpleNamespace(all_greedy=True, output_token_ids=[[ids["speak_token_id"], *range(100, 108)]])
+    logits = torch.zeros(1, 128)
+    logits[0, ids["chunk_eos_token_id"]] = 20
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["chunk_eos_token_id"]
+    model._minicpmo45_duplex_row_payloads = {
+        0: {"gander_replay": True, "gander_replay_output_ids": [ids["listen_token_id"]]}
+    }
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == ids["listen_token_id"]
+    assert state.generated_tokens == [100]
+
+
+@pytest.mark.parametrize("boundary_wins", [False, True])
+def test_gander_boundary_is_decided_before_repetition_penalty(ids, boundary_wins):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    state = SimpleNamespace(generated_tokens=[100], gander_tools_enabled=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    metadata = SimpleNamespace(all_greedy=True, output_token_ids=[[ids["speak_token_id"]]])
+    logits = torch.full((1, 128), -100.0)
+    logits[0, 100] = 10
+    logits[0, ids["chunk_eos_token_id"]] = 10.1 if boundary_wins else 9.8
+    # In the released decoder, EOS wins the unpenalized first draw or is
+    # removed from the content draw. Penalizing 10 / 1.05 must not create EOS.
+    expected = ids["chunk_eos_token_id"] if boundary_wins else 100
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == expected
+    assert state.generated_tokens == ([100] if boundary_wins else [100, 100])
+
+
+def test_gander_boundary_draw_uses_raw_probability_and_request_generator(ids, mocker):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    state = SimpleNamespace(generated_tokens=[100], gander_tools_enabled=False)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model._minicpmo45_tokenizer = lambda: SimpleNamespace(eos_token_id=None)
+    generator = torch.Generator().manual_seed(7346)
+    metadata = SimpleNamespace(
+        all_greedy=False,
+        output_token_ids=[[], [ids["speak_token_id"]]],
+        temperature=0.1,
+        top_k=1,
+        top_p=0.1,
+        generators={1: generator},
+    )
+    logits = torch.full((1, 128), float("-inf"))
+    logits[0, 100] = 10
+    logits[0, ids["chunk_eos_token_id"]] = 9.8
+    # Raw P(EOS) is about .45. Temperature/top-k would make it effectively
+    # zero; the content repetition penalty would instead make it dominant.
+    draw = mocker.patch("torch.rand", return_value=torch.tensor(0.4))
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=1, token_ids=ids) == ids["chunk_eos_token_id"]
+    draw.assert_called_once_with((), generator=generator, device=logits.device)
+    assert state.generated_tokens == [100]
+
+
 def test_gander_final_unit_drains_remaining_context():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _native_duplex_chunk_budget
 
