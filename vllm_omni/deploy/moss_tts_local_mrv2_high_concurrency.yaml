@@ -9,6 +9,12 @@ connectors:
       # This is a dispatch target, not a cap: execution capacity remains 128.
       generation_min_batch_size: 32
       generation_max_wait_ms: 12
+      # Exact codec kernel paths for the triton_slot backend: one RoPE table per
+      # decoder transformer and step, single-launch slot attention for short
+      # chunks, and skipping wholly masked attention tiles.
+      codec_shared_rope: 1
+      codec_fused_slot_attention: 1
+      codec_skip_empty_attention_tiles: 1
       # Optional; preserves the first/steady sizes while adding a middle chunk.
       # codec_chunk_ramp: [1, 4, 15]
 

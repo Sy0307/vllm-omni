@@ -4,6 +4,9 @@
 # Adds prefix caching, Triton backbone attention and faster codec dispatch;
 # keeps the original Local depth projection and native Torch sampler.
 # The throughput baseline remains moss_tts_local_mrv2_high_concurrency.yaml.
+# At high client concurrency (C64 and above) a single API process becomes the
+# bottleneck; launch with --api-server-count 4. The API processes then share
+# one reference encoder and its codes.
 base_config: moss_tts_local_mrv2_high_concurrency.yaml
 model_runner: v1
 
