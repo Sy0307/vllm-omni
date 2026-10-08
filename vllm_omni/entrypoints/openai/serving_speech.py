@@ -1969,7 +1969,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             ) as chunks:
                 async for chunk in chunks:
-                    payload = {
+                    payload: dict[str, Any] = {
                         "type": "speech.audio.delta",
                         "audio": base64.b64encode(chunk).decode("ascii"),
                         "response_format": response_format,
