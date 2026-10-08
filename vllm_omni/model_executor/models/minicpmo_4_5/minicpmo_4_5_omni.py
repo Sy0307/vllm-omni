@@ -1581,7 +1581,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         eos_id = getattr(self._minicpmo45_tokenizer(), "eos_token_id", None)
         if isinstance(eos_id, int) and 0 <= eos_id < logits.shape[-1]:
             logits[:, eos_id] = float("-inf")
-        temperature = float(self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7))
+        host_params = (getattr(self, "_minicpmo45_duplex_row_sampling_host", None) or {}).get(row_idx)
+        temperature = float(
+            host_params[0]
+            if host_params is not None
+            else self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7)
+        )
         greedy = bool(getattr(sampling_metadata, "all_greedy", False)) or temperature <= 0
         generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
         chunk_eos_id = token_ids["chunk_eos_token_id"]
@@ -1612,8 +1617,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         else:
             logits = self._top_k_top_p_filter(
                 logits / temperature,
-                top_k=int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 20)),
-                top_p=float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8)),
+                top_k=int(
+                    host_params[1]
+                    if host_params is not None
+                    else self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 20)
+                ),
+                top_p=float(
+                    host_params[2]
+                    if host_params is not None
+                    else self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8)
+                ),
             )
             sampled = int(torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).item())
         self._record_minicpmo45_duplex_generation_token(row_idx, sampled)

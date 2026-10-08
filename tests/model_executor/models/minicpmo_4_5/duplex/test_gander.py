@@ -72,6 +72,163 @@ def ids():
     return {key: index for index, key in enumerate(names)}
 
 
+@pytest.fixture
+def gander_host_sampler(ids, mocker):
+    import torch
+    from transformers import PretrainedConfig
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model.config = PretrainedConfig(gander_unit8=True)
+    model._minicpmo45_native_duplex_token_ids_cache = {**ids, "unit_token_id": 10}
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.sessions = {"request": _MiniCPMO45Stage0SessionState(session_id="session")}
+    model._minicpmo45_duplex_data_plane_helper = runtime
+    mocker.patch.object(model, "_minicpmo45_tokenizer", return_value=mocker.Mock(eos_token_id=None))
+    return model
+
+
+def _gander_host_metadata(params, history):
+    import torch
+    from vllm.v1.sample.logits_processor import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+
+    return SamplingMetadata(
+        temperature=torch.tensor([p[0] for p in params]),
+        all_greedy=False,
+        all_random=False,
+        top_k=torch.tensor([p[1] for p in params]),
+        top_p=torch.tensor([p[2] for p in params]),
+        generators={row: torch.Generator().manual_seed(7346 + row) for row in range(len(params))},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(len(params)),
+        presence_penalties=torch.zeros(len(params)),
+        repetition_penalties=torch.ones(len(params)),
+        output_token_ids=history,
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
+    )
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.75])
+def test_gander_host_snapshot_refreshes_without_metadata_scalar_reads(gander_host_sampler, ids, mocker, temperature):
+    from dataclasses import replace
+
+    import torch
+
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+
+    model = gander_host_sampler
+    metadata = _gander_host_metadata([(0.5, 1, 0.5), (temperature, 5, 0.875)], [[], [ids["speak_token_id"]]])
+    row = DuplexSamplingRow(1, "request", "session", 1, {}, 11, temperature=temperature, top_k=5, top_p=0.875)
+    logits = torch.full((2, 128), float("-inf"))
+    logits[1, 100:105] = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    mocker.patch.object(
+        model, "_sampling_metadata_value", side_effect=AssertionError("Gander read a device sampling scalar")
+    )
+    filtered = mocker.spy(model, "_top_k_top_p_filter")
+    assert model._sample_gander_dialogue_row(logits[1:2], metadata, row_idx=1, token_ids=ids) in range(100, 105)
+    if temperature == 0:
+        filtered.assert_not_called()
+    else:
+        assert filtered.call_args.kwargs == {"top_k": 5, "top_p": 0.875}
+    # The same request can append with new parameters and move to another batch row.
+    refreshed = replace(row, row_idx=0, seq=2, temperature=0.5, top_k=1, top_p=1.0)
+    metadata.output_token_ids[0] = [ids["speak_token_id"]]
+    model.prepare_duplex_sampling(logits, metadata, (refreshed,))
+    assert model._sample_gander_dialogue_row(logits[1:2], metadata, row_idx=0, token_ids=ids) == 104
+    assert filtered.call_args.kwargs == {"top_k": 1, "top_p": 1.0}
+    assert model._minicpmo45_duplex_row_sampling_host == {0: (0.5, 1, 1.0)}
+    model.prepare_duplex_sampling(logits, metadata, ())
+    assert model._minicpmo45_duplex_row_sampling_host == {}
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.75])
+@pytest.mark.parametrize("phase", ["action", "speech", "boundary"])
+def test_gander_host_snapshot_preserves_seeded_samples_and_rng(gander_host_sampler, ids, temperature, phase):
+    import torch
+
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+
+    model = gander_host_sampler
+    history = [] if phase == "action" else [ids["speak_token_id"], *([100] * 8 if phase == "boundary" else [])]
+    metadata = _gander_host_metadata([(temperature, 5, 0.875)], [history])
+    row = DuplexSamplingRow(0, "request", "session", 1, {}, 11, temperature=temperature, top_k=5, top_p=0.875)
+    logits = torch.linspace(-2, 2, 128).reshape(1, -1)
+    logits[0, ids["chunk_eos_token_id"]] = 2.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    state = model._minicpmo45_duplex_data_plane_helper.sessions["request"]
+    generator = metadata.generators[0]
+    for seed in range(20):
+        model._minicpmo45_duplex_row_sampling_host = {}
+        state.generated_tokens = [100]
+        generator.manual_seed(seed)
+        expected = model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids)
+        expected_rng, expected_history = generator.get_state(), list(state.generated_tokens)
+        model.prepare_duplex_sampling(logits, metadata, (row,))
+        state.generated_tokens = [100]
+        generator.manual_seed(seed)
+        assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == expected
+        assert torch.equal(generator.get_state(), expected_rng)
+        assert state.generated_tokens == expected_history
+
+
+def test_gander_host_missing_snapshot_keeps_release_defaults(gander_host_sampler, ids, mocker):
+    import torch
+
+    model = gander_host_sampler
+    metadata = _gander_host_metadata([(0.7, 20, 0.8)], [[ids["speak_token_id"]]])
+    metadata.temperature = metadata.top_k = metadata.top_p = torch.empty(0)
+    filtered = mocker.spy(model, "_top_k_top_p_filter")
+    logits = torch.full((1, 128), float("-inf"))
+    logits[0, 100] = 1.0
+    assert model._sample_gander_dialogue_row(logits, metadata, row_idx=0, token_ids=ids) == 100
+    assert filtered.call_args.kwargs == {"top_k": 20, "top_p": 0.8}
+    assert torch.isclose(filtered.call_args.args[0][0, 100], torch.tensor(1.0 / 0.7))
+
+
+def test_gander_host_mixed_chat_batch_keeps_peer_sample_and_rng(gander_host_sampler, ids, mocker):
+    import torch
+    from vllm.v1.outputs import SamplerOutput
+
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+
+    model = gander_host_sampler
+    metadata = _gander_host_metadata([(0.75, 5, 0.875), (0.0, 5, 0.875)], [[], [ids["speak_token_id"]]])
+    row = DuplexSamplingRow(1, "request", "session", 1, {}, 11, temperature=0.0, top_k=5, top_p=0.875)
+    logits = torch.full((2, 128), float("-inf"))
+    logits[:, 100] = 20.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    before = [generator.get_state().clone() for generator in metadata.generators.values()]
+
+    def standard_sample(values, sampling):
+        values.zero_()
+        for generator in sampling.generators.values():
+            torch.rand((), generator=generator)
+        return SamplerOutput(sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.int32), logprobs_tensors=None)
+
+    mocker.patch.object(model, "sampler", create=True, side_effect=standard_sample)
+    mocker.patch.object(
+        model, "_sampling_metadata_value", side_effect=AssertionError("Gander read a device sampling scalar")
+    )
+    output = model.sample(logits, metadata)
+    assert output.sampled_token_ids.tolist() == [[101], [100]]
+    assert not torch.equal(metadata.generators[0].get_state(), before[0])
+    assert torch.equal(metadata.generators[1].get_state(), before[1])
+    assert logits[1, 100] == 20.0
+
+
 def test_first_unit_allows_only_dialogue_actions(ids):
     allow, values = dialogue_constraint([], ids)
     assert allow
