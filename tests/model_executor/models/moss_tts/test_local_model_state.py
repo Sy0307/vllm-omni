@@ -79,7 +79,7 @@ def _state(cls, device):
     state._eager_state = EagerMTPState(state)
     if cls is MossLocalModelState:
         state._init_slot_buffers(5, 4, device, state.dtype)
-        state._uva, state._pending_resets = None, []
+        state._uva, state._pending_resets, state._partitioned_rows = None, [], False
     return state
 
 

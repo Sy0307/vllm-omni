@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
-from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
@@ -43,13 +43,19 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
     into a slab and slices each back, then slices each again after the D2H.
     Here the gathered ``[decode_rows, n_vq]`` tensor is already owned, so the
     copy is a single D2H and the per-request views come from one ``split``.
+
+    With ``partitioned`` (async-chunk runners), the host copy is returned as
+    the runner's already-partitioned flat payloads, so output materialization
+    does not clone, flatten and partition every request's row again. The rows
+    are views of the per-output pinned host copy, which no later step reuses.
     """
 
-    def __init__(self, codes: torch.Tensor, decode_rows: list[int], num_reqs: int) -> None:
+    def __init__(self, codes: torch.Tensor, decode_rows: list[int], num_reqs: int, partitioned: bool = False) -> None:
         dict.__init__(self, {"codes": {"audio": self._rows(codes, decode_rows, num_reqs)}})
         self._codes = codes
         self._decode_rows = decode_rows
         self._num_reqs = num_reqs
+        self._partitioned = partitioned
         self.producer_event = None
 
     @staticmethod
@@ -60,8 +66,10 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
         return outputs
 
     def copy_to_cpu(self, copy_tensor):
-        cpu = copy_tensor(self._codes)
-        return {"codes": {"audio": self._rows(cpu, self._decode_rows, self._num_reqs)}}
+        rows = self._rows(copy_tensor(self._codes), self._decode_rows, self._num_reqs)
+        if self._partitioned:
+            return RequestOutputSnapshot([{"codes.audio": row} for row in rows])
+        return {"codes": {"audio": rows}}
 
 
 class _UvaIndexPools:
@@ -105,6 +113,8 @@ class MossLocalModelState(OmniModelState):
         # allocation + H2D upload and several eager gathers per step.
         self._uva: _UvaIndexPools | None = None
         self._pending_resets: list[int] = []
+        # Async-chunk runners consume request-partitioned inter-stage payloads.
+        self._partitioned_rows = bool(getattr(getattr(vllm_config, "model_config", None), "async_chunk", False))
         if device.type == "cuda" and is_uva_available():
             # Round-robin depth: CPU may run a few steps ahead of the GPU.
             depth = buffer_utils._DEFAULT_MAX_CONCURRENCY + 2
@@ -542,4 +552,6 @@ class MossLocalModelState(OmniModelState):
                     codes.device,
                 )
             model._batch_should_continue.index_copy_(0, rows, keep)
-        return model_output, _CodeRowsSnapshot(codes, list(self._decode_rows), input_batch.num_reqs)
+        return model_output, _CodeRowsSnapshot(
+            codes, list(self._decode_rows), input_batch.num_reqs, partitioned=self._partitioned_rows
+        )
