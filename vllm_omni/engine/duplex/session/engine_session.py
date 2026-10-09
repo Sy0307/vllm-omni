@@ -1024,7 +1024,7 @@ class DuplexEngineSession:
             "num_tokens_out",
             "stage_gen_time_ms",
             "postprocess_time_ms",
-            "audio_generated_frames",
+            "audio_frames",
             "audio_duration_s",
             "image_pixels",
             "output_unit_count",

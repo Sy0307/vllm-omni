@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
@@ -149,6 +150,9 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        self._audio_snapshot_frames_by_request: dict[str, int] = {}
+        self._reported_audio_frames_by_request: dict[str, int] = {}
+        self._metrics_end_timestamps_by_request: dict[str, float] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -532,6 +536,9 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._audio_snapshot_frames_by_request.pop(str(request_id), None)
+        self._reported_audio_frames_by_request.pop(str(request_id), None)
+        self._metrics_end_timestamps_by_request.pop(str(request_id), None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -632,9 +639,14 @@ class StagePool:
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
-
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
+        # A resumable request reports several segment ends under the same
+        # request id. Emit non-overlapping wall intervals so response totals
+        # do not repeatedly include all earlier segments of that request.
+        previous_metrics_ts = self._metrics_end_timestamps_by_request.get(request_id, submit_ts)
+        stage_gen_time_ms = max(now - max(submit_ts, previous_metrics_ts), 0.0) * 1000.0
+        if request_id:
+            self._metrics_end_timestamps_by_request[request_id] = max(now, previous_metrics_ts)
         output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
         non_empty_first_output_ts = (
             self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
@@ -668,7 +680,21 @@ class StagePool:
         current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
-        audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        snapshot_audio_frames = self._audio_snapshot_frames_by_request.pop(request_id, 0) if request_id else 0
+        output_kind = getattr(sampling_params, "output_kind", None)
+        if output_kind in (RequestOutputKind.CUMULATIVE, RequestOutputKind.FINAL_ONLY):
+            # Cumulative PCM survives segment boundaries in the output
+            # processor. Only its newly generated suffix belongs to this
+            # event; adding the full prefix inflates duration and throughput.
+            total_audio_frames = max(snapshot_audio_frames, current_audio_frames)
+            previously_reported_frames = self._reported_audio_frames_by_request.get(request_id, 0)
+            audio_generated_frames = max(total_audio_frames - previously_reported_frames, 0)
+            if request_id:
+                self._reported_audio_frames_by_request[request_id] = max(total_audio_frames, previously_reported_frames)
+        else:
+            audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        if output_unit_type == "audio":
+            output_unit_count = audio_generated_frames
         audio_sample_rate = accumulated_audio_sample_rate or current_audio_sample_rate
         audio_duration_s = (
             float(audio_generated_frames) / float(audio_sample_rate)
@@ -835,7 +861,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -980,6 +1006,9 @@ class StagePool:
             )
             if audio_frames > 0:
                 self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+                self._audio_snapshot_frames_by_request[rid] = max(
+                    self._audio_snapshot_frames_by_request.get(rid, 0), audio_frames
+                )
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
@@ -1015,8 +1044,8 @@ class StagePool:
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            diffusion_client = self._diffusion_client(replica_id)
+            await diffusion_client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(
