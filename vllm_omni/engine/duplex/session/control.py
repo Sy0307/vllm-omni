@@ -203,6 +203,7 @@ class SessionControl:
         pending_turn_detection: PendingTurnDetectionUpdate | None = None
 
         def reject_update() -> None:
+            self._ctx.manager.reject_session_update(session.session_id)
             if pending_turn_detection is not None:
                 pending_turn_detection.reject()
 
@@ -212,6 +213,7 @@ class SessionControl:
             )
         except Exception as exc:
             self._out.emit_error("unsupported_turn_detection", str(exc), event_id=realtime_event_id)
+            reject_update()
             return
         if not await self._wait_for_append_tail():
             self._out.emit_error(

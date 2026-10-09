@@ -517,6 +517,8 @@ class DuplexSessionRunner:
                 raise
             except Exception as exc:
                 logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
+                if isinstance(item, UpdateSession):
+                    self.manager.reject_session_update(self.session.session_id)
                 self._emit_error("internal_error", str(exc))
 
     async def _stop_worker(self) -> None:
@@ -561,6 +563,8 @@ class DuplexSessionRunner:
             elif isinstance(item, AppendAudio):
                 admission = len(item.audio) + sum(len(frame) for frame in item.video_frames)
                 session.release_input_bytes(admission)
+            elif isinstance(item, UpdateSession):
+                self.manager.reject_session_update(session.session_id)
             return
         await self._on_command(item)
 

@@ -39,7 +39,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent
+from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionUpdated
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -1372,6 +1372,56 @@ async def test_session_update_replaces_config_and_runtime_config_together() -> N
         assert h.session.config.temperature == 0.3
         assert h.session.runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.3
         assert h.session.config_generation == generation + 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("patch", "error_code"),
+    [
+        ({"model": "another-model"}, "model_update_unsupported"),
+        ({"turn_detection": {"type": "server_vad", "threshold": "invalid"}}, "unsupported_turn_detection"),
+    ],
+)
+async def test_engine_update_rejection_settles_without_consuming_error(patch, error_code) -> None:
+    h = await open_harness()
+    try:
+        pending = h.output_buffer.observe_session_update()
+        h.submit(commands.UpdateSession(patch=patch))
+        assert await asyncio.wait_for(pending, timeout=2) is None
+        events = await h.settle()
+        assert types(events) == ["error"]
+        assert events[0].code == error_code
+        accepted = h.output_buffer.observe_session_update()
+        h.submit(commands.UpdateSession(patch={"temperature": 0.3}))
+        result = await asyncio.wait_for(accepted, timeout=2)
+        assert isinstance(result, SessionUpdated)
+        assert result.session["temperature"] == 0.3
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_failed_update_worker_settles_and_keeps_session_usable(monkeypatch) -> None:
+    h = await open_harness()
+    try:
+        original = h.runner.control.on_session_update
+
+        async def fail(*args, **kwargs):
+            raise RuntimeError("update handler failed")
+
+        monkeypatch.setattr(h.runner.control, "on_session_update", fail)
+        pending = h.output_buffer.observe_session_update()
+        h.submit(commands.UpdateSession(patch={"temperature": 0.3}))
+        assert await asyncio.wait_for(pending, timeout=2) is None
+        events = await h.settle()
+        assert types(events) == ["error"]
+        assert events[0].code == "internal_error"
+        monkeypatch.setattr(h.runner.control, "on_session_update", original)
+        accepted = h.output_buffer.observe_session_update()
+        h.submit(commands.UpdateSession(patch={"temperature": 0.4}))
+        assert isinstance(await asyncio.wait_for(accepted, timeout=2), SessionUpdated)
     finally:
         await close_harness(h)
 
