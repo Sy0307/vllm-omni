@@ -26,6 +26,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.reference_audio import decode_reference_audio
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -325,7 +326,10 @@ class TestPromptAndMultiModal:
         )
 
         intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
-        assert intermediate_buffer["codes"]["ref"] == [0.25, -0.5]
+        assert isinstance(intermediate_buffer["codes"]["ref"]["data"], bytes)
+        torch.testing.assert_close(
+            decode_reference_audio(intermediate_buffer["codes"]["ref"]), torch.tensor([0.25, -0.5]), rtol=0, atol=0
+        )
         assert intermediate_buffer["meta"]["ref_audio_sr"] == 16000
 
     def test_serving_reference_audio_is_added_to_stage_handoff(self) -> None:
@@ -338,7 +342,10 @@ class TestPromptAndMultiModal:
         )
 
         intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
-        assert intermediate_buffer["codes"]["ref"] == [0.125, -0.25]
+        assert isinstance(intermediate_buffer["codes"]["ref"]["data"], bytes)
+        torch.testing.assert_close(
+            decode_reference_audio(intermediate_buffer["codes"]["ref"]), torch.tensor([0.125, -0.25]), rtol=0, atol=0
+        )
         assert intermediate_buffer["meta"]["ref_audio_sr"] == 24000
 
     def test_missing_reference_audio_does_not_add_stage_handoff_fields(self) -> None:
