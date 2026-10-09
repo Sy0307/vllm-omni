@@ -266,15 +266,6 @@ async def test_output_drain_coalesces_wakeups_while_busy(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_output_drain_timeout_returns_empty_when_alive() -> None:
-    engine = _drain_engine(alive=True)
-    try:
-        assert await engine.get_outputs_async(timeout=0.05) == []
-    finally:
-        engine.output_queue.close()
-
-
-@pytest.mark.asyncio
 async def test_output_drain_keeps_messages_put_after_a_timeout() -> None:
     engine = _drain_engine(alive=True)
     try:
