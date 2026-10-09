@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
@@ -173,7 +173,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        self.connector = self.create_connector(model_config)
+        self.connector: Any = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
@@ -195,7 +195,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
         # Save-thread only: running count of segments reclaimed after finish.
@@ -203,9 +203,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -410,6 +410,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 because ``finish_requests`` skips requests that already report
                 ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
+        assert request is not None
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -774,7 +775,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(cast(dict[str, Any], raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1360,7 +1361,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._active_streams[request_id] = request
         return True
 
-    def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:
+    def collect_timed_out_request_ids(self, timeout_s: float, session_request_ids: set[str] | None = None) -> set[str]:
         """Return IDs whose chunk wait has exceeded *timeout_s*.
 
         The async-chunk path had no deadline of any kind: a request parks in
@@ -1385,6 +1386,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if timeout_s <= 0 or not self._waiting_since:
             return set()
         now = time.monotonic()
+        # Healthy duplex sessions can listen or wait between turns without
+        # emitting codec chunks. Their session owns the idle deadline. Keep a
+        # fresh connector deadline for a subsequent non-resumable final update.
+        if session_request_ids:
+            for req_id in self._waiting_since.keys() & session_request_ids:
+                self._waiting_since[req_id] = now
         timed_out_ids = {req_id for req_id, started in self._waiting_since.items() if now - started > timeout_s}
         for req_id in timed_out_ids:
             self._waiting_since.pop(req_id, None)
@@ -1627,6 +1634,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
+            assert requests is not None
             request_ids = requests.keys()
 
         connector_owned_ids = {
