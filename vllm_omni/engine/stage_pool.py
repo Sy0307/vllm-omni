@@ -153,6 +153,8 @@ class StagePool:
         self._audio_snapshot_frames_by_request: dict[str, int] = {}
         self._reported_audio_frames_by_request: dict[str, int] = {}
         self._metrics_end_timestamps_by_request: dict[str, float] = {}
+        self._metrics_prompt_submissions_by_request: dict[str, float] = {}
+        self._reported_token_counts_by_request: dict[str, int] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -539,6 +541,8 @@ class StagePool:
         self._audio_snapshot_frames_by_request.pop(str(request_id), None)
         self._reported_audio_frames_by_request.pop(str(request_id), None)
         self._metrics_end_timestamps_by_request.pop(str(request_id), None)
+        self._metrics_prompt_submissions_by_request.pop(str(request_id), None)
+        self._reported_token_counts_by_request.pop(str(request_id), None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -636,6 +640,7 @@ class StagePool:
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
+        incremental: bool = False,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
@@ -648,6 +653,10 @@ class StagePool:
         if request_id:
             self._metrics_end_timestamps_by_request[request_id] = max(now, previous_metrics_ts)
         output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
+        if incremental and request_id and output_timestamps:
+            # Retain the boundary once so the next chunk's interval includes
+            # the gap, even though this chunk's counts have already been emitted.
+            self._output_timestamps_by_request[request_id] = output_timestamps[-1:]
         non_empty_first_output_ts = (
             self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
@@ -657,6 +666,7 @@ class StagePool:
             if callable(pop_native_text_metrics):
                 native_text_metrics = pop_native_text_metrics(request_id)
         native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        output_kind = getattr(sampling_params, "output_kind", None)
         finish_reason = next(
             (
                 str(reason)
@@ -671,6 +681,15 @@ class StagePool:
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
             else count_tokens_from_outputs(request_outputs)
         )
+        if (
+            incremental
+            and request_id
+            and not (isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool))
+            and output_kind in (RequestOutputKind.CUMULATIVE, RequestOutputKind.FINAL_ONLY)
+        ):
+            previous_token_count = self._reported_token_counts_by_request.get(request_id, 0)
+            self._reported_token_counts_by_request[request_id] = max(num_tokens_out, previous_token_count)
+            num_tokens_out = max(num_tokens_out - previous_token_count, 0)
         output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
         output_unit_count = self._count_output_units(
             request_outputs,
@@ -681,7 +700,6 @@ class StagePool:
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
         snapshot_audio_frames = self._audio_snapshot_frames_by_request.pop(request_id, 0) if request_id else 0
-        output_kind = getattr(sampling_params, "output_kind", None)
         if output_kind in (RequestOutputKind.CUMULATIVE, RequestOutputKind.FINAL_ONLY):
             # Cumulative PCM survives segment boundaries in the output
             # processor. Only its newly generated suffix belongs to this
@@ -732,6 +750,11 @@ class StagePool:
                 ptids = getattr(ro, "prompt_token_ids", None)
                 if ptids is not None:
                     num_tokens_in += len(ptids)
+            if incremental and request_id:
+                if self._metrics_prompt_submissions_by_request.get(request_id) == submit_ts:
+                    num_tokens_in = 0
+                else:
+                    self._metrics_prompt_submissions_by_request[request_id] = submit_ts
 
         metrics = self._replica_metrics[replica_id]
         metrics.batch_seq += 1
@@ -744,8 +767,8 @@ class StagePool:
             num_tokens_out=num_tokens_out,
             stage_gen_time_ms=stage_gen_time_ms,
             batch_id=batch_id,
-            # This event summarizes one completed request. Execution batching
-            # happens inside the model runner and is not observable here.
+            # This event summarizes one request or audio interval. Execution
+            # batching happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
             finish_reason=finish_reason,
