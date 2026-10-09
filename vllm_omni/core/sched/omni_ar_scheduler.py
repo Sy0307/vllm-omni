@@ -22,6 +22,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
@@ -119,6 +120,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        install_decode_allocate_fast_path(self.kv_cache_manager)
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -512,6 +514,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # The per-request emit policy only varies with stop/control state: look the config up once.
+        emit_every_step: bool | None = None
+        # Loop invariants; the helpers they guard return early when these are empty.
+        spec_decode_tokens = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        kv_transfer_criteria = getattr(self, "kv_transfer_criteria", None)
+        # Plain decode rows (one sampled token, nothing but the token and the
+        # step's audio to publish) take a short path below when this step
+        # carries none of the features the general path handles.
+        fast_decode = not (
+            failed_kv_load_req_ids
+            or spec_decode_tokens
+            or kv_transfer_criteria
+            or getattr(self, "chunk_transfer_adapter", None) is not None
+            or getattr(self, "is_mm_encoder_only", False)
+            or num_nans_in_logits is not None
+            or prompt_logprobs_dict
+            or prompt_token_id_logprobs_dict
+            or pooler_outputs
+        )
+        new_prompt_len_snapshot = getattr(self, "_new_prompt_len_snapshot", {})
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -562,6 +584,47 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
 
             status_before_stop = request.status
+            pre_updated = None
+            if (
+                fast_decode
+                and generated_token_ids
+                and not output_is_stale
+                and not getattr(request, "num_encoder_inputs", 0)
+                and getattr(request, "structured_output_request", None) is None
+                and getattr(request, "sampling_params", None) is not None
+                and request.sampling_params.num_logprobs is None
+                and not getattr(request, "pooling_params", None)
+            ):
+                new_token_ids, stopped = self._update_request_with_output(request, generated_token_ids)
+                if not stopped:
+                    prefill_stats = request.take_prefill_stats()
+                    if prefill_stats is not None:
+                        prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
+                    if emit_every_step is None:
+                        emit_every_step = _should_emit_engine_output(
+                            self.vllm_config.model_config, stopped=False, has_control=False
+                        )
+                    if emit_every_step:
+                        emitted_token_ids: Any = getattr(request, "output_token_ids", None)
+                        if emitted_token_ids is None:
+                            emitted_token_ids = getattr(request, "_output_token_ids", ())
+                        outputs[request.client_index].append(
+                            OmniEngineCoreOutput(
+                                request_id=req_id,
+                                new_token_ids=new_token_ids,
+                                multimodal_output=mm_outputs[req_index] if mm_outputs else None,
+                                stop_reason=request.stop_reason,
+                                events=request.take_events(),
+                                prefill_stats=prefill_stats,
+                                trace_headers=request.trace_headers,
+                                num_nans_in_logits=request.num_nans_in_logits,
+                                new_prompt_len_snapshot=new_prompt_len_snapshot.get(req_id),
+                                num_generation_tokens=len(emitted_token_ids),
+                            )
+                        )
+                    continue
+                # Stopped this step: the general path below finishes the request.
+                pre_updated = new_token_ids, stopped
             new_logprobs = None
             logprob_validation_failed = False
 
@@ -583,7 +646,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     generated_token_ids = []
                     logprob_validation_failed = True
 
-            scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            scheduled_spec_token_ids = spec_decode_tokens.get(req_id) if spec_decode_tokens else None
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -627,7 +690,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Decode the pooling output before stop handling so a decoder
             # failure finishes the request with FinishReason.ERROR (500).
             try:
-                pooling_output_payload = self._maybe_decode_pooling_output(request, pooler_output)
+                pooling_output_payload = (
+                    self._maybe_decode_pooling_output(request, pooler_output) if pooler_output is not None else None
+                )
             except Exception as exc:
                 logger.exception("[pooling] decoder hook failed for request %s", req_id)
                 pooling_output_payload = None
@@ -636,7 +701,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.resumable = False
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if pre_updated is not None:
+                new_token_ids, stopped = pre_updated
+            elif new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
                 if output_is_stale:
                     new_token_ids, stopped = self._update_request_with_output(request, new_token_ids, is_stale=True)
@@ -670,10 +737,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
             # transfer (e.g. prefill finished / special token) but continues decoding.
-            if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
+            if not stopped and kv_transfer_criteria and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
-            if OmniSchedulerMixin._reject_invalid_grammar_tokens(self, request, new_token_ids):
+            if getattr(request, "use_structured_output", True) and OmniSchedulerMixin._reject_invalid_grammar_tokens(
+                self, request, new_token_ids
+            ):
                 stopped = True
 
             # Finalize prefill stats BEFORE stop handling (upstream v0.28
@@ -780,8 +849,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
             # Get prompt logprobs for this request.
-            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            prompt_token_id_logprobs = prompt_token_id_logprobs_dict.get(req_id)
+            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id) if prompt_logprobs_dict else None
+            prompt_token_id_logprobs = (
+                prompt_token_id_logprobs_dict.get(req_id) if prompt_token_id_logprobs_dict else None
+            )
             has_stage_output = (
                 bool(new_token_ids)
                 or mm_output is not None
@@ -789,31 +860,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or kv_transfer_params
                 or stopped
             )
-            if has_stage_output and _should_emit_engine_output(
-                self.vllm_config.model_config,
-                stopped=stopped,
-                has_control=kv_transfer_params is not None,
-            ):
-                OmniSchedulerMixin._append_request_output(
-                    self,
-                    outputs,
-                    request,
-                    new_token_ids=new_token_ids,
-                    finish_reason=finish_reason,
-                    new_logprobs=new_logprobs,
-                    new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                    prompt_token_id_logprobs=prompt_token_id_logprobs,
-                    pooling_output=pooling_output_payload,
-                    multimodal_output=mm_output,
-                    stop_reason=request.stop_reason,
-                    prefill_stats=prefill_stats,
-                    kv_transfer_params=kv_transfer_params,
-                    ec_transfer_params=ec_transfer_params,
-                    routed_experts=routed_experts,
-                    num_nans_in_logits=request.num_nans_in_logits,
-                    is_segment_finished=is_segment_finished,
-                    new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
-                    num_generation_tokens=num_generation_tokens,
+            if has_stage_output and emit_every_step is None and not stopped and kv_transfer_params is None:
+                emit_every_step = _should_emit_engine_output(
+                    self.vllm_config.model_config, stopped=False, has_control=False
+                )
+            if has_stage_output and (stopped or kv_transfer_params is not None or emit_every_step):
+                outputs[request.client_index].append(
+                    OmniSchedulerMixin._make_omni_engine_output(
+                        self,
+                        request,
+                        new_token_ids=new_token_ids,
+                        finish_reason=finish_reason,
+                        new_logprobs=new_logprobs,
+                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        prompt_token_id_logprobs=prompt_token_id_logprobs,
+                        pooling_output=pooling_output_payload,
+                        multimodal_output=mm_output,
+                        stop_reason=request.stop_reason,
+                        prefill_stats=prefill_stats,
+                        kv_transfer_params=kv_transfer_params,
+                        ec_transfer_params=ec_transfer_params,
+                        routed_experts=routed_experts,
+                        num_nans_in_logits=request.num_nans_in_logits,
+                        is_segment_finished=is_segment_finished,
+                        new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id),
+                        num_generation_tokens=num_generation_tokens,
+                    )
                 )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.

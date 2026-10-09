@@ -11,6 +11,7 @@ from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
     Qwen3TTSTalkerConfig,
 )
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    _TEXT_PROJECTION_ROW_ALIGN,
     PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
 )
@@ -57,8 +58,11 @@ def test_batch_preprocess_projects_new_non_streaming_texts_once():
 
     builder.preprocess_infos_batch(req_infos=list(buf.values()), device=torch.device("cpu"))
 
-    # One embedding + projection over both requests' text tokens (template stripped).
-    assert projected_shapes == [(1, (len(ids_a) - 8) + (len(ids_b) - 8), 4)]
+    # One embedding + projection over both requests' text tokens (template
+    # stripped), padded to a row multiple that keeps the GEMM shapes few.
+    num_text = (len(ids_a) - 8) + (len(ids_b) - 8)
+    align = _TEXT_PROJECTION_ROW_ALIGN
+    assert projected_shapes == [(1, (num_text + align - 1) // align * align, 4)]
     assert set(builder._batched_text_embeds) == {"a", "b"}
     with torch.no_grad():
         for req_id, ids in (("a", ids_a), ("b", ids_b)):
@@ -106,7 +110,8 @@ def _prompt_builder() -> Qwen3TTSPromptEmbedsBuilder:
 
 @pytest.mark.parametrize("task_type", ["CustomVoice", "VoiceDesign"])
 @pytest.mark.parametrize("non_streaming", [False, True])
-def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: str, non_streaming: bool):
+@pytest.mark.parametrize("instruct", ["Speak calmly", ""])
+def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: str, non_streaming: bool, instruct: str):
     batched, serial = _prompt_builder(), _prompt_builder()
 
     def request(req_id: str, ids: list[int], speaker: str) -> dict[str, Any]:
@@ -116,7 +121,7 @@ def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: s
             "task_type": [task_type],
             "language": ["English"],
             "speaker": [speaker],
-            "instruct": ["Speak calmly"],
+            "instruct": [instruct],
             "non_streaming_mode": [non_streaming],
             PRECOMPUTED_TEXT_IDS_KEY: [ids],
         }
@@ -138,3 +143,25 @@ def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: s
             assert not batched._batched_text_embeds
         batched.preprocess_infos_batch(req_infos=[], device=torch.device("cpu"))
         assert not batched._batched_text_embeds
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_projected_text_table_matches_the_projection_per_token():
+    builder = Qwen3TTSPromptEmbedsBuilder.__new__(Qwen3TTSPromptEmbedsBuilder)
+    torch.manual_seed(0)
+    builder._text_embedding = torch.nn.Embedding(1000, 32).cuda()
+    mlp = torch.nn.Sequential(torch.nn.Linear(32, 48), torch.nn.SiLU(), torch.nn.Linear(48, 16)).cuda()
+    builder._text_projection = mlp
+    builder._projected_text_table = None
+    builder._projected_token_cache = {("cuda:0", (1,)): torch.zeros(1)}
+    ids = torch.tensor([[5, 999, 0, 5, 321]], device="cuda")
+    direct = mlp(builder._text_embedding(ids))
+    torch.testing.assert_close(builder._project_text_ids(ids), direct)
+
+    builder.build_projected_text_table(chunk_rows=300)  # several chunks, a partial last one
+    assert builder._projected_text_table is not None
+    assert builder._projected_text_table.shape == (1000, 16)
+    assert not builder._projected_token_cache, "constants are re-projected from the table"
+    torch.testing.assert_close(builder._project_text_ids(ids), direct, rtol=1e-5, atol=1e-5)
