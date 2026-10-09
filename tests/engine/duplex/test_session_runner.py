@@ -831,13 +831,17 @@ async def test_close_invalidates_draining_audio_before_stage_abort_finishes() ->
         assert held is not None and h.output_buffer.is_valid(held)
         h.submit(commands.CloseSession())
         await asyncio.wait_for(h.port.abort_started.wait(), timeout=2.0)
-        # Session close suppresses audio.cancelled notifications; it must still
-        # invalidate the pending output without relying on those later events.
+        # Invalidate output before awaiting abort, without relying on the
+        # cancellation terminal emitted after the stage has stopped.
         assert not h.output_buffer.is_valid(held)
         assert h.output_buffer.pending_events == 0
         assert h.port.aborts == [["duplex-drain-tts"]]
         release_abort.set()
         events = await h.settle()
+        terminals = [event for event in events if event.type == "response.done"]
+        assert [event.response_id for event in terminals] == ["resp-old"]
+        assert terminals[0].status == "cancelled"
+        assert types(events).index("response.done") < types(events).index("session.closed")
         assert "session.closed" in types(events)
         assert h.manager.active_count() == 0
     finally:
@@ -1863,14 +1867,79 @@ async def test_closing_the_session_with_a_pending_append_emits_no_failed_respons
     """A close ends the active response itself; the append it cancels stays quiet."""
     h = await open_harness(auto_response=False)
     try:
-        await _commit_with_pending_response(h)
+        response_id = await _commit_with_pending_response(h)
+        request_id = h.stage0_request_id()
+        old_epoch = h.session.epoch
 
         events = await h.run(commands.CloseSession(reason="client_close"))
         events += await h.settle()
 
-        assert [event.type for event in events if event.type == "response.done"] == []
+        terminals = [event for event in events if event.type == "response.done"]
+        assert [event.response_id for event in terminals] == [response_id]
+        assert terminals[0].status == "cancelled"
+        assert terminals[0].response["status_details"]["reason"] == "client_close"
+        assert "error" not in types(events)
+        assert types(events).index("response.done") < types(events).index("session.closed")
         assert "session.closed" in types(events)
         assert h.session.active_response_id is None
+        assert h.session.epoch == old_epoch + 1
+        assert h.manager.active_count() == 0
+        # A late stage output or repeated close cannot reopen/settle it again.
+        h.deliver(tts_output(request_id, epoch=old_epoch), epoch=old_epoch)
+        assert await h.settle() == []
+        await h.runner.close("client_close")
+        assert await h.settle() == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_close_settles_active_and_draining_responses_before_session_terminal() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id))
+        draining_id = h.session.active_response_id
+        assert draining_id is not None
+        h.session.bind_draining_request("older-tts", draining_id)
+        active_id = h.session.begin_response(turn_id=(h.session.turn_id or 0) + 1)
+        h.runner.emit({"type": "response.created", "response_id": active_id, "epoch": h.session.epoch})
+        await h.settle()
+
+        events = await h.run(commands.CloseSession(reason="client_close"))
+        terminals = [event for event in events if event.type == "response.done"]
+        assert {event.response_id for event in terminals} == {active_id, draining_id}
+        assert len(terminals) == 2
+        assert all(event.status == "cancelled" for event in terminals)
+        closed_index = types(events).index("session.closed")
+        assert all(events.index(event) < closed_index for event in terminals)
+        assert "response.output_audio.delta" not in types(events)
+        assert "error" not in types(events)
+        assert h.session.draining_request_ids() == []
+        assert h.session.active_response_id is None
+        assert not h.session.request_resources
+        assert h.manager.active_count() == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_repeat_a_completed_draining_response_terminal() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        events = await h.deliver_and_settle(tts_output(request_id, finished=True, turn_end=True))
+        completed = find(events, "response.done")
+        assert completed.status == "completed"
+        h.session.bind_draining_request("completed-tts", completed.response_id)
+
+        events = await h.run(commands.CloseSession())
+        assert "response.done" not in types(events)
+        assert "error" not in types(events)
+        assert types(events).count("session.closed") == 1
+        assert not h.session.request_resources
     finally:
         await close_harness(h)
 

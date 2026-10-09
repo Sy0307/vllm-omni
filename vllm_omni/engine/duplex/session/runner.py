@@ -1579,7 +1579,9 @@ class DuplexSessionRunner:
             # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
             except (TimeoutError, asyncio.TimeoutError):
                 pass
-        if notify:
+        # Closing suppresses abort-error notifications, but still owes a
+        # terminal for every response the client has already seen.
+        if notify or self.run.closing:
             self.emit(
                 {
                     "type": "audio.cancelled",
