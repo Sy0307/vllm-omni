@@ -16,6 +16,7 @@ import json
 import struct
 import wave
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -333,8 +334,10 @@ async def test_websocket_handshake_sends_session_update_and_acks_sequenced_event
         assert client.resume_token == "tok-1"
         assert calls == ["ws://test-host:8099/v1/realtime?duplex=1&model=test-model&autostart=0"]
         assert sock.sent[0]["type"] == "session.update"
-        assert sock.sent[0]["session"]["model"] == "test-model"
-        assert "session_id" not in sock.sent[0]["session"]
+        session = sock.sent[0]["session"]
+        assert isinstance(session, dict)
+        assert session["model"] == "test-model"
+        assert "session_id" not in session
         # session.created is unjournaled (no seq): nothing to ack yet.
         assert _acks(sock) == []
         sock.feed({"type": "response.listen", "server_event_seq": 1})
@@ -388,7 +391,9 @@ async def test_append_audio_tracks_cumulative_end_ms():
         assert appends[0]["duration_ms"] == 100
         assert "is_speech" not in appends[0]
         assert appends[1]["is_speech"] is True
-        assert base64.b64decode(appends[0]["audio"]) == pcm
+        audio = appends[0]["audio"]
+        assert isinstance(audio, str)
+        assert base64.b64decode(audio) == pcm
         sock.feed(SESSION_CLOSED)
 
 
@@ -417,6 +422,59 @@ async def test_stream_pcm_chunking():
         appends = [event for event in sock.sent if event.get("type") == "input_audio_buffer.append"]
         assert [a["duration_ms"] for a in appends] == [100, 100, 50]
         sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_delay_s", [0.0, 0.01, 0.35])
+async def test_stream_pcm_paces_media_time_without_accumulating_send_delay(monkeypatch, send_delay_s):
+    from vllm_omni.clients import duplex as client_module
+
+    class Clock:
+        now = 100.0
+
+        def time(self):
+            return self.now
+
+        async def sleep(self, delay):
+            assert delay >= 0
+            self.now += delay
+
+    clock = Clock()
+    client, _ = make_client(FakeSocket())
+    monkeypatch.setattr(client_module, "asyncio", SimpleNamespace(sleep=clock.sleep, get_running_loop=lambda: clock))
+    pcm = b"\x01\x00" * (16_000 * 2 + 800)  # 2.05 s, including a partial final chunk.
+    sent = []
+
+    async def append(chunk, **kwargs):
+        sent.append((clock.now - 100, chunk, kwargs["video_frames"]))
+        clock.now += send_delay_s
+
+    monkeypatch.setattr(client, "append_audio", append)
+    frames_sent = await client.stream_pcm(
+        pcm, chunk_ms=200, video_frames=["f0", "f1"], stacked_video_frames=["s0", None]
+    )
+    assert [row[0] for row in sent] == pytest.approx([max(i * 0.2, i * send_delay_s) for i in range(11)])
+    assert clock.now - 100 == pytest.approx(max(2.05, 11 * send_delay_s))
+    assert b"".join(row[1] for row in sent) == pcm
+    assert [row[2] for row in sent if row[2]] == [["f0", "s0"], ["f1"]]
+    assert frames_sent == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm_unpaced_does_not_access_the_clock(monkeypatch):
+    from vllm_omni.clients import duplex as client_module
+
+    client, _ = make_client(FakeSocket())
+    monkeypatch.setattr(client_module, "asyncio", SimpleNamespace())
+    sent = []
+
+    async def append(chunk, **kwargs):
+        sent.append(chunk)
+
+    monkeypatch.setattr(client, "append_audio", append)
+    pcm = b"\x01\x00" * 800
+    assert await client.stream_pcm(pcm, realtime=False) == 0
+    assert sent == [pcm]
 
 
 @pytest.mark.asyncio
