@@ -655,6 +655,7 @@ class MossReferenceEncoder:
         role = shared_encoder_role(self._shared_codes_dir) if self._shares_encoder else ""
         if role == "host":
             return self._host().encode(prepared)
+        place_tokenizer = False
         if role == "client":
             if self._shared_client is None:
                 self._shared_client = SharedReferenceEncoderClient(self._shared_codes_dir)
@@ -664,9 +665,15 @@ class MossReferenceEncoder:
                 raise
             except Exception:  # noqa: BLE001 — the host is unreachable: encode here
                 logger.warning("MOSS shared reference encoder unavailable; encoding locally", exc_info=True)
+                place_tokenizer = True
+        with self._local_lock:
+            # Moving the tokenizer rewrites its parameters one by one: with
+            # several batches in flight, another one must not encode until the
+            # whole module is on the device (its stream also follows the device).
+            if place_tokenizer:
                 self._place_tokenizer_for_local_encode()
-        with self._local_lock, self._local_stream_context():
-            return self._encode_local(prepared)
+            with self._local_stream_context():
+                return self._encode_local(prepared)
 
     def _local_stream_context(self):
         tokenizer = getattr(self._processor, "audio_tokenizer", None)
