@@ -1228,7 +1228,9 @@ class DuplexClient(DuplexClientBase):
             self.resume_token = None
 
         seq = data.get("server_event_seq")
-        if isinstance(seq, int) and not self._closed.is_set() and self._ws is not None:
+        # A local close retires the journal. The peer can close its wire
+        # while the client is still draining queued response terminals.
+        if isinstance(seq, int) and not self._closing and not self._closed.is_set() and self._ws is not None:
             try:
                 await self._ws.send(json.dumps({"type": "session.event_ack", "server_event_seq": seq}))
             except asyncio.CancelledError:
@@ -1250,6 +1252,10 @@ class DuplexClient(DuplexClientBase):
                         continue
                     if isinstance(data, dict):
                         await self._dispatch(data)
+                        if self._closed.is_set():
+                            # The terminal event ended the protocol; do not
+                            # read another frame just to observe normal EOF.
+                            return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

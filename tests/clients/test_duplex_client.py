@@ -112,6 +112,110 @@ def make_client(*sockets: FakeSocket, **kwargs) -> tuple[DuplexClient, list[str]
     return client, calls
 
 
+class _ImmediateClosingSocket(FakeSocket):
+    """A peer queues its terminal events and immediately closes the wire."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_ack_sends = 0
+        self.reads_after_terminal = 0
+
+    async def send(self, raw: str) -> None:
+        payload = json.loads(raw)
+        if self.closed and payload.get("type") == "session.event_ack":
+            self.failed_ack_sends += 1
+        await super().send(raw)
+        if payload.get("type") == "session.close":
+            self.close_from_peer()
+
+    def close_from_peer(self) -> None:
+        terminal_events: list[dict[str, object]] = [
+            {"type": "response.output_audio.done", "response_id": "resp-close"},
+            {"type": "response.output_audio_transcript.done", "response_id": "resp-close", "transcript": "hello"},
+            {"type": "response.done", "response": {"id": "resp-close", "status": "cancelled"}},
+            {"type": "session.closed", "session_id": SESSION_ID, "reason": "client_close"},
+        ]
+        for index, event in enumerate(terminal_events, start=2):
+            self.feed({**event, "server_event_seq": index})
+        self.closed = True
+
+    async def recv(self) -> str:
+        if self.closed and self.incoming.empty():
+            self.reads_after_terminal += 1
+            raise ConnectionError("peer closed after terminal")
+        return await super().recv()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_method", ["explicit", "context-exit"])
+async def test_close_drains_terminals_without_sending_acks_to_closed_peer(close_method):
+    socket = _ImmediateClosingSocket()
+    socket.feed(SESSION_CREATED)
+    client, _ = make_client(socket)
+    await client.__aenter__()
+    collector = EventCollector()
+    consume = asyncio.create_task(collector.consume(client))
+    await asyncio.sleep(0)
+    socket.feed({"type": "response.created", "response": {"id": "resp-close"}, "server_event_seq": 1})
+    for _ in range(20):
+        if collector.count("response.created"):
+            break
+        await asyncio.sleep(0)
+    assert collector.count("response.created") == 1
+    if close_method == "explicit":
+        await client.close(timeout_s=1)
+        await client._teardown_quietly()
+    else:
+        await client.__aexit__(None, None, None)
+    await asyncio.wait_for(consume, timeout=1)
+    assert socket.failed_ack_sends == 0
+    assert socket.reads_after_terminal == 0
+    assert collector.count("response.done") == collector.count("session.closed") == 1
+    assert [event["type"] for event in collector.events] == [
+        "response.created",
+        "response.output_audio.done",
+        "response.output_audio_transcript.done",
+        "response.done",
+        "session.closed",
+    ]
+    assert [event["server_event_seq"] for event in socket.sent if event["type"] == "session.event_ack"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_peer_terminal_stops_reader_before_normal_eof():
+    socket = _ImmediateClosingSocket()
+    socket.feed(SESSION_CREATED)
+    client, _ = make_client(socket)
+    await client.__aenter__()
+    collector = EventCollector()
+    consume = asyncio.create_task(collector.consume(client))
+    await asyncio.sleep(0)
+    # Isolate the terminal-reader seam; no response events need ACKs here.
+    socket.feed(SESSION_CLOSED)
+    socket.closed = True
+    await asyncio.wait_for(consume, timeout=1)
+    assert collector.count("session.closed") == 1
+    assert socket.reads_after_terminal == 0
+    assert client._reader_task is not None and client._reader_task.done()
+    await client._teardown_quietly()
+
+
+@pytest.mark.asyncio
+async def test_open_session_keeps_automatic_event_ack():
+    socket = FakeSocket()
+    socket.feed(SESSION_CREATED)
+    client, _ = make_client(socket)
+    await client.__aenter__()
+    socket.feed({"type": "session.updated", "session": {"id": SESSION_ID}, "server_event_seq": 1})
+    for _ in range(20):
+        if "session.event_ack" in socket.sent_types():
+            break
+        await asyncio.sleep(0)
+    assert [event["server_event_seq"] for event in socket.sent if event["type"] == "session.event_ack"] == [1]
+    assert client._reader_task is not None and not client._reader_task.done()
+    await client._teardown_quietly()
+
+
 # ---------------------------------------------------------------------------
 # Fake DuplexOmni for the inline client
 
