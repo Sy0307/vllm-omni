@@ -71,7 +71,7 @@ FLASH_T_GRID = [0.0, 0.07612049579620361, 0.2928932309150696, 0.6173166036605835
 CKPT_DIR = os.environ.get("AUK_OMNI_CKPT_DIR") or os.environ.get("AUK_CKPT_DIR")
 PARITY_REF = os.environ.get("AUK_PARITY_REF")
 # An assembled directory is the only thing this pipeline can load.
-IS_ASSEMBLED = bool(CKPT_DIR) and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
+IS_ASSEMBLED = CKPT_DIR is not None and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
 
 # Measured on the released base checkpoint: mean frame cosine 0.961 to 0.968,
 # relative latent MSE 0.051 to 0.063, log-mel distance 0.34. That spread is
@@ -228,7 +228,7 @@ def build_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_auk, "AuKVAE", _StubVAE)
 
     def _build(
-        variant: str = "base", *, model_config: dict[str, Any] | None = None
+        variant: str = "base", *, model_config: dict[str, Any] | None = None, quantization: Any = None
     ) -> tuple[AuKPipeline, list[dict[str, Any]]]:
         calls: list[dict[str, Any]] = []
         monkeypatch.setattr(pipeline_auk, "sample_latents", _stub_sampler(calls))
@@ -237,6 +237,7 @@ def build_pipeline(tmp_path, monkeypatch):
             dtype=torch.float32,
             model_class_name="AuKPipeline",
             model_config=model_config or {},
+            quantization_config=quantization,
         )
         return AuKPipeline(od_config=od_config), calls
 
@@ -302,6 +303,103 @@ class TestRequestParsing:
     def test_invalid_ref_cache_size_is_rejected(self, build_pipeline, size):
         with pytest.raises(ValueError, match="AuK auk_ref_cache_size must be a non-negative integer"):
             build_pipeline(model_config={"auk_ref_cache_size": size})
+
+    def test_dit_stays_in_the_model_dtype_by_default(self, build_pipeline, monkeypatch):
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(
+            pipeline_auk, "quantize_block_linears", lambda dit, **_: pytest.fail("FP8 was not requested")
+        )
+        pipeline, _ = build_pipeline()
+        assert pipeline.dit_fp8 is False
+
+    def test_fp8_quantization_swaps_the_block_linears(self, build_pipeline, monkeypatch):
+        swapped = []
+
+        def record(dit, **kwargs) -> int:
+            swapped.append(dit)
+            return 160
+
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", record)
+        pipeline, _ = build_pipeline(quantization="fp8")
+        assert pipeline.dit_fp8 is True
+        assert swapped == [pipeline.dit]
+
+    def test_fp8_quantization_is_skipped_on_an_unsupported_device(self, build_pipeline, monkeypatch):
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: pytest.fail("no FP8 GEMMs on CPU"))
+        pipeline, _ = build_pipeline(quantization="fp8")
+        assert pipeline.dit_fp8 is False
+
+    def test_other_quantization_methods_are_rejected(self, build_pipeline):
+        with pytest.raises(ValueError, match="AuK supports only 'fp8' quantization"):
+            build_pipeline(quantization="int8")
+
+    @pytest.mark.parametrize(
+        ("quantization", "expected"),
+        [
+            ({"dit": {"method": "fp8"}, "vae": None}, True),
+            ({"dit": None}, False),
+            ({"dit": None, "vae": None}, False),
+        ],
+    )
+    def test_per_component_config_resolves_the_dit_entry(self, build_pipeline, monkeypatch, quantization, expected):
+        swapped = []
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+
+        def quantize(dit, **_):
+            swapped.append(dit)
+            return 160
+
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", quantize)
+        pipeline, _ = build_pipeline(quantization=quantization)
+        assert pipeline.dit_fp8 is expected
+        assert swapped == ([pipeline.dit] if expected else [])
+
+    def test_quantizing_a_component_other_than_the_dit_is_rejected(self, build_pipeline):
+        with pytest.raises(ValueError, match="AuK quantizes only the DiT"):
+            build_pipeline(quantization={"dit": {"method": "fp8"}, "vae": {"method": "fp8"}})
+
+    @pytest.mark.parametrize(
+        "quantization",
+        [
+            # A child-only scope would otherwise quantize nothing.
+            {"dit.transformer_blocks.0": {"method": "fp8"}},
+            # A null child under an FP8 DiT would otherwise still be quantized.
+            {"dit": {"method": "fp8"}, "dit.transformer_blocks.0": None},
+            # A different method on a child would otherwise be ignored.
+            {"dit": {"method": "fp8"}, "dit.transformer_blocks.0": {"method": "int8"}},
+        ],
+        ids=["child-only", "child-null", "child-other-method"],
+    )
+    def test_scopes_below_the_dit_are_rejected(self, build_pipeline, monkeypatch, quantization):
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: pytest.fail("must not quantize"))
+        with pytest.raises(ValueError, match="does not support the sub-scopes"):
+            build_pipeline(quantization=quantization)
+
+    def test_ignored_layers_reach_the_fp8_swap(self, build_pipeline, monkeypatch):
+        calls = []
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+
+        def quantize(dit, **kwargs):
+            calls.append(kwargs)
+            return 159
+
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", quantize)
+        layer = "dit.transformer_blocks.0.attn.to_qkv"
+        build_pipeline(quantization={"dit": {"method": "fp8", "ignored_layers": [layer]}, "vae": None})
+        assert calls == [{"ignored_layers": [layer], "match_mode": "exact"}]
+
+    @pytest.mark.parametrize(
+        ("options", "rejected"),
+        [
+            ({"activation_scheme": "static"}, "activation_scheme"),
+            ({"is_checkpoint_fp8_serialized": True}, "is_checkpoint_fp8_serialized"),
+        ],
+    )
+    def test_fp8_options_the_dit_cannot_honour_are_rejected(self, build_pipeline, options, rejected):
+        with pytest.raises(ValueError, match=rejected):
+            build_pipeline(quantization={"method": "fp8", **options})
 
     def test_pipeline_declares_audio_output(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -575,6 +673,7 @@ def _log_mel_distance(left: torch.Tensor, right: torch.Tensor, sample_rate: int)
 def test_zero_shot_tts_tracks_the_upstream_reference():
     """Replay the saved zero-shot TTS case and report the distances."""
 
+    assert PARITY_REF is not None
     parity_dir = Path(PARITY_REF)
     fusion_dir = Path(os.environ.get("AUK_FUSION_REF") or parity_dir.parent.parent / "fusion_ref")
     reference = torch.load(parity_dir / "zs_tts_en.pt", map_location="cpu", weights_only=False)

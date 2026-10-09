@@ -10,15 +10,17 @@ Tests that:
 Adapted from vllm/tests/models/multimodal/processing/test_common.py
 """
 
-from functools import partial
+from functools import cache, partial
 
 import numpy as np
 import pytest
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from PIL import Image
 from vllm.config.multimodal import (
     AudioDummyOptions,
     BaseDummyOptions,
     ImageDummyOptions,
+    MultiModalConfig,
     VideoDummyOptions,
 )
 from vllm.inputs import MultiModalDataDict, MultiModalInput
@@ -34,6 +36,8 @@ from tests.model_executor.models.registry import (
 )
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 
 def random_image(rng: np.random.RandomState, min_wh: int, max_wh: int):
@@ -66,6 +70,8 @@ def random_audio(
 
 _IGNORE_MM_KEYS: dict[str, set[str]] = {}
 
+_PROCESSOR_METADATA_PATTERNS = ("*.json", "*.txt")
+
 
 def _get_model_archs_to_test() -> list[str]:
     """Return architecture strings for parametrization."""
@@ -92,11 +98,33 @@ def get_text_token_prompts(
     return text_prompt, token_prompt
 
 
+@cache
+def _resolve_processor_snapshot(model: str) -> str:
+    """Resolve processor metadata once while excluding model weights."""
+    snapshot_path = hf_api().snapshot_download(
+        repo_id=model,
+        allow_patterns=list(_PROCESSOR_METADATA_PATTERNS),
+    )
+    if not isinstance(snapshot_path, str):
+        raise TypeError(f"Expected a snapshot path for {model}, got {snapshot_path!r}")
+    return snapshot_path
+
+
+@pytest.fixture
+def clear_processor_snapshot_cache():
+    _resolve_processor_snapshot.cache_clear()
+    yield
+    _resolve_processor_snapshot.cache_clear()
+
+
 def _build_model_config(model_arch: str, info: _OmniExamplesInfo) -> OmniModelConfig:
     """Create an ``OmniModelConfig`` suitable for processor testing."""
+    # Only ROCm CI needs metadata prefetch. Keep the original Hub-ID path on
+    # other platforms so their processor lookup behavior remains covered.
+    model_path = _resolve_processor_snapshot(info.default) if current_omni_platform.is_rocm() else info.default
     kwargs: dict = dict(
-        model=info.default,
-        tokenizer=info.default,
+        model=model_path,
+        tokenizer=model_path,
         tokenizer_mode="auto",
         trust_remote_code=info.trust_remote_code,
         model_arch=model_arch,
@@ -322,6 +350,106 @@ def test_omni_processing_correctness(
         num_batches=num_batches,
         simplify_rate=simplify_rate,
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+def test_processor_snapshot_is_reused_with_fresh_model_configs(
+    mocker,
+    clear_processor_snapshot_cache,
+):
+    mocker.patch.object(current_omni_platform, "is_rocm", return_value=True)
+    info = next(iter(_MULTIMODAL_OMNI_EXAMPLE_MODELS.values()))
+    snapshot_download = mocker.patch.object(
+        hf_api(),
+        "snapshot_download",
+        return_value="/cache/model",
+    )
+    configs = [mocker.Mock(spec=OmniModelConfig) for _ in range(2)]
+    for config in configs:
+        config.multimodal_config = MultiModalConfig(mm_processor_cache_gb=0)
+    model_config_cls = mocker.patch(
+        f"{__name__}.OmniModelConfig",
+        side_effect=configs,
+    )
+    first = _build_model_config("arch", info)
+    second = _build_model_config("arch", info)
+
+    snapshot_download.assert_called_once_with(
+        repo_id=info.default,
+        allow_patterns=list(_PROCESSOR_METADATA_PATTERNS),
+    )
+    assert model_config_cls.call_count == 2
+    assert first is not second
+    assert first.multimodal_config is not second.multimodal_config
+    assert model_config_cls.call_args_list[0].kwargs["model"] == "/cache/model"
+    assert model_config_cls.call_args_list[0].kwargs["tokenizer"] == "/cache/model"
+
+    first.multimodal_config.mm_processor_cache_gb = 1
+    assert second.multimodal_config.mm_processor_cache_gb == 2048
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+@pytest.mark.parametrize("model_arch", _get_model_archs_to_test())
+def test_non_rocm_processor_config_keeps_original_hub_ids(mocker, model_arch):
+    mocker.patch.object(current_omni_platform, "is_rocm", return_value=False)
+    snapshot_download = mocker.patch.object(hf_api(), "snapshot_download")
+    config = mocker.Mock(spec=OmniModelConfig)
+    config.multimodal_config = MultiModalConfig(mm_processor_cache_gb=0)
+    model_config_cls = mocker.patch(f"{__name__}.OmniModelConfig", return_value=config)
+    info = _MULTIMODAL_OMNI_EXAMPLE_MODELS[model_arch]
+
+    assert _build_model_config(model_arch, info) is config
+
+    snapshot_download.assert_not_called()
+    expected_kwargs = dict(
+        model=info.default,
+        tokenizer=info.default,
+        tokenizer_mode="auto",
+        trust_remote_code=info.trust_remote_code,
+        model_arch=model_arch,
+        model_stage=info.model_stage,
+        max_model_len=info.max_model_len,
+        enforce_eager=True,
+        dtype="auto",
+    )
+    if info.hf_config_name is not None:
+        expected_kwargs["hf_config_name"] = info.hf_config_name
+    model_config_cls.assert_called_once_with(**expected_kwargs)
+    assert config.multimodal_config.mm_processor_cache_gb == 2048
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+@pytest.mark.parametrize("failure", ["rate-limit", "offline-cache-miss"])
+def test_processor_snapshot_failures_are_not_swallowed_or_cached(
+    mocker,
+    clear_processor_snapshot_cache,
+    failure,
+):
+    if failure == "rate-limit":
+        error = HfHubHTTPError(
+            "429 Too Many Requests",
+            response=mocker.Mock(headers={}, request=mocker.Mock()),
+        )
+    else:
+        error = LocalEntryNotFoundError("processor metadata is not cached")
+    snapshot_download = mocker.patch.object(
+        hf_api(),
+        "snapshot_download",
+        side_effect=error,
+    )
+
+    for _ in range(2):
+        with pytest.raises(type(error)) as exc_info:
+            _resolve_processor_snapshot("org/model")
+        assert exc_info.value is error
+
+    assert snapshot_download.call_count == 2
 
 
 def _assert_inputs_equal(
