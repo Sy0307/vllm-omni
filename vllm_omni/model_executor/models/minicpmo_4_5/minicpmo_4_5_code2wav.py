@@ -32,6 +32,7 @@ from .batched_token2wav import (
     state_shape_signature,
 )
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .reference_audio import decode_reference_audio
 
 logger = init_logger(__name__)
 
@@ -138,7 +139,7 @@ def _normalize_reference(
     References longer than ``max_seconds`` are truncated with a warning;
     the window is configurable via ``ref_audio_max_seconds``.
     """
-    tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
+    tensor = decode_reference_audio(ref_audio)
     if tensor.dim() > 1:
         # (channels, samples) -> mono; plain reshape(-1) would interleave.
         # Upstream flattens request references to 1-D, so anything else is a

@@ -431,6 +431,68 @@ test('interrupted playback reports its cursor before clear resets it', () => {
   assert.equal(messages.filter(m => m.type === 'playback-stopped').length, 1);
 });
 
+function bufferedPlayback() {
+  let Playback;
+  const ctx = vm.createContext({
+    sampleRate: 24000,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage() {} }; } },
+    registerProcessor: (_name, cls) => { Playback = cls; },
+  });
+  vm.runInContext(fs.readFileSync(path.join(root, 'playback_worklet.js'), 'utf8'), ctx);
+  return new Playback();
+}
+
+test('native playback starts immediately once its audio buffering target is available', () => {
+  const player = bufferedPlayback();
+  player.handleMessage({ type: 'audio', responseId: 'native',
+    pcm: new Int16Array(26400).fill(12000), initialBufferMs: 400, playbackLeadMs: 1100 });
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.playedFrames, 128);
+  player.handleMessage({ type: 'clear' });
+  assertSilent(player);
+
+  const ordinary = bufferedPlayback();
+  ordinary.handleMessage({ type: 'audio', responseId: 'turn',
+    pcm: new Int16Array(9600).fill(12000), initialBufferMs: 400 });
+  assert.ok(renderPlayback(ordinary).every(sample => sample === 0));
+  assert.equal(ordinary.playedFrames, 0);
+});
+
+test('native short packets retain the wait bound and drain their complete tail', () => {
+  const player = bufferedPlayback();
+  player.handleMessage({ type: 'audio', responseId: 'short',
+    pcm: new Int16Array(2400).fill(12000), initialBufferMs: 400, playbackLeadMs: 1100 });
+  for (let i = 0; i < 75; i += 1) assert.ok(renderPlayback(player).every(sample => sample === 0));
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.playedFrames, 128);
+  player.handleMessage({ type: 'drain', responseId: 'short' });
+  for (let i = 0; i < 18; i += 1) renderPlayback(player);
+  assert.equal(player.bufferedFrames(), 0);
+  assert.equal(player.activeResponseId, null);
+});
+
+test('native playback resumes on enough queued audio after an underrun', () => {
+  const player = bufferedPlayback();
+  const audio = { type: 'audio', responseId: 'native', initialBufferMs: 400, playbackLeadMs: 1100 };
+  player.handleMessage({ ...audio, pcm: new Int16Array(26400).fill(12000) });
+  for (let i = 0; i < 207; i += 1) renderPlayback(player);
+  assert.equal(player.rebuffering, true);
+  player.handleMessage({ ...audio, pcm: new Int16Array(26400).fill(12000) });
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.rebuffering, false);
+  player.handleMessage({ type: 'clear' });
+  assertSilent(player);
+});
+
+test('native one-second packets wait only for the remaining arrival headroom', () => {
+  const player = bufferedPlayback();
+  player.handleMessage({ type: 'audio', responseId: 'unit',
+    pcm: new Int16Array(24000).fill(12000), initialBufferMs: 400, playbackLeadMs: 1100 });
+  for (let i = 0; i < 19; i += 1) assert.ok(renderPlayback(player).every(sample => sample === 0));
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.playedFrames, 128);
+});
+
 test('late interruption cursor acknowledges old response without finishing the new response', async () => {
   const app = shell('qwen3-turn', 'vad');
   await app.ui.startSession();

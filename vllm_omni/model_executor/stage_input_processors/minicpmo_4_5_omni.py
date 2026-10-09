@@ -21,6 +21,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.reference_audio import (
+    decode_reference_audio,
+    encode_reference_audio,
+)
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -106,6 +110,46 @@ def _extract_native_runtime_ref_audio(data_plane_metadata):
         return None
     sample_rate = runtime_config.get("ref_audio_sample_rate_hz") or 16000
     return torch.as_tensor(waveform, dtype=torch.float32).reshape(-1).cpu(), int(sample_rate)
+
+
+def _native_runtime_ref_audio_payload(data_plane_metadata, streaming_context, *, request_id: str):
+    """Cache one immutable reference snapshot in the owning streaming context.
+
+    The signature includes the actual reference/configuration and request,
+    session and epoch boundaries. Turn changes can reuse a fixed reference;
+    replacement, interruption and context reuse cannot select stale PCM.
+    No cache lives beyond the streaming context's existing cleanup lifetime.
+    """
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    cache_key = "minicpmo45_reference_audio"
+    metadata = data_plane_metadata if isinstance(data_plane_metadata, dict) else {}
+    runtime_config = metadata.get("runtime_config")
+    config = runtime_config if isinstance(runtime_config, dict) else {}
+    signature = (
+        request_id,
+        metadata.get("session_id"),
+        metadata.get("epoch"),
+        config.get("ref_audio_data"),
+        config.get("ref_audio_format"),
+        config.get("ref_audio_sample_rate_hz"),
+        config.get("ref_audio_path"),
+        config.get("tts_ref_audio_path"),
+    )
+    cached = bridge_states.get(cache_key) if isinstance(bridge_states, dict) else None
+    if isinstance(cached, dict) and cached.get("signature") == signature:
+        # Copy the tiny envelope: callers cannot modify a later condition's
+        # cached metadata, while immutable PCM bytes remain shared.
+        return dict(cached["payload"]), cached["sample_rate"]
+    reference = _extract_native_runtime_ref_audio(data_plane_metadata)
+    if reference is None:
+        if isinstance(bridge_states, dict):
+            bridge_states.pop(cache_key, None)
+        return None
+    waveform, sample_rate = reference
+    payload = encode_reference_audio(waveform)
+    if isinstance(bridge_states, dict):
+        bridge_states[cache_key] = {"signature": signature, "payload": payload, "sample_rate": sample_rate}
+    return dict(payload), sample_rate
 
 
 def _coerce_token_id_list(value):
@@ -418,7 +462,7 @@ def tts2code2wav_async_chunk(
         raw_ref_audio_sr = meta_info.get("ref_audio_sr")
         ref_audio_sr = _coerce_int(raw_ref_audio_sr)
         if raw_ref_audio is not None:
-            ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+            ref_audio = decode_reference_audio(raw_ref_audio).reshape(-1).cpu()
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -480,7 +524,7 @@ def tts2code2wav_full_payload(
     return OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(output_codes, dtype=torch.long),
-            ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
+            ref=decode_reference_audio(ref_audio).reshape(-1) if ref_audio is not None else None,
         ),
         meta=_MiniCPMO45MetaStruct(
             request_id=request_id,
@@ -1252,13 +1296,18 @@ def llm2tts(
             # per-handoff flags, so false must overwrite an earlier boundary.
             meta["segment_end"] = native_segment_end
         ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
-        if ref_audio is None:
-            ref_audio = _extract_native_runtime_ref_audio(
-                model_intermediate_buffer.get("duplex"),
-            )
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
-            set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
+            set_ref_audio(model_intermediate_buffer, encode_reference_audio(ref_waveform), ref_sr)
+        else:
+            ref_payload = _native_runtime_ref_audio_payload(
+                model_intermediate_buffer.get("duplex"),
+                _streaming_context,
+                request_id=str(llm_output.request_id),
+            )
+            if ref_payload is not None:
+                payload, ref_sr = ref_payload
+                set_ref_audio(model_intermediate_buffer, payload, ref_sr)
         handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
         native_turn_end_handoff = False
         if is_native_duplex_handoff:

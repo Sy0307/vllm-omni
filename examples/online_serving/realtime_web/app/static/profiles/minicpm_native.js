@@ -7,6 +7,8 @@
     description: 'Speak naturally. The model can listen and speak at the same time. Camera frames are sent with your audio.',
     waiting: 'Listening', camera: true, playbackAck: true, clientCommit: false,
     halfDuplex: false, closeSession: true, reconnectEachTurn: false,
+    // One native audio unit plus 100 ms of arrival headroom.
+    playbackLeadMs: 1100,
     readyEvent: 'session.updated', instructions: true, sendIntervalMs: 200,
     presets: {
       omni: 'Streaming Omni Conversation.',

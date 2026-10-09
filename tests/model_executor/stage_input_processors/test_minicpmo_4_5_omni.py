@@ -97,7 +97,9 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     )[0]
 
     info = converted["model_intermediate_buffer"]
-    assert info["codes"]["ref"] == ref_waveform.tolist()
+    from vllm_omni.model_executor.models.minicpmo_4_5.reference_audio import decode_reference_audio
+
+    torch.testing.assert_close(decode_reference_audio(info["codes"]["ref"]), ref_waveform, rtol=0, atol=0)
     assert info["meta"]["ref_audio_sr"] == 22050
     assert info["ids"]["tts"] == [11, 12]
 

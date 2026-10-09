@@ -36,6 +36,30 @@ feeds it as a native TEXT unit before the first microphone unit. Continue
 microphone input while awaiting the answer, as for speech turns. The opening
 text participates in the same history and replay rules as other input units.
 
+## Optional H200 latency profiles
+
+Gander uses the shared MiniCPM V1 Talker and codec. Two optional profiles
+keep its four-session capacity, model speech units, sampling and KV budgets:
+
+- `vllm_omni/deploy/gander_hift_h200.yaml` precaptures exact first-chunk,
+  continuation and tail HiFT shapes for batches 1–4. It increases startup
+  time and graph memory; unsupported shapes continue to run eagerly.
+- `vllm_omni/deploy/gander_latency_h200.yaml` also reduces codec windows
+  from 25 to 15 frames. It executes the codec more often and can change PCM
+  at chunk boundaries. Compare pronunciation, tails and playback gaps before
+  selecting it for a workload.
+
+Pass the chosen path to `--deploy-config`. All stages must use the same GPU.
+Use `gander.yaml` as the control and measure independent starts with identical
+inputs and effective sampling. These profiles need workload-specific GPU
+validation; their presence does not establish a latency or quality gain.
+
+The shared native web player uses queued audio to shorten its startup and
+recovery waits, targeting a one-second unit plus 100 ms arrival headroom.
+Short packets retain the existing 400 ms maximum wait. Ordinary completion
+drains queued audio; interruption clears it. Browser playback delay is
+separate from server first-packet delay and acoustic onset.
+
 ## Tools and context
 
 Tools are optional function schemas in `session.update.session.tools`.
