@@ -317,6 +317,44 @@ def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int
     return model, token2wav
 
 
+def test_auxiliary_capture_uses_forward_precision_without_creating_sessions(monkeypatch):
+    model, _ = _model()
+    model.backend.flow.register_parameter("warmup_parameter", nn.Parameter(torch.zeros(1)))
+    model._precapture_pending = True
+    monkeypatch.setattr(model, "_extra_config", lambda: {"token2wav_allow_tf32": True})
+    calls = []
+
+    def capture():
+        assert torch.backends.cuda.matmul.allow_tf32
+        calls.append("capture")
+        model._precapture_pending = False
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", capture)
+    prior = torch.backends.cuda.matmul.allow_tf32
+    model.capture_auxiliary_graphs()
+    model.capture_auxiliary_graphs()
+    assert calls == ["capture"]
+    assert torch.backends.cuda.matmul.allow_tf32 == prior
+    assert not model._states and not model._request_prompt_keys
+
+
+def test_auxiliary_capture_failure_restores_precision_and_keeps_sessions_empty(monkeypatch):
+    model, _ = _model()
+    model.backend.flow.register_parameter("warmup_parameter", nn.Parameter(torch.zeros(1)))
+    model._precapture_pending = True
+    monkeypatch.setattr(model, "_extra_config", lambda: {"token2wav_allow_tf32": True})
+
+    def capture():
+        raise RuntimeError("auxiliary warmup failed")
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", capture)
+    prior = torch.backends.cuda.matmul.allow_tf32
+    with pytest.raises(RuntimeError, match="auxiliary warmup failed"):
+        model.capture_auxiliary_graphs()
+    assert torch.backends.cuda.matmul.allow_tf32 == prior
+    assert not model._states and not model._request_prompt_keys
+
+
 def test_setup_cache_reuses_read_only_state_for_the_same_exact_batch():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav, setup_cache_size=2)
@@ -459,6 +497,21 @@ def _runtime_ref_info(request_id: str, reference: torch.Tensor):
     info["meta"]["ref_audio_sr"] = 16000
     info["meta"].pop("prompt_cache_id")
     return info
+
+
+def test_requests_without_reference_reuse_default_prompt_features():
+    model, token2wav = _model()
+    for request_id in ("default-a", "default-b"):
+        info = _info(request_id, 0, [10, 11])
+        info["meta"].pop("prompt_cache_id")
+        _forward(model, [info])
+        assert model._states[request_id].prompt_wav == "/fake/prompt.wav"
+        assert model._states[request_id].prompt_cache_id == "shared"
+        model.on_requests_finished([request_id])
+
+    assert token2wav.prompt_calls == 1
+    assert not model._runtime_prompts
+    assert not model._request_prompt_keys
 
 
 def test_runtime_prompt_cache_rejects_negative_capacity():

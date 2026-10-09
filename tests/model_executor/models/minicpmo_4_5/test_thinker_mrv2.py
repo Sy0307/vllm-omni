@@ -4,13 +4,56 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni as omni
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_mrv2_preprocess_stages_shared_encoders_before_reordered_prefill_rows(mocker):
+    model = _model(mocker, session="duplex")
+    state = object.__new__(OmniModelState)
+    state.model, state.has_preprocess, state._static_inputs_embeds = model, True, None
+    state.intermediate_buffer = OmniIntermediateBuffer(3)
+    state.intermediate_buffer.buffers = [{"req_id": "r0"}, {"req_id": "decode"}, {"req_id": "r2"}]
+    calls = []
+
+    def stage(*, req_ids, model_intermediate_buffer, device):
+        calls.append(("batch", req_ids))
+        assert device.type == "cpu"
+        for request_id in req_ids:
+            index = int(request_id[-1])
+            assert model_intermediate_buffer[request_id] is state.intermediate_buffer.buffers[index]
+            model_intermediate_buffer[request_id]["staged"] = True
+
+    def preprocess(ids, embeds, **info):
+        calls.append(("row", info["req_id"]))
+        assert info.get("staged", False) is (info["req_id"] != "decode")
+        assert info["_omni_is_prefill"] is (info["req_id"] != "decode")
+        return ids, embeds, {}
+
+    mocker.patch.object(model, "preprocess_batch", side_effect=stage)
+    mocker.patch.object(model, "preprocess", side_effect=preprocess)
+    batch = mocker.Mock(
+        spec=InputBatch,
+        num_reqs=3,
+        idx_mapping_np=np.array([2, 0, 1]),
+        num_scheduled_tokens=np.array([2, 1, 2]),
+        query_start_loc_np=np.array([0, 2, 3]),
+    )
+    req_states = mocker.Mock(spec=RequestState, prompt_len=np.array([5, 1, 5]), num_computed_tokens=np.array([4, 1, 0]))
+    inputs = {"input_ids": torch.arange(5), "inputs_embeds": torch.zeros(5, 4)}
+    state.run_preprocess(batch, inputs, req_states)
+    assert calls == [("batch", ["r2", "r0"]), ("row", "r2"), ("row", "r0"), ("row", "decode")]
+    assert state.intermediate_buffer.buffers[1] == {"req_id": "decode"}
 
 
 @pytest.mark.parametrize(
@@ -43,6 +86,7 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False):
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
+    mocker.patch.object(omni.MiniCPMO45OmniForConditionalGeneration, "_duplex_data_plane_helper", return_value=None)
     mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config")
     config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -98,3 +142,42 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
         assert out.multimodal_outputs["latent"] is hidden
         torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], batch.input_ids[:, None])
         torch.testing.assert_close(out.multimodal_outputs["latent_positions"], batch.positions[:, None])
+
+
+@pytest.mark.parametrize("hidden_device", ["cpu", "meta"])
+def test_duplex_row_metadata_is_rebuilt_after_replay(mocker, hidden_device):
+    model = _model(mocker)
+    batch = mocker.Mock(spec=InputBatch, input_ids=torch.tensor([11, 12]), positions=torch.tensor([0, 1]))
+    # A device-side hidden buffer must not move host bridge metadata onto
+    # that device. The meta device exercises this contract without CUDA.
+    hidden = torch.empty(2, 8, device=hidden_device)
+    info = {"duplex": {"duplex_prompt_token_ids": [3], "special_token_ids": {"listen_token_id": 7}}}
+    for prompt in ([3], [4, 5]):
+        info["duplex"]["duplex_prompt_token_ids"] = prompt
+        output = model.make_omni_output_mrv2(
+            hidden, input_batch=batch, req_states=None, model_intermediate_buffer=[info]
+        )
+        assert output.multimodal_outputs["duplex_prompt_token_ids"] == [prompt]
+        assert output.multimodal_outputs["meta"]["listen_token_id"][0].device.type == "cpu"
+        assert output.multimodal_outputs["meta"]["listen_token_id"][0].item() == 7
+
+
+@pytest.mark.parametrize("session", ["turn", "duplex"])
+def test_worker_readiness_primes_duplex_thinker_sampler(mocker, session):
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import MiniCPMO45DuplexSampler
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    model = _model(mocker, session=session)
+    warmup = mocker.patch.object(MiniCPMO45DuplexSampler, "warmup")
+    custom = model.mrv2_custom_sampler(mocker.Mock(spec=Sampler))
+    worker = mocker.Mock(
+        spec=OmniGPUWorkerBase,
+        model_runner=mocker.Mock(spec=OmniARModelRunner, model=model),
+    )
+    OmniGPUWorkerBase._capture_auxiliary_graphs(worker)
+    # Turn mode keeps the stock sampler, whose kernels vLLM's profile run primes.
+    assert (custom is not None) is (session == "duplex")
+    assert warmup.call_count == (session == "duplex")

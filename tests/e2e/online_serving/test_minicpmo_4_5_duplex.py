@@ -9,11 +9,13 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
+    DUPLEX_RUNNER_SERVER_PARAMS,
     SERVER_PARAMS,
     demo_args,
     duplex_camera_frames,
@@ -174,6 +176,13 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededTextResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +192,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededTextResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context
@@ -280,7 +289,7 @@ async def _run_seeded_text_to_audio(
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 def test_duplex_websocket_protocol_smoke(omni_server) -> None:
     ref_audio = resolve_ref_audio()
     events = asyncio.run(
@@ -298,7 +307,7 @@ def test_duplex_websocket_protocol_smoke(omni_server) -> None:
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 def test_duplex_single_session_response_required(omni_server, tmp_path: Path) -> None:
     args = demo_args(
         omni_server=omni_server,
@@ -324,7 +333,7 @@ def test_duplex_single_session_response_required(omni_server, tmp_path: Path) ->
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 def test_duplex_single_session_video_input(omni_server, tmp_path: Path) -> None:
     """Audio plus a 1 fps camera track, the omni-duplex video contract.
 
@@ -360,9 +369,10 @@ def test_duplex_single_session_video_input(omni_server, tmp_path: Path) -> None:
     _assert_session_metrics(result["session_metrics"], expected_count=2)
 
 
+@pytest.mark.core_model
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize(
     ("locale", "text"),
     [
@@ -395,14 +405,7 @@ def test_duplex_seeded_text_to_audio(omni_server, locale: str, text: str) -> Non
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> None:
-    """text -> text, the one duplex session that opens without a reference voice.
-
-    ``ref_audio`` is required only when the session asks for audio output, so a
-    ``modalities: ["text"]`` session is the duplex equivalent of the deleted
-    turn-based ``text -> text`` case. The model is model-native and still
-    speaks its answer, so this asserts the text side and the absence of the
-    ``ref_audio_required`` rejection, not the absence of audio.
-    """
+    """A text-output session may omit optional voice conditioning."""
     result = asyncio.run(
         _run_seeded_text_to_audio(
             url=realtime_url(omni_server),
@@ -416,6 +419,26 @@ def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> Non
     assert "response.done" in result["event_types"], result["event_types"]
     produced_text = str(result["output_text"]) or str(result["transcript"])
     assert produced_text.strip(), f"text-only session produced nothing: {result['event_types']}"
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
+def test_duplex_seeded_text_to_audio_needs_no_reference_voice(omni_server) -> None:
+    """Default-voice speech uses the codec prompt without client ref_audio."""
+    result = asyncio.run(
+        _run_seeded_text_to_audio(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            ref_audio=None,
+            text="What is the capital of France? Answer in one short sentence.",
+        )
+    )
+
+    assert "response.done" in result["event_types"], result["event_types"]
+    assert int(result["audio_bytes"]) > 0, "default-voice session produced no audio"
+    assert str(result["transcript"]).strip(), "default-voice session produced no transcript"
 
 
 @pytest.mark.advanced_model
@@ -469,7 +492,7 @@ def test_duplex_seeded_long_form_generation(omni_server) -> None:
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 def test_duplex_sequential_sessions_are_independent(omni_server) -> None:
     """A second session must answer its own prompt, not replay the first one.
 
@@ -571,7 +594,7 @@ def test_duplex_single_session_still_image_input(omni_server, tmp_path: Path) ->
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) -> None:
     result = asyncio.run(
         run_multi_session(

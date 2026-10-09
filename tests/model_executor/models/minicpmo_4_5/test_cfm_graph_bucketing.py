@@ -344,3 +344,44 @@ def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypa
     if max_graphs == 32:
         assert (1, 100, 350) in captured
         assert captured[15:] == [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+
+
+@pytest.mark.parametrize("caller_mask", [False, True])
+def test_capture_mask_excludes_cache_capacity_padding(caller_mask):
+    width, query_cap, offset, cache_cap = 6, 8, 5, 16
+    caller = torch.ones(2, width, width + offset, dtype=torch.bool) if caller_mask else None
+    if caller is not None:
+        caller[:, :, width + 2] = False
+    mask = _build_capture_mask(
+        attn_mask=caller,
+        batch_size=1,
+        query_cap=query_cap,
+        offset=offset,
+        offset_cap=cache_cap,
+        mel_width=width,
+        mel_frames=width,
+        device=torch.device("cpu"),
+    )
+    assert mask.shape == (2, query_cap, query_cap + cache_cap)
+    assert mask[:, :, :width].all()
+    assert not mask[:, :, width:query_cap].any()
+    assert not mask[:, :, query_cap + offset :].any()
+    expected = torch.ones(2, query_cap, offset, dtype=torch.bool)
+    if caller_mask:
+        expected[:, :, 2] = False
+    assert torch.equal(mask[:, :, query_cap : query_cap + offset], expected)
+    assert mask.any(dim=-1).all()
+
+
+def test_capture_mask_rejects_truncated_cache_capacity():
+    with pytest.raises(ValueError, match="smaller than its valid offset"):
+        _build_capture_mask(
+            attn_mask=None,
+            batch_size=1,
+            query_cap=8,
+            offset=5,
+            offset_cap=4,
+            mel_width=8,
+            mel_frames=8,
+            device=torch.device("cpu"),
+        )

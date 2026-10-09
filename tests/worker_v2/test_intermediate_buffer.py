@@ -96,6 +96,41 @@ def test_update_merge_semantics(monkeypatch):
     assert "kv" in buf.buffers[0]
 
 
+def test_integer_history_snapshots_remain_independent():
+    buf = OmniIntermediateBuffer(max_num_reqs=2)
+    history = list(range(8192))
+    for slot in range(2):
+        buf.add_request(slot, _make_new_req_data(f"r{slot}", model_intermediate_buffer={"ids": {"prompt": history}}))
+    history[0] = -1
+    history.append(8192)
+    assert buf.buffers[0]["ids"]["prompt"] == list(range(8192))
+    buf.buffers[0]["ids"]["prompt"][1] = -2
+    assert buf.buffers[1]["ids"]["prompt"] == list(range(8192))
+
+
+@pytest.mark.parametrize("gpu_resident", [False, True])
+def test_integer_prefix_does_not_hide_tensor_tail(monkeypatch, gpu_resident):
+    buf = OmniIntermediateBuffer(max_num_reqs=1)
+    tensor = torch.tensor([2.0], requires_grad=True)
+    cpu_calls = []
+    original_cpu = torch.Tensor.cpu
+
+    def tracked_cpu(value, *args, **kwargs):
+        cpu_calls.append(value)
+        return original_cpu(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", tracked_cpu)
+    prefix = list(range(8192))
+    buf.update(0, {"history": prefix + [tensor]}, gpu_resident_keys={"history"} if gpu_resident else None)
+    stored = buf.buffers[0]["history"]
+    assert stored[:-1] == prefix
+    assert torch.equal(stored[-1], tensor)
+    assert not stored[-1].requires_grad
+    assert len(cpu_calls) == (0 if gpu_resident else 1)
+    if gpu_resident:
+        assert stored[-1].data_ptr() != tensor.data_ptr()
+
+
 def test_add_request_merges_orchestrator_model_intermediate_buffer():
     """Stage bridges such as MiniCPM-o's llm2tts hand over ``model_intermediate_buffer``."""
     buf = OmniIntermediateBuffer(max_num_reqs=2)

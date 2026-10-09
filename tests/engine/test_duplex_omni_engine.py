@@ -215,3 +215,15 @@ async def test_async_wrappers_run_the_blocking_calls_off_the_event_loop() -> Non
     engine.rpc_client.execute = execute
     await engine.touch_session_async("sid", activity="heartbeat")
     assert seen == [False]
+
+
+def test_duplex_engine_defaults_to_the_event_driven_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
+
+    engine = object.__new__(DuplexOmniEngine)
+    engine.deploy_config = None
+    engine._set_pipeline_runtime_config(SimpleNamespace(model_type="minicpmo_4_5", endpoint_restrictions=()), None)
+
+    assert engine._event_driven_orch_default is True
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", "0")
+    assert _event_driven_orch_enabled(default=engine._event_driven_orch_default) is False

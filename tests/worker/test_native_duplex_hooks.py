@@ -987,6 +987,33 @@ def test_minicpmo_stage0_context_window_inserts_previous_before_suffix():
     assert rebuilt["num_input_tokens"] == 7
 
 
+@pytest.mark.parametrize("turn_ended", [False, True])
+@pytest.mark.parametrize("close_turn", [False, True])
+def test_minicpmo_stage0_close_turn_ends_the_unit_on_turn_eos(close_turn, turn_ended):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-close-turn")
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    # The model was speaking: its last unit ended on <|chunk_eos|> (8).
+    state.pending_terminator_token = 8
+    state.current_turn_ended = turn_ended
+    state.pending_speech_context = True
+
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), seq=2, close_turn=close_turn, is_speech=False
+    )
+
+    closes = close_turn and not turn_ended
+    # <|turn_eos|> (10) replaces the sampled terminator: the same span, so the
+    # scheduler's reserve for this append still matches.
+    assert result["input_token_ids"] == [10 if closes else 8, 2, 1, 11]
+    assert state.current_turn_ended is (turn_ended or closes)
+    assert state.pending_speech_context is not closes
+
+
 @pytest.mark.parametrize("pending_terminator", [None, 3, 99])
 def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(pending_terminator):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
