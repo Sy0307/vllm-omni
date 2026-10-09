@@ -136,6 +136,34 @@ def test_deferred_writes_land_together_like_immediate_writes():
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_repeated_flushes_survive_a_slow_stream():
+    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+
+    from vllm_omni.worker_v2 import staged_writes
+
+    staged_writes.install()
+    device = torch.device("cuda", 0)
+    t = StagedWriteTensor((64, 32), dtype=torch.int64, device=device)
+    expected = np.zeros((64, 32), dtype=np.int64)
+    rng = np.random.default_rng(3)
+    # Compile the flush kernel first, so the timed window below only queues launches.
+    with staged_writes.deferred_writes():
+        t.stage_write(0, 0, np.zeros(32, dtype=np.int64))
+        t.apply_write()
+    torch.accelerator.synchronize()
+    with staged_writes.deferred_writes():
+        torch.cuda._sleep(1_000_000_000)  # ~0.5 s: the flushes queue behind it while the host keeps going
+        # Each re-apply of the same tensor flushes the window: many flushes in one window.
+        for row in range(64):
+            values = rng.integers(0, 1 << 30, 32)
+            t.stage_write(row, 0, values)
+            t.apply_write()
+            expected[row] = values
+    torch.accelerator.synchronize()
+    np.testing.assert_array_equal(t.gpu.cpu().numpy(), expected)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_staged_h2d_matches_the_pinned_copy_and_survives_slow_readers():
     from vllm.utils.torch_utils import async_tensor_h2d as original
     from vllm.v1.worker.gpu import model_runner

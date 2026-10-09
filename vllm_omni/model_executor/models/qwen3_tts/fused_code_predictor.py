@@ -411,7 +411,7 @@ def _cp_gemm_stream_kernel(
     a_ptr, a_rs, a_ro, w_ptr, ws_ptr, cnt_ptr, out_ptr, ss_in_ptr, ss_out_ptr, M, eps,
     K: tl.constexpr, N: tl.constexpr, HID: tl.constexpr, RMAX: tl.constexpr,
     BN: tl.constexpr, BK: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
-    EPI: tl.constexpr, NT_IN: tl.constexpr, STAGES: tl.constexpr, PREFETCH: tl.constexpr, NLP: tl.constexpr,
+    EPI: tl.constexpr, NT_IN: tl.constexpr, STAGES: tl.constexpr, NLP: tl.constexpr,
 ):  # fmt: skip
     """Large-M variant: one M tile per CTA and a pipelined K loop; the CTA's weight slice is prefetched into
     L2 before the wait instead of being held in registers."""
@@ -421,10 +421,9 @@ def _cp_gemm_stream_kernel(
     KS: tl.constexpr = K // SK
     n = pid_n * BN + tl.arange(0, BN)
     kb = pid_k * KS
-    if PREFETCH:
-        # one prefetch per 128-byte line of the slice (index clamped to pad to a power of two)
-        li = tl.minimum(tl.arange(0, NLP), KS // 64 - 1)
-        _prefetch_l2(w_ptr + n[:, None] * K + kb + (li * 64)[None, :])
+    # one prefetch per 128-byte line of the slice (index clamped to pad to a power of two)
+    li = tl.minimum(tl.arange(0, NLP), KS // 64 - 1)
+    _prefetch_l2(w_ptr + n[:, None] * K + kb + (li * 64)[None, :])
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
     m = pid_m * BM + tl.arange(0, BM)
@@ -450,7 +449,7 @@ def _cp_gemm_stream_kernel(
 
 # Chain GEMM launch configs by the largest batch they serve (tuned on H200 over the
 # whole predictor graph). Register-panel kernel: (BN, BK, NCH, BM, warps, MT, MSTAGES);
-# streaming kernel: ("s", BN, BK, SK, BM, warps, STAGES, PREFETCH). Batches above the
+# streaming kernel: ("s", BN, BK, SK, BM, warps, STAGES). Batches above the
 # last entry take the cuBLAS path (the chain was ~5% slower at 96 and 128). The
 # gate/up tile width is fixed by its weight layout.
 _PDL_GU_BN = 64
@@ -464,7 +463,7 @@ _PDL_CONFIGS: tuple[tuple[int, dict[str, tuple]], ...] = (
         "down": (64, 256, 2, 16, 4, 1, 2), "lm": (128, 256, 2, 16, 8, 1, 1),
     }),
     (32, {
-        "qkv": (128, 256, 2, 32, 8, 2, 1), "o": ("s", 64, 128, 2, 32, 4, 4, 1), "gu": ("s", 64, 128, 2, 64, 4, 2, 1),
+        "qkv": (128, 256, 2, 32, 8, 2, 1), "o": ("s", 64, 128, 2, 32, 4, 4), "gu": ("s", 64, 128, 2, 64, 4, 2),
         "down": (64, 256, 4, 32, 4, 2, 1), "lm": (128, 256, 2, 16, 8, 2, 1),
     }),
     (64, {
@@ -655,10 +654,10 @@ class FusedCodePredictor:
         N, K = w.shape
         common = (a, a_rs, a_ro, w, self.pdl_ws, self.pdl_cnt, out, ss_in, ss_out, M, eps)
         if cfg[0] == "s":
-            _, BN, BK, SK, BM, warps, stages, prefetch = cfg
+            _, BN, BK, SK, BM, warps, stages = cfg
             _cp_gemm_stream_kernel[(N // BN, SK, triton.cdiv(M, BM))](
                 *common, K=K, N=N, HID=self.hidden, RMAX=self._rows, BN=BN, BK=BK, SK=SK, BM=BM, EPI=epi,
-                NT_IN=nt_in, STAGES=stages, PREFETCH=prefetch, NLP=triton.next_power_of_2(K // SK // 64),
+                NT_IN=nt_in, STAGES=stages, NLP=triton.next_power_of_2(K // SK // 64),
                 num_warps=warps, launch_pdl=True,
             )  # fmt: skip
         else:

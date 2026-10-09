@@ -226,6 +226,7 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
     model.stream_decoder = stream
     model.stream_prime_graphs = graphs
     model.stream_chunk_frames = 25
+    model.stream_prime_pieces = {}
     if use_graph == "pieces":
         # Tails of 3 and 51 frames replay 2 + 1 and 25 + 25 + 1 frame graphs.
         model.stream_prime_pieces = {

@@ -147,9 +147,6 @@ def coerce_ref_code_tensor(value: object, *, device: torch.device) -> torch.Tens
     return ref_code.to(device=device, dtype=torch.long).contiguous()
 
 
-_TEXT_PROJECTION_ROW_ALIGN = 64
-
-
 def coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | None:
     value = first_value(value)
     if value is None:
@@ -469,15 +466,13 @@ class Qwen3TTSPromptEmbedsBuilder:
         raw = info_dict.get("speaker") or [""]
         return raw[0] if isinstance(raw, (list, tuple)) else raw
 
-    def _cached_custom_voice_prompt(
+    def _cached_custom_voice_entry(
         self, info_dict: dict[str, Any], text: Any, language: Any
-    ) -> tuple[torch.Tensor, torch.Tensor, None, None] | None:
-        """The non-streaming CustomVoice prompt from cached rows, or ``None`` for the full path.
+    ) -> tuple[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None:
+        """``(cache key, cached prompt pieces)`` when an earlier request resolved this speaker/language.
 
-        Applies when an earlier request resolved this speaker/language to a
-        cached prefix and the batched preprocess already projected this
-        request's text: the prompt is then prefix + (text + pad row) + eos row
-        + tail, exactly what the full path assembles from the same rows.
+        Only for plain text with no instruct, where the prompt is the cached
+        pieces around the projected text.
         """
         if not isinstance(text, str) or text[:1].isspace():
             return None
@@ -492,9 +487,23 @@ class Qwen3TTSPromptEmbedsBuilder:
         except TypeError:  # unhashable request fields
             return None
         cached = self._custom_voice_prompt_cache.get(cache_key) if cache_key is not None else None
+        return None if cached is None else (cache_key, cached)
+
+    def _cached_custom_voice_prompt(
+        self, info_dict: dict[str, Any], text: Any, language: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None] | None:
+        """The non-streaming CustomVoice prompt from cached rows, or ``None`` for the full path.
+
+        Applies when an earlier request resolved this speaker/language to a
+        cached prefix and the batched preprocess already projected this
+        request's text: the prompt is then prefix + (text + pad row) + eos row
+        + tail, exactly what the full path assembles from the same rows.
+        """
+        entry = self._cached_custom_voice_entry(info_dict, text, language)
         req_id = str(info_dict.get("req_id"))
-        if cached is None or req_id not in self._batched_text_embeds:
+        if entry is None or req_id not in self._batched_text_embeds:
             return None
+        cached = entry[1]
         text_all = self._batched_text_embeds.pop(req_id)
         info_dict.pop(PRECOMPUTED_TEXT_IDS_KEY, None)
         prefix, pad_row, tail, eos_row = cached
@@ -521,22 +530,11 @@ class Qwen3TTSPromptEmbedsBuilder:
         if task_type != "CustomVoice" or not self._non_streaming_mode(info_dict, task_type):
             return None
         text = (info_dict.get("text") or [""])[0]
-        if not isinstance(text, str) or text[:1].isspace():
-            return None
-        instruct = (info_dict.get("instruct") or [""])[0]
-        if isinstance(instruct, str) and instruct.strip():
-            return None
-        fast_keys = self.__dict__.get("_cv_fast_keys")
-        if not fast_keys:
-            return None
         language = (info_dict.get("language") or ["Auto"])[0]
-        try:
-            cache_key = fast_keys.get((self._speaker_field(info_dict), language))
-        except TypeError:  # unhashable request fields
+        entry = self._cached_custom_voice_entry(info_dict, text, language)
+        if entry is None or entry[0][0] != str(table.device):
             return None
-        cached = self._custom_voice_prompt_cache.get(cache_key) if cache_key is not None else None
-        if cached is None or cache_key[0] != str(table.device):
-            return None
+        cache_key, cached = entry
         ids = first_value(info_dict.get(PRECOMPUTED_TEXT_IDS_KEY))
         if isinstance(ids, torch.Tensor):
             if ids.device.type != "cpu":
@@ -1200,12 +1198,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         full_ids = [ids for _info, _req_id, ids in items]
         text_ids = [ids[3:-5] for ids in full_ids]
         num_full = sum(ids.size for ids in full_ids)
-        num_text = sum(ids.size for ids in text_ids)
-        # Rows are independent; padding the token count to a multiple of 64
-        # keeps the projection GEMMs to a few shapes whose cuBLAS plans stay
-        # cached (an unseen M costs ~0.1 ms of host time per GEMM).
-        pad = np.zeros((-num_text) % _TEXT_PROJECTION_ROW_ALIGN, dtype=np.int64)
-        packed = to_device_nonblocking(torch.from_numpy(np.concatenate(full_ids + text_ids + [pad])), self._device())
+        packed = to_device_nonblocking(torch.from_numpy(np.concatenate(full_ids + text_ids)), self._device())
         projected = self._project_text_ids(packed[num_full:].view(1, -1))
         embeds: dict[str, torch.Tensor] = {}
         full_offset = text_offset = 0
@@ -1714,8 +1707,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                 cached_speaker = self._speaker_embed_cache[speaker_key] = (spk_id, spk_embed)
             spk_id, spk_embed = cached_speaker
             speaker_embed = spk_embed
-            # [codec prefix, speaker, pad, bos]; only cache misses and streaming read it.
-            codec_input = None
+            codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
             # The role tokens, speaker/language codec prefix, codec pad row and
             # closing row do not depend on the text: cache them per speaker and
@@ -1731,8 +1723,6 @@ class Qwen3TTSPromptEmbedsBuilder:
                 )
             cv_cache = self._custom_voice_prompt_cache
             cached = cv_cache.get(cache_key) if cache_key is not None else None
-            if cached is None or not non_streaming_mode:
-                codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
             if cached is None:
                 role_embed = text_projection(text_embedding(input_ids[:, :3]))
                 codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)

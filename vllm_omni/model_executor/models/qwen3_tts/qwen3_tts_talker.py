@@ -28,7 +28,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.utils.device_copy import DeviceStager, index_to_device, to_device_nonblocking
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -1449,9 +1449,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         packed = torch.empty(rows.num_packed, input_embeds.shape[-1], dtype=dtype, device=device)
         stager = self.__dict__.get("_prefill_rows_stager")
         if stager is None:
-            from vllm_omni.utils.device_copy import DeviceStager
-
-            stager = self._prefill_rows_stager = DeviceStager(dtype=torch.int64)
+            stager = self._prefill_rows_stager = DeviceStager()
         launch_prefill_rows(
             rows,
             stager(rows.array(), device),
@@ -1708,7 +1706,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             n = len(items)
             slots = index_to_device([idx for idx, _ref in items], stream.device, dtype=torch.int32)
             graphs = self.stream_prime_graphs
-            pieces = getattr(self, "stream_prime_pieces", None) or {}
+            pieces = self.stream_prime_pieces
             # Graph pieces only help when every piece size covers this group.
             if any(max(piece.sizes) < n for piece in pieces.values()):
                 pieces = {}

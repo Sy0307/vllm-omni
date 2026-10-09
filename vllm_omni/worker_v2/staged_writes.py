@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# ruff: noqa: N803, N807 - Triton constexpr capitals; patched dunder methods.
+# ruff: noqa: N803 - Triton constexpr parameters use kernel-style capitals.
 """Cheaper staged writes for the MRv2 runner's persistent state tensors.
 
 vLLM's ``StagedWriteTensor`` keeps staged contents as one flat Python list
@@ -25,34 +25,48 @@ Inside :func:`deferred_writes` (the runner wraps ``add_requests`` in it), each
 land with one byte-copy launch when the window closes, or earlier when a
 reader needs them (the penalty ``bincount`` reads the new prompt tokens).
 Joining requests otherwise cost one write launch per state tensor per step.
+A window can flush more than once per step, so the flush stages its arguments
+through fenced ``DeviceStager`` rings rather than a two-slot ``UvaBufferPool``.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator, Sequence
-from typing import Any
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
+
+from vllm_omni.utils.device_copy import DeviceStager
 
 logger = init_logger(__name__)
 
 _installed = False
 
 
+class _PendingWrite(NamedTuple):
+    """The staged writes one ``apply_write`` queued for its tensor."""
+
+    tensor: Any  # vLLM StagedWriteTensor
+    indices: list[int]
+    starts: list[int]
+    contents: list
+    cu_lens: list[int]
+
+
 class _Deferred:
     depth = 0
-    # (tensor, indices, starts, contents, cu_lens) taken from each queued apply_write
-    pending: list[tuple[Any, list, list, list, list]] = []
-    flush: Any = None  # set by install(): applies and clears ``pending``
+    pending: list[_PendingWrite] = []
+    flush: Callable[[], None] | None = None  # set by install(): applies and clears ``pending``
 
 
 @contextlib.contextmanager
 def deferred_writes() -> Iterator[None]:
     """Queue ``StagedWriteTensor.apply_write`` calls and apply them together on exit."""
-    if _Deferred.flush is None:
+    flush = _Deferred.flush
+    if flush is None:
         yield
         return
     _Deferred.depth += 1
@@ -61,13 +75,14 @@ def deferred_writes() -> Iterator[None]:
     finally:
         _Deferred.depth -= 1
         if _Deferred.depth == 0:
-            _Deferred.flush()
+            flush()
 
 
-def flush_deferred_writes() -> None:
+def _flush_deferred_writes() -> None:
     """Apply the queued writes now (before a kernel that reads them)."""
-    if _Deferred.flush is not None:
-        _Deferred.flush()
+    flush = _Deferred.flush
+    if flush is not None:
+        flush()
 
 
 def _stage_values(chunks: list, x: Any) -> int:
@@ -119,7 +134,7 @@ def install() -> None:
     orig_init = swt.__init__
     orig_fused_init = fused.__init__
 
-    def __init__(self, size, dtype, device, max_concurrency=None, uva_instead_of_gpu=False):
+    def swt_init(self, size, dtype, device, max_concurrency=None, uva_instead_of_gpu=False):
         orig_init(self, size, dtype, device, max_concurrency, uva_instead_of_gpu)
         self._np_dtype = torch.empty((), dtype=dtype).numpy().dtype
         self._staged_len = 0
@@ -154,12 +169,12 @@ def install() -> None:
         if n == 0:
             return
         if _Deferred.depth:
-            if any(record[0] is self for record in _Deferred.pending):
+            if any(write.tensor is self for write in _Deferred.pending):
                 # Writes of one launch run in parallel: keep a later batch for the same tensor ordered.
                 flush()
             # Take this batch as an immediate apply would; later stages start fresh lists.
             _Deferred.pending.append(
-                (
+                _PendingWrite(
                     self,
                     self._staged_write_indices,
                     self._staged_write_starts,
@@ -211,8 +226,8 @@ def install() -> None:
             m = offs < nbytes
             tl.store(dst + offs, tl.load(contents_ptr + src + offs, mask=m), mask=m)
 
-    meta_pool = pool_cls(1, dtype=torch.int64)
-    contents_pool = pool_cls(1, dtype=torch.uint8)
+    meta_stager = DeviceStager(dtype=torch.int64)
+    contents_stager = DeviceStager(dtype=torch.uint8)
 
     def flush() -> None:
         pending = _Deferred.pending
@@ -238,8 +253,9 @@ def install() -> None:
             metas.append(meta)
             blobs.append(blob)
             offset += blob.size
-        meta_uva = meta_pool.copy_to_uva(np.concatenate(metas).reshape(-1))
-        contents_uva = contents_pool.copy_to_uva(blobs[0] if len(blobs) == 1 else np.concatenate(blobs))
+        device = pending[0][0].gpu.device
+        meta_uva = meta_stager(np.concatenate(metas).reshape(-1), device)
+        contents_uva = contents_stager(blobs[0] if len(blobs) == 1 else np.concatenate(blobs), device)
         _byte_scatter_kernel[(meta_uva.shape[0] // 3,)](meta_uva, contents_uva, BLOCK=1024)
 
     def fused_init(self, device, max_writes, max_concurrency=None):
@@ -294,7 +310,7 @@ def install() -> None:
 
     _install_staged_h2d()
     _install_fused_bincount()
-    swt.__init__ = __init__
+    swt.__init__ = swt_init
     swt.stage_write = stage_write
     swt.stage_write_elem = stage_write_elem
     swt.apply_write = apply_write
@@ -368,7 +384,7 @@ def _install_fused_bincount() -> None:
         if n == 0:
             return
         # Counts the prompt tokens a deferred write may still be holding.
-        flush_deferred_writes()
+        _flush_deferred_writes()
         _fused_bincount_kernel[(n,)](
             expanded_idx_mapping,
             all_token_ids,
@@ -399,8 +415,6 @@ def _install_staged_h2d() -> None:
     from vllm.v1.worker.gpu import model_runner
     from vllm.v1.worker.gpu.sample import penalties
 
-    from vllm_omni.utils.device_copy import DeviceStager
-
     original = torch_utils.async_tensor_h2d
     stagers: dict[torch.dtype, DeviceStager] = {}
 
@@ -426,4 +440,4 @@ def _install_staged_h2d() -> None:
     penalties.async_tensor_h2d = staged_h2d
 
 
-__all__ = ["deferred_writes", "flush_deferred_writes", "install"]
+__all__ = ["deferred_writes", "install"]

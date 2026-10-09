@@ -11,7 +11,6 @@ from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
     Qwen3TTSTalkerConfig,
 )
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
-    _TEXT_PROJECTION_ROW_ALIGN,
     PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
 )
@@ -58,11 +57,8 @@ def test_batch_preprocess_projects_new_non_streaming_texts_once():
 
     builder.preprocess_infos_batch(req_infos=list(buf.values()), device=torch.device("cpu"))
 
-    # One embedding + projection over both requests' text tokens (template
-    # stripped), padded to a row multiple that keeps the GEMM shapes few.
-    num_text = (len(ids_a) - 8) + (len(ids_b) - 8)
-    align = _TEXT_PROJECTION_ROW_ALIGN
-    assert projected_shapes == [(1, (num_text + align - 1) // align * align, 4)]
+    # One embedding + projection over both requests' text tokens (template stripped).
+    assert projected_shapes == [(1, (len(ids_a) - 8) + (len(ids_b) - 8), 4)]
     assert set(builder._batched_text_embeds) == {"a", "b"}
     with torch.no_grad():
         for req_id, ids in (("a", ids_a), ("b", ids_b)):

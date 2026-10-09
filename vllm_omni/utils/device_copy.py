@@ -19,6 +19,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+from vllm.utils.platform_utils import is_uva_available
 
 
 def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
@@ -34,14 +35,6 @@ def index_to_device(values: Sequence[int], device: torch.device | str, dtype: to
     if torch.device(device).type != "cuda":
         return torch.tensor(values, dtype=dtype, device=device)
     return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
-
-
-def array_to_device(values: np.ndarray, device: torch.device | str) -> torch.Tensor:
-    """A host numpy array as a device tensor, without a host sync or a Python list round trip."""
-    host = torch.from_numpy(np.ascontiguousarray(values))
-    if torch.device(device).type != "cuda":
-        return host.to(device)
-    return host.pin_memory().to(device, non_blocking=True)
 
 
 class DeviceStager:
@@ -77,17 +70,6 @@ class DeviceStager:
         self._np_dtype = torch.empty((), dtype=dtype).numpy().dtype
         self._init_capacity = capacity
         self._prev = -1
-        self._uva: bool | None = None
-
-    def _uva_available(self) -> bool:
-        if self._uva is None:
-            try:
-                from vllm.utils.platform_utils import is_uva_available
-
-                self._uva = bool(is_uva_available())
-            except (ImportError, RuntimeError):
-                self._uva = False
-        return self._uva
 
     def _grow(self, slot: int, n: int, device: torch.device) -> None:
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -111,8 +93,8 @@ class DeviceStager:
         arr = np.asarray(values, dtype=self._np_dtype)
         if not isinstance(device, torch.device):
             device = torch.device(device)
-        if device.type != "cuda" or not self._uva_available():
-            return array_to_device(arr, device)
+        if device.type != "cuda" or not is_uva_available():
+            return to_device_nonblocking(torch.from_numpy(np.ascontiguousarray(arr)), device)
         slot = (self._prev + 1) % self._slots
         if slot % self._group == 0:
             if self._prev >= 0:

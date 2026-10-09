@@ -66,16 +66,14 @@ def _talker_sample_kernel(
     out_counts_stride,
     BLOCK: tl.constexpr,
     TOPK_BLOCK: tl.constexpr,
-    HAS_DISALLOWED: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     req = tl.load(idx_mapping_ptr + row).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     in_vocab = cols < vocab_size
     logits = tl.load(logits_ptr + row * logits_stride + cols, mask=in_vocab, other=float("-inf")).to(tl.float32)
-    if HAS_DISALLOWED:
-        disallowed = tl.load(disallowed_ptr + cols, mask=in_vocab, other=1) != 0
-        logits = tl.where(disallowed, float("-inf"), logits)
+    disallowed = tl.load(disallowed_ptr + cols, mask=in_vocab, other=1) != 0
+    logits = tl.where(disallowed, float("-inf"), logits)
 
     pos = tl.load(positions_ptr + tl.load(logits_indices_ptr + row))
 
@@ -133,9 +131,7 @@ def _talker_sample_kernel(
 class Qwen3TTSTalkerSampler(OmniSampler):
     """Fused Talker sampling for the settings the Talker uses, upstream sampling otherwise."""
 
-    omni_static_staged_writes = True
-
-    def __init__(self, base_sampler: Sampler, talker: Any = None):
+    def __init__(self, base_sampler: Sampler, talker: Any):
         super().__init__(base_sampler)
         self.vocab_size = int(base_sampler.sampling_states.vocab_size)
         self._fast = np.zeros(base_sampler.req_states.max_num_reqs, dtype=bool)
@@ -147,10 +143,8 @@ class Qwen3TTSTalkerSampler(OmniSampler):
         if self._enabled:
             logger.info("Qwen3-TTS Talker: single-kernel MRv2 sampler (top_k <= %d)", MAX_TOP_K)
 
-    def _disallowed_on(self, device: torch.device) -> torch.Tensor | None:
-        if self._talker is None:
-            return None
-        if self._disallowed is None or self._disallowed.device != device:
+    def _disallowed_on(self, device: torch.device) -> torch.Tensor:
+        if self._disallowed is None:
             mask = self._talker._codec_disallowed_mask
             self._disallowed = mask.to(device=device, dtype=torch.int8).contiguous()
         return self._disallowed
@@ -166,6 +160,8 @@ class Qwen3TTSTalkerSampler(OmniSampler):
             and torch.cuda.is_available()
             and self.vocab_size <= MAX_VOCAB
             and not base.compute_nans
+            # The kernel draws fp32 Gumbel noise.
+            and not base.use_fp64_gumbel
             and base.trace_replay_state is None
             and not base.return_sampling_mask
             and processors is not None
@@ -175,7 +171,7 @@ class Qwen3TTSTalkerSampler(OmniSampler):
     @property
     def fused_disallowed_mask(self) -> bool:
         """True when the codec mask is applied here, so compute_logits may skip it."""
-        return self._enabled and self._talker is not None
+        return self._enabled
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         base = self.base_sampler
@@ -231,7 +227,7 @@ class Qwen3TTSTalkerSampler(OmniSampler):
             input_batch.positions,
             input_batch.seq_lens,
             base.req_states.prefill_len.gpu,
-            logits if disallowed is None else disallowed,
+            disallowed,
             states.temperature.gpu,
             states.top_k.gpu,
             states.seeds.gpu,
@@ -248,7 +244,6 @@ class Qwen3TTSTalkerSampler(OmniSampler):
             penalties.output_bin_counts.stride(0),
             BLOCK=triton.next_power_of_2(logits.shape[1]),
             TOPK_BLOCK=MAX_TOP_K,
-            HAS_DISALLOWED=disallowed is not None,
             num_warps=8,
         )
         return SamplerOutput(

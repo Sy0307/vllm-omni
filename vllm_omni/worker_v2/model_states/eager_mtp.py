@@ -98,15 +98,15 @@ class EagerMTPState:
     def stream_position(self, req_id: str, req_idx: int) -> int | None:
         """Next frame index of a request's stream, wherever it is tracked."""
         owners = self._slot_stream_owner
-        if owners is not None and 0 <= req_idx < owners.shape[0] and owners[req_idx] == req_id:
+        if owners is not None and owners[req_idx] == req_id:
             assert self._slot_stream_pos is not None
             return int(self._slot_stream_pos[req_idx])
         return self.owner._stream_pos.get(req_id)
 
     def release_stream_slot(self, req_id: str, req_idx: int) -> None:
-        """Move a slot-tracked stream position back to the per-request map (or drop it)."""
+        """Stop tracking the request's stream position in its slot."""
         owners = self._slot_stream_owner
-        if owners is not None and 0 <= req_idx < owners.shape[0] and owners[req_idx] == req_id:
+        if owners is not None and owners[req_idx] == req_id:
             owners[req_idx] = None
 
     def suspend_audio(self, req_id: str, req_idx: int) -> None:
@@ -139,7 +139,7 @@ class EagerMTPState:
             self.owner._stream_pos[req_id] = saved.position
             self.owner._mtp_generators[req_id] = saved.generator
             if saved.generator is not None:
-                self.owner.__dict__.setdefault("_mtp_seeded", set()).add(req_id)
+                self.owner._mtp_seeded.add(req_id)
             self._restore_audio[req_id] = saved.decoder_state
             self.owner.intermediate_buffer.buffers[req_idx] = saved.runtime
             assert self.owner._eager_embeds is not None
@@ -525,11 +525,9 @@ class EagerMTPState:
             if not kept.all():
                 # New or resumed streams; a request that keeps its slot is tracked in place.
                 positions = owner._stream_pos
-                audio_requests = self._audio_buffer.requests
                 for row in np.flatnonzero(~kept).tolist():
                     req_idx, req_id = rows_req_idx[row], rows_req_id[row]
-                    if req_id not in audio_requests:
-                        self._audio_buffer.add(req_id)
+                    self._audio_buffer.add(req_id)
                     p = positions.pop(req_id, None)
                     if p is None:
                         first_rows.append(row)

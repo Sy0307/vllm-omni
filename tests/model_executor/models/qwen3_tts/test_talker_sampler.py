@@ -17,7 +17,7 @@ pytestmark = [
 VOCAB, MAX_REQS, EOS = 3072, 16, 2150
 
 
-def _setup(params, prompt_len=4):
+def _setup(params, prompt_len=4, use_fp64_gumbel=False):
     from vllm.v1.worker.gpu.sample.sampler import Sampler
     from vllm.v1.worker.gpu.states import RequestState
 
@@ -29,6 +29,7 @@ def _setup(params, prompt_len=4):
         vocab_size=VOCAB,
         device=device,
         req_states=req_states,
+        use_fp64_gumbel=use_fp64_gumbel,
     )
     # The fused kernel uses the upstream seeded Gumbel draw; compare against that path.
     base.use_flashinfer = False
@@ -136,3 +137,15 @@ def test_unsupported_requests_take_the_upstream_sampler():
     ref = base(logits.masked_fill(talker._codec_disallowed_mask, float("-inf")), batch)
     torch.testing.assert_close(out.sampled_token_ids, ref.sampled_token_ids, rtol=0, atol=0)
     assert out.logprobs_tensors is not None
+
+
+def test_fp64_gumbel_sampler_stays_upstream():
+    params = [_talker_params(seed=7), _talker_params(seed=8)]
+    base, fused, talker, _, slots, device = _setup(params, use_fp64_gumbel=True)
+    # The Talker's compute_logits then applies the codec mask itself.
+    assert not fused._enabled and not fused.fused_disallowed_mask
+    logits = torch.randn(len(slots), VOCAB, device=device).masked_fill(talker._codec_disallowed_mask, float("-inf"))
+    batch = _batch(slots, [9] * len(slots), [10] * len(slots), device)
+    out = fused(logits.clone(), batch)
+    ref = base(logits.clone(), batch)
+    torch.testing.assert_close(out.sampled_token_ids, ref.sampled_token_ids, rtol=0, atol=0)

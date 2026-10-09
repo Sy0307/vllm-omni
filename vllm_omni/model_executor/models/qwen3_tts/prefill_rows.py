@@ -21,19 +21,12 @@ import numpy as np
 import torch
 from vllm.triton_utils import tl, triton
 
-# Descriptor columns (int64).
-DESC_ROWS = 0  # prompt rows
-DESC_OFFSET = 1  # first prompt row of the scheduled span
-DESC_SPAN = 2  # scheduled tokens
-DESC_START = 3  # first inputs_embeds row of the span
-DESC_PACKED = 4  # first packed row of a new prompt; -1 for a stored prompt
-DESC_STORED = 5  # device address of a stored [rows, H] prompt
-DESC_PREFIX_START = 6
-DESC_PREFIX_LEN = 7
-DESC_PAD_ROW = 8
-DESC_EOS_ROW = 9
-DESC_TAIL_ROW = 10
-DESC_TEXT = 11  # index of the first text id in the ids array
+# Descriptor columns (int64), in order:
+#   0 prompt rows, 1 first prompt row of the scheduled span, 2 scheduled tokens,
+#   3 first inputs_embeds row of the span, 4 first packed row of a new prompt
+#   (-1 for a stored prompt), 5 device address of a stored [rows, H] prompt,
+#   6 prefix start, 7 prefix length, 8 pad row, 9 eos row, 10 tail row
+#   (constant-table rows), 11 index of the first text id in the ids array.
 DESC_WIDTH = 12
 
 
@@ -53,7 +46,7 @@ def _prefill_rows_kernel(
 ):
     req = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1).to(tl.int64)
-    d = desc_ptr + req * 12
+    d = desc_ptr + req * 12  # DESC_WIDTH
     n = tl.load(d + 0)
     offset = tl.load(d + 1)
     span = tl.load(d + 2)
@@ -159,8 +152,6 @@ def launch_prefill_rows(
 ) -> None:
     """Run the requests of ``rows``; ``staged`` is ``rows.array()`` readable by the device."""
     num_reqs = len(rows.desc) // DESC_WIDTH
-    if num_reqs == 0 or rows.max_rows == 0:
-        return
     hidden = embeds.shape[-1]
     _prefill_rows_kernel[(num_reqs, rows.max_rows)](
         staged,

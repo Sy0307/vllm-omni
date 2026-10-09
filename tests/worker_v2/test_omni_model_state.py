@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
+from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -66,6 +67,8 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.mtp_sampling_params = {}
     model.get_mtp_seed = lambda params: (getattr(params, "extra_args", None) or {}).get("test_seed")
     model.preprocess_batch_mrv2 = None
+    model.preprocess_prefill_rows_mrv2 = None
+    model.preprocess_prefill_updates_owned = False
     model.preprocess_decode_batch_mrv2 = None
     model.preprocess_decode_batch = None
     model.postprocess_batch_mrv2 = None
@@ -85,6 +88,9 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     state._eager_state = EagerMTPState(state)
     state._stream_pos = {}
     state._mtp_generators = {}
+    state._mtp_seeded = set()
+    state._mtp_replays = {}
+    state._stage_offsets = DeviceStager()
     state._mtp_runner = None
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step", "_mtp_offsets"):
         setattr(state, name, None)
@@ -696,14 +702,13 @@ def test_prefill_rows_written_for_the_batch_skip_per_request_preprocess():
     seen_rows: list[list[tuple[int, int, str]]] = []
     preprocessed: list[str] = []
 
-    def preprocess_prefill_rows_mrv2(self, *, entries, input_ids, input_embeds):
+    def preprocess_prefill_rows_mrv2(*, entries, input_ids, input_embeds):
         seen_rows.append([(start, n_tok, info["req_id"]) for start, n_tok, info in entries])
         start, n_tok, _info = entries[0]
         input_embeds[start : start + n_tok] = 9.0
         return [{"meta": {"talker_prefill_offset": n_tok}}, None]
 
-    # A hook counts only when the model class declares it.
-    type(state.model).preprocess_prefill_rows_mrv2 = preprocess_prefill_rows_mrv2
+    state.model.preprocess_prefill_rows_mrv2 = preprocess_prefill_rows_mrv2
 
     def preprocess(input_ids, input_embeds, **info):
         preprocessed.append(info["req_id"])

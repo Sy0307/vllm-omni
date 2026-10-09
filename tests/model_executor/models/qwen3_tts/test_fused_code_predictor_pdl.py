@@ -8,9 +8,10 @@ import types
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
     pytest.mark.skipif(
         not torch.cuda.is_available() or torch.version.hip is not None or torch.cuda.get_device_capability()[0] < 9,
         reason="requires CUDA sm90+ (programmatic dependent launch)",
@@ -42,11 +43,12 @@ def _launch(kind: str, a, w, out, ss_in, nt_in, ss_out, M, epi, a_rs=1, a_ro=0, 
     else:
         _cp_gemm_stream_kernel[(N // 64, 2, triton.cdiv(M, 32))](
             *common, K=K, N=N, HID=HID, RMAX=rmax, BN=64, BK=128, SK=2, BM=32, EPI=epi, NT_IN=nt_in, STAGES=2,
-            PREFETCH=True, NLP=triton.next_power_of_2(K // 2 // 64), num_warps=4, launch_pdl=True,
+            NLP=triton.next_power_of_2(K // 2 // 64), num_warps=4, launch_pdl=True,
         )  # fmt: skip
     assert int(cnt.abs().sum()) == 0, "split-K arrival counters must return to zero"
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("kind", ["panel", "stream"])
 @torch.inference_mode()
 def test_chain_gemm_epilogues_match_reference(kind: str):
@@ -132,6 +134,7 @@ def _predictor(dev: str):
     )  # fmt: skip
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_pdl_predictor_matches_cublas_path_and_replays_in_graphs(monkeypatch):
     from vllm_omni.model_executor.models.qwen3_tts import fused_code_predictor as fcp
@@ -140,17 +143,19 @@ def test_pdl_predictor_matches_cublas_path_and_replays_in_graphs(monkeypatch):
     pred = _predictor(dev)
     pdl = fcp.FusedCodePredictor(pred, 64)
     assert pdl._pdl_configs, "sm90+ must take the PDL chain"
+    # Every config bucket at its limit and just above the previous one, read before the configs are cleared.
+    limits = [limit for limit, _ in fcp._PDL_CONFIGS]
+    batches = sorted({1, 2, 5, *limits, *(limit + 1 for limit in limits[:-1])})
     monkeypatch.setattr(fcp, "_PDL_CONFIGS", ())
     ref = fcp.FusedCodePredictor(pred, 64)
     assert ref._pdl_config(1) is None
 
-    for B in sorted({1, 2, 5, *(limit for limit, _ in fcp._PDL_CONFIGS if limit <= 64)}):
+    for B in batches:
+        assert pdl._pdl_config(B) is not None
         gen = torch.Generator(device=dev).manual_seed(B)
         code0 = torch.randint(0, VOCAB, (B, 1), device=dev, generator=gen)
         emb = torch.randn(B, 1, 2048, device=dev, generator=gen).to(torch.bfloat16)
         hid = torch.randn(B, 1, 2048, device=dev, generator=gen).to(torch.bfloat16)
-        if pdl._pdl_config(B) is None:
-            continue
         # greedy: constant Gumbel noise, no top-k
         half = torch.full((B, GROUPS - 1, VOCAB), 0.5, device=dev)
         got = pdl(code0, emb, hid, 1.0, 0, half)

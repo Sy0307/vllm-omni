@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Implicit-GEMM dilated unit convs match the patch-matrix path across calls and slots."""
+"""Implicit-GEMM dilated unit convs and the tap-GEMM output conv match the direct paths across calls and slots."""
 
 import pytest
 import torch
@@ -43,7 +43,7 @@ def test_dilated_unit_conv_matches_patch_matrix_path():
     decoder = decoder.to(device="cuda", dtype=torch.bfloat16)
     decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
     stream = StreamingCodecDecoder(decoder, num_slots=17, dtype=torch.bfloat16)
-    assert stream.dilated_igemm
+    assert stream.dilated_igemm and stream.conv_out_gemm
     assert {blk["c_out"] for blk in stream.blocks} >= set(_DILATED_IGEMM)
 
     batch, frames = 16, 5
@@ -51,8 +51,9 @@ def test_dilated_unit_conv_matches_patch_matrix_path():
     # Reversed, non-contiguous slots: rows of one tile belong to different requests.
     slots = torch.arange(batch, 0, -1, device="cuda", dtype=torch.int32)
 
-    def decode(use_igemm: bool) -> torch.Tensor:
+    def decode(use_igemm: bool, use_out_gemm: bool) -> torch.Tensor:
         stream.dilated_igemm = use_igemm
+        stream.conv_out_gemm = use_out_gemm
         out = []
         for t in range(frames):
             pos = torch.full((batch,), t, device="cuda", dtype=torch.int32)
@@ -62,7 +63,8 @@ def test_dilated_unit_conv_matches_patch_matrix_path():
         out.append(stream(codes[:, frames:].contiguous(), slots, pos).clone())
         return torch.cat(out, dim=1)
 
-    expected = decode(False)
-    actual = decode(True)
-    assert actual.abs().max() > 0
-    torch.testing.assert_close(actual, expected, rtol=0, atol=4e-3)
+    expected = decode(False, False)
+    for flags in ((True, False), (False, True), (True, True)):
+        actual = decode(*flags)
+        assert actual.abs().max() > 0
+        torch.testing.assert_close(actual, expected, rtol=0, atol=4e-3, msg=lambda m, flags=flags: f"{flags}: {m}")
