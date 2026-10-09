@@ -27,6 +27,7 @@ class _StageVllmConfig:
 class _Replica:
     def __init__(self, *, hang: bool = False, fail: bool = False):
         self.calls: list[list[str]] = []
+        self.started = asyncio.Event()
         # Released for a healthy replica; a hung replica blocks until the test sets it.
         self.gate = asyncio.Event()
         if not hang:
@@ -36,6 +37,7 @@ class _Replica:
     async def call_utility_async(self, method, request_ids):
         assert method == "omni_release_request_resources"
         self.calls.append(list(request_ids))
+        self.started.set()
         await self.gate.wait()
         if self.fail:
             raise RuntimeError("replica gone")
@@ -50,8 +52,7 @@ def _pool(*replicas: _Replica) -> StagePool:
 
 
 async def _settle(pool: StagePool) -> None:
-    while pool._release_flushers:
-        await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(*pool._release_flushers.values()), timeout=2.0)
 
 
 @pytest.mark.asyncio
@@ -74,8 +75,7 @@ async def test_completions_during_an_rpc_join_that_replicas_next_batch() -> None
     pool = _pool(replica)
 
     pool.schedule_release_request_resources(["a"])
-    while not replica.calls:
-        await asyncio.sleep(0)
+    await asyncio.wait_for(replica.started.wait(), timeout=2.0)
     pool.schedule_release_request_resources(["b"])
     pool.schedule_release_request_resources(["c"])
     await asyncio.sleep(0)
@@ -103,7 +103,7 @@ async def test_hung_replica_does_not_delay_healthy_replica_batches(monkeypatch) 
     assert healthy.calls == [["a"], ["b"]]
     assert hung.calls == [["a"]]
 
-    await asyncio.wait_for(_settle(pool), timeout=2.0)
+    await _settle(pool)
     assert hung.calls == [["a"], ["b"]]
     assert len(warn) == 2  # both of the hung replica's RPCs timed out
 
@@ -114,8 +114,7 @@ async def test_removed_replica_drops_its_pending_releases() -> None:
     pool = _pool(replica)
 
     pool.schedule_release_request_resources(["a"])
-    while not replica.calls:
-        await asyncio.sleep(0)
+    await asyncio.wait_for(replica.started.wait(), timeout=2.0)
     pool.schedule_release_request_resources(["b"])
     pool.clients[0] = None
     replica.gate.set()
