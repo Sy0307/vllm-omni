@@ -92,6 +92,11 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 # `available_replica_ids()` (elastic membership, replica eviction) while idle.
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
+# Prompt fields an async-chunk prewarm placeholder replaces or serializes itself.
+_PREWARM_UNCOPIED_PROMPT_KEYS = frozenset(
+    ("prompt_token_ids", "multi_modal_data", "mm_processor_kwargs", "additional_information")
+)
+
 
 def _event_driven_orch_enabled(*, default: bool = False) -> bool:
     value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
@@ -2718,7 +2723,21 @@ class OrchestratorBase:
                 if isinstance(original_prompt, dict):
                     from vllm_omni.engine.request_snapshot import copy_request_snapshot
 
-                    base_input = copy_request_snapshot(original_prompt)
+                    # The placeholder replaces the prompt and multimodal fields,
+                    # so they are not copied (multimodal inputs can be megabytes).
+                    # additional_information is serialized below, which copies
+                    # tensor bytes; its containers are copied, its tensors shared.
+                    memo: dict[int, Any] = {}
+                    base_input = copy_request_snapshot(
+                        {k: v for k, v in original_prompt.items() if k not in _PREWARM_UNCOPIED_PROMPT_KEYS},
+                        memo,
+                    )
+                    if "additional_information" in original_prompt:
+                        base_input["additional_information"] = copy_request_snapshot(
+                            original_prompt["additional_information"],
+                            memo,
+                            shared_types=(torch.Tensor,),
+                        )
                 else:
                     base_input = {}
 
