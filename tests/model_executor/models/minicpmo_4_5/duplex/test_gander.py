@@ -195,6 +195,65 @@ def test_mrv2_keeps_gander_grammar_after_partial_prefill(
         assert history == [*before, wanted] and state.generated_tokens == generated
 
 
+@pytest.mark.parametrize("terminator", ["listen_token_id", "interrupt_token_id"])
+def test_mrv2_closed_gander_unit_preserves_action_state_and_rng(gander_host_sampler, ids, mocker, terminator):
+    import numpy as np
+    import torch
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import MiniCPMO45DuplexSampler
+
+    model = gander_host_sampler
+    model._mrv2_duplex_infos = [
+        {
+            "req_id": "request",
+            "sampling_params": SamplingParams(temperature=0.7, seed=42),
+            "duplex": {"data_plane": True, "session_id": "session", "seq": 1, "payload": {}},
+        }
+    ]
+    base = mocker.Mock(spec=Sampler)
+    base.side_effect = lambda logits, batch: SamplerOutput(
+        sampled_token_ids=logits.argmax(-1).view(-1, 1),
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=torch.ones(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+    )
+    sampler = MiniCPMO45DuplexSampler(base, model)
+    batch = mocker.Mock(
+        spec=InputBatch,
+        num_reqs=1,
+        num_computed_prefill_tokens_np=np.array([0]),
+        num_scheduled_tokens=np.array([1]),
+        prefill_len_np=np.array([1]),
+    )
+    logits = torch.full((1, 128), float("-inf"))
+    logits[0, ids[terminator]] = 20.0
+    assert sampler(logits.clone(), batch).sampled_token_ids.item() == ids[terminator]
+    state = model._minicpmo45_duplex_data_plane_helper.sessions["request"]
+    history = list(sampler._requests["request"][1])
+    generated = list(state.generated_tokens)
+    pending = state.pending_terminator_token
+    generator = sampler._generators["request"]
+    rng = generator.get_state()
+    # Async lookahead belongs to the closed unit; these logits must never
+    # reopen a turn or enter the next action's decoder/RNG history.
+    logits.fill_(float("-inf"))
+    logits[0, ids["speak_token_id"]] = 20.0
+    assert sampler(logits.clone(), batch).sampled_token_ids.item() == ids[terminator]
+    assert sampler._requests["request"][1] == history
+    assert state.generated_tokens == generated and state.pending_terminator_token == pending
+    assert torch.equal(generator.get_state(), rng)
+    # The next genuine media unit may act normally on the same request.
+    model._mrv2_duplex_infos[0]["duplex"]["seq"] = 2
+    assert sampler(logits.clone(), batch).sampled_token_ids.item() == ids["speak_token_id"]
+    assert sampler._requests["request"][1] == [ids["speak_token_id"]]
+    assert state.generated_tokens == [*generated, ids["speak_token_id"]]
+
+
 @pytest.mark.parametrize("temperature", [0.0, 0.75])
 def test_gander_host_snapshot_refreshes_without_metadata_scalar_reads(gander_host_sampler, ids, mocker, temperature):
     from dataclasses import replace

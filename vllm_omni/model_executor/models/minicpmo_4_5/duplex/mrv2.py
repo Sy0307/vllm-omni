@@ -864,10 +864,14 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             logitsprocs=LogitsProcessors(),
         )
         self.model.prepare_duplex_sampling(logits, metadata, tuple(rows))
+        discarded_rows = getattr(self.model, "_minicpmo45_discarded_duplex_rows", ())
         token_ids = self.model._minicpmo45_native_duplex_token_ids()
         terminators = self.model._minicpmo45_chunk_terminator_token_ids(token_ids)
         fresh_rows = [
-            row for row in rows if not histories[row.row_idx] or histories[row.row_idx][-1] not in terminators
+            row
+            for row in rows
+            if row.row_idx not in discarded_rows
+            and (not histories[row.row_idx] or histories[row.row_idx][-1] not in terminators)
         ]
         sessions = [row.session_id for row in fresh_rows if row.session_id is not None]
         batch_sampled = {}
@@ -906,7 +910,11 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             batch_sampled = dict(zip(indices, sampled_rows, strict=True))
         for row in rows:
             history = histories[row.row_idx]
-            if history and history[-1] in terminators:
+            if row.row_idx in discarded_rows:
+                # Async lookahead after any model-owned unit terminator has
+                # no accepted sample. Preserve its action, state and RNG.
+                sampled = history[-1] if history else 0
+            elif history and history[-1] in terminators:
                 sampled = history[-1]
             else:
                 sampled = (
