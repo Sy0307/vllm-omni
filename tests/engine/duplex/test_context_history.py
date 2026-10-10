@@ -343,6 +343,90 @@ async def test_native_speech_interrupt_preserves_pending_application_tool(monkey
 
 
 @pytest.mark.asyncio
+async def test_journal_session_rejects_public_truncation_without_changing_history():
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from vllm_omni.engine.duplex.commands import AckPlayback, TruncateItem
+    from vllm_omni.engine.duplex.realtime_events import retrieve_item_events
+
+    h = await initialized()
+    try:
+        # initialized() attaches the real history after the ordinary MiniCPM
+        # harness opens. A journal-enabled runner must narrow the open result too.
+        h.session.capabilities = replace(h.session.capabilities, supports_audio_truncate=False)
+        rid = h.stage0_request_id()
+        await h.runner.model._send_one_model_output_event(
+            {
+                "data_plane_request_id": rid,
+                "model_turn_id": h.session.turn_id,
+                "text": "abcdefgh",
+                "audio": "ABAAEA==",
+                "audio_format": "pcm16",
+                "sample_rate_hz": 24000,
+                "audio_duration_ms": 8000,
+                "end_of_turn": True,
+            },
+            expected_epoch=h.session.epoch,
+        )
+        response_id = h.session.last_response_id
+        assert response_id is not None
+        item_id = "item_" + response_id
+        before = deepcopy(h.runner.ctx.history.prompts)
+        projector = h.runner.out.require_projector()
+        original_item = retrieve_item_events(projector, {"item_id": item_id})[0].to_realtime()["item"]
+        for command in [
+            TruncateItem(item_id=item_id, audio_end_ms=4000, event_id="truncate"),
+            translate_realtime_command(
+                {
+                    "type": "playback.ack",
+                    "response_id": response_id,
+                    "played_ms": 4000,
+                    "truncate": True,
+                    "event_id": "ack-cut",
+                }
+            ),
+        ]:
+            events = await h.run(command)
+            rejection = [e for e in events if isinstance(e, ErrorEvent)]
+            assert len(rejection) == 1 and rejection[0].code == "audio_truncate_unsupported"
+            assert not any(e.type in {"conversation.item.truncated", "playback.acknowledged"} for e in events)
+            assert retrieve_item_events(projector, {"item_id": item_id})[0].to_realtime()["item"] == original_item
+            assert h.runner.ctx.history.prompts == before
+            assert not projector.item_truncation_cursors
+        events = await h.run(AckPlayback(response_id=response_id, played_ms=8000))
+        assert any(e.type == "playback.acknowledged" for e in events)
+        assert not h.runner.ctx.run.closing
+        assert h.runner.ctx.history.prompts == before
+        await h.run(append_audio())
+        complete(h, seq=2)
+        await h.runner.ctx.history.wait_applied()
+        assert len(h.runner.ctx.history.prompts) == 2
+    finally:
+        await close_harness(h)
+
+
+def test_journal_runner_does_not_advertise_audio_truncation(mocker):
+    from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
+
+    h_session = mocker.Mock()
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import minicpmo45_native_capabilities
+
+    h_session.capabilities = minicpmo45_native_capabilities()
+    h_session.runtime_config = {"gander_enabled": True}
+    h_session.epoch = 0
+    h_session.model_state = mocker.Mock()
+    plugin = mocker.Mock()
+    plugin.context_policy.return_value = GanderContextPolicy()
+    runner = DuplexSessionRunner(
+        session=h_session, plugin=plugin, stage_port=mocker.Mock(), manager=mocker.Mock(), model_config=None
+    )
+    assert runner.ctx.history is not None
+    assert not h_session.capabilities.supports_audio_truncate
+    assert h_session.capabilities.supports_playback_ack
+
+
+@pytest.mark.asyncio
 async def test_replacement_waits_for_model_completion_and_suppresses_replay():
     h = await initialized()
     task = None

@@ -172,6 +172,13 @@ class SessionControl:
             )
             return
         if turn_event == "conversation.item.truncate":
+            if not session.capabilities.supports_audio_truncate:
+                self._out.emit_error(
+                    "audio_truncate_unsupported",
+                    "This session cannot truncate model audio history",
+                    event_id=realtime_event_id,
+                )
+                return
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None
             audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None

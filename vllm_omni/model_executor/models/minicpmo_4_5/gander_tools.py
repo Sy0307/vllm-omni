@@ -380,7 +380,6 @@ def prepare_context_input(item: dict, current: dict, *, epoch: int) -> tuple[dic
             len(tokenizer.encode(prefix, add_special_tokens=False))
             + ref_tokens
             + len(tokenizer.encode(suffix, add_special_tokens=False))
-            + len(tokenizer.encode(runtime.get("initial_user_text") or "", add_special_tokens=False))
         )
     else:
         raise error("kind must be tool_result, runtime_event, or task_slate")

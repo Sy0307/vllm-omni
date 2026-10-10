@@ -5,6 +5,7 @@
 import logging
 import time
 from collections.abc import Mapping, Sequence
+from threading import Lock
 from typing import Any, cast
 
 import torch
@@ -347,6 +348,7 @@ def _is_aborted(request: Any) -> bool:
 # against more codec steps. Written by the output path, read by the scheduler
 # of the same EngineCore process.
 _FIRST_WINDOW_YIELD_UNTIL: dict[str, float] = {}
+_FIRST_WINDOW_YIELD_LOCK = Lock()
 # Shared by the Talker and its scheduler when this processor runs on MRv2.
 MRV2_DECODE_BURST_STEPS = 4
 _FIRST_WINDOW_YIELD_S = 0.025
@@ -354,10 +356,11 @@ _FIRST_WINDOW_YIELD_S = 0.025
 
 def scheduling_hold_request_ids(now: float) -> set[str]:
     """Internal request ids the Talker scheduler should not schedule at ``now``."""
-    expired = [request_id for request_id, until in _FIRST_WINDOW_YIELD_UNTIL.items() if until <= now]
-    for request_id in expired:
-        del _FIRST_WINDOW_YIELD_UNTIL[request_id]
-    return set(_FIRST_WINDOW_YIELD_UNTIL)
+    with _FIRST_WINDOW_YIELD_LOCK:
+        expired = [request_id for request_id, until in _FIRST_WINDOW_YIELD_UNTIL.items() if until <= now]
+        for request_id in expired:
+            del _FIRST_WINDOW_YIELD_UNTIL[request_id]
+        return set(_FIRST_WINDOW_YIELD_UNTIL)
 
 
 def tts2code2wav_async_chunk(
@@ -506,7 +509,8 @@ def tts2code2wav_async_chunk(
     new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else release_frames)
     if new_token_count and not flush_pending and int(state.get("response_frames", 0)) == 0:
         if native_duplex and getattr(getattr(transfer_manager, "config", None), "use_v2_model_runner", False):
-            _FIRST_WINDOW_YIELD_UNTIL[internal_id] = time.monotonic() + _FIRST_WINDOW_YIELD_S
+            with _FIRST_WINDOW_YIELD_LOCK:
+                _FIRST_WINDOW_YIELD_UNTIL[internal_id] = time.monotonic() + _FIRST_WINDOW_YIELD_S
     state["response_frames"] = int(state.get("response_frames", 0)) + new_token_count
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]

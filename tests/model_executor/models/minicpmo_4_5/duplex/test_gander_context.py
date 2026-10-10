@@ -220,6 +220,80 @@ def test_opening_text_unit_has_exact_slots_and_does_not_consume_audio():
         helper._stage_control_embeddings(state, payload, epoch=0, seq=2)
 
 
+@pytest.mark.parametrize("initial_text", ["", "opening question"])
+def test_slate_replacement_keeps_opening_text_out_of_prefix_reservation(monkeypatch, initial_text):
+    from tests.model_executor.models.minicpmo_4_5.duplex.test_gander_tools import Tokenizer
+    from vllm_omni.model_executor.models.minicpmo_4_5 import gander_tools
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import _apply_first_append_context_tokens
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    tokenizer = Tokenizer()
+    monkeypatch.setattr(gander_tools, "tokenizer_for", lambda path: tokenizer)
+    runtime = {
+        "gander_enabled": True,
+        "gander_tokenizer_path": "fake",
+        "instructions": "system",
+        "initial_user_text": initial_text,
+    }
+    updated, _ = gander_tools.prepare_context_replacement(
+        {"kind": "task_slate", "event_id": "slate", "epoch": 0, "version": 1, "slate": "working"},
+        runtime,
+        epoch=0,
+    )
+    expected = {"gander_enabled": True, "gander_instructions": updated["gander_instructions"]}
+    _apply_first_append_context_tokens(
+        expected, tokenizer=tokenizer, instructions="system", initial_user_text=initial_text, ref_sample_count=None
+    )
+    assert updated["duplex_first_append_context_tokens"] == expected["duplex_first_append_context_tokens"]
+    prefix_count = expected["duplex_first_append_context_tokens"]
+    payload = {
+        "type": "text",
+        "token_ids": tokenizer.encode(initial_text),
+        "gander_replay": True,
+        "context_version": updated["gander_context_version"],
+    }
+    prompt = build_duplex_data_plane_prompt(
+        request_id="new",
+        fence=DuplexFence("s", epoch=1),
+        session_config={},
+        runtime_config=updated,
+        seq=1,
+        turn_seq=1,
+        payload=payload,
+        final=False,
+    )
+    helper = object.__new__(MiniCPMO45Stage0DuplexRuntime)
+    helper.unit_token_id, helper.unit_end_token_id, helper.chunk_eos_token_id = 10, 11, 12
+    helper._embed_token = lambda token: torch.tensor([[float(token)]])
+    helper._special_token_ids = lambda: {}
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="s",
+        context_token_ids=[1] * prefix_count,
+        context_embeds=[torch.ones(prefix_count, 1)],
+        gander_context_version=updated["gander_context_version"],
+    )
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "llm"
+    model.config = SimpleNamespace(gander_unit8=True)
+    model._duplex_data_plane_helper = lambda: helper
+    model._minicpmo45_duplex_session_state = lambda *args, **kwargs: state
+    model.get_input_embeddings = lambda ids: ids.float().unsqueeze(-1)
+    reserved = len(prompt["prompt_token_ids"])
+    _, embeddings, _ = model.preprocess(
+        torch.zeros(reserved, dtype=torch.long),
+        request_id="new",
+        duplex_prompt_len=reserved,
+        duplex_token_offset=0,
+        duplex=metadata(prompt),
+    )
+    assert embeddings.shape[0] == prefix_count + 1 + len(payload["token_ids"]) == reserved
+
+
 def test_seeded_text_is_counted_in_its_own_unit_and_not_in_the_system_prefix():
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
         MiniCPMO45DuplexPlugin,

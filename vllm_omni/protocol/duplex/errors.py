@@ -76,6 +76,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "playback_item_mismatch": "invalid_request_error",
     "playback_item_not_found": "invalid_request_error",
     "playback_ack_too_late": "invalid_request_error",
+    "audio_truncate_unsupported": "invalid_request_error",
     "unsupported_audio_format": "invalid_request_error",
     "unsupported_turn_detection": "invalid_request_error",
     "unsupported_ref_audio_path": "invalid_request_error",

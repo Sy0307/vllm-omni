@@ -459,6 +459,13 @@ session's history.
 
 An `input.context.appended` event confirms queueing. `input.context.applied`
 confirms completion of that input unit, including an empty-output LISTEN unit.
+Journal-enabled sessions do not support audio-cursor truncation: their journal
+records generated tokens, without audio-aligned token spans for rebuilding a
+played-only KV prefix. The runner narrows `supports_audio_truncate` to false;
+explicit truncate commands fail before changing either projected or model
+history. Ordinary playback ACKs and native output cancellation remain separate
+from unit-level context editing.
+
 `input.context.replaced` is emitted after reconstruction succeeds and carries
 the new epoch. The Realtime projection prefixes these custom event types with
 `duplex.` and nests the domain payload under `event`.

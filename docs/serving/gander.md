@@ -118,6 +118,15 @@ Default history rollover starts at 128 units and retains 96; configure
 MiniCPM's `duplex_window_config` and sliding-window parameters are rejected for
 Gander; use `gander_history` so rollover preserves Gander's protected context.
 Automatic rollover waits for active responses and acknowledged audio playback.
+Gander sessions advertise `supports_audio_truncate: false` and reject
+`conversation.item.truncate` and `playback.ack` with `truncate: true` as
+`audio_truncate_unsupported`, without changing the item or model journal.
+The native KV and replay journal retain generated tokens; they do not have
+an audio-aligned token prefix that could safely remove unplayed words.
+Ordinary playback acknowledgements track progress, and clients must still
+clear their playback queue on interruption. Use the versioned context-edit
+API for supported unit-level changes; a playback cursor is not a KV edit.
+
 Hard context and replay byte/token limits still apply; each session has a
 256 MiB prompt journal limit, at most 64 registered calls, and 128 context
 receipts. These bounds are admission limits, not a long-session garbage

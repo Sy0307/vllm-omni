@@ -1015,7 +1015,12 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
 
-After this acknowledgement, `conversation.item.retrieve` returns the truncated
+Check `capabilities.supports_audio_truncate` before sending this command.
+Gander's generated-token journal cannot apply an audio-aligned KV cut, so its
+sessions advertise `false` and reject this command and truncating playback ACKs
+with `audio_truncate_unsupported`. Ordinary playback ACKs remain supported.
+
+After a successful acknowledgement, `conversation.item.retrieve` returns the truncated
 transcript. Without text/audio alignment marks, its prefix is estimated from
 the requested position and audio duration; this is not exact word alignment.
 

@@ -24,7 +24,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, TypeVar
 
 from vllm.logger import init_logger
@@ -210,6 +210,9 @@ class DuplexSessionRunner:
         if policy is not None:
             from vllm_omni.engine.duplex.session.context_history import DuplexContextHistory
 
+            # A prompt journal retains generated tokens, not audio-aligned token
+            # spans. Do not promise KV truncation by only editing the public item.
+            session.capabilities = replace(session.capabilities, supports_audio_truncate=False)
             self.ctx.history = DuplexContextHistory(
                 self.ctx,
                 policy,
@@ -708,6 +711,13 @@ class DuplexSessionRunner:
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
         elif isinstance(command, TruncateItem):
+            if not self.session.capabilities.supports_audio_truncate:
+                self._emit_error(
+                    "audio_truncate_unsupported",
+                    "This session cannot truncate model audio history",
+                    event_id=command.event_id,
+                )
+                return
             control = resolve_truncate_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:

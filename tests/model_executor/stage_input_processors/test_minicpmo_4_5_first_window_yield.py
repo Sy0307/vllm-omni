@@ -44,6 +44,66 @@ def test_only_mrv2_native_first_stream_window_yields(monkeypatch, mocker, v2, na
     assert processor.scheduling_hold_request_ids(11.0) == set()
 
 
+def test_sender_waits_for_scheduler_expiry_snapshot(monkeypatch, mocker):
+    from threading import Event, Lock, Thread
+
+    original_lock = Lock()
+
+    class CheckedDeadlines(dict):
+        def items(self):
+            assert original_lock.locked(), "scheduler expiry bypassed the shared lock"
+            return super().items()
+
+    table = CheckedDeadlines({"expired": 0.0})
+    monkeypatch.setattr(processor, "_FIRST_WINDOW_YIELD_UNTIL", table)
+    manager = _manager()
+    manager.config = mocker.Mock(spec=OmniModelConfig, use_v2_model_runner=True)
+    manager.connector.config["extra"]["initial_codec_chunk_frames"] = 10
+    blocked = Event()
+    entered = Event()
+    failures = []
+
+    class ObservedLock:
+        def __enter__(self):
+            entered.set()
+            if not original_lock.acquire(blocking=False):
+                blocked.set()
+                original_lock.acquire()
+            return self
+
+        def __exit__(self, *args):
+            original_lock.release()
+
+    monkeypatch.setattr(processor, "_FIRST_WINDOW_YIELD_LOCK", ObservedLock(), raising=False)
+
+    def publish():
+        try:
+            assert (
+                processor.tts2code2wav_async_chunk(
+                    manager, _duplex_delta(*range(10)), _request("external", "new"), False
+                )
+                is not None
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = Thread(target=publish)
+    try:
+        with processor._FIRST_WINDOW_YIELD_LOCK:
+            entered.clear()
+            thread.start()
+            assert entered.wait(5), "first-window publisher bypassed the shared lock"
+            assert blocked.wait(5)
+            assert table == {"expired": 0.0}
+            table.pop("expired")
+    finally:
+        if thread.ident is not None:
+            thread.join(5)
+    assert not thread.is_alive()
+    assert not failures, failures
+    assert processor.scheduling_hold_request_ids(0.0) == {"new"}
+
+
 def test_hold_ids_expire_at_their_deadline(monkeypatch):
     monkeypatch.setattr(processor, "_FIRST_WINDOW_YIELD_UNTIL", {"a": 10.0, "b": 20.0})
     assert processor.scheduling_hold_request_ids(5.0) == {"a", "b"}
