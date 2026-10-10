@@ -406,7 +406,7 @@ def test_native_duplex_mid_unit_tts_bos_keeps_earlier_text(opening, turn_end) ->
 
     expected = [21, 22, 9301, 9310] if turn_end else [21, 22, 9301]
     assert info["ids"]["tts"] == expected
-    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[3 : 3 + len(expected)])
+    torch.testing.assert_close(get_tts_handoff(info)[1], latent[3 : 3 + len(expected)])
     assert info.get("meta", {}).get("turn_end", False) is turn_end
 
 
@@ -424,7 +424,7 @@ def test_native_duplex_folded_boundary_with_mid_unit_tts_bos(terminator) -> None
 
     expected = [21, 22, 9301, *terminator[:-1]]
     assert info["ids"]["tts"] == expected
-    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[2 : 2 + len(expected)])
+    torch.testing.assert_close(get_tts_handoff(info)[1], latent[2 : 2 + len(expected)])
 
 
 @pytest.mark.parametrize("folded_decisions", [0, 1, 2])
