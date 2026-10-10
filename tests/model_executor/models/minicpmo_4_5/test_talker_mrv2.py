@@ -225,7 +225,7 @@ def test_mrv2_native_unit_keeps_codec_budget_and_final_eos(mocker, speech_tokens
     meta = {"turn_start": False, "turn_end": turn_end, "gander_context_version": 7}
     if speech_tokens is not None:
         meta["gander_speech_tokens"] = speech_tokens
-    info = {"native_duplex": True, "meta": meta}
+    info = {"native_duplex": True, "duplex": {"epoch": 3, "turn_id": 5}, "meta": meta}
     _, _, updates = talker.preprocess(
         torch.zeros(2, dtype=torch.long),
         None,
@@ -261,6 +261,8 @@ def test_mrv2_native_unit_keeps_codec_budget_and_final_eos(mocker, speech_tokens
     assert talker._mrv2_mask_eos.tolist() == [masked]
     assert out.multimodal_outputs["meta"]["codec_frame_valid"].tolist() == [True]
     assert talker._mrv2_output_meta[1]["gander_context_version"][0].item() == 7
+    assert talker._mrv2_output_meta[1]["duplex_epoch"][0].item() == 3
+    assert talker._mrv2_output_meta[1]["duplex_turn_id"][0].item() == 5
 
 
 @pytest.mark.parametrize("forced", [None, [False, True]])

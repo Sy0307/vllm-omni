@@ -162,6 +162,7 @@ def test_mrv2_keeps_gander_grammar_after_partial_prefill(
     base.side_effect = lambda logits, batch: SamplerOutput(
         sampled_token_ids=logits.argmax(-1).view(-1, 1),
         logprobs_tensors=None,
+        num_nans=None,
         num_sampled=torch.ones(1, dtype=torch.int32),
         num_rejected=torch.zeros(1, dtype=torch.int32),
     )
