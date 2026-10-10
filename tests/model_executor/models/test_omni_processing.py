@@ -10,7 +10,14 @@ Tests that:
 Adapted from vllm/tests/models/multimodal/processing/test_common.py
 """
 
+import json
+import os
+import time
+from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import cache, partial
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -38,6 +45,73 @@ from vllm_omni.config import OmniModelConfig
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+_AMD_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
+_TIMING_PREFIX = "OMNI_PROCESSOR_PHASE "
+_TIMING_PHASES = (
+    "config_tokenizer_setup",
+    "processor_construction",
+    "prompt_input_preparation",
+    "baseline_token_processing",
+    "cached_token_processing",
+    "baseline_text_processing",
+    "cached_text_processing",
+    "assertions",
+)
+
+
+class _PhaseTimer:
+    def __init__(self, nodeid: str):
+        self.enabled = os.getenv(_AMD_TIMING_ENV) == "1"
+        self.nodeid = nodeid
+        self.elapsed: defaultdict[str, float] = defaultdict(float)
+
+    def _emit(self, payload: dict[str, object]) -> None:
+        print(
+            f"{_TIMING_PREFIX}{json.dumps(payload, sort_keys=True, separators=(',', ':'))}",
+            flush=True,
+        )
+
+    @contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        if not self.enabled:
+            yield
+            return
+
+        started = time.perf_counter()
+        self._emit({"event": "start", "nodeid": self.nodeid, "phase": name})
+        status = "error"
+        try:
+            yield
+            status = "success"
+        finally:
+            seconds = time.perf_counter() - started
+            self.elapsed[name] += seconds
+            self._emit(
+                {
+                    "event": "end",
+                    "nodeid": self.nodeid,
+                    "phase": name,
+                    "seconds": round(seconds, 9),
+                    "status": status,
+                }
+            )
+
+    def report(self) -> None:
+        if not self.enabled:
+            return
+
+        for phase in _TIMING_PHASES:
+            if phase not in self.elapsed:
+                continue
+            self._emit(
+                {
+                    "event": "summary",
+                    "nodeid": self.nodeid,
+                    "phase": phase,
+                    "seconds": round(self.elapsed[phase], 9),
+                }
+            )
 
 
 def random_image(rng: np.random.RandomState, min_wh: int, max_wh: int):
@@ -76,6 +150,14 @@ _PROCESSOR_METADATA_PATTERNS = ("*.json", "*.txt")
 def _get_model_archs_to_test() -> list[str]:
     """Return architecture strings for parametrization."""
     return list(_MULTIMODAL_OMNI_EXAMPLE_MODELS.keys())
+
+
+def _get_processor_snapshot_smoke_archs() -> list[str]:
+    """Select one processor architecture for each backing model repository."""
+    representatives: dict[str, str] = {}
+    for model_arch, info in _MULTIMODAL_OMNI_EXAMPLE_MODELS.items():
+        representatives.setdefault(info.default, model_arch)
+    return list(representatives.values())
 
 
 def get_text_token_prompts(
@@ -177,43 +259,49 @@ def _test_processing_correctness(
     hit_rate: float,
     num_batches: int,
     simplify_rate: float,
+    timing: _PhaseTimer,
 ):
     """Run the full processing-correctness test for one Omni model."""
     info = _MULTIMODAL_OMNI_EXAMPLE_MODELS[model_arch]
     info.check_transformers_version(on_fail="skip")
     info.check_available_online(on_fail="skip")
 
-    model_config = _build_model_config(model_arch, info)
+    with timing.phase("config_tokenizer_setup"):
+        model_config = _build_model_config(model_arch, info)
 
-    model_cls = _get_model_class_for_omni_processing(model_config)
-    factories = model_cls._processor_factory
-    ctx = InputProcessingContext(
-        model_config,
-        tokenizer=cached_tokenizer_from_config(model_config),
-    )
-    cache = MultiModalProcessorOnlyCache(model_config)
+    with timing.phase("processor_construction"):
+        model_cls = _get_model_class_for_omni_processing(model_config)
+        factories = model_cls._processor_factory
 
-    processing_info = factories.info(ctx)
-    supported_mm_limits = processing_info.get_supported_mm_limits()
-    limit_mm_per_prompt_ints = {
-        modality: 3 if limit is None else limit for modality, limit in supported_mm_limits.items()
-    }
+    with timing.phase("config_tokenizer_setup"):
+        ctx = InputProcessingContext(
+            model_config,
+            tokenizer=cached_tokenizer_from_config(model_config),
+        )
 
-    def _to_dummy_options(modality: str, count: int) -> BaseDummyOptions:
-        if modality == "video":
-            return VideoDummyOptions(count=count)
-        if modality == "image":
-            return ImageDummyOptions(count=count)
-        if modality == "audio":
-            return AudioDummyOptions(count=count)
-        return BaseDummyOptions(count=count)
+    with timing.phase("processor_construction"):
+        cache = MultiModalProcessorOnlyCache(model_config)
+        processing_info = factories.info(ctx)
+        supported_mm_limits = processing_info.get_supported_mm_limits()
+        limit_mm_per_prompt_ints = {
+            modality: 3 if limit is None else limit for modality, limit in supported_mm_limits.items()
+        }
 
-    model_config.get_multimodal_config().limit_per_prompt = {
-        modality: _to_dummy_options(modality, count) for modality, count in limit_mm_per_prompt_ints.items()
-    }
+        def _to_dummy_options(modality: str, count: int) -> BaseDummyOptions:
+            if modality == "video":
+                return VideoDummyOptions(count=count)
+            if modality == "image":
+                return ImageDummyOptions(count=count)
+            if modality == "audio":
+                return AudioDummyOptions(count=count)
+            return BaseDummyOptions(count=count)
 
-    baseline_processor = factories.build_processor(ctx)
-    cached_processor = factories.build_processor(ctx)
+        model_config.get_multimodal_config().limit_per_prompt = {
+            modality: _to_dummy_options(modality, count) for modality, count in limit_mm_per_prompt_ints.items()
+        }
+
+        baseline_processor = factories.build_processor(ctx)
+        cached_processor = factories.build_processor(ctx)
 
     rng = np.random.RandomState(0)
 
@@ -229,21 +317,22 @@ def _test_processing_correctness(
     }
 
     for batch_idx in range(num_batches):
-        mm_data = {
-            k: [
-                (input_to_hit[k] if rng.rand() < hit_rate else input_factory[k]())
-                for _ in range(rng.randint(limit + 1))
-            ]
-            for k, limit in limit_mm_per_prompt_ints.items()
-        }
+        with timing.phase("prompt_input_preparation"):
+            mm_data = {
+                k: [
+                    (input_to_hit[k] if rng.rand() < hit_rate else input_factory[k]())
+                    for _ in range(rng.randint(limit + 1))
+                ]
+                for k, limit in limit_mm_per_prompt_ints.items()
+            }
 
-        # Drop unnecessary keys and test single -> multi conversion
-        if rng.rand() < simplify_rate:
-            for k in list(mm_data.keys()):
-                if not mm_data[k]:
-                    del mm_data[k]
-                elif len(mm_data[k]) == 1:
-                    mm_data[k] = mm_data[k][0]
+            # Drop unnecessary keys and test single -> multi conversion
+            if rng.rand() < simplify_rate:
+                for k in list(mm_data.keys()):
+                    if not mm_data[k]:
+                        del mm_data[k]
+                    elif len(mm_data[k]) == 1:
+                        mm_data[k] = mm_data[k][0]
 
         _test_processing_correctness_one(
             model_config,
@@ -252,6 +341,7 @@ def _test_processing_correctness(
             cached_processor,
             batch_idx,
             cache,
+            timing,
         )
 
 
@@ -262,68 +352,76 @@ def _test_processing_correctness_one(
     cached_processor: BaseMultiModalProcessor,
     batch_idx: int,
     cache: MultiModalProcessorOnlyCache,
+    timing: _PhaseTimer,
 ):
     model_type = model_config.hf_config.model_type
 
-    text_prompt, token_prompt = get_text_token_prompts(baseline_processor, mm_data)
-    mm_items = baseline_processor.info.parse_mm_data(mm_data)
-    ignore_mm_keys = _IGNORE_MM_KEYS.get(model_type, set[str]())
+    with timing.phase("prompt_input_preparation"):
+        text_prompt, token_prompt = get_text_token_prompts(baseline_processor, mm_data)
+        mm_items = baseline_processor.info.parse_mm_data(mm_data)
+        ignore_mm_keys = _IGNORE_MM_KEYS.get(model_type, set[str]())
 
-    baseline_tokenized_result = baseline_processor(
-        token_prompt,
-        mm_items=mm_items,
-        hf_processor_mm_kwargs={},
-        cache=None,
-    )
-
-    cached_tokenized_result = cached_processor(
-        token_prompt,
-        mm_items=mm_items,
-        hf_processor_mm_kwargs={},
-        cache=cache,
-    )
-
-    _assert_inputs_equal(
-        baseline_tokenized_result,
-        cached_tokenized_result,
-        ignore_mm_keys=ignore_mm_keys,
-        msg=f"Failed ({batch_idx=}, {token_prompt=}, {mm_data=})",
-    )
-
-    if text_prompt is not None:
-        baseline_text_result = baseline_processor(
-            text_prompt,
+    with timing.phase("baseline_token_processing"):
+        baseline_tokenized_result = baseline_processor(
+            token_prompt,
             mm_items=mm_items,
             hf_processor_mm_kwargs={},
             cache=None,
         )
-        cached_text_result = cached_processor(
-            text_prompt,
+
+    with timing.phase("cached_token_processing"):
+        cached_tokenized_result = cached_processor(
+            token_prompt,
             mm_items=mm_items,
             hf_processor_mm_kwargs={},
             cache=cache,
         )
 
+    with timing.phase("assertions"):
         _assert_inputs_equal(
-            baseline_text_result,
-            cached_text_result,
-            ignore_mm_keys=ignore_mm_keys,
-            msg=f"Failed ({batch_idx=}, {text_prompt=}, {mm_data=})",
-        )
-
-        _assert_inputs_equal(
-            baseline_text_result,
             baseline_tokenized_result,
-            ignore_mm_keys=ignore_mm_keys,
-            msg=f"Failed ({batch_idx=}, {text_prompt=}, {token_prompt=}, {mm_data=})",
-        )
-
-        _assert_inputs_equal(
-            cached_text_result,
             cached_tokenized_result,
             ignore_mm_keys=ignore_mm_keys,
-            msg=f"Failed ({batch_idx=}, {text_prompt=}, {token_prompt=}, {mm_data=})",
+            msg=f"Failed ({batch_idx=}, {token_prompt=}, {mm_data=})",
         )
+
+    if text_prompt is not None:
+        with timing.phase("baseline_text_processing"):
+            baseline_text_result = baseline_processor(
+                text_prompt,
+                mm_items=mm_items,
+                hf_processor_mm_kwargs={},
+                cache=None,
+            )
+        with timing.phase("cached_text_processing"):
+            cached_text_result = cached_processor(
+                text_prompt,
+                mm_items=mm_items,
+                hf_processor_mm_kwargs={},
+                cache=cache,
+            )
+
+        with timing.phase("assertions"):
+            _assert_inputs_equal(
+                baseline_text_result,
+                cached_text_result,
+                ignore_mm_keys=ignore_mm_keys,
+                msg=f"Failed ({batch_idx=}, {text_prompt=}, {mm_data=})",
+            )
+
+            _assert_inputs_equal(
+                baseline_text_result,
+                baseline_tokenized_result,
+                ignore_mm_keys=ignore_mm_keys,
+                msg=(f"Failed ({batch_idx=}, {text_prompt=}, {token_prompt=}, {mm_data=})"),
+            )
+
+            _assert_inputs_equal(
+                cached_text_result,
+                cached_tokenized_result,
+                ignore_mm_keys=ignore_mm_keys,
+                msg=(f"Failed ({batch_idx=}, {text_prompt=}, {token_prompt=}, {mm_data=})"),
+            )
 
 
 @pytest.mark.core_model
@@ -334,6 +432,7 @@ def _test_processing_correctness_one(
 @pytest.mark.parametrize("num_batches", [32])
 @pytest.mark.parametrize("simplify_rate", [1.0])
 def test_omni_processing_correctness(
+    request: pytest.FixtureRequest,
     model_arch: str,
     hit_rate: float,
     num_batches: int,
@@ -344,12 +443,152 @@ def test_omni_processing_correctness(
     - cached and non-cached processor outputs are identical.
     - text-prompt and token-prompt inputs yield the same result.
     """
-    _test_processing_correctness(
-        model_arch,
-        hit_rate=hit_rate,
-        num_batches=num_batches,
-        simplify_rate=simplify_rate,
-    )
+    timing = _PhaseTimer(request.node.nodeid)
+    try:
+        _test_processing_correctness(
+            model_arch,
+            hit_rate=hit_rate,
+            num_batches=num_batches,
+            simplify_rate=simplify_rate,
+            timing=timing,
+        )
+    finally:
+        timing.report()
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "model_arch",
+    _get_processor_snapshot_smoke_archs(),
+    ids=lambda model_arch: _MULTIMODAL_OMNI_EXAMPLE_MODELS[model_arch].default,
+)
+def test_rocm_processor_snapshot_smoke(
+    model_arch: str,
+    clear_processor_snapshot_cache,
+):
+    """Exercise one real local-metadata snapshot per Omni model repository."""
+    if not current_omni_platform.is_rocm():
+        pytest.skip("ROCm-only processor metadata integration smoke")
+
+    info = _MULTIMODAL_OMNI_EXAMPLE_MODELS[model_arch]
+    info.check_transformers_version(on_fail="skip")
+    info.check_available_online(on_fail="skip")
+
+    before = _resolve_processor_snapshot.cache_info()
+    first = _build_model_config(model_arch, info)
+    tokenizer = cached_tokenizer_from_config(first)
+    after_first = _resolve_processor_snapshot.cache_info()
+
+    assert tokenizer is not None
+    assert first.model == first.tokenizer
+    assert Path(first.model).is_dir()
+    assert after_first.misses == before.misses + 1
+    assert after_first.hits == before.hits
+
+    second = _build_model_config(model_arch, info)
+    after_second = _resolve_processor_snapshot.cache_info()
+
+    assert second is not first
+    assert second.model == first.model
+    assert second.tokenizer == first.tokenizer
+    assert after_second.misses == after_first.misses
+    assert after_second.hits == after_first.hits + 1
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+def test_phase_timer_disabled_has_no_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    monkeypatch.delenv(_AMD_TIMING_ENV, raising=False)
+
+    def fail_if_called() -> float:
+        raise AssertionError("disabled timing must not read the clock")
+
+    monkeypatch.setattr(time, "perf_counter", fail_if_called)
+    timing = _PhaseTimer("test-node")
+    with timing.phase("assertions"):
+        pass
+    timing.report()
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+def test_phase_timer_streams_ordered_flushed_json(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(_AMD_TIMING_ENV, "1")
+    readings = iter((10.0, 10.125))
+    monkeypatch.setattr(time, "perf_counter", lambda: next(readings))
+    records: list[tuple[str, bool]] = []
+
+    def record_print(value: str, *, flush: bool) -> None:
+        records.append((value, flush))
+
+    monkeypatch.setattr("builtins.print", record_print)
+    timing = _PhaseTimer("test-node")
+    with timing.phase("config_tokenizer_setup"):
+        assert len(records) == 1
+    timing.report()
+
+    payloads = [json.loads(record.removeprefix(_TIMING_PREFIX)) for record, _ in records]
+    assert payloads == [
+        {
+            "event": "start",
+            "nodeid": "test-node",
+            "phase": "config_tokenizer_setup",
+        },
+        {
+            "event": "end",
+            "nodeid": "test-node",
+            "phase": "config_tokenizer_setup",
+            "seconds": 0.125,
+            "status": "success",
+        },
+        {
+            "event": "summary",
+            "nodeid": "test-node",
+            "phase": "config_tokenizer_setup",
+            "seconds": 0.125,
+        },
+    ]
+    assert all(flush for _, flush in records)
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.cpu
+def test_phase_timer_streams_error_and_preserves_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    monkeypatch.setenv(_AMD_TIMING_ENV, "1")
+    readings = iter((20.0, 20.5))
+    monkeypatch.setattr(time, "perf_counter", lambda: next(readings))
+    error = RuntimeError("sensitive exception value")
+
+    timing = _PhaseTimer("test-node")
+    with pytest.raises(RuntimeError) as exc_info:
+        with timing.phase("assertions"):
+            raise error
+
+    assert exc_info.value is error
+    payloads = [json.loads(line.removeprefix(_TIMING_PREFIX)) for line in capsys.readouterr().out.splitlines()]
+    assert payloads[-1] == {
+        "event": "end",
+        "nodeid": "test-node",
+        "phase": "assertions",
+        "seconds": 0.5,
+        "status": "error",
+    }
+    assert "sensitive exception value" not in json.dumps(payloads)
 
 
 @pytest.mark.core_model
