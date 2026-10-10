@@ -325,6 +325,38 @@ def test_gander_seeded_text_to_audio(omni_server, text, expected):
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_seeded_text_slate_replacement(omni_server, tmp_path):
+    from tests.helpers.runtime import send_duplex_seeded_context_request
+
+    send_duplex_seeded_context_request(
+        server=omni_server,
+        text="Please say hello in one short sentence.",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
+        output_dir=tmp_path / "seeded_slate",
+        operation="slate",
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_gander_rejects_audio_truncation_and_continues(omni_server, tmp_path):
+    from tests.helpers.runtime import send_duplex_seeded_context_request
+
+    send_duplex_seeded_context_request(
+        server=omni_server,
+        text="Please say hello in one short sentence.",
+        ref_audio=Path(MODEL) / "assets/ref_audio.wav",
+        input_wav=Path(__file__).resolve().parents[2] / "assets/minicpmo_4_5/response_required_16k.wav",
+        output_dir=tmp_path / "reject_truncate",
+        operation="truncate",
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_gander_seeded_text_without_reference_voice(omni_server):
     from tests.helpers.runtime import send_duplex_seeded_text_request
 

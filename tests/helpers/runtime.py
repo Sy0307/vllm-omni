@@ -2235,6 +2235,170 @@ def send_duplex_seeded_text_request(*, server, text, ref_audio, expected_text_pa
     return result
 
 
+def send_duplex_seeded_context_request(*, server, text, ref_audio, input_wav, output_dir, operation):
+    """Validate a seeded session's slate rebuild or explicit truncation rejection.
+
+    Both paths must preserve ordinary playback ACKs and answer a later real
+    microphone input. Inputs and operation selection belong to the caller.
+    """
+    import asyncio
+    import json
+
+    from vllm_omni.clients.duplex import (
+        DuplexClient,
+        EventCollector,
+        SessionConfig,
+        acknowledge_collected_playback,
+        read_pcm16_wav,
+        reference_audio_data_url,
+        write_pcm16_wav,
+    )
+
+    async def run():
+        collector = EventCollector()
+        destination = Path(output_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        config = SessionConfig(
+            ref_audio=reference_audio_data_url(ref_audio),
+            temperature=0.0,
+            extra_body={"auto_response": True, "force_listen_count": 0, "duplex_initial_user_text": text},
+        )
+        async with DuplexClient(
+            f"ws://{server.host}:{server.port}/v1/realtime?duplex=1",
+            model=server.model,
+            config=config,
+            reconnect=None,
+            heartbeat_interval_s=None,
+            handshake_timeout_s=90,
+        ) as client:
+            consumer = asyncio.create_task(collector.consume(client))
+            feeder = None
+            expected_errors = 0
+
+            async def wait(predicate, start=0):
+                deadline = time.monotonic() + 90
+                while time.monotonic() < deadline:
+                    if consumer.done():
+                        consumer.result()
+                        raise AssertionError("Session reader stopped during context validation")
+                    if feeder is not None and feeder.done() and not feeder.cancelled():
+                        feeder.result()
+                    assert len(collector.errors()) <= expected_errors, collector.errors()
+                    for event in collector.events[start:]:
+                        native = event.get("event", event) if event.get("type", "").startswith("duplex.") else event
+                        if predicate(native):
+                            return native
+                    await asyncio.sleep(0.05)
+                raise AssertionError("Seeded context request timed out")
+
+            async def microphone():
+                while True:
+                    await client.stream_pcm(bytes(6400), chunk_ms=200, realtime=True)
+
+            async def snapshot():
+                start = len(collector.events)
+                await client.send({"type": "input.context.get"})
+                return await wait(lambda e: e.get("type") == "input.context.snapshot", start)
+
+            try:
+                assert client.session_info["capabilities"]["supports_audio_truncate"] is False
+                feeder = asyncio.create_task(microphone())
+                first = await wait(
+                    lambda e: e.get("type") == "response.done" and e.get("response", {}).get("status") == "completed"
+                )
+                first_id = first["response"]["id"]
+                assert collector.audio_bytes(first_id), "Seeded response contains no audio"
+                feeder.cancel()
+                await asyncio.gather(feeder, return_exceptions=True)
+                feeder = None
+                before = await snapshot()
+                if operation == "slate":
+                    start = len(collector.events)
+                    await client.send(
+                        {
+                            "type": "input.context.append",
+                            "context": {
+                                "kind": "task_slate",
+                                "event_id": "seeded-slate",
+                                "epoch": before["epoch"],
+                                "version": 1,
+                                "slate": "当前没有进行中的任务。",
+                            },
+                        }
+                    )
+                    replaced = await wait(
+                        lambda e: e.get("type") == "input.context.replaced" and e.get("event_id") == "seeded-slate",
+                        start,
+                    )
+                    assert replaced["epoch"] == before["epoch"] + 1
+                    assert replaced["units"], "Rebuild lost initialized context"
+                elif operation == "truncate":
+                    item_id = "item_" + first_id
+                    start = len(collector.events)
+                    await client.send({"type": "conversation.item.retrieve", "item_id": item_id})
+                    retrieved = await wait(lambda e: e.get("type") == "conversation.item.retrieved", start)
+                    for event in [
+                        {
+                            "type": "conversation.item.truncate",
+                            "item_id": item_id,
+                            "audio_end_ms": 0,
+                            "event_id": "cut",
+                        },
+                        {
+                            "type": "playback.ack",
+                            "response_id": first_id,
+                            "played_ms": 0,
+                            "truncate": True,
+                            "event_id": "ack-cut",
+                        },
+                    ]:
+                        expected_errors += 1
+                        start = len(collector.events)
+                        await client.send(event)
+                        rejected = await wait(lambda e: e.get("type") == "error", start)
+                        assert rejected["error"]["code"] == "audio_truncate_unsupported"
+                        assert rejected["error"]["event_id"] == event["event_id"]
+                    assert await snapshot() == before
+                    start = len(collector.events)
+                    await client.send({"type": "conversation.item.retrieve", "item_id": item_id})
+                    after = await wait(lambda e: e.get("type") == "conversation.item.retrieved", start)
+                    assert after["item"] == retrieved["item"]
+                    await acknowledge_collected_playback(client, collector)
+                else:
+                    raise ValueError("operation must be slate or truncate")
+                start = len(collector.events)
+                feeder = asyncio.create_task(
+                    client.stream_pcm(
+                        read_pcm16_wav(input_wav) + bytes(32000 * 40),
+                        chunk_ms=200,
+                        realtime=True,
+                    )
+                )
+                followup = await wait(
+                    lambda e: e.get("type") == "response.done"
+                    and e.get("response", {}).get("status") == "completed"
+                    and e.get("response", {}).get("id") != first_id,
+                    start,
+                )
+                followup_id = followup["response"]["id"]
+                assert collector.audio_bytes(followup_id), "No audio after context operation"
+                assert len(collector.errors()) == expected_errors
+                return {"first_response": first_id, "followup_response": followup_id, "operation": operation}
+            finally:
+                if feeder is not None:
+                    feeder.cancel()
+                    await asyncio.gather(feeder, return_exceptions=True)
+                consumer.cancel()
+                await asyncio.gather(consumer, return_exceptions=True)
+                (destination / "events.json").write_text(json.dumps(collector.events, ensure_ascii=False))
+                for index, response_id in enumerate(collector.response_ids):
+                    pcm = collector.audio_bytes(response_id)
+                    if pcm:
+                        write_pcm16_wav(destination / f"response-{index}.wav", pcm, sample_rate_hz=24000)
+
+    return asyncio.run(run())
+
+
 async def run_duplex_seeded_text_to_audio(
     *,
     url: str,
