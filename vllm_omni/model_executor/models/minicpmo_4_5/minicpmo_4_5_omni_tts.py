@@ -731,7 +731,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "step": 0,
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
-                "turn_end_drain": bool(native_duplex and isinstance(meta, Mapping) and bool(meta.get("turn_end"))),
+                # DetachedTalker learns its final EOS without MiniCPM's
+                # 25-frame cadence mask; preserve it at every frame.
+                "turn_end_drain": bool(
+                    native_duplex
+                    and isinstance(meta, Mapping)
+                    and bool(meta.get("turn_end"))
+                    and meta.get("gander_speech_tokens") != 50
+                ),
             }
             if isinstance(retained_codes, torch.Tensor) or retained_codes:
                 state["recent_codes"] = retained_codes
