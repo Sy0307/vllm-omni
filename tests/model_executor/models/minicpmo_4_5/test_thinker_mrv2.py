@@ -97,6 +97,9 @@ def test_gander_mrv2_profile_retains_native_capacity_and_sampling(monkeypatch):
     ]
     control, optimized = [merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config) for config in configs]
     assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in optimized] == [True] * 3
+    # MRv2 collects the complete Thinker row ledger for llm2tts; only the
+    # Talker/codec edge uses chunked output. An inherited True prevents startup.
+    assert [stage.yaml_engine_args["async_chunk"] for stage in optimized] == [False, True, True]
     assert [stage.yaml_engine_args["max_num_seqs"] for stage in optimized] == [4] * 3
     assert [stage.yaml_runtime["devices"] for stage in optimized] == ["0"] * 3
     assert [stage.yaml_engine_args["async_scheduling"] for stage in optimized] == [True, False, False]

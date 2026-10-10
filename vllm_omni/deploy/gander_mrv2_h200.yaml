@@ -11,6 +11,8 @@ connectors:
 
 stages:
   - stage_id: 0
+    # llm2tts needs the complete Thinker hidden-state ledger in MRv2.
+    async_chunk: false
     enforce_eager: false
     async_scheduling: true
     compilation_config:
