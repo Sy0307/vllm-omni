@@ -1530,6 +1530,9 @@ class DuplexSessionRunner:
             or self.run.stream_request_id != request_id
             or session.draining_request_ids()
             or (active_task is not None and not active_task.done())
+            # Versioned context requires an epoch fence and reconstruction to
+            # invalidate cancelled input/tool transactions before re-admission.
+            or self.ctx.history is not None
             or not self.plugin.close_model_turn(self.model_state)
         ):
             return False

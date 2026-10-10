@@ -98,12 +98,10 @@ def test_gander_mrv2_profile_retains_native_capacity_and_sampling(monkeypatch):
     control, optimized = [merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config) for config in configs]
     assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in optimized] == [True] * 3
     assert [stage.yaml_engine_args["max_num_seqs"] for stage in optimized] == [4] * 3
-    assert [stage.yaml_engine_args["devices"] for stage in optimized] == ["0"] * 3
+    assert [stage.yaml_runtime["devices"] for stage in optimized] == ["0"] * 3
     assert [stage.yaml_engine_args["async_scheduling"] for stage in optimized] == [True, False, False]
     for baseline, actual in zip(control, optimized, strict=True):
-        assert (
-            actual.yaml_engine_args["default_sampling_params"] == baseline.yaml_engine_args["default_sampling_params"]
-        )
+        assert actual.yaml_extras["default_sampling_params"] == baseline.yaml_extras["default_sampling_params"]
         assert actual.yaml_engine_args["max_model_len"] == baseline.yaml_engine_args["max_model_len"]
     assert configs[1].duplex_session.max_sessions == configs[0].duplex_session.max_sessions == 4
     extra = configs[1].connectors["connector_of_shared_memory"]["extra"]

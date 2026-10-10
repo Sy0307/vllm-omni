@@ -136,12 +136,11 @@ def _gander_host_metadata(params, history):
 def test_mrv2_keeps_gander_grammar_after_partial_prefill(
     gander_host_sampler, ids, mocker, history_keys, tools, preferred, expected
 ):
-    from types import SimpleNamespace
-
     import numpy as np
     import torch
     from vllm.sampling_params import SamplingParams
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
     from vllm.v1.worker.gpu.sample.sampler import Sampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import MiniCPMO45DuplexSampler
@@ -160,7 +159,12 @@ def test_mrv2_keeps_gander_grammar_after_partial_prefill(
     ]
     history = [tokens[key] if isinstance(key, str) else key for key in history_keys]
     base = mocker.Mock(spec=Sampler)
-    base.side_effect = lambda logits, batch: SimpleNamespace(sampled_token_ids=logits.argmax(-1).view(-1, 1))
+    base.side_effect = lambda logits, batch: SamplerOutput(
+        sampled_token_ids=logits.argmax(-1).view(-1, 1),
+        logprobs_tensors=None,
+        num_sampled=torch.ones(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+    )
     sampler = MiniCPMO45DuplexSampler(base, model)
     sampler._requests["request"] = (1, history, None)
     batch = mocker.Mock(

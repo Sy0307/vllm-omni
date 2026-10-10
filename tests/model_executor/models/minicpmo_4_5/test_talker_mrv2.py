@@ -59,6 +59,7 @@ def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker._mrv2_empty_speech = torch.zeros(max_reqs, dtype=torch.bool)
     talker._mrv2_forced_eos = None
     talker._mrv2_decode_rows_logged = False
+    talker._deferred_cleanup_ids = set()
     return talker
 
 
