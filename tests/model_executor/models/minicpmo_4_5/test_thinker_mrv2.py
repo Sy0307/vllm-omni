@@ -4,56 +4,13 @@
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni as omni
-from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
-from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_mrv2_preprocess_stages_shared_encoders_before_reordered_prefill_rows(mocker):
-    model = _model(mocker, session="duplex")
-    state = object.__new__(OmniModelState)
-    state.model, state.has_preprocess, state._static_inputs_embeds = model, True, None
-    state.intermediate_buffer = OmniIntermediateBuffer(3)
-    state.intermediate_buffer.buffers = [{"req_id": "r0"}, {"req_id": "decode"}, {"req_id": "r2"}]
-    calls = []
-
-    def stage(*, req_ids, model_intermediate_buffer, device):
-        calls.append(("batch", req_ids))
-        assert device.type == "cpu"
-        for request_id in req_ids:
-            index = int(request_id[-1])
-            assert model_intermediate_buffer[request_id] is state.intermediate_buffer.buffers[index]
-            model_intermediate_buffer[request_id]["staged"] = True
-
-    def preprocess(ids, embeds, **info):
-        calls.append(("row", info["req_id"]))
-        assert info.get("staged", False) is (info["req_id"] != "decode")
-        assert info["_omni_is_prefill"] is (info["req_id"] != "decode")
-        return ids, embeds, {}
-
-    mocker.patch.object(model, "preprocess_batch", side_effect=stage)
-    mocker.patch.object(model, "preprocess", side_effect=preprocess)
-    batch = mocker.Mock(
-        spec=InputBatch,
-        num_reqs=3,
-        idx_mapping_np=np.array([2, 0, 1]),
-        num_scheduled_tokens=np.array([2, 1, 2]),
-        query_start_loc_np=np.array([0, 2, 3]),
-    )
-    req_states = mocker.Mock(spec=RequestState, prompt_len=np.array([5, 1, 5]), num_computed_tokens=np.array([4, 1, 0]))
-    inputs = {"input_ids": torch.arange(5), "inputs_embeds": torch.zeros(5, 4)}
-    state.run_preprocess(batch, inputs, req_states)
-    assert calls == [("batch", ["r2", "r0"]), ("row", "r2"), ("row", "r0"), ("row", "decode")]
-    assert state.intermediate_buffer.buffers[1] == {"req_id": "decode"}
 
 
 @pytest.mark.parametrize(
@@ -86,7 +43,6 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False):
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
-    mocker.patch.object(omni.MiniCPMO45OmniForConditionalGeneration, "_duplex_data_plane_helper", return_value=None)
     mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config")
     config = SimpleNamespace(
         model_config=SimpleNamespace(

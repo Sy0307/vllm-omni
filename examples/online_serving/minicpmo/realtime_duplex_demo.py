@@ -681,9 +681,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ref-audio",
+        required=True,
         help=(
-            "Optional reference WAV for the MiniCPM-o duplex assistant voice. "
-            "Omit to use the model's default voice and codec prompt."
+            "Reference WAV for the MiniCPM-o duplex assistant voice. "
+            "This demo matches the official flow by always providing a reference audio clip."
         ),
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")

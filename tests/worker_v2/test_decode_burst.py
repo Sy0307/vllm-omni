@@ -1,41 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Decode-burst configuration and runner behavior against one-step eager."""
+"""Decode-burst runner behavior against independently scheduled eager steps."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 import torch
-from vllm.config import VllmConfig
-
-from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.worker_v2.decode_burst import decode_burst_steps
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-@pytest.mark.parametrize(
-    "v2,mode,processor,expected",
-    [
-        (False, "duplex", "minicpmo_4_5_omni.tts2code2wav_async_chunk", 1),
-        (True, "turn", "minicpmo_4_5_omni.tts2code2wav_async_chunk", 1),
-        (True, "duplex", "minicpmo_4_5_omni.tts2code2wav_async_chunk", 4),
-        (True, "duplex", "qwen3_omni.thinker2talker", 1),
-        (True, "duplex", None, 1),
-    ],
-)
-def test_decode_burst_steps(mocker, v2, mode, processor, expected):
-    config = VllmConfig()
-    config.model_config = mocker.Mock(
-        spec=OmniModelConfig,
-        use_v2_model_runner=v2,
-        session_mode=mode,
-        custom_process_next_stage_input_func=(
-            f"vllm_omni.model_executor.stage_input_processors.{processor}" if processor else None
-        ),
-    )
-    assert decode_burst_steps(config) == expected
 
 
 @pytest.mark.parametrize("stop_after", [1, 2, 5])

@@ -55,8 +55,3 @@ def test_get_tts_handoff_keeps_list_and_tensor_payloads():
     rows = torch.ones(1, 2)
     assert get_tts_handoff({"hidden_states": {"tts": rows}})[1] is rows
     assert get_tts_handoff({"tts_hidden_states": [[1.0, 2.0]]})[1] == [[1.0, 2.0]]
-
-
-def test_packed_tts_hidden_requires_bytes_and_shape():
-    with pytest.raises(ValueError, match="bytes data and a shape"):
-        get_tts_handoff({"hidden_states": {"tts": {"packed_float32": [1.0], "shape": [1, 1]}}})

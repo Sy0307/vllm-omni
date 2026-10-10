@@ -95,7 +95,7 @@ Wiring, in the order the pieces get used
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
@@ -112,11 +112,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     cdiv,
     plan_position_reanchor,
 )
-
-if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
-
-    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 #: Default block size for sliding window on CUDA. Hardware like Ascend NPU may
 #: use larger page sizes (e.g. 128).
@@ -872,151 +867,123 @@ class MiniCPMO45DuplexWorkerHelper:
     @classmethod
     def maybe_apply_reanchor(cls, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
-        if hasattr(runner, "req_states"):
-            cls.maybe_apply_reanchor_mrv2(runner, scheduler_output)
-            return
-        if not hasattr(runner, "input_batch") or runner.input_batch is None:
-            return
-        num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
-        req_ids = runner.input_batch.req_ids[:num_reqs]
-        for req_idx, req_id in enumerate(req_ids):
-            info = runner.model_intermediate_buffer.get(req_id)
-            if not isinstance(info, dict):
-                continue
-            cls._apply_reanchor(
-                runner,
-                scheduler_output,
-                req_id,
-                req_idx,
-                info,
-                int(runner.input_batch.num_computed_tokens_cpu[req_idx]),
-            )
-
-    @classmethod
-    def _apply_reanchor(
-        cls,
-        runner: Any,
-        scheduler_output: Any,
-        req_id: str,
-        req_idx: int,
-        info: dict[str, Any],
-        num_computed_tokens: int,
-    ) -> None:
+        mrv2 = hasattr(runner, "req_states")
+        if mrv2:
+            # Staged block-table writes are already applied. Reuse the same
+            # rotation below with V2's live request slots and device KV rows.
+            req_ids = list(scheduler_output.num_scheduled_tokens)
+        else:
+            if not hasattr(runner, "input_batch") or runner.input_batch is None:
+                return
+            num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
+            req_ids = runner.input_batch.req_ids[:num_reqs]
         applied_reanchors = getattr(runner, "_applied_stage0_reanchor_ids", None)
         if applied_reanchors is None:
             applied_reanchors = runner._applied_stage0_reanchor_ids = set()
-        duplex = info.get("duplex")
-        if not isinstance(duplex, dict):
-            return
-        reanchor = duplex.pop("stage0_reanchor", None)
-        if reanchor is None:
-            return
 
-        # Sanitize scheduled_new_reqs in scheduler_output so subsequent runner
-        # metadata refreshes (_update_additional_information in _preprocess)
-        # do not re-inject this already popped reanchor command.
-        if scheduler_output is not None and hasattr(scheduler_output, "scheduled_new_reqs"):
-            for new_req in scheduler_output.scheduled_new_reqs:
-                if getattr(new_req, "req_id", None) == req_id:
-                    buf = getattr(new_req, "model_intermediate_buffer", None)
-                    if isinstance(buf, dict) and isinstance(buf.get("duplex"), dict):
-                        buf["duplex"].pop("stage0_reanchor", None)
-
-        reanchor_sig = (
-            f"{req_id}:{reanchor.get('moved_from')}:{reanchor.get('delta')}:{reanchor.get('old_computed_tokens')}"
-        )
-        reanchor_id = reanchor.get("reanchor_id") or reanchor_sig
-        if reanchor_id in applied_reanchors:
-            return
-        applied_reanchors.add(reanchor_id)
-        reanchor["reanchor_id"] = reanchor_id
-
-        plan = PositionReanchor(
-            delta=reanchor["delta"],
-            moved_from=reanchor["moved_from"],
-            sink_blocks=reanchor["sink_blocks"],
-        )
-
-        # Scheduler is authoritative for logical state (block_table and computed tokens).
-        # The parent runner's _update_states() already installed the post-compaction block IDs
-        # and decremented num_computed_tokens_cpu. We do NOT double-compact or double-decrement here.
-        old_computed = int(
-            reanchor.get(
-                "old_computed_tokens",
-                num_computed_tokens + plan.delta,
-            )
-        )
-
-        req_state = runner.requests.get(req_id) if hasattr(runner, "requests") else None
-        mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
-        if mrope_pos is not None:
-            assert_uniform_position_shift(mrope_pos, plan.moved_from)
-            block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
-            sink_tokens = plan.sink_blocks * block_size
-            if mrope_pos.shape[1] >= old_computed:
-                req_state.mrope_positions = torch.cat(
-                    [
-                        mrope_pos[:, :sink_tokens],
-                        mrope_pos[:, plan.moved_from : old_computed] - plan.delta,
-                    ],
-                    dim=1,
-                )
-            if getattr(req_state, "mrope_position_delta", None) is not None:
-                req_state.mrope_position_delta = max(0, req_state.mrope_position_delta - plan.delta)
-
-        positions = torch.arange(plan.moved_from, old_computed, dtype=torch.long, device=runner.device)
-        if mrope_pos is None:
-            assert_uniform_position_shift(positions, plan.moved_from)
-
-        if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
-            inv_freq = cls.get_rope_inv_freq(runner)
-            kv_groups = getattr(runner, "kv_cache_group_ids", None)
-            block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
-            for layer_idx, kv_cache in enumerate(runner.kv_caches):
-                group_idx = kv_groups[layer_idx] if (kv_groups and layer_idx < len(kv_groups)) else 0
-                layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
-                rotate_cached_keys(
-                    kv_cache,
-                    block_ids=layer_block_ids,
-                    positions=positions,
-                    plan=plan,
-                    inv_freq=inv_freq,
-                    block_size=block_size,
-                )
-
-        # Evict worker-held unit history so state.window_units remains bounded
-        model = getattr(runner, "model", None)
-        helper = getattr(model, "_minicpmo45_duplex_data_plane_helper", None)
-        if helper is not None and isinstance(getattr(helper, "sessions", None), dict):
-            req_sessions = getattr(model, "_minicpmo45_duplex_request_sessions", {})
-            session_key = duplex.get("session_id") or (
-                req_sessions.get(req_id) if isinstance(req_sessions, dict) else None
-            )
-            session_state = helper.sessions.get(session_key) if session_key else None
-            if session_state is not None and hasattr(session_state, "window_units"):
-                if hasattr(helper, "_evict_window_units_for_reanchor"):
-                    helper._evict_window_units_for_reanchor(session_state, reanchor)
-                else:
-                    session_state.window_units.clear()
-
-    @classmethod
-    def maybe_apply_reanchor_mrv2(cls, runner: OmniGPUModelRunner, scheduler_output: SchedulerOutput) -> None:
-        """Adapt MRv2 slots to the shared re-RoPE operation.
-
-        The scheduler already compacted the block table and token counts.
-        Rotate keys using the new table without decrementing those counts a
-        second time. Only rows with a reanchor command invoke the rotation.
-        """
-        for req_id in scheduler_output.num_scheduled_tokens:
-            slot = runner.req_states.req_id_to_index[req_id]
-            info = runner.model_state.intermediate_buffer.buffers[slot]
+        for req_idx, req_id in enumerate(req_ids):
+            if mrv2:
+                req_idx = runner.req_states.req_id_to_index[req_id]
+                info = runner.model_state.intermediate_buffer.buffers[req_idx]
+            else:
+                info = runner.model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
             duplex = info.get("duplex")
-            if isinstance(duplex, dict) and "stage0_reanchor" in duplex:
-                cls._apply_reanchor(
-                    runner,
-                    scheduler_output,
-                    req_id,
-                    slot,
-                    info,
-                    int(runner.req_states.num_computed_tokens_np[slot]),
+            if not isinstance(duplex, dict):
+                continue
+            reanchor = duplex.pop("stage0_reanchor", None)
+            if reanchor is None:
+                continue
+
+            # Sanitize scheduled_new_reqs in scheduler_output so subsequent runner
+            # metadata refreshes (_update_additional_information in _preprocess)
+            # do not re-inject this already popped reanchor command.
+            if scheduler_output is not None and hasattr(scheduler_output, "scheduled_new_reqs"):
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    if getattr(new_req, "req_id", None) == req_id:
+                        buf = getattr(new_req, "model_intermediate_buffer", None)
+                        if isinstance(buf, dict) and isinstance(buf.get("duplex"), dict):
+                            buf["duplex"].pop("stage0_reanchor", None)
+
+            reanchor_sig = (
+                f"{req_id}:{reanchor.get('moved_from')}:{reanchor.get('delta')}:{reanchor.get('old_computed_tokens')}"
+            )
+            reanchor_id = reanchor.get("reanchor_id") or reanchor_sig
+            if reanchor_id in applied_reanchors:
+                continue
+            applied_reanchors.add(reanchor_id)
+            reanchor["reanchor_id"] = reanchor_id
+
+            plan = PositionReanchor(
+                delta=reanchor["delta"],
+                moved_from=reanchor["moved_from"],
+                sink_blocks=reanchor["sink_blocks"],
+            )
+
+            # Scheduler is authoritative for logical state (block_table and computed tokens).
+            # The parent runner's _update_states() already installed the post-compaction block IDs
+            # and decremented num_computed_tokens_cpu. We do NOT double-compact or double-decrement here.
+            old_computed = int(
+                reanchor.get(
+                    "old_computed_tokens",
+                    int(
+                        runner.req_states.num_computed_tokens_np[req_idx]
+                        if mrv2
+                        else runner.input_batch.num_computed_tokens_cpu[req_idx]
+                    )
+                    + plan.delta,
                 )
+            )
+
+            req_state = runner.requests.get(req_id) if hasattr(runner, "requests") else None
+            mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
+            if mrope_pos is not None:
+                assert_uniform_position_shift(mrope_pos, plan.moved_from)
+                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+                sink_tokens = plan.sink_blocks * block_size
+                if mrope_pos.shape[1] >= old_computed:
+                    req_state.mrope_positions = torch.cat(
+                        [
+                            mrope_pos[:, :sink_tokens],
+                            mrope_pos[:, plan.moved_from : old_computed] - plan.delta,
+                        ],
+                        dim=1,
+                    )
+                if getattr(req_state, "mrope_position_delta", None) is not None:
+                    req_state.mrope_position_delta = max(0, req_state.mrope_position_delta - plan.delta)
+
+            positions = torch.arange(plan.moved_from, old_computed, dtype=torch.long, device=runner.device)
+            if mrope_pos is None:
+                assert_uniform_position_shift(positions, plan.moved_from)
+
+            if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
+                inv_freq = cls.get_rope_inv_freq(runner)
+                kv_groups = getattr(runner, "kv_cache_group_ids", None)
+                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+                for layer_idx, kv_cache in enumerate(runner.kv_caches):
+                    group_idx = kv_groups[layer_idx] if (kv_groups and layer_idx < len(kv_groups)) else 0
+                    layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                    rotate_cached_keys(
+                        kv_cache,
+                        block_ids=layer_block_ids,
+                        positions=positions,
+                        plan=plan,
+                        inv_freq=inv_freq,
+                        block_size=block_size,
+                    )
+
+            # Evict worker-held unit history so state.window_units remains bounded
+            model = getattr(runner, "model", None)
+            helper = getattr(model, "_minicpmo45_duplex_data_plane_helper", None)
+            if helper is not None and isinstance(getattr(helper, "sessions", None), dict):
+                req_sessions = getattr(model, "_minicpmo45_duplex_request_sessions", {})
+                session_key = duplex.get("session_id") or (
+                    req_sessions.get(req_id) if isinstance(req_sessions, dict) else None
+                )
+                session_state = helper.sessions.get(session_key) if session_key else None
+                if session_state is not None and hasattr(session_state, "window_units"):
+                    if hasattr(helper, "_evict_window_units_for_reanchor"):
+                        helper._evict_window_units_for_reanchor(session_state, reanchor)
+                    else:
+                        session_state.window_units.clear()

@@ -370,7 +370,6 @@ class MiniCPMO45SeededCodecSampler(Sampler):
 
 @dataclass
 class _SeededDecodeGraph:
-    rows: int
     logits: torch.Tensor
     expanded_idx_mapping: torch.Tensor
     mask_eos: torch.Tensor
@@ -600,7 +599,6 @@ class SeededCodecDecodeGraphs:
         # before any capture, and smaller batches reuse a prefix view of it.
         for rows in range(max_rows, 0, -1):
             entry = _SeededDecodeGraph(
-                rows=rows,
                 logits=torch.linspace(-8.0, 8.0, self.vocab_size, device=device).repeat(rows, 1),
                 expanded_idx_mapping=torch.zeros(rows, dtype=torch.int32, device=device),
                 mask_eos=torch.zeros(rows, dtype=torch.bool, device=device),
@@ -714,9 +712,6 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         self._generators: dict[str, torch.Generator] = {}
         self._empty = torch.empty(0)
         self._pending_history: tuple[_MiniCPMO45PendingSamples, list[tuple[str, list[int], int]]] | None = None
-
-    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
-        self.base_sampler.add_request(req_idx, sampling_params)
 
     @torch.inference_mode()
     def warmup(self) -> None:

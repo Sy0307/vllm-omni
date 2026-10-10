@@ -338,7 +338,7 @@ def test_first_chunk_express_slack_guard_tracks_emitted_audio(monkeypatch):
     assert scheduler._stream_audio["started"] == [100.0, 2.0]
 
 
-def _express_scheduler(*, native=True):
+def _express_scheduler():
     continuation = Request("continuation", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
     first = Request("first", [1], SamplingParams(max_tokens=4), pooling_params=None)
     scheduler = _make_generation_scheduler(continuation, use_v2_model_runner=True)
@@ -346,12 +346,11 @@ def _express_scheduler(*, native=True):
     scheduler.requests[first.request_id] = first
     scheduler.max_num_active_reqs = 4
     scheduler.max_num_running_reqs = 4
-    scheduler._native_data_plane = native
-    if native:
-        scheduler.chunk_transfer_adapter = None
-        scheduler.input_coordinator = SimpleNamespace(
-            _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
-        )
+    scheduler._native_data_plane = True
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+    )
     scheduler._first_chunk_express = True
     scheduler._last_step_express = False
     scheduler._chunk_started = {"continuation"}
@@ -360,9 +359,8 @@ def _express_scheduler(*, native=True):
     return scheduler, continuation, first
 
 
-@pytest.mark.parametrize("native", [True, False])
-def test_express_schedules_only_first_chunks_then_allows_continuations(native):
-    scheduler, continuation, first = _express_scheduler(native=native)
+def test_express_schedules_only_first_chunks_then_allows_continuations():
+    scheduler, continuation, first = _express_scheduler()
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"first": 1}
     assert scheduler._last_step_express
@@ -377,18 +375,16 @@ def test_express_schedules_only_first_chunks_then_allows_continuations(native):
     assert "continuation" in output.num_scheduled_tokens
 
 
-@pytest.mark.parametrize("native", [True, False])
-def test_express_does_not_delay_continuation_for_unready_first_chunk(native):
-    scheduler, continuation, first = _express_scheduler(native=native)
+def test_express_does_not_delay_continuation_for_unready_first_chunk():
+    scheduler, continuation, first = _express_scheduler()
     first.num_in_flight_tokens = 1
     output = scheduler.schedule()
     assert not scheduler._last_step_express
     assert output.num_scheduled_tokens == {"continuation": 2}
 
 
-@pytest.mark.parametrize("native", [True, False])
-def test_express_slack_guard_is_used_by_schedule(native):
-    scheduler, continuation, first = _express_scheduler(native=native)
+def test_express_slack_guard_is_used_by_schedule():
+    scheduler, continuation, first = _express_scheduler()
     scheduler._express_min_slack_s = 0.5
     scheduler._express_skipped_for_slack = 0
     output = scheduler.schedule()
@@ -406,32 +402,3 @@ def test_express_cancel_cleans_playback_state(monkeypatch):
     scheduler._free_request(continuation)
     assert "continuation" not in scheduler._chunk_started
     assert "continuation" not in scheduler._stream_audio
-
-
-@pytest.mark.parametrize("native", [True, False])
-@pytest.mark.parametrize("retains_state", [True, False])
-def test_chunk_admission_preserves_inflight_and_request_state(native, retains_state):
-    scheduler, completed, first = _express_scheduler(native=native)
-    completed.status = RequestStatus.WAITING_FOR_CHUNK
-    completed.num_computed_tokens = len(completed.prompt_token_ids)
-    first.status = RequestStatus.RUNNING
-    first.num_in_flight_tokens = 1
-    scheduler.waiting = create_request_queue(scheduler.policy)
-    scheduler.running = [completed, first]
-    scheduler._retains_state_across_chunks = retains_state
-    scheduler._requeue_completed_generation_chunks()
-    assert first in scheduler.running
-    assert (completed in scheduler.running) == retains_state
-    assert not scheduler.waiting
-    assert list(scheduler.kv_holding_waiting) == ([] if retains_state else [completed])
-    assert completed.status == RequestStatus.WAITING_FOR_CHUNK
-    assert completed.num_computed_tokens == len(completed.prompt_token_ids)
-    assert first.num_in_flight_tokens == 1
-
-
-def test_express_slack_guard_includes_kv_holders():
-    scheduler, continuation, first = _express_scheduler()
-    scheduler.waiting.remove_request(continuation)
-    scheduler.kv_holding_waiting.add_request(continuation)
-    scheduler._express_min_slack_s = 0.5
-    assert not scheduler._continuations_have_slack()

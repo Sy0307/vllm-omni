@@ -602,12 +602,6 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
     return MiniCPMO45TalkerSampler(sampler, talker)
 
 
-def _is_seeded_decode_graphs(value: Any) -> bool:
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import SeededCodecDecodeGraphs
-
-    return isinstance(value, SeededCodecDecodeGraphs)
-
-
 class MiniCPMO45TalkerSampler(OmniSampler):
     omni_static_staged_writes = True
 
@@ -619,8 +613,10 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
         masked = getattr(self.talker, "_mrv2_mask_eos", None)
         if forced is not None and masked is not None and masked.shape[0] == logits.shape[0]:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import SeededCodecDecodeGraphs
+
             graphs = getattr(getattr(self.talker, "_mrv2_seeded_codec_sampler", None), "decode_graphs", None)
-            if graphs is not None and _is_seeded_decode_graphs(graphs):
+            if isinstance(graphs, SeededCodecDecodeGraphs):
                 # Same kernels (mask, sampling, forced EOS) replayed as one graph.
                 output = graphs.try_sample(logits, input_batch, masked, forced)
                 if output is not None:
@@ -698,7 +694,9 @@ class _TalkerDecodeBurst:
     def finalizer(
         self, batch: BurstOutputBatch
     ) -> Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot]:
-        return self.talker._mrv2_burst_finalizer(batch)
+        return self.talker._codec_history_finalizer(
+            batch, self.talker._mrv2_output_infos, self.talker._mrv2_last_output_meta
+        )
 
     def finish(self, num_sampled_np: np.ndarray, copy_event: torch.cuda.Event) -> None:
         self.talker._mrv2_seeded_codec_sampler.defer_rng_rewind(
@@ -1540,11 +1538,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         generators = [sampler._generators.get(request_id) for request_id in input_batch.req_ids[:num_reqs]]
         return _TalkerDecodeBurst(self, steps, generators)
 
-    def _mrv2_burst_finalizer(
-        self, batch: BurstOutputBatch
-    ) -> Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot]:
-        return self._codec_history_finalizer(batch, self._mrv2_output_infos, self._mrv2_last_output_meta)
-
     def take_mrv2_forced_eos(self, input_batch: Any, req_states: Any, num_rows: int) -> torch.Tensor | None:
         """This step's forced-EOS rows, once; ``None`` outside a model step (warmup)."""
         forced, self._mrv2_forced_eos = self._mrv2_forced_eos, None
@@ -1653,9 +1646,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     @staticmethod
     def _duplex_output_metadata(infos: list[dict[str, Any]]) -> dict[str, list[torch.Tensor]]:
-        result = {
-            key: [] for key in ("native_duplex", "duplex_epoch", "duplex_turn_id", "llm_output_text_utf8", "turn_end")
-        }
+        result = {key: [] for key in _DUPLEX_OUTPUT_META_KEYS}
         for info in infos:
             info = info if isinstance(info, dict) else {}
             native = info.get("native_duplex") is True

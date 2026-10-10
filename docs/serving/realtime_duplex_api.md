@@ -88,8 +88,9 @@ python examples/online_serving/barge_in_client.py \
     --output-dir ./duplex_out
 ```
 
-Input WAVs must be mono 16 kHz PCM16. `--ref-audio` optionally conditions the
-MiniCPM-o voice; omitting it uses the model's default voice and codec prompt.
+Input WAVs must be mono 16 kHz PCM16. The MiniCPM-o client requires
+`--ref-audio`; the realtime API also accepts sessions without reference audio
+and uses the model's default voice and codec prompt in that case.
 `--preset personaplex` switches the session shape to
 the PersonaPlex preset. The flow is diagrammed in
 `examples/online_serving/barge_in_client_flow.md`.

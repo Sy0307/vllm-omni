@@ -775,9 +775,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 multimodal_outputs["latent_input_ids"] = thinker_input_ids.reshape(-1, 1)
                 multimodal_outputs["latent_positions"] = thinker_positions.reshape(-1, 1)
 
-            multimodal_outputs.update(
-                self._thinker_duplex_metadata(kwargs.get("runtime_additional_information"), torch.device("cpu"))
-            )
+            multimodal_outputs.update(self._thinker_duplex_metadata(kwargs.get("runtime_additional_information")))
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -799,7 +797,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     @staticmethod
     def _thinker_duplex_metadata(
         runtime_info: list[dict[str, Any]] | None,
-        device: torch.device,
         *,
         emitted_prompts: dict[str, list[int]] | None = None,
         meta_tensors: dict[int, torch.Tensor] | None = None,
@@ -841,41 +838,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if any(row is not None for row in prompt_rows):
                 outputs["duplex_prompt_token_ids"] = prompt_rows
 
+            special_rows = [row.get("special_token_ids") for row in duplex_rows]
+            special_rows = [row if isinstance(row, dict) else {} for row in special_rows]
             special_keys = {
                 key
-                for duplex_info in duplex_rows
-                for key, value in (
-                    duplex_info.get("special_token_ids", {}).items()
-                    if isinstance(duplex_info.get("special_token_ids"), dict)
-                    else ()
-                )
+                for row in special_rows
+                for key, value in row.items()
                 if isinstance(key, str) and isinstance(value, int) and value >= 0
             }
             if special_keys:
-
-                def _meta_tensor(value: int) -> torch.Tensor:
-                    if meta_tensors is None:
-                        return torch.tensor([value], dtype=torch.long, device=device)
-                    tensor = meta_tensors.get(value)
-                    if tensor is None:
-                        tensor = torch.tensor([value], dtype=torch.long, device=device)
-                        meta_tensors[value] = tensor
-                    return tensor
-
-                outputs["meta"] = {
-                    key: [
-                        _meta_tensor(int(value)) if isinstance(value, int) and value >= 0 else None
-                        for duplex_info in duplex_rows
-                        for value in [
-                            (
-                                duplex_info.get("special_token_ids", {}).get(key)
-                                if isinstance(duplex_info.get("special_token_ids"), dict)
-                                else None
-                            )
-                        ]
-                    ]
-                    for key in sorted(special_keys)
-                }
+                meta = {}
+                for key in sorted(special_keys):
+                    column: list[torch.Tensor | None] = []
+                    for row in special_rows:
+                        value = row.get(key)
+                        if not isinstance(value, int) or value < 0:
+                            column.append(None)
+                            continue
+                        tensor = meta_tensors.get(value) if meta_tensors is not None else None
+                        if tensor is None:
+                            # Both runners consume these bridge token IDs on the host.
+                            tensor = torch.tensor([int(value)], dtype=torch.long, device="cpu")
+                            if meta_tensors is not None:
+                                meta_tensors[value] = tensor
+                        column.append(tensor)
+                    meta[key] = column
+                outputs["meta"] = meta
         return outputs
 
     def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
@@ -905,7 +893,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 # device scalars here would immediately copy them back to CPU.
                 **self._thinker_duplex_metadata(
                     model_intermediate_buffer,
-                    torch.device("cpu"),
                     emitted_prompts=emitted_prompts,
                     meta_tensors=self.__dict__.setdefault("_mrv2_duplex_meta_tensors", {}),
                 ),

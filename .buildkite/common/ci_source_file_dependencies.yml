@@ -45,7 +45,6 @@ x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/config/model.py
-  - tests/config/test_audio_vocab.py
   - vllm_omni/model_executor/models/minicpmo_4_5/
   - vllm_omni/model_executor/models/step_audio2/
   - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
