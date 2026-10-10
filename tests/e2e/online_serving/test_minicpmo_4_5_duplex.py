@@ -281,8 +281,9 @@ def test_duplex_seeded_text_to_audio_needs_no_reference_voice(omni_server) -> No
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
-    assert int(result["audio_bytes"]) > 0, "default-voice session produced no audio"
+    event_types, audio_bytes = result["event_types"], result["audio_bytes"]
+    assert isinstance(event_types, list) and "response.done" in event_types, event_types
+    assert isinstance(audio_bytes, int) and audio_bytes > 0, "default-voice session produced no audio"
     assert str(result["transcript"]).strip(), "default-voice session produced no transcript"
 
 
