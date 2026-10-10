@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA: the Talker's fused decode output and graph-replayed seeded codec draw are bit-identical to eager."""
 
+import gc
 import random
 from types import SimpleNamespace
 
@@ -91,6 +92,38 @@ def _batch(reqs, slots, step):
         num_scheduled_tokens=np.ones(rows, dtype=np.int32),
         prefill_len_np=prefill,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("gc_enabled", [False, True])
+@torch.inference_mode()
+def test_seeded_codec_capture_prevents_cyclic_gc_and_restores_state(monkeypatch, gc_enabled):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import SeededCodecDecodeGraphs
+
+    monkeypatch.setenv("VLLM_ENABLE_CUDAGRAPH_GC", "0")
+    states_during_capture = []
+    original_body = SeededCodecDecodeGraphs._body
+
+    def observe_capture(self, entry):
+        if torch.cuda.is_current_stream_capturing():
+            # A GC cycle can destroy an older CUDAGraph or Triton module on
+            # this thread, invalidating the active capture. Guard the whole
+            # auxiliary capture, including standalone model warmup.
+            states_during_capture.append(gc.isenabled())
+        return original_body(self, entry)
+
+    monkeypatch.setattr(SeededCodecDecodeGraphs, "_body", observe_capture)
+    was_enabled = gc.isenabled()
+    try:
+        gc.enable() if gc_enabled else gc.disable()
+        params = dict(temperature=0.8, top_k=25, top_p=0.85, repetition_penalty=1.05, max_tokens=256, seed=1)
+        talker, _, _, _ = _setup(True, 2, [("a", 4, [1, 2, 3, 4], params)])
+        graphs = talker._mrv2_seeded_codec_sampler.decode_graphs
+        assert graphs is not None and sorted(graphs.graphs) == [1, 2]
+        assert states_during_capture == [False, False]
+        assert gc.isenabled() == gc_enabled
+    finally:
+        gc.enable() if was_enabled else gc.disable()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

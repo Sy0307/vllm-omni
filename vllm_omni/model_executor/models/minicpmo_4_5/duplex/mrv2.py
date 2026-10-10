@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler as LegacySampler
@@ -581,6 +582,7 @@ class SeededCodecDecodeGraphs:
         sampled.masked_fill_(entry.forced_eos, eos_id)
         return sampled
 
+    @freeze_gc_for_cudagraph_capture()
     @torch.inference_mode()
     def capture(self, device: torch.device) -> None:
         from vllm.v1.sample.ops import topk_topp_triton
