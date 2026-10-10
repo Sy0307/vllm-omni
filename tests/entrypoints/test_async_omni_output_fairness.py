@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+from itertools import count
 
 import pytest
 
@@ -15,25 +16,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("route", ["subclass", "ack", "request_error", "ignored"])
 async def test_every_message_route_obeys_the_time_slice(mocker, monkeypatch, route):
     processed = []
-    clock = [0.0]
 
     async def resolve(msg):
         processed.append(msg)
-        clock[0] += 0.002
 
     def route_message(msg):
         if route != "ack":
             processed.append(msg)
-            clock[0] += 0.002
         return route == "subclass"
 
-    message_routes: dict[str, list[object]] = {
-        "subclass": list(range(32)),
-        "ack": [{"type": "ack", "ack": mocker.Mock(task_id="ack")} for _ in range(32)],
-        "request_error": [ErrorMessage(request_id="gone", error="failed") for _ in range(32)],
-        "ignored": list(range(32)),
-    }
-    messages = message_routes[route]
+    message = {"type": "ack", "ack": mocker.Mock(task_id="ack")} if route == "ack" else 0
+    if route == "request_error":
+        message = ErrorMessage(request_id="gone", error="failed")
+    messages = [message] * 32
 
     async def get_outputs_async(**kwargs):
         if not processed:
@@ -47,10 +42,10 @@ async def test_every_message_route_obeys_the_time_slice(mocker, monkeypatch, rou
     frontend._handle_output_message = lambda msg: (True, None, None, None)
     frontend.event_resolver = mocker.Mock(resolve=resolve)
     frontend.request_states = {}
-    monkeypatch.setattr(async_omni_base, "time", mocker.Mock(monotonic=lambda: clock[0]))
+    clock = count(step=0.0006)
+    monkeypatch.setattr(async_omni_base, "time", mocker.Mock(monotonic=lambda: next(clock)))
     async_omni_base.AsyncOmniBase._final_output_handler(frontend)
-    task = getattr(frontend, "final_output_task")
-    assert isinstance(task, asyncio.Task)
+    task = frontend.final_output_task
     try:
         await asyncio.sleep(0)
         assert 0 < len(processed) < len(messages)

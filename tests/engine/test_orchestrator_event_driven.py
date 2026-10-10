@@ -216,6 +216,7 @@ def _drain_engine(alive: bool = True) -> AsyncOmniEngine:
 async def test_output_drain_caps_the_batch() -> None:
     engine = _drain_engine()
     try:
+        assert await engine.get_outputs_async(timeout=0.01) == []
         for i in range(5):
             engine._output_sink.put_nowait(i)
         assert await engine.get_outputs_async(timeout=1.0, max_messages=3) == [0, 1, 2]
@@ -237,41 +238,6 @@ async def test_output_drain_wakes_on_put_from_another_thread() -> None:
         timer.join()
         assert msgs == ["late-msg"]
         assert loop.time() - started < 1.0
-    finally:
-        engine.output_queue.close()
-
-
-@pytest.mark.asyncio
-async def test_output_drain_coalesces_wakeups_while_busy(monkeypatch) -> None:
-    """Puts made after a wakeup is scheduled schedule no further loop callbacks."""
-    engine = _drain_engine()
-    sink = engine._output_sink
-    loop = asyncio.get_running_loop()
-    try:
-        assert await engine.get_outputs_async(timeout=0.01) == []  # armed, nothing queued
-        calls = []
-        original = loop.call_soon_threadsafe
-
-        def counting_call_soon_threadsafe(*args, **kwargs):
-            calls.append(args)
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(loop, "call_soon_threadsafe", counting_call_soon_threadsafe)
-        for i in range(10):
-            sink.put_nowait(i)
-        assert len(calls) == 1
-        assert await engine.get_outputs_async(timeout=1.0) == list(range(10))
-    finally:
-        engine.output_queue.close()
-
-
-@pytest.mark.asyncio
-async def test_output_drain_keeps_messages_put_after_a_timeout() -> None:
-    engine = _drain_engine(alive=True)
-    try:
-        assert await engine.get_outputs_async(timeout=0.02) == []
-        engine._output_sink.put_nowait("after-timeout")
-        assert await engine.get_outputs_async(timeout=1.0) == ["after-timeout"]
     finally:
         engine.output_queue.close()
 

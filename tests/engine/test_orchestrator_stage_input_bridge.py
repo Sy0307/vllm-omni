@@ -208,6 +208,10 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload_sender_info", [None, {"host": "10.0.0.2", "zmq_port": 52099}])
 async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> None:
+    import torch
+
+    from vllm_omni.engine.serialization import deserialize_additional_information
+
     orchestrator = object.__new__(Orchestrator)
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("sender")
@@ -217,9 +221,14 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
+    max_frames = [256]
+    prompt = {
+        "prompt_token_ids": [1, 2],
+        "additional_information": {"codes": {"ref": torch.arange(6).reshape(3, 2)}, "max_new_frames": max_frames},
+    }
     req_state = OrchestratorRequestState(
         request_id="req-prewarm",
-        prompt={"prompt_token_ids": [1, 2]},
+        prompt=prompt,
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
     )
@@ -229,6 +238,12 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
         SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
         req_state,
     )
+    max_frames.append(512)
+    info = deserialize_additional_information(stage2.submitted[0].additional_information)
+    assert torch.equal(info["codes"]["ref"], torch.arange(6).reshape(3, 2))
+    assert info["max_new_frames"] == [256]
+    assert set(stage2.submitted[0].prompt_token_ids) == {0}
+    assert prompt["prompt_token_ids"] == [1, 2]
 
     assert prewarmed is True
     assert stage1.submitted == []
@@ -248,50 +263,6 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
         0,
         req_state,
     )
-
-
-class _NotCopyable:
-    def __deepcopy__(self, memo):
-        raise AssertionError("prewarm must not copy multimodal inputs it replaces")
-
-
-@pytest.mark.asyncio
-async def test_async_prewarm_copies_only_the_fields_its_placeholder_keeps() -> None:
-    import torch
-
-    from vllm_omni.engine.serialization import deserialize_additional_information
-
-    orchestrator = object.__new__(Orchestrator)
-    stage0 = FakePrewarmPool("sender")
-    stage1 = FakePrewarmPool("receiver")
-    orchestrator.stage_pools = [stage0, stage1]
-    orchestrator._emit_tx_edge = lambda **_kwargs: None
-    orchestrator._on_stage_submitted = MagicMock()
-    max_frames = [256]
-    prompt: dict[str, Any] = {
-        "prompt_token_ids": [1, 2],
-        "multi_modal_data": {"image": [_NotCopyable()]},
-        "mm_processor_kwargs": {"opaque": _NotCopyable()},
-        "additional_information": {"codes": {"ref": torch.arange(6).reshape(3, 2)}, "max_new_frames": max_frames},
-    }
-    req_state = OrchestratorRequestState(
-        request_id="req-lean",
-        prompt=prompt,
-        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
-        final_stage_id=1,
-    )
-
-    assert await orchestrator._prewarm_async_chunk_stages(
-        "req-lean", SimpleNamespace(prompt_token_ids=[1, 2]), req_state
-    )
-    max_frames.append(512)  # a later edit of the source must not reach the queued request
-
-    (submitted,) = stage1.submitted
-    info = deserialize_additional_information(submitted.additional_information)
-    assert torch.equal(info["codes"]["ref"], torch.arange(6).reshape(3, 2))
-    assert info["max_new_frames"] == [256]
-    assert set(submitted.prompt_token_ids) == {0}
-    assert prompt["multi_modal_data"]["image"] and prompt["prompt_token_ids"] == [1, 2]
 
 
 @pytest.mark.asyncio

@@ -6209,9 +6209,16 @@ class TestTTSAsyncOffloading:
 
 
 @pytest.mark.parametrize("request_logger", [None, RequestLogger(max_log_len=None)])
-def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixture, request_logger):
-    server = object.__new__(OmniOpenAIServingSpeech)
-    server.request_logger = request_logger
+@pytest.mark.parametrize("diffusion", [False, True])
+def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixture, request_logger, diffusion):
+    if diffusion:
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(), model_name="test-model", request_logger=request_logger
+        )
+        assert server.request_logger is request_logger
+    else:
+        server = object.__new__(OmniOpenAIServingSpeech)
+        server.request_logger = request_logger
     log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
     log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
 
@@ -6220,14 +6227,3 @@ def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixtu
     used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
     used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
     unused.assert_not_called()
-
-
-@pytest.mark.parametrize("request_logger", [None, RequestLogger(max_log_len=None)])
-def test_diffusion_speech_factory_keeps_request_logger(mocker: MockerFixture, request_logger):
-    server = OmniOpenAIServingSpeech.for_diffusion(
-        diffusion_engine=mocker.MagicMock(), model_name="test-model", request_logger=request_logger
-    )
-    assert server.request_logger is request_logger
-    log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
-    server._log_request("Diffusion TTS speech request %s: voice_clone=%s", "req-1", False)
-    assert log_info.called is (request_logger is not None)
