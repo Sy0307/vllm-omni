@@ -177,6 +177,13 @@ a separate Qwen2.5-7B-Instruct judge. It selects four videos from each of
 revisions are pinned in the configuration. This is a small regression sample;
 increase the sample count for a broader quality evaluation.
 
+Each subset must meet its own IA-QTF1 floor of 0.2, in addition to the pooled
+floor of 0.2. This prevents good results in one scenario from hiding failed
+sustained guidance or mathematical question answering in another. Capture
+success alone does not establish answer quality. The text judge can also
+misgrade an answer, so inspect individual answers and verify spoken content
+separately before treating a benchmark pass as model acceptance.
+
 Compose the release at `Gander-Unit8-vllm` in the repository root, cache the
 dataset and judge weights, and allocate two available CUDA GPUs. The second
 device in `CUDA_VISIBLE_DEVICES` is reserved for the judge:
@@ -189,7 +196,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m pytest -sv tests/dfx/perf/scripts/run_benchma
 ```
 
 Nightly CI composes the same pinned release and uploads benchmark artifacts.
-The configuration checks request success and aggregate IA/QTF1. Functional
+The configuration checks request success, per-subset IA-QTF1 and pooled IA-QTF1. Functional
 E2E success alone does not establish benchmark quality or a performance gain.
 
 Automatic tool-timeout recovery remains follow-up work in
