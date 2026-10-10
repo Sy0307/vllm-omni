@@ -45,6 +45,10 @@
         played_ms: playedMs, committed_ms: playedMs };
     },
     mapEvent(event) {
+      if (event.type === 'output_audio_buffer.cleared'
+          || (event.type === 'response.done' && event.response?.status === 'cancelled')) {
+        return { kind: 'interrupt', responseId: event.response_id || event.response?.id || null };
+      }
       if (event.type === 'response.listen') return { kind: 'listen' };
       if (event.type === 'response.speak') return { kind: 'begin', responseId: event.response_id || event.response?.id };
       if (event.type === 'playback.acknowledged') {

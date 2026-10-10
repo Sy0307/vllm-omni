@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any, cast
+from typing import Any
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
@@ -18,6 +18,7 @@ from vllm.v1.utils import ConstantList
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.base import OmniConnectorBase
 from ..connectors.shm_connector import SharedMemoryConnector
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
@@ -136,6 +137,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     The base class owns background recv/save loops; load/save only enqueue
     work and return immediately.
     """
+
+    connector: OmniConnectorBase
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
@@ -287,6 +290,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
         request.num_prompt_tokens = len(request.prompt_token_ids)
+        # Generation chunks replace the prompt rather than append AR tokens.
+        # Keep Request's ConstantList views and MRv2's prefill_token_ids on
+        # the same current chunk, including replacements of the prewarm stub.
+        request._all_token_ids[:] = request.prompt_token_ids
+        request._output_token_ids.clear()
+        request.output_token_count = 0
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
 
@@ -775,7 +784,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(cast(dict[str, Any], raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(dict(raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1072,6 +1081,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _release_shm_prefix(self, key_prefix: str) -> None:
+        assert isinstance(self.connector, SharedMemoryConnector)
         reclaimed = self.connector.cleanup_prefix(key_prefix)
         if not reclaimed:
             return
@@ -1437,6 +1447,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
+            if self.model_mode == "generation" and getattr(request, "num_in_flight_tokens", 0) > 0:
+                continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
                     # Requests that have loaded chunk from last round
@@ -1574,6 +1586,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
+            if self.model_mode == "generation" and getattr(request, "num_in_flight_tokens", 0) > 0:
+                # Do not let the receive thread replace a generation chunk's
+                # prompt or terminal metadata before its output is retired.
+                # The next scheduler cycle will register its successor.
+                continue
             if not self._ensure_active_stream(request):
                 if target_status == RequestStatus.WAITING:
                     # A non-active placeholder must not remain visible to the

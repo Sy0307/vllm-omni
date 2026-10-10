@@ -120,6 +120,76 @@ def _gander_host_metadata(params, history):
     )
 
 
+@pytest.mark.parametrize(
+    "history_keys,tools,preferred,expected",
+    [
+        ([], False, "tool_call_token_id", "speak_token_id"),
+        ([], True, "tool_call_token_id", "tool_call_token_id"),
+        ([], False, "backchannel_token_id", "backchannel_token_id"),
+        (["speak_token_id"], False, "interrupt_token_id", 100),
+        (["speak_token_id", *([100] * 8)], False, 100, "chunk_eos_token_id"),
+        (["tool_call_token_id", 100], True, "speak_token_id", "tool_call_end_token_id"),
+        (["tool_call_token_id", 100, "tool_call_end_token_id"], True, 100, "chunk_eos_token_id"),
+        (["speak_token_id", "turn_eos_token_id"], False, 100, "chunk_eos_token_id"),
+    ],
+)
+def test_mrv2_keeps_gander_grammar_after_partial_prefill(
+    gander_host_sampler, ids, mocker, history_keys, tools, preferred, expected
+):
+    from types import SimpleNamespace
+
+    import numpy as np
+    import torch
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import MiniCPMO45DuplexSampler
+
+    model = gander_host_sampler
+    tokens = {**ids, "unit_token_id": 10, "unit_end_token_id": 11}
+    model._minicpmo45_native_duplex_token_ids_cache = tokens
+    state = model._minicpmo45_duplex_data_plane_helper.sessions["request"]
+    state.gander_tools_enabled = tools
+    model._mrv2_duplex_infos = [
+        {
+            "req_id": "request",
+            "sampling_params": SamplingParams(temperature=0.0, seed=42),
+            "duplex": {"data_plane": True, "session_id": "session", "seq": 1, "payload": {}},
+        }
+    ]
+    history = [tokens[key] if isinstance(key, str) else key for key in history_keys]
+    base = mocker.Mock(spec=Sampler)
+    base.side_effect = lambda logits, batch: SimpleNamespace(sampled_token_ids=logits.argmax(-1).view(-1, 1))
+    sampler = MiniCPMO45DuplexSampler(base, model)
+    sampler._requests["request"] = (1, history, None)
+    batch = mocker.Mock(
+        spec=InputBatch,
+        num_reqs=1,
+        num_computed_prefill_tokens_np=np.array([0]),
+        num_scheduled_tokens=np.array([2]),
+        prefill_len_np=np.array([8]),
+    )
+    wanted = tokens[expected] if isinstance(expected, str) else expected
+    preferred_id = tokens[preferred] if isinstance(preferred, str) else preferred
+    logits = torch.full((1, 128), float("-inf"))
+    logits[0, wanted] = 10.0
+    logits[0, preferred_id] = 20.0
+    before = list(history)
+    sampler(logits.clone(), batch)
+    assert history == before and not state.generated_tokens
+    batch.num_computed_prefill_tokens_np[0] = 6
+    output = sampler(logits.clone(), batch)
+    assert output.sampled_token_ids.item() == wanted
+    assert history == [*before, wanted]
+    assert sampler._pending_history is None
+    # The lookahead after a terminator must neither resample nor mutate grammar.
+    if wanted == tokens["chunk_eos_token_id"]:
+        generated = list(state.generated_tokens)
+        assert sampler(logits.clone(), batch).sampled_token_ids.item() == wanted
+        assert history == [*before, wanted] and state.generated_tokens == generated
+
+
 @pytest.mark.parametrize("temperature", [0.0, 0.75])
 def test_gander_host_snapshot_refreshes_without_metadata_scalar_reads(gander_host_sampler, ids, mocker, temperature):
     from dataclasses import replace

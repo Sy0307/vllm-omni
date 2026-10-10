@@ -50,19 +50,10 @@ def test_reference_survives_engine_ipc_buffer_and_codec_bridge() -> None:
     )
     stored = buffer.buffers[0]
     torch.testing.assert_close(decode_reference_audio(stored["codes"]["ref"]), waveform, rtol=0, atol=0)
-    codec = tts2code2wav_full_payload(
-        SimpleNamespace(),
-        torch.tensor([10, 20]),
-        SimpleNamespace(request_id=request.request_id, model_intermediate_buffer=stored),
-    )
-    torch.testing.assert_close(codec.codes.ref, waveform, rtol=0, atol=0)
-    stream = tts2code2wav_async_chunk(
-        SimpleNamespace(),
-        torch.tensor([10, 20]),
-        SimpleNamespace(request_id=request.request_id, model_intermediate_buffer=stored),
-        is_finished=True,
-    )
-    torch.testing.assert_close(stream.codes.ref, waveform, rtol=0, atol=0)
+    wire.model_intermediate_buffer = stored
+    for processor, kwargs in ((tts2code2wav_full_payload, {}), (tts2code2wav_async_chunk, {"is_finished": True})):
+        codec = processor(SimpleNamespace(), torch.tensor([10, 20]), wire, **kwargs)
+        torch.testing.assert_close(codec.codes.ref, waveform, rtol=0, atol=0)
     compact, compact_sr = _normalize_reference(payload, 16000)
     legacy, legacy_sr = _normalize_reference(waveform.tolist(), 16000)
     assert compact_sr == legacy_sr
