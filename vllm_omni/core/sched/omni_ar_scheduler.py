@@ -815,6 +815,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 and prompt_logprobs_tensors is None
                 and prompt_token_id_logprobs is None
                 and kv_transfer_params is None
+                and request.num_nans_in_logits == 0
                 and self._hold_payloadless_outputs
                 and request.sampling_params is not None
                 and not request.sampling_params.detokenize
@@ -931,6 +932,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     held = self._held_token_ids.pop(output.request_id, None)
                     if held:
                         output.new_token_ids = held + output.new_token_ids
+                        output.is_coalesced = True
 
         self._attach_scheduler_stats(
             engine_core_outputs,

@@ -95,9 +95,10 @@ async def test_hung_replica_does_not_delay_healthy_replica_batches(monkeypatch) 
     monkeypatch.setattr("vllm_omni.engine.stage_pool.logger.warning", lambda *a: warn.append(a))
 
     pool.schedule_release_request_resources(["a"])
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(healthy.started.wait(), timeout=2.0)
+    healthy.started.clear()
     pool.schedule_release_request_resources(["b"])
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(healthy.started.wait(), timeout=2.0)
 
     # Well before the hung replica's timeout, the healthy one released both.
     assert healthy.calls == [["a"], ["b"]]

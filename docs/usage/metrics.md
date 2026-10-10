@@ -101,6 +101,8 @@ When the pipeline includes an LLM stage, the upstream vLLM engine exposes its fu
 
 vLLM-Omni wraps the upstream `vllm.v1.metrics.loggers.PrometheusStatLogger` with `OmniPrometheusStatLogger` so that the original `engine` single label is reshaped into `stage` + `replica`. Every `vllm:*` family — TTFT, ITL, TPOT, e2e latency, KV cache usage, scheduler running/waiting, request success counts, etc. — therefore gains per-`(stage, replica)` visibility automatically. No omni-side duplicate is needed for the text path.
 
+Final AR audio stages can coalesce token-only decode steps into the next audio output. Their coalesced intervals are excluded from both upstream ITL histograms and Omni `vllm_itls_ms`; ordinary step samples, token counts, TTFT, TPOT and completion statistics remain available. ITL coverage therefore excludes coalesced steps. An empty ITL list means no individual-step samples were available; the corresponding zero average does not mean zero decode latency.
+
 ```text
 # Before wrap:
 vllm:num_requests_running{model_name="...", engine="1"}              3.0

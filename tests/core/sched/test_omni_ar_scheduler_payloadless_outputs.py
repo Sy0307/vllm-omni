@@ -15,6 +15,7 @@ import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import FinishReason
+from vllm.v1.metrics.stats import IterationStats, LoRARequestStates, RequestStateStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _holds_payloadless_outputs
@@ -92,7 +93,13 @@ def _make_sched(mocker, request: Request, *, hold: bool):
     return sched
 
 
-def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop: bool = False):
+@pytest.fixture
+def audio_scheduler(mocker):
+    request = _make_request(detokenize=False)
+    return request, _make_sched(mocker, request, hold=True)
+
+
+def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop: bool = False, nan_count: int = 0):
     scheduler_output = mocker.Mock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {request.request_id: 1}
     scheduler_output.total_num_scheduled_tokens = 1
@@ -106,7 +113,7 @@ def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop
     model_runner_output.prompt_token_id_logprobs_dict = {}
     model_runner_output.pooler_output = None
     model_runner_output.multimodal_outputs = [mm_output]
-    model_runner_output.num_nans_in_logits = None
+    model_runner_output.num_nans_in_logits = {request.request_id: nan_count}
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
     model_runner_output.req_id_to_index = {request.request_id: 0}
@@ -125,14 +132,14 @@ def _step(mocker, sched, request: Request, token: int | None, mm_output, *, stop
     return list(outputs[request.client_index].outputs)
 
 
-def test_token_only_steps_ride_on_the_next_audio_output(mocker) -> None:
-    request = _make_request(detokenize=False)
-    sched = _make_sched(mocker, request, hold=True)
+def test_token_only_steps_ride_on_the_next_audio_output(mocker, audio_scheduler) -> None:
+    request, sched = audio_scheduler
 
     # The first output always goes out: it carries the prefill statistics.
     (first,) = _step(mocker, sched, request, 10, {})
     assert first.new_token_ids == [10]
     assert first.prefill_stats is not None
+    assert not first.is_coalesced
 
     assert _step(mocker, sched, request, 11, {}) == []
     assert _step(mocker, sched, request, 12, {}) == []
@@ -140,11 +147,27 @@ def test_token_only_steps_ride_on_the_next_audio_output(mocker) -> None:
     (audio,) = _step(mocker, sched, request, 13, _AUDIO)
     assert audio.new_token_ids == [11, 12, 13]
     assert audio.multimodal_output is _AUDIO
+    assert audio.is_coalesced
 
     assert _step(mocker, sched, request, 14, {}) == []
     (last,) = _step(mocker, sched, request, 15, {}, stop=True)
     assert last.new_token_ids == [14, 15]
     assert last.finish_reason is not None
+    assert last.is_coalesced
+
+
+def test_nan_diagnostic_survives_a_later_zero_count(mocker, monkeypatch, audio_scheduler) -> None:
+    monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "1")
+    request, sched = audio_scheduler
+    stats, request_stats, lora_states = IterationStats(), RequestStateStats(), LoRARequestStates()
+    emitted = []
+    for step in range(7):
+        for output in _step(mocker, sched, request, step, {}, stop=step == 6, nan_count=3 if step == 5 else 0):
+            stats.update_from_output(output, 100.0 + step * 0.01, step == 0, request_stats, lora_states, None)
+            emitted.append(output)
+    assert [output.num_nans_in_logits for output in emitted] == [0, 3, 0]
+    assert request_stats.is_corrupted
+    assert request_stats.num_generation_tokens == 7
 
 
 @pytest.mark.parametrize(
@@ -169,9 +192,8 @@ def test_every_step_is_emitted_when_tokens_are_client_visible(mocker, monkeypatc
     assert [eco.new_token_ids for eco in emitted] == [[10], [11], [12]]
 
 
-def test_partial_prefill_preserves_pending_tokens(mocker) -> None:
-    request = _make_request(detokenize=False)
-    sched = _make_sched(mocker, request, hold=True)
+def test_partial_prefill_preserves_pending_tokens(mocker, audio_scheduler) -> None:
+    request, sched = audio_scheduler
     _step(mocker, sched, request, 10, {})
     assert _step(mocker, sched, request, 11, {}) == []
     assert _step(mocker, sched, request, None, None) == []
@@ -181,9 +203,10 @@ def test_partial_prefill_preserves_pending_tokens(mocker) -> None:
 
 
 @pytest.mark.parametrize("termination", ["kv_failure", "grammar_error", "abort", "input_timeout", "context_overflow"])
-def test_external_termination_flushes_pending_tokens_after_request_removal(mocker, termination) -> None:
-    request = _make_request(detokenize=False)
-    sched = _make_sched(mocker, request, hold=True)
+def test_external_termination_flushes_pending_tokens_after_request_removal(
+    mocker, audio_scheduler, termination
+) -> None:
+    request, sched = audio_scheduler
     _step(mocker, sched, request, 10, {})
     assert _step(mocker, sched, request, 11, {}) == []
     assert _step(mocker, sched, request, 12, {}) == []
@@ -217,5 +240,6 @@ def test_external_termination_flushes_pending_tokens_after_request_removal(mocke
     (terminal,) = _step(mocker, sched, request, None, None)
     assert terminal.finish_reason == expected
     assert terminal.new_token_ids == [11, 12]
+    assert terminal.is_coalesced
     assert sched._held_token_ids == {}
     assert sched.requests == {}
