@@ -907,13 +907,15 @@ def test_full_payload_ledger_survives_runner_and_processor_once(monkeypatch):
         num_reqs=1,
         num_tokens_after_padding=3,
     )
-    output = _async_output(
+    pending = _async_output(
         req_ids=["r"],
         text_hidden=hidden,
         multimodal_outputs={"latent": hidden, "latent_input_ids": ids, "latent_positions": positions},
         input_batch=batch,
         async_chunk=False,
-    ).get_output()
+    )
+    assert pending._mm_cpu["latent"] is pending._hidden_cpu
+    output = pending.get_output()
     stage_payload = output.inter_stage_outputs[0]
     for name, expected in [("latent", hidden), ("latent_input_ids", ids), ("latent_positions", positions)]:
         torch.testing.assert_close(stage_payload[name], expected)

@@ -26,39 +26,28 @@ def plugin(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("modalities", [("audio",), ("text", "audio"), ("text",)])
-async def test_session_without_reference_skips_voice_resolution(plugin, mocker, modalities):
-    resolve = mocker.patch.object(module, "resolve_ref_audio", new_callable=mocker.AsyncMock)
-    config = DuplexSessionConfig(modalities=modalities, instructions="Streaming Omni Conversation.")
-
-    runtime = await plugin.prepare_runtime_config(config, model_config=None)
-
-    resolve.assert_not_awaited()
-    assert config.ref_audio is None
-    assert not any(key.startswith("ref_audio") for key in runtime)
-    assert runtime["duplex_first_append_context_tokens"] == len(
-        "<|im_start|>system\nStreaming Omni Conversation.<|im_end|>"
-    )
-
-
-@pytest.mark.asyncio
-async def test_explicit_reference_keeps_audio_conditioning_and_exact_reserve(plugin, mocker):
+@pytest.mark.parametrize(
+    "modalities,reference", [(("audio",), False), (("text", "audio"), False), (("text",), False), (("audio",), True)]
+)
+async def test_reference_conditioning_and_exact_reserve(plugin, mocker, modalities, reference):
+    uri = "data:audio/wav;base64,AAA=" if reference else None
     resolve = mocker.patch.object(
         module,
         "resolve_ref_audio",
         new_callable=mocker.AsyncMock,
         return_value=(np.zeros(4801, dtype=np.float32), 16000),
     )
-    config = DuplexSessionConfig(modalities=("audio",), ref_audio="data:audio/wav;base64,AAA=")
-
+    config = DuplexSessionConfig(modalities=modalities, ref_audio=uri, instructions="Streaming Omni Conversation.")
     runtime = await plugin.prepare_runtime_config(config, model_config=None)
-
-    resolve.assert_awaited_once_with("data:audio/wav;base64,AAA=", model_config=None)
-    assert runtime["ref_audio_format"] == "pcm_f32le"
-    assert runtime["ref_audio_sample_rate_hz"] == 16000
-    assert len(module.b64decode(runtime["ref_audio_data"])) == 4800 * 4
     assert config.ref_audio is None
-    assert (
-        runtime["duplex_first_append_context_tokens"]
-        == len("<|im_start|>system\nStreaming Omni Conversation.\n<|audio_start|><|audio_end|><|im_end|>") + 3
-    )
+    system = "<|im_start|>system\nStreaming Omni Conversation."
+    if reference:
+        resolve.assert_awaited_once_with(uri, model_config=None)
+        assert runtime["ref_audio_format"] == "pcm_f32le"
+        assert runtime["ref_audio_sample_rate_hz"] == 16000
+        assert len(module.b64decode(runtime["ref_audio_data"])) == 4800 * 4
+        system += "\n<|audio_start|><|audio_end|>"
+    else:
+        resolve.assert_not_awaited()
+        assert not any(key.startswith("ref_audio") for key in runtime)
+    assert runtime["duplex_first_append_context_tokens"] == len(system + "<|im_end|>") + (3 if reference else 0)

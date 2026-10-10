@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 import numpy as np
 import pytest
 import torch
@@ -27,9 +25,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         (True, "duplex", None, 1),
     ],
 )
-def test_decode_burst_steps(v2, mode, processor, expected):
+def test_decode_burst_steps(mocker, v2, mode, processor, expected):
     config = VllmConfig()
-    config.model_config = Mock(
+    config.model_config = mocker.Mock(
         spec=OmniModelConfig,
         use_v2_model_runner=v2,
         session_mode=mode,

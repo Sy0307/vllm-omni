@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 import pytest
 
 from tests.model_executor.stage_input_processors.test_minicpmo_4_5_async_chunk import (
@@ -23,11 +21,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize(
     "v2,native,finished", [(True, True, False), (False, True, False), (True, False, False), (True, True, True)]
 )
-def test_only_mrv2_native_first_stream_window_yields(monkeypatch, v2, native, finished):
+def test_only_mrv2_native_first_stream_window_yields(monkeypatch, mocker, v2, native, finished):
     monkeypatch.setattr(processor, "_FIRST_WINDOW_YIELD_UNTIL", {})
     monkeypatch.setattr(processor.time, "monotonic", lambda: 10.0)
     manager = _manager()
-    manager.config = Mock(spec=OmniModelConfig, use_v2_model_runner=v2)
+    manager.config = mocker.Mock(spec=OmniModelConfig, use_v2_model_runner=v2)
     manager.connector.config["extra"]["initial_codec_chunk_frames"] = 10
 
     def delta(*codes: int) -> dict:

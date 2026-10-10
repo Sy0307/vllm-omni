@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
-import weakref
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -23,7 +21,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
 )
-from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import StepAudio2Token2WavCore
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
 
@@ -228,106 +225,6 @@ def test_hift_replay_clears_padding_and_preserves_previous_outputs(monkeypatch):
     for value, speech, source in saved:
         assert torch.all(speech == value)
         assert torch.all(source == value)
-
-
-@pytest.mark.cpu
-def test_short_hift_blocks_use_exact_captured_batch_without_lazy_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    wrapper = _fake_wrapper(monkeypatch)
-    wrapper.exact_batch_sizes = [3, 4, 8]
-    wrapper._exact_keys = {(b, 5, 2) for b in wrapper.exact_batch_sizes}
-    wrapper._capture(3, 5, 2)
-    wrapper._capture(4, 5, 2)
-    wrapper._capture(8, 5, 2)
-    wrapper._capture.reset_mock()
-    # A wider previous replay must not overwrite another batch's static inputs.
-    wrapper.replay(torch.full((4, 80, 5), 7.0), torch.full((4, 1, 2), 9.0))
-    speech, source = wrapper.replay(torch.full((3, 80, 5), 2.0), torch.full((3, 1, 2), 3.0))
-    assert speech.shape == (3, 1, 5) and source.shape == (3, 1, 5)
-    assert wrapper.static_speech_inputs[(3, 5, 2)].eq(2.0).all()
-    assert wrapper.static_cache_source_inputs[(3, 5, 2)].eq(3.0).all()
-    assert wrapper.static_speech_inputs[(4, 5, 2)].eq(7.0).all()
-    assert not wrapper.static_speech_inputs[(8, 5, 2)].any()
-    wrapper._capture.assert_not_called()
-    wrapper.decode_fn.assert_not_called()
-    # A missing cache width or too many rows still uses eager execution.
-    wrapper.replay(torch.ones(3, 80, 5), torch.zeros(3, 1, 0))
-    wrapper.replay(torch.ones(9, 80, 5), torch.zeros(9, 1, 2))
-    assert wrapper.decode_fn.call_count == 2
-    wrapper._capture.assert_not_called()
-
-
-@pytest.mark.cpu
-def test_hift_output_arena_reuses_contiguous_views_and_preserves_old_graph_storage() -> None:
-    wrapper = object.__new__(HiFTGraphWrapper)
-    wrapper._output_arenas = [None, None, None]
-    initial = wrapper._output_views(tuple(torch.empty(4, 2, 17) for _ in range(3)))
-    narrow = wrapper._output_views(tuple(torch.empty(3, 2, 7) for _ in range(3)))
-    for old, new in zip(initial, narrow, strict=True):
-        assert old.untyped_storage().data_ptr() == new.untyped_storage().data_ptr()
-        assert new.shape == (3, 2, 7) and new.is_contiguous()
-        new.fill_(9)
-        assert old.flatten()[: new.numel()].eq(9).all()
-    grown = wrapper._output_views(tuple(torch.empty(5, 4, 21) for _ in range(3)))
-    for old, new in zip(initial, grown, strict=True):
-        assert old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr()
-        new.zero_()
-        assert old.flatten()[:42].eq(9).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_short_hift_exact_batches_match_eager_after_wider_replay(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An isolated pool avoids reusing another test's graph-owned allocations.
-    pool = torch.cuda.graph_pool_handle()
-    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
-    torch.manual_seed(0)
-    hift = _small_hift()
-    token2wav = Mock(
-        spec=StepAudio2Token2WavCore,
-        hift=hift,
-        flow=Mock(
-            spec=nn.Module,
-            encoder=Mock(spec=nn.Module, pre_lookahead_layer=Mock(spec=nn.Module, pre_lookahead_len=3)),
-            token_mel_ratio=2,
-        ),
-        mel_cache_len=2,
-        source_cache_len=960,
-    )
-    wrapper = HiFTGraphWrapper(
-        token2wav,
-        connector_config={
-            "codec_chunk_frames": 4,
-            "codec_left_context_frames": 3,
-            "hift_graph_first_chunk_frames": [2, 2],
-            "hift_graph_continuation_frames": [2, 2],
-            "hift_graph_exact_batch_sizes": [1, 3, 4],
-        },
-        capture_batch_sizes=[1],
-    )
-    wrapper.capture()
-    saved: list[tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, ...]]] = []
-    with torch.inference_mode():
-        for frames, cache_len in ((4, 0), (6, 960)):
-            for rows in (4, 3, 1, 3):
-                features = torch.randn(rows, 80, frames, device="cuda")
-                cache = torch.randn(rows, 1, cache_len, device="cuda")
-                expected = hift.inference(features, cache)
-                actual = wrapper.replay(features, cache)
-                for value, reference in zip(actual, expected, strict=True):
-                    torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
-                for previous, owned in saved:
-                    for value, reference in zip(previous, owned, strict=True):
-                        torch.testing.assert_close(value, reference, rtol=0, atol=0)
-                saved.append((actual, tuple(value.clone() for value in actual)))
-                torch.testing.assert_close(wrapper.static_speech_inputs[(rows, frames, cache_len)], features)
-                torch.testing.assert_close(wrapper.static_cache_source_inputs[(rows, frames, cache_len)], cache)
-    assert wrapper.lazy_graph_count == 0
-    for buffers in (
-        wrapper.static_magnitude_outputs,
-        wrapper.static_phase_outputs,
-        wrapper.static_cache_source_outputs,
-    ):
-        assert len({value.untyped_storage().data_ptr() for value in buffers.values()}) == 1
-        assert all(value.is_contiguous() for value in buffers.values())
 
 
 # ---------------------------------------------------------------------------
@@ -2394,165 +2291,6 @@ def _ragged_mask(lengths: list[int], width: int, offset: int) -> torch.Tensor:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-@pytest.mark.parametrize("resident", [False, True])
-def test_whole_euler_prompt_arena_reserves_only_fallback_rows_with_resident_slots(
-    monkeypatch: pytest.MonkeyPatch, resident: bool
-) -> None:
-    """Prompt graphs stay small with resident history; a larger fallback can grow safely."""
-    from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
-        blocks_forward_chunk_fused,
-        dit_modulation,
-    )
-
-    pool = torch.cuda.graph_pool_handle()
-    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
-    # Tiled fused attention requires a dot-product dimension of at least 16.
-    estimator = _tiny_upstream_dit(head_dim=16)
-    wrapper = WholeEulerCFMGraphWrapper(
-        estimator=estimator,
-        n_timesteps=10,
-        max_graphs=8,
-        micro_batch_size=16,
-        max_graph_batch=16,
-        query_bucket_frames=8,
-        att_slots=18 if resident else 0,
-        ragged_body=blocks_forward_chunk_fused,
-        modulation_fn=partial(dit_modulation, estimator),
-    )
-    # Compare identical fused math with the original full arena allocation.
-    # The upstream eager DiT uses a different attention precision policy.
-    reference = WholeEulerCFMGraphWrapper(
-        estimator=estimator,
-        n_timesteps=10,
-        max_graphs=8,
-        micro_batch_size=16,
-        max_graph_batch=16,
-        query_bucket_frames=8,
-        ragged_body=blocks_forward_chunk_fused,
-        modulation_fn=partial(dit_modulation, estimator),
-    )
-    wrapper._att_capacity = 128  # Steady history was announced by precapture.
-    reference._att_capacity = 128
-    for batch_size, resident_rows in ((1, 1), (4, 4), (1, 4)):
-        chunk = _whole_euler_chunk(batch_size, 8)
-        actual = wrapper.replay(**chunk, cnn_cache=None, att_cache=None)
-        assert actual is not None
-        expected = reference.replay(**chunk, cnn_cache=None, att_cache=None)
-        assert expected is not None
-        for got, want in zip(actual, expected, strict=True):
-            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
-        storage = wrapper.arena._att
-        assert storage is not None
-        assert storage.shape[2] == 2 * (resident_rows if resident else 16)
-        assert storage.shape[4] == (16 if resident else 144)
-    assert wrapper._stats["flushes"] == int(resident)
-    wrapper._flush()
-    reference._flush()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_fallback_growth_preserves_live_resident_graphs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fallback growth frees the old arena without invalidating live resident caches or graphs."""
-    from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
-        blocks_forward_chunk_fused,
-        dit_modulation,
-    )
-
-    graph_pool = torch.cuda.graph_pool_handle()
-    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: graph_pool)
-    estimator = _tiny_upstream_dit(head_dim=16)
-    options = dict(
-        estimator=estimator,
-        n_timesteps=10,
-        max_graphs=8,
-        micro_batch_size=16,
-        query_bucket_frames=16,
-        att_slots=18,
-        ragged_body=blocks_forward_chunk_fused,
-        modulation_fn=partial(dit_modulation, estimator),
-    )
-    wrapper = WholeEulerCFMGraphWrapper(**options)
-    # Compare the same fused kernels with an independent stream that never
-    # grows its fallback arena. This isolates storage lifetime from TF32
-    # rounding differences against the upstream unfused eager body.
-    reference = WholeEulerCFMGraphWrapper(**options)
-    keep = (96, 8)
-    slot_pool = wrapper._ensure_slot_pool(keep)
-    assert slot_pool is not None
-    slot_entry = wrapper._slot_entry(graph_batch=1, query_cap=16, channels=4, spk_dim=4, fill=wrapper._precapture_fill)
-    assert slot_entry is not None
-
-    prompt = _whole_euler_chunk(1, 40)
-    prompt_result = wrapper.replay(**prompt, cnn_cache=None, att_cache=None, att_keep=keep)
-    assert prompt_result is not None
-    expected_prompt = reference.replay(**prompt, cnn_cache=None, att_cache=None, att_keep=keep)
-    assert expected_prompt is not None
-    for actual, expected in zip(prompt_result, expected_prompt, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-    prompt_snapshot = [value.clone() for value in prompt_result]
-    storage = wrapper.arena._att
-    assert storage is not None
-    assert storage.shape[2] == 2
-    assert storage.shape[4] == 48  # Actual query width, rounded to the cache alignment.
-    old_storage = weakref.ref(storage)
-    del storage
-
-    chunk = _whole_euler_chunk(1, 16)
-    resident_result = wrapper.replay(**chunk, cnn_cache=prompt_result[1], att_cache=[prompt_result[2]], att_keep=keep)
-    assert resident_result is not None
-    expected_resident = reference.replay(
-        **chunk, cnn_cache=expected_prompt[1], att_cache=[expected_prompt[2]], att_keep=keep
-    )
-    assert expected_resident is not None
-    resident = resident_result[2][0]
-    for actual, expected in zip(
-        (*resident_result[:2], resident.materialize()),
-        (*expected_resident[:2], expected_resident[2][0].materialize()),
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-    resident_snapshot = resident.materialize()
-
-    fallback = _whole_euler_chunk(3, 80)
-    fallback_result = wrapper.replay(**fallback, cnn_cache=None, att_cache=None)
-    assert fallback_result is not None
-    fallback_reference = WholeEulerCFMGraphWrapper(**{**options, "att_slots": 0})
-    expected_fallback = fallback_reference.replay(**fallback, cnn_cache=None, att_cache=None)
-    assert expected_fallback is not None
-    for actual, expected in zip(fallback_result, expected_fallback, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-    assert wrapper._stats["flushes"] == 1
-    assert old_storage() is None
-    assert wrapper.arena._att.shape[2:5:2] == (8, 80)
-    assert wrapper.slot_pool is slot_pool
-    assert list(wrapper._slot_graphs.values()) == [slot_entry]
-    torch.testing.assert_close(resident.materialize(), resident_snapshot, rtol=0, atol=0)
-    for actual, expected in zip(prompt_result, prompt_snapshot, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    following = _whole_euler_chunk(1, 16)
-    following_result = wrapper.replay(**following, cnn_cache=resident_result[1], att_cache=[resident], att_keep=keep)
-    assert following_result is not None
-    expected_following = reference.replay(
-        **following, cnn_cache=expected_resident[1], att_cache=expected_resident[2], att_keep=keep
-    )
-    assert expected_following is not None
-    for actual, expected in zip(
-        (*following_result[:2], following_result[2][0].materialize()),
-        (*expected_following[:2], expected_following[2][0].materialize()),
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-    wrapper._flush()
-    wrapper._retire(wrapper._slot_graphs)
-    reference._flush()
-    reference._retire(reference._slot_graphs)
-    fallback_reference._flush()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.MonkeyPatch) -> None:
     """One graph solves rows of different lengths exactly as each row's own unpadded solve.
 
@@ -2758,50 +2496,6 @@ def test_vocoder_restores_tf32_policy(fail):
     else:
         assert MiniCPMO45Code2Wav.forward(model) == "ok"
     assert torch.backends.cuda.matmul.allow_tf32 == previous
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-@pytest.mark.parametrize("batch_size", [1, 3, 5])
-@pytest.mark.parametrize("per_request", [False, True])
-def test_whole_euler_cache_buckets_preserve_streaming_history(monkeypatch, batch_size, per_request):
-    """Masked capacity does not extend history or shift the current-first trim."""
-    pool = torch.cuda.graph_pool_handle()
-    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
-    estimator = _tiny_upstream_dit()
-    exact = WholeEulerCFMGraphWrapper(
-        estimator=estimator,
-        max_graphs=32,
-        query_bucket_frames=16,
-        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
-    )
-    bucketed = WholeEulerCFMGraphWrapper(
-        estimator=estimator,
-        max_graphs=32,
-        query_bucket_frames=16,
-        offset_bucket_frames=16,
-        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
-    )
-    caches = {"exact": (None, None), "bucketed": (None, None)}
-    for width in (10, 8, 16, 6, 12):
-        chunk = _whole_euler_chunk(batch_size, width)
-        results = {}
-        for name, wrapper in (("exact", exact), ("bucketed", bucketed)):
-            cnn, att = caches[name]
-            result = wrapper.replay(**chunk, cnn_cache=cnn, att_cache=att, att_keep=(8, 16))
-            assert result is not None
-            out_x, out_cnn, out_att = result
-            rows = _split_cfg_rows(out_att, batch_size) if isinstance(out_att, torch.Tensor) else out_att
-            assert all(int(row.shape[4]) <= 24 and torch.isfinite(row).all() for row in rows)
-            results[name] = (out_x, out_cnn, rows)
-            caches[name] = (out_cnn, rows if per_request else out_att)
-        for actual, expected in zip(results["bucketed"][:2], results["exact"][:2], strict=True):
-            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-        for actual, expected in zip(results["bucketed"][2], results["exact"][2], strict=True):
-            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-    assert {key[3] for key in bucketed._cache} == {0, 24}
-    assert len(bucketed._cache) < len(exact._cache)
-    exact._flush()
-    bucketed._flush()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")

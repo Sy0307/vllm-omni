@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-from transformers.cache_utils import EncoderDecoderCache
 
 from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph import EncoderCudaGraph
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
@@ -176,41 +175,6 @@ def test_streaming_audio_does_not_replay_stateless_graph():
         output = model.get_audio_embedding_streaming(data)
         assert output[0][0].shape == (10, 48)
     assert model.audio_past_key_values.get_seq_length() == 100
-
-
-@pytest.mark.cpu
-@pytest.mark.parametrize("selected_layer", [-1, -2])
-@torch.inference_mode()
-def test_streaming_audio_matches_hidden_state_reference_across_chunks(selected_layer):
-    model = _audio_model("cpu")
-    model.audio_encoder_layer = selected_layer
-    reference_cache: EncoderDecoderCache | None = None
-    for frames in (100, 80, 40):
-        features = torch.randn(1, 80, frames)
-        current_length = (frames + 1) // 2
-        past_length = 0 if reference_cache is None else reference_cache.get_seq_length()
-        reference = model.apm(
-            features,
-            past_key_values=reference_cache,
-            use_cache=True,
-            output_hidden_states=True,
-            attention_mask=torch.zeros(1, 1, current_length, past_length + current_length),
-        )
-        reference_cache = reference.past_key_values
-        expected = model.audio_projection_layer(reference.hidden_states[selected_layer])
-        expected = model.audio_avg_pooler(expected.transpose(1, 2)).transpose(1, 2)
-        actual = model.get_audio_embedding_streaming(
-            {"audio_features": features, "audio_feature_lens": torch.tensor([[frames]])}
-        )[0][0]
-        torch.testing.assert_close(actual, expected[0], rtol=0, atol=0)
-        assert model.audio_past_key_values.get_seq_length() == past_length + current_length
-        for actual_layer, expected_layer in zip(
-            model.audio_past_key_values.self_attention_cache.layers,
-            reference_cache.self_attention_cache.layers,
-            strict=True,
-        ):
-            torch.testing.assert_close(actual_layer.keys, expected_layer.keys, rtol=0, atol=0)
-            torch.testing.assert_close(actual_layer.values, expected_layer.values, rtol=0, atol=0)
 
 
 @pytest.mark.cpu

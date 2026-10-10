@@ -26,18 +26,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 GIB = 1024**3
 
 
-class _AuxiliaryModel(torch.nn.Module):
-    def __init__(self, capture):
-        super().__init__()
-        self._capture = capture
-
-    def capture_auxiliary_graphs(self):
-        self._capture()
-
-
 @pytest.mark.parametrize("enable_jit_warmup", [False, True])
-@pytest.mark.parametrize("has_auxiliary_hook", [False, True])
-def test_auxiliary_warmup_precedes_jit_monitor_activation(mocker, enable_jit_warmup, has_auxiliary_hook):
+@pytest.mark.parametrize("hook", ["absent", "ok", "error"])
+def test_auxiliary_warmup_precedes_jit_monitor_activation(mocker, enable_jit_warmup, hook):
     from vllm.config import VllmConfig
 
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
@@ -48,40 +39,26 @@ def test_auxiliary_warmup_precedes_jit_monitor_activation(mocker, enable_jit_war
     worker.observability_config = worker.vllm_config.observability_config
     worker.observability_config.jit_monitor_mode = "error"
     events = []
-    if has_auxiliary_hook:
-        model = _AuxiliaryModel(lambda: events.append("auxiliary"))
-    else:
-        model = torch.nn.Linear(1, 1)
+    model = torch.nn.Module()
+
+    def capture():
+        events.append("auxiliary")
+        if hook == "error":
+            raise RuntimeError("auxiliary priming failed")
+
+    if hook != "absent":
+        model.capture_auxiliary_graphs = capture
     worker.model_runner = mocker.Mock(spec=OmniARModelRunner, model=model)
     monitor = mocker.patch("vllm.utils.jit_monitor.activate", side_effect=lambda **kwargs: events.append("monitor"))
-
-    worker._maybe_activate_jit_monitor()
-
-    assert events == (["auxiliary"] if has_auxiliary_hook else []) + (["monitor"] if enable_jit_warmup else [])
-    if enable_jit_warmup:
-        monitor.assert_called_once_with(mode="error", verbose=worker.observability_config.jit_monitor_verbose)
+    if hook == "error":
+        with pytest.raises(RuntimeError, match="auxiliary priming failed"):
+            worker._maybe_activate_jit_monitor()
     else:
-        monitor.assert_not_called()
-
-
-@pytest.mark.parametrize("enable_jit_warmup", [False, True])
-def test_auxiliary_warmup_failure_never_activates_monitor(mocker, enable_jit_warmup):
-    from vllm.config import VllmConfig
-
-    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
-
-    worker = object.__new__(OmniGPUWorkerBase)
-    worker.vllm_config = VllmConfig()
-    worker.vllm_config.kernel_config.enable_jit_warmup = enable_jit_warmup
-    capture = mocker.Mock(side_effect=RuntimeError("auxiliary priming failed"))
-    model = _AuxiliaryModel(capture)
-    worker.model_runner = mocker.Mock(spec=OmniARModelRunner, model=model)
-    monitor = mocker.patch("vllm.utils.jit_monitor.activate")
-
-    with pytest.raises(RuntimeError, match="auxiliary priming failed"):
         worker._maybe_activate_jit_monitor()
-    capture.assert_called_once_with()
-    monitor.assert_not_called()
+    assert events == (["auxiliary"] if hook != "absent" else []) + (
+        ["monitor"] if enable_jit_warmup and hook != "error" else []
+    )
+    assert monitor.call_count == int(enable_jit_warmup and hook != "error")
 
 
 def _fake_memory_profiling(*, non_torch: int, torch_peak: int):

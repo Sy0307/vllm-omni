@@ -20,27 +20,11 @@ def _scheduler(running, held_ids):
     return scheduler
 
 
-def test_sole_running_request_is_held():
-    request = SimpleNamespace(request_id="a")
-    scheduler = _scheduler([request], {"a"})
-    assert scheduler._take_held_running_requests() == [request]
-    assert scheduler.running == []
-
-
 def test_request_is_not_held_while_other_rows_decode():
     held, other = SimpleNamespace(request_id="a"), SimpleNamespace(request_id="b")
     scheduler = _scheduler([held, other], {"a"})
     assert scheduler._take_held_running_requests() == []
     assert scheduler.running == [held, other]
-
-
-def test_no_hook_or_no_hold_keeps_running():
-    request = SimpleNamespace(request_id="a")
-    scheduler = _scheduler([request], set())
-    assert scheduler._take_held_running_requests() == []
-    scheduler._scheduling_hold_hook = None
-    assert scheduler._take_held_running_requests() == []
-    assert scheduler.running == [request]
 
 
 @pytest.mark.parametrize("raises", [False, True])

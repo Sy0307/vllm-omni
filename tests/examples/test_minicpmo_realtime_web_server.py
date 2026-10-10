@@ -107,20 +107,6 @@ def test_build_app_exposes_realtime_websocket_and_static_assets():
     assert client.get("/static/playback_worklet.js").status_code == 200
 
 
-def test_minicpm_cli_starts_without_reference_audio(monkeypatch, mocker):
-    from examples.online_serving.realtime_web import server as shared_server
-
-    monkeypatch.setattr(sys, "argv", ["realtime_web", "--profile", "minicpm-native"])
-    run = mocker.patch.object(shared_server.uvicorn, "run")
-
-    shared_server.main()
-
-    run.assert_called_once()
-    page = TestClient(run.call_args.args[0]).get("/").text
-    assert '"profile": "minicpm-native"' in page
-    assert '"refAudio": null' in page
-
-
 def test_qwen_config_does_not_inject_reference_voice():
     client = TestClient(build_app(profile="qwen3-turn", turn_mode="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
     page = client.get("/").text

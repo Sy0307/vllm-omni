@@ -8,15 +8,10 @@ runs that launch; a synchronizing write here serializes every Thinker step.
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import MiniCPMO45DuplexSampler
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.utils.device_copy import index_to_device
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -31,26 +26,13 @@ def _sampler(mocker, deferred):
         "sampling_params": params,
         "duplex": {"data_plane": True, "session_id": "s", "seq": 0, "payload": {}},
     }
-    model = mocker.Mock(
-        spec=MiniCPMO45OmniForConditionalGeneration,
-        _mrv2_duplex_infos=[info],
-        prepare_duplex_sampling=mocker.Mock(),
-        _minicpmo45_native_duplex_token_ids=lambda: {},
-        _minicpmo45_chunk_terminator_token_ids=lambda _: {_TERMINATOR},
-        _sample_minicpmo45_native_duplex_rows_deferred=mocker.Mock(side_effect=deferred),
-        _record_minicpmo45_duplex_terminator=mocker.Mock(),
-        _commit_minicpmo45_duplex_pending_samples=mocker.Mock(),
-    )
-    base = mocker.Mock(spec=Sampler, side_effect=lambda logits, _batch: logits)
-    batch = mocker.Mock(
-        spec=InputBatch,
-        num_reqs=1,
-        idx_mapping_np=np.array([0]),
-        num_computed_prefill_tokens_np=np.array([4]),
-        num_scheduled_tokens=np.array([1]),
-        prefill_len_np=np.array([4]),
-    )
-    return MiniCPMO45DuplexSampler(base, model), model, batch
+    from tests.model_executor.models.minicpmo_4_5.test_duplex_mrv2 import _sampler as make_sampler
+
+    sampler, model, batch = make_sampler(mocker, [info], [0], [4], computed=[4])
+    batch.num_scheduled_tokens[:] = 1
+    model._sample_minicpmo45_native_duplex_rows_deferred.side_effect = deferred
+    sampler.base_sampler.side_effect = lambda logits, _batch: logits
+    return sampler, model, batch
 
 
 def test_deferred_and_lookahead_rows_select_tokens_without_host_sync(mocker):

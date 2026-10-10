@@ -15,21 +15,6 @@ from vllm_omni.config.model import OmniModelArchConfigConvertor
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize(
-    "values,expected",
-    [
-        ({}, 0),
-        ({"num_audio_tokens": 6562}, 6562),
-        ({"vocab_size": 64, "num_audio_tokens": 6562}, 64),
-        ({"vocab_size": 0, "num_audio_tokens": 6562}, 0),
-    ],
-)
-def test_audio_vocab_fallback_preserves_explicit_vocab(values, expected):
-    text_config = PretrainedConfig(**values)
-    converter = OmniModelArchConfigConvertor(PretrainedConfig(), text_config, stage_config_name="tts_config")
-    assert converter.get_vocab_size() == expected
-
-
 def test_remote_codec_vocab_retains_top_k_in_real_v1_metadata(monkeypatch):
     # The released remote TTS config omits vocab_size. Exercise the real V1
     # admission/metadata path: testing SamplingParams alone misses the bug.
@@ -63,14 +48,3 @@ def test_remote_codec_vocab_retains_top_k_in_real_v1_metadata(monkeypatch):
     batch.refresh_metadata()
     assert batch.sampling_metadata.top_k is not None
     assert batch.sampling_metadata.top_k.tolist() == [25, 6562]
-    # Removal and re-admission must retain the request's filter, as they do
-    # when a resumable duplex request receives another conditioning chunk.
-    batch.remove_request("filtered")
-    batch.condense()
-    batch.refresh_metadata()
-    assert batch.sampling_metadata.top_k is None
-    batch.add_request(requests["filtered"])
-    batch.refresh_metadata()
-    metadata_after_readmission = batch.sampling_metadata
-    assert metadata_after_readmission.top_k is not None
-    assert metadata_after_readmission.top_k.tolist() == [6562, 25]

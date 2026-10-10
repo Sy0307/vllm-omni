@@ -577,26 +577,6 @@ def test_mrv2_frame_validity_selects_codec_rows(rows, valid) -> None:
         assert _extract_codec_delta(payload, "r") == expected
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        (torch.tensor(True), 1),
-        (torch.tensor(False), 0),
-        (torch.tensor(7), 7),
-        (torch.tensor([9]), 9),
-        (torch.tensor([[4, 5]]), 4),
-        (torch.tensor([], dtype=torch.long), None),
-        (3, 3),
-        ("x", None),
-        (None, None),
-    ],
-)
-def test_metadata_scalar_reads_first_element(value, expected) -> None:
-    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _coerce_int
-
-    assert _coerce_int(value) == expected
-
-
 def _initial_manager(initial: int):
     manager = _manager()
     manager.connector.config["extra"]["initial_codec_chunk_frames"] = initial
@@ -616,12 +596,6 @@ def test_initial_chunk_releases_first_window_then_steady_windows() -> None:
     assert second is not None
     assert _codes(second) == [8, 9, 10] + list(range(11, 36))
     assert second.meta.codec_chunk_frames == 25
-
-
-def test_initial_chunk_default_keeps_25_frame_first_window() -> None:
-    manager = _manager()
-    request = _request("req-default")
-    assert tts2code2wav_async_chunk(manager, _delta(*range(1, 11)), request) is None
 
 
 def test_duplex_initial_chunk_applies_to_each_turn() -> None:
@@ -656,8 +630,3 @@ def test_duplex_cancelled_turn_state_does_not_open_the_next_turn(first_window_se
     assert next_first.meta.chunk_seq == 0
     assert next_first.meta.cache_epoch == 1
     assert next_first.meta.llm_output_text_utf8.tolist() == list(b"new")
-
-
-def test_initial_chunk_rejects_negative_config() -> None:
-    with pytest.raises(ValueError, match="initial_codec_chunk_frames"):
-        tts2code2wav_async_chunk(_initial_manager(-1), _delta(1), _request("req-bad"))

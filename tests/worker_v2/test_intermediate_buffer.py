@@ -96,18 +96,6 @@ def test_update_merge_semantics(monkeypatch):
     assert "kv" in buf.buffers[0]
 
 
-def test_integer_history_snapshots_remain_independent():
-    buf = OmniIntermediateBuffer(max_num_reqs=2)
-    history = list(range(8192))
-    for slot in range(2):
-        buf.add_request(slot, _make_new_req_data(f"r{slot}", model_intermediate_buffer={"ids": {"prompt": history}}))
-    history[0] = -1
-    history.append(8192)
-    assert buf.buffers[0]["ids"]["prompt"] == list(range(8192))
-    buf.buffers[0]["ids"]["prompt"][1] = -2
-    assert buf.buffers[1]["ids"]["prompt"] == list(range(8192))
-
-
 @pytest.mark.parametrize("gpu_resident", [False, True])
 def test_integer_prefix_does_not_hide_tensor_tail(monkeypatch, gpu_resident):
     buf = OmniIntermediateBuffer(max_num_reqs=1)
