@@ -8,6 +8,7 @@ import pytest
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     DUPLEX_RUNNER_SERVER_PARAMS,
+    SERVER_PARAMS,
     duplex_camera_frames,
     realtime_url,
     resolve_ref_audio,
@@ -50,7 +51,7 @@ def test_window_rebuild_and_next_session(omni_server, mode, reference):
 
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.full_model
-@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode,camera", [("basic", False), ("context", False), ("context", True)])
 def test_window_continuous_input(omni_server, tmp_path, mode, camera):
     # 24 repeats cover over two minutes and many canonical KV replacements.

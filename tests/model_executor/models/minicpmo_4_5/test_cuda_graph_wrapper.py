@@ -2258,7 +2258,7 @@ def test_whole_euler_disabled_via_serving_config() -> None:
     assert adapter_derived._whole_euler_graph_wrapper.query_bucket_frames == 50
 
 
-def _tiny_upstream_dit(head_dim: int = 8) -> nn.Module:
+def _tiny_upstream_dit() -> nn.Module:
     """The shipped DiT architecture at toy width, so ``_blocks_forward_chunk_ragged`` runs as in serving."""
     for name in ("cosyvoice2.flow.decoder_dit", "stepaudio2.cosyvoice2.flow.decoder_dit"):
         try:
@@ -2271,9 +2271,7 @@ def _tiny_upstream_dit(head_dim: int = 8) -> nn.Module:
     else:
         decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     torch.manual_seed(0)
-    estimator = decoder_dit.DiT(
-        in_channels=16, out_channels=4, depth=2, num_heads=2, head_dim=head_dim, hidden_size=2 * head_dim
-    )
+    estimator = decoder_dit.DiT(in_channels=16, out_channels=4, depth=2, num_heads=2, head_dim=8, hidden_size=16)
     with torch.no_grad():
         # The adaLN-Zero init makes every block an identity; any weights will do here.
         for parameter in estimator.parameters():
@@ -2505,14 +2503,9 @@ def test_whole_euler_cache_bucket_replay_accepts_shorter_history(monkeypatch, ra
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
     estimator = _tiny_upstream_dit()
-    exact = WholeEulerCFMGraphWrapper(
-        estimator=estimator,
-        max_graphs=32,
-        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
-    )
+    exact = WholeEulerCFMGraphWrapper(estimator=estimator, ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged)
     bucketed = WholeEulerCFMGraphWrapper(
         estimator=estimator,
-        max_graphs=32,
         offset_bucket_frames=16,
         ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
     )
@@ -2533,8 +2526,7 @@ def test_whole_euler_cache_bucket_replay_accepts_shorter_history(monkeypatch, ra
                 att_cache=rows,
                 attn_mask=mask,
                 valid_lengths=lengths if ragged else None,
-                # Serving announces the steady history capacity up front.
-                # Keep every frame here; isolate reuse from arena growth.
+                # Announce the steady history capacity to isolate graph reuse from arena growth.
                 att_keep=(8, 32),
             )
             assert values[name] is not None

@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
-    DUPLEX_RUNNER_SERVER_PARAMS,
     SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
     deploy_max_sessions,
@@ -81,7 +80,7 @@ def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None
 # throughput. The current NPU stack runs several times slower than real time,
 # so it never reaches a mid-stream decision point.
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
-@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
     input_wav = validated_soft_interrupt_wav()
     result = asyncio.run(
@@ -114,7 +113,7 @@ def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
-@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_server_vad_hard_interrupt(_cached_server_vad_artifact, omni_server) -> None:
     result = asyncio.run(
         run_server_vad_interrupt(

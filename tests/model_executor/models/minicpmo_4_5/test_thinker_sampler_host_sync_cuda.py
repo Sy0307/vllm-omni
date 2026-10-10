@@ -19,26 +19,21 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
 _TERMINATOR = 7
 
 
-def _sampler(mocker, deferred):
+def test_deferred_and_lookahead_rows_select_tokens_without_host_sync(mocker):
+    from tests.model_executor.models.minicpmo_4_5.test_duplex_mrv2 import _sampler as make_sampler
+
+    device = torch.device("cuda")
+    drawn = torch.tensor([_TERMINATOR], device=device)
     params = SamplingParams(temperature=0.7, top_k=100, top_p=0.8, seed=42, max_tokens=20)
     info = {
         "req_id": "r",
         "sampling_params": params,
         "duplex": {"data_plane": True, "session_id": "s", "seq": 0, "payload": {}},
     }
-    from tests.model_executor.models.minicpmo_4_5.test_duplex_mrv2 import _sampler as make_sampler
-
     sampler, model, batch = make_sampler(mocker, [info], [0], [4], computed=[4])
     batch.num_scheduled_tokens[:] = 1
-    model._sample_minicpmo45_native_duplex_rows_deferred.side_effect = deferred
+    model._sample_minicpmo45_native_duplex_rows_deferred.side_effect = lambda *args, **kwargs: drawn
     sampler.base_sampler.side_effect = lambda logits, _batch: logits
-    return sampler, model, batch
-
-
-def test_deferred_and_lookahead_rows_select_tokens_without_host_sync(mocker):
-    device = torch.device("cuda")
-    drawn = torch.tensor([_TERMINATOR], device=device)
-    sampler, model, batch = _sampler(mocker, lambda *args, **kwargs: drawn)
     host = torch.tensor([[_TERMINATOR, _TERMINATOR, 0]], dtype=torch.long, pin_memory=True)
     model._minicpmo45_duplex_pending_samples = mocker.Mock(host=host, event=None)
     # Warm the pinned host allocator and CUDA context outside the check.

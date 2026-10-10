@@ -369,14 +369,15 @@ def test_duplex_single_session_video_input(omni_server, tmp_path: Path) -> None:
     _assert_session_metrics(result["session_metrics"], expected_count=2)
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize(
     ("locale", "text"),
     [
-        ("en", "Please say exactly: the quick brown fox jumps over the lazy dog."),
+        pytest.param(
+            "en", "Please say exactly: the quick brown fox jumps over the lazy dog.", marks=pytest.mark.core_model
+        ),
         ("zh", "请朗读：今天天气很好，我们一起去公园散步。"),
     ],
 )

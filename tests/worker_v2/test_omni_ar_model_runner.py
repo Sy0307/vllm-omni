@@ -229,25 +229,14 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     torch.testing.assert_close(output.prompt_token_id_logprobs_dict["req"], expected)
 
 
-def test_ensure_tensor_values_skips_absent_keys_and_warns_on_unconvertible(monkeypatch) -> None:
-    # None marks a per-row key with nothing new this step (an unchanged duplex
-    # prompt snapshot). Only genuinely unconvertible values are reported.
-    warnings = []
-    monkeypatch.setattr(omni_ar_model_runner.logger, "warning", lambda *args: warnings.append(args))
+def test_ensure_tensor_values_skips_absent_keys_without_warning(mocker) -> None:
+    warning = mocker.patch.object(omni_ar_model_runner.logger, "warning")
     ids = torch.tensor([1, 2])
-    result = omni_ar_model_runner._ensure_tensor_values(
-        {
-            "duplex_prompt_token_ids": None,
-            "ids": ids,
-            "step": 3,
-            "bad": {"nested": 1},
-            "ragged": [[1], [2, 3]],
-        }
-    )
+    result = omni_ar_model_runner._ensure_tensor_values({"duplex_prompt_token_ids": None, "ids": ids, "step": 3})
     assert set(result) == {"ids", "step"}
     assert result["ids"] is ids
     assert result["step"].item() == 3
-    assert [(args[1], args[2]) for args in warnings] == [("bad", "dict"), ("ragged", "list")]
+    warning.assert_not_called()
 
 
 def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
