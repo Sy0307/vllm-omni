@@ -649,9 +649,11 @@ class StagePool:
         # A resumable request reports several segment ends under the same
         # request id. Emit non-overlapping wall intervals so response totals
         # do not repeatedly include all earlier segments of that request.
-        previous_metrics_ts = self._metrics_end_timestamps_by_request.get(request_id, submit_ts)
+        previous_metrics_ts = (
+            self._metrics_end_timestamps_by_request.get(request_id, submit_ts) if incremental else submit_ts
+        )
         stage_gen_time_ms = max(now - max(submit_ts, previous_metrics_ts), 0.0) * 1000.0
-        if request_id:
+        if incremental and request_id:
             self._metrics_end_timestamps_by_request[request_id] = max(now, previous_metrics_ts)
         native_text_metrics = {}
         if request_id:

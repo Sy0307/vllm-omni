@@ -36,7 +36,7 @@ def test_stage_pool_resumable_metrics_do_not_recount_prior_segments(monkeypatch,
         )
         pool.record_output_timestamps([output], output_ts=now)
         metrics = pool.build_stage_metrics(
-            [output], submit_ts=100.0, request_timestamp=100.0, replica_id=0, sampling_params=params
+            [output], submit_ts=100.0, request_timestamp=100.0, replica_id=0, sampling_params=params, incremental=True
         )
         totals.append(metrics)
 
@@ -227,7 +227,7 @@ def test_incremental_audio_metrics_preserve_integrated_text_counts_and_intervals
     else:
         assert all(item.audio_generated_frames == 0 for item in metrics)
         assert all(item.output_unit_count == 0 for item in metrics)
-        assert all(item.inter_output_latencies_ms == [] for item in metrics)
+        assert all(item.inter_output_latencies_ms is None for item in metrics)
     pool.release_binding("audio-and-text")
     monkeypatch.setattr("vllm_omni.engine.stage_pool._time.time", lambda: 201.0)
     pool.record_output_timestamps([output], output_ts=201.0)
@@ -242,4 +242,4 @@ def test_incremental_audio_metrics_preserve_integrated_text_counts_and_intervals
     assert restarted.num_tokens_in == 4 and restarted.num_tokens_out == 3
     assert restarted.audio_generated_frames == (72000 if collect_stage_metrics else 0)
     assert restarted.stage_gen_time_ms == pytest.approx(1000.0)
-    assert restarted.inter_output_latencies_ms == []
+    assert restarted.inter_output_latencies_ms == ([] if collect_stage_metrics else None)
