@@ -471,6 +471,9 @@ def _tts2code2wav_window(
     pending_text_utf8 = state.setdefault("pending_text_utf8", [])
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    request_terminal = bool(
+        callable(request_finished) and request_finished() and not getattr(request, "resumable", False)
+    )
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     # A response's first window may be shorter (``initial_codec_chunk_frames``)
     # to start playback sooner; later windows keep ``chunk_frames``. Native
@@ -582,7 +585,10 @@ def _tts2code2wav_window(
             left_context_size=len(context),
             last_chunk=last_chunk,
             stream_finished=finished_tensor,
-            finished=finished_tensor,
+            # Closing one response must not finish its resumable transport.
+            finished=torch.tensor(last_chunk and request_terminal, dtype=torch.bool)
+            if native_duplex
+            else finished_tensor,
             is_segment_finished=torch.tensor(segment_finished, dtype=torch.bool),
             codec_streaming=True,
             req_id=[request_id],

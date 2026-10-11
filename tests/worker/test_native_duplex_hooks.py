@@ -1499,20 +1499,23 @@ def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
     )
 
     class _Mel:
-        def __init__(self):
+        def __init__(self, feature_extractor):
             self.counter = 0
+            self.feature_extractor = feature_extractor
 
     class _Processor:
         def __init__(self):
-            self._streaming_mel_processor = _Mel()
+            self.audio_processor = SimpleNamespace(dynamic_log_norm=True)
+            self._streaming_mel_processor = _Mel(self.audio_processor)
 
         def set_streaming_mode(self, **_kwargs):
-            return None
+            self._streaming_mel_processor = _Mel(self.audio_processor)
 
         def reset_streaming(self):
             self._streaming_mel_processor.counter = 0
 
         def process_audio_streaming(self, _audio, **_kwargs):
+            self._streaming_mel_processor.feature_extractor.dynamic_log_norm = False
             self._streaming_mel_processor.counter += 1
             return self._streaming_mel_processor.counter
 
@@ -1535,6 +1538,12 @@ def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
     assert observed == [1, 1, 2, 2]
     assert processor_a is not processor_b
     assert runtime.processor._streaming_mel_processor.counter == 0
+    assert runtime.processor.audio_processor.dynamic_log_norm is True
+    assert processor_a.audio_processor is not processor_b.audio_processor
+    assert processor_a._streaming_mel_processor.feature_extractor is processor_a.audio_processor
+    assert processor_b._streaming_mel_processor.feature_extractor is processor_b.audio_processor
+    processor_c = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="c"))
+    assert processor_c.audio_processor.dynamic_log_norm is True
 
 
 def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():

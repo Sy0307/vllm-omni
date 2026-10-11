@@ -90,19 +90,11 @@ def _batch(reqs, slots, step):
 @pytest.mark.parametrize("rows", [1, 2, 3, 5])
 @pytest.mark.parametrize("min_tokens", [0, 50])
 @torch.inference_mode()
-def test_seeded_codec_graph_matches_eager_draws_and_generators(rows, min_tokens):
+def test_seeded_codec_graph_matches_eager_draws_and_generators(mocker, rows, min_tokens):
     capacity = 8
     rng = random.Random(rows)
-    params = dict(
-        temperature=0.8,
-        top_k=25,
-        top_p=0.85,
-        repetition_penalty=1.05,
-        min_tokens=min_tokens,
-        stop_token_ids=[_EOS],
-        max_tokens=256,
-        detokenize=False,
-    )
+    params: dict[str, object] = dict(temperature=0.8, top_k=25, top_p=0.85, repetition_penalty=1.05)
+    params.update(min_tokens=min_tokens, stop_token_ids=[_EOS], max_tokens=256, detokenize=False)
     requests = []
     for i in range(rows):
         prompt = [rng.randrange(_VOCAB - 1) for _ in range(8 + i)]
@@ -112,16 +104,7 @@ def test_seeded_codec_graph_matches_eager_draws_and_generators(rows, min_tokens)
     graph = _setup(True, capacity, requests)
     graphs = graph[0]._mrv2_seeded_codec_sampler.decode_graphs
     assert graphs is not None and sorted(graphs.graphs) == list(range(1, capacity + 1))
-    replays = []
-    original = graphs.try_sample
-
-    def spy(*args, **kwargs):
-        result = original(*args, **kwargs)
-        assert result is not None
-        replays.append(True)
-        return result
-
-    graphs.try_sample = spy
+    spy = mocker.spy(graphs, "try_sample")
     gen = torch.Generator(device="cuda").manual_seed(rows)
     onset = 0
     for step in range(84):
@@ -153,19 +136,19 @@ def test_seeded_codec_graph_matches_eager_draws_and_generators(rows, min_tokens)
             got = graph[0]._mrv2_seeded_codec_sampler._generators[f"r{i}"]
             want = eager[0]._mrv2_seeded_codec_sampler._generators[f"r{i}"]
             torch.testing.assert_close(got.get_state(), want.get_state(), rtol=0, atol=0)
-    assert replays and all(replays)
+    assert spy.call_count > 0 and all(value is not None for value in spy.spy_return_list)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     "unsupported",
     [
-        dict(min_p=0.1),  # min-p is not replayed
-        dict(frequency_penalty=0.3),  # the window state's stock base would act
+        dict(min_p=0.1),
+        dict(frequency_penalty=0.3),
         dict(presence_penalty=0.3),
         dict(logprobs=1),
-        dict(temperature=0.0),  # greedy rows keep the eager argmax
-        dict(top_k=-1, top_p=1.0),  # the captured draw assumes active top-k/top-p
+        dict(temperature=0.0),
+        dict(top_k=-1, top_p=1.0),
     ],
 )
 @torch.inference_mode()

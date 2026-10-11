@@ -860,7 +860,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         processor_controls_codec_lifetime = payload_data.meta.finished is not None and self._is_truthy_scalar(
             payload_data.meta.codec_streaming
         )
-        if not processor_controls_codec_lifetime:
+        # An explicit request terminal (including a parked-session close)
+        # wins over a processor's still-open codec lifetime.
+        if is_finished or not processor_controls_codec_lifetime:
             payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
