@@ -185,13 +185,17 @@ async def test_session_audio_metrics_stay_with_response_before_interrupt(monkeyp
     assert sum(sum(metric.inter_output_latencies_ms) for metric in routed) == pytest.approx(16000.0)
 
 
-def test_incremental_audio_metrics_preserve_integrated_text_counts_and_intervals(monkeypatch) -> None:
+@pytest.mark.parametrize("collect_stage_metrics", [True, False])
+def test_incremental_audio_metrics_preserve_integrated_text_counts_and_intervals(
+    monkeypatch, collect_stage_metrics
+) -> None:
     pool = StagePool(
         0,
         [SimpleNamespace(stage_type="llm", final_output=True, final_output_type="audio")],
         output_processor=SimpleNamespace(),
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
+    pool.collect_stage_metrics = collect_stage_metrics
     metrics: list[StageRequestStats] = []
     for count in [1, 2, 3, 3]:
         now = 100.0 + len(metrics) + 1
@@ -215,8 +219,15 @@ def test_incremental_audio_metrics_preserve_integrated_text_counts_and_intervals
         )
     assert sum(item.num_tokens_in for item in metrics) == 4
     assert sum(item.num_tokens_out for item in metrics) == 3
-    assert sum(item.audio_generated_frames for item in metrics) == 72000
-    assert sum(len(item.inter_output_latencies_ms) for item in metrics) == 3
+    assert sum(item.stage_gen_time_ms for item in metrics) == pytest.approx(4000.0)
+    assert metrics[-1].stage_stats.total_token == 3
+    if collect_stage_metrics:
+        assert sum(item.audio_generated_frames for item in metrics) == 72000
+        assert sum(len(item.inter_output_latencies_ms) for item in metrics) == 3
+    else:
+        assert all(item.audio_generated_frames == 0 for item in metrics)
+        assert all(item.output_unit_count == 0 for item in metrics)
+        assert all(item.inter_output_latencies_ms == [] for item in metrics)
     pool.release_binding("audio-and-text")
     monkeypatch.setattr("vllm_omni.engine.stage_pool._time.time", lambda: 201.0)
     pool.record_output_timestamps([output], output_ts=201.0)
@@ -229,5 +240,6 @@ def test_incremental_audio_metrics_preserve_integrated_text_counts_and_intervals
         incremental=True,
     )
     assert restarted.num_tokens_in == 4 and restarted.num_tokens_out == 3
-    assert restarted.audio_generated_frames == 72000
+    assert restarted.audio_generated_frames == (72000 if collect_stage_metrics else 0)
+    assert restarted.stage_gen_time_ms == pytest.approx(1000.0)
     assert restarted.inter_output_latencies_ms == []
