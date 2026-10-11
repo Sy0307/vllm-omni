@@ -702,6 +702,7 @@ class MiniCPMO45DuplexSchedulerHelper:
         reanchor_id = f"{session.request_id}-r{reanchor_count}-{plan.moved_from}-{plan.delta}"
         duplex["stage0_reanchor"] = {
             "reanchor_id": reanchor_id,
+            "reanchor_seq": reanchor_count,
             "delta": plan.delta,
             "moved_from": plan.moved_from,
             "sink_blocks": plan.sink_blocks,
@@ -877,9 +878,13 @@ class MiniCPMO45DuplexWorkerHelper:
                 return
             num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
             req_ids = runner.input_batch.req_ids[:num_reqs]
-        applied_reanchors = getattr(runner, "_applied_stage0_reanchor_ids", None)
+        # The model finish hook owns reclamation, including requests whose
+        # runner slot was already released. Keep one watermark per request.
+        owner = getattr(runner, "model", runner)
+        applied_reanchors = getattr(owner, "_minicpmo45_applied_reanchors", None)
         if applied_reanchors is None:
-            applied_reanchors = runner._applied_stage0_reanchor_ids = set()
+            applied_reanchors = owner._minicpmo45_applied_reanchors = {}
+        runner._applied_stage0_reanchor_ids = applied_reanchors
 
         for req_idx, req_id in enumerate(req_ids):
             if mrv2:
@@ -910,9 +915,11 @@ class MiniCPMO45DuplexWorkerHelper:
                 f"{req_id}:{reanchor.get('moved_from')}:{reanchor.get('delta')}:{reanchor.get('old_computed_tokens')}"
             )
             reanchor_id = reanchor.get("reanchor_id") or reanchor_sig
-            if reanchor_id in applied_reanchors:
+            reanchor_seq = int(reanchor.get("reanchor_seq", 0))
+            previous_seq, previous_id = applied_reanchors.get(req_id, (0, None))
+            if reanchor_id == previous_id or (reanchor_seq and reanchor_seq <= previous_seq):
                 continue
-            applied_reanchors.add(reanchor_id)
+            applied_reanchors[req_id] = (reanchor_seq, reanchor_id)
             reanchor["reanchor_id"] = reanchor_id
 
             plan = PositionReanchor(

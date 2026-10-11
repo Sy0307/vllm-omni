@@ -95,6 +95,8 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    _last_reanchor_id: str | None = None
+    _applied_reanchor_seq: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,13 +675,13 @@ class MiniCPMO45Stage0DuplexRuntime:
         when zero-copy Re-RoPE KV reuse is active and prompt rebuild is bypassed.
         """
         reanchor_id = stage0_reanchor.get("reanchor_id")
-        if reanchor_id:
-            applied = getattr(state, "_applied_reanchor_ids", None)
-            if applied is None:
-                applied = state._applied_reanchor_ids = set()
-            if reanchor_id in applied:
-                return
-            applied.add(reanchor_id)
+        reanchor_seq = int(stage0_reanchor.get("reanchor_seq", 0))
+        if (reanchor_id and reanchor_id == getattr(state, "_last_reanchor_id", None)) or (
+            reanchor_seq and reanchor_seq <= getattr(state, "_applied_reanchor_seq", 0)
+        ):
+            return
+        state._last_reanchor_id = reanchor_id
+        state._applied_reanchor_seq = reanchor_seq
 
         delta = int(stage0_reanchor.get("delta", 0) or 0)
         if delta <= 0 or not state.window_units:

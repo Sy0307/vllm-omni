@@ -181,7 +181,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
-        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
+        self.custom_process_next_stage_input_func: (
+            Callable[..., OmniPayloadStruct | list[OmniPayloadStruct] | None] | None
+        ) = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
@@ -788,13 +790,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
-        stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
-        external_req_id = request.external_req_id
-        chunk_id = self.put_req_chunk[external_req_id]
-        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
+        payload_data: OmniPayloadStruct | list[OmniPayloadStruct] | None = None
         if self.custom_process_next_stage_input_func:
             try:
                 processor = self.custom_process_next_stage_input_func
@@ -824,6 +821,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
+        payloads = payload_data if isinstance(payload_data, list) else [payload_data]
+        for index, payload_data in enumerate(payloads):
+            # Only the final window carries the scheduler boundary.
+            last = index == len(payloads) - 1
+            if not self._put_chunk_payload(
+                request,
+                payload_data,
+                sender_token,
+                is_finished=is_finished and last,
+                is_segment_finished=is_segment_finished and last,
+                terminal_task=is_finished,
+            ):
+                return
+
+    def _put_chunk_payload(
+        self,
+        request,
+        payload_data,
+        sender_token,
+        *,
+        is_finished: bool,
+        is_segment_finished: bool,
+        terminal_task: bool,
+    ) -> bool:
+        stage_id = self.connector.stage_id
+        next_stage_id = stage_id + 1
+        external_req_id = request.external_req_id
+        chunk_id = self.put_req_chunk[external_req_id]
+        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
         # A model-native codec stream may span many resumable scheduler
@@ -840,10 +866,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
         if sender_token is not None and not self._sender_generation_is_active(
-            external_req_id, sender_token, is_terminal=is_finished
+            external_req_id, sender_token, is_terminal=terminal_task
         ):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
-            return
+            return False
 
         if sender_token is not None:
             # Include the in-flight key even if cancellation wins before put
@@ -862,11 +888,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     sender_token.terminal_sent = True
                 still_current = self._sender_tokens.get(external_req_id) is sender_token
                 retiring_without_terminal = sender_token.cancelled and not (
-                    is_finished or sender_token.terminal_pending
+                    terminal_task or sender_token.terminal_pending
                 )
                 if not still_current or retiring_without_terminal:
                     logger.debug("Ignoring completed put for retired request %s", external_req_id)
-                    return
+                    return False
             if success:
                 # A receiver may already have consumed this key while put was
                 # in flight. Even if cleanup retired this generation, its
@@ -915,6 +941,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # `self.requests` -- and therefore `finish_requests` -- is keyed by the
             # internal one.
             self.record_send_failure(request.request_id, "connector.put reported failure")
+            return False
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
@@ -924,6 +951,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
+        return True
 
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.

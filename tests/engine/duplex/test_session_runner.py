@@ -859,7 +859,8 @@ async def test_cancel_response_without_active_response_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_response_closes_the_model_turn_and_keeps_its_request() -> None:
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_cancel_response_closes_the_model_turn_and_keeps_its_request(overlap) -> None:
     """response.cancel ends the response inside the running Stage-0 request.
 
     Replacing the request would drop the KV that holds the conversation; the
@@ -868,16 +869,18 @@ async def test_cancel_response_closes_the_model_turn_and_keeps_its_request() -> 
     """
     h = await open_harness()
     try:
+        if overlap:
+            h.session.config.overlap_policy = "barge_in_on_speech"
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
         await h.run(commands.AckPlayback(played_ms=400, response_id=h.session.active_response_id))
         turn_id = h.session.active_response_turn_id
 
-        events = await h.run(commands.CancelResponse())
+        events = await h.run(append_audio() if overlap else commands.CancelResponse())
         done = find(events, "response.done")
         assert done.status == "cancelled"
-        assert done.response["status_details"]["reason"] == "client_cancelled"
+        assert done.response["status_details"]["reason"] == ("barge_in" if overlap else "client_cancelled")
         assert h.port.aborts == []
         assert h.port.cleanups == []
         assert h.session.epoch == 0
@@ -891,7 +894,8 @@ async def test_cancel_response_closes_the_model_turn_and_keeps_its_request() -> 
         assert await h.settle() == []
 
         # The next append resumes the same request and closes the turn, once.
-        await h.run(append_audio())
+        if not overlap:
+            await h.run(append_audio())
         await h.run(append_audio())
         closing, after = h.port.submissions[-2:]
         assert closing.context.request_id == after.context.request_id == request_id
@@ -1213,6 +1217,7 @@ async def test_turn_mode_keeps_silent_chunks_with_video_frames() -> None:
         events = await h.run(cmd)
         assert "response.listen" not in types(events)
         assert h.runner.model_state.audio_buffer.has_pending()
+        assert h.session.pending_input_bytes == len(cmd.audio) + len(frame)
         events = await h.run(commands.Commit(create_response=True))
         # MiniCPM prepare_commit is speech-gated (no frames-only Stage0).
         assert "input_audio_buffer.committed" in types(events), types(events)

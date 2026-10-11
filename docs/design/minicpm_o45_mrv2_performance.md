@@ -38,8 +38,10 @@ The repetition penalty uses the last sixteen codec tokens across conditions
 and replaces the upstream penalty processor in its ordered processor list.
 Frequency and presence penalties continue through the upstream implementation.
 
-The first codec window contains ten generated frames; later windows contain
-twenty-five. After publishing the first nonterminal window, MRv2 Talker may
+Codec windows contain twenty-five generated frames across conditioning
+segments, followed by a final residual window. Bursts drain full windows in
+order and retain excess frames for the next window; conditioning boundaries
+do not flush short audio. After publishing the first nonterminal window, MRv2 Talker may
 yield for 25 ms when it has one running request, allowing Code2Wav to start.
 The scheduler expires this deadline and does not hold concurrent batches.
 Cancellation keeps Thinker conversation history, fences interrupted output,

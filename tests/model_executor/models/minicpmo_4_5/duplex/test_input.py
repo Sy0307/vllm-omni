@@ -127,7 +127,7 @@ def test_pcm_append_reservation_rollback_restores_emitted_audio():
 
     retried = buffer.flush(chunk_period_ms=1_000)
     assert retried is not None
-    assert base64.b64decode(retried["audio"]) == base64.b64decode(original["audio"])
+    assert base64.b64decode(retried["audio"]) == base64.b64decode(str(original["audio"]))
 
 
 def test_pcm_commit_keeps_prior_append_reservation_active():
@@ -176,7 +176,9 @@ def test_pcm_commit_reservation_rollback_restores_residual_audio():
         chunk_period_ms=1_000,
     )
     assert retried.payload is not None
-    assert base64.b64decode(retried.payload["audio"]) == (base64.b64decode(original["audio"]) + b"\x00" * (8_000 * 4))
+    assert base64.b64decode(str(retried.payload["audio"])) == (
+        base64.b64decode(str(original["audio"])) + b"\x00" * (8_000 * 4)
+    )
 
 
 def _frame_payload(samples: int, frames: list[str]) -> dict[str, object]:
@@ -197,20 +199,23 @@ def test_append_attaches_every_frame_of_the_unit_closing_append():
     assert buffer._frame_queue == []
 
 
-def test_stacked_frames_do_not_accumulate_across_units():
+def test_high_frame_rate_samples_latest_group_without_backlog():
     buffer = MiniCPMO45PcmAppendBuffer()
     attached: list[list[str]] = []
 
-    for unit in range(64):
+    for chunk in range(60):
         emitted = buffer.append(
-            _frame_payload(16_000, [f"base-{unit}", f"stack-{unit}"]),
+            _frame_payload(3_200, [f"base-{chunk}", f"stack-{chunk}"]),
             chunk_period_ms=1_000,
         )
-        assert emitted is not None
-        attached.append(list(emitted["video_frames"]))
+        if emitted is not None:
+            attached.append(list(emitted["video_frames"]))
+        assert buffer.pending_byte_count == len(buffer._buffer) + sum(
+            len(frame) for _, group in buffer._frame_queue for frame in group
+        )
 
-    assert attached[0] == ["base-0", "stack-0"]
-    assert attached[-1] == ["base-63", "stack-63"]
+    assert attached == [[f"base-{n}", f"stack-{n}"] for n in range(4, 60, 5)]
+    assert buffer.pending_byte_count == 0
     assert buffer._frame_queue == []
 
 
@@ -277,8 +282,8 @@ def test_rollback_restores_frame_groups_in_wire_order():
 
     first.rollback()
 
-    assert buffer._frame_queue == [["base-0", "stack-0"], ["base-1", "stack-1"]]
-    retried = buffer.flush(chunk_period_ms=1_000)
+    assert buffer.pending_byte_count == 128000 + len("base-0stack-0base-1stack-1")
+    retried = buffer.append(pcm_payload(0), chunk_period_ms=1_000)
     assert retried is not None
     assert retried["video_frames"] == ["base-0", "stack-0"]
-    assert buffer._frame_queue == [["base-1", "stack-1"]]
+    assert buffer._frame_queue == [(64000, ["base-1", "stack-1"])]

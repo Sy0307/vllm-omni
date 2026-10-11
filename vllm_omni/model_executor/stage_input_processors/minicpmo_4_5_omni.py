@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
-_MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
 _UNSET = object()
 
 
@@ -363,6 +362,35 @@ def tts2code2wav_async_chunk(
     multimodal_output: Any,
     request: Any,
     is_finished: bool = False,
+) -> OmniPayloadStruct | list[OmniPayloadStruct] | None:
+    """Emit fixed codec windows, including every window crossed by a burst.
+
+    A conditioning segment boundary is only a downstream wake-up. Its codec
+    tail belongs to the same response, and is held until a full window or the
+    response's final flush. The connector sends multiple windows in order.
+    """
+    payloads = []
+    output = multimodal_output
+    while True:
+        payload = _tts2code2wav_window(transfer_manager, output, request, is_finished)
+        if payload is None:
+            break
+        payloads.append(payload)
+        state = transfer_manager.request_payload.get(payload.request_id, {}).get(_MINICPMO45_ASYNC_STATE)
+        if not state or not state.get("drain_pending"):
+            break
+        # The original turn_end marker is kept on every drain call; the
+        # emitted metadata marks it only on the final window.
+        meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, Mapping) else {}
+        output = {"meta": meta}
+    return payloads if len(payloads) > 1 else (payloads[0] if payloads else None)
+
+
+def _tts2code2wav_window(
+    transfer_manager: Any,
+    multimodal_output: Any,
+    request: Any,
+    is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """Stream request-owned MiniCPM-o codec windows to Code2Wav."""
     external_id = getattr(request, "external_req_id", None)
@@ -477,20 +505,20 @@ def tts2code2wav_async_chunk(
         else chunk_frames
     )
     flush_pending = finished
-    last_chunk = bool(flush_pending and (not native_duplex or turn_end))
+    final_flush = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < release_frames:
         return None
 
-    hold_short_unit = (
-        native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
-    )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else release_frames)
+    new_token_count = min(len(pending), release_frames) if len(pending) >= release_frames or final_flush else 0
+    last_chunk = final_flush and new_token_count == len(pending)
     if new_token_count and not flush_pending and int(state.get("response_frames", 0)) == 0:
         if native_duplex and getattr(getattr(transfer_manager, "config", None), "use_v2_model_runner", False):
             _FIRST_WINDOW_YIELD_UNTIL[internal_id] = time.monotonic() + _FIRST_WINDOW_YIELD_S
     state["response_frames"] = int(state.get("response_frames", 0)) + new_token_count
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
+    segment_finished = flush_pending and len(pending) < chunk_frames and (not final_flush or not pending)
+    state["drain_pending"] = len(pending) >= chunk_frames or bool(final_flush and pending)
     codec_start = int(state["codec_end"])
     codec_end = codec_start + new_token_count
 
@@ -510,10 +538,11 @@ def tts2code2wav_async_chunk(
         output_codes = []
     state["codec_end"] = codec_end
     code_flat_numel = len(output_codes)
-    if native_duplex and code_flat_numel > 0:
-        segment_text_utf8 = torch.tensor(pending_text_utf8, dtype=torch.uint8)
-        pending_text_utf8.clear()
-    if native_duplex and finished:
+    if native_duplex:
+        segment_text_utf8 = torch.tensor(pending_text_utf8 if new_token_count else [], dtype=torch.uint8)
+        if new_token_count:
+            pending_text_utf8.clear()
+    if native_duplex and segment_finished:
         state["segment_text_recorded"] = False
     if flush_pending and not last_chunk and code_flat_numel == 0:
         # Keep the generic generation connector model-agnostic: a real token
@@ -554,12 +583,13 @@ def tts2code2wav_async_chunk(
             last_chunk=last_chunk,
             stream_finished=finished_tensor,
             finished=finished_tensor,
-            is_segment_finished=finished_tensor,
+            is_segment_finished=torch.tensor(segment_finished, dtype=torch.bool),
+            codec_streaming=True,
             req_id=[request_id],
             duplex_epoch=duplex_epoch,
             duplex_turn_id=duplex_turn_id,
             llm_output_text_utf8=segment_text_utf8,
-            tts_is_last_chunk=flush_pending,
+            tts_is_last_chunk=segment_finished,
             turn_end=turn_end and last_chunk,
             replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,

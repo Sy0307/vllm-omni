@@ -22,6 +22,32 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_reanchor_watermarks_are_bounded_and_reclaimed():
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import MiniCPMO45DuplexWorkerHelper as Helper
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Module()
+    runner = SimpleNamespace(
+        model=model,
+        device=torch.device("cpu"),
+        requests={},
+        req_states=SimpleNamespace(req_id_to_index={"r": 0}, num_computed_tokens_np=np.array([16])),
+        model_state=SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[None])),
+    )
+    command = dict(delta=16, moved_from=32, sink_blocks=1, old_computed_tokens=32)
+    for request in range(1000):
+        for seq in (1, 2, 1, 2):
+            cmd = dict(command, reanchor_id=f"{request}-{seq}", reanchor_seq=seq)
+            runner.model_state.intermediate_buffer.buffers[0] = {"duplex": {"stage0_reanchor": cmd}}
+            Helper.maybe_apply_reanchor(runner, SimpleNamespace(num_scheduled_tokens={"r": 1}, scheduled_new_reqs=[]))
+        assert runner._applied_stage0_reanchor_ids == {"r": (2, f"{request}-2")}
+        model.on_requests_finished({"r"})
+        assert runner._applied_stage0_reanchor_ids == {}
+
+
 def _sampler(mocker, infos, slots, prefill, computed=None):
     model = mocker.Mock(
         spec=MiniCPMO45OmniForConditionalGeneration,
@@ -55,7 +81,6 @@ def test_sampler_skips_partial_prefill_and_resets_history_on_new_segment(mocker)
     batch.num_computed_prefill_tokens_np[0] = 2
     sampler(torch.zeros(1, 10), batch)
     model._sample_minicpmo45_native_duplex_rows.assert_called_once()
-    # A lookahead after the terminator does not mutate the session policy.
     sampler(torch.zeros(1, 10), batch)
     model._sample_minicpmo45_native_duplex_rows.assert_called_once()
     info["duplex"]["seq"] = 1
@@ -65,7 +90,6 @@ def test_sampler_skips_partial_prefill_and_resets_history_on_new_segment(mocker)
     assert sampler._requests["r"][0] == 1
     generator = sampler._requests["r"][2]
     assert generator is sampler._generators["r"]
-    # Preemption and slot reassignment preserve accepted history and RNG.
     torch.rand(1, generator=generator)
     rng_state = generator.get_state()
     history = sampler._requests["r"][1]
@@ -100,7 +124,6 @@ def test_mixed_batch_preserves_sampling_params_and_shared_session_order(mocker, 
     sampler, model, batch = _sampler(mocker, infos, [5, 2], [2, 2])
     model._sample_minicpmo45_native_duplex_rows.side_effect = sample
     sampler(torch.zeros(2, 10), batch)
-    # vLLM normalizes greedy parameters before the model sees them.
     expected_params = [(0.0, 0, 1.0), (0.7, 17, 0.9)]
     if shared_session:
         assert policies == [([0], False, expected_params), ([1], False, expected_params)]
@@ -127,7 +150,6 @@ def test_reanchor_reads_real_mrv2_staged_block_tables_after_overwrite(mocker):
 
     device = torch.device("cuda")
     blocks = BlockTables([16, 16], 3, 32, [4, 4], device, [16, 16])
-    # Slot 2 belongs to this request even when it is the only scheduled row.
     blocks.append_block_ids(2, ([3, 5, 9], [1, 6, 8]), overwrite=True)
     blocks.apply_staged_writes()
     blocks.append_block_ids(2, ([3, 9], [1, 8]), overwrite=True)
@@ -148,7 +170,7 @@ def test_reanchor_reads_real_mrv2_staged_block_tables_after_overwrite(mocker):
         cache_config=mocker.Mock(block_size=16),
         kv_caches=kv_caches,
         kv_cache_group_ids=[0, 1],
-        model=object(),
+        model=mocker.Mock(spec=MiniCPMO45OmniForConditionalGeneration),
         _duplex_inv_freq=torch.tensor([1.0, 0.01], device=device),
     )
     schedule = mocker.Mock(spec=SchedulerOutput, num_scheduled_tokens={"r": 1}, scheduled_new_reqs=[])

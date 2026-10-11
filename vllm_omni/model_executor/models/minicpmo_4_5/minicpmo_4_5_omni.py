@@ -932,6 +932,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self.model.compute_logits(hidden_states)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        reanchors = getattr(self, "_minicpmo45_applied_reanchors", None)
+        if reanchors is not None:
+            for request_id in finished_req_ids:
+                reanchors.pop(request_id, None)
         duplex_sampler = getattr(self, "_mrv2_duplex_sampler", None)
         if duplex_sampler is not None:
             duplex_sampler.on_requests_finished(finished_req_ids)

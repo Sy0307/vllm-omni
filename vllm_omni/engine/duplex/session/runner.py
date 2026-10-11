@@ -755,6 +755,9 @@ class DuplexSessionRunner:
         await self.tasks.cancel_append_tasks()
         had_stream = self.run.stream_request_id is not None
         cancel_reason = str(decision.get("cancel_reason") or "barge_in")
+        if self._cancel_response_in_model_stream(reason=cancel_reason):
+            self.tasks.active_response_task = None
+            return True
         cancelled = await self._cancel_active_response(
             self.tasks.active_response_task,
             reason=cancel_reason,
@@ -968,10 +971,12 @@ class DuplexSessionRunner:
             self.session, event, payload
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
+        frames = payload.get("video_frames")
+        wire_bytes = raw_audio_bytes + (sum(len(frame) for frame in frames) if isinstance(frames, list) else 0)
         pending_before = model_state.audio_buffer.pending_byte_count
         try:
             if not session.reserve_input_bytes(
-                raw_audio_bytes,
+                wire_bytes,
                 limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
             ):
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
@@ -986,27 +991,19 @@ class DuplexSessionRunner:
                 allow_emit=allow_emit,
             )
         except ValueError as exc:
-            session.release_input_bytes(raw_audio_bytes)
+            session.release_input_bytes(wire_bytes)
             self._emit_error("bad_event", str(exc))
             return
+        retained_bytes = model_state.audio_buffer.pending_byte_count
+        if pcm_reservation is not None:
+            retained_bytes += pcm_reservation.byte_count
+        # Transfer ownership to the exact buffered/reserved bytes. In
+        # particular, superseded video frames release their budget now;
+        # selected frames remain charged until append acceptance or rollback.
+        session.release_input_bytes(max(0, pending_before + wire_bytes - retained_bytes))
         if pcm_reservation is None:
-            # Commit-only buffers (AURA) accumulate in place and return None.
-            # Undo the speculative audio reserve and re-apply the exact pending
-            # delta so retained video frames are counted (and later released).
-            session.release_input_bytes(raw_audio_bytes)
-            pending_delta = model_state.audio_buffer.pending_byte_count - pending_before
-            if pending_delta > 0 and not session.reserve_input_bytes(
-                pending_delta,
-                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
-            ):
-                self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
-                return
-            if pending_delta < 0:
-                session.release_input_bytes(-pending_delta)
             self._maybe_schedule_vad_commit(vad_result)
             return
-        if pcm_reservation.byte_count == 0:
-            session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
         if append_payload is None:
             self._maybe_schedule_vad_commit(vad_result)

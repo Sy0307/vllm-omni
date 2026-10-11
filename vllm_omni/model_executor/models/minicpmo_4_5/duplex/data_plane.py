@@ -29,6 +29,7 @@ class MiniCPMO45DataPlaneContext(DuplexDataPlaneContext):
 @dataclass(slots=True)
 class _TurnState:
     sent_segment_text: str = ""
+    sent_text_chunk: tuple[int, int] | None = None
     has_text: bool = False
     tts_eos_done: bool = False
     turn_eos_done: bool = False
@@ -245,8 +246,11 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
 
         text_turn_id = output_turn_id if output_turn_id is not None else context.turn_id
         text_turn_state = request_state.turn(text_turn_id) if request_state is not None else None
+        cache_epoch = _first_metadata_int(mm_output, "cache_epoch")
+        chunk_seq = _first_metadata_int(mm_output, "chunk_seq")
+        text_chunk = (cache_epoch, chunk_seq) if cache_epoch is not None and chunk_seq is not None else None
         if audio_chunks:
-            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk=text_chunk)
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = _sample_rate_hz(mm_output)
             audio_text_marks = _audio_text_marks(mm_output)
@@ -317,7 +321,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             pending_audio = request_state.pending_audio_without_text
             request_state.pending_audio_without_text = []
             if pending_audio:
-                delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+                delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk=text_chunk)
                 if delta_text:
                     pending_audio[0]["text"] = delta_text
                     if text_turn_state is not None:
@@ -452,12 +456,22 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             end_of_turn=unit_end_of_turn,
         )
 
-    def segment_text_delta(self, request_id: str | None, text: object, *, turn_id: int | None = None) -> str:
+    def segment_text_delta(
+        self, request_id: str | None, text: object, *, turn_id: int | None = None, chunk: tuple[int, int] | None = None
+    ) -> str:
         if not isinstance(text, str) or not text:
             return ""
         if request_id is None:
             return text
         turn_state = self._requests.setdefault(request_id, _RequestState()).turn(turn_id)
+        if chunk is not None:
+            # Native codec payloads carry segment deltas once per window.
+            # Identical words in different windows are valid; only a replay
+            # of an already projected window is a duplicate.
+            if turn_state.sent_text_chunk is not None and chunk <= turn_state.sent_text_chunk:
+                return ""
+            turn_state.sent_text_chunk = chunk
+            return text
         sent_text = turn_state.sent_segment_text
         if not sent_text:
             delta_text = text

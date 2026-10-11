@@ -31,6 +31,27 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("fail_at", [None, 1])
+def test_terminal_codec_burst_sends_windows_before_finish(build_adapter, fail_at):
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import tts2code2wav_async_chunk
+
+    adapter, connector = build_adapter(connector_extra={"codec_chunk_frames": 25})
+    adapter.custom_process_next_stage_input_func = tts2code2wav_async_chunk
+    request = _req("r", RequestStatus.FINISHED_STOPPED)
+    mm = {"codes": {"audio": torch.arange(114)}, "meta": {"native_duplex": True, "turn_end": True}}
+    if fail_at is not None:
+        connector.put.side_effect = [(True, 1, {}), (False, 0, {})]
+    adapter.save_async(mm, request)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    sent = [call.kwargs["data"] for call in connector.put.call_args_list]
+    if fail_at is None:
+        assert [p.meta.codec_chunk_frames for p in sent] == [25, 25, 25, 25, 14]
+        assert [bool(p.meta.finished) for p in sent] == [False] * 4 + [True]
+        assert [bool(p.meta.is_segment_finished) for p in sent] == [False] * 4 + [True]
+    else:
+        assert len(sent) == 2 and adapter._send_failures["r"]
+
+
 @pytest.fixture
 def shm_sender(build_adapter):
     adapter, _ = build_adapter(stage_id=0)

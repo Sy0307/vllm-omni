@@ -18,6 +18,62 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("burst", [1, 4, 114])
+def test_codec_windows_ignore_condition_boundaries_and_burst_size(burst):
+    manager, request, windows = _manager(), _request("stream"), []
+    for start, stop in ((0, 24), (24, 28), (28, 114)):
+        for offset in range(start, stop, burst):
+            end = min(offset + burst, stop)
+            payload = tts2code2wav_async_chunk(
+                manager, _duplex_delta(*range(offset, end), turn_end=stop == 114), request, end == stop
+            )
+            windows.extend(payload if isinstance(payload, list) else [payload] if payload is not None else [])
+    audio = [p for p in windows if p.meta.codec_chunk_frames]
+    assert [p.meta.codec_chunk_frames for p in audio] == [25, 25, 25, 25, 14]
+    assert [c for p in audio for c in _codes(p)[3:]] == list(range(114))
+    assert [_codes(p)[:3] for p in audio] == [[4218] * 3, [22, 23, 24], [47, 48, 49], [72, 73, 74], [97, 98, 99]]
+    assert sum(p.meta.last_chunk for p in windows) == 1 and windows[-1].meta.turn_end
+    assert [p.meta.chunk_seq for p in windows] == list(range(len(windows)))
+
+
+@pytest.mark.parametrize("texts", [("你好", "你好"), ("一", "一二三")])
+def test_native_text_deltas_deduplicate_payload_identity_not_words(texts):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
+        MiniCPMO45DataPlaneContext,
+        MiniCPMO45DataPlaneSession,
+    )
+    from vllm_omni.outputs.mm_outputs import MultimodalPayload
+    from vllm_omni.outputs.output_modality import OutputModality
+    from vllm_omni.utils.mm_outputs import partition_flat_payload
+
+    accumulated = MultimodalPayload()
+    plane = MiniCPMO45DataPlaneSession(lambda audio, *args: "audio" if audio is not None else None)
+    context = MiniCPMO45DataPlaneContext(epoch=3, auto_responds=True, active_response_id="r", active_response_turn_id=7)
+    manager, request = _manager(), _request("stream")
+    emitted: list[str] = []
+    for text in texts:
+        plane.begin_request("stream")
+        p = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text=text), request, True)
+        mm = {
+            "model_outputs": torch.zeros(24000),
+            "sr": torch.tensor(24000),
+            "meta.duplex_epoch": torch.tensor(3),
+            "meta.duplex_turn_id": torch.tensor(7),
+            "meta.cache_epoch": torch.tensor(p.meta.cache_epoch),
+            "meta.chunk_seq": torch.tensor(p.meta.chunk_seq),
+            "meta.llm_output_text_utf8": p.meta.llm_output_text_utf8,
+        }
+        _, client_mm = partition_flat_payload(mm)
+        accumulated = accumulated.merged_with(MultimodalPayload.from_dict(client_mm))
+        accumulated.consolidate_tensors(OutputModality.AUDIO)
+        output = SimpleNamespace(
+            request_id="stream", finished=False, outputs=[], multimodal_output=accumulated.to_dict()
+        )
+        emitted.extend(item.get("text", "") for item in plane.project_output(output, context=context))
+        assert list(plane.project_output(output, context=context)) == []
+    assert "".join(emitted) == "".join(texts)
+
+
 def _manager():
     return SimpleNamespace(
         connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 3}}),
@@ -344,15 +400,16 @@ def test_empty_duplex_boundary_uses_zero_length_transport_placeholder() -> None:
     assert _codes(boundary) == [0]
     assert boundary.meta.code_flat_numel == 0
     assert boundary.meta.last_chunk is False
-    assert boundary.meta.is_segment_finished.item() is False
+    assert boundary.meta.is_segment_finished.item() is True
     torch.testing.assert_close(
         boundary.meta.llm_output_text_utf8,
-        torch.tensor(list(b"boundary"), dtype=torch.uint8),
+        torch.empty(0, dtype=torch.uint8),
     )
 
 
 def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     manager = _manager()
+    manager.connector.config["extra"]["codec_chunk_frames"] = 2
     request = _request("req-duplex")
     request.additional_information = {
         "codes": {"ref": [0.1, 0.2, 0.3]},
@@ -391,12 +448,13 @@ def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     )
     assert second.meta.tts_is_last_chunk is True
     assert second.meta.turn_end is False
-    assert first.meta.is_segment_finished.item() is False
-    assert second.meta.is_segment_finished.item() is False
+    assert first.meta.is_segment_finished.item() is True
+    assert second.meta.is_segment_finished.item() is True
 
 
-def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
+def test_duplex_short_units_wait_for_full_window() -> None:
     manager = _manager()
+    manager.connector.config["extra"]["codec_chunk_frames"] = 5
     request = _request("req-duplex")
 
     first = tts2code2wav_async_chunk(
@@ -478,7 +536,7 @@ def test_duplex_short_tail_does_not_replay_previous_segment_text() -> None:
     assert first_tail is not None
     assert first_tail.meta.code_flat_numel == 0
     assert chunk([27, 28, 29], "的距离大约是", False) is None
-    next_flush = chunk([], "的距离大约是", True)
+    next_flush = chunk(range(30, 50), "的距离大约是", True)
     assert next_flush is not None
     assert next_flush.meta.llm_output_text_utf8.tolist() == list("的距离大约是".encode())
 

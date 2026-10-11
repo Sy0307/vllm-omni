@@ -22,7 +22,7 @@ connectors:
       hift_graph_continuation_frames: [1, 32]
       hift_graph_exact_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
       # Later windows retain the inherited 25-frame size.
-      initial_codec_chunk_frames: 10
+      initial_codec_chunk_frames: 25
       cfm_graph_capture_frames: [50, 100]
 
 stages:

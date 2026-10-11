@@ -26,11 +26,26 @@ from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
 
 logger = init_logger(__name__)
 
-# Keys whose values are metadata scalars (e.g. audio sample rate or the
-# latest completion flag) may arrive as 0-d torch.Tensors. from_dict routes
+# Snapshot metadata (rates, flags, identities and the current text delta)
+# may arrive as scalar or vector torch.Tensors. from_dict routes
 # all tensors into .tensors, so relocate these keys to .metadata before
 # consolidation to preserve the latest value without attempting torch.cat.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate", "meta.finished"})
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset(
+    {
+        "sr",
+        "sample_rate",
+        "audio_sample_rate",
+        "meta.finished",
+        "meta.cache_epoch",
+        "meta.chunk_seq",
+        "meta.duplex_epoch",
+        "meta.duplex_turn_id",
+        "meta.llm_output_text_utf8",
+        "meta.segment_end",
+        "meta.tts_is_last_chunk",
+        "meta.turn_end",
+    }
+)
 
 
 def _cat_tensors(
@@ -222,7 +237,7 @@ class MultimodalPayload(Mapping):
         """Merge *incoming* onto this payload and return the result.
 
         Content tensors accumulate into lists for deferred concatenation;
-        known scalar metadata keys are snapshots replaced immediately, including
+        known metadata keys are snapshots replaced immediately, including
         in DELTA streams that do not consolidate each emission. Missing keys
         retain their previous value. Other values keep the existing merge
         behavior. When this payload
@@ -253,7 +268,7 @@ class MultimodalPayload(Mapping):
         matrix that grows along dim 0 rather than the waveform-tuned default
         for its modality -- via ``register_key_accumulation_strategy``.
         """
-        # Relocate scalar metadata tensors (e.g. sample rate) that from_dict
+        # Relocate snapshot metadata tensors (e.g. sample rate) that from_dict
         # routed into .tensors, so they take the REPLACE path via .metadata
         # instead of failing torch.cat as 0-d tensors.
         for key in _METADATA_TENSOR_KEYS:

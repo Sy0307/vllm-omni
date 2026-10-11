@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
@@ -31,6 +34,8 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
 _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
+        "cache_epoch",
+        "chunk_seq",
         "duplex_epoch",
         "duplex_turn_id",
         "llm_output_text_utf8",
