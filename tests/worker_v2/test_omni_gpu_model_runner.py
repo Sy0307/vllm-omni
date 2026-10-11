@@ -29,6 +29,7 @@ def _make_runner():
     """Create an OmniGPUModelRunner without calling __init__."""
     runner = object.__new__(OmniGPUModelRunner)
     runner.model = MagicMock()
+    runner.model_config = SimpleNamespace(logits_processors=None)
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
@@ -51,6 +52,42 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
         parent.assert_called_once_with(output)
     assert sampling_params.all_stop_token_ids == {2150}
     assert sampling_params.eos_token_id == 151645
+
+
+@pytest.mark.parametrize("new_request", [False, True])
+def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request):
+    from vllm_omni.worker_v2 import staged_writes
+
+    runner = _make_runner()
+    runner.sampler = Sampler.__new__(Sampler)
+    runner.model_config.logits_processors = ["test.CustomProcessor"]
+    runner.model = SimpleNamespace()
+    output = SchedulerOutput.make_empty()
+    if new_request:
+        output.scheduled_new_reqs = [SimpleNamespace(sampling_params=None)]
+    tokens = [0]
+    pending: list[list[int]] = []
+    observed = []
+
+    def flush():
+        if pending:
+            tokens[:] = pending.pop()
+
+    monkeypatch.setattr(staged_writes._Deferred, "flush", flush)
+
+    def parent_add_requests(_runner, _output):
+        # Model the upstream order: request writes, then a custom processor
+        # initializes device statistics from the newly installed token row.
+        if new_request:
+            if staged_writes._Deferred.depth:
+                pending.append([17])
+            else:
+                tokens[:] = [17]
+        observed.extend(tokens)
+
+    with patch.object(GPUModelRunner, "add_requests", parent_add_requests):
+        runner.add_requests(output)
+    assert observed == ([17] if new_request else [0])
 
 
 def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():

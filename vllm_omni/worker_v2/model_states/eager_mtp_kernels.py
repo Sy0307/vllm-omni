@@ -155,34 +155,7 @@ def _settled_kernel(
         tl.store(embeds_ptr + row * H + c, value.to(embeds_ptr.dtype.element_ty), mask=m)
 
 
-@triton.jit
-def _record_kernel(
-    index_ptr,  # int64 [3, n]: request slot, position, token row
-    n,
-    embeds_ptr,  # [T, H]
-    slab_ptr,  # [R, L, H]
-    slab_stride,
-    H: tl.constexpr,
-    BH: tl.constexpr,
-):
-    b = tl.program_id(0)
-    slot = tl.load(index_ptr + b)
-    pos = tl.load(index_ptr + n + b)
-    row = tl.load(index_ptr + 2 * n + b)
-    for h0 in tl.static_range(0, H, BH):
-        c = h0 + tl.arange(0, BH)
-        m = c < H
-        value = tl.load(embeds_ptr + row * H + c, mask=m)
-        tl.store(slab_ptr + slot * slab_stride + pos * H + c, value.to(slab_ptr.dtype.element_ty), mask=m)
-
-
 def settled_frames(meta: torch.Tensor, n: int, eager: torch.Tensor, step: torch.Tensor, embeds: torch.Tensor) -> None:
     """``embeds[row] = eager[slot] + step`` for each (slot, row) column of ``meta``, rounded like the torch ops."""
     H = eager.shape[-1]
     _settled_kernel[(n,)](meta, n, eager, step, embeds, H=H, BH=min(1024, triton.next_power_of_2(H)))
-
-
-def record_rows(index: torch.Tensor, n: int, embeds: torch.Tensor, slab: torch.Tensor) -> None:
-    """``slab[slot, pos] = embeds[row]`` for each (slot, pos, row) column of ``index``."""
-    H = embeds.shape[-1]
-    _record_kernel[(n,)](index, n, embeds, slab, slab.stride(0), H=H, BH=min(1024, triton.next_power_of_2(H)))

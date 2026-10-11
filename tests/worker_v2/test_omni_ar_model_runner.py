@@ -868,3 +868,29 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+
+
+def test_stream_history_allocates_only_for_scheduled_requests():
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    owner = SimpleNamespace(
+        model=SimpleNamespace(stream_decoder=object()),
+        _eager_embeds=torch.zeros(128, 4),
+        _stream_pos={},
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["request"],
+        idx_mapping_np=np.array([127]),
+        num_computed_tokens_np=np.array([0]),
+        query_start_loc_np=np.array([0, 1]),
+    )
+    state = EagerMTPState(owner)
+    embeds = torch.arange(4).reshape(1, 4).float()
+    state.record_inputs(batch, embeds)
+    history = state._talker_inputs["request"]
+    assert history.embeds.untyped_storage().nbytes() == 64 * 4 * embeds.element_size()
+    torch.testing.assert_close(history.embeds[:1], embeds)
+    state.finish_audio({"request"})
+    assert not state._talker_inputs

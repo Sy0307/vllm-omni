@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -220,9 +221,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Keep the upstream path for custom/speculative samplers, whose staged
         # writes may have a different lifecycle.
         sampler = getattr(self, "sampler", None)
-        if not scheduler_output.scheduled_new_reqs and (
+        static_staged_writes = (
             type(sampler) is Sampler or getattr(sampler, "omni_static_staged_writes", False)
-        ):
+        ) and not self.model_config.logits_processors
+        if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
@@ -237,9 +239,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                         sampling_params,
                         logits_vocab,
                     )
-        # The request, model and sampler states each apply their staged
-        # writes here; land them with one launch instead of one per tensor.
-        with staged_writes.deferred_writes():
+        # Custom processors may read request tokens in apply_staged_writes;
+        # preserve upstream's request-state flush before their callback.
+        with staged_writes.deferred_writes() if static_staged_writes else nullcontext():
             super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:

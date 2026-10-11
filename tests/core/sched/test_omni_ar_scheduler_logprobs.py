@@ -103,6 +103,7 @@ class _Request:
         # vLLM 0.27 (a0c092ee72): Request gained num_stale_output_tokens to
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
+        self.drop_stale_output = False
         self.has_encoder_inputs = False
         self.use_structured_output = False
         self.pooling_params: Any = None

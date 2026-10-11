@@ -17,18 +17,22 @@ budgets) take the upstream sampler for the whole step.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
 
 logger = init_logger(__name__)
 
@@ -107,7 +111,15 @@ def _talker_sample_kernel(
     if top_k < vocab_size:
         ordered = tl.topk(logits, TOPK_BLOCK)
         threshold = tl.sum(tl.where(tl.arange(0, TOPK_BLOCK) == top_k - 1, ordered, 0.0))
-        logits = tl.where(logits < threshold, float("-inf"), logits)
+        above = logits > threshold
+        tied = (logits == threshold) & in_vocab
+        remaining = top_k - tl.sum(above.to(tl.int32))
+        # Upstream keeps exactly k entries, taking cutoff ties in token-id order.
+        if tl.sum(tied.to(tl.int32)) > remaining:
+            keep = above | (tied & (tl.cumsum(tied.to(tl.int32)) <= remaining))
+        else:
+            keep = above | tied
+        logits = tl.where(keep, logits, float("-inf"))
 
     seed = tl.load(seeds_ptr + req)
     _, token = gumbel_noised_argmax(
@@ -131,7 +143,7 @@ def _talker_sample_kernel(
 class Qwen3TTSTalkerSampler(OmniSampler):
     """Fused Talker sampling for the settings the Talker uses, upstream sampling otherwise."""
 
-    def __init__(self, base_sampler: Sampler, talker: Any):
+    def __init__(self, base_sampler: Sampler, talker: Qwen3TTSTalkerForConditionalGeneration):
         super().__init__(base_sampler)
         self.vocab_size = int(base_sampler.sampling_states.vocab_size)
         self._fast = np.zeros(base_sampler.req_states.max_num_reqs, dtype=bool)
@@ -195,7 +207,7 @@ class Qwen3TTSTalkerSampler(OmniSampler):
             and (top_k <= MAX_TOP_K or top_k >= self.vocab_size)
         )
 
-    def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:
+    def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         n = input_batch.num_reqs
         if self._enabled and logits.shape[0] == n and self._fast[input_batch.idx_mapping_np[:n]].all():
             return self._sample(logits, input_batch, n)
@@ -207,7 +219,7 @@ class Qwen3TTSTalkerSampler(OmniSampler):
             logits = logits.masked_fill(self._talker._codec_disallowed_mask, float("-inf"))
         return self.base_sampler(logits, input_batch)
 
-    def _sample(self, logits: torch.Tensor, input_batch: Any, n: int) -> SamplerOutput:
+    def _sample(self, logits: torch.Tensor, input_batch: InputBatch, n: int) -> SamplerOutput:
         base = self.base_sampler
         states = base.sampling_states
         bias = base.logits_processors[0]

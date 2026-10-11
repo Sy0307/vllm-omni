@@ -35,6 +35,15 @@ steps:
           - "pytest -sv tests/worker_v2/test_capture_query_bound_gpu.py tests/worker_v2/test_decode_query_bound_gpu.py -m 'core_model and cuda and H100' --run-level=core_model"
         mirror_hardwares: h100_1
 
+      - label: "Simple · Qwen3-TTS PDL Predictor Test"
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - tests/model_executor/models/qwen3_tts/test_fused_code_predictor_pdl.py
+          - vllm_omni/model_executor/models/qwen3_tts/fused_code_predictor.py
+        commands:
+          - "pytest -sv tests/model_executor/models/qwen3_tts/test_fused_code_predictor_pdl.py -m 'core_model and cuda and H100' --run-level=core_model"
+        mirror_hardwares: h100_1
+
       - label: "Simple · Diffusion Test"
         timeout_in_minutes: 30
         commands:

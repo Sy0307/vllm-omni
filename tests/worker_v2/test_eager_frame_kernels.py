@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Settled-frame and input-record kernels equal the torch indexing they replace."""
+"""Settled-frame and codec-input kernels equal the torch indexing they replace."""
 
 import pytest
 import torch
@@ -26,21 +26,6 @@ def test_settled_frames_match_torch(step_dtype):
     expected.index_copy_(0, rows, (eager.index_select(0, slots) + step.to(eager.dtype)).to(expected.dtype))
     settled_frames(torch.stack((slots, rows)).contiguous(), 4, eager, step, embeds)
     torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_record_rows_match_torch():
-    from vllm_omni.worker_v2.model_states.eager_mtp_kernels import record_rows
-
-    device = torch.device("cuda", 0)
-    H = 2048
-    slab = torch.zeros(8, 32, H, device=device, dtype=torch.bfloat16)
-    embeds = torch.randn(12, H, device=device, dtype=torch.bfloat16)
-    index = torch.tensor([[1, 1, 6, 0], [0, 1, 31, 5], [3, 4, 11, 0]], device=device)
-    expected = slab.clone()
-    expected[index[0], index[1]] = embeds.index_select(0, index[2])
-    record_rows(index, 4, embeds, slab)
-    torch.testing.assert_close(slab, expected, rtol=0, atol=0)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

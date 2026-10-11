@@ -1,45 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803 - Triton constexpr parameters use kernel-style capitals.
-"""Cheaper staged writes for the MRv2 runner's persistent state tensors.
+"""NumPy/UVA staging for MRv2 persistent state, without per-write H2D copies.
 
-vLLM's ``StagedWriteTensor`` keeps staged contents as one flat Python list
-(prompt token ids and M-RoPE rows are unboxed element by element) and, for a
-device tensor, rebuilds a pinned tensor from that list and launches a copy on
-every ``apply_write``. With requests joining most steps at high concurrency
-this costs ~0.6 ms of engine-loop time per step for a TTS Talker.
-
-Here the contents stay typed NumPy chunks until ``apply_write``, which
-concatenates them once into a pinned UVA buffer that the write kernel reads in
-place, exactly like the indices, starts and lengths already are. The buffers
-come from the same round-robin ``UvaBufferPool`` vLLM uses for those, so the
-contents live exactly as long as the other write arguments. The same applies
-to ``FusedStagedWriter`` (block tables). M-RoPE prefill positions are staged as
-NumPy rows instead of Python lists.
-
-Kept in step with vllm-project/vllm#51334 (typed staging chunks), which does
-not remove the per-write pinned allocation and copy launch.
-
-Inside :func:`deferred_writes` (the runner wraps ``add_requests`` in it), each
-``apply_write`` only queues its tensor; the queued writes of every tensor then
-land with one byte-copy launch when the window closes, or earlier when a
-reader needs them (the penalty ``bincount`` reads the new prompt tokens).
-Joining requests otherwise cost one write launch per state tensor per step.
-A window can flush more than once per step, so the flush stages its arguments
-through fenced ``DeviceStager`` rings rather than a two-slot ``UvaBufferPool``.
+Immediate writes use upstream's ``UvaBufferPool`` lifetime. Deferred writes
+combine tensors into one launch and flush before penalty statistics read new
+prompt tokens. A window may flush more than once, so its arguments use fenced
+``DeviceStager`` rings rather than a two-slot pool.
 """
 
 from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.utils.device_copy import DeviceStager
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
 logger = init_logger(__name__)
 
@@ -49,7 +32,7 @@ _installed = False
 class _PendingWrite(NamedTuple):
     """The staged writes one ``apply_write`` queued for its tensor."""
 
-    tensor: Any  # vLLM StagedWriteTensor
+    tensor: StagedWriteTensor
     indices: list[int]
     starts: list[int]
     contents: list

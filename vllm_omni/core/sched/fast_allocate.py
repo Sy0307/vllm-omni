@@ -14,15 +14,18 @@ result; everything else takes the original path.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.request import RequestStatus
 
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
 logger = init_logger(__name__)
 
 
-def install_decode_allocate_fast_path(kv_cache_manager: Any) -> bool:
+def install_decode_allocate_fast_path(kv_cache_manager: KVCacheManager) -> bool:
     """Wrap ``kv_cache_manager.allocate_slots`` on this instance when the fast path is exact."""
     from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinatorNoPrefixCache
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager

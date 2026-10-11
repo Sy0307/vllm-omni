@@ -47,3 +47,23 @@ def test_exact_fp32_reference_encode_restores_global_flags():
     finally:
         torch.backends.cuda.matmul.allow_tf32 = tf32
         torch.set_default_dtype(default_dtype)
+
+
+def test_compiled_reference_encoder_preserves_request_errors(monkeypatch):
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import CompiledReferenceEncoder
+
+    calls = []
+
+    def encode(valid):
+        calls.append(valid)
+        if not valid:
+            raise ValueError("invalid reference")
+        return 17
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    encoder = CompiledReferenceEncoder(encode, "test")
+    with pytest.raises(ValueError, match="invalid reference"):
+        encoder(False)
+    assert calls == [False]
+    assert encoder._compiled is encode
+    assert encoder(True) == 17

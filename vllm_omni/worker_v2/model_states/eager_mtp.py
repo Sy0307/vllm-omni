@@ -44,8 +44,6 @@ def _snapshot_runtime(value: Any) -> Any:
 class TalkerInputs:
     embeds: torch.Tensor
     length: int = 0
-    # Slot whose row of the shared device slab ``embeds`` views; -1 when not a slab row.
-    slot: int = -1
 
 
 @dataclass
@@ -70,14 +68,7 @@ class EagerMTPState:
         self._suspended_audio: dict[str, SuspendedAudio] = {}
         self._restore_audio: dict[str, list[torch.Tensor]] = {}
         self._talker_inputs: dict[str, TalkerInputs] = {}
-        # Request owning each slab row and its recorded length; lengths of
-        # requests that keep their row are tracked here, not on TalkerInputs.
-        self._slot_owner: np.ndarray | None = None
-        self._slot_len: np.ndarray | None = None
-        # [slots, max_model_len, hidden]: one row per request slot, written once per step.
-        self._input_slab: torch.Tensor | None = None
         # Per-step row indices, read by the GPU in place (one stager per call site).
-        self._stage_record = DeviceStager()
         self._stage_eager = DeviceStager()
         self._stage_settled = DeviceStager()
         self._stage_meta = DeviceStager()
@@ -120,9 +111,8 @@ class EagerMTPState:
         if saved is None:
             self._decode_stream.synchronize()
             saved = decoder.save_slot(req_idx)
-        history = self._history(req_id)
+        history = self._talker_inputs[req_id]
         history.embeds = history.embeds[: history.length].to("cpu", copy=True)
-        self._release_slot(history, req_id)
         runtime = self.owner.intermediate_buffer.buffers[req_idx]
         assert self.owner._eager_embeds is not None
         self._suspended_audio[req_id] = SuspendedAudio(
@@ -151,9 +141,7 @@ class EagerMTPState:
             self._suspended_audio.pop(req_id, None)
             self._restore_audio.pop(req_id, None)
             self.owner._stream_pos.pop(req_id, None)
-            history = self._talker_inputs.pop(req_id, None)
-            if history is not None:
-                self._release_slot(history, req_id)
+            self._talker_inputs.pop(req_id, None)
         if self._audio_buffer is not None:
             self._audio_buffer.finish(req_ids)
 
@@ -165,7 +153,7 @@ class EagerMTPState:
         """Rebuild freed Talker KV from the exact conditioned inputs, without rerunning MTP."""
         if req_id not in self._restore_audio:
             return False
-        history = self._history(req_id)
+        history = self._talker_inputs[req_id]
         count = min(len(ids), max(0, history.length - offset))
         if count:
             embeds[:count].copy_(history.embeds[offset : offset + count])
@@ -187,87 +175,33 @@ class EagerMTPState:
     def record_inputs(self, input_batch: InputBatch, embeds: torch.Tensor) -> None:
         if getattr(self.owner.model, "stream_decoder", None) is None:
             return
-        n = input_batch.num_reqs
-        if not n:
-            return
-        slab = self._input_slab
-        if slab is None or slab.device != embeds.device:
-            assert self.owner._eager_embeds is not None
-            slab = self._input_slab = torch.empty(
-                self.owner._eager_embeds.shape[0],
-                self.owner.vllm_config.model_config.max_model_len,
-                embeds.shape[-1],
-                device=embeds.device,
-                dtype=embeds.dtype,
-            )
-        qsl = np.asarray(input_batch.query_start_loc_np[: n + 1], dtype=np.int64)
-        starts, counts = qsl[:-1], np.diff(qsl)
-        offsets = np.asarray(input_batch.num_computed_tokens_np[:n], dtype=np.int64)
-        slots = np.asarray(input_batch.idx_mapping_np[:n], dtype=np.int64)
-        self._track_lengths(input_batch.req_ids[:n], slots, offsets + counts, slab)
-        # Keep exact inputs for replay with one scatter instead of one copy per row.
-        if (counts == 1).all():
-            rows, pos, tok_slots = starts, offsets, slots
-        else:
-            inner = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(qsl[:-1] - qsl[0], counts)
-            rows = np.repeat(starts, counts) + inner
-            pos = np.repeat(offsets, counts) + inner
-            tok_slots = np.repeat(slots, counts)
-        index = self._stage_record(np.stack((tok_slots, pos, rows)), embeds.device)
-        if embeds.is_contiguous() and embeds.is_cuda:
-            from vllm_omni.worker_v2.model_states.eager_mtp_kernels import record_rows
-
-            record_rows(index, int(rows.shape[0]), embeds, slab)
-        else:
-            slab[index[0], index[1]] = embeds.index_select(0, index[2])
-
-    def _history(self, req_id: str) -> TalkerInputs:
-        """The request's recorded inputs, with the length tracked for its slab row."""
-        history = self._talker_inputs[req_id]
-        owners = self._slot_owner
-        if history.slot >= 0 and owners is not None and owners[history.slot] == req_id:
-            assert self._slot_len is not None
-            history.length = max(history.length, int(self._slot_len[history.slot]))
-        return history
-
-    def _release_slot(self, history: TalkerInputs, req_id: str) -> None:
-        owners = self._slot_owner
-        if history.slot >= 0 and owners is not None and owners[history.slot] == req_id:
-            owners[history.slot] = None
-        history.slot = -1
-
-    def _track_lengths(self, req_ids: list[str], slots: np.ndarray, lengths: np.ndarray, slab: torch.Tensor) -> None:
-        """Grow each request's recorded length; only new or moved requests take the per-row path."""
-        if self._slot_owner is None or self._slot_owner.shape[0] != slab.shape[0]:
-            self._slot_owner = np.full(slab.shape[0], None, dtype=object)
-            self._slot_len = np.zeros(slab.shape[0], dtype=np.int64)
-        owners, slot_len = self._slot_owner, self._slot_len
-        assert slot_len is not None
-        ids = np.empty(len(req_ids), dtype=object)
-        ids[:] = req_ids
-        kept = owners[slots] == ids
-        if not kept.all():
-            histories = self._talker_inputs
-            for i in np.flatnonzero(~kept).tolist():
-                req_id, slot, length = req_ids[i], int(slots[i]), int(lengths[i])
-                history = histories.get(req_id)
-                if history is None:
-                    history = histories[req_id] = TalkerInputs(slab[slot], length, slot)
-                else:
-                    history = self._history(req_id)
-                    if history.slot != slot:
-                        # A resumed request's inputs wait on the host (or another
-                        # slot); move them into this slot's row once.
-                        slab[slot, : history.length].copy_(history.embeds[: history.length])
-                        self._release_slot(history, req_id)
-                        history.embeds, history.slot = slab[slot], slot
-                    history.length = max(history.length, length)
-                owners[slot] = req_id
-                slot_len[slot] = history.length
-            kept_slots, kept_lengths = slots[kept], lengths[kept]
-        else:
-            kept_slots, kept_lengths = slots, lengths
-        slot_len[kept_slots] = np.maximum(slot_len[kept_slots], kept_lengths)
+        history_slices: list[torch.Tensor] = []
+        input_slices: list[torch.Tensor] = []
+        histories = self._talker_inputs
+        on_cpu = embeds.is_cpu
+        for i, req_id in enumerate(input_batch.req_ids):
+            start, end = input_batch.query_start_loc_np[i : i + 2]
+            offset = int(input_batch.num_computed_tokens_np[i])
+            length = offset + int(end - start)
+            history = histories.get(req_id)
+            # A suspended request's inputs wait on the host; bring them back.
+            if history is None or history.embeds.is_cpu != on_cpu:
+                storage = torch.empty(
+                    self.owner.vllm_config.model_config.max_model_len,
+                    embeds.shape[-1],
+                    device=embeds.device,
+                    dtype=embeds.dtype,
+                )
+                if history is not None:
+                    storage[: history.length].copy_(history.embeds)
+                history = TalkerInputs(storage, history.length if history else 0)
+                self._talker_inputs[req_id] = history
+            history_slices.append(history.embeds[offset:length])
+            input_slices.append(embeds[start:end])
+            history.length = max(history.length, length)
+        if history_slices:
+            # Keep exact inputs for replay without launching one copy per row.
+            torch._foreach_copy_(history_slices, input_slices)
 
     def prepare_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]

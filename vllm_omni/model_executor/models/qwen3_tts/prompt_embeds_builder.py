@@ -38,6 +38,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
+from torch._dynamo.exc import BackendCompilerFailed, Unsupported
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
@@ -213,7 +214,7 @@ class CompiledReferenceEncoder:
         if self._compiled is not None:
             try:
                 return self._compiled(*args, **kwargs)
-            except Exception as exc:
+            except (BackendCompilerFailed, Unsupported) as exc:
                 logger.warning("Compiled Qwen3-TTS %s failed; using eager: %s", self._name, exc)
                 self._compiled = None
         return self._eager(*args, **kwargs)

@@ -127,6 +127,22 @@ def test_fused_talker_sampler_counts_chunked_prefill_rows_as_unsampled():
     assert out.num_sampled.tolist() == [0, 1] == ref.num_sampled.tolist()
 
 
+@pytest.mark.parametrize("top_k", [1, 50, 64])
+@pytest.mark.parametrize("num_reqs", [1, 8])
+def test_fused_talker_sampler_matches_upstream_cutoff_ties(top_k, num_reqs):
+    params = [_talker_params(seed=4, top_k=top_k, min_tokens=0, repetition_penalty=1.0)] * num_reqs
+    base, fused, talker, _, slots, device = _setup(params)
+    logits = torch.full((num_reqs, VOCAB), -10.0, dtype=torch.bfloat16, device=device)
+    if top_k > 1:
+        logits[:, 1:top_k] = torch.linspace(6, 8, top_k - 1, dtype=torch.bfloat16, device=device)
+    logits[:, 100:104] = 5.0
+    # Seed 4, position 46 used to select the excluded token 101 at k=50.
+    batch = _batch(slots, [46] * num_reqs, [47] * num_reqs, device)
+    out = fused(logits.clone(), batch)
+    ref = base(logits.masked_fill(talker._codec_disallowed_mask, float("-inf")), batch)
+    torch.testing.assert_close(out.sampled_token_ids, ref.sampled_token_ids, rtol=0, atol=0)
+
+
 def test_unsupported_requests_take_the_upstream_sampler():
     params = [_talker_params(), _talker_params(top_p=0.8), _talker_params(top_k=100), _talker_params(logprobs=2)]
     base, fused, talker, _, slots, device = _setup(params)
