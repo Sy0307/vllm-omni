@@ -33,6 +33,15 @@ stages:
       mrv2_gpu_slot_state: true
       mrv2_batch_prefill: true
       mrv2_direct_tokens: true
+      # Sample each frame right after the forward that produced its hidden
+      # state: one batched MTP per step. With fused_early_first_audio the rows
+      # whose prefill just completed join that MTP; otherwise their first frame
+      # needs a separate depth pass (~1 ms, bound by its weight reads) on every
+      # step that completes a prefill. H200, API4, EN1088, same GPUs, early
+      # first audio with vs without (2026-10-13): steady C128 937.9 -> 978.2,
+      # C64 660.1 -> 706.6 (fused-main without early first audio: 985.1 /
+      # 709.1); mean first PCM unchanged; paired WER/SIM unchanged within noise.
+      mrv2_eager_mtp: true
       local_compile_audio_sampler: true
       # One launch per codebook for sampling, code store and the next
       # position's attention; bitwise identical to the unfused depth step.
@@ -92,6 +101,9 @@ stages:
         # engine output queue. No extra decoder or decode. RTX PRO 6000, API4,
         # file refs (2026-10-12): mean first PCM C64 114 -> 61 ms, C128 165 ->
         # 91 ms; audio-s/s -3.6% / -0.8% (one start, two rounds per level).
+        # H200 with mrv2_eager_mtp (2026-10-13, 12 rounds per level): mean
+        # first PCM C64 74.4 -> 45.6 ms, C128 123.3 -> 83.6 ms; steady
+        # audio-s/s C64 -0.4%, C128 -0.7%.
         fused_early_first_audio: 1
         fused_decode_last_wait_steps: 1
         # A decode waits only for the chunk data it reads, not for the whole
