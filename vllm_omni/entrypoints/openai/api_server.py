@@ -318,7 +318,7 @@ def run_omni_api_server_worker_proc(
 
 
 def _limit_api_server_torch_threads() -> None:
-    """Cap the API server's intra-op Torch pool at four threads.
+    """Limit the process-wide Torch pool at API worker startup.
 
     The API process runs small host-side tensor ops per output (audio chunk
     concatenation, copies) whose parallel regions leave the OpenMP workers
@@ -326,8 +326,18 @@ def _limit_api_server_torch_threads() -> None:
     API server and starved co-located stage processes. A few threads keep media
     preprocessing (image and video resize/normalize) close to full speed. A
     lower thread count already in effect (e.g. from OMP_NUM_THREADS) is kept.
+    Inline diffusion stages share this pool. Set
+    VLLM_OMNI_API_SERVER_TORCH_THREADS to a higher cap or zero to disable it.
     """
-    torch.set_num_threads(min(4, torch.get_num_threads()))
+    value = os.environ.get("VLLM_OMNI_API_SERVER_TORCH_THREADS", "4")
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise ValueError("VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer") from exc
+    if limit < 0:
+        raise ValueError("VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer")
+    if limit:
+        torch.set_num_threads(min(limit, torch.get_num_threads()))
 
 
 async def omni_run_server_worker(

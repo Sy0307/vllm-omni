@@ -1564,6 +1564,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        elif status == RequestStatus.FINISHED_ABORTED:
+            # Without finished-request notifications no synthetic abort output
+            # will flush these tokens; the cancelled consumer no longer needs them.
+            getattr(self, "_held_token_ids", {}).pop(request_id, None)
 
         # Mirror the generation scheduler's try/finally pattern so the
         # input_coordinator entry is always pruned along every return path,
