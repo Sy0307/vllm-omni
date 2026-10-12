@@ -1116,7 +1116,7 @@ class MossTTSCodecDecoder(nn.Module):
     @property
     def packed_decode_ready(self) -> bool:
         session = self._stream_session
-        return session is not None and session._packed_wrapper is not None and self._first_chunk_fast_path is None
+        return session is not None and session._packed_wrapper is not None
 
     def _decode_streaming_packed(self, items: list[tuple[int, str, torch.Tensor, bool]]) -> dict[int, torch.Tensor]:
         """``_decode_streaming_batch`` with one packed call for any mix of chunk lengths.

@@ -9,6 +9,8 @@ itself. ``initialize_decoder_state_pool(chunk_frames=...)`` adds one chunk of
 headroom per layer so streaming reproduces the non-streaming decoder.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -16,6 +18,7 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudi
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_audio_tokenizer_v2 import (
     MossAudioTokenizerConfig,
 )
+from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -33,6 +36,19 @@ TRANSFORMER = {
     "layer_scale": 1.0,
     "conv_layout": True,
 }
+
+
+def test_packed_readiness_selects_captured_graph_without_legacy_first_chunk_state():
+    codec = MossTTSCodecDecoder.__new__(MossTTSCodecDecoder)
+    torch.nn.Module.__init__(codec)
+    codec._stream_session = None
+    assert not codec.packed_decode_ready
+    codec._stream_session = SimpleNamespace(_packed_wrapper=None)
+    assert not codec.packed_decode_ready
+    codec._stream_session._packed_wrapper = object()
+    # MossFusedAudio uses this lookup. An AttributeError inside the property
+    # would silently choose unpacked decoding even after packed graph capture.
+    assert getattr(codec, "packed_decode_ready", False)
 
 
 def tiny_codec() -> MossAudioTokenizerModel:

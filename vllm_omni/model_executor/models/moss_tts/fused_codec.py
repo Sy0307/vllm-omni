@@ -85,10 +85,11 @@ def build_fused_codec(vllm_config: VllmConfig):
     if not codec._gpu_stream_output:
         raise RuntimeError("The single-stage MOSS pipeline requires GPU codec stream output")
     logger.info(
-        "MOSS single-stage codec ready: capacity=%d chunks=%d/%d graphs=%s",
+        "MOSS single-stage codec ready: capacity=%d chunks=%d/%d graphs=%s packed=%s",
         codec._stream_state_capacity,
         codec._initial_stream_chunk_frames,
         codec._stream_chunk_frames,
         session._cudagraph_wrapper.capture_sizes if session._cudagraph_wrapper is not None else [],
+        codec.packed_decode_ready,
     )
     return codec
