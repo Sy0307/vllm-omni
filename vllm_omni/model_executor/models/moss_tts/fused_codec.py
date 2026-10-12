@@ -33,6 +33,13 @@ def fused_codec_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+def fused_early_first_audio_enabled(vllm_config: VllmConfig) -> bool:
+    """Send each stream's first frame through the first-audio sender (see ``fused_audio``)."""
+    if not fused_codec_enabled(vllm_config):
+        return False
+    return bool(int(fused_codec_options(vllm_config).get("fused_early_first_audio", 0)))
+
+
 def fused_codec_options(vllm_config: VllmConfig) -> dict[str, Any]:
     additional = getattr(vllm_config, "additional_config", None) or {}
     options = additional.get(FUSED_CODEC_CONFIG_KEY) or {}

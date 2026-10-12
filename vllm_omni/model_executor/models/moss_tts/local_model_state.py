@@ -159,10 +159,26 @@ class MossLocalModelState(OmniModelState):
                 model.fused_codec, self.scheduler_config.max_num_seqs, model.n_vq, model.audio_pad_token_id, device
             )
             logger.info("MOSS Local single-stage codec decoding enabled")
+            from vllm_omni.model_executor.models.moss_tts.fused_codec import fused_early_first_audio_enabled
+
+            if self._early_first_audio is None and fused_early_first_audio_enabled(vllm_config):
+                # The first frame is sampled right after the final prefill, as
+                # in the two-stage pipeline; the in-process codec decodes it in
+                # its next packed call and the first-audio sender delivers it.
+                from .first_audio_state import MossEarlyFirstAudioState
+
+                self._early_first_audio = MossEarlyFirstAudioState(
+                    self, None, publish=self._fused_audio.add_first_frames
+                )
+                # The engine binds the first-audio sink only to stages that opt in.
+                self.accepts_first_audio_sink = True
+                logger.info("MOSS Local single-stage first PCM goes ahead of the step output")
 
     def set_first_audio_sink(self, sink):
         if self._early_first_audio is not None:
             self._early_first_audio.set_sink(sink)
+            if self._fused_audio is not None:
+                self._fused_audio.first_sender = self._first_audio_sender
         else:
             super().set_first_audio_sink(sink)
 
@@ -680,7 +696,11 @@ class MossLocalModelState(OmniModelState):
         codes = self._codes_pool.index_select(0, slots)
         keep = codes.ne(model.audio_pad_token_id).any(dim=-1)
         fused = self._fused_audio
+        early = getattr(self, "_early_first_audio", None)
         if fused is not None:
+            if early is not None:
+                # Early first frames already went to the fused codec; no flags to publish.
+                early.updates.clear()
             # Frames stay on the device; the stop token keeps its two-stage step.
             upload = lambda data: _metadata_to_device(data, codes.device)  # noqa: E731
             fused.step(input_batch, self._decode_rows, codes, keep, upload)
@@ -698,7 +718,6 @@ class MossLocalModelState(OmniModelState):
         if fused is not None:
             # Read only for truthiness; PCM comes from prepare_streaming_audio_output.
             return model_output, {"fused_audio": True}
-        early = getattr(self, "_early_first_audio", None)
         first_audio = early.take_flags(input_batch.req_ids, codes.device) if early is not None else None
         return model_output, _CodeRowsSnapshot(
             codes, list(self._decode_rows), input_batch.num_reqs, first_audio, partitioned=self._partitioned_rows

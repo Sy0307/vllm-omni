@@ -56,3 +56,18 @@ def test_an_empty_final_is_queued_without_audio():
     (only,) = _wait(scheduler.omni_tail_outputs, 1)
     sender.close()
     assert only == ("e", None, True)
+
+
+def test_outputs_after_an_early_first_frame_carry_the_marker():
+    from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
+    scheduler = SimpleNamespace(omni_deferred_finishes={"m": {}}, omni_tail_outputs=deque())
+    sender = TailAudioSender(None, scheduler, torch.device("cuda"))
+    sr = torch.tensor(48000, dtype=torch.int32)
+    sender.submit("m", [(torch.ones((2, 4), device="cuda"), None)], sr, False, after_first=True)
+    # Even a terminal output without audio must follow the sent first frame.
+    sender.submit("m", [], sr, True, after_first=True)
+    (audio, final) = _wait(scheduler.omni_tail_outputs, 2)
+    sender.close()
+    assert bool(audio[1][FIRST_AUDIO_REQUIRED_KEY]) and audio[1]["model_outputs"].shape == (2, 4)
+    assert final[2] is True and set(final[1]) == {FIRST_AUDIO_REQUIRED_KEY}

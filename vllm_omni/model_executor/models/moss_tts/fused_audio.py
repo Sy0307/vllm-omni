@@ -27,6 +27,15 @@ terminal output that the scheduler held back. Aborted requests release their cod
 
 The emitted audio is exactly the two-stage audio: every non-padding frame up to
 the stop.
+
+With early first audio (``fused_early_first_audio``), a stream's first frame is
+queued as its first chunk as soon as it is sampled, right after the final
+prefill, instead of after its continue mask arrives: a padding frame is decoded
+as code 0 and dropped by its validity on the device. That chunk rides the next
+packed decode, which also starts the stream's codec state, and the first-audio
+sender hands its PCM to the engine output queue once the decode completes,
+ahead of the step output path. The stream's later outputs are marked so the
+orchestrator holds them until that first frame has arrived.
 """
 
 from __future__ import annotations
@@ -41,6 +50,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_uva_available
 from vllm.v1.worker.gpu import buffer_utils
+
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 
 logger = init_logger(__name__)
 
@@ -57,11 +68,19 @@ class FusedAudioStep:
     pcm: list[torch.Tensor]
     sample_rate: torch.Tensor
     events: list[torch.cuda.Event] = field(default_factory=list)
+    # Rows whose first frame was sent ahead by the first-audio sender.
+    after_first: set[int] = field(default_factory=set)
 
     def to_cpu(self, copy_stream: torch.cuda.Stream, copy_tensor) -> FusedAudioStep:
         for event in self.events:
             copy_stream.wait_event(event)
-        return FusedAudioStep(self.num_reqs, self.rows, [copy_tensor(pcm) for pcm in self.pcm], self.sample_rate)
+        return FusedAudioStep(
+            self.num_reqs,
+            self.rows,
+            [copy_tensor(pcm) for pcm in self.pcm],
+            self.sample_rate,
+            after_first=self.after_first,
+        )
 
     def get_output(self) -> list[dict[str, torch.Tensor] | None]:
         parts: dict[int, list[torch.Tensor]] = {}
@@ -72,6 +91,8 @@ class FusedAudioStep:
         for row, pieces in parts.items():
             pcm = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-1)
             output[row] = {"model_outputs": pcm, "sr": self.sample_rate}
+            if row in self.after_first:
+                output[row][FIRST_AUDIO_REQUIRED_KEY] = torch.tensor(True)
         return output
 
 
@@ -96,6 +117,11 @@ class _Ready:
     step: int
     # Producer event of ``codes`` when it was not made on the codec stream.
     dep: torch.cuda.Event | None = None
+    # Early first frame: routes frozen when the frame was sampled, and the
+    # frame's validity on the device. Its PCM goes to the first-audio sender as
+    # soon as this decode completes.
+    first_delivery: Any = None
+    first_valid: torch.Tensor | None = None
 
 
 @dataclass
@@ -118,6 +144,8 @@ class _Stream:
     stopped: bool = False
     # The last chunk was cut.
     closed: bool = False
+    # The first frame was cut when it was sampled, ahead of its continue mask.
+    precut: bool = False
     owned: torch.Tensor | None = None
     owned_event: torch.cuda.Event | None = None
 
@@ -223,6 +251,12 @@ class MossFusedAudio:
         self.slot_of: dict[str, int] = {}
         self.detached: dict[str, _Stream] = {}
         self.tail_sender: Any = None
+        # Early first audio: requests whose first frame went to the sender,
+        # until that frame is known; then those whose first frame was audio,
+        # whose later outputs must follow it.
+        self.early: set[str] = set()
+        self.after_first: set[str] = set()
+        self.first_sender: Any = None
         self._keep_records: list[_KeepRecord] = []
         self._keep_free: list[torch.Tensor] = []
         self._capacity = capacity
@@ -262,6 +296,46 @@ class MossFusedAudio:
             depth = buffer_utils._DEFAULT_MAX_CONCURRENCY + 2
             self._append_pool = buffer_utils.UvaBufferPool(3 * capacity, torch.int64, depth)
             self._gather_pool = buffer_utils.UvaBufferPool(2 * capacity * self.chunk_frames, torch.int64, depth)
+
+    def add_first_frames(self, req_ids, codes: torch.Tensor, valid: torch.Tensor) -> list[str]:
+        """Queue just-sampled first frames ([n, n_vq] codes) as urgent first chunks.
+
+        They are cut before their continue mask arrives: a padding frame is
+        decoded as code 0 and the sender drops it by ``valid``. The ring still
+        receives the frame with its step; ``_cut`` skips it once known.
+        Returns the requests whose first frame the sender will deliver; the
+        others keep the regular first chunk.
+        """
+        sender = self.first_sender
+        if sender is None or self._fast:
+            return []
+        ids = [str(req_id) for req_id in req_ids]
+        delivery = sender.prepare([req_id for req_id in ids if req_id in self.slot_of])
+        if not delivery.routes:
+            return []
+        frames = torch.where(valid[:, None], codes, 0)
+        dep = torch.cuda.Event()
+        dep.record()
+        accepted = []
+        for row, req_id in enumerate(ids):
+            if req_id not in delivery.routes:
+                continue
+            self.streams[self.slot_of[req_id]].precut = True
+            self.early.add(req_id)
+            self._ready.append(
+                _Ready(
+                    req_id,
+                    frames[row][:, None],
+                    False,
+                    True,
+                    self._steps,
+                    dep,
+                    first_delivery=delivery,
+                    first_valid=valid[row],
+                )
+            )
+            accepted.append(req_id)
+        return accepted
 
     def set_tail_sender(self, factory) -> bool:
         self.tail_sender = factory(self.device)
@@ -322,6 +396,8 @@ class MossFusedAudio:
         if not req_ids:
             return
         gone = set(req_ids)
+        self.early.difference_update(gone)
+        self.after_first.difference_update(gone)
         self._decoded = [audio for audio in self._decoded if audio.req_id not in gone]
         self._ready = [chunk for chunk in self._ready if chunk.req_id not in gone]
         self.codec.on_requests_finished(req_ids)
@@ -346,7 +422,13 @@ class MossFusedAudio:
         kept = []
         for audio in self._decoded:
             if audio.req_id == stream.req_id:
-                self.tail_sender.submit(audio.req_id, [(audio.pcm, audio.event)], self.sample_rate, False)
+                self.tail_sender.submit(
+                    audio.req_id,
+                    [(audio.pcm, audio.event)],
+                    self.sample_rate,
+                    False,
+                    after_first=audio.req_id in self.after_first,
+                )
             else:
                 kept.append(audio)
         self._decoded = kept
@@ -440,6 +522,22 @@ class MossFusedAudio:
         """(start, frames, last, first) chunks of known frames; advances the stream."""
         chunks = []
         while not stream.closed:
+            # MOSS_FAST_AUDIO streams never take early first frames.
+            if getattr(stream, "precut", False) and not stream.emitted:
+                if stream.known < 1:
+                    if not final:
+                        break
+                else:
+                    # The in-band first frame was already decoded; it was audio.
+                    stream.head = (stream.head + 1) % self.ring if stream.owned is None else stream.head + 1
+                    stream.count -= 1
+                    stream.known -= 1
+                    stream.emitted = True
+                    stream.precut = False
+                    if stream.req_id in self.early:
+                        self.early.discard(stream.req_id)
+                        self.after_first.add(stream.req_id)
+                    continue
             threshold = self.chunk_frames if stream.emitted else self.initial_frames
             if stream.known >= threshold and not (final and stream.known == stream.count == threshold):
                 frames = threshold
@@ -538,6 +636,9 @@ class MossFusedAudio:
             decode = self.codec._decode_streaming_packed if self.packed else self.codec._decode_streaming_batch
             for wave in waves:
                 decoded.update(decode([(position, chunk.req_id, chunk.codes, chunk.last) for position, chunk in wave]))
+            firsts = [(position, chunk) for position, chunk in enumerate(batch) if chunk.first_delivery is not None]
+            if firsts:
+                self._send_first_frames(firsts, decoded)
             empty_last = [chunk.req_id for chunk in batch if chunk.codes is None and chunk.last]
             if empty_last:
                 self.codec.on_requests_finished(empty_last)
@@ -545,14 +646,39 @@ class MossFusedAudio:
             event.record(self.stream)
         self._decode_events.append(event)
         for position, chunk in enumerate(batch):
+            if chunk.first_delivery is not None:
+                continue
             wav = decoded.get(position)
             if chunk.req_id in self.detached:
                 pieces = [(wav, event)] if wav is not None else []
-                self.tail_sender.submit(chunk.req_id, pieces, self.sample_rate, chunk.last)
+                if pieces or chunk.last:
+                    self.tail_sender.submit(
+                        chunk.req_id,
+                        pieces,
+                        self.sample_rate,
+                        chunk.last,
+                        after_first=chunk.req_id in self.after_first,
+                    )
                 if chunk.last:
                     self.detached.pop(chunk.req_id)
+                    self.after_first.discard(chunk.req_id)
+                    self.early.discard(chunk.req_id)
             elif wav is not None and chunk.req_id in self.slot_of:
                 self._decoded.append(_Decoded(chunk.req_id, wav, event))
+
+    def _send_first_frames(self, firsts, decoded) -> None:
+        """Hand in-band first frames to the first-audio sender; runs on the codec stream."""
+        from vllm_omni.worker_v2.first_audio_sender import _PreparedDelivery
+
+        routes: dict[str, int] = {}
+        for _, chunk in firsts:
+            routes[chunk.req_id] = chunk.first_delivery.routes[chunk.req_id]
+            chunk.first_valid.record_stream(self.stream)
+        ids = list(routes)
+        pcm = torch.stack([decoded[position] for position, _ in firsts])
+        valid = torch.stack([chunk.first_valid for _, chunk in firsts])
+        sink = firsts[0][1].first_delivery.sink
+        self.first_sender.submit_prepared(_PreparedDelivery(sink, routes), ids, pcm, self.sample_rate, valid)
 
     def drain_detached_audio(self) -> None:
         """Advance stopped requests' audio; called on every step, with or without a batch."""
@@ -659,6 +785,7 @@ class MossFusedAudio:
         row_of = {req_id: row for row, req_id in enumerate(input_batch.req_ids[:num_reqs])}
         rows: list[int] = []
         pcm: list[torch.Tensor] = []
+        after_first: set[int] = set()
         kept: list[_Decoded] = []
         ready: dict[int, bool] = {}
         for audio in self._decoded:
@@ -674,8 +801,10 @@ class MossFusedAudio:
                 continue
             rows.append(row)
             pcm.append(audio.pcm)
+            if audio.req_id in self.after_first:
+                after_first.add(row)
         self._decoded = kept
-        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate)
+        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate, after_first=after_first)
 
     def _step_fast(self, input_batch, decode_rows, codes, keep, upload) -> None:
         """``step`` with the per-row bookkeeping of attached streams vectorized."""
@@ -762,6 +891,7 @@ class MossFusedAudio:
         # Deliver audio whose decode completed to this step's rows.
         rows: list[int] = []
         pcm: list[torch.Tensor] = []
+        after_first: set[int] = set()
         if self._decoded:
             row_of_slot = np.full(self._capacity, -1, dtype=np.int64)
             row_of_slot[input_batch.idx_mapping_np[:num_reqs]] = np.arange(num_reqs)
@@ -780,8 +910,10 @@ class MossFusedAudio:
                     continue
                 rows.append(row)
                 pcm.append(audio.pcm)
+                if audio.req_id in self.after_first:
+                    after_first.add(row)
             self._decoded = kept
-        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate)
+        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate, after_first=after_first)
 
     def take_step(self, num_reqs: int) -> FusedAudioStep:
         step = self._step

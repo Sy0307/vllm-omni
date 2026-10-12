@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.moss_tts.fused_audio import MossFusedAudio
 
 pytestmark = [
@@ -69,16 +70,18 @@ class _FakeSender:
     def __init__(self):
         self.deferred = set()
         self.sent = []  # (request, codes, final)
+        self.after_first = []  # after_first flag per submit
 
     def is_deferred(self, req_id):
         return req_id in self.deferred
 
-    def submit(self, req_id, pieces, sample_rate, final):
+    def submit(self, req_id, pieces, sample_rate, final, *, after_first=False):
         torch.accelerator.synchronize()
         codes = []
         for pcm, _event in pieces:
             codes.extend(pcm[0, ::SPF].to(torch.long).tolist())
         self.sent.append((req_id, codes, final))
+        self.after_first.append(after_first)
 
 
 class _Batch:
@@ -96,10 +99,11 @@ def _fused(initial, chunk, **options):
     return codec, fused, sender
 
 
-def _run(fused, slots, frames):
+def _run(fused, slots, frames, markers=None):
     """One runner step: drain, then a decode step; ``frames`` maps slot -> first code (None = padding).
 
-    Returns {request: (continue, delivered codes or None)}.
+    Returns {request: (continue, delivered codes or None)}. ``markers`` collects
+    the requests whose delivered audio must follow an early first frame.
     """
     fused.drain_detached_audio()
     req_ids = [fused.streams[slot].req_id for slot in slots]
@@ -114,6 +118,12 @@ def _run(fused, slots, frames):
     host = step.to_cpu(torch.cuda.current_stream(), lambda tensor: tensor.cpu())
     torch.accelerator.synchronize()
     output = host.get_output()
+    if markers is not None:
+        markers.update(
+            req_id
+            for req_id, payload in zip(req_ids, output, strict=True)
+            if payload is not None and bool(payload.get(FIRST_AUDIO_REQUIRED_KEY, False))
+        )
     return {
         req_id: (bool(go), None if payload is None else payload["model_outputs"][0, ::SPF].to(torch.long).tolist())
         for req_id, go, payload in zip(req_ids, keep.cpu().tolist(), output, strict=True)
@@ -350,3 +360,114 @@ def test_packed_last_chunk_launches_after_last_wait_steps():
 
     eager, lazy = steps_until_tail(0), steps_until_tail(6)
     assert eager is not None and lazy is not None and eager < lazy
+
+
+class _FakeFirstSender:
+    """Prepares routes for live requests and records first frames once decoded."""
+
+    def __init__(self):
+        self.sent = []  # (request ids, first codes, valid)
+
+    def prepare(self, req_ids):
+        return SimpleNamespace(sink="sink", routes={req_id: 0 for req_id in req_ids})
+
+    def submit_prepared(self, delivery, req_ids, pcm, sample_rate, valid):
+        torch.accelerator.synchronize()
+        self.sent.append((list(req_ids), pcm[:, 0, ::SPF].to(torch.long).reshape(-1).tolist(), valid.tolist()))
+
+
+def _first_frames(fused, frames):
+    """Frames just sampled after the final prefill: {request: first code (None = padding)}."""
+    ids = list(frames)
+    codes = torch.full((len(ids), N_VQ), PAD, dtype=torch.long, device="cuda")
+    for row, req_id in enumerate(ids):
+        if frames[req_id] is not None:
+            codes[row] = frames[req_id]
+    valid = codes.ne(PAD).any(dim=-1)
+    return fused.add_first_frames(ids, codes, valid)
+
+
+def _early_fused(**options):
+    codec, fused, sender = _fused(initial=1, chunk=3, packed=True, **options)
+    first = _FakeFirstSender()
+    fused.first_sender = first
+    return codec, fused, sender, first
+
+
+def test_early_first_frame_decodes_once_and_goes_to_the_sender():
+    codec, fused, sender, first = _early_fused()
+    fused.add_request(0, "a")
+    fused.add_request(1, "b")
+    assert _first_frames(fused, {"a": 10}) == ["a"]
+    delivered: dict[str, list[list[int]]] = {"a": [], "b": []}
+    markers: set[str] = set()
+    for step, code in enumerate([10, 11, 12, 13, 14, None]):
+        result = _run(fused, [0, 1], {0: code, 1: 30 + step}, markers)
+        for req_id, (_go, audio) in result.items():
+            if audio is not None:
+                delivered[req_id].append(audio)
+    _stop(fused, sender, "a")
+    # The first frame went to the sender as soon as its decode completed, decoded once.
+    assert first.sent == [(["a"], [10], [True])]
+    order = [codes for call in codec.calls for req, codes, _ in call if req == "a"]
+    assert order[0] == [10] and sum(order, []) == [10, 11, 12, 13, 14]
+    audio, finals = _stream_audio(delivered["a"], sender, "a")
+    assert sum(audio, []) == [11, 12, 13, 14] and finals[-1] is True
+    assert "a" in markers and "b" not in markers and delivered["b"][0] == [30]
+    assert not fused.after_first and not fused.early
+
+
+def test_early_padding_first_frame_finishes_without_audio():
+    codec, fused, sender, first = _early_fused()
+    fused.add_request(0, "p")
+    _first_frames(fused, {"p": None})
+    _run(fused, [0], {0: None})
+    _stop(fused, sender, "p")
+    # Decoded as code 0 and dropped by validity; the terminal waits for nothing.
+    assert first.sent == [(["p"], [0], [False])]
+    assert sender.sent == [("p", [], True)] and sender.after_first == [False]
+    assert codec.finished == ["p"] and not fused.early and not fused.after_first
+
+
+def test_early_first_frame_of_a_length_stopped_request():
+    _, fused, sender, first = _early_fused()
+    fused.add_request(0, "l")
+    _first_frames(fused, {"l": 7})
+    _run(fused, [0], {0: 7})
+    _stop(fused, sender, "l")
+    # Its only audio went ahead; the terminal output must follow it.
+    assert first.sent == [(["l"], [7], [True])]
+    assert sender.sent == [("l", [], True)] and sender.after_first == [True]
+
+
+def test_early_first_frame_launches_at_once_and_skips_the_mask_wait():
+    codec, fused, _sender, first = _early_fused(fused_decode_min_batch=99, fused_decode_max_wait_steps=9)
+    fused.add_request(0, "a")
+    _first_frames(fused, {"a": 10})
+    # The first step after the final prefill decodes it: no continue-mask wait.
+    _run(fused, [0], {0: 10})
+    assert codec.calls == [[("a", [10], False)]] and first.sent == [(["a"], [10], [True])]
+
+
+def test_early_first_frame_without_a_route_keeps_the_regular_first_chunk():
+    _, fused, _sender, first = _early_fused()
+    first.prepare = lambda req_ids: SimpleNamespace(sink="sink", routes={})
+    fused.add_request(0, "r")
+    assert _first_frames(fused, {"r": 4}) == []
+    delivered = []
+    for code in [4, 5, 6, 7, 8]:
+        _, audio = _run(fused, [0], {0: code})["r"]
+        if audio is not None:
+            delivered.append(audio)
+    assert delivered[0] == [4] and first.sent == []
+
+
+def test_early_first_frame_released_on_abort():
+    codec, fused, sender, first = _early_fused()
+    fused.add_request(0, "x")
+    _first_frames(fused, {"x": 5})
+    _run(fused, [0], {0: 5})
+    _run(fused, [0], {0: 6})
+    fused.finish(["x"])  # not deferred: aborted
+    assert codec.finished == ["x"] and sender.sent == []
+    assert not fused.early and not fused.after_first

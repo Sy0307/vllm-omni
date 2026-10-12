@@ -21,7 +21,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
+from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 
 logger = init_logger(__name__)
 
@@ -76,6 +76,22 @@ class FirstAudioSender:
         accepted = list(delivery.routes)
         if not accepted:
             return []
+        self.submit_prepared(delivery, request_ids, pcm, sample_rate, valid)
+        return accepted
+
+    def prepare(self, request_ids: list[str]) -> _PreparedDelivery:
+        """Freeze routes now for PCM decoded and submitted later."""
+        return self._sink.prepare(request_ids)
+
+    def submit_prepared(
+        self,
+        delivery: _PreparedDelivery,
+        request_ids: list[str],
+        pcm: torch.Tensor,
+        sample_rate: torch.Tensor,
+        valid: torch.Tensor | None = None,
+    ) -> None:
+        """``submit`` for routes frozen by an earlier ``prepare``."""
         host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
         host.copy_(pcm, non_blocking=True)
         host_valid = None
@@ -85,7 +101,6 @@ class FirstAudioSender:
         copied = torch.cuda.Event()
         copied.record()
         self._queue.put((copied, host, list(request_ids), sample_rate, host_valid, delivery))
-        return accepted
 
     def close(self) -> None:
         self._queue.put(None)
@@ -212,8 +227,11 @@ class TailAudioSender:
         pieces: list[tuple[torch.Tensor, torch.cuda.Event | None]],
         sample_rate: torch.Tensor,
         final: bool,
+        *,
+        after_first: bool = False,
     ) -> None:
-        self._queue.put((request_id, pieces, sample_rate, final))
+        """``after_first``: the request's first frame went ahead through the first-audio sender."""
+        self._queue.put((request_id, pieces, sample_rate, final, after_first))
 
     def close(self) -> None:
         self._queue.put(None)
@@ -223,7 +241,7 @@ class TailAudioSender:
         torch.accelerator.set_device_index(self.device.index)
         copy_stream = torch.cuda.Stream(device=self.device)
         while (item := self._queue.get()) is not None:
-            request_id, pieces, sample_rate, final = item
+            request_id, pieces, sample_rate, final, after_first = item
             payload = None
             try:
                 hosts = []
@@ -243,5 +261,8 @@ class TailAudioSender:
             except Exception:
                 logger.exception("Tail audio copy failed for %s", request_id)
             finally:
+                if after_first and (payload is not None or final):
+                    # Even a terminal output without audio must not overtake the sent first frame.
+                    payload = {**(payload or {}), FIRST_AUDIO_REQUIRED_KEY: torch.tensor(True)}
                 del pieces
                 self.scheduler.omni_tail_outputs.append((request_id, payload, final))

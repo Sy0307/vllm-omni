@@ -86,6 +86,13 @@ stages:
         fused_decode_min_batch: 32
         fused_decode_max_wait_steps: 3
         fused_decode_first_wait_steps: 1
+        # First PCM ahead of the step output: a stream's first frame is sampled
+        # right after its final prefill, joins the next packed decode without
+        # waiting for its continue mask, and a sender thread hands its PCM to the
+        # engine output queue. No extra decoder or decode. RTX PRO 6000, API4,
+        # file refs (2026-10-12): mean first PCM C64 114 -> 61 ms, C128 165 ->
+        # 91 ms; audio-s/s -3.6% / -0.8% (one start, two rounds per level).
+        fused_early_first_audio: 1
         fused_decode_last_wait_steps: 1
         # A decode waits only for the chunk data it reads, not for the whole
         # talker step queued before it.
