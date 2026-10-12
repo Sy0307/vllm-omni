@@ -41,6 +41,7 @@ from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOut
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
 
 logger = init_logger(__name__)
+
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
 
 
@@ -952,11 +953,18 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
             self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
-            self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]
-                if pooler_client
-                else None
-            )
+            if self._streaming_audio is not None and pooler_client:
+                # Streaming PCM already sits in CPU buffers this output owns
+                # (allocated per chunk by the async D2H): no second copy.
+                self.model_runner_output.multimodal_outputs = [
+                    _ensure_tensor_values(p) if p else {} for p in pooler_client
+                ]
+            else:
+                self.model_runner_output.multimodal_outputs = (
+                    [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]
+                    if pooler_client
+                    else None
+                )
         elif self._need_pooler and self._hidden_cpu is not None:
             pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(
                 self._hidden_cpu,

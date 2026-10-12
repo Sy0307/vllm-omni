@@ -430,3 +430,27 @@ python -m pytest -q tests/model_executor/models/moss_tts/test_slot_attention.py 
   tests/model_executor/models/moss_tts/test_streaming_attention.py \
   -m 'core_model and cuda' --run-level=core_model
 ```
+
+## Single-stage Local fused profile (CUDA)
+
+`moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
+process on one CUDA GPU. The profile uses 128 request slots and a 32 GiB talker
+KV cache, with additional memory needed for codec weights, state and graphs.
+It requires the V2 model runner, asynchronous chunk output, and TP=PP=1.
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --omni --api-server-count 4 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml
+```
+
+The codec returns 48 kHz stereo PCM: a one-frame first chunk (80 ms), followed
+by 15-frame chunks (1.2 s). Eager MTP samples newly completed prefills together
+with decode requests. The codec sends the first PCM as soon as it is ready;
+later chunks and completion follow it in order. Stopped requests release their
+talker slot while the codec finishes their remaining audio.
+KV-cache preemption terminates the affected request with an explicit error;
+provision enough KV cache for the chosen concurrency to avoid interrupted audio.
+
+The ordinary `moss_tts_local.yaml` continues to use separate talker and codec
+stages. Select that profile for deployments that need separate stage resources.

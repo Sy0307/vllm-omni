@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
-import glob
 import hashlib
 import os
 import select
@@ -151,7 +150,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         if not _wakeup_enabled():
             return
         try:
-            pattern = f"{self._wake_directory}/{int(to_stage)}_*"
+            prefix = f"{int(to_stage)}_"
         except (TypeError, ValueError):
             return  # non-numeric stage names use the ordinary polling path
         with self._wake_lock:
@@ -159,7 +158,15 @@ class SharedMemoryConnector(OmniConnectorBase):
                 return
             # Discover every replica, including newly restarted receivers. Do
             # not cache writers across receiver lifetimes or unlink peers' paths.
-            for path in glob.iglob(pattern):
+            # One listdir per send; glob's pattern machinery costs far more.
+            try:
+                names = os.listdir(self._wake_directory)
+            except OSError:
+                return
+            for name in names:
+                if not name.startswith(prefix):
+                    continue
+                path = os.path.join(self._wake_directory, name)
                 fd = None
                 try:
                     fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)

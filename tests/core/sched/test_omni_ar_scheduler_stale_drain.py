@@ -26,6 +26,7 @@ runs for the frame.
 
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -89,6 +90,9 @@ def _replace_streaming_session(session: Request) -> None:
 
 def _make_drain_sched(session: Request) -> MagicMock:
     sched = MagicMock()
+    sched.omni_defer_audio_finish = False
+    sched.omni_deferred_finishes = {}
+    sched.omni_tail_outputs = deque()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True

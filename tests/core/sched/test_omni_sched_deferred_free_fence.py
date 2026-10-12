@@ -23,6 +23,7 @@ free logic itself is upstream-tested.
 
 from __future__ import annotations
 
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -49,6 +50,9 @@ def _make_update_sched(scheduler_cls) -> MagicMock:
     """MagicMock scheduler driving the real ``update_from_output`` with an
     empty batch; only the fence state carries real values."""
     sched = MagicMock()
+    sched.omni_defer_audio_finish = False
+    sched.omni_deferred_finishes = {}
+    sched.omni_tail_outputs = deque()
     sched.requests = {}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None

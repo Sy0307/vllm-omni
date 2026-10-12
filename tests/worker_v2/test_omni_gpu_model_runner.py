@@ -34,6 +34,27 @@ def _make_runner():
     return runner
 
 
+def test_shutdown_closes_model_state_even_when_first_audio_close_fails(monkeypatch):
+    runner = _make_runner()
+    closed = []
+
+    def fail_first_audio():
+        closed.append("first")
+        raise RuntimeError("sender shutdown failed")
+
+    runner.model_state = SimpleNamespace(
+        _first_audio_sender=SimpleNamespace(close=fail_first_audio),
+        shutdown=lambda: closed.append("tail"),
+    )
+    runner._native_output_materializer = SimpleNamespace(close=lambda: closed.append("materializer"))
+    runner._omni_data_plane = SimpleNamespace(close=lambda: closed.append("data_plane"))
+    monkeypatch.setattr(GPUModelRunner, "shutdown", lambda self: closed.append("runner"))
+    with pytest.raises(RuntimeError, match="sender shutdown failed"):
+        runner.shutdown()
+    assert closed == ["first", "tail", "materializer", "data_plane", "runner"]
+    assert runner._native_output_materializer is None
+
+
 def test_add_requests_empty_admission_and_stop_id_sanitization():
     runner = _make_runner()
     runner.sampler = Sampler.__new__(Sampler)
@@ -98,7 +119,8 @@ def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
 def test_duplex_kv_reanchor_runs_after_block_table_writes():
     # Same model hook as the V1 AR runner: reanchor reads the committed block tables.
     runner = object.__new__(OmniGPUModelRunner)
-    order = []
+    runner._host_fast_paths_installed = True
+    order: list[object] = []
     for name in ("_prepare_native_data_plane", "finish_requests", "free_states", "add_requests", "update_requests"):
         setattr(runner, name, lambda *_args: None)
     runner._sync_native_data_plane_payloads = lambda *_args: None

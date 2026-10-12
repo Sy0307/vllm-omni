@@ -91,14 +91,40 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     model_runner = getattr(worker, "model_runner", None)
     model_state = getattr(model_runner, "model_state", None)
     model = getattr(model_runner, "model", None)
-    decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
-        getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
+    decodes_audio = (
+        getattr(model, "first_frame_decoder", None) is not None
+        or (getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False)))
+        or getattr(model_state, "accepts_first_audio_sink", False) is True
     )
     if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
         assert model_state is not None
         model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
         return True
     return False
+
+
+def _bind_tail_audio_sender(model_executor: Any, scheduler: Any) -> bool:
+    """Let an in-process audio stage finish requests before their last audio.
+
+    The scheduler then holds a stopped request's terminal output until the
+    model state's sender delivers the audio decoded after the stop.
+    """
+    if not isinstance(model_executor, UniProcExecutor) or not hasattr(scheduler, "omni_deferred_finishes"):
+        return False
+    parallel_config = model_executor.vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 1 or parallel_config.pipeline_parallel_size != 1:
+        return False
+    worker = getattr(getattr(model_executor, "driver_worker", None), "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    bind = getattr(getattr(model_runner, "model_state", None), "set_tail_audio_sender", None)
+    if not callable(bind):
+        return False
+    from vllm_omni.worker_v2.first_audio_sender import TailAudioSender
+
+    if not bind(lambda device: TailAudioSender(scheduler, device)):
+        return False
+    scheduler.omni_defer_audio_finish = True
+    return True
 
 
 def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
@@ -141,6 +167,8 @@ class StageEngineCoreProc(EngineCoreProc):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
+        if _bind_tail_audio_sender(self.model_executor, self.scheduler):
+            logger.info("Stopped requests hand their last audio to the tail-audio sender.")
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 

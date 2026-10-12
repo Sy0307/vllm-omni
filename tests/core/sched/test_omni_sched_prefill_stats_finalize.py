@@ -12,6 +12,7 @@ emitted ``take_prefill_stats()`` raw, so creation usage was always 0.
 
 from __future__ import annotations
 
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -53,6 +54,9 @@ def _make_request() -> Request:
 
 def _make_sched(request: Request) -> MagicMock:
     sched = MagicMock()
+    sched.omni_defer_audio_finish = False
+    sched.omni_deferred_finishes = {}
+    sched.omni_tail_outputs = deque()
     sched._first_chunk_express = False
     sched._express_min_slack_s = 0.0
     sched.requests = {request.request_id: request}

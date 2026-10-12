@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from types import MethodType, SimpleNamespace
 
@@ -25,6 +25,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # Shared update_from_output helpers moved onto OmniSchedulerMixin; bind them on
 # the lightweight stub so direct method calls still exercise the real paths.
 _MIXIN_UPDATE_HELPERS = (
+    "_finish_requests_with_error",
     "_remove_stopped_requests_from_queues",
     "_handle_failed_kv_load_outputs",
     "_aggregate_kv_connector_stats",
@@ -103,7 +104,7 @@ class _Request:
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
         self.has_encoder_inputs = False
-        self.pooling_params = None
+        self.pooling_params: SimpleNamespace | None = None
         self.resumable = True
         self.stop_reason = None
         self.trace_headers = None
@@ -132,6 +133,9 @@ class _RequestQueue(list):
 def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     """Build a minimal stub for OmniARScheduler.update_from_output()."""
     scheduler = SimpleNamespace(
+        omni_defer_audio_finish=False,
+        omni_deferred_finishes={},
+        omni_tail_outputs=deque(),
         perf_metrics=None,
         connector=None,
         aux_output_connector=None,

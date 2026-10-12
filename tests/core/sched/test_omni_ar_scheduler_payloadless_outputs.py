@@ -33,7 +33,7 @@ def audio_scheduler():
     sched = _make_scheduler_stub([request])
     sched._hold_payloadless_outputs = True
     sched._held_token_ids = {}
-    sched._pending_input_timeout_outputs = {}
+    sched._pending_error_outputs = {}
     sched._streaming_context_overflow = {}
     sched.kv_cache_manager.estimate_cached_tokens = lambda req: 0
     sched.vllm_config.model_config.engine_output_type = "audio"

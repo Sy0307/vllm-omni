@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -67,7 +68,7 @@ def test_cfg_companion_forces_kv_transfer_without_downstream_payload():
 
 
 class _ChunkRequest(SimpleNamespace):
-    def __hash__(self):
+    def __hash__(self) -> int:  # type: ignore[override]
         return hash(self.request_id)
 
     def __eq__(self, other):
@@ -111,6 +112,9 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     adapter._confirmed_num_computed_tokens.return_value = 1
 
     sched = mocker.MagicMock()
+    sched.omni_defer_audio_finish = False
+    sched.omni_deferred_finishes = {}
+    sched.omni_tail_outputs = deque()
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False
@@ -191,7 +195,7 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
     tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
 
     class Session(SimpleNamespace):
-        __hash__ = object.__hash__
+        __hash__ = object.__hash__  # type: ignore[assignment]
 
     session = Session(
         request_id="req",

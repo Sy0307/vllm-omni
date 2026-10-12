@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Audio decoded after a request stopped is queued, in order, for the scheduler."""
+
+import time
+from collections import deque
+from contextlib import nullcontext
+from queue import SimpleQueue
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm_omni.worker_v2.first_audio_sender import TailAudioSender
+
+pytestmark = [pytest.mark.core_model]
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+def _wait(tail, count):
+    deadline = time.monotonic() + 10
+    while len(tail) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(tail) == count
+    return list(tail)
+
+
+@pytest.mark.cuda
+@requires_cuda
+def test_pieces_wait_for_their_decode_and_keep_submission_order():
+    scheduler = SimpleNamespace(omni_deferred_finishes={"r": {}}, omni_tail_outputs=deque())
+    sender = TailAudioSender(scheduler, torch.device("cuda"))
+    side = torch.cuda.Stream()
+    pieces = []
+    with torch.cuda.stream(side):
+        for value in (1.0, 2.0, 3.0):
+            torch.cuda._sleep(5_000_000)
+            pcm = torch.full((2, 4), value, device="cuda")
+            event = torch.cuda.Event()
+            event.record(side)
+            pieces.append((pcm, event))
+    sr = torch.tensor(48000, dtype=torch.int32)
+    assert sender.is_deferred("r") and not sender.is_deferred("x")
+    sender.submit("r", [pieces[0]], sr, False)
+    sender.submit("r", pieces[1:], sr, True)
+    (first, last) = _wait(scheduler.omni_tail_outputs, 2)
+    sender.close()
+    assert first[0] == "r" and first[2] is False
+    assert first[1]["model_outputs"].unique().tolist() == [1.0] and not first[1]["model_outputs"].is_cuda
+    assert last[2] is True and last[1]["model_outputs"][0].tolist() == [2.0] * 4 + [3.0] * 4
+
+
+@pytest.mark.cuda
+@requires_cuda
+def test_an_empty_final_is_queued_without_audio():
+    scheduler = SimpleNamespace(omni_deferred_finishes={"e": {}}, omni_tail_outputs=deque())
+    sender = TailAudioSender(scheduler, torch.device("cuda"))
+    sender.submit("e", [], torch.tensor(48000, dtype=torch.int32), True)
+    (only,) = _wait(scheduler.omni_tail_outputs, 1)
+    sender.close()
+    assert only == ("e", None, True)
+
+
+@pytest.mark.cuda
+@requires_cuda
+def test_outputs_after_an_early_first_frame_carry_the_marker():
+    from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
+    scheduler = SimpleNamespace(omni_deferred_finishes={"m": {}}, omni_tail_outputs=deque())
+    sender = TailAudioSender(scheduler, torch.device("cuda"))
+    sr = torch.tensor(48000, dtype=torch.int32)
+    sender.submit("m", [(torch.ones((2, 4), device="cuda"), None)], sr, False, after_first=True)
+    # Even a terminal output without audio must follow the sent first frame.
+    sender.submit("m", [], sr, True, after_first=True)
+    (audio, final) = _wait(scheduler.omni_tail_outputs, 2)
+    sender.close()
+    assert bool(audio[1][FIRST_AUDIO_REQUIRED_KEY]) and audio[1]["model_outputs"].shape == (2, 4)
+    assert final[2] is True and set(final[1]) == {FIRST_AUDIO_REQUIRED_KEY}
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("during_startup", [False, True])
+def test_sender_failure_reaches_engine_without_successful_terminal(monkeypatch, during_startup):
+    failure = RuntimeError("injected CUDA failure")
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda _index: None)
+    monkeypatch.setattr(
+        torch.cuda, "Stream", fail if during_startup else lambda **kwargs: SimpleNamespace(synchronize=fail)
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    sender = TailAudioSender.__new__(TailAudioSender)
+    sender.scheduler = SimpleNamespace(omni_tail_outputs=deque())
+    sender.device = torch.device("cuda", 0)
+    sender._error = None
+    sender._queue = SimpleQueue()
+    sender._queue.put(("r", [], torch.tensor(48000), True, False))
+    sender._queue.put(None)
+    sender._run()
+
+    assert not sender.scheduler.omni_tail_outputs
+    with pytest.raises(RuntimeError, match="Tail audio delivery failed") as exc:
+        sender.raise_if_failed()
+    assert exc.value.__cause__ is failure

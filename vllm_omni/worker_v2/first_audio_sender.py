@@ -15,13 +15,16 @@ from __future__ import annotations
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
+from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
+
+if TYPE_CHECKING:
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 logger = init_logger(__name__)
 
@@ -76,6 +79,22 @@ class FirstAudioSender:
         accepted = list(delivery.routes)
         if not accepted:
             return []
+        self.submit_prepared(delivery, request_ids, pcm, sample_rate, valid)
+        return accepted
+
+    def prepare(self, request_ids: list[str]) -> _PreparedDelivery:
+        """Freeze routes now for PCM decoded and submitted later."""
+        return self._sink.prepare(request_ids)
+
+    def submit_prepared(
+        self,
+        delivery: _PreparedDelivery,
+        request_ids: list[str],
+        pcm: torch.Tensor,
+        sample_rate: torch.Tensor,
+        valid: torch.Tensor | None = None,
+    ) -> None:
+        """``submit`` for routes frozen by an earlier ``prepare``."""
         host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
         host.copy_(pcm, non_blocking=True)
         host_valid = None
@@ -85,7 +104,6 @@ class FirstAudioSender:
         copied = torch.cuda.Event()
         copied.record()
         self._queue.put((copied, host, list(request_ids), sample_rate, host_valid, delivery))
-        return accepted
 
     def close(self) -> None:
         self._queue.put(None)
@@ -173,5 +191,85 @@ class _EngineOutputSink:
 
 
 def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:
-    """Route prepared first audio from an upstream stage."""
+    """Route first audio through the orchestrator's ordering channel."""
     return _EngineOutputSink(output_queue, scheduler)
+
+
+class TailAudioSender:
+    """Prepare audio decoded after a request stopped generating.
+
+    The scheduler released the request at its stop and holds its terminal
+    output in ``scheduler.omni_deferred_finishes``. Pieces submitted here are
+    handled in order on one thread: each waits for its decode event and is
+    copied on a private stream (no legacy-stream synchronization with the
+    talker), then queued on ``scheduler.omni_tail_outputs``. The scheduler emits
+    them after its next step's own outputs, so a request's audio from steps in
+    flight at its stop, its tail and its terminal output stay in order.
+    """
+
+    def __init__(self, scheduler: OmniARScheduler, device: torch.device) -> None:
+        self.scheduler = scheduler
+        # The sender thread selects the device by index.
+        index = device.index if device.index is not None else torch.accelerator.current_device_index()
+        self.device = torch.device(device.type, index)
+        self._queue: queue.SimpleQueue[
+            tuple[str, list[tuple[torch.Tensor, torch.cuda.Event | None]], torch.Tensor, bool, bool] | None
+        ] = queue.SimpleQueue()
+        self._error: Exception | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name="omni-tail-audio-sender")
+        self._thread.start()
+
+    def is_deferred(self, request_id: str) -> bool:
+        return request_id in self.scheduler.omni_deferred_finishes
+
+    def submit(
+        self,
+        request_id: str,
+        pieces: list[tuple[torch.Tensor, torch.cuda.Event | None]],
+        sample_rate: torch.Tensor,
+        final: bool,
+        *,
+        after_first: bool = False,
+    ) -> None:
+        """``after_first``: the request's first frame went ahead through the first-audio sender."""
+        self.raise_if_failed()
+        self._queue.put((request_id, pieces, sample_rate, final, after_first))
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("Tail audio delivery failed") from self._error
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            raise RuntimeError("Tail audio sender did not stop within its shutdown deadline")
+
+    def _run(self) -> None:
+        try:
+            torch.accelerator.set_device_index(self.device.index)
+            copy_stream = torch.cuda.Stream(device=self.device)
+            while (item := self._queue.get()) is not None:
+                request_id, pieces, sample_rate, final, after_first = item
+                payload = None
+                hosts = []
+                with torch.cuda.stream(copy_stream):
+                    for pcm, event in pieces:
+                        if not pcm.numel():
+                            continue
+                        if event is not None:
+                            copy_stream.wait_event(event)
+                        host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
+                        host.copy_(pcm, non_blocking=True)
+                        hosts.append(host)
+                copy_stream.synchronize()
+                if hosts:
+                    pcm = hosts[0] if len(hosts) == 1 else torch.cat(hosts, dim=-1)
+                    payload = {"model_outputs": pcm, "sr": sample_rate}
+                if after_first and (payload is not None or final):
+                    # Even a terminal output without audio must not overtake the sent first frame.
+                    payload = {**(payload or {}), FIRST_AUDIO_REQUIRED_KEY: torch.tensor(True)}
+                del pieces
+                self.scheduler.omni_tail_outputs.append((request_id, payload, final))
+        except Exception as error:
+            self._error = error

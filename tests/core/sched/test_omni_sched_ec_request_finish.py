@@ -14,6 +14,7 @@ item, so a remote encoder-cache handle could never reach the frontend.
 
 from __future__ import annotations
 
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -120,6 +121,9 @@ def _make_finish_sched(request: Request) -> MagicMock:
     """MagicMock scheduler driving the real ``update_from_output`` through a
     finishing request; ``_free_request`` reports EC transfer params."""
     sched = MagicMock()
+    sched.omni_defer_audio_finish = False
+    sched.omni_deferred_finishes = {}
+    sched.omni_tail_outputs = deque()
     sched._first_chunk_express = False
     sched._express_min_slack_s = 0.0
     sched.requests = {request.request_id: request}

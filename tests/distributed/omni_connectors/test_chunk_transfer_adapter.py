@@ -2689,6 +2689,9 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
     scheduler = mocker.MagicMock()
+    scheduler.omni_defer_audio_finish = False
+    scheduler.omni_deferred_finishes = {}
+    scheduler.omni_tail_outputs = deque()
     scheduler.aux_output_connector = None
     scheduler.chunk_transfer_adapter = adapter_mock
     bind_omits_transfer_helpers(scheduler)
