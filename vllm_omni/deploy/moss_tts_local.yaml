@@ -21,9 +21,6 @@ connectors:
       codec_left_context_frames: 0
       generation_min_batch_size: 16
       generation_max_wait_ms: 6
-      codec_shared_rope: 1
-      codec_fused_slot_attention: 1
-      codec_skip_empty_attention_tiles: 1
 stages:
   - stage_id: 0
     max_num_seqs: 64

@@ -201,8 +201,8 @@ class StreamingExecutionContext:
     state_slot_ids: torch.Tensor
     valid_rows: torch.Tensor
     attention_metadata: StreamingAttentionMetadata | None = None
-    # Opt-in (codec_shared_rope): one transformer's ``rope_angles`` result,
-    # shared by its layers, whose per-slot offsets advance together.
+    # One transformer's ``rope_angles`` result, shared by its layers, whose
+    # per-slot offsets advance together.
     rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
