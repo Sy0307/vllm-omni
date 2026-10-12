@@ -39,16 +39,6 @@ def _bthd_out(q: torch.Tensor) -> torch.Tensor:
     return torch.empty((b, t, h, d), device=q.device, dtype=q.dtype).transpose(1, 2)
 
 
-def _bthd_out(q: torch.Tensor) -> torch.Tensor:
-    """(B, H, T, D) output backed by (B, T, H, D) storage.
-
-    The codec immediately transposes attention output back to (B, T, H*D), so
-    this layout makes that reshape a view instead of a copy kernel.
-    """
-    b, h, t, d = q.shape
-    return torch.empty((b, t, h, d), device=q.device, dtype=q.dtype).transpose(1, 2)
-
-
 @triton.jit
 def _write(
     k_ptr,
