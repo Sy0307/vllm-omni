@@ -213,6 +213,9 @@ def test_concurrent_local_fallbacks_wait_for_the_whole_tokenizer_move(host_dir, 
             return self
 
     class _Processor(_FakeProcessor):
+        audio_tokenizer: _Tokenizer
+        _vllm_omni_ref_encoder_device: torch.device
+
         def encode_audios_from_wav(self, wav_list, sampling_rate, n_vq=None):
             if any(p.device != target for p in self.audio_tokenizer.params):
                 raise RuntimeError("encode on a partly moved tokenizer")

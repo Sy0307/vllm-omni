@@ -77,7 +77,8 @@ def _publish(tm, req_id, payload):
         {"codec_chunk_frames": 15, "codec_chunk_ramp": [1, 4, 8]},
     ],
 )
-def test_batch_matches_scalar(extra):
+@pytest.mark.parametrize("direct_first", [False, True])
+def test_batch_matches_scalar(extra, direct_first):
     rng = random.Random(0)
     torch.manual_seed(0)
     scalar_tm, batch_tm = _tm(dict(extra)), _tm(dict(extra))
@@ -87,6 +88,10 @@ def test_batch_matches_scalar(extra):
         host: list[torch.Tensor] = []
         requests = [SimpleNamespace(external_req_id=req_id, request_id=f"internal-{req_id}") for req_id in live]
         outputs = [_output(rng, host) for _ in live]
+        if direct_first:
+            for output in outputs:
+                if output is not None and rng.random() < 0.15:
+                    output["meta"] = {"first_audio": torch.tensor(True)}
         finished = [rng.random() < 0.04 for _ in live]
 
         expected = [

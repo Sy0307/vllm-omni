@@ -243,6 +243,18 @@ def _init_raw_chunk_state(transfer_manager: Any) -> None:
         transfer_manager.ramp_chunk_count = defaultdict(int)
 
 
+def _record_raw_first_audio(transfer_manager: Any, req_id: str, multimodal_output: Any) -> None:
+    saved = transfer_manager.request_payload.get(req_id)
+    if isinstance(saved, dict) and saved.get("first_audio", False):
+        return
+    source_meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, Mapping) else {}
+    first_audio = source_meta.get("first_audio", False)
+    if isinstance(first_audio, torch.Tensor):
+        first_audio = bool(first_audio.numel() and first_audio.reshape(-1)[-1].item())
+    if first_audio:
+        transfer_manager.request_payload[req_id] = {"first_audio": True}
+
+
 def _raw_new_frames(multimodal_output: Any) -> torch.Tensor | None:
     if isinstance(multimodal_output, Mapping):
         codes_dict = multimodal_output.get("codes", {}) or {}
@@ -293,6 +305,8 @@ def _raw_emit_chunk(
     config: tuple[int, int, list[int] | None],
 ) -> OmniPayloadStruct | None:
     chunk_frames, initial_chunk_frames, ramp = config
+    saved = transfer_manager.request_payload.get(req_id)
+    direct_first = isinstance(saved, dict) and bool(saved.get("first_audio", False))
     pending = len(pending_frames)
     emitted_chunks = int(transfer_manager.put_req_chunk.get(req_id, 0))
     emitted_any = emitted_chunks > 0
@@ -302,6 +316,8 @@ def _raw_emit_chunk(
         # restarts at each segment boundary; put_req_chunk is request-global.
         ramp_index = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
         threshold = ramp_chunk_size(ramp_index, ramp, chunk_frames)
+    if direct_first and not emitted_any and ramp is None:
+        threshold = chunk_frames
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)
@@ -316,6 +332,7 @@ def _raw_emit_chunk(
                     left_context_size=0,
                     codec_chunk_frames=0,
                     codec_left_context_frames=0,
+                    first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
                     stream_finished=torch.tensor(True, dtype=torch.bool),
                     finished=torch.tensor(True, dtype=torch.bool),
                 ),
@@ -344,6 +361,7 @@ def _raw_emit_chunk(
             left_context_size=0,
             codec_chunk_frames=int(chunk_np.shape[0]),
             codec_left_context_frames=0,
+            first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
             code_flat_numel=int(codec_flat.numel()),
             stream_finished=torch.tensor(finished, dtype=torch.bool),
             finished=torch.tensor(finished, dtype=torch.bool),
@@ -368,6 +386,7 @@ def talker2codec_raw_async_chunk(
     """
     req_id = _raw_request_id(request)
     _init_raw_chunk_state(transfer_manager)
+    _record_raw_first_audio(transfer_manager, req_id, multimodal_output)
     pending_frames = transfer_manager.code_prompt_token_ids[req_id]
 
     new_frames = _raw_new_frames(multimodal_output)
@@ -405,6 +424,7 @@ def talker2codec_raw_async_chunk_batch(
     present: list[int] = []
     tensors: list[torch.Tensor] = []
     for index, output in enumerate(pooling_outputs):
+        _record_raw_first_audio(transfer_manager, req_ids[index], output)
         new_frames = _raw_new_frames(output)
         if new_frames is not None:
             present.append(index)
