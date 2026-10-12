@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
 from typing import Any
@@ -28,6 +28,8 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.models.moss_tts import host_trim as _moss_host_trim
+from vllm_omni.model_executor.models.moss_tts import shared_head as _moss_shared_head
 
 logger = init_logger(__name__)
 
@@ -105,6 +107,14 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
     return sliced
 
 
+_moss_shared_head.install()
+
+_moss_host_trim.install_hash_trim()
+# Single-stage audio: a decode step without PCM publishes nothing; its tokens ride on
+# the request's next published output (audio chunk, stop, error or control data).
+_MOSS_SPARSE_OUTPUT = _moss_host_trim.flag("MOSS_SPARSE_OUTPUT")
+
+
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
     used as a base class for the OmniARAsyncScheduler and holds most of the
@@ -132,6 +142,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # MOSS_SPARSE_OUTPUT: token ids of unpublished decode steps, per request.
+        self._moss_sparse_pending: dict[str, list[int]] = {}
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -146,6 +158,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # completes so that kv_ready can be emitted while the request is still
         # alive.  Stopped on the first scheduler step after extraction ack.
         self.pending_stop_after_extraction: set[str] = set()
+
+        # A single-stage audio stage may still decode a request's last audio
+        # after the request stops generating. Its KV blocks and batch slot are
+        # released at the stop; its terminal output (finish reason) is held
+        # here and emitted by the stage's tail-audio sender after that audio.
+        # Enabled by the engine when the model state supports it.
+        self.omni_defer_audio_finish = False
+        self.omni_deferred_finishes: dict[str, dict[str, Any]] = {}
+        # (request id, audio payload or None, final), appended by the sender
+        # thread and emitted here so all of a request's outputs share one
+        # ordered channel.
+        self.omni_tail_outputs: deque[tuple[str, dict[str, Any] | None, bool]] = deque()
 
         self.finished_req_ids_dict = defaultdict(set)
 
@@ -558,6 +582,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or async scheduling).
+                if request is None and mm_outputs:
+                    # A stopped request whose terminal output is held still
+                    # receives audio produced by a step in flight at its stop.
+                    OmniARScheduler._forward_deferred_audio(self, outputs, req_id, mm_outputs, model_runner_output)
                 continue
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
@@ -825,23 +853,57 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # instead of sending one output per decode step.
                 self._held_token_ids.setdefault(req_id, []).extend(new_token_ids)
                 has_stage_output = False
-            if has_stage_output and _should_emit_engine_output(
+            deferred_finish = (
+                # Strict: SimpleNamespace/MagicMock unit-test stubs may not carry it.
+                getattr(self, "omni_defer_audio_finish", False) is True
+                and finished
+                and finish_reason in (FinishReason.STOP, FinishReason.LENGTH)
+            )
+            if deferred_finish:
+                self.omni_deferred_finishes[req_id] = {
+                    "client_index": request.client_index,
+                    "finish_reason": finish_reason,
+                    "stop_reason": request.stop_reason,
+                }
+            emit = has_stage_output and _should_emit_engine_output(
                 self.vllm_config.model_config,
                 stopped=stopped,
                 has_control=kv_transfer_params is not None,
-            ):
+            )
+            if _MOSS_SPARSE_OUTPUT and emit:
+                pending = self._moss_sparse_pending
+                if (
+                    not stopped
+                    and not mm_output
+                    and pooler_output is None
+                    and kv_transfer_params is None
+                    and new_logprobs is None
+                    and prompt_logprobs_tensors is None
+                    and prompt_token_id_logprobs is None
+                    and prefill_stats is None
+                    and not is_segment_finished
+                    and not request.events
+                ):
+                    if new_token_ids:
+                        pending.setdefault(req_id, []).extend(new_token_ids)
+                    emit = False
+                elif pending:
+                    held = pending.pop(req_id, None)
+                    if held:
+                        new_token_ids = held + list(new_token_ids)
+            if emit:
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,
                     request,
                     new_token_ids=new_token_ids,
-                    finish_reason=finish_reason,
+                    finish_reason=None if deferred_finish else finish_reason,
                     new_logprobs=new_logprobs,
                     new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                     prompt_token_id_logprobs=prompt_token_id_logprobs,
                     pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
-                    stop_reason=request.stop_reason,
+                    stop_reason=None if deferred_finish else request.stop_reason,
                     prefill_stats=prefill_stats,
                     kv_transfer_params=kv_transfer_params,
                     ec_transfer_params=ec_transfer_params,
@@ -889,6 +951,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped_running_reqs,
             stopped_preempted_reqs,
         )
+        if _MOSS_SPARSE_OUTPUT and len(self._moss_sparse_pending) > 2 * len(self.requests) + 256:
+            # Aborted requests never publish again.
+            for held_id in [r for r in self._moss_sparse_pending if r not in self.requests]:
+                del self._moss_sparse_pending[held_id]
 
         OmniSchedulerMixin._finish_error_requests(self, outputs)
 
@@ -914,6 +980,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         kv_connector_stats = self._aggregate_kv_connector_stats(kv_connector_output)
         self._publish_kv_cache_events()
+
+        # After this step's own outputs: audio decoded after a stop, and the
+        # held terminal outputs, in the order the tail-audio sender queued them.
+        OmniARScheduler._emit_tail_outputs(self, outputs)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -1703,12 +1773,56 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.active_kv_transfers.discard(req_id)
             self.pending_stop_after_extraction.discard(req_id)
 
+    def _forward_deferred_audio(
+        self,
+        outputs: dict[int, list[EngineCoreOutput]],
+        req_id: str,
+        mm_outputs: list[Any],
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        deferred = getattr(self, "omni_deferred_finishes", None)
+        # Strict types: SimpleNamespace/MagicMock unit-test stubs may not carry these.
+        held = deferred.get(req_id) if isinstance(deferred, dict) else None
+        index = model_runner_output.req_id_to_index.get(req_id)
+        if held is None or index is None or index >= len(mm_outputs) or not mm_outputs[index]:
+            return
+        outputs[held["client_index"]].append(
+            OmniEngineCoreOutput(request_id=req_id, new_token_ids=[], multimodal_output=mm_outputs[index])
+        )
+
+    def _emit_tail_outputs(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        tail = getattr(self, "omni_tail_outputs", None)
+        if not isinstance(tail, deque):
+            return
+        while tail:
+            req_id, payload, final = tail.popleft()
+            held = self.omni_deferred_finishes.get(req_id)
+            if held is None:
+                continue
+            if payload is None and not final:
+                continue
+            outputs[held["client_index"]].append(
+                OmniEngineCoreOutput(
+                    request_id=req_id,
+                    new_token_ids=[],
+                    multimodal_output=payload,
+                    finish_reason=held["finish_reason"] if final else None,
+                    stop_reason=held["stop_reason"] if final else None,
+                )
+            )
+            if final:
+                self.omni_deferred_finishes.pop(req_id)
+
     def _has_pending_kv_work(self) -> bool:
         return bool(self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free)
 
     def has_requests(self) -> bool:
-        """Check if there are any requests to process, including KV transfers."""
-        return self._has_pending_kv_work() or super().has_requests()
+        """Check if there are any requests to process, including KV transfers.
+
+        Deferred terminal outputs keep the engine stepping: the runner drains
+        their last audio on every step, also on steps without a batch.
+        """
+        return self._has_pending_kv_work() or bool(self.omni_deferred_finishes) or super().has_requests()
 
     def has_finished_requests(self) -> bool:
         """Check if there are any finished requests (including those needing KV transfer)."""

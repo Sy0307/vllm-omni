@@ -430,3 +430,39 @@ python -m pytest -q tests/model_executor/models/moss_tts/test_slot_attention.py 
   tests/model_executor/models/moss_tts/test_streaming_attention.py \
   -m 'core_model and cuda' --run-level=core_model
 ```
+
+## Single-stage Local fused profile (CUDA)
+
+`moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
+process on one GPU. It uses packed codec graphs, fused depth kernels, precise
+stream dependencies, and a codec GEMM SM carveout of 48. The ordinary
+`moss_tts_local.yaml` retains its two-stage CUDA pipeline and upstream first-audio
+path. Both CUDA profiles have 128 request slots and a 32 GiB talker KV cache.
+
+The following opt-in switches enable the validated stable overlay's additional
+host reductions and prefix sharing. They default to off:
+
+```bash
+export MOSS_TRITON_PDL=1 MOSS_SHARED_HEAD=1
+export MOSS_TRIM_HASH=1 MOSS_SPARSE_OUTPUT=1 MOSS_TRIM_PCM_CLONE=1
+export MOSS_TRIM_MTP_LISTS=1 MOSS_FAST_AUDIO=1
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --omni --api-server-count 4 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml \
+  --allowed-local-media-path /absolute/path/to/seedtts_testset
+```
+
+For a C128 main-versus-fused comparison, use the same model, dependency versions,
+physical GPU, CPU allocation, four API servers, and dataset on both sides. Run
+main with its unchanged `moss_tts_local.yaml` and clear the optional switches
+above. Pass `--seed-tts-file-ref-audio` to `vllm bench serve --omni` with the
+Seed-TTS dataset; each request then refers to `file:///.../prompt.wav`. The server
+and client must see the same absolute paths. This changes reference transport;
+it does not bypass the reference encoder.
+
+Warm both services with the same full dataset before formal rounds, and report
+successful audio seconds divided by complete round wall time. Any steady-window
+estimate must be labeled separately. Historical overlay throughput and quality
+results do not establish the performance or quality of a rebase onto a new main.
+Experimental oracle, profiling, codec scheduling, and FFN chunking changes are
+excluded from this profile.

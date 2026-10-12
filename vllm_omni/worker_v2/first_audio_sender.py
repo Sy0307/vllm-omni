@@ -123,7 +123,8 @@ class _PreparedDelivery:
 
 
 class _EngineOutputSink:
-    def __init__(self, output_queue: Any, scheduler: Any) -> None:
+    def __init__(self, output_queue: Any, scheduler: Any, *, upstream_first_audio: bool = True) -> None:
+        self.upstream_first_audio = upstream_first_audio
         self.output_queue = output_queue
         self.scheduler = scheduler
 
@@ -142,7 +143,9 @@ class _EngineOutputSink:
         for request_id, pcm in zip(request_ids, pcm_rows, strict=True):
             if request_id not in routes:
                 continue
-            payload = {"model_outputs": pcm, "sr": sample_rate, FIRST_AUDIO_KEY: torch.tensor(True)}
+            payload = {"model_outputs": pcm, "sr": sample_rate}
+            if self.upstream_first_audio:
+                payload[FIRST_AUDIO_KEY] = torch.tensor(True)
             by_client.setdefault(routes[request_id], []).append(
                 OmniEngineCoreOutput(
                     request_id=request_id,
@@ -172,6 +175,73 @@ class _EngineOutputSink:
                 routes.pop(request_id)
 
 
-def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:
-    """Route prepared first audio from an upstream stage."""
-    return _EngineOutputSink(output_queue, scheduler)
+def engine_output_queue_sink(
+    output_queue: Any, scheduler: Any, *, upstream_first_audio: bool = True
+) -> _EngineOutputSink:
+    """Route prepared audio; final-stage PCM must not carry the upstream marker."""
+    return _EngineOutputSink(output_queue, scheduler, upstream_first_audio=upstream_first_audio)
+
+
+class TailAudioSender:
+    """Prepare audio decoded after a request stopped generating.
+
+    The scheduler released the request at its stop and holds its terminal
+    output in ``scheduler.omni_deferred_finishes``. Pieces submitted here are
+    handled in order on one thread: each waits for its decode event and is
+    copied on a private stream (no legacy-stream synchronization with the
+    talker), then queued on ``scheduler.omni_tail_outputs``. The scheduler emits
+    them after its next step's own outputs, so a request's audio from steps in
+    flight at its stop, its tail and its terminal output stay in order.
+    """
+
+    def __init__(self, output_queue: Any, scheduler: Any, device: torch.device) -> None:
+        self.scheduler = scheduler
+        # The sender thread selects the device by index.
+        index = device.index if device.index is not None else torch.accelerator.current_device_index()
+        self.device = torch.device(device.type, index)
+        self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="omni-tail-audio-sender")
+        self._thread.start()
+
+    def is_deferred(self, request_id: str) -> bool:
+        return request_id in self.scheduler.omni_deferred_finishes
+
+    def submit(
+        self,
+        request_id: str,
+        pieces: list[tuple[torch.Tensor, torch.cuda.Event | None]],
+        sample_rate: torch.Tensor,
+        final: bool,
+    ) -> None:
+        self._queue.put((request_id, pieces, sample_rate, final))
+
+    def close(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        torch.accelerator.set_device_index(self.device.index)
+        copy_stream = torch.cuda.Stream(device=self.device)
+        while (item := self._queue.get()) is not None:
+            request_id, pieces, sample_rate, final = item
+            payload = None
+            try:
+                hosts = []
+                with torch.cuda.stream(copy_stream):
+                    for pcm, event in pieces:
+                        if not pcm.numel():
+                            continue
+                        if event is not None:
+                            copy_stream.wait_event(event)
+                        host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
+                        host.copy_(pcm, non_blocking=True)
+                        hosts.append(host)
+                copy_stream.synchronize()
+                if hosts:
+                    pcm = hosts[0] if len(hosts) == 1 else torch.cat(hosts, dim=-1)
+                    payload = {"model_outputs": pcm, "sr": sample_rate}
+            except Exception:
+                logger.exception("Tail audio copy failed for %s", request_id)
+            finally:
+                del pieces
+                self.scheduler.omni_tail_outputs.append((request_id, payload, final))

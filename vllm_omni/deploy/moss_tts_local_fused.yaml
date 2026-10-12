@@ -1,0 +1,106 @@
+# Single-stage MOSS-TTS-Local-Transformer-v1.5 on one CUDA GPU (H200 class).
+# The talker decodes its own codec chunks (MOSS-Audio-Tokenizer-v2) on a side
+# CUDA stream and returns 48 kHz stereo PCM as the final output: no codec
+# stage, no connector, no MPS. Chunking matches the two-stage profile (first
+# chunk 1 frame, then 15 frames). For the main/fused comparison, launch with
+# --api-server-count 4 at C128 and MOSS_TRITON_PDL=1 (programmatic dependent launch of the
+# custom Triton kernels; results unchanged). Optional MOSS_SHARED_HEAD=1 lets
+# requests share the prefix-cache blocks of the constant prompt head (48
+# tokens, pad audio codes): the conditioning salt starts after the head.
+# Measured at C128 (H200, 2026-10-11): steady +0.5-1.7% per GPU, e2el -1.2%,
+# paired WER/SIM unchanged within noise.
+pipeline: moss_tts_local_fused
+model_runner: v2
+async_chunk: true
+
+speech_cache:
+  resolve_max_bytes: 2147483648  # 2 GiB
+  resolve_max_entries: 2048
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: true
+    async_scheduling: true
+    # Bound prefill work so new prompts do not monopolize streaming decode.
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    devices: "0"
+    # Leave room for the codec weights, its state pool and its CUDA graphs.
+    kv_cache_memory_bytes: 34359738368  # 32 GiB
+    hf_overrides:
+      mrv2_gpu_slot_state: true
+      mrv2_batch_prefill: true
+      mrv2_direct_tokens: true
+      local_compile_audio_sampler: true
+      # One launch per codebook for sampling, code store and the next
+      # position's attention; bitwise identical to the unfused depth step.
+      local_fused_depth: true
+      # Backbone decode attention with two KV heads per program (~17% faster
+      # kernel at C128; decode rows equal vLLM's kernel to rounding).
+      talker_decode_attention: true
+      codec_attention_backend: triton_slot
+    attention_config:
+      backend: TRITON_ATTN
+    compilation_config:
+      mode: 3
+      cudagraph_mode: FULL
+      max_cudagraph_capture_size: 512
+      cudagraph_num_of_warmups: 1
+      # Programmatic dependent launch for Inductor's Triton kernels, plus
+      # tuned tiles for its pointwise/reduction kernels (C128 steady +1.5..2%).
+      inductor_compile_config:
+        enable_auto_functionalized_v2: false
+        combo_kernels: true
+        benchmark_combo_kernel: true
+        triton.enable_pdl: true
+        coordinate_descent_tuning: true
+        max_autotune_pointwise: true
+    additional_config:
+      moss_fused_codec:
+        initial_codec_chunk_frames: 1   # 80 ms first audio chunk
+        codec_chunk_frames: 15          # 1.2 s steady chunks
+        codec_shared_rope: 1
+        codec_fused_slot_attention: 1
+        codec_skip_empty_attention_tiles: 1
+        # One-launch ring attention: exact, about 2.4x faster than the rows kernels.
+        codec_flash_slot_attention: 1
+        # Packed decode: every ready chunk (1-frame first chunks, 15-frame steady
+        # chunks, short tails) is one segment of one sequence, decoded in one
+        # graph replay keyed by its total frame count. No per-length replays
+        # and no padding to a common chunk length.
+        codec_packed_decode: 1
+        # 8-frame buckets up to 256 frames, 16 above: less padding per replay.
+        codec_packed_frame_sizes: [2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+        # Retuned attention tiles for the 12.5/25 Hz decoder stages.
+        codec_packed_tuned_attention: 1
+        # GELU (tanh form) in the FFN up-projection GEMM epilogue.
+        codec_gelu_epilogue: 1
+        # Decode at most every fused_decode_packed_interval steps, once this
+        # many streams have a chunk ready, the oldest ready chunk waited
+        # fused_decode_max_wait_steps, a first chunk fused_decode_first_wait_steps
+        # or a last chunk fused_decode_last_wait_steps (it gates the client's
+        # next request).
+        fused_decode_packed_interval: 2
+        fused_decode_min_batch: 32
+        fused_decode_max_wait_steps: 3
+        fused_decode_first_wait_steps: 1
+        fused_decode_last_wait_steps: 1
+        # A decode waits only for the chunk data it reads, not for the whole
+        # talker step queued before it.
+        fused_codec_precise_deps: 1
+        # Codec GEMMs leave 48 SMs to the talker (persistent cuBLAS grids
+        # otherwise hold every SM). Bitwise identical audio (only the CTA
+        # count changes); C128 steady +0.8% (H200, 2026-10-12).
+        codec_gemm_sm_carveout: 48
+        # Batched (unpacked) codec graph buckets: packed decode covers every
+        # fused chunk, so only the smallest are kept.
+        cudagraph_capture_sizes: [1, 2]
+    default_sampling_params:
+      temperature: 1.7
+      top_p: 0.8
+      top_k: 25
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0

@@ -1,0 +1,791 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Codec chunk decoding inside the MOSS-TTS-Local talker stage.
+
+Each decode step appends one frame per stream to a device-resident ring. The
+final frame of a stream is the frame whose code row is all padding: the talker
+emits its stop token on that very step (as in the two-stage pipeline), so the
+scheduler releases the request's KV blocks and batch slot at once. The step's
+continue mask tells the host which frame that was once its copy completes; the
+host never waits for it. Frames become *known* when their step's mask has
+arrived, and only known audio frames are cut into chunks (the first chunk,
+then steady chunks, as the two-stage connector cuts them).
+
+Cut chunks wait in a ready queue and are decoded together on a side CUDA
+stream beside the talker's next steps: a decode costs nearly the same for one
+stream as for dozens (each of its ~1000 kernels has a fixed cost), so like the
+two-stage codec stage it decodes once enough streams are ready, or once a chunk
+has waited a few steps (sooner for a stream's first chunk). Audio is
+delivered with the first step of its stream that runs after the decode
+completed, so no step output waits for the codec.
+
+A stream whose request stopped is *detached*: its pending frames are copied out
+of the ring (the slot serves the next request), its remaining audio is cut and
+decoded on later steps, also on steps without a batch, and handed to the tail
+sender, which hands it to the scheduler to emit, in order, with the request's
+terminal output that the scheduler held back. Aborted requests release their codec stream at once.
+
+The emitted audio is exactly the two-stage audio: every non-padding frame up to
+the stop.
+"""
+
+from __future__ import annotations
+
+import os
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import torch
+from vllm.logger import init_logger
+from vllm.utils.platform_utils import is_uva_available
+from vllm.v1.worker.gpu import buffer_utils
+
+logger = init_logger(__name__)
+
+# Codec decodes allowed to overlap the talker before its stream waits for them.
+_CODEC_LAG = 1
+
+
+@dataclass
+class FusedAudioStep:
+    """Audio delivered with one step; the runner's streaming-audio interface."""
+
+    num_reqs: int
+    rows: list[int]
+    pcm: list[torch.Tensor]
+    sample_rate: torch.Tensor
+    events: list[torch.cuda.Event] = field(default_factory=list)
+
+    def to_cpu(self, copy_stream: torch.cuda.Stream, copy_tensor) -> FusedAudioStep:
+        for event in self.events:
+            copy_stream.wait_event(event)
+        return FusedAudioStep(self.num_reqs, self.rows, [copy_tensor(pcm) for pcm in self.pcm], self.sample_rate)
+
+    def get_output(self) -> list[dict[str, torch.Tensor] | None]:
+        parts: dict[int, list[torch.Tensor]] = {}
+        for row, pcm in zip(self.rows, self.pcm, strict=True):
+            if pcm.shape[-1]:
+                parts.setdefault(row, []).append(pcm)
+        output: list[dict[str, torch.Tensor] | None] = [None] * self.num_reqs
+        for row, pieces in parts.items():
+            pcm = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-1)
+            output[row] = {"model_outputs": pcm, "sr": self.sample_rate}
+        return output
+
+
+@dataclass
+class _KeepRecord:
+    event: torch.cuda.Event
+    host: torch.Tensor
+    slots: list[int]
+    req_ids: list[str | None]
+    # MOSS_FAST_AUDIO: slots as an array, the attached stream generation per row
+    # (-1: no running stream), and the stream objects (for streams detached since).
+    gens: np.ndarray | None = None
+    objs: list | None = None
+
+
+@dataclass
+class _Ready:
+    req_id: str
+    codes: torch.Tensor | None  # [n_vq, frames], owned; None for an empty last chunk
+    last: bool
+    urgent: bool
+    step: int
+    # Producer event of ``codes`` when it was not made on the codec stream.
+    dep: torch.cuda.Event | None = None
+
+
+@dataclass
+class _Decoded:
+    req_id: str
+    pcm: torch.Tensor
+    event: torch.cuda.Event
+
+
+@dataclass
+class _Stream:
+    req_id: str
+    # Frames [head, head + count) are pending, in the slot's ring row or, once
+    # detached, in ``owned``; the first ``known`` of them are confirmed audio.
+    head: int = 0
+    count: int = 0
+    known: int = 0
+    emitted: bool = False
+    # The padding frame was seen; frames after it are discarded.
+    stopped: bool = False
+    # The last chunk was cut.
+    closed: bool = False
+    owned: torch.Tensor | None = None
+    owned_event: torch.cuda.Event | None = None
+
+
+# MOSS_FAST_AUDIO=1: attached streams keep their counters in per-slot arrays and the
+# per-step append / keep / cut bookkeeping runs vectorized over the batch's slots.
+_FAST_AUDIO = os.environ.get("MOSS_FAST_AUDIO", "0") == "1"
+
+
+class _SlotArrays:
+    def __init__(self, capacity: int) -> None:
+        self.head = np.zeros(capacity, dtype=np.int64)
+        self.count = np.zeros(capacity, dtype=np.int64)
+        self.known = np.zeros(capacity, dtype=np.int64)
+        self.emitted = np.zeros(capacity, dtype=np.bool_)
+        self.stopped = np.zeros(capacity, dtype=np.bool_)
+        self.closed = np.zeros(capacity, dtype=np.bool_)
+        # A stream is attached to the slot; its generation (bumped per admission).
+        self.att = np.zeros(capacity, dtype=np.bool_)
+        self.gen = np.zeros(capacity, dtype=np.int64)
+
+
+def _slot_field(index: int, name: str, cast):
+    def get(self):
+        if self._a is None:
+            return self._v[index]
+        return cast(getattr(self._a, name)[self._slot])
+
+    def set(self, value):
+        if self._a is None:
+            self._v[index] = value
+        else:
+            getattr(self._a, name)[self._slot] = value
+
+    return property(get, set)
+
+
+class _SlotStream:
+    """``_Stream`` whose counters live in the slot arrays while attached."""
+
+    __slots__ = ("req_id", "owned", "owned_event", "_a", "_slot", "_v")
+
+    def __init__(self, req_id: str, arrays: _SlotArrays, slot: int) -> None:
+        self.req_id = req_id
+        self.owned = None
+        self.owned_event = None
+        self._a = arrays
+        self._slot = slot
+        self._v = None
+
+    def freeze(self) -> None:
+        """Leave the slot: keep the current counters on the object."""
+        if self._a is None:
+            return
+        a, i = self._a, self._slot
+        self._v = [
+            int(a.head[i]),
+            int(a.count[i]),
+            int(a.known[i]),
+            bool(a.emitted[i]),
+            bool(a.stopped[i]),
+            bool(a.closed[i]),
+        ]
+        a.att[i] = False
+        self._a = None
+
+    head = _slot_field(0, "head", int)
+    count = _slot_field(1, "count", int)
+    known = _slot_field(2, "known", int)
+    emitted = _slot_field(3, "emitted", bool)
+    stopped = _slot_field(4, "stopped", bool)
+    closed = _slot_field(5, "closed", bool)
+
+
+class MossFusedAudio:
+    """Request-slot chunk state for the talker's in-process codec."""
+
+    def __init__(self, codec: Any, capacity: int, n_vq: int, pad_id: int, device: torch.device) -> None:
+        self.codec = codec
+        self.pad_id = int(pad_id)
+        session = codec._stream_session
+        self.chunk_frames = int(codec._stream_chunk_frames)
+        self.initial_frames = int(codec._initial_stream_chunk_frames) or self.chunk_frames
+        if self.chunk_frames <= 0:
+            raise ValueError("The single-stage MOSS pipeline requires codec_chunk_frames > 0")
+        self.samples_per_frame = int(session._samples_per_frame)
+        self.sample_rate = codec._sr_tensor
+        self.device = device
+        # Codec decodes, terminal resets and cancellations share this stream.
+        self.stream = torch.cuda.Stream(device=device)
+        codec._codec_stream = self.stream
+        # fused_codec_precise_deps: a decode waits only for the data it reads
+        # (chunk gathers on an otherwise idle stream, detach copies) instead of
+        # everything queued on the talker stream, so an idle codec starts at once.
+        self.precise_deps = bool(codec._connector_int("fused_codec_precise_deps", 0)) and device.type == "cuda"
+        self.gather_stream = torch.cuda.Stream(device=device) if self.precise_deps else None
+        # A chunk plus the frames whose masks are still in flight.
+        self.ring = 4 * max(self.chunk_frames, self.initial_frames)
+        self.pending = torch.zeros((capacity, self.ring, n_vq), dtype=torch.long, device=device)
+        self.streams: list[_Stream | None] = [None] * capacity
+        self._fast = _FAST_AUDIO
+        self._arr = _SlotArrays(capacity) if self._fast else None
+        self.slot_of: dict[str, int] = {}
+        self.detached: dict[str, _Stream] = {}
+        self.tail_sender: Any = None
+        self._keep_records: list[_KeepRecord] = []
+        self._keep_free: list[torch.Tensor] = []
+        self._capacity = capacity
+        self._decoded: list[_Decoded] = []
+        # Codec work of recent launches. The talker's stream waits for decodes
+        # older than ``_CODEC_LAG`` launches: a saturated GPU otherwise runs
+        # the talker ahead and the codec, and every stream's audio, falls behind.
+        self._decode_events: deque[torch.cuda.Event] = deque()
+        self._ready: list[_Ready] = []
+        self._steps = 0
+        self._drain_steps = -1
+        self.min_batch = max(1, codec._connector_int("fused_decode_min_batch", 32))
+        self.max_wait = max(0, codec._connector_int("fused_decode_max_wait_steps", 3))
+        self.first_wait = max(0, codec._connector_int("fused_decode_first_wait_steps", 1))
+        # Packed decode (codec_packed_decode): one codec call takes every ready
+        # chunk whatever its length, at most once per ``packed_interval`` steps.
+        self.packed = bool(getattr(codec, "packed_decode_ready", False))
+        self.packed_interval = max(1, codec._connector_int("fused_decode_packed_interval", 1))
+        self.last_wait = max(0, codec._connector_int("fused_decode_last_wait_steps", self.max_wait))
+        self._last_launch = -(1 << 30)
+        self._step: FusedAudioStep | None = None
+        self._warned_preemption = False
+        # SMs the talker's cuBLASLt GEMMs leave free, process-wide from here on
+        # (its CUDA graphs are captured later), so codec kernels on the side
+        # stream run beside them. The decode-sized GEMMs are bandwidth-bound and
+        # keep their speed with a few dozen SMs fewer. The codec's packed graphs
+        # set their own carveout while they are captured.
+        talker_carveout = codec._connector_int("talker_gemm_sm_carveout", 0)
+        if talker_carveout and device.type == "cuda":
+            torch._C._set_sm_carveout_experimental(talker_carveout)
+            logger.info("MOSS single-stage talker GEMM SM carveout: %d", talker_carveout)
+        # Per-step ring indices go through pinned device-mapped (UVA) pools,
+        # one per upload site, each used once per step (see ``_UvaIndexPools``
+        # in ``local_model_state``), instead of a pinned allocation + H2D copy.
+        self._append_pool = self._gather_pool = None
+        if device.type == "cuda" and is_uva_available():
+            depth = buffer_utils._DEFAULT_MAX_CONCURRENCY + 2
+            self._append_pool = buffer_utils.UvaBufferPool(3 * capacity, torch.int64, depth)
+            self._gather_pool = buffer_utils.UvaBufferPool(2 * capacity * self.chunk_frames, torch.int64, depth)
+
+    def set_tail_sender(self, factory) -> bool:
+        self.tail_sender = factory(self.device)
+        return True
+
+    # ------------------------------------------------------------------
+    # Request lifecycle
+    # ------------------------------------------------------------------
+
+    def add_request(self, slot: int, req_id: str) -> None:
+        previous = self.streams[slot]
+        if previous is not None and self.slot_of.get(previous.req_id) == slot:
+            self.slot_of.pop(previous.req_id)
+        if self._fast:
+            if previous is not None:
+                previous.freeze()
+            a = self._arr
+            a.head[slot] = a.count[slot] = a.known[slot] = 0
+            a.emitted[slot] = a.stopped[slot] = a.closed[slot] = False
+            a.att[slot] = True
+            a.gen[slot] += 1
+            self.streams[slot] = _SlotStream(req_id, a, slot)
+        else:
+            self.streams[slot] = _Stream(req_id)
+        self.slot_of[req_id] = slot
+
+    def finish(self, req_ids) -> None:
+        """Detach stopped requests whose terminal output waits for their audio; release the rest."""
+        released = []
+        for req_id in map(str, req_ids):
+            slot = self.slot_of.pop(req_id, None)
+            if slot is None:
+                continue
+            stream = self.streams[slot]
+            self.streams[slot] = None
+            if self._fast and stream is not None:
+                stream.freeze()
+            if stream is not None and self.tail_sender is not None and self.tail_sender.is_deferred(req_id):
+                self._detach(slot, stream)
+            else:
+                released.append(req_id)
+        self._release(released)
+
+    def preempt(self, req_id: str) -> None:
+        # A recomputed request restarts its codes; its codec stream cannot
+        # resume. Keep the stream consistent by ending its audio here.
+        if not self._warned_preemption:
+            logger.warning("MOSS single-stage audio ends at preemption; size KV cache to avoid preemption")
+            self._warned_preemption = True
+        slot = self.slot_of.pop(req_id, None)
+        if slot is not None:
+            if self._fast and self.streams[slot] is not None:
+                self.streams[slot].freeze()
+            self.streams[slot] = None
+            self._release([req_id])
+
+    def _release(self, req_ids: list[str]) -> None:
+        if not req_ids:
+            return
+        gone = set(req_ids)
+        self._decoded = [audio for audio in self._decoded if audio.req_id not in gone]
+        self._ready = [chunk for chunk in self._ready if chunk.req_id not in gone]
+        self.codec.on_requests_finished(req_ids)
+
+    def _detach(self, slot: int, stream: _Stream) -> None:
+        # The slot's ring row serves the next request: own the pending frames.
+        if stream.count:
+            # The pending frames are one ring range, wrapped at most once:
+            # copy it with device slices, without a host index upload.
+            row = self.pending[slot]
+            end = stream.head + stream.count
+            if end <= self.ring:
+                stream.owned = row[stream.head : end].clone()
+            else:
+                stream.owned = torch.cat((row[stream.head :], row[: end - self.ring]))
+            if self.precise_deps:
+                stream.owned_event = torch.cuda.Event()
+                stream.owned_event.record()
+        stream.head = 0
+        self.detached[stream.req_id] = stream
+        # Audio decoded before the stop goes ahead of the tail, in order.
+        kept = []
+        for audio in self._decoded:
+            if audio.req_id == stream.req_id:
+                self.tail_sender.submit(audio.req_id, [(audio.pcm, audio.event)], self.sample_rate, False)
+            else:
+                kept.append(audio)
+        self._decoded = kept
+
+    def _stream_of(self, slot: int, req_id: str | None) -> _Stream | None:
+        if req_id is None:
+            return None
+        stream = self.streams[slot]
+        if stream is not None and stream.req_id == req_id:
+            return stream
+        return self.detached.get(req_id)
+
+    # ------------------------------------------------------------------
+    # Per step
+    # ------------------------------------------------------------------
+
+    def _apply_keep_records(self) -> None:
+        """Confirm frames of steps whose masks arrived, in step order."""
+        if self._fast:
+            self._apply_keep_records_fast()
+            return
+        done = 0
+        for record in self._keep_records:
+            if not record.event.query():
+                break
+            keep = record.host[: len(record.slots)].numpy()
+            for index, (slot, req_id) in enumerate(zip(record.slots, record.req_ids, strict=True)):
+                stream = self._stream_of(slot, req_id)
+                if stream is None or stream.stopped:
+                    continue
+                if keep[index]:
+                    stream.known += 1
+                else:
+                    # The padding frame and every frame after it are discarded.
+                    stream.stopped = True
+                    stream.count = stream.known
+            self._keep_free.append(record.host)
+            done += 1
+        del self._keep_records[:done]
+
+    def _apply_keep_records_fast(self) -> None:
+        a = self._arr
+        done = 0
+        for record in self._keep_records:
+            if not record.event.query():
+                break
+            slots, gens = record.slots, record.gens
+            n = len(slots)
+            keep = record.host[:n].numpy()
+            valid = gens >= 0
+            attached = valid & a.att[slots] & (a.gen[slots] == gens)
+            live = attached & ~a.stopped[slots]
+            grow = slots[live & keep]
+            a.known[grow] += 1
+            stop = slots[live & ~keep]
+            a.stopped[stop] = True
+            a.count[stop] = a.known[stop]
+            for index in np.flatnonzero(valid & ~attached):
+                # The request stopped since: its stream, if still owned, is detached.
+                stream = record.objs[index]
+                if stream is None or self.detached.get(stream.req_id) is not stream or stream.stopped:
+                    continue
+                if keep[index]:
+                    stream.known += 1
+                else:
+                    stream.stopped = True
+                    stream.count = stream.known
+            self._keep_free.append(record.host)
+            done += 1
+        del self._keep_records[:done]
+
+    def _record_keep_fast(self, keep: torch.Tensor, slots: np.ndarray, gens: np.ndarray, objs: list) -> None:
+        host = (
+            self._keep_free.pop() if self._keep_free else torch.empty(self._capacity, dtype=torch.bool, pin_memory=True)
+        )
+        host[: keep.shape[0]].copy_(keep, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._keep_records.append(_KeepRecord(event, host, slots, [], gens, objs))
+
+    def _record_keep(self, keep: torch.Tensor, entries: list[tuple[int, str | None]]) -> None:
+        host = (
+            self._keep_free.pop() if self._keep_free else torch.empty(self._capacity, dtype=torch.bool, pin_memory=True)
+        )
+        host[: keep.shape[0]].copy_(keep, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self._keep_records.append(_KeepRecord(event, host, [s for s, _ in entries], [r for _, r in entries]))
+
+    def _cut(self, stream: _Stream, final: bool) -> list[tuple[int, int, bool, bool]]:
+        """(start, frames, last, first) chunks of known frames; advances the stream."""
+        chunks = []
+        while not stream.closed:
+            threshold = self.chunk_frames if stream.emitted else self.initial_frames
+            if stream.known >= threshold and not (final and stream.known == stream.count == threshold):
+                frames = threshold
+            elif final:
+                frames = stream.known
+            else:
+                break
+            last = final and frames == stream.count
+            chunks.append((stream.head, frames, last, not stream.emitted))
+            stream.head = (stream.head + frames) % self.ring if stream.owned is None else stream.head + frames
+            stream.count -= frames
+            stream.known -= frames
+            stream.emitted = True
+            if last:
+                stream.closed = True
+        return chunks
+
+    def _service_detached(self) -> None:
+        """Cut the remaining audio of stopped requests once all their frames are known."""
+        for stream in self.detached.values():
+            if stream.closed or not (stream.stopped or stream.known == stream.count):
+                continue
+            for start, frames, last, _first in self._cut(stream, final=True):
+                codes = stream.owned[start : start + frames].t() if frames else None
+                # Batched like steady chunks: the stream holds no batch slot.
+                self._ready.append(_Ready(stream.req_id, codes, last, False, self._steps, stream.owned_event))
+
+    def _launch(self, main: torch.cuda.Stream, force: bool) -> None:
+        ready = self._ready
+        if not ready:
+            return
+        if force:
+            batch = ready
+        elif self.packed:
+            if self._steps - self._last_launch < self.packed_interval:
+                return
+            steady = [chunk for chunk in ready if not chunk.urgent]
+            due = (
+                len(steady) >= self.min_batch
+                or (bool(steady) and self._steps - steady[0].step >= self.max_wait)
+                or any(chunk.urgent and self._steps - chunk.step >= self.first_wait for chunk in ready)
+                # A stream's last chunk gates its client's next request.
+                or any(chunk.last and self._steps - chunk.step >= self.last_wait for chunk in ready)
+            )
+            if not due:
+                return
+            batch = ready
+        else:
+            # First chunks (one frame) and steady chunks decode in separate
+            # codec calls, each mostly fixed cost. A due first chunk must not
+            # drag along a steady batch that is not due yet.
+            steady = [chunk for chunk in ready if not chunk.urgent]
+            due_steady = bool(steady) and (
+                len(steady) >= self.min_batch or self._steps - steady[0].step >= self.max_wait
+            )
+            firsts = [chunk for chunk in ready if chunk.urgent]
+            due_first = len(firsts) >= self.min_batch or any(
+                self._steps - chunk.step >= self.first_wait for chunk in firsts
+            )
+            if due_steady and due_first:
+                batch = ready
+            elif due_first:
+                batch = firsts
+            elif due_steady:
+                # A stream's chunks decode in order: take its queued first chunk along.
+                with_first = {chunk.req_id for chunk in steady} & {chunk.req_id for chunk in firsts}
+                batch = [chunk for chunk in ready if not chunk.urgent or chunk.req_id in with_first]
+            else:
+                return
+        taken = {id(chunk) for chunk in batch}
+        self._ready = [chunk for chunk in ready if id(chunk) not in taken]
+        self._last_launch = self._steps
+        if self.precise_deps:
+            for chunk in batch:
+                if chunk.dep is not None:
+                    self.stream.wait_event(chunk.dep)
+        else:
+            self.stream.wait_stream(main)
+        with torch.cuda.stream(self.stream):
+            for chunk in batch:
+                if chunk.codes is not None:
+                    chunk.codes.record_stream(self.stream)
+            # A stream may have several queued chunks: decode them in order, at
+            # most one per stream in each codec call.
+            rank: dict[str, int] = {}
+            waves: list[list[tuple[int, _Ready]]] = []
+            for position, chunk in enumerate(batch):
+                if chunk.codes is None:
+                    continue
+                index = rank.get(chunk.req_id, 0)
+                rank[chunk.req_id] = index + 1
+                if index == len(waves):
+                    waves.append([])
+                waves[index].append((position, chunk))
+            decoded: dict[int, torch.Tensor] = {}
+            decode = self.codec._decode_streaming_packed if self.packed else self.codec._decode_streaming_batch
+            for wave in waves:
+                decoded.update(decode([(position, chunk.req_id, chunk.codes, chunk.last) for position, chunk in wave]))
+            empty_last = [chunk.req_id for chunk in batch if chunk.codes is None and chunk.last]
+            if empty_last:
+                self.codec.on_requests_finished(empty_last)
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        self._decode_events.append(event)
+        for position, chunk in enumerate(batch):
+            wav = decoded.get(position)
+            if chunk.req_id in self.detached:
+                pieces = [(wav, event)] if wav is not None else []
+                self.tail_sender.submit(chunk.req_id, pieces, self.sample_rate, chunk.last)
+                if chunk.last:
+                    self.detached.pop(chunk.req_id)
+            elif wav is not None and chunk.req_id in self.slot_of:
+                self._decoded.append(_Decoded(chunk.req_id, wav, event))
+
+    def drain_detached_audio(self) -> None:
+        """Advance stopped requests' audio; called on every step, with or without a batch."""
+        if not self.detached:
+            return
+        self._apply_keep_records()
+        self._service_detached()
+        # Running batches launch decodes in step(). Without one since the last
+        # drain the engine only steps for these streams: decode what is ready.
+        idle = self._steps == self._drain_steps
+        self._drain_steps = self._steps
+        if idle:
+            self._launch(torch.cuda.current_stream(self.device), force=True)
+
+    def step(
+        self,
+        input_batch: Any,
+        decode_rows: list[int],
+        codes: torch.Tensor,
+        keep: torch.Tensor,
+        upload,
+    ) -> None:
+        """Append this step's frames, queue chunk decodes and deliver finished audio."""
+        if self.tail_sender is None:
+            raise RuntimeError("The single-stage MOSS pipeline requires an in-process engine with a tail-audio sender")
+        if self._fast:
+            self._step_fast(input_batch, decode_rows, codes, keep, upload)
+            return
+        num_reqs = input_batch.num_reqs
+        slots = input_batch.idx_mapping_np[decode_rows].tolist()
+        self._steps += 1
+        self._apply_keep_records()
+        main = torch.cuda.current_stream(self.device)
+        while len(self._decode_events) > _CODEC_LAG:
+            main.wait_event(self._decode_events.popleft())
+
+        # Append this step's frames.
+        append_rows: list[int] = []
+        append_slots: list[int] = []
+        append_pos: list[int] = []
+        recorded: list[tuple[int, str | None]] = []
+        for index, slot in enumerate(slots):
+            stream = self.streams[slot]
+            if stream is None or stream.stopped:
+                recorded.append((slot, None))
+                continue
+            if stream.count >= self.ring:
+                raise RuntimeError("MOSS single-stage codec ring overflow; continue masks are not arriving")
+            append_rows.append(index)
+            append_slots.append(slot)
+            append_pos.append((stream.head + stream.count) % self.ring)
+            stream.count += 1
+            recorded.append((slot, stream.req_id))
+        if append_rows:
+            index = np.asarray([append_rows, append_slots, append_pos], dtype=np.int64).reshape(-1)
+            pool = self._append_pool
+            index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(3, -1)
+            frames = codes.index_select(0, index[0])
+            # Padding is outside the codebook; it is never cut, but keep the ring valid.
+            self.pending.index_put_((index[1], index[2]), frames.masked_fill(frames.eq(self.pad_id), 0))
+        self._record_keep(keep, recorded)
+
+        # Cut first and steady chunks of known frames of running streams.
+        gather_slots: list[int] = []
+        gather_pos: list[int] = []
+        cut: list[tuple[str, int, bool]] = []  # (request, frames, first)
+        for slot in slots:
+            stream = self.streams[slot]
+            if stream is None or stream.closed:
+                continue
+            for start, frames, _last, first in self._cut(stream, final=False):
+                gather_slots.extend([slot] * frames)
+                gather_pos.extend((start + offset) % self.ring for offset in range(frames))
+                cut.append((stream.req_id, frames, first))
+        if cut:
+            # One owned gather for every chunk: later steps rewrite the ring.
+            index = np.asarray([gather_slots, gather_pos], dtype=np.int64).reshape(-1)
+            pool = self._gather_pool
+            dep = None
+            if self.precise_deps and pool is not None:
+                # Known frames were written by steps whose masks already arrived:
+                # gather them beside the talker. Later steps rewrite these ring
+                # positions on the talker stream, so it waits for the gather.
+                index = pool.copy_to_uva(index).view(2, -1)
+                with torch.cuda.stream(self.gather_stream):
+                    rows_of_chunks = self.pending[index[0], index[1]]
+                    dep = torch.cuda.Event()
+                    dep.record(self.gather_stream)
+                main.wait_event(dep)
+            else:
+                index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(2, -1)
+                rows_of_chunks = self.pending[index[0], index[1]]
+            offset = 0
+            for req_id, frames, first in cut:
+                chunk = rows_of_chunks[offset : offset + frames].t()
+                self._ready.append(_Ready(req_id, chunk, False, first, self._steps, dep))
+                offset += frames
+        self._service_detached()
+        self._launch(main, force=False)
+
+        # Deliver audio whose decode completed to this step's rows. Audio of
+        # a request that stopped on a step still in flight is forwarded by the
+        # scheduler, which holds that request's terminal output.
+        row_of = {req_id: row for row, req_id in enumerate(input_batch.req_ids[:num_reqs])}
+        rows: list[int] = []
+        pcm: list[torch.Tensor] = []
+        kept: list[_Decoded] = []
+        ready: dict[int, bool] = {}
+        for audio in self._decoded:
+            row = row_of.get(audio.req_id)
+            slot = self.slot_of.get(audio.req_id)
+            if row is not None and slot is not None and self.streams[slot].stopped:
+                row = None
+            key = id(audio.event)
+            if key not in ready:
+                ready[key] = audio.event.query()
+            if row is None or not ready[key]:
+                kept.append(audio)
+                continue
+            rows.append(row)
+            pcm.append(audio.pcm)
+        self._decoded = kept
+        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate)
+
+    def _step_fast(self, input_batch, decode_rows, codes, keep, upload) -> None:
+        """``step`` with the per-row bookkeeping of attached streams vectorized."""
+        num_reqs = input_batch.num_reqs
+        slots = input_batch.idx_mapping_np[decode_rows].astype(np.int64, copy=False)
+        self._steps += 1
+        self._apply_keep_records_fast()
+        main = torch.cuda.current_stream(self.device)
+        while len(self._decode_events) > _CODEC_LAG:
+            main.wait_event(self._decode_events.popleft())
+        a, ring = self._arr, self.ring
+
+        # Append this step's frames to running streams.
+        appending = a.att[slots] & ~a.stopped[slots]
+        append_slots = slots[appending]
+        if len(append_slots) and int(a.count[append_slots].max()) >= ring:
+            raise RuntimeError("MOSS single-stage codec ring overflow; continue masks are not arriving")
+        append_pos = (a.head[append_slots] + a.count[append_slots]) % ring
+        a.count[append_slots] += 1
+        if len(append_slots):
+            index = np.concatenate((np.flatnonzero(appending), append_slots, append_pos))
+            pool = self._append_pool
+            index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(3, -1)
+            frames = codes.index_select(0, index[0])
+            # Padding is outside the codebook; it is never cut, but keep the ring valid.
+            self.pending.index_put_((index[1], index[2]), frames.masked_fill(frames.eq(self.pad_id), 0))
+        streams = self.streams
+        self._record_keep_fast(keep, slots, np.where(appending, a.gen[slots], -1), [streams[s] for s in slots.tolist()])
+
+        # Cut first and steady chunks of known frames of running streams.
+        order = np.flatnonzero(a.att[slots] & ~a.closed[slots])
+        cut_slots = slots[order]
+        parts = []
+        while len(cut_slots):
+            threshold = np.where(a.emitted[cut_slots], self.chunk_frames, self.initial_frames)
+            due = a.known[cut_slots] >= threshold
+            if not due.any():
+                break
+            order, cut_slots, frames = order[due], cut_slots[due], threshold[due]
+            starts = a.head[cut_slots].copy()
+            parts.append((order, cut_slots, starts, frames, ~a.emitted[cut_slots]))
+            a.head[cut_slots] = (starts + frames) % ring
+            a.count[cut_slots] -= frames
+            a.known[cut_slots] -= frames
+            a.emitted[cut_slots] = True
+        if parts:
+            if len(parts) == 1:
+                _, c_slots, c_starts, c_frames, c_first = parts[0]
+            else:
+                # A stream's chunks stay consecutive, streams in batch order.
+                c_order = np.concatenate([p[0] for p in parts])
+                rank = np.concatenate([np.full(len(p[0]), r) for r, p in enumerate(parts)])
+                sort = np.lexsort((rank, c_order))
+                c_slots = np.concatenate([p[1] for p in parts])[sort]
+                c_starts = np.concatenate([p[2] for p in parts])[sort]
+                c_frames = np.concatenate([p[3] for p in parts])[sort]
+                c_first = np.concatenate([p[4] for p in parts])[sort]
+            total = int(c_frames.sum())
+            offsets = np.repeat(np.cumsum(c_frames) - c_frames, c_frames)
+            gather_slots = np.repeat(c_slots, c_frames)
+            gather_pos = (np.repeat(c_starts, c_frames) + np.arange(total) - offsets) % ring
+            # One owned gather for every chunk: later steps rewrite the ring.
+            index = np.concatenate((gather_slots, gather_pos))
+            pool = self._gather_pool
+            dep = None
+            if self.precise_deps and pool is not None:
+                index = pool.copy_to_uva(index).view(2, -1)
+                with torch.cuda.stream(self.gather_stream):
+                    rows_of_chunks = self.pending[index[0], index[1]]
+                    dep = torch.cuda.Event()
+                    dep.record(self.gather_stream)
+                main.wait_event(dep)
+            else:
+                index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(2, -1)
+                rows_of_chunks = self.pending[index[0], index[1]]
+            offset = 0
+            for slot, frames, first in zip(c_slots.tolist(), c_frames.tolist(), c_first.tolist()):
+                chunk = rows_of_chunks[offset : offset + frames].t()
+                self._ready.append(_Ready(streams[slot].req_id, chunk, False, first, self._steps, dep))
+                offset += frames
+        self._service_detached()
+        self._launch(main, force=False)
+
+        # Deliver audio whose decode completed to this step's rows.
+        rows: list[int] = []
+        pcm: list[torch.Tensor] = []
+        if self._decoded:
+            row_of_slot = np.full(self._capacity, -1, dtype=np.int64)
+            row_of_slot[input_batch.idx_mapping_np[:num_reqs]] = np.arange(num_reqs)
+            kept: list[_Decoded] = []
+            ready: dict[int, bool] = {}
+            for audio in self._decoded:
+                slot = self.slot_of.get(audio.req_id)
+                row = -1 if slot is None else int(row_of_slot[slot])
+                if row >= 0 and a.stopped[slot]:
+                    row = -1
+                key = id(audio.event)
+                if key not in ready:
+                    ready[key] = audio.event.query()
+                if row < 0 or not ready[key]:
+                    kept.append(audio)
+                    continue
+                rows.append(row)
+                pcm.append(audio.pcm)
+            self._decoded = kept
+        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate)
+
+    def take_step(self, num_reqs: int) -> FusedAudioStep:
+        step = self._step
+        self._step = None
+        if step is None:
+            return FusedAudioStep(num_reqs, [], [], self.sample_rate)
+        return step

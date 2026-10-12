@@ -634,6 +634,17 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params, registered_voice=registered_voice)
+        from vllm_omni.model_executor.models.moss_tts import shared_head
+
+        if shared_head.enabled() and self._moss_variant == "local" and isinstance(prompt.get("prompt_token_ids"), list):
+            proc = self._get_moss_processor()
+            seg = proc.__dict__.get("_vllm_omni_continuation_segments", {}).get(request.language)
+            codes = (tts_params.get("codes") or {}).get("ref")
+            pad_id = getattr(getattr(proc, "model_config", None), "audio_pad_token_id", None)
+            if seg is not None and pad_id is not None:
+                prompt["cache_salt"] = shared_head.head_salt(
+                    prompt["cache_salt"], prompt["prompt_token_ids"], codes, seg[0], int(pad_id)
+                )
         return PreparedRequest(
             prompt=prompt,
             tts_params=tts_params,
