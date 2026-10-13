@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    *hardware_marks(res={"cuda": ["L4", "H100", "H200"]}),
+    pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="requires NVIDIA CUDA"),
 ]
 
 VOCAB, MAX_REQS, EOS = 3072, 16, 2150

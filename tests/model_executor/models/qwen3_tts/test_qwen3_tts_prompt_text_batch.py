@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
     Qwen3TTSConfig,
     Qwen3TTSTalkerConfig,
@@ -141,7 +142,7 @@ def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: s
         assert not batched._batched_text_embeds
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": ["L4", "H100", "H200"]})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
 def test_projected_text_table_matches_the_projection_per_token():

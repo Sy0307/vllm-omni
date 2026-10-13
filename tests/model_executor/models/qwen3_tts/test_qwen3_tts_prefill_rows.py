@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
     Qwen3TTSConfig,
     Qwen3TTSTalkerConfig,
@@ -20,8 +21,8 @@ from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    *hardware_marks(res={"cuda": ["L4", "H100", "H200"]}),
+    pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="requires NVIDIA CUDA"),
 ]
 
 HIDDEN = 48

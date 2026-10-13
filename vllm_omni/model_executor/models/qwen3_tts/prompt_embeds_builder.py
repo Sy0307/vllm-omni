@@ -43,7 +43,6 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -897,6 +896,8 @@ class Qwen3TTSPromptEmbedsBuilder:
     _mel_spectrogram_on_cpu: bool = False
 
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        from vllm_omni.platforms import current_omni_platform
+
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.

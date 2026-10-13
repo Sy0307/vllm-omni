@@ -7,7 +7,11 @@ import torch
 
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.core_model, pytest.mark.tts]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.tts,
+    pytest.mark.skipif(torch.version.hip is not None, reason="implicit-GEMM optimization requires NVIDIA CUDA"),
+]
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
