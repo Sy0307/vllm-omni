@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # This script build the XPU docker image and run the offline inference inside the container.
 set -ex
@@ -100,7 +102,11 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
-time timeout -k 30 30m docker run \
+# All four suites can take 36 minutes on B70, including Z-Image weight loading.
+# Leave image build and cleanup time within the pipeline's 60-minute limit.
+# Expand the quoted test variables inside the container.
+# shellcheck disable=SC2016
+time timeout -k 30 45m docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
