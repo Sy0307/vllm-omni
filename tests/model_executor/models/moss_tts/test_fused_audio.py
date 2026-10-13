@@ -173,6 +173,21 @@ def test_abort_releases_without_delivery():
     assert codec.finished == ["x"] and sender.sent == [] and not fused.detached
 
 
+def test_abort_of_detached_request_releases_pending_codec_work():
+    codec, fused, sender = _fused(initial=1, chunk=15)
+    fused.add_request(0, "x")
+    _run(fused, [0], {0: 5})
+    _run(fused, [0], {0: 6})
+    sender.deferred.add("x")
+    fused.finish(["x"])
+    assert "x" in fused.detached
+    sender.deferred.remove("x")
+    fused.finish(["x"])
+    assert "x" not in fused.detached and codec.finished == ["x"]
+    assert all(chunk.req_id != "x" for chunk in fused._ready)
+    assert all(audio.req_id != "x" for audio in fused._decoded)
+
+
 def test_undelivered_audio_goes_ahead_of_the_tail():
     _, fused, sender = _fused(initial=1, chunk=2)
     fused.add_request(1, "u")

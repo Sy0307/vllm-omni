@@ -55,7 +55,7 @@ def test_an_empty_final_is_queued_without_audio():
     sender.submit("e", [], torch.tensor(48000, dtype=torch.int32), True)
     (only,) = _wait(scheduler.omni_tail_outputs, 1)
     sender.close()
-    assert only == ("e", None, True)
+    assert only == ("e", None, True, None)
 
 
 def test_outputs_after_an_early_first_frame_carry_the_marker():

@@ -734,6 +734,14 @@ class MossLocalModelState(OmniModelState):
             return False
         return self._fused_audio.set_tail_sender(factory)
 
+    def close_audio_senders(self):
+        try:
+            if self._first_audio_sender is not None:
+                self._first_audio_sender.close()
+        finally:
+            if self._fused_audio is not None and self._fused_audio.tail_sender is not None:
+                self._fused_audio.tail_sender.close()
+
     def drain_detached_audio(self):
         if self._fused_audio is not None:
             self._fused_audio.drain_detached_audio()

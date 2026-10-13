@@ -166,10 +166,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Enabled by the engine when the model state supports it.
         self.omni_defer_audio_finish = False
         self.omni_deferred_finishes: dict[str, dict[str, Any]] = {}
-        # (request id, audio payload or None, final), appended by the sender
+        # (request id, audio payload or None, final, error), appended by the sender
         # thread and emitted here so all of a request's outputs share one
         # ordered channel.
-        self.omni_tail_outputs: deque[tuple[str, dict[str, Any] | None, bool]] = deque()
+        self.omni_tail_outputs: deque[tuple[str, dict[str, Any] | None, bool, str | None]] = deque()
 
         self.finished_req_ids_dict = defaultdict(set)
 
@@ -291,9 +291,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_request_ids = ids
             cleanup_ids = tuple(ids)
 
+        deferred = getattr(self, "omni_deferred_finishes", None)
+        if deferred:
+            deferred_ids = set(deferred) if request_ids is None else set(cleanup_ids) & deferred.keys()
+            for req_id in deferred_ids:
+                deferred.pop(req_id)
+                self.finished_req_ids.add(req_id)
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
         return finished
+
+    def _preempt_request(self, request: Request, timestamp: float, drop_stale_output: bool = False) -> None:
+        super()._preempt_request(request, timestamp, drop_stale_output)
+        if self.omni_defer_audio_finish:
+            # Recomputing the talker cannot recreate an already-streamed codec prefix.
+            self.waiting.remove_requests([request])
+            request.status = RequestStatus.FINISHED_ERROR
+            request.resumable = False
+            request.stop_reason = "Fused audio cannot resume after KV-cache preemption"
+            self._free_request(request)
+            self.omni_deferred_finishes[request.request_id] = {
+                "client_index": request.client_index,
+                "finish_reason": FinishReason.ERROR,
+                "stop_reason": request.stop_reason,
+            }
+            self.omni_tail_outputs.append((request.request_id, None, True, request.stop_reason))
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         return self._get_omni_kv_config_value("kv_transfer_criteria")
@@ -434,6 +456,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
+        # Detached requests still lease codec state until their tail retires.
+        reserved_running_slots += len(getattr(self, "omni_deferred_finishes", {}))
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
@@ -1795,7 +1819,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not isinstance(tail, deque):
             return
         while tail:
-            req_id, payload, final = tail.popleft()
+            req_id, payload, final, error = tail.popleft()
             held = self.omni_deferred_finishes.get(req_id)
             if held is None:
                 continue
@@ -1806,12 +1830,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request_id=req_id,
                     new_token_ids=[],
                     multimodal_output=payload,
-                    finish_reason=held["finish_reason"] if final else None,
-                    stop_reason=held["stop_reason"] if final else None,
+                    finish_reason=FinishReason.ERROR if error is not None else held["finish_reason"] if final else None,
+                    stop_reason=error if error is not None else held["stop_reason"] if final else None,
                 )
             )
             if final:
                 self.omni_deferred_finishes.pop(req_id)
+                if error is not None:
+                    # Notify the worker again to release any remaining detached codec work.
+                    self.finished_req_ids.add(req_id)
 
     def _has_pending_kv_work(self) -> bool:
         return bool(self.requests_needing_kv_transfer or self.active_kv_transfers or self.waiting_for_transfer_free)

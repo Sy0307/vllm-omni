@@ -40,7 +40,6 @@ orchestrator holds them until that first frame has arrived.
 
 from __future__ import annotations
 
-import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -102,10 +101,6 @@ class _KeepRecord:
     host: torch.Tensor
     slots: list[int]
     req_ids: list[str | None]
-    # MOSS_FAST_AUDIO: slots as an array, the attached stream generation per row
-    # (-1: no running stream), and the stream objects (for streams detached since).
-    gens: np.ndarray | None = None
-    objs: list | None = None
 
 
 @dataclass
@@ -150,76 +145,6 @@ class _Stream:
     owned_event: torch.cuda.Event | None = None
 
 
-# MOSS_FAST_AUDIO=1: attached streams keep their counters in per-slot arrays and the
-# per-step append / keep / cut bookkeeping runs vectorized over the batch's slots.
-_FAST_AUDIO = os.environ.get("MOSS_FAST_AUDIO", "0") == "1"
-
-
-class _SlotArrays:
-    def __init__(self, capacity: int) -> None:
-        self.head = np.zeros(capacity, dtype=np.int64)
-        self.count = np.zeros(capacity, dtype=np.int64)
-        self.known = np.zeros(capacity, dtype=np.int64)
-        self.emitted = np.zeros(capacity, dtype=np.bool_)
-        self.stopped = np.zeros(capacity, dtype=np.bool_)
-        self.closed = np.zeros(capacity, dtype=np.bool_)
-        # A stream is attached to the slot; its generation (bumped per admission).
-        self.att = np.zeros(capacity, dtype=np.bool_)
-        self.gen = np.zeros(capacity, dtype=np.int64)
-
-
-def _slot_field(index: int, name: str, cast):
-    def get(self):
-        if self._a is None:
-            return self._v[index]
-        return cast(getattr(self._a, name)[self._slot])
-
-    def set(self, value):
-        if self._a is None:
-            self._v[index] = value
-        else:
-            getattr(self._a, name)[self._slot] = value
-
-    return property(get, set)
-
-
-class _SlotStream:
-    """``_Stream`` whose counters live in the slot arrays while attached."""
-
-    __slots__ = ("req_id", "owned", "owned_event", "_a", "_slot", "_v")
-
-    def __init__(self, req_id: str, arrays: _SlotArrays, slot: int) -> None:
-        self.req_id = req_id
-        self.owned = None
-        self.owned_event = None
-        self._a = arrays
-        self._slot = slot
-        self._v = None
-
-    def freeze(self) -> None:
-        """Leave the slot: keep the current counters on the object."""
-        if self._a is None:
-            return
-        a, i = self._a, self._slot
-        self._v = [
-            int(a.head[i]),
-            int(a.count[i]),
-            int(a.known[i]),
-            bool(a.emitted[i]),
-            bool(a.stopped[i]),
-            bool(a.closed[i]),
-        ]
-        a.att[i] = False
-        self._a = None
-
-    head = _slot_field(0, "head", int)
-    count = _slot_field(1, "count", int)
-    known = _slot_field(2, "known", int)
-    emitted = _slot_field(3, "emitted", bool)
-    stopped = _slot_field(4, "stopped", bool)
-    closed = _slot_field(5, "closed", bool)
-
-
 class MossFusedAudio:
     """Request-slot chunk state for the talker's in-process codec."""
 
@@ -246,8 +171,6 @@ class MossFusedAudio:
         self.ring = 4 * max(self.chunk_frames, self.initial_frames)
         self.pending = torch.zeros((capacity, self.ring, n_vq), dtype=torch.long, device=device)
         self.streams: list[_Stream | None] = [None] * capacity
-        self._fast = _FAST_AUDIO
-        self._arr = _SlotArrays(capacity) if self._fast else None
         self.slot_of: dict[str, int] = {}
         self.detached: dict[str, _Stream] = {}
         self.tail_sender: Any = None
@@ -278,7 +201,6 @@ class MossFusedAudio:
         self.last_wait = max(0, codec._connector_int("fused_decode_last_wait_steps", self.max_wait))
         self._last_launch = -(1 << 30)
         self._step: FusedAudioStep | None = None
-        self._warned_preemption = False
         # SMs the talker's cuBLASLt GEMMs leave free, process-wide from here on
         # (its CUDA graphs are captured later), so codec kernels on the side
         # stream run beside them. The decode-sized GEMMs are bandwidth-bound and
@@ -307,7 +229,7 @@ class MossFusedAudio:
         others keep the regular first chunk.
         """
         sender = self.first_sender
-        if sender is None or self._fast:
+        if sender is None:
             return []
         ids = [str(req_id) for req_id in req_ids]
         delivery = sender.prepare([req_id for req_id in ids if req_id in self.slot_of])
@@ -349,17 +271,7 @@ class MossFusedAudio:
         previous = self.streams[slot]
         if previous is not None and self.slot_of.get(previous.req_id) == slot:
             self.slot_of.pop(previous.req_id)
-        if self._fast:
-            if previous is not None:
-                previous.freeze()
-            a = self._arr
-            a.head[slot] = a.count[slot] = a.known[slot] = 0
-            a.emitted[slot] = a.stopped[slot] = a.closed[slot] = False
-            a.att[slot] = True
-            a.gen[slot] += 1
-            self.streams[slot] = _SlotStream(req_id, a, slot)
-        else:
-            self.streams[slot] = _Stream(req_id)
+        self.streams[slot] = _Stream(req_id)
         self.slot_of[req_id] = slot
 
     def finish(self, req_ids) -> None:
@@ -368,11 +280,12 @@ class MossFusedAudio:
         for req_id in map(str, req_ids):
             slot = self.slot_of.pop(req_id, None)
             if slot is None:
+                if req_id in self.detached and not self.tail_sender.is_deferred(req_id):
+                    self.detached.pop(req_id)
+                    released.append(req_id)
                 continue
             stream = self.streams[slot]
             self.streams[slot] = None
-            if self._fast and stream is not None:
-                stream.freeze()
             if stream is not None and self.tail_sender is not None and self.tail_sender.is_deferred(req_id):
                 self._detach(slot, stream)
             else:
@@ -380,17 +293,12 @@ class MossFusedAudio:
         self._release(released)
 
     def preempt(self, req_id: str) -> None:
-        # A recomputed request restarts its codes; its codec stream cannot
-        # resume. Keep the stream consistent by ending its audio here.
-        if not self._warned_preemption:
-            logger.warning("MOSS single-stage audio ends at preemption; size KV cache to avoid preemption")
-            self._warned_preemption = True
+        # The scheduler reports preemption as a request error, not a resumable stop.
         slot = self.slot_of.pop(req_id, None)
         if slot is not None:
-            if self._fast and self.streams[slot] is not None:
-                self.streams[slot].freeze()
             self.streams[slot] = None
-            self._release([req_id])
+        self.detached.pop(req_id, None)
+        self._release([req_id])
 
     def _release(self, req_ids: list[str]) -> None:
         if not req_ids:
@@ -447,9 +355,6 @@ class MossFusedAudio:
 
     def _apply_keep_records(self) -> None:
         """Confirm frames of steps whose masks arrived, in step order."""
-        if self._fast:
-            self._apply_keep_records_fast()
-            return
         done = 0
         for record in self._keep_records:
             if not record.event.query():
@@ -469,46 +374,6 @@ class MossFusedAudio:
             done += 1
         del self._keep_records[:done]
 
-    def _apply_keep_records_fast(self) -> None:
-        a = self._arr
-        done = 0
-        for record in self._keep_records:
-            if not record.event.query():
-                break
-            slots, gens = record.slots, record.gens
-            n = len(slots)
-            keep = record.host[:n].numpy()
-            valid = gens >= 0
-            attached = valid & a.att[slots] & (a.gen[slots] == gens)
-            live = attached & ~a.stopped[slots]
-            grow = slots[live & keep]
-            a.known[grow] += 1
-            stop = slots[live & ~keep]
-            a.stopped[stop] = True
-            a.count[stop] = a.known[stop]
-            for index in np.flatnonzero(valid & ~attached):
-                # The request stopped since: its stream, if still owned, is detached.
-                stream = record.objs[index]
-                if stream is None or self.detached.get(stream.req_id) is not stream or stream.stopped:
-                    continue
-                if keep[index]:
-                    stream.known += 1
-                else:
-                    stream.stopped = True
-                    stream.count = stream.known
-            self._keep_free.append(record.host)
-            done += 1
-        del self._keep_records[:done]
-
-    def _record_keep_fast(self, keep: torch.Tensor, slots: np.ndarray, gens: np.ndarray, objs: list) -> None:
-        host = (
-            self._keep_free.pop() if self._keep_free else torch.empty(self._capacity, dtype=torch.bool, pin_memory=True)
-        )
-        host[: keep.shape[0]].copy_(keep, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._keep_records.append(_KeepRecord(event, host, slots, [], gens, objs))
-
     def _record_keep(self, keep: torch.Tensor, entries: list[tuple[int, str | None]]) -> None:
         host = (
             self._keep_free.pop() if self._keep_free else torch.empty(self._capacity, dtype=torch.bool, pin_memory=True)
@@ -522,8 +387,7 @@ class MossFusedAudio:
         """(start, frames, last, first) chunks of known frames; advances the stream."""
         chunks = []
         while not stream.closed:
-            # MOSS_FAST_AUDIO streams never take early first frames.
-            if getattr(stream, "precut", False) and not stream.emitted:
+            if stream.precut and not stream.emitted:
                 if stream.known < 1:
                     if not final:
                         break
@@ -704,9 +568,6 @@ class MossFusedAudio:
         """Append this step's frames, queue chunk decodes and deliver finished audio."""
         if self.tail_sender is None:
             raise RuntimeError("The single-stage MOSS pipeline requires an in-process engine with a tail-audio sender")
-        if self._fast:
-            self._step_fast(input_batch, decode_rows, codes, keep, upload)
-            return
         num_reqs = input_batch.num_reqs
         slots = input_batch.idx_mapping_np[decode_rows].tolist()
         self._steps += 1
@@ -804,115 +665,6 @@ class MossFusedAudio:
             if audio.req_id in self.after_first:
                 after_first.add(row)
         self._decoded = kept
-        self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate, after_first=after_first)
-
-    def _step_fast(self, input_batch, decode_rows, codes, keep, upload) -> None:
-        """``step`` with the per-row bookkeeping of attached streams vectorized."""
-        num_reqs = input_batch.num_reqs
-        slots = input_batch.idx_mapping_np[decode_rows].astype(np.int64, copy=False)
-        self._steps += 1
-        self._apply_keep_records_fast()
-        main = torch.cuda.current_stream(self.device)
-        while len(self._decode_events) > _CODEC_LAG:
-            main.wait_event(self._decode_events.popleft())
-        a, ring = self._arr, self.ring
-
-        # Append this step's frames to running streams.
-        appending = a.att[slots] & ~a.stopped[slots]
-        append_slots = slots[appending]
-        if len(append_slots) and int(a.count[append_slots].max()) >= ring:
-            raise RuntimeError("MOSS single-stage codec ring overflow; continue masks are not arriving")
-        append_pos = (a.head[append_slots] + a.count[append_slots]) % ring
-        a.count[append_slots] += 1
-        if len(append_slots):
-            index = np.concatenate((np.flatnonzero(appending), append_slots, append_pos))
-            pool = self._append_pool
-            index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(3, -1)
-            frames = codes.index_select(0, index[0])
-            # Padding is outside the codebook; it is never cut, but keep the ring valid.
-            self.pending.index_put_((index[1], index[2]), frames.masked_fill(frames.eq(self.pad_id), 0))
-        streams = self.streams
-        self._record_keep_fast(keep, slots, np.where(appending, a.gen[slots], -1), [streams[s] for s in slots.tolist()])
-
-        # Cut first and steady chunks of known frames of running streams.
-        order = np.flatnonzero(a.att[slots] & ~a.closed[slots])
-        cut_slots = slots[order]
-        parts = []
-        while len(cut_slots):
-            threshold = np.where(a.emitted[cut_slots], self.chunk_frames, self.initial_frames)
-            due = a.known[cut_slots] >= threshold
-            if not due.any():
-                break
-            order, cut_slots, frames = order[due], cut_slots[due], threshold[due]
-            starts = a.head[cut_slots].copy()
-            parts.append((order, cut_slots, starts, frames, ~a.emitted[cut_slots]))
-            a.head[cut_slots] = (starts + frames) % ring
-            a.count[cut_slots] -= frames
-            a.known[cut_slots] -= frames
-            a.emitted[cut_slots] = True
-        if parts:
-            if len(parts) == 1:
-                _, c_slots, c_starts, c_frames, c_first = parts[0]
-            else:
-                # A stream's chunks stay consecutive, streams in batch order.
-                c_order = np.concatenate([p[0] for p in parts])
-                rank = np.concatenate([np.full(len(p[0]), r) for r, p in enumerate(parts)])
-                sort = np.lexsort((rank, c_order))
-                c_slots = np.concatenate([p[1] for p in parts])[sort]
-                c_starts = np.concatenate([p[2] for p in parts])[sort]
-                c_frames = np.concatenate([p[3] for p in parts])[sort]
-                c_first = np.concatenate([p[4] for p in parts])[sort]
-            total = int(c_frames.sum())
-            offsets = np.repeat(np.cumsum(c_frames) - c_frames, c_frames)
-            gather_slots = np.repeat(c_slots, c_frames)
-            gather_pos = (np.repeat(c_starts, c_frames) + np.arange(total) - offsets) % ring
-            # One owned gather for every chunk: later steps rewrite the ring.
-            index = np.concatenate((gather_slots, gather_pos))
-            pool = self._gather_pool
-            dep = None
-            if self.precise_deps and pool is not None:
-                index = pool.copy_to_uva(index).view(2, -1)
-                with torch.cuda.stream(self.gather_stream):
-                    rows_of_chunks = self.pending[index[0], index[1]]
-                    dep = torch.cuda.Event()
-                    dep.record(self.gather_stream)
-                main.wait_event(dep)
-            else:
-                index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(2, -1)
-                rows_of_chunks = self.pending[index[0], index[1]]
-            offset = 0
-            for slot, frames, first in zip(c_slots.tolist(), c_frames.tolist(), c_first.tolist()):
-                chunk = rows_of_chunks[offset : offset + frames].t()
-                self._ready.append(_Ready(streams[slot].req_id, chunk, False, first, self._steps, dep))
-                offset += frames
-        self._service_detached()
-        self._launch(main, force=False)
-
-        # Deliver audio whose decode completed to this step's rows.
-        rows: list[int] = []
-        pcm: list[torch.Tensor] = []
-        after_first: set[int] = set()
-        if self._decoded:
-            row_of_slot = np.full(self._capacity, -1, dtype=np.int64)
-            row_of_slot[input_batch.idx_mapping_np[:num_reqs]] = np.arange(num_reqs)
-            kept: list[_Decoded] = []
-            ready: dict[int, bool] = {}
-            for audio in self._decoded:
-                slot = self.slot_of.get(audio.req_id)
-                row = -1 if slot is None else int(row_of_slot[slot])
-                if row >= 0 and a.stopped[slot]:
-                    row = -1
-                key = id(audio.event)
-                if key not in ready:
-                    ready[key] = audio.event.query()
-                if row < 0 or not ready[key]:
-                    kept.append(audio)
-                    continue
-                rows.append(row)
-                pcm.append(audio.pcm)
-                if audio.req_id in self.after_first:
-                    after_first.add(row)
-            self._decoded = kept
         self._step = FusedAudioStep(num_reqs, rows, pcm, self.sample_rate, after_first=after_first)
 
     def take_step(self, num_reqs: int) -> FusedAudioStep:

@@ -215,11 +215,21 @@ class TailAudioSender:
         index = device.index if device.index is not None else torch.accelerator.current_device_index()
         self.device = torch.device(device.type, index)
         self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._started = threading.Event()
+        self._start_error: Exception | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="omni-tail-audio-sender")
         self._thread.start()
+        if not self._started.wait(timeout=10):
+            self._queue.put(None)
+            raise TimeoutError("Tail-audio sender initialization timed out")
+        if self._start_error is not None:
+            raise RuntimeError("Tail-audio sender initialization failed") from self._start_error
 
     def is_deferred(self, request_id: str) -> bool:
-        return request_id in self.scheduler.omni_deferred_finishes
+        from vllm.v1.engine import FinishReason
+
+        held = self.scheduler.omni_deferred_finishes.get(request_id)
+        return held is not None and held.get("finish_reason") != FinishReason.ERROR
 
     def submit(
         self,
@@ -236,13 +246,22 @@ class TailAudioSender:
     def close(self) -> None:
         self._queue.put(None)
         self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            raise TimeoutError("Tail-audio sender did not drain before shutdown")
 
     def _run(self) -> None:
-        torch.accelerator.set_device_index(self.device.index)
-        copy_stream = torch.cuda.Stream(device=self.device)
+        try:
+            torch.accelerator.set_device_index(self.device.index)
+            copy_stream = torch.cuda.Stream(device=self.device)
+        except Exception as exc:
+            self._start_error = exc
+            return
+        finally:
+            self._started.set()
         while (item := self._queue.get()) is not None:
             request_id, pieces, sample_rate, final, after_first = item
             payload = None
+            error = None
             try:
                 hosts = []
                 with torch.cuda.stream(copy_stream):
@@ -258,11 +277,13 @@ class TailAudioSender:
                 if hosts:
                     pcm = hosts[0] if len(hosts) == 1 else torch.cat(hosts, dim=-1)
                     payload = {"model_outputs": pcm, "sr": sample_rate}
-            except Exception:
+            except Exception as exc:
                 logger.exception("Tail audio copy failed for %s", request_id)
+                error = f"Tail audio copy failed: {exc}"
+                final = True
             finally:
-                if after_first and (payload is not None or final):
+                if error is None and after_first and (payload is not None or final):
                     # Even a terminal output without audio must not overtake the sent first frame.
                     payload = {**(payload or {}), FIRST_AUDIO_REQUIRED_KEY: torch.tensor(True)}
                 del pieces
-                self.scheduler.omni_tail_outputs.append((request_id, payload, final))
+                self.scheduler.omni_tail_outputs.append((request_id, payload, final, error))
