@@ -639,9 +639,10 @@ def _ring_flash(
     only overwrites slots holding positions < end - capacity, which no query
     attends to, so no program reads a slot that another program writes.
 
-    The arithmetic per visited tile is that of ``_attend`` (same block_n,
-    physical ring order and online-softmax update), so the output is bitwise
-    identical. Differences from ``_attend`` are exact rewrites:
+    The visited tiles retain ``_attend``'s physical ring order and online
+    softmax update. Tested configurations match exactly; this is not a
+    universal bitwise guarantee, since FTZ drops subnormal weights and Triton
+    may change reduction layouts. Differences from ``_attend``:
     - only key tiles holding an allowed (query, key) pair of this block are
       visited; a wholly masked tile's update is the identity;
     - exp uses ex2.approx.ftz (equal unless a weight is below 2**-126);
@@ -1003,9 +1004,10 @@ def slot_ring_flash_attention(
 ) -> torch.Tensor:
     """``slot_ring_attention`` with the single-pass flash ring kernel.
 
-    Same contract and bitwise-identical output/ring/offsets; one write+attend
-    launch plus the offset advance. ``skip_empty_tiles`` is accepted for
-    signature compatibility: this kernel always skips wholly masked tiles.
+    Same state and masking contract; one write+attend launch plus the offset
+    advance. FTZ and reduction-layout choices prevent a universal bitwise
+    output guarantee. ``skip_empty_tiles`` is accepted for signature
+    compatibility: this kernel always skips wholly masked tiles.
     """
     b = q.shape[0]
     _check_inputs(q, k, v, cache, (end_offset, slot_ids, valid_lengths), context)
@@ -1047,7 +1049,8 @@ def slot_ring_flash_attention_rows(
 ) -> torch.Tensor:
     """``slot_ring_attention_rows`` with the single-pass flash ring kernel.
 
-    One launch for every chunk length; bitwise-identical output and ring.
+    One launch per chunk, preserving ring updates and causal masking; see
+    ``_ring_flash`` for the numerical limitations.
     """
     b = q.shape[0]
     _check_inputs(q, k, v, cache, (starts, slot_ids, valid_lengths), context)

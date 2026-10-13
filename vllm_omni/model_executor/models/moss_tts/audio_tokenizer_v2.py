@@ -1288,13 +1288,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
             assert self.linear1 is not None
             assert self.linear2 is not None
             gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
-            if gelu_bias is not None and getattr(self, "_coresident_gelu", False):
-                # Opt-in (codec_coresident_gemm): the same tanh-form GELU epilogue in the
-                # co-resident GEMM (linear2 is a CoresidentLinear as well).
-                from vllm_omni.model_executor.models.moss_tts.coresident_gemm import gemm_2d
-
-                update = self.linear2(gemm_2d(x, self.linear1.weight, 1))
-            elif gelu_bias is not None:
+            if gelu_bias is not None:
                 # Opt-in (codec_gelu_epilogue): GELU in the up-projection GEMM
                 # epilogue (cuBLASLt, tanh form, applied before bf16 rounding)
                 # instead of a separate pass over the FFN activations. Under

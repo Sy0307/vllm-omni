@@ -438,6 +438,9 @@ process on one GPU. It uses packed codec graphs, fused depth kernels, precise
 stream dependencies, and a codec GEMM SM carveout of 48. The ordinary
 `moss_tts_local.yaml` retains its two-stage CUDA pipeline and upstream first-audio
 path. Both CUDA profiles have 128 request slots and a 32 GiB talker KV cache.
+The fused scheduler reserves codec capacity until stopped requests finish their
+last audio. KV-cache preemption fails the affected fused request explicitly;
+it does not silently restart a partially delivered waveform.
 
 The following opt-in switches enable the validated stable overlay's additional
 host reductions and prefix sharing. They default to off:
@@ -445,7 +448,7 @@ host reductions and prefix sharing. They default to off:
 ```bash
 export MOSS_TRITON_PDL=1 MOSS_SHARED_HEAD=1
 export MOSS_TRIM_HASH=1 MOSS_SPARSE_OUTPUT=1 MOSS_TRIM_PCM_CLONE=1
-export MOSS_TRIM_MTP_LISTS=1 MOSS_FAST_AUDIO=1
+export MOSS_TRIM_MTP_LISTS=1
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
   --omni --api-server-count 4 \
   --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml \

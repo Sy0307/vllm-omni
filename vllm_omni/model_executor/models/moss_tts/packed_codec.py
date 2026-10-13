@@ -259,10 +259,6 @@ class CUDAGraphPackedDecoderWrapper:
             self.sm_carveout,
             time.perf_counter() - start_s,
         )
-        if any(type(m).__name__ == "CoresidentLinear" for m in self.codec.modules()):
-            from vllm_omni.model_executor.models.moss_tts.coresident_gemm import dispatch_summary
-
-            logger.info("MOSS codec co-resident GEMM dispatch: %s", dispatch_summary())
 
     def _capture(self, device: torch.device) -> None:
         for _ in range(16):
