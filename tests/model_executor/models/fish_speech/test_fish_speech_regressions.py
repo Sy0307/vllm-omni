@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import functools
 import math
 from types import SimpleNamespace
@@ -273,3 +276,39 @@ def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(mo
     expected_1 = (torch.tensor([4.0, 5.0, 6.0]) + torch.tensor([30.0, 40.0, 0.0])) / math.sqrt(3.0)
     assert torch.allclose(prefill[2].to(dtype=torch.float32), expected_0, atol=2e-2, rtol=0)
     assert torch.allclose(prefill[3].to(dtype=torch.float32), expected_1, atol=2e-2, rtol=0)
+
+
+def _stream_decoder(slots: int):
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    decoder = object.__new__(FishSpeechDACDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder._stateful = True
+    decoder._stream_slots = {}
+    decoder._free_stream_slots = list(range(slots - 1, -1, -1))
+    decoder._stream_positions = {}
+    return decoder
+
+
+def test_dac_decoder_stream_slots_follow_request_lifetime():
+    decoder = _stream_decoder(2)
+    claim = decoder._claim_stream_slots
+
+    # First windows claim slots; a third stream finds the pool empty.
+    slots, fresh, positions, release = claim(["a", "b", "c"], [True] * 3, [False] * 3, [6, 6, 6], 4096)
+    assert slots == [0, 1, None] and fresh == [True, True, False] and positions == [0, 0, 0] and release == []
+    # Later windows continue them; a finished window releases after its decode.
+    slots, fresh, positions, release = claim(["a", "b", "c"], [False] * 3, [False, True, False], [8, 8, 8], 4096)
+    assert slots == [0, 1, None] and fresh == [False, False, False] and positions == [6, 6, 0] and release == ["b"]
+    for request_id in release:
+        decoder._release_stream_slot(request_id)
+    # A restarted stream gives its slot back and claims one afresh; an
+    # aborted one is freed by the runner hook.
+    slots, fresh, positions, _ = claim(["a"], [True], [False], [6], 4096)
+    assert slots == [0] and fresh == [True] and positions == [0] and decoder._free_stream_slots == [1]
+    decoder.on_requests_finished({"a", "unknown"})
+    assert decoder._stream_slots == {} and sorted(decoder._free_stream_slots) == [0, 1]
+    # No request id: decode without history.
+    assert claim([None], [True], [False], [6], 4096)[0] == [None]
+    # Real frames past the rotary table: the stream continues without history.
+    claim(["d"], [True], [False], [4090], 4096)
+    assert claim(["d"], [False], [False], [8], 4096)[0] == [None] and "d" not in decoder._stream_slots
