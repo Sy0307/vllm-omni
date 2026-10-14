@@ -1131,6 +1131,67 @@ def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapte
     assert adapter.get_req_chunk[request.request_id] == 2
 
 
+@pytest.mark.parametrize("left_context", [0, 2])
+@pytest.mark.parametrize("frames", [2, 5])
+def test_generation_window_ending_the_audio_is_not_decoded_again(build_adapter, left_context, frames):
+    """Drama 3 audio that ends exactly at a window (ramp 2, 3): the finished marker that
+    follows is an empty [codebooks, 0] window through the real chunker and SHM transport,
+    so it replaces the last window's codes and Stage 1 has nothing left to decode."""
+    from vllm_omni.core.sched.omni_generation_scheduler import _has_async_chunk_payload_to_run
+    from vllm_omni.model_executor.stage_input_processors.fish_omni import (
+        NUM_CODEBOOKS,
+        SEMANTIC_BEGIN_ID,
+        fish_omni_to_dac_decoder_async_chunk,
+    )
+
+    manager = SimpleNamespace(
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "codec_chunk_ramp": "2,3",
+                    "codec_chunk_frames": 4,
+                    "codec_left_context_frames": left_context,
+                }
+            }
+        ),
+        request_payload={},
+    )
+    producer = SimpleNamespace(external_req_id="tail", is_finished=lambda: False)
+
+    def frame(main: int) -> dict:
+        return {"codes.audio": torch.cat((torch.tensor([main]), torch.arange(NUM_CODEBOOKS))).unsqueeze(0)}
+
+    windows = [fish_omni_to_dac_decoder_async_chunk(manager, frame(SEMANTIC_BEGIN_ID), producer) for _ in range(frames)]
+    end_of_speech = SEMANTIC_BEGIN_ID - 1
+    windows.append(fish_omni_to_dac_decoder_async_chunk(manager, frame(end_of_speech), producer, is_finished=True))
+    windows = [window for window in windows if window is not None]
+
+    shm = SharedMemoryConnector({"stage_id": 0})
+    received = []
+    try:
+        for index, window in enumerate(windows):
+            key = f"tail_{uuid.uuid4().hex}_{index}"
+            assert shm.put("0", "1", key, window)[0]
+            received.append(shm.get("0", "1", key))
+            shm.cleanup(key)
+    finally:
+        shm.close()
+
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    request = _req("tail", RequestStatus.WAITING)
+    connector.get.side_effect = received
+    # Each window is registered and received as the scheduler asks for the next one.
+    for _ in received[:-1]:
+        assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+        assert request.prompt_token_ids == [0]
+        assert _has_async_chunk_payload_to_run(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert connector.get.call_count == len(received)
+    assert request.prompt_token_ids == []
+    assert not _has_async_chunk_payload_to_run(request)
+    assert request.additional_information["codes"]["audio"].shape == (NUM_CODEBOOKS, 0)
+
+
 def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -1400,6 +1461,52 @@ def test_cancel_while_batch_processor_runs_does_not_recreate_state(build_adapter
     assert "ext-c" not in adapter.request_payload and "ext-c" not in adapter._sender_tokens
     assert [c.kwargs["put_key"] for c in connector.put.call_args_list] == ["ext-k_0_0"]
     assert not adapter._sender_tokens["ext-k"].in_flight
+
+
+def _fish_omni_frame(index: int) -> dict:
+    from vllm_omni.model_executor.stage_input_processors.fish_omni import SEMANTIC_BEGIN_ID
+
+    codes = torch.arange(10) + 100 * index
+    return {"codes.audio": torch.cat((torch.tensor([SEMANTIC_BEGIN_ID + index]), codes)).unsqueeze(0)}
+
+
+def _fish_omni_adapter(build_adapter, monkeypatch, ramp="1"):
+    from vllm_omni.model_executor.stage_input_processors import fish_omni
+
+    adapter, connector = build_adapter(stage_id=0, connector_extra={"codec_chunk_ramp": ramp})
+    adapter.custom_process_next_stage_input_func = fish_omni.fish_omni_to_dac_decoder_async_chunk
+    adapter.custom_process_next_stage_input_batch_func = fish_omni.fish_omni_to_dac_decoder_async_chunk_batch
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+    return adapter, connector
+
+
+def _send_step(adapter, requests, frame_index):
+    adapter.save_async_batch(
+        [
+            {"multimodal_output": _fish_omni_frame(frame_index), "request": r, "is_segment_finished": False}
+            for r in requests
+        ]
+    )
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+
+def test_cancelled_fish_omni_streams_leave_no_frame_history(build_adapter, monkeypatch):
+    """Cancelling and cleaning a request drops its frame history; a reused id starts fresh."""
+    adapter, connector = _fish_omni_adapter(build_adapter, monkeypatch, ramp="4")
+    requests = [_req(f"req-{i}", RequestStatus.RUNNING, external_req_id=f"ext-{i}") for i in range(100)]
+    for index in range(3):  # below the first window: nothing is sent yet
+        _send_step(adapter, requests, index)
+    assert len(adapter.request_payload) == 100
+    for request in requests:
+        adapter.cleanup_sender(request.external_req_id)
+    assert not adapter.request_payload and not adapter._sender_tokens
+
+    reused = _req("req-new", RequestStatus.RUNNING, external_req_id="ext-0")
+    for index in range(50, 54):
+        _send_step(adapter, [reused], index)
+    payload = connector.put.call_args.kwargs["data"]
+    codes = payload["codes"]["audio"] if isinstance(payload, dict) else payload.codes.audio
+    assert (codes[0] // 100).tolist() == [50, 51, 52, 53]
 
 
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):

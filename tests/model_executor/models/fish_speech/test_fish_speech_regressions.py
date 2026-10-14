@@ -312,3 +312,59 @@ def test_dac_decoder_stream_slots_follow_request_lifetime():
     # Real frames past the rotary table: the stream continues without history.
     claim(["d"], [True], [False], [4090], 4096)
     assert claim(["d"], [False], [False], [8], 4096)[0] == [None] and "d" not in decoder._stream_slots
+
+
+@pytest.mark.parametrize("left_context", [0, 32])
+def test_dac_stream_history_follows_the_drama3_chunker(left_context):
+    """The real Drama 3 chunker into the codec's slot management: one slot per stream, fresh
+    only at its first window, positions counting new frames -- also without left context."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.stage_input_processors.fish_omni import (
+        SEMANTIC_BEGIN_ID,
+        fish_omni_to_dac_decoder_async_chunk,
+    )
+
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
+    manager = SimpleNamespace(
+        connector=SimpleNamespace(config={"extra": {"codec_left_context_frames": left_context}}),
+        request_payload={},
+    )
+    decoder = _stream_decoder(4)
+
+    def frame(index):
+        row = torch.cat((torch.tensor([SEMANTIC_BEGIN_ID + index % 4096]), torch.arange(10)))
+        return {"codes.audio": row.unsqueeze(0)}
+
+    def run_stream(request_id, frames):
+        request = SimpleNamespace(external_req_id=request_id, is_finished=lambda: False)
+        claimed = []
+        for index in range(frames):
+            payload = fish_omni_to_dac_decoder_async_chunk(
+                manager, frame(index), request, is_finished=index == frames - 1
+            )
+            if payload is None or payload.codes.audio.numel() == 0:
+                continue
+            meta = {"left_context_size": payload.meta.left_context_size, "chunk_seq": payload.meta.chunk_seq}
+            context = int(meta["left_context_size"])
+            new = int(payload.codes.audio.shape[1]) - context
+            first = FishSpeechDACDecoder._meta_first_window([{"meta": meta}], 0, context)
+            done = bool(payload.meta.finished)
+            slots, fresh, positions, release = decoder._claim_stream_slots([request_id], [first], [done], [new], 4096)
+            claimed.append((slots[0], fresh[0], positions[0], new))
+            for owner in release:
+                decoder._release_stream_slot(owner)
+        return claimed
+
+    windows = run_stream("r", 300)
+    assert len(windows) > 3
+    assert {slot for slot, *_ in windows} == {windows[0][0]} and windows[0][0] is not None
+    assert [fresh for _, fresh, _, _ in windows] == [True] + [False] * (len(windows) - 1)
+    starts = [position for _, _, position, _ in windows]
+    assert starts == [sum(new for *_, new in windows[:i]) for i in range(len(windows))]
+    assert sum(new for *_, new in windows) == 300
+    # The stream's last window released its slot; the same id restarts afresh.
+    assert "r" not in decoder._stream_slots
+    manager.request_payload.clear()
+    restarted = run_stream("r", 20)
+    assert restarted[0][1] is True and restarted[0][2] == 0
