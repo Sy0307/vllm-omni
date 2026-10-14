@@ -421,6 +421,11 @@ _DIFFUSION_MODELS = {
         "pipeline_kandinsky6",
         "Kandinsky6TI2VAPipeline",
     ),
+    "MOSImagePipeline": (
+        "mosimage",
+        "pipeline_mosimage",
+        "MOSImagePipeline",
+    ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
@@ -750,6 +755,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
+    "MOSImagePipeline": "get_mosimage_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -764,6 +770,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "MOSImagePipeline": "get_mosimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
