@@ -1332,6 +1332,76 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
 
 
+def test_save_async_batch_runs_processor_once_and_sends_only_payloads(build_adapter, monkeypatch):
+    """A step's requests go through the batch processor in one call; only returned payloads are put."""
+    adapter, connector = build_adapter(stage_id=0)
+    first = _req("req-1", RequestStatus.RUNNING, external_req_id="ext-1")
+    second = _req("req-2", RequestStatus.RUNNING, external_req_id="ext-2")
+    calls = []
+
+    def batch_processor(transfer_manager, outputs, requests, is_finished):
+        calls.append(([r.external_req_id for r in requests], list(is_finished), [o["codes"]["audio"] for o in outputs]))
+        return [None, OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([7], dtype=torch.long)))]
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: pytest.fail("single processor called")
+    adapter.custom_process_next_stage_input_batch_func = batch_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+    snapshots = []
+
+    def snapshot(request):
+        snapshots.append(request)
+        return request
+
+    monkeypatch.setattr(adapter, "_snapshot_processor_request", snapshot)
+
+    adapter.save_async_batch(
+        [
+            {"multimodal_output": {"codes.audio": torch.tensor([1])}, "request": first, "is_segment_finished": False},
+            {"multimodal_output": {"codes.audio": torch.tensor([2])}, "request": second, "is_segment_finished": False},
+        ]
+    )
+    assert len(adapter._pending_save_reqs) == 1 and not snapshots
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert [c[:2] for c in calls] == [(["ext-1", "ext-2"], [False, False])]
+    assert [int(t) for t in calls[0][2]] == [1, 2]
+    assert connector.put.call_count == 1
+    assert connector.put.call_args.kwargs["put_key"] == "ext-2_0_0"
+    assert adapter.put_req_chunk["ext-2"] == 1 and adapter.put_req_chunk["ext-1"] == 0
+
+
+def test_cancel_while_batch_processor_runs_does_not_recreate_state(build_adapter, monkeypatch):
+    """The scheduler's cleanup during the batch processor defers to the save thread,
+    so the processor cannot recreate the cancelled request's state."""
+    adapter, connector = build_adapter(stage_id=0)
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+    cancelled = _req("req-c", RequestStatus.RUNNING, external_req_id="ext-c")
+    kept = _req("req-k", RequestStatus.RUNNING, external_req_id="ext-k")
+
+    def batch_processor(transfer_manager, outputs, requests, is_finished):
+        transfer_manager.cleanup_sender("ext-c")  # scheduler thread, while the processor runs
+        payloads = []
+        for request in requests:
+            state = transfer_manager.request_payload.setdefault(request.external_req_id, {}).setdefault("frames", [])
+            state.append(1)
+            payloads.append(OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([len(state)]))))
+        return payloads
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: pytest.fail("single processor called")
+    adapter.custom_process_next_stage_input_batch_func = batch_processor
+    adapter.save_async_batch(
+        [
+            {"multimodal_output": {"codes.audio": torch.tensor([1])}, "request": r, "is_segment_finished": False}
+            for r in (cancelled, kept)
+        ]
+    )
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-c" not in adapter.request_payload and "ext-c" not in adapter._sender_tokens
+    assert [c.kwargs["put_key"] for c in connector.put.call_args_list] == ["ext-k_0_0"]
+    assert not adapter._sender_tokens["ext-k"].in_flight
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``
