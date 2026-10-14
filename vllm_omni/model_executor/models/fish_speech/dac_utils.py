@@ -17,6 +17,13 @@ from torch.nn.utils.weight_norm import WeightNorm
 DAC_SAMPLE_RATE = 44100
 DAC_HOP_LENGTH = 2048  # 512 (decoder upsample) * 4 (quantizer upsample)
 DAC_NUM_CODEBOOKS = 10  # 1 semantic + 9 residual
+DAC_SEMANTIC_CODEBOOK_SIZE = 4096
+DAC_RESIDUAL_CODEBOOK_SIZE = 1024
+
+
+def dac_codebook_sizes() -> tuple[int, ...]:
+    """Entries of each codebook, in code order: the semantic one, then the residual ones."""
+    return (DAC_SEMANTIC_CODEBOOK_SIZE,) + (DAC_RESIDUAL_CODEBOOK_SIZE,) * (DAC_NUM_CODEBOOKS - 1)
 
 
 def build_dac_codec() -> nn.Module:
@@ -74,14 +81,14 @@ def build_dac_codec() -> nn.Module:
     )
     quantizer = DownsampleResidualVectorQuantize(
         input_dim=1024,
-        n_codebooks=9,
-        codebook_size=1024,
+        n_codebooks=DAC_NUM_CODEBOOKS - 1,
+        codebook_size=DAC_RESIDUAL_CODEBOOK_SIZE,
         codebook_dim=8,
         quantizer_dropout=0.0,
         downsample_factor=[2, 2],
         post_module=post_module,
         pre_module=pre_module,
-        semantic_codebook_size=4096,
+        semantic_codebook_size=DAC_SEMANTIC_CODEBOOK_SIZE,
     )
     codec = DAC(
         encoder_dim=64,
