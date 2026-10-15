@@ -66,13 +66,10 @@ class FusedAudioStep:
     rows: list[int]
     pcm: list[torch.Tensor]
     sample_rate: torch.Tensor
-    events: list[torch.cuda.Event] = field(default_factory=list)
     # Rows whose first frame was sent ahead by the first-audio sender.
     after_first: set[int] = field(default_factory=set)
 
     def to_cpu(self, copy_stream: torch.cuda.Stream, copy_tensor) -> FusedAudioStep:
-        for event in self.events:
-            copy_stream.wait_event(event)
         return FusedAudioStep(
             self.num_reqs,
             self.rows,
@@ -151,12 +148,10 @@ class MossFusedAudio:
     def __init__(self, codec: Any, capacity: int, n_vq: int, pad_id: int, device: torch.device) -> None:
         self.codec = codec
         self.pad_id = int(pad_id)
-        session = codec._stream_session
         self.chunk_frames = int(codec._stream_chunk_frames)
         self.initial_frames = int(codec._initial_stream_chunk_frames) or self.chunk_frames
         if self.chunk_frames <= 0:
             raise ValueError("The single-stage MOSS pipeline requires codec_chunk_frames > 0")
-        self.samples_per_frame = int(session._samples_per_frame)
         self.sample_rate = codec._sr_tensor
         self.device = device
         # Codec decodes, terminal resets and cancellations share this stream.

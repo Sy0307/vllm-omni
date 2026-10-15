@@ -111,9 +111,6 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
 _moss_shared_head.install()
 
 _moss_host_trim.install_hash_trim()
-# Single-stage audio: a decode step without PCM publishes nothing; its tokens ride on
-# the request's next published output (audio chunk, stop, error or control data).
-_MOSS_SPARSE_OUTPUT = _moss_host_trim.flag("MOSS_SPARSE_OUTPUT")
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -143,8 +140,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # MOSS_SPARSE_OUTPUT: token ids of unpublished decode steps, per request.
-        self._moss_sparse_pending: dict[str, list[int]] = {}
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -957,27 +952,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stopped=stopped,
                 has_control=kv_transfer_params is not None,
             )
-            if _MOSS_SPARSE_OUTPUT and emit:
-                pending = self._moss_sparse_pending
-                if (
-                    not stopped
-                    and not mm_output
-                    and pooler_output is None
-                    and kv_transfer_params is None
-                    and new_logprobs is None
-                    and prompt_logprobs_tensors is None
-                    and prompt_token_id_logprobs is None
-                    and prefill_stats is None
-                    and not is_segment_finished
-                    and not request.events
-                ):
-                    if new_token_ids:
-                        pending.setdefault(req_id, []).extend(new_token_ids)
-                    emit = False
-                elif pending:
-                    held = pending.pop(req_id, None)
-                    if held:
-                        new_token_ids = held + list(new_token_ids)
             if emit:
                 OmniSchedulerMixin._append_request_output(
                     self,
@@ -1051,11 +1025,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped_running_reqs,
             stopped_preempted_reqs,
         )
-        if _MOSS_SPARSE_OUTPUT and len(self._moss_sparse_pending) > 2 * len(self.requests) + 256:
-            # Aborted requests never publish again.
-            for held_id in [r for r in self._moss_sparse_pending if r not in self.requests]:
-                del self._moss_sparse_pending[held_id]
-
         OmniSchedulerMixin._finish_error_requests(self, outputs)
 
         failed_requests = self._handle_failed_kv_load_outputs(

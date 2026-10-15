@@ -9,11 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.worker_v2.first_audio_sender import TailAudioSender
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
 ]
 
@@ -28,7 +29,7 @@ def _wait(tail, count):
 
 def test_pieces_wait_for_their_decode_and_keep_submission_order():
     scheduler = SimpleNamespace(omni_deferred_finishes={"r": {}}, omni_tail_outputs=deque())
-    sender = TailAudioSender(None, scheduler, torch.device("cuda"))
+    sender = TailAudioSender(scheduler, torch.device("cuda"))
     side = torch.cuda.Stream()
     pieces = []
     with torch.cuda.stream(side):
@@ -51,7 +52,7 @@ def test_pieces_wait_for_their_decode_and_keep_submission_order():
 
 def test_an_empty_final_is_queued_without_audio():
     scheduler = SimpleNamespace(omni_deferred_finishes={"e": {}}, omni_tail_outputs=deque())
-    sender = TailAudioSender(None, scheduler, torch.device("cuda"))
+    sender = TailAudioSender(scheduler, torch.device("cuda"))
     sender.submit("e", [], torch.tensor(48000, dtype=torch.int32), True)
     (only,) = _wait(scheduler.omni_tail_outputs, 1)
     sender.close()
@@ -62,7 +63,7 @@ def test_outputs_after_an_early_first_frame_carry_the_marker():
     from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 
     scheduler = SimpleNamespace(omni_deferred_finishes={"m": {}}, omni_tail_outputs=deque())
-    sender = TailAudioSender(None, scheduler, torch.device("cuda"))
+    sender = TailAudioSender(scheduler, torch.device("cuda"))
     sr = torch.tensor(48000, dtype=torch.int32)
     sender.submit("m", [(torch.ones((2, 4), device="cuda"), None)], sr, False, after_first=True)
     # Even a terminal output without audio must follow the sent first frame.

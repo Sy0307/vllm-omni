@@ -26,7 +26,6 @@ from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, Reque
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
-_TRIM_MTP_LISTS = __import__("os").environ.get("MOSS_TRIM_MTP_LISTS", "0") == "1"
 
 
 def _metadata_to_device(data: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -211,10 +210,6 @@ class MossLocalModelState(OmniModelState):
         self._eager_host = [False] * capacity
         self._first_mtp_slots = set()
         self._mtp_dispatcher = None
-        # MOSS_TRIM_MTP_LISTS: per-slot result of the MTP generator lookup for
-        # the slot's current request (known, has a seed). Reset on admission.
-        self._mtp_seed_known = np.zeros(capacity, dtype=np.bool_)
-        self._mtp_seeded = np.zeros(capacity, dtype=np.bool_)
 
     def sample_determined_tokens(self, batch, sampler):
         """Skip full-vocabulary sampling only for unconstrained Local tokens.
@@ -304,7 +299,6 @@ class MossLocalModelState(OmniModelState):
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
         self._active_host[req_index] = True
-        self._mtp_seed_known[req_index] = False
         self._eager_host[req_index] = False
         if self._fused_audio is not None:
             self._fused_audio.add_request(req_index, str(new_req_data.req_id))
@@ -552,25 +546,12 @@ class MossLocalModelState(OmniModelState):
             torch.index_select(self._hidden_pool, 0, slots, out=hidden)
             step[:, 0].copy_(self._active_pool.index_select(0, slots))
 
-        slot_ids = (
-            batch.idx_mapping_np[rows]
-            if _TRIM_MTP_LISTS and getattr(self, "_early_first_audio", None) is None
-            else None
-        )
-        if slot_ids is not None and self._mtp_seed_known[slot_ids].all() and not self._mtp_seeded[slot_ids].any():
-            # Every row's request is known to be seedless: the graph path reads
-            # no per-request sampling state (no generators, no req_infos).
-            buffers, req_ids, generators = [], [], [None] * bsz
-        else:
-            buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
-            req_ids = [str(buf["req_id"]) for buf in buffers]
-            generators = [
-                self._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
-                for req_id, buf in zip(req_ids, buffers, strict=True)
-            ]
-            if slot_ids is not None and not getattr(self.model, "mtp_accepts_req_infos", False):
-                self._mtp_seeded[slot_ids] = [g is not None for g in generators]
-                self._mtp_seed_known[slot_ids] = True
+        buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
+        req_ids = [str(buf["req_id"]) for buf in buffers]
+        generators = [
+            self._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
+            for req_id, buf in zip(req_ids, buffers, strict=True)
+        ]
         can_graph = self._is_mtp_graph_runner() and not any(g is not None for g in generators)
         desc = dispatcher(bsz) if can_graph and dispatcher is not None else None
         mode = getattr(desc, "cg_mode", CUDAGraphMode.FULL) if can_graph else CUDAGraphMode.NONE

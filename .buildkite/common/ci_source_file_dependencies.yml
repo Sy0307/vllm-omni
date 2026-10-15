@@ -235,6 +235,8 @@ source_file_dependencies:
     - vllm_omni/entrypoints/
 
   engine_model_executor_worker_function:
+    - tests/attention/
+    - vllm_omni/attention/
     - tests/engine/
     - tests/model_executor/
     - tests/worker_v2/

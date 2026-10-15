@@ -103,7 +103,7 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     return False
 
 
-def _bind_tail_audio_sender(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
+def _bind_tail_audio_sender(model_executor: Any, scheduler: Any) -> bool:
     """Let an in-process audio stage finish requests before their last audio.
 
     The scheduler then holds a stopped request's terminal output until the
@@ -121,7 +121,7 @@ def _bind_tail_audio_sender(model_executor: Any, output_queue: Any, scheduler: A
         return False
     from vllm_omni.worker_v2.first_audio_sender import TailAudioSender
 
-    if not bind(lambda device: TailAudioSender(output_queue, scheduler, device)):
+    if not bind(lambda device: TailAudioSender(scheduler, device)):
         return False
     scheduler.omni_defer_audio_finish = True
     return True
@@ -167,7 +167,7 @@ class StageEngineCoreProc(EngineCoreProc):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
-        if _bind_tail_audio_sender(self.model_executor, self.output_queue, self.scheduler):
+        if _bind_tail_audio_sender(self.model_executor, self.scheduler):
             logger.info("Stopped requests hand their last audio to the tail-audio sender.")
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")

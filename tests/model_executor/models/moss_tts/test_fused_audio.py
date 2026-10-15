@@ -8,12 +8,13 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.moss_tts.fused_audio import MossFusedAudio
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams"),
 ]
 

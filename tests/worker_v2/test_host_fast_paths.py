@@ -9,11 +9,12 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.worker_v2.host_fast_paths import GrowOnlyUvaBufferPool, UvaUploads, stage_write_contents_in_uva
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available() or not is_uva_available(), reason="needs CUDA UVA"),
 ]
 

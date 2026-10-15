@@ -23,7 +23,7 @@ def test_startup_failure_is_reported_to_engine(monkeypatch, failure):
     monkeypatch.setattr(torch.accelerator, "set_device_index", fail if failure == "device" else lambda *args: None)
     monkeypatch.setattr(torch.cuda, "Stream", fail)
     with pytest.raises(RuntimeError, match="initialization failed") as exc:
-        TailAudioSender(None, SimpleNamespace(), torch.device("cuda", 0))
+        TailAudioSender(SimpleNamespace(), torch.device("cuda", 0))
     assert "initialization unavailable" in str(exc.value.__cause__)
 
 
@@ -45,7 +45,7 @@ def test_copy_failure_is_queued_as_terminal_error(monkeypatch, failure):
     host = SimpleNamespace(copy_=fail if failure == "copy" else lambda *args, **kwargs: None)
     monkeypatch.setattr(torch, "empty", fail if failure == "allocation" else lambda *args, **kwargs: host)
     scheduler = SimpleNamespace(omni_tail_outputs=deque())
-    sender = TailAudioSender(None, scheduler, torch.device("cuda", 0))
+    sender = TailAudioSender(scheduler, torch.device("cuda", 0))
     sender.submit("r", [(torch.ones(2, 4), object())], torch.tensor(48000), False, after_first=True)
     sender.close()
     ((request, payload, final, error),) = scheduler.omni_tail_outputs

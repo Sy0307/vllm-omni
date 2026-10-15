@@ -201,8 +201,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def _install_host_fast_paths(self) -> None:
-        """Stage per-step uploads in pinned UVA rings (see host_fast_paths)."""
+        """Stage MOSS Local uploads in pinned UVA rings (see host_fast_paths)."""
         self._host_fast_paths_installed = True
+        from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
+
+        if not isinstance(self.model_state, MossLocalModelState):
+            return
         if self.device.type != "cuda" or not is_uva_available():
             return
         from vllm.v1.worker.gpu import buffer_utils

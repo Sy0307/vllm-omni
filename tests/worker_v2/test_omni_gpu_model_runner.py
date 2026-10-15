@@ -400,3 +400,16 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     assert runner.execute_model_state.cudagraph_stats is None
     if runner_kind != "generation":
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
+
+
+def test_host_fast_paths_leave_non_moss_runner_unchanged(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as upstream_runner
+
+    runner = _make_runner()
+    runner.model_state = SimpleNamespace()
+    runner.device = torch.device("cuda")
+    original = upstream_runner.async_tensor_h2d
+    monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.is_uva_available", lambda: True)
+    runner._install_host_fast_paths()
+    assert runner._host_fast_paths_installed
+    assert upstream_runner.async_tensor_h2d is original

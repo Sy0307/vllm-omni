@@ -138,8 +138,7 @@ class _PreparedDelivery:
 
 
 class _EngineOutputSink:
-    def __init__(self, output_queue: Any, scheduler: Any, *, upstream_first_audio: bool = True) -> None:
-        self.upstream_first_audio = upstream_first_audio
+    def __init__(self, output_queue: Any, scheduler: Any) -> None:
         self.output_queue = output_queue
         self.scheduler = scheduler
 
@@ -159,8 +158,7 @@ class _EngineOutputSink:
             if request_id not in routes:
                 continue
             payload = {"model_outputs": pcm, "sr": sample_rate}
-            if self.upstream_first_audio:
-                payload[FIRST_AUDIO_KEY] = torch.tensor(True)
+            payload[FIRST_AUDIO_KEY] = torch.tensor(True)
             by_client.setdefault(routes[request_id], []).append(
                 OmniEngineCoreOutput(
                     request_id=request_id,
@@ -190,11 +188,9 @@ class _EngineOutputSink:
                 routes.pop(request_id)
 
 
-def engine_output_queue_sink(
-    output_queue: Any, scheduler: Any, *, upstream_first_audio: bool = True
-) -> _EngineOutputSink:
-    """Route prepared audio; final-stage PCM must not carry the upstream marker."""
-    return _EngineOutputSink(output_queue, scheduler, upstream_first_audio=upstream_first_audio)
+def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:
+    """Route first PCM with the marker used to order subsequent step output."""
+    return _EngineOutputSink(output_queue, scheduler)
 
 
 class TailAudioSender:
@@ -209,7 +205,7 @@ class TailAudioSender:
     flight at its stop, its tail and its terminal output stay in order.
     """
 
-    def __init__(self, output_queue: Any, scheduler: Any, device: torch.device) -> None:
+    def __init__(self, scheduler: Any, device: torch.device) -> None:
         self.scheduler = scheduler
         # The sender thread selects the device by index.
         index = device.index if device.index is not None else torch.accelerator.current_device_index()

@@ -104,14 +104,14 @@ steps:
       - label: "Engine&Model Executor&Work Test · L4"
         timeout_in_minutes: 30
         commands:
-          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
+          - "pytest -sv tests/attention/ tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
         mirror_hardwares: l4_1
 
       - label: "Engine&Model Executor&Work Test · H100"
         timeout_in_minutes: 20
         source_file_dependencies: engine_model_executor_worker_function
         commands:
-          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and H100' --run-level 'core_model'"
+          - "pytest -sv tests/attention/ tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and H100' --run-level 'core_model'"
         mirror_hardwares: h100_1
 
   - label: "Distributed Test"

@@ -83,3 +83,33 @@ def test_unsupported_layouts_fall_back():
     assert _local_continuation_prompt(proc, {"text": "t"}, [codes, codes]) is None
     assert _local_continuation_prompt(proc, {"text": "t"}, ["path.wav"]) is None
     assert _local_continuation_prompt(proc, {"text": "t"}, [torch.zeros((2, 4), dtype=torch.long)]) is None
+
+
+@pytest.mark.parametrize("enabled,valid", [(True, True), (True, False), (False, True)])
+def test_shared_head_metadata_is_validated_without_mutating_defaults(monkeypatch, enabled, valid):
+    from vllm import SamplingParams
+
+    from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
+    from vllm_omni.model_executor.models.moss_tts.shared_head import HEAD_TOKENS_KEY
+
+    monkeypatch.setenv("MOSS_SHARED_HEAD", "1" if enabled else "0")
+    proc = SimpleNamespace(
+        model_config=SimpleNamespace(audio_pad_token_id=99),
+        _vllm_omni_continuation_segments={None: ([1, 2],)},
+    )
+    adapter = SimpleNamespace(_moss_variant="local", _get_moss_processor=lambda: proc)
+    # A caller-supplied internal key is overwritten or removed after validation.
+    default = SamplingParams(max_tokens=20, extra_args={HEAD_TOKENS_KEY: 99, "other": 1})
+    defaults = [default]
+    prompt = {
+        "cache_salt": "hello|tenant",
+        "prompt_token_ids": [1, 2, 3],
+        "additional_information": {"codes": {"ref": torch.full((3, 2), 99 if valid else 0)}},
+    }
+    result = MossTTSAdapter.apply_sampling_overrides(
+        adapter, defaults, SimpleNamespace(max_new_tokens=None, language=None), prompt
+    )
+    assert result[0].extra_args.get(HEAD_TOKENS_KEY) == (2 if enabled and valid else None)
+    assert result[0].extra_args["other"] == 1
+    assert defaults == [default] and default.extra_args[HEAD_TOKENS_KEY] == 99
+    assert prompt["cache_salt"] == "hello|tenant"
