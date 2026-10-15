@@ -46,6 +46,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
+    sched.omni_deferred_finishes = {}
     sched.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
     )

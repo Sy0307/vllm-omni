@@ -843,7 +843,7 @@ def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch, mocke
 
     finalizer = mocker.Mock(side_effect=finalize) if consumer == "finalizer" else None
     extra = ({"extra": torch.tensor([7])}, _FakeEvent()) if consumer == "extra" else None
-    result = _async_output(
+    pending = _async_output(
         req_ids=["frame", "eos", "prefill"],
         sampler_output=SamplerOutput(torch.tensor([[1], [2], [3]]), None, None, None, None),
         num_sampled_tokens=torch.tensor([1, 1, 1]),
@@ -853,11 +853,18 @@ def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch, mocke
         streaming_audio=streaming_audio,
         finalize_multimodal=finalizer,
         extra_multimodal_outputs=extra,
-    ).get_output()
+    )
+    result = pending.get_output()
     assert copy_mm.call_count == {"pcm_only": 0, "finalizer": 1, "extra": 2}[consumer]
     if finalizer is not None:
         finalizer.assert_called_once()
+    # Each D2H output has a fresh allocation. Replacing the producer's buffer
+    # must leave earlier request-owned views alive without cloning them.
+    assert pending._streaming_audio is not None
+    host_wav = pending._streaming_audio.wav
+    assert result.multimodal_outputs[0]["model_outputs"].data_ptr() == host_wav.data_ptr()
     wav.fill_(-1)
+    pending._streaming_audio.wav = torch.full_like(host_wav, -1)
     assert result.inter_stage_outputs is None
     assert result.multimodal_outputs[0]["model_outputs"].tolist() == [0, 1, 2, 3]
     assert result.multimodal_outputs[1] == {}

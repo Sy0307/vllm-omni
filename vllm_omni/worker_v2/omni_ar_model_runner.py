@@ -42,7 +42,6 @@ from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
 
 logger = init_logger(__name__)
 
-_TRIM_PCM_CLONE = __import__("os").environ.get("MOSS_TRIM_PCM_CLONE", "0") == "1"
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
 
 
@@ -954,7 +953,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
             self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
-            if _TRIM_PCM_CLONE and self._streaming_audio is not None and pooler_client:
+            if self._streaming_audio is not None and pooler_client:
                 # Streaming PCM already sits in CPU buffers this output owns
                 # (allocated per chunk by the async D2H): no second copy.
                 self.model_runner_output.multimodal_outputs = [

@@ -660,8 +660,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             params.extra_args = dict(params.extra_args)
             params.extra_args.pop(shared_head.HEAD_TOKENS_KEY, None)
         if (
-            shared_head.enabled()
-            and self._moss_variant == "local"
+            self._moss_variant == "local"
             and prompt is not None
             and prompt.get("cache_salt")
             and isinstance(prompt.get("prompt_token_ids"), list)

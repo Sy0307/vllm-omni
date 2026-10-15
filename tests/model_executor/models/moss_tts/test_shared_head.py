@@ -16,12 +16,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture
 def installed(monkeypatch):
-    monkeypatch.setenv("MOSS_SHARED_HEAD", "1")
     # Let monkeypatch restore both module aliases after install().
     monkeypatch.setattr(kv_cache_utils, "generate_block_hash_extra_keys", kv_cache_utils.generate_block_hash_extra_keys)
     monkeypatch.setattr(block_pool, "generate_block_hash_extra_keys", block_pool.generate_block_hash_extra_keys)
     manager_method = KVCacheManager.get_computed_blocks
-    assert shared_head.install()
+    shared_head.install()
     assert KVCacheManager.get_computed_blocks is manager_method
     return kv_cache_utils.generate_block_hash_extra_keys
 
@@ -66,8 +65,7 @@ def test_head_requires_identical_tokens_and_pad_conditioning():
     assert shared_head.validated_head_length([1, 2, 3, 4, 5], codes, [1, 2, 3], 99) is None
 
 
-def test_disabled_install_does_not_patch(monkeypatch):
-    monkeypatch.delenv("MOSS_SHARED_HEAD", raising=False)
-    original = kv_cache_utils.generate_block_hash_extra_keys
-    assert not shared_head.install()
-    assert kv_cache_utils.generate_block_hash_extra_keys is original
+def test_install_is_idempotent(installed):
+    shared_head.install()
+    assert kv_cache_utils.generate_block_hash_extra_keys is installed
+    assert block_pool.generate_block_hash_extra_keys is installed

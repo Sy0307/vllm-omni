@@ -21,14 +21,10 @@ def _equal(actual, expected):
 
 
 @pytest.mark.cpu
-def test_fused_depth_is_opt_in(monkeypatch):
+def test_fused_depth_is_opt_in():
     config = GPT2Config(n_embd=32, n_head=4, n_inner=64, layer_norm_epsilon=1e-6)
-    monkeypatch.delenv("VLLM_OMNI_MOSS_LOCAL_FUSED_DEPTH", raising=False)
     assert not MossTTSLocalDepthTransformer(config).fused_depth
     assert MossTTSLocalDepthTransformer(config, fused_depth=True).fused_depth
-    monkeypatch.setenv("VLLM_OMNI_MOSS_LOCAL_FUSED_DEPTH", "1")
-    assert MossTTSLocalDepthTransformer(config).fused_depth
-    # An explicit hf_override value wins over the environment.
     assert not MossTTSLocalDepthTransformer(config, fused_depth=False).fused_depth
 
 

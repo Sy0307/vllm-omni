@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Share the KV blocks of a constant prompt head across requests (MOSS_SHARED_HEAD=1).
+"""Share validated constant prompt heads across MOSS Local requests.
 
 The serving layer salts every MOSS request's prefix-cache hash with its full conditioning, so even the
 constant chat-template head (identical tokens, pad audio codes, same positions -> identical KV) is stored
@@ -12,13 +12,7 @@ the salted one. Public cache salts remain opaque strings.
 
 from __future__ import annotations
 
-import os
-
 HEAD_TOKENS_KEY = "_moss_shared_head_tokens"
-
-
-def enabled() -> bool:
-    return os.environ.get("MOSS_SHARED_HEAD", "0") == "1"
 
 
 def validated_head_length(prompt_ids: list[int], codes, head: list[int], pad_id: int) -> int | None:
@@ -31,14 +25,12 @@ def validated_head_length(prompt_ids: list[int], codes, head: list[int], pad_id:
     return n
 
 
-def install() -> bool:
-    if not enabled():
-        return False
+def install() -> None:
     from vllm.v1.core import block_pool, kv_cache_utils
 
     orig = kv_cache_utils.generate_block_hash_extra_keys
     if getattr(orig, "_moss_shared_head", False):
-        return True
+        return
 
     def generate_block_hash_extra_keys(request, start_token_idx, end_token_idx, start_mm_idx):
         salt = getattr(request, "cache_salt", None)
@@ -59,4 +51,3 @@ def install() -> bool:
     generate_block_hash_extra_keys._moss_shared_head = True
     kv_cache_utils.generate_block_hash_extra_keys = generate_block_hash_extra_keys
     block_pool.generate_block_hash_extra_keys = generate_block_hash_extra_keys
-    return True

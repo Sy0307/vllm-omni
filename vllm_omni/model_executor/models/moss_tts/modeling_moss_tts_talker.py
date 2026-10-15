@@ -1364,8 +1364,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self.local_transformer = MossTTSLocalDepthTransformer(
             self.config.gpt2_config,
             hidden_size=hidden_size,
-            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
-            fused_depth=getattr(self.config, "local_fused_depth", None),
+            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", False),
+            fused_depth=getattr(self.config, "local_fused_depth", False),
         )
 
         self._batch_state: list[dict[str, Any]] | None = None

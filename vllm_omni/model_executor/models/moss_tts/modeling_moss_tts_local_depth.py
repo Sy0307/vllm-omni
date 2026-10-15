@@ -22,7 +22,6 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 
 import torch
@@ -55,7 +54,6 @@ class _MossTTSLocalAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = hidden_size // n_head
         self.embed_dim = hidden_size
-        self._short_attention = os.environ.get("VLLM_OMNI_MOSS_LOCAL_SHORT_ATTN", "0") == "1"
         self.c_attn = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
         self.c_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
@@ -138,19 +136,7 @@ class _MossTTSLocalAttention(nn.Module):
             v_cache[:, :, position : position + 1].copy_(value)
             key = k_cache[:, :, : position + 1]
             value = v_cache[:, :, : position + 1]
-        if (
-            self._short_attention
-            and kv_cache is not None
-            and query.is_cuda
-            and query.dtype == torch.bfloat16
-            and self.head_dim <= 128
-            and key.shape[2] <= 16
-        ):
-            from vllm_omni.model_executor.models.moss_tts.local_short_attention import local_short_attention
-
-            attn_output = local_short_attention(query, key, value)
-        else:
-            attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=kv_cache is None)
+        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=kv_cache is None)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         return self.c_proj(attn_output)
 
@@ -205,8 +191,8 @@ class MossTTSLocalDepthTransformer(nn.Module):
         gpt2_config,
         hidden_size: int | None = None,
         *,
-        compile_audio_sampler: bool | None = None,
-        fused_depth: bool | None = None,
+        compile_audio_sampler: bool = False,
+        fused_depth: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size if hidden_size is not None else gpt2_config.n_embd)
@@ -225,8 +211,6 @@ class MossTTSLocalDepthTransformer(nn.Module):
         self._fused_attention = False
         self._auto_fused_linear = False
         self._fused_sampling = False
-        if fused_depth is None:
-            fused_depth = os.environ.get("VLLM_OMNI_MOSS_LOCAL_FUSED_DEPTH", "0") == "1"
         # Opt-in: one launch per codebook for sample + code store + next
         # position's attention, a fused binary gate, and (in the talker) a
         # fused MTP output epilogue. Bit-identical to the unfused kernels.
@@ -358,10 +342,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 options={"epilogue_fusion": False},
             )
             logger.info("MOSS-TTS local depth frame-local KV execution enabled with torch.compile")
-        compile_sampler = self._compile_audio_sampler
-        if compile_sampler is None:
-            compile_sampler = os.environ.get("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", "0") == "1"
-        if compile_sampler and self._compiled_audio_sampler is None:
+        if self._compile_audio_sampler and self._compiled_audio_sampler is None:
             # Keep the existing top-k/top-p algorithm and torch RNG. Explicit
             # per-request generators use the original helper below. The
             # binary continue/stop head is deliberately unchanged.
@@ -543,15 +524,6 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 generators=generators,
             )
             should_continue = binary_choice.eq(0)
-        import os as _os
-
-        if _os.environ.get("MOSS_TTS_DEBUG_STOP"):
-            import logging as _logging
-
-            _logging.getLogger("moss_tts_debug").warning(
-                "binary_logits=%s choice=%s", binary_logits.float().tolist(), (~should_continue).long().tolist()
-            )
-
         if fused_depth:
             # Every column is written by sample_attend below.
             codes = backbone_last_hidden.new_empty((batch_size, n_vq), dtype=torch.long)

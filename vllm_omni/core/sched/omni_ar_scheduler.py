@@ -29,8 +29,6 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.model_executor.models.moss_tts import host_trim as _moss_host_trim
-from vllm_omni.model_executor.models.moss_tts import shared_head as _moss_shared_head
 
 logger = init_logger(__name__)
 
@@ -108,11 +106,6 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
     return sliced
 
 
-_moss_shared_head.install()
-
-_moss_host_trim.install_hash_trim()
-
-
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
     used as a base class for the OmniARAsyncScheduler and holds most of the
@@ -140,6 +133,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if getattr(self.vllm_config.model_config.hf_config, "model_type", None) == "moss_tts_local":
+            from vllm_omni.model_executor.models.moss_tts.shared_head import install
+
+            install()
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}

@@ -459,12 +459,14 @@ The fused scheduler reserves codec capacity until stopped requests finish their
 last audio. KV-cache preemption fails the affected fused request explicitly;
 it does not silently restart a partially delivered waveform.
 
-The following opt-in switches enable the validated stable overlay's additional
-host reductions and prefix sharing. They default to off:
+On Hopper and newer CUDA GPUs, compatible Triton kernels automatically use
+programmatic dependent launch. Local requests share constant prompt-head KV
+blocks after validating the tokens and pad-only audio conditioning. Streaming
+PCM outputs reuse their request-owned host buffers without a second clone.
+The fused depth and compiled sampler settings come from the deployment YAML.
+No additional experiment environment switches are required:
 
 ```bash
-export MOSS_TRITON_PDL=1 MOSS_SHARED_HEAD=1
-export MOSS_TRIM_HASH=1 MOSS_TRIM_PCM_CLONE=1
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
   --omni --api-server-count 4 \
   --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml \
@@ -473,8 +475,8 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
 
 For a C128 main-versus-fused comparison, use the same model, dependency versions,
 physical GPU, CPU allocation, four API servers, and dataset on both sides. Run
-main with its unchanged `moss_tts_local.yaml` and clear the optional switches
-above. Pass `--seed-tts-file-ref-audio` to `vllm bench serve --omni` with the
+main with its unchanged `moss_tts_local.yaml`.
+Pass `--seed-tts-file-ref-audio` to `vllm bench serve --omni` with the
 Seed-TTS dataset; each request then refers to `file:///.../prompt.wav`. The server
 and client must see the same absolute paths. This changes reference transport;
 it does not bypass the reference encoder.

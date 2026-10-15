@@ -144,6 +144,7 @@ def test_patch_routes_supported_calls_and_falls_back(monkeypatch):
     from vllm_omni.attention import triton_decode_attention as tda
 
     monkeypatch.setattr(triton_attn, "unified_attention", triton_attn.unified_attention)
+    monkeypatch.setattr(triton_attn, "triton_reshape_and_cache_flash", triton_attn.triton_reshape_and_cache_flash)
     calls = []
     real = tda.paged_attention
 
@@ -197,3 +198,49 @@ def test_patch_routes_supported_calls_and_falls_back(monkeypatch):
     # Sliding window is not handled: upstream kernel, same result.
     assert torch.equal(call(patched, window_size=(31, 0))[:n], call(patched.__wrapped__, window_size=(31, 0))[:n])
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("use_pdl", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_cache_write_matches_upstream_with_padding_and_graph_replay(monkeypatch, use_pdl, dtype):
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
+
+    from vllm_omni.attention import triton_decode_attention as tda
+
+    if use_pdl and not tda._USE_PDL:
+        pytest.skip("PDL requires Hopper or newer")
+    monkeypatch.setattr(tda, "_USE_PDL", use_pdl)
+    key = torch.randn(37, 8, HEAD, device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
+    cache = torch.zeros(8, BLOCK, 8, 2 * HEAD, device="cuda", dtype=dtype)
+    expected = torch.zeros_like(cache)
+    slots = torch.randperm(8 * BLOCK, device="cuda")[:37]
+    slots[-3:] = -1
+    scale = torch.ones(1, device="cuda")
+
+    def write():
+        tda._cache_write_pdl(
+            key,
+            value,
+            cache[..., :HEAD],
+            cache[..., HEAD:],
+            slots,
+            "auto",
+            scale,
+            scale,
+            upstream=triton_reshape_and_cache_flash,
+        )
+
+    write()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        write()
+    for _ in range(2):
+        key.normal_()
+        value.normal_()
+        graph.replay()
+        triton_reshape_and_cache_flash(
+            key, value, expected[..., :HEAD], expected[..., HEAD:], slots, "auto", scale, scale
+        )
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)

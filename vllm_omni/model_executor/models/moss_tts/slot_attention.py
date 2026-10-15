@@ -16,17 +16,16 @@ The op deliberately preserves chunk-complete ring overwrite semantics; it does
 not recover entries overwritten by later tokens of the same input chunk.
 """
 
-import os as _pdl_os
-
 import torch
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
 
-# MOSS_TRITON_PDL=1 (Hopper+): launch with programmatic dependent launch. The kernel waits for its
+# Hopper+ supports programmatic dependent launch. The kernel waits for its
 # predecessor before any global access and lets its successor launch at once; results are unchanged.
-_TRITON_PDL = _pdl_os.environ.get("MOSS_TRITON_PDL") == "1"
+_USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
 
 
 def _bthd_out(q: torch.Tensor) -> torch.Tensor:
@@ -840,8 +839,8 @@ def _launch_flash(q, k, v, cache, starts, slot_ids, valid_lengths, context, row_
         one_warpgroup,
         one_warpgroup and d == 64,
         False,
-        USE_PDL=_TRITON_PDL,
-        launch_pdl=_TRITON_PDL,
+        USE_PDL=_USE_PDL,
+        launch_pdl=_USE_PDL,
         num_warps=nw,
         num_stages=ns,
     )
@@ -912,8 +911,8 @@ def _launch_flash_packed(
         one_warpgroup,
         one_warpgroup and d == 64,
         True,
-        USE_PDL=_TRITON_PDL,
-        launch_pdl=_TRITON_PDL,
+        USE_PDL=_USE_PDL,
+        launch_pdl=_USE_PDL,
         num_warps=nw,
         num_stages=ns or 2,
     )
