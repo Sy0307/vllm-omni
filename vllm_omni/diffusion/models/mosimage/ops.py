@@ -11,18 +11,23 @@ _MATCHED_REDUCTION = torch.__version__.split("+")[0].split(".")[:2] == ["2", "13
 if HAS_TRITON:
     from triton.language.extra.cuda import libdevice
 
+    # Shape-dependent sizes (sequence length, row counts, batch strides) are
+    # runtime arguments and the batch index comes from the launch grid, so a
+    # new prompt length or batch size reuses the compiled kernel. Only values
+    # fixed by the model (hidden sizes, head counts, per-row strides) are
+    # constexpr. `seq` is not specialized on divisibility by 16 either.
     @triton.jit
-    def _gated_residual_kernel(
-        x, y, gate, out, n: tl.constexpr, seq: tl.constexpr, dim: tl.constexpr, gs: tl.constexpr, block: tl.constexpr
-    ):
-        i = tl.program_id(0) * block + tl.arange(0, block)
-        a = tl.load(x + i, i < n, 0).to(tl.float32)
-        b = tl.load(y + i, i < n, 0).to(tl.float32)
-        g = tl.load(gate + i // (seq * dim) * gs + i % dim, i < n, 0).to(tl.float32)
+    def _gated_residual_kernel(x, y, gate, out, per_batch, dim: tl.constexpr, gs: tl.constexpr, block: tl.constexpr):
+        batch = tl.program_id(1)
+        j = tl.program_id(0) * block + tl.arange(0, block)
+        i = batch * per_batch + j
+        a = tl.load(x + i, j < per_batch, 0).to(tl.float32)
+        b = tl.load(y + i, j < per_batch, 0).to(tl.float32)
+        g = tl.load(gate + batch * gs + j % dim, j < per_batch, 0).to(tl.float32)
         product = (b * g).to(tl.bfloat16).to(tl.float32)
-        tl.store(out + i, a + product, i < n)
+        tl.store(out + i, a + product, j < per_batch)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["seq"])
     def _qk_norm_rope_kernel(
         q,
         k,
@@ -31,10 +36,9 @@ if HAS_TRITON:
         rope,
         oq,
         ok,
-        rows: tl.constexpr,
-        seq: tl.constexpr,
+        seq,
         heads: tl.constexpr,
-        bs: tl.constexpr,
+        bs,
         ss: tl.constexpr,
         hs: tl.constexpr,
         rs: tl.constexpr,
@@ -43,9 +47,12 @@ if HAS_TRITON:
             src, weight, dst = q, qw, oq
         else:
             src, weight, dst = k, kw, ok
-        row = tl.program_id(0) * 4 + tl.arange(0, 4)
-        s = row // heads % seq
-        base = row // (seq * heads) * bs + s * ss + row % heads * hs
+        batch = tl.program_id(2)
+        local = tl.program_id(0) * 4 + tl.arange(0, 4)
+        s = local // heads
+        base = batch * bs + s * ss + local % heads * hs
+        rows = (batch + 1) * (seq * heads)
+        row = batch * (seq * heads) + local
         lane = tl.arange(0, 32)
         offset = base[:, None] + lane[None, :] * 4
         v0 = tl.load(src + offset, row[:, None] < rows, 0).to(tl.float32)
@@ -68,7 +75,7 @@ if HAS_TRITON:
         b = (y * sin).to(tl.bfloat16).to(tl.float32)
         tl.store(dst + row[:, None] * 128 + d[None, :], a + b, row[:, None] < rows)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["seq"])
     def _rms_full_kernel(
         x_ptr,
         w_ptr,
@@ -76,21 +83,22 @@ if HAS_TRITON:
         scale_ptr,
         shift_ptr,
         dim: tl.constexpr,
-        seq: tl.constexpr,
+        seq,
         heads: tl.constexpr,
-        bs: tl.constexpr,
+        bs,
         ss: tl.constexpr,
         hs: tl.constexpr,
         modulate: tl.constexpr,
         scale_stride: tl.constexpr,
         shift_stride: tl.constexpr,
         block: tl.constexpr,
-        rows: tl.constexpr,
         row_tile: tl.constexpr,
     ):
-        row = tl.program_id(0) * row_tile + tl.arange(0, row_tile)[:, None]
-        batch = row // (seq * heads)
-        base = batch * bs + (row // heads % seq) * ss + (row % heads) * hs
+        batch = tl.program_id(1)
+        local = tl.program_id(0) * row_tile + tl.arange(0, row_tile)[:, None]
+        base = batch * bs + (local // heads) * ss + (local % heads) * hs
+        rows = (batch + 1) * (seq * heads)
+        row = batch * (seq * heads) + local
         lane = tl.arange(0, 32)[None, :]
         a0 = tl.full((row_tile, 32), 0, tl.float32)
         a1 = tl.full((row_tile, 32), 0, tl.float32)
@@ -126,9 +134,7 @@ if HAS_TRITON:
         tl.store(out_ptr + row * dim + d, result, mask)
 
     @triton.jit
-    def _situ_kernel(
-        h_ptr, g_ptr, out_ptr, n: tl.constexpr, dim: tl.constexpr, stride: tl.constexpr, block: tl.constexpr
-    ):
+    def _situ_kernel(h_ptr, g_ptr, out_ptr, n, dim: tl.constexpr, stride: tl.constexpr, block: tl.constexpr):
         i = tl.program_id(0) * block + tl.arange(0, block)
         offset = i // dim * stride + i % dim
         h = tl.load(h_ptr + offset, i < n, other=0).to(tl.float32)
@@ -151,29 +157,30 @@ if HAS_TRITON:
         out_ptr,
         scale_ptr,
         shift_ptr,
-        n: tl.constexpr,
+        per_batch,
         dim: tl.constexpr,
         block: tl.constexpr,
         modulate: tl.constexpr,
-        seq: tl.constexpr,
         scale_stride: tl.constexpr,
         shift_stride: tl.constexpr,
     ):
-        i = tl.program_id(0) * block + tl.arange(0, block)
-        x = tl.load(x_ptr + i, i < n, other=0)
-        inv = tl.load(inv_ptr + i // dim, i < n, other=0)
-        weight = tl.load(weight_ptr + i % dim, i < n, other=0).to(tl.float32)
+        batch = tl.program_id(1)
+        j = tl.program_id(0) * block + tl.arange(0, block)
+        i = batch * per_batch + j
+        mask = j < per_batch
+        x = tl.load(x_ptr + i, mask, other=0)
+        inv = tl.load(inv_ptr + i // dim, mask, other=0)
+        weight = tl.load(weight_ptr + j % dim, mask, other=0).to(tl.float32)
         normalized = (x * inv).to(tl.bfloat16).to(tl.float32)
         result = normalized * weight
         if modulate:
-            batch = i // (seq * dim)
-            scale = tl.load(scale_ptr + batch * scale_stride + i % dim, i < n, other=0).to(tl.float32)
-            shift = tl.load(shift_ptr + batch * shift_stride + i % dim, i < n, other=0).to(tl.float32)
+            scale = tl.load(scale_ptr + batch * scale_stride + j % dim, mask, other=0).to(tl.float32)
+            shift = tl.load(shift_ptr + batch * shift_stride + j % dim, mask, other=0).to(tl.float32)
             # Preserve all three eager BF16 rounding boundaries.
             result = result.to(tl.bfloat16).to(tl.float32)
             factor = (1.0 + scale).to(tl.bfloat16).to(tl.float32)
             result = (result * factor).to(tl.bfloat16).to(tl.float32) + shift
-        tl.store(out_ptr + i, result, i < n)
+        tl.store(out_ptr + i, result, mask)
 
     @triton.jit
     def _rotate_qk_kernel(
@@ -182,16 +189,18 @@ if HAS_TRITON:
         rope_ptr,
         out_q_ptr,
         out_k_ptr,
-        n: tl.constexpr,
-        sequence: tl.constexpr,
+        per_batch,
         heads: tl.constexpr,
         dim: tl.constexpr,
         rope_stride: tl.constexpr,
         block: tl.constexpr,
     ):
-        i = tl.program_id(0) * block + tl.arange(0, block)
-        d = i % dim
-        s = i // (heads * dim) % sequence
+        batch = tl.program_id(2)
+        j = tl.program_id(0) * block + tl.arange(0, block)
+        i = batch * per_batch + j
+        n = (batch + 1) * per_batch
+        d = j % dim
+        s = j // (heads * dim)
         pair = i + tl.where(d < dim // 2, dim // 2, -dim // 2)
         if tl.program_id(1) == 0:
             src = q_ptr
@@ -230,13 +239,13 @@ def gated_residual(x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor) -> torc
     ):
         return x + y * gate[:, None]
     out = torch.empty_like(x)
-    _gated_residual_kernel[(triton.cdiv(x.numel(), 1024),)](
+    per_batch = x.shape[1] * x.shape[2]
+    _gated_residual_kernel[(triton.cdiv(per_batch, 1024), x.shape[0])](
         x,
         y,
         gate,
         out,
-        x.numel(),
-        x.shape[1],
+        per_batch,
         x.shape[2],
         gate.stride(0),
         1024,
@@ -271,7 +280,7 @@ def try_qk_norm_rope(q, k, q_weight, k_weight, rope):
         return None
     oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     ok = torch.empty_like(oq)
-    _qk_norm_rope_kernel[(triton.cdiv(q.numel() // 128, 4), 2)](
+    _qk_norm_rope_kernel[(triton.cdiv(q.shape[1] * q.shape[2], 4), 2, q.shape[0])](
         q,
         k,
         q_weight,
@@ -279,7 +288,6 @@ def try_qk_norm_rope(q, k, q_weight, k_weight, rope):
         rope,
         oq,
         ok,
-        q.numel() // 128,
         q.shape[1],
         q.shape[2],
         *q.stride()[:3],
@@ -312,14 +320,13 @@ def try_rotate_qk(q: torch.Tensor, k: torch.Tensor, rope: torch.Tensor) -> tuple
         return None
     oq, ok = torch.empty_like(q), torch.empty_like(k)
     _, s, h, d = q.shape
-    _rotate_qk_kernel[(triton.cdiv(q.numel(), 1024), 2)](
+    _rotate_qk_kernel[(triton.cdiv(s * h * d, 1024), 2, q.shape[0])](
         q,
         k,
         rope,
         oq,
         ok,
-        q.numel(),
-        s,
+        s * h * d,
         h,
         d,
         rope.stride(1),
@@ -367,7 +374,8 @@ def try_rms_norm(
         and x.shape[-1] in (128, 3072)
         and x.numel() // x.shape[-1] >= 16
     ):
-        _rms_full_kernel[(triton.cdiv(x.numel() // x.shape[-1], 4),)](
+        heads = x.shape[2] if x.ndim == 4 else 1
+        _rms_full_kernel[(triton.cdiv(x.shape[1] * heads, 4), x.shape[0])](
             x,
             weight,
             output,
@@ -375,7 +383,7 @@ def try_rms_norm(
             shift if modulate else weight,
             x.shape[-1],
             x.shape[1],
-            x.shape[2] if x.ndim == 4 else 1,
+            heads,
             x.stride(0),
             x.stride(1),
             x.stride(2) if x.ndim == 4 else 0,
@@ -383,7 +391,6 @@ def try_rms_norm(
             scale.stride(0) if modulate else 0,
             shift.stride(0) if modulate else 0,
             triton.next_power_of_2(x.shape[-1]),
-            x.numel() // x.shape[-1],
             4,
             num_warps=4,
             enable_fp_fusion=False,
@@ -391,18 +398,20 @@ def try_rms_norm(
         return output
     xf = x.float().contiguous()
     inv = torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6)
-    _rms_tail_kernel[(triton.cdiv(x.numel(), 1024),)](
+    # Modulation is per batch row (x is [B, S, D]); otherwise treat x as one block.
+    batch = x.shape[0] if modulate else 1
+    per_batch = x.numel() // batch
+    _rms_tail_kernel[(triton.cdiv(per_batch, 1024), batch)](
         xf,
         inv,
         weight,
         output,
         scale if modulate else weight,
         shift if modulate else weight,
-        x.numel(),
+        per_batch,
         x.shape[-1],
         1024,
         modulate,
-        x.shape[1] if modulate else 1,
         scale.stride(0) if modulate else 0,
         shift.stride(0) if modulate else 0,
         num_warps=4,

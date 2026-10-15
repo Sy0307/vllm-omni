@@ -153,3 +153,63 @@ def test_situ_strided_ffn():
     actual = try_situ(hidden, gate)
     assert actual is not None
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "batch,sequence,dim,modulate",
+    [(2, 33, 256, True), (2, 5, 3072, True), (1, 7, 128, False)],
+)
+@torch.inference_mode()
+def test_rms_tail_rounding(batch, sequence, dim, modulate):
+    # Unmatched widths and fewer than 16 rows take the torch-reduction tail kernel.
+    torch.manual_seed(29)
+    x = torch.randn(batch, sequence, dim, device="cuda", dtype=torch.bfloat16) * 3
+    weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    scale, shift = torch.randn(batch, 2, dim, device="cuda", dtype=torch.bfloat16).unbind(1)
+    xf = x.float()
+    expected = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6)).to(x.dtype) * weight
+    if modulate:
+        expected = expected * (1 + scale[:, None]) + shift[:, None]
+        actual = try_rms_norm(x, weight, scale, shift)
+    else:
+        actual = try_rms_norm(x, weight)
+    assert actual is not None
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_new_shapes_reuse_compiled_kernels(monkeypatch):
+    """Prompt lengths and batch sizes vary per request and must not recompile kernels."""
+    from vllm.triton_utils import triton
+
+    from vllm_omni.diffusion.models.mosimage.ops import gated_residual, try_qk_norm_rope
+
+    if not hasattr(triton, "knobs"):
+        pytest.skip("Triton compile hooks are unavailable")
+
+    def run(batch, sequence):
+        kw = {"device": "cuda", "dtype": torch.bfloat16}
+        x = torch.randn(batch, sequence, 3072, **kw)
+        shift, scale, gate = torch.randn(batch, 6, 3072, **kw).unbind(1)[:3]
+        assert try_rms_norm(x, torch.randn(3072, **kw), scale, shift) is not None
+        gated_residual(x, x, gate)
+        q, k, _ = [t.unflatten(-1, (24, 128)) for t in torch.randn(batch, sequence, 3 * 3072, **kw).chunk(3, -1)]
+        head_weight = torch.randn(128, **kw)
+        rope = torch.randn(1, sequence, 128, **kw)
+        if _MATCHED_REDUCTION:
+            assert try_qk_norm_rope(q, k, head_weight, head_weight, rope) is not None
+        assert try_rotate_qk(q.contiguous(), k.contiguous(), rope) is not None
+        hidden, ffn_gate = torch.randn(batch, sequence, 16384, **kw).chunk(2, -1)
+        assert try_situ(hidden, ffn_gate) is not None
+        tail_scale, tail_shift = torch.randn(batch, 2, 256, **kw).unbind(1)
+        tail = torch.randn(batch, sequence, 256, **kw)
+        assert try_rms_norm(tail, torch.randn(256, **kw), tail_scale, tail_shift) is not None
+
+    run(1, 257)
+    compiled = []
+    monkeypatch.setattr(
+        triton.knobs.runtime, "jit_post_compile_hook", lambda **kwargs: compiled.append(kwargs["fn"].name)
+    )
+    for batch, sequence in [(1, 258), (2, 272), (3, 301)]:
+        run(batch, sequence)
+    assert not compiled, f"Triton recompiled for new shapes: {compiled}"
