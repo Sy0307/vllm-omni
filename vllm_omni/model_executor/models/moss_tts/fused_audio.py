@@ -25,8 +25,8 @@ decoded on later steps, also on steps without a batch, and handed to the tail
 sender, which hands it to the scheduler to emit, in order, with the request's
 terminal output that the scheduler held back. Aborted requests release their codec stream at once.
 
-The emitted audio is exactly the two-stage audio: every non-padding frame up to
-the stop.
+Every non-padding frame before the stop is decoded in order. Chunk boundaries
+and BF16 rounding can change the waveform relative to the two-stage decoder.
 
 With early first audio (``fused_early_first_audio``), a stream's first frame is
 queued as its first chunk as soon as it is sampled, right after the final

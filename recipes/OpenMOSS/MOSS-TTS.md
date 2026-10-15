@@ -444,6 +444,12 @@ audio counts as the first chunk. Ramp chunks use the first-chunk wait budget,
 and a stopped stream flushes its remaining
 frames immediately through the normal tail path.
 
+Chunk boundaries can change BF16 decoder rounding. Equal request seeds also
+do not guarantee identical generated codec tokens across dynamic serving
+batches. Validate chunking changes with both fixed-token decoder comparisons
+and repeated end-to-end quality runs using the deployed sampling and graph
+path. A confidence interval containing zero does not establish equal quality.
+
 `moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
 process on one GPU. It uses packed codec graphs, fused depth kernels, precise
 stream dependencies, and a codec GEMM SM carveout of 48. The ordinary
