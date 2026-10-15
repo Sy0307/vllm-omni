@@ -115,12 +115,13 @@ def test_deferred_writes_land_together_like_immediate_writes():
                 t.stage_write_elem(idx, value)
                 e[idx] = value
 
+    writes = staged_writes.StagedWrites()
     for _ in range(3):
-        with staged_writes.deferred_writes():
+        with writes.deferred():
             for i in range(len(tensors)):
                 stage(i)
                 tensors[i].apply_write()
-            assert len(staged_writes._Deferred.pending) == len(tensors), "applied on exit, not per tensor"
+            assert len(writes.pending) == len(tensors), "applied on exit, not per tensor"
             # A second batch for the same tensor stays ordered after the first.
             stage(0)
             tensors[0].apply_write()
@@ -146,12 +147,13 @@ def test_repeated_flushes_survive_a_slow_stream():
     t = StagedWriteTensor((64, 32), dtype=torch.int64, device=device)
     expected = np.zeros((64, 32), dtype=np.int64)
     rng = np.random.default_rng(3)
+    writes = staged_writes.StagedWrites()
     # Compile the flush kernel first, so the timed window below only queues launches.
-    with staged_writes.deferred_writes():
+    with writes.deferred():
         t.stage_write(0, 0, np.zeros(32, dtype=np.int64))
         t.apply_write()
     torch.accelerator.synchronize()
-    with staged_writes.deferred_writes():
+    with writes.deferred():
         torch.cuda._sleep(1_000_000_000)  # ~0.5 s: the flushes queue behind it while the host keeps going
         # Each re-apply of the same tensor flushes the window: many flushes in one window.
         for row in range(64):
@@ -171,7 +173,12 @@ def test_staged_h2d_matches_the_pinned_copy_and_survives_slow_readers():
     from vllm_omni.worker_v2 import staged_writes
 
     staged_writes.install()
-    staged = model_runner.async_tensor_h2d
+    writes = staged_writes.StagedWrites()
+
+    def staged(*args, **kwargs):
+        with writes.activate():
+            return model_runner.async_tensor_h2d(*args, **kwargs)
+
     assert staged is not original
     device = torch.device("cuda", 0)
     rng = np.random.default_rng(2)
@@ -231,3 +238,28 @@ def test_fused_bincount_matches_a_host_count():
         want_mask = np.packbits(bits.reshape(-1, 32)[:, ::-1], axis=1, bitorder="big").view(">u4").reshape(-1)
         np.testing.assert_array_equal(got_mask[r], want_mask.astype(np.uint32))
         np.testing.assert_array_equal(got_counts[r], np.bincount(tok[r, pl[r] : fl[r]], minlength=vocab))
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_nested_runner_contexts_keep_pending_writes_isolated():
+    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+
+    from vllm_omni.worker_v2 import staged_writes
+
+    staged_writes.install()
+    a, b = staged_writes.StagedWrites(), staged_writes.StagedWrites()
+    device = torch.device("cuda", 0)
+    ta, tb = [StagedWriteTensor((1, 2), dtype=torch.int32, device=device) for _ in range(2)]
+    with a.deferred():
+        ta.stage_write(0, 0, [11, 12])
+        ta.apply_write()
+        with b.deferred():
+            tb.stage_write(0, 0, [21, 22])
+            tb.apply_write()
+            assert len(a.pending) == len(b.pending) == 1
+        assert len(a.pending) == 1 and not b.pending
+        ta.stage_write(0, 0, [31, 32])
+        ta.apply_write()
+    assert not a.pending and not b.pending and staged_writes._active.get() is None
+    assert ta.gpu.cpu().tolist() == [[31, 32]]
+    assert tb.gpu.cpu().tolist() == [[21, 22]]

@@ -576,8 +576,8 @@ def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
 
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 4096
-    owner._stream_decode_event = None
     eager = EagerMTPState(owner)
+    eager.decode_event = None
     eager._audio_buffer = StreamingAudioBuffer(4, 25)
     eager._audio_buffer.add("request")
     eager._frame_requests = {"request"}
@@ -605,15 +605,15 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
 
     owner = mocker.Mock()
-    owner._stream_pos = {"request": 37}
-    owner._eager_embeds = torch.arange(18).reshape(6, 3).float()
-    owner._eager_ready = {}
     owner.intermediate_buffer.buffers = [{} for _ in range(6)]
     generator = torch.Generator().manual_seed(42)
     owner._mtp_generators = {"request": generator}
     saved = [torch.arange(6)]
     owner.model.stream_decoder.save_slot.return_value = saved
     eager = EagerMTPState(owner)
+    eager.stream_pos = {"request": 37}
+    eager.embeds = torch.arange(18).reshape(6, 3).float()
+    eager.ready = {}
     eager._talker_inputs["request"] = TalkerInputs(torch.ones(20, 3), 10)
     eager._side_stream = mocker.Mock()
     eager._audio_buffer = StreamingAudioBuffer(4, 25)
@@ -621,10 +621,10 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     request.push(torch.ones(4), False)
     request.push(torch.ones(4), False)
     eager.suspend_audio("request", 2)
-    owner._stream_pos.clear()
+    eager.stream_pos.clear()
     owner._mtp_generators.clear()
     eager.resume_audio("request", 5)
-    assert owner._stream_pos["request"] == 37
+    assert eager.stream_pos["request"] == 37
     assert owner._mtp_generators["request"] is generator
     assert eager._restore_audio["request"] is saved
     assert sum(part.numel() for part in request.pending) == 4
@@ -640,10 +640,10 @@ def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mock
     from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, TalkerInputs
 
     owner = mocker.Mock()
-    owner._eager_embeds = torch.tensor([[20.0, 30.0]])
     owner.model.preprocess.return_value = (None, None, {"mtp_inputs": (None, torch.tensor([[2.0, 3.0]]))})
     owner.intermediate_buffer.buffers = [{"req_id": "request"}]
     eager = EagerMTPState(owner)
+    eager.embeds = torch.tensor([[20.0, 30.0]])
     eager._restore_audio["request"] = []
     history = torch.arange(8).reshape(4, 2).float()
     eager._talker_inputs["request"] = TalkerInputs(history, 4)
@@ -744,8 +744,8 @@ def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker
 
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 12
-    owner._eager_embeds = torch.zeros(2, 3)
     eager = EagerMTPState(owner)
+    eager.embeds = torch.zeros(2, 3)
     first = torch.arange(9, dtype=torch.float32).reshape(3, 3)
     second = torch.arange(9, 18, dtype=torch.float32).reshape(3, 3)
     expected = {"a": torch.cat((first[:2], second[2:])), "b": torch.cat((first[2:], second[:2]))}
@@ -914,8 +914,6 @@ def test_stream_history_allocates_only_for_scheduled_requests():
 
     owner = SimpleNamespace(
         model=SimpleNamespace(stream_decoder=object()),
-        _eager_embeds=torch.zeros(128, 4),
-        _stream_pos={},
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
     batch = SimpleNamespace(

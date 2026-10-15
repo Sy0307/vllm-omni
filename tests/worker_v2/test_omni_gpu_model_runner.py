@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
@@ -28,6 +29,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_runner():
     """Create an OmniGPUModelRunner without calling __init__."""
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     runner.model = MagicMock()
     runner.model_config = SimpleNamespace(logits_processors=None)
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
@@ -56,8 +58,6 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
 
 @pytest.mark.parametrize("new_request", [False, True])
 def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request):
-    from vllm_omni.worker_v2 import staged_writes
-
     runner = _make_runner()
     runner.sampler = Sampler.__new__(Sampler)
     runner.model_config.logits_processors = ["test.CustomProcessor"]
@@ -73,13 +73,13 @@ def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request):
         if pending:
             tokens[:] = pending.pop()
 
-    monkeypatch.setattr(staged_writes._Deferred, "flush", flush)
+    monkeypatch.setattr(runner._staged_writes, "flush", flush)
 
     def parent_add_requests(_runner, _output):
         # Model the upstream order: request writes, then a custom processor
         # initializes device statistics from the newly installed token row.
         if new_request:
-            if staged_writes._Deferred.depth:
+            if runner._staged_writes.depth:
                 pending.append([17])
             else:
                 tokens[:] = [17]
@@ -121,6 +121,7 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
 
 def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     runner.model_config = object.__new__(OmniModelConfig)
     runner.model_config.async_chunk = False
     plane = mocker.Mock()
@@ -135,6 +136,7 @@ def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
 def test_duplex_kv_reanchor_runs_after_block_table_writes():
     # Same model hook as the V1 AR runner: reanchor reads the committed block tables.
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     order: list[str | tuple[str, object, object]] = []
     for name in ("_prepare_native_data_plane", "finish_requests", "free_states", "add_requests", "update_requests"):
         setattr(runner, name, lambda *_args: None)
@@ -160,6 +162,7 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: (0, 0))
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(1, 2)
 
     def original_forward():
@@ -206,6 +209,7 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
 )
 def test_mrv2_rejects_parallel_modes_at_startup(parallel_config, match):
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(**parallel_config))
     with pytest.raises(NotImplementedError, match=match):
         runner._validate_parallel_support()
@@ -281,6 +285,7 @@ def _aux_output(num_tokens):
 
 def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
     runner._configure_cudagraph_output_contract()
     assert runner._full_graph_aux_outputs and not runner._exclude_full_graph
@@ -330,6 +335,7 @@ def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
 )
 def test_full_graph_aux_contract_rejects_invalid_outputs(aux):
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
     runner._configure_cudagraph_output_contract()
     with pytest.raises(RuntimeError, match="supports_mrv2_full_graph_aux_outputs"):
@@ -338,6 +344,7 @@ def test_full_graph_aux_contract_rejects_invalid_outputs(aux):
 
 def test_full_graph_aux_contract_rejects_structure_change():
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
     runner._configure_cudagraph_output_contract()
     runner._flatten_capture_aux_output((torch.zeros(3, 2), {"layers": {0: torch.zeros(3, 2)}}))
@@ -347,6 +354,7 @@ def test_full_graph_aux_contract_rejects_structure_change():
 
 def test_full_graph_output_without_contract_is_hidden_only():
     runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(2, 2)
     assert runner._split_fullgraph_output(hidden) == (hidden, None)
 
@@ -365,6 +373,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         runner_kind
     ]
     runner = object.__new__(runner_cls)
+    runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(1, 2)
     runner.model = MagicMock(
         return_value=OmniOutput(text_hidden_states=hidden, multimodal_outputs={})

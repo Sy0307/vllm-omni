@@ -914,6 +914,26 @@ class StreamingDecodeGraphs:
             self.graphs[bsz] = (graph, codes, slots, pos, out)
         self.sizes = sorted(self.graphs)
 
+    def input_buffers(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Inputs for a fused producer; the caller must fence prior replay and output readers.
+
+        Only one-frame eager MTP uses this interface. Reference priming keeps
+        the copy-based path and must not run between a direct fill and replay.
+        """
+        if self.frames != 1:
+            return None
+        size = next((b for b in self.sizes if b >= n), None)
+        if size is None:
+            return None
+        _graph, codes, slots, pos, _out = self.graphs[size]
+        return codes, slots, pos
+
+    def replay_prepared(self, n: int, size: int) -> torch.Tensor:
+        """Replay after the producer has filled all rows, including scratch padding."""
+        graph, _codes, _slots, _pos, out = self.graphs[size]
+        graph.replay()
+        return out[:n]
+
     def __call__(self, codes: torch.Tensor, slots: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """``codes`` [n, frames, NQ], ``slots``/``pos`` [n] on device -> waveform view [n, frames * spf]."""
         n = int(codes.shape[0])

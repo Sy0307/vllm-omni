@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import DeviceStager
+from vllm_omni.worker_v2.model_states.eager_mtp import FrameBatch
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -86,7 +87,6 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 
     state._eager_state = EagerMTPState(state)
-    state._stream_pos = {}
     state._mtp_generators = {}
     state._mtp_seeded = set()
     state._mtp_replays = {}
@@ -146,6 +146,12 @@ def test_remove_request_state_isolation(mode):
     state = _make_state()
     _add(state, "r1", 0)
     state._mtp_generators["r1"] = torch.Generator(device="cpu")
+    _add(state, "r2", 1)
+    eager = state._eager_state
+    eager.embeds = torch.zeros(4, 2)
+    eager.ready = {0: "r1", 1: "r2"}
+    eager.mark_settled(0, "r1")
+    eager.mark_settled(1, "r2")
     if mode == "unknown":
         state.remove_request("missing")
         assert state.intermediate_buffer.buffers[0]["req_id"] == "r1"
@@ -154,6 +160,11 @@ def test_remove_request_state_isolation(mode):
     state.remove_request(0 if mode == "index" else "r1")
     assert state.intermediate_buffer.buffers[0] == {}
     assert "r1" not in state._mtp_generators  # recycled slot inherits no seed stream
+
+    assert eager.ready == {1: "r2"}
+    assert eager.settled.tolist() == [None, "r2", None, None]
+    _add(state, "replacement", 0)
+    assert eager.settled[0] is None and 0 not in eager.ready
 
 
 def test_output_spans_follow_reordered_mixed_batch():
@@ -607,16 +618,9 @@ class _EagerBatch(_DummyInputBatch):
 def _make_eager_state(max_num_reqs=4):
     state = _make_state(max_num_reqs=max_num_reqs, has_preprocess=True)
     _init_static(state, max_num_reqs, dim=_EAGER_DIM)
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
-
-    state._eager_state = EagerMTPState(state)
-    state._first_audio_requests = set()
     state._eager_mtp = True
     state._eager_fastpath = False
-    state._eager_rows = None
-    state._eager_ready = {}
-    state._eager_settled = {}
-    state._eager_embeds = torch.zeros((max_num_reqs, _EAGER_DIM))
+    state._eager_state.embeds = torch.zeros((max_num_reqs, _EAGER_DIM))
     state._decode_preprocess = None
     state._mtp_sample_uniforms = None
     state.vllm_config.cache_config = SimpleNamespace(enable_prefix_caching=False)
@@ -650,7 +654,11 @@ def test_eager_mtp_publishes_frames_in_the_step_that_sampled_cb0():
     # EOS (async scheduling ran the finished request once more).
     batch = _EagerBatch([3, 1, 1])
     input_ids = torch.tensor([0, 0, 0, 42, _EOS])
-    state._eager_rows = (batch, [(0, 0, "prefill", True), (1, 1, "decode", False), (2, 2, "ended", False)], input_ids)
+    state._eager_state.recorded = (
+        batch,
+        FrameBatch([(0, 0, "prefill", True), (1, 1, "decode", False), (2, 2, "ended", False)]),
+        input_ids,
+    )
     text_hidden = torch.arange(5 * _EAGER_DIM, dtype=torch.float32).reshape(5, _EAGER_DIM)
     sampled = torch.tensor([[7], [_EOS], [9]])
     outputs = _eager_outputs(5)
@@ -670,15 +678,15 @@ def test_eager_mtp_publishes_frames_in_the_step_that_sampled_cb0():
     assert not codes[:2].any()
     # Valid only when both the sampled and (for decode) the input CB0 are codec ids.
     assert outputs["meta"]["codec_frame_valid"].tolist() == [0, 0, 1, 0, 0]
-    assert state._eager_ready == {0: "prefill", 1: "decode", 2: "ended"}
-    assert torch.equal(state._eager_embeds[0], torch.full((_EAGER_DIM,), 107.0))
-    assert state._eager_rows is None
+    assert state._eager_state.ready == {0: "prefill", 1: "decode", 2: "ended"}
+    assert torch.equal(state._eager_state.embeds[0], torch.full((_EAGER_DIM,), 107.0))
+    assert state._eager_state.recorded is None
 
 
 def test_eager_mtp_ignores_rows_recorded_for_another_batch():
     state = _make_eager_state()
     _fill_buffers(state, "r0")
-    state._eager_rows = (_EagerBatch([1]), [(0, 0, "r0", False)], torch.tensor([5]))
+    state._eager_state.recorded = (_EagerBatch([1]), FrameBatch([(0, 0, "r0", False)]), torch.tensor([5]))
     outputs = _eager_outputs(1)
     state.run_eager_mtp(_EagerBatch([1]), torch.zeros(1, _EAGER_DIM), torch.tensor([[3]]), outputs)
     assert state.model.mtp_calls == []
@@ -689,7 +697,7 @@ def test_eager_mtp_requires_retained_frame_outputs():
     state = _make_eager_state()
     _fill_buffers(state, "r0")
     batch = _EagerBatch([1])
-    state._eager_rows = (batch, [(0, 0, "r0", False)], torch.tensor([5]))
+    state._eager_state.recorded = (batch, FrameBatch([(0, 0, "r0", False)]), torch.tensor([5]))
     with pytest.raises(RuntimeError, match="requires retained codes.audio"):
         state.run_eager_mtp(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[3]]), {"codes": {"audio": None}})
 
@@ -697,9 +705,9 @@ def test_eager_mtp_requires_retained_frame_outputs():
 def test_eager_decode_input_is_previous_frame_plus_text_step():
     state = _make_eager_state()
     _fill_buffers(state, "r0", "r1")
-    state._eager_ready = {0: "r0", 1: "r1"}
-    state._eager_embeds[0] = 5.0
-    state._eager_embeds[1] = 7.0
+    state._eager_state.ready = {0: "r0", 1: "r1"}
+    state._eager_state.embeds[0] = 5.0
+    state._eager_state.embeds[1] = 7.0
     embeds = torch.zeros((2, _EAGER_DIM))
     batches = [
         (0, 0, (torch.zeros(_EAGER_DIM), torch.full((_EAGER_DIM,), 2.0))),
@@ -727,8 +735,8 @@ def test_run_preprocess_records_rows_that_keep_a_sample(has_stream_decoder):
         # define the attribute at all.
         del state.model.stream_decoder
     _fill_buffers(state, "chunk", "final", "decode")
-    state._eager_ready = {2: "decode"}
-    state._eager_embeds[2] = 4.0
+    state._eager_state.ready = {2: "decode"}
+    state._eager_state.embeds[2] = 4.0
     text_step = torch.ones(_EAGER_DIM)
 
     def preprocess(input_ids, input_embeds, **info):
@@ -744,7 +752,8 @@ def test_run_preprocess_records_rows_that_keep_a_sample(has_stream_decoder):
     )
     state.run_preprocess(batch, model_inputs, req_states)
 
-    recorded_batch, entries, _ids = state._eager_rows
+    recorded_batch, frame_batch, _ids = state._eager_state.recorded
+    entries = frame_batch.entries
     assert recorded_batch is batch
     # A non-final prefill chunk samples nothing that is kept.
     assert entries == [(1, 1, "final", True), (2, 2, "decode", False)]
@@ -755,8 +764,8 @@ def test_run_preprocess_records_rows_that_keep_a_sample(has_stream_decoder):
 def test_prefill_rows_written_for_the_batch_skip_per_request_preprocess():
     state = _make_eager_state()
     _fill_buffers(state, "batched", "serial", "decode")
-    state._eager_ready = {2: "decode"}
-    state._eager_embeds[2] = 4.0
+    state._eager_state.ready = {2: "decode"}
+    state._eager_state.embeds[2] = 4.0
     seen_rows: list[list[tuple[int, int, str]]] = []
     preprocessed: list[str] = []
 
@@ -787,17 +796,17 @@ def test_prefill_rows_written_for_the_batch_skip_per_request_preprocess():
     assert model_inputs["inputs_embeds"][:3].eq(9.0).all()
     assert state.intermediate_buffer.buffers[0]["meta"] == {"talker_prefill_offset": 3}
     # The batch-written row still keeps its sample (its prompt ends in this chunk).
-    assert [entry[2] for entry in state._eager_rows[1]] == ["batched", "decode"]
+    assert [entry[2] for entry in state._eager_state.recorded[1].entries] == ["batched", "decode"]
 
 
 @pytest.mark.parametrize("first_was_valid", [False, True])
 def test_first_audio_requirement_survives_eos_only_if_audio_was_queued(first_was_valid):
     state = _make_eager_state()
     _fill_buffers(state, "r0")
-    state._first_audio_requests.add("r0")
+    state._eager_state.first_audio_requests.add("r0")
     state._eager_state._first_audio_valid = torch.tensor([first_was_valid, False, False, False])
     batch = _EagerBatch([1])
-    state._eager_rows = (batch, [(0, 0, "r0", False)], torch.tensor([5]))
+    state._eager_state.recorded = (batch, FrameBatch([(0, 0, "r0", False)]), torch.tensor([5]))
     outputs = _eager_outputs(1)
     outputs["meta"]["first_audio"] = torch.zeros(1, dtype=torch.bool)
     state.run_eager_mtp(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[_EOS]]), outputs)
@@ -813,19 +822,23 @@ def test_first_audio_marker_requires_accepted_delivery(monkeypatch, accepted):
     state.model.first_frame_decoder = SimpleNamespace(
         sample_rate=24000, decode=lambda codes: torch.ones(codes.shape[0], 2)
     )
-    state._first_audio_stream = SimpleNamespace(wait_stream=lambda stream: None)
-    state._first_audio_sender = SimpleNamespace(submit=lambda ids, pcm, sr, valid: accepted)
+    state._eager_state.first_audio_stream = SimpleNamespace(wait_stream=lambda stream: None)
+    state._eager_state.first_audio_sender = SimpleNamespace(submit=lambda ids, pcm, sr, valid: accepted)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: None)
     batch = _EagerBatch([1, 1])
-    state._eager_rows = (batch, [(0, 0, "r0", True), (1, 1, "r1", True)], torch.zeros(2, dtype=torch.long))
+    state._eager_state.recorded = (
+        batch,
+        FrameBatch([(0, 0, "r0", True), (1, 1, "r1", True)]),
+        torch.zeros(2, dtype=torch.long),
+    )
     outputs = _eager_outputs(2)
     outputs["meta"]["first_audio"] = torch.zeros(2, dtype=torch.bool)
 
     state.run_eager_mtp(batch, torch.zeros(2, _EAGER_DIM), torch.tensor([[7], [8]]), outputs)
 
-    assert state._first_audio_requests == set(accepted)
+    assert state._eager_state.first_audio_requests == set(accepted)
     # A missing route must leave the normal codec path responsible for frame 0;
     # otherwise it skips the frame and the orchestrator waits forever for it.
     assert outputs["meta"]["first_audio"].tolist() == ["r0" in accepted, "r1" in accepted]
@@ -879,13 +892,16 @@ def test_split_settled_rows_matches_per_row_check():
     req_indices = batch.idx_mapping_np.tolist()
     # Slot 2 still names a finished request, slot 1 schedules a prefill
     # chunk, slot 4 is not settled and slot 7 is not scheduled.
-    settled = {3: "c", 0: "a", 2: "old", 1: "b", 7: "z"}
+    settled = np.array(["a", "b", "old", "c", None, None, None, "z"], dtype=object)
     split = OmniModelState._split_settled_rows(batch, req_indices, settled)
     assert split is not None
     settled_rows, remaining = split
     assert settled_rows == [(0, 3, 0, "c"), (1, 0, 1, "a")]
     assert remaining == [(2, 2), (3, 1), (4, 4)]
-    assert OmniModelState._split_settled_rows(batch, req_indices, {2: "old"}) is None
+    assert (
+        OmniModelState._split_settled_rows(batch, req_indices, np.array([None, None, "old", None, None], dtype=object))
+        is None
+    )
 
 
 def test_settled_row_split_preserves_mixed_batch_and_pending_replay(monkeypatch):
@@ -895,9 +911,9 @@ def test_settled_row_split_preserves_mixed_batch_and_pending_replay(monkeypatch)
         state = _make_eager_state()
         _fill_buffers(state, "prefill", "decode")
         state._eager_fastpath = True
-        state._eager_settled = {1: "decode"}
-        state._eager_ready = {1: "decode"}
-        state._eager_embeds[1].fill_(7)
+        state._eager_state.mark_settled(1, "decode")
+        state._eager_state.ready = {1: "decode"}
+        state._eager_state.embeds[1].fill_(7)
         state.model.eager_settled_text_step = lambda: torch.ones(_EAGER_DIM)
         state.model.eager_decode_settled = lambda info: False
         state.model.preprocess = lambda input_ids, input_embeds, **info: (input_ids, input_embeds, {})
@@ -912,7 +928,7 @@ def test_settled_row_split_preserves_mixed_batch_and_pending_replay(monkeypatch)
     monkeypatch.setattr(reference, "_split_settled_rows", lambda *args: None)
     reference.run_preprocess(ref_batch, ref_inputs)
     torch.testing.assert_close(inputs["inputs_embeds"], ref_inputs["inputs_embeds"], rtol=0, atol=0)
-    assert vector._eager_rows[1] == reference._eager_rows[1]
+    assert vector._eager_state.recorded[1].entries == reference._eager_state.recorded[1].entries
     assert inputs["inputs_embeds"][3].tolist() == [8.0] * _EAGER_DIM
 
     replay, replay_batch, replay_inputs = prepare()

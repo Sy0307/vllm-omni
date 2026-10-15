@@ -191,7 +191,9 @@ class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Before the runner builds its staged-write state tensors.
         staged_writes.install()
-        super().__init__(*args, **kwargs)
+        self._staged_writes = staged_writes.StagedWrites()
+        with self._staged_writes.activate():
+            super().__init__(*args, **kwargs)
         self._validate_parallel_support()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
@@ -215,6 +217,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 "use model_runner: v1 when prefill_context_parallel_size > 1"
             )
 
+    @staged_writes.runner_context
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         # The upstream Sampler stages static parameters only in add_request.
         # With no new requests, its UVA snapshots remain valid and immutable.
@@ -241,11 +244,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
         # Custom processors may read request tokens in apply_staged_writes;
         # preserve upstream's request-state flush before their callback.
-        with staged_writes.deferred_writes() if static_staged_writes else nullcontext():
+        with self._staged_writes.deferred() if static_staged_writes else nullcontext():
             super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
-        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
+        sender = getattr(getattr(getattr(self, "model_state", None), "_eager_state", None), "first_audio_sender", None)
         if sender is not None:
             sender.close()
         # Every owner must release its resources even if an earlier drain fails.
@@ -404,6 +407,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
 
+    @staged_writes.runner_context
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Handle CUDA graph capture for Omni models.
 
@@ -516,6 +520,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
+    @staged_writes.runner_context
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,

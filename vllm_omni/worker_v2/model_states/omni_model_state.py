@@ -39,7 +39,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import DeviceStager, index_to_device
-from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, FrameBatch
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
@@ -106,11 +106,7 @@ class OmniModelState(DefaultModelState):
     _decode_preprocess_is_identity = False
     _eager_mtp = False
     _eager_fastpath = False
-    _eager_rows: tuple[InputBatch, list[tuple[int, int, str, bool]], torch.Tensor] | None = None
     preprocess_keeps_mm_inputs = False
-    _first_audio_stream: torch.cuda.Stream | None = None
-    # Set by the stage engine process when it can take one-request outputs directly.
-    _first_audio_sender: Any = None
 
     def __init__(
         self,
@@ -199,10 +195,6 @@ class OmniModelState(DefaultModelState):
         # Captured whole-MTP graph entry per batch size, once a replay through
         # the wrapper has resolved it: (padded rows, entry).
         self._mtp_replays: dict[int, tuple[int, Any]] = {}
-        # Talker stream decode: each request's next frame position, and the
-        # side-stream event the step's PCM output copy must wait on.
-        self._stream_pos: dict[str, int] = {}
-        self._stream_decode_event: torch.cuda.Event | None = None
         if self._embed_dim > 0 and hasattr(model, "mtp"):
             max_bs = max_num_reqs
             self._mtp_input_ids = torch.zeros(max_bs, dtype=torch.long, device=device)
@@ -222,17 +214,10 @@ class OmniModelState(DefaultModelState):
         # Eager frames: finish MTP in the step that sampled CB0 (see
         # run_eager_mtp). The next step only adds its text-step embedding.
         self._eager_mtp = self._mtp_input_ids is not None and bool(getattr(model, "mtp_eager_frames", False))
-        self._eager_rows = None
         self._eager_state = EagerMTPState(self)
-        self._eager_embeds: torch.Tensor | None = None
-        self._eager_ready: dict[int, str] = {}
-        self._first_audio_requests: set[str] = set()
-        # Slots whose decode preprocess no longer changes state (see
-        # model.eager_decode_settled); they skip the per-row path.
-        self._eager_settled: dict[int, str] = {}
         self._eager_fastpath = self._eager_mtp
         if self._eager_mtp:
-            self._eager_embeds = torch.zeros((max_num_reqs, self._embed_dim), dtype=self.dtype, device=device)
+            self._eager_state.embeds = torch.zeros((max_num_reqs, self._embed_dim), dtype=self.dtype, device=device)
             # The model then leaves frame codes/validity and the decode MTP
             # inputs to run_eager_mtp instead of building them per row.
             model.eager_frames_active = True
@@ -461,13 +446,7 @@ class OmniModelState(DefaultModelState):
         if req_id is not None:
             getattr(self, "_mtp_generators", {}).pop(req_id, None)
             getattr(self, "_mtp_seeded", set()).discard(req_id)
-            self._stream_pos.pop(req_id, None)
-            eager_state = getattr(self, "_eager_state", None)
-            if eager_state is not None:
-                eager_state.release_stream_slot(req_id, req_index)
-            getattr(self, "_first_audio_requests", set()).discard(req_id)
-        getattr(self, "_eager_ready", {}).pop(req_index, None)
-        getattr(self, "_eager_settled", {}).pop(req_index, None)
+            self._eager_state.release_request(req_id, req_index)
         self.intermediate_buffer.remove_request(req_index)
 
     # ------------------------------------------------------------------
@@ -700,7 +679,7 @@ class OmniModelState(DefaultModelState):
     def _split_settled_rows(
         input_batch: InputBatch,
         req_indices: list[int],
-        settled: dict[int, str],
+        settled: np.ndarray,
     ) -> tuple[list[tuple[int, int, int, str]], list[tuple[int, int]]] | None:
         """Vectorized settled-row test of ``run_preprocess``.
 
@@ -713,13 +692,9 @@ class OmniModelState(DefaultModelState):
         """
         n = input_batch.num_reqs
         slots = np.asarray(input_batch.idx_mapping_np[:n])
-        owners = np.full(max(int(slots.max()), max(settled)) + 1, None, dtype=object)
-        owners[np.fromiter(settled.keys(), dtype=np.int64, count=len(settled))] = np.array(
-            list(settled.values()), dtype=object
-        )
         req_ids = np.empty(n, dtype=object)
         req_ids[:] = input_batch.req_ids[:n]
-        is_settled = (np.asarray(input_batch.num_scheduled_tokens[:n]) == 1) & (owners[slots] == req_ids)
+        is_settled = (np.asarray(input_batch.num_scheduled_tokens[:n]) == 1) & (settled[slots] == req_ids)
         if not is_settled.any():
             return None
         rows = np.flatnonzero(is_settled)
@@ -779,14 +754,14 @@ class OmniModelState(DefaultModelState):
         self._stage_batched_preprocess_inputs(req_indices, embeds.device)
 
         preprocess_entries: list[tuple[int, int, int, int, dict[str, Any], bool]] = []
-        settled = self._eager_settled if self._eager_fastpath else None
+        settled = self._eager_state.settled if self._eager_fastpath else None
         settled_rows: list[tuple[int, int, int, str]] = []
         replay_rows: list[tuple[int, int, str, bool]] = []
         # Declared identity decode has no per-row updates or hook work.
         skip_decode_rows = self._decode_preprocess_is_identity and not self._eager_mtp
         is_prefilling_np = getattr(input_batch, "is_prefilling_np", None) if skip_decode_rows else None
         rows: Iterable[tuple[int, int]] = enumerate(req_indices)
-        if settled and is_prefilling_np is None and not self._eager_state.has_pending_replay():
+        if settled is not None and is_prefilling_np is None and not self._eager_state.has_pending_replay():
             split = self._split_settled_rows(input_batch, req_indices, settled)
             if split is not None:
                 settled_rows, rows = split
@@ -813,7 +788,7 @@ class OmniModelState(DefaultModelState):
                 if input_batch.num_computed_prefill_tokens_np[i] + n_tok >= input_batch.prefill_len_np[i]:
                     replay_rows.append((i, req_idx, buf["req_id"], True))
                 continue
-            if settled and n_tok == 1 and settled.get(req_idx) == buf["req_id"]:
+            if settled is not None and n_tok == 1 and settled[req_idx] == buf["req_id"]:
                 settled_rows.append((i, req_idx, start, buf["req_id"]))
                 continue
             if str(buf["req_id"]).startswith("_warmup_"):
@@ -846,16 +821,18 @@ class OmniModelState(DefaultModelState):
 
         if self._eager_mtp:
             # Rows whose sample is kept this step: decode, or the final prefill chunk.
-            self._eager_rows = (
+            self._eager_state.recorded = (
                 input_batch,
-                [
-                    (i, req_idx, str(info["req_id"]), is_prefill)
-                    for i, req_idx, _start, n_tok, info, is_prefill in preprocess_entries
-                    if not is_prefill
-                    or int(info.get("_omni_num_computed_tokens", 0)) + n_tok >= int(info.get("_omni_prompt_len", 0))
-                ]
-                + [(i, req_idx, str(req_id), False) for i, req_idx, _start, req_id in settled_rows]
-                + replay_rows,
+                FrameBatch(
+                    [
+                        (i, req_idx, str(info["req_id"]), is_prefill)
+                        for i, req_idx, _start, n_tok, info, is_prefill in preprocess_entries
+                        if not is_prefill
+                        or int(info.get("_omni_num_computed_tokens", 0)) + n_tok >= int(info.get("_omni_prompt_len", 0))
+                    ]
+                    + [(i, req_idx, str(req_id), False) for i, req_idx, _start, req_id in settled_rows]
+                    + replay_rows
+                ),
                 input_ids,
             )
 
@@ -991,7 +968,7 @@ class OmniModelState(DefaultModelState):
                 for _i, req_idx, _start, n_tok, info, is_prefill in preprocess_entries:
                     buf = self.intermediate_buffer.buffers[req_idx]
                     if not is_prefill and n_tok == 1 and settled_check(buf):
-                        self._eager_settled[req_idx] = buf["req_id"]
+                        self._eager_state.mark_settled(req_idx, buf["req_id"])
             if settled_rows:
                 self._eager_state._apply_settled_frames(settled_rows, embeds)
         if mtp_batches and self._eager_mtp:

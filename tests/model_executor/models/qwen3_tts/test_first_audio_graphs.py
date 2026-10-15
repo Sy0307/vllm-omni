@@ -256,7 +256,7 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize("use_graph", [False, True, "prepared"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_stream_frames_match_fp32_exact_decoder(use_graph, dtype):
@@ -291,7 +291,14 @@ def test_stream_frames_match_fp32_exact_decoder(use_graph, dtype):
     spf = int(stream.spf)
     for frame in range(codes.shape[1]):
         positions = torch.full((2,), frame, device=DEVICE, dtype=torch.int32)
-        actual = decode(codes[:, frame : frame + 1].contiguous().to(torch.int32), slots, positions).reshape(2, -1)
+        if use_graph == "prepared":
+            static_codes, static_slots, static_pos = decode.input_buffers(2)
+            static_codes.copy_(codes[:, frame : frame + 1])
+            static_slots.copy_(slots)
+            static_pos.copy_(positions)
+            actual = decode.replay_prepared(2, 2).reshape(2, -1)
+        else:
+            actual = decode(codes[:, frame : frame + 1].contiguous().to(torch.int32), slots, positions).reshape(2, -1)
         exact_frame = expected[:, frame * spf : (frame + 1) * spf]
         relative_rms = (actual - exact_frame).square().mean(1).sqrt() / exact_frame.square().mean(1).sqrt()
         # BF16 kernels are approximate; compare every frame to the independent

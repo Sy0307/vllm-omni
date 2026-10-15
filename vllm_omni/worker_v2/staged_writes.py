@@ -12,12 +12,15 @@ prompt tokens. A window may flush more than once, so its arguments use fenced
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
+from contextvars import ContextVar
+from functools import wraps
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 from vllm_omni.utils.device_copy import DeviceStager
 
@@ -39,33 +42,76 @@ class _PendingWrite(NamedTuple):
     cu_lens: list[int]
 
 
-class _Deferred:
-    depth = 0
-    pending: list[_PendingWrite] = []
-    flush: Callable[[], None] | None = None  # set by install(): applies and clears ``pending``
+_active: ContextVar[StagedWrites | None] = ContextVar("omni_staged_writes", default=None)
 
 
-@contextlib.contextmanager
-def deferred_writes() -> Iterator[None]:
-    """Queue ``StagedWriteTensor.apply_write`` calls and apply them together on exit."""
-    flush = _Deferred.flush
-    if flush is None:
-        yield
-        return
-    _Deferred.depth += 1
-    try:
-        yield
-    finally:
-        _Deferred.depth -= 1
-        if _Deferred.depth == 0:
-            flush()
+class StagedWrites:
+    """Runner-owned pending writes and fenced staging buffers."""
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.pending: list[_PendingWrite] = []
+        self.meta_stager = DeviceStager(dtype=torch.int64)
+        self.contents_stager = DeviceStager(dtype=torch.uint8)
+        self.h2d_stagers: dict[torch.dtype, DeviceStager] = {}
+
+    @contextlib.contextmanager
+    def activate(self) -> Iterator[None]:
+        token = _active.set(self)
+        try:
+            yield
+        finally:
+            _active.reset(token)
+
+    @contextlib.contextmanager
+    def deferred(self) -> Iterator[None]:
+        with self.activate():
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
+                if self.depth == 0:
+                    self.flush()
+
+    def flush(self) -> None:
+        pending, self.pending = self.pending, []
+        if not pending:
+            return
+        metas: list[np.ndarray] = []
+        blobs: list[np.ndarray] = []
+        offset = 0
+        for t, indices, starts, contents, cu_lens in pending:
+            elem = t.gpu.element_size()
+            cu = np.asarray(cu_lens, dtype=np.int64)
+            prev = np.concatenate(([0], cu[:-1]))
+            meta = np.empty((cu.size, 3), dtype=np.int64)
+            meta[:, 0] = (
+                t.gpu.data_ptr()
+                + np.asarray(indices, dtype=np.int64) * (t.gpu.stride(0) * elem)
+                + np.asarray(starts, dtype=np.int64) * elem
+            )
+            meta[:, 1] = offset + prev * elem
+            meta[:, 2] = (cu - prev) * elem
+            blob = np.ascontiguousarray(_concat(contents, t._np_dtype)).view(np.uint8)
+            metas.append(meta)
+            blobs.append(blob)
+            offset += blob.size
+        device = pending[0][0].gpu.device
+        meta_uva = self.meta_stager(np.concatenate(metas).reshape(-1), device)
+        contents_uva = self.contents_stager(blobs[0] if len(blobs) == 1 else np.concatenate(blobs), device)
+        _byte_scatter_kernel[(meta_uva.shape[0] // 3,)](meta_uva, contents_uva, BLOCK=1024)
 
 
-def _flush_deferred_writes() -> None:
-    """Apply the queued writes now (before a kernel that reads them)."""
-    flush = _Deferred.flush
-    if flush is not None:
-        flush()
+def runner_context(method):
+    """Scope upstream adapter hooks to the runner making the call."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._staged_writes.activate():
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 def _stage_values(chunks: list, x: Any) -> int:
@@ -96,6 +142,19 @@ def _stage_values(chunks: list, x: Any) -> int:
 def _concat(chunks: list, np_dtype: np.dtype) -> np.ndarray:
     arrays = [np.asarray(chunk, dtype=np_dtype) for chunk in chunks]
     return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
+
+
+@triton.jit
+def _byte_scatter_kernel(meta_ptr, contents_ptr, BLOCK: tl.constexpr):
+    # meta row w: destination address, source byte offset, byte count
+    w = tl.program_id(0).to(tl.int64)
+    dst = tl.cast(tl.load(meta_ptr + 3 * w), tl.pointer_type(tl.uint8))
+    src = tl.load(meta_ptr + 3 * w + 1)
+    nbytes = tl.load(meta_ptr + 3 * w + 2)
+    for off in range(0, nbytes, BLOCK):
+        offs = off + tl.arange(0, BLOCK)
+        m = offs < nbytes
+        tl.store(dst + offs, tl.load(contents_ptr + src + offs, mask=m), mask=m)
 
 
 def install() -> None:
@@ -151,12 +210,13 @@ def install() -> None:
         n = len(self._staged_write_indices)
         if n == 0:
             return
-        if _Deferred.depth:
-            if any(write.tensor is self for write in _Deferred.pending):
+        state = _active.get()
+        if state is not None and state.depth:
+            if any(write.tensor is self for write in state.pending):
                 # Writes of one launch run in parallel: keep a later batch for the same tensor ordered.
-                flush()
+                state.flush()
             # Take this batch as an immediate apply would; later stages start fresh lists.
-            _Deferred.pending.append(
+            state.pending.append(
                 _PendingWrite(
                     self,
                     self._staged_write_indices,
@@ -194,52 +254,6 @@ def install() -> None:
         self._staged_write_contents.clear()
         self._staged_write_cu_lens.clear()
         self._staged_len = 0
-
-    from vllm.triton_utils import tl, triton
-
-    @triton.jit
-    def _byte_scatter_kernel(meta_ptr, contents_ptr, BLOCK: tl.constexpr):
-        # meta row w: destination address, source byte offset, byte count
-        w = tl.program_id(0).to(tl.int64)
-        dst = tl.cast(tl.load(meta_ptr + 3 * w), tl.pointer_type(tl.uint8))
-        src = tl.load(meta_ptr + 3 * w + 1)
-        nbytes = tl.load(meta_ptr + 3 * w + 2)
-        for off in range(0, nbytes, BLOCK):
-            offs = off + tl.arange(0, BLOCK)
-            m = offs < nbytes
-            tl.store(dst + offs, tl.load(contents_ptr + src + offs, mask=m), mask=m)
-
-    meta_stager = DeviceStager(dtype=torch.int64)
-    contents_stager = DeviceStager(dtype=torch.uint8)
-
-    def flush() -> None:
-        pending = _Deferred.pending
-        if not pending:
-            return
-        _Deferred.pending = []
-        metas: list[np.ndarray] = []
-        blobs: list[np.ndarray] = []
-        offset = 0
-        for t, indices, starts, contents, cu_lens in pending:
-            elem = t.gpu.element_size()
-            cu = np.asarray(cu_lens, dtype=np.int64)
-            prev = np.concatenate(([0], cu[:-1]))
-            meta = np.empty((cu.size, 3), dtype=np.int64)
-            meta[:, 0] = (
-                t.gpu.data_ptr()
-                + np.asarray(indices, dtype=np.int64) * (t.gpu.stride(0) * elem)
-                + np.asarray(starts, dtype=np.int64) * elem
-            )
-            meta[:, 1] = offset + prev * elem
-            meta[:, 2] = (cu - prev) * elem
-            blob = np.ascontiguousarray(_concat(contents, t._np_dtype)).view(np.uint8)
-            metas.append(meta)
-            blobs.append(blob)
-            offset += blob.size
-        device = pending[0][0].gpu.device
-        meta_uva = meta_stager(np.concatenate(metas).reshape(-1), device)
-        contents_uva = contents_stager(blobs[0] if len(blobs) == 1 else np.concatenate(blobs), device)
-        _byte_scatter_kernel[(meta_uva.shape[0] // 3,)](meta_uva, contents_uva, BLOCK=1024)
 
     def fused_init(self, device, max_writes, max_concurrency=None):
         orig_fused_init(self, device, max_writes, max_concurrency)
@@ -298,7 +312,6 @@ def install() -> None:
     swt.stage_write_elem = stage_write_elem
     swt.apply_write = apply_write
     swt.clear_staged_writes = clear_staged_writes
-    _Deferred.flush = flush
     fused.__init__ = fused_init
     fused.apply = fused_apply
     rope.RopeState.init_prefill_positions = init_prefill_positions
@@ -367,7 +380,9 @@ def _install_fused_bincount() -> None:
         if n == 0:
             return
         # Counts the prompt tokens a deferred write may still be holding.
-        _flush_deferred_writes()
+        state = _active.get()
+        if state is not None:
+            state.flush()
         _fused_bincount_kernel[(n,)](
             expanded_idx_mapping,
             all_token_ids,
@@ -399,9 +414,11 @@ def _install_staged_h2d() -> None:
     from vllm.v1.worker.gpu.sample import penalties
 
     original = torch_utils.async_tensor_h2d
-    stagers: dict[torch.dtype, DeviceStager] = {}
 
     def staged_h2d(data, device=None, dtype=None, out=None):
+        state = _active.get()
+        if state is None:
+            return original(data, device=device, dtype=dtype, out=out)
         if dtype is None and out is not None:
             dtype = out.dtype
         if isinstance(data, torch.Tensor) or (dtype is None and not isinstance(data, np.ndarray)):
@@ -411,9 +428,9 @@ def _install_staged_h2d() -> None:
         if target.type != "cuda" or arr.size > _STAGED_H2D_MAX_ELEMENTS or arr.dtype.kind not in "biuf":
             return original(data, device=device, dtype=dtype, out=out)
         torch_dtype = torch.from_numpy(arr[:0]).dtype
-        stager = stagers.get(torch_dtype)
+        stager = state.h2d_stagers.get(torch_dtype)
         if stager is None:
-            stager = stagers[torch_dtype] = DeviceStager(dtype=torch_dtype, slots=32, group=8)
+            stager = state.h2d_stagers[torch_dtype] = DeviceStager(dtype=torch_dtype, slots=32, group=8)
         view = stager(arr, target)
         if out is not None:
             return out.copy_(view, non_blocking=True)
@@ -423,4 +440,4 @@ def _install_staged_h2d() -> None:
     penalties.async_tensor_h2d = staged_h2d
 
 
-__all__ = ["deferred_writes", "install"]
+__all__ = ["StagedWrites", "install", "runner_context"]

@@ -66,7 +66,11 @@ def _post_kernel(
     fa_ptr,  # [T] first_audio output or dummy
     fa_valid_ptr,  # [R] bool or dummy
     codes32_ptr,  # [n, Q] int32 copy of the codes for the codec, or dummy
+    codec_slots_ptr,
+    codec_pos_ptr,
+    scratch,
     vocab,
+    DIRECT_CODEC: tl.constexpr,
     H: tl.constexpr,
     Q: tl.constexpr,
     QP: tl.constexpr,
@@ -76,6 +80,15 @@ def _post_kernel(
     CODES32: tl.constexpr,
 ):
     b = tl.program_id(0)
+    if DIRECT_CODEC:
+        q = tl.arange(0, QP)
+        if b >= n:
+            tl.store(codec_slots_ptr + b, scratch)
+            tl.store(codec_pos_ptr + b, 0)
+            tl.store(codes32_ptr + b * Q + q, 0, mask=q < Q)
+            return
+        tl.store(codec_slots_ptr + b, tl.load(meta_ptr + n + b).to(tl.int32))
+        tl.store(codec_pos_ptr + b, tl.load(meta_ptr + 4 * n + b).to(tl.int32))
     req = tl.load(meta_ptr + n + b)
     prefill = tl.load(meta_ptr + 2 * n + b) != 0
     last = tl.load(last_ptr + b)
@@ -117,16 +130,35 @@ def eager_pre(meta, n, qsl, sampled, hidden, emb_w, ids, emb, mtp_hidden, step):
 
 
 def eager_post(
-    meta, n, last, layer0, frames, eager, codes, codes_out, input_ids, valid_out, fa, fa_valid, vocab, codes32=None
+    meta,
+    n,
+    last,
+    layer0,
+    frames,
+    eager,
+    codes,
+    codes_out,
+    input_ids,
+    valid_out,
+    fa,
+    fa_valid,
+    vocab,
+    codes32=None,
+    codec_slots=None,
+    codec_pos=None,
+    scratch=0,
 ):
     valid = torch.empty(n, dtype=torch.bool, device=last.device)
     H = eager.shape[-1]
     Q = codes_out.shape[-1]
     dummy = valid
-    _post_kernel[(n,)](
+    size = codes32.shape[0] if codec_slots is not None else n
+    _post_kernel[(size,)](
         meta, n, last, layer0, frames, eager, codes, codes_out, input_ids, valid_out, valid,
         fa if fa is not None else dummy, fa_valid if fa_valid is not None else dummy,
-        codes32 if codes32 is not None else dummy, int(vocab),
+        codes32 if codes32 is not None else dummy,
+        codec_slots if codec_slots is not None else dummy, codec_pos if codec_pos is not None else dummy,
+        scratch, int(vocab), DIRECT_CODEC=codec_slots is not None,
         H=H, Q=Q, QP=triton.next_power_of_2(Q), BH=min(1024, triton.next_power_of_2(H)),
         WRITE_FA=fa is not None, HAS_FA_VALID=fa_valid is not None, CODES32=codes32 is not None,
     )  # fmt: skip
@@ -159,3 +191,23 @@ def settled_frames(meta: torch.Tensor, n: int, eager: torch.Tensor, step: torch.
     """``embeds[row] = eager[slot] + step`` for each (slot, row) column of ``meta``, rounded like the torch ops."""
     H = eager.shape[-1]
     _settled_kernel[(n,)](meta, n, eager, step, embeds, H=H, BH=min(1024, triton.next_power_of_2(H)))
+
+
+@triton.jit
+def _history_kernel(meta, inputs, n, H: tl.constexpr, BLOCK: tl.constexpr):
+    token = tl.program_id(0)
+    row = tl.load(meta + 4 * n + token)
+    dst = tl.cast(tl.load(meta + row), tl.pointer_type(inputs.dtype.element_ty))
+    local = token - tl.load(meta + 3 * n + row)
+    start = tl.load(meta + n + row) + local
+    offset = tl.load(meta + 2 * n + row) + local
+    idx = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < H
+    values = tl.load(inputs + start * H + idx, mask=mask)
+    tl.store(dst + offset * H + idx, values, mask=mask)
+
+
+def record_history(meta: torch.Tensor, inputs: torch.Tensor, n: int, num_tokens: int) -> None:
+    """Copy conditioned inputs without padding the grid to the longest request span."""
+    hidden = inputs.shape[-1]
+    _history_kernel[(num_tokens, triton.cdiv(hidden, 1024))](meta, inputs, n, H=hidden, BLOCK=1024)
