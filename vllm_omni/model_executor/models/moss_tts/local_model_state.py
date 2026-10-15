@@ -709,11 +709,13 @@ class MossLocalModelState(OmniModelState):
             return super().prepare_streaming_audio_output(input_batch, req_states, outputs)
         return self._fused_audio.take_step(input_batch.num_reqs)
 
-    def set_tail_audio_sender(self, factory):
+    def set_tail_audio_sender(self, scheduler):
         """Bind the sender of audio decoded after a request stopped generating."""
         if self._fused_audio is None:
             return False
-        self._fused_audio.tail_sender = factory(self.device)
+        from .tail_audio_sender import TailAudioSender
+
+        self._fused_audio.tail_sender = TailAudioSender(scheduler, self.device)
         return True
 
     def close_audio_senders(self):

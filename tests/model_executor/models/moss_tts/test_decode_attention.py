@@ -74,7 +74,7 @@ def _reference(c, max_seqlen_q):
 
 
 def _ours(c, **kwargs):
-    from vllm_omni.attention.triton_decode_attention import paged_attention
+    from vllm_omni.model_executor.models.moss_tts.decode_attention import paged_attention
 
     out = torch.zeros_like(c["q"])
     paged_attention(
@@ -114,7 +114,7 @@ def test_bitwise_equal_to_unified_attention(case, heads, decode_heads, dtype):
 def test_cuda_graph_replay_with_new_lengths():
     c = _case([1] * 100, [50 + i for i in range(100)], 32, 8, 128, 128, torch.bfloat16)
     out = torch.zeros_like(c["q"])
-    from vllm_omni.attention.triton_decode_attention import paged_attention
+    from vllm_omni.model_executor.models.moss_tts.decode_attention import paged_attention
 
     def run():
         paged_attention(c["q"], c["k"], c["v"], out, c["cu_seqlens_q"], c["seqused_k"], c["block_table"], HEAD**-0.5)
@@ -138,13 +138,34 @@ def test_cuda_graph_replay_with_new_lengths():
 
 
 @torch.inference_mode()
-def test_patch_routes_supported_calls_and_falls_back(monkeypatch):
+def test_model_layer_routing_preserves_upstream_and_falls_back(monkeypatch):
+    from vllm.model_executor.layers.attention import Attention
     from vllm.v1.attention.backends import triton_attn
 
-    from vllm_omni.attention import triton_decode_attention as tda
+    from vllm_omni.model_executor.models.moss_tts import decode_attention as tda
 
-    monkeypatch.setattr(triton_attn, "unified_attention", triton_attn.unified_attention)
-    monkeypatch.setattr(triton_attn, "triton_reshape_and_cache_flash", triton_attn.triton_reshape_and_cache_flash)
+    original_attention = triton_attn.unified_attention
+    original_cache_write = triton_attn.triton_reshape_and_cache_flash
+    args = dict(
+        num_heads=32,
+        head_size=HEAD,
+        scale=HEAD**-0.5,
+        num_kv_heads=8,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+    reference = triton_attn.TritonAttentionImpl(**args)
+    layer = Attention.__new__(Attention)
+    torch.nn.Module.__init__(layer)
+    layer.impl = triton_attn.TritonAttentionImpl(**args)
+    layer._q_scale = layer._k_scale = layer._v_scale = torch.tensor(1.0, device="cuda")
+    model = torch.nn.ModuleList([layer])
+    tda.use_moss_local_attention(model)
+    assert isinstance(layer.impl, tda.MossLocalAttentionImpl)
+    assert type(reference) is triton_attn.TritonAttentionImpl
+    assert triton_attn.unified_attention is original_attention
+    assert triton_attn.triton_reshape_and_cache_flash is original_cache_write
     calls = []
     real = tda.paged_attention
 
@@ -153,50 +174,40 @@ def test_patch_routes_supported_calls_and_falls_back(monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(tda, "paged_attention", recording_attention)
-    assert tda.install_triton_attention_patch()
-    assert not tda.install_triton_attention_patch()  # idempotent
-    patched = triton_attn.unified_attention
-
     c = _case([1] * 20 + [40], [100] * 20 + [40], 32, 8, 32, 64, torch.bfloat16)
-    ones = torch.ones((32, 8), device="cuda")
-    segm = dict(
+    cache = torch.cat([c["k"], c["v"]], dim=-1).transpose(1, 2)
+    meta = triton_attn.TritonAttentionMetadata(
+        num_actual_tokens=c["num_tokens"],
+        query_start_loc=c["cu_seqlens_q"],
+        seq_lens=c["seqused_k"],
+        max_query_len=40,
+        max_seq_len=128,
+        block_table=c["block_table"],
+        causal=True,
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+        slot_mapping=torch.empty(0, dtype=torch.int64, device="cuda"),
         seq_threshold_3D=16,
         num_par_softmax_segments=16,
         softmax_segm_output=torch.empty((16, 32, 16, HEAD), device="cuda"),
         softmax_segm_max=torch.empty((16, 32, 16), device="cuda"),
         softmax_segm_expsum=torch.empty((16, 32, 16), device="cuda"),
+        mm_prefix_range_tensor=None,
+        rswa_prefix_lens=None,
+        rswa_window=None,
     )
 
-    def call(fn, **overrides):
-        out = torch.zeros_like(c["q"])
-        args = dict(
-            q=c["q"],
-            k=c["k"],
-            v=c["v"],
-            out=out,
-            cu_seqlens_q=c["cu_seqlens_q"],
-            max_seqlen_q=64,
-            seqused_k=c["seqused_k"],
-            max_seqlen_k=128,
-            softmax_scale=HEAD**-0.5,
-            causal=True,
-            window_size=(-1, -1),
-            block_table=c["block_table"],
-            softcap=0,
-            q_descale=None,
-            k_descale=ones,
-            v_descale=ones,
-            **segm,
-        )
-        args.update(overrides)
-        fn(**args)
-        return out
+    def run(impl):
+        return impl.forward(layer, c["q"], None, None, cache, meta, torch.zeros_like(c["q"]))
 
-    n = c["num_tokens"]
-    assert torch.equal(call(patched)[:n], call(patched.__wrapped__)[:n])
+    assert torch.equal(run(layer.impl), run(reference))
     assert len(calls) == 1
-    # Sliding window is not handled: upstream kernel, same result.
-    assert torch.equal(call(patched, window_size=(31, 0))[:n], call(patched.__wrapped__, window_size=(31, 0))[:n])
+    # The same layer falls back for unsupported variants; other models keep vLLM.
+    reference.sliding_window = layer.impl.sliding_window = (31, 0)
+    assert torch.equal(run(layer.impl), run(reference))
     assert len(calls) == 1
 
 
@@ -206,7 +217,7 @@ def test_patch_routes_supported_calls_and_falls_back(monkeypatch):
 def test_cache_write_matches_upstream_with_padding_and_graph_replay(monkeypatch, use_pdl, dtype):
     from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 
-    from vllm_omni.attention import triton_decode_attention as tda
+    from vllm_omni.model_executor.models.moss_tts import decode_attention as tda
 
     if use_pdl and not tda._USE_PDL:
         pytest.skip("PDL requires Hopper or newer")

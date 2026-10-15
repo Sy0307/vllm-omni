@@ -1322,15 +1322,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self.audio_assistant_slot_token_id: int = int(self.config.audio_assistant_slot_token_id)
         self.im_end_token_id: int = int(self.config.im_end_token_id)
 
-        if getattr(self.config, "talker_decode_attention", False):
-            # Opt-in: the backbone's TRITON_ATTN 2D calls take the head-grouped
-            # paged kernel (decode rows ~17% faster at C128; prefill rows match
-            # vLLM's kernel bitwise, decode rows to rounding).
-            from vllm_omni.attention.triton_decode_attention import install_triton_attention_patch
-
-            if install_triton_attention_patch():
-                logger.info("MOSS Local talker: TRITON_ATTN decode uses the head-grouped paged kernel")
-
         # Qwen3 backbone. get_text_config() is sufficient for vLLM to size
         # KV cache / heads correctly, as long as AutoConfig resolves to the
         # local MossTTSLocalConfig rather than the HF remote-code class.
@@ -1338,6 +1329,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
+        if getattr(self.config, "talker_decode_attention", False):
+            from .decode_attention import use_moss_local_attention
+
+            use_moss_local_attention(self.model)
 
         # Real text LM head -- loaded from the checkpoint but never consulted
         # at inference (see class docstring); kept purely as a destination

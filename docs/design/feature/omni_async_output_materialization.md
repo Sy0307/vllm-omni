@@ -186,11 +186,6 @@ be reused by the next forward pass. The dedicated copy stream and pinned host
 buffers make the D2H transfer asynchronous; the snapshot retains its cloned
 CUDA sources until the transfer event completes.
 
-MRv2 in-stage streaming PCM uses a fresh host allocation for each D2H batch.
-Request accumulation and emitted tensors retain that allocation, so the final
-PCM payload can be delivered without a second CPU clone. This does not apply
-to reusable device outputs or generic multimodal snapshots.
-
 ### Live Runner State and Ownership
 
 The complete builder input is not a detached snapshot. Connector output state

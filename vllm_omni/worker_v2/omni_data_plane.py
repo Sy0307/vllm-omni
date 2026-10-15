@@ -39,7 +39,6 @@ class _NativeRequestState:
     resumable: bool = False
     output_token_ids: list[int] = field(default_factory=list)
     finished: bool = False
-    _stop_rule: tuple[Any, set[int], int, int | None] | None = field(default=None, repr=False, compare=False)
     output_stopped: bool = False
     # Set by ``abort_requests``: the scheduler ended the request outside its
     # own output (cancel, error or a parked close), so the runner has no
@@ -55,20 +54,11 @@ class _NativeRequestState:
         Resumable requests keep their segment boundaries owned by the scheduler.
         """
         params = self.sampling_params
-        # Called for every request on every step; derive the stop set once
-        # per sampling-params object.
-        cached = self._stop_rule
-        if cached is None or cached[0] is not params:
-            stop_ids = set(getattr(params, "stop_token_ids", None) or ())
-            if not getattr(params, "ignore_eos", False):
-                stop_ids.update(getattr(params, "_all_stop_token_ids", ()) or ())
-            cached = self._stop_rule = (
-                params,
-                stop_ids,
-                getattr(params, "min_tokens", 0) or 0,
-                getattr(params, "max_tokens", None),
-            )
-        _, stop_ids, min_tokens, max_tokens = cached
+        stop_ids = set(getattr(params, "stop_token_ids", None) or ())
+        if not getattr(params, "ignore_eos", False):
+            stop_ids.update(getattr(params, "_all_stop_token_ids", ()) or ())
+        min_tokens = getattr(params, "min_tokens", 0) or 0
+        max_tokens = getattr(params, "max_tokens", None)
         for token_id in token_ids:
             self.output_token_ids.append(int(token_id))
             if not self.resumable and (

@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
-from vllm_omni.worker_v2.first_audio_sender import TailAudioSender
+from vllm_omni.model_executor.models.moss_tts.tail_audio_sender import TailAudioSender
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

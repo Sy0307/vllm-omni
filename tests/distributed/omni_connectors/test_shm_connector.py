@@ -326,16 +326,16 @@ def test_wakeup_discovery_only_scans_deployment_directory(monkeypatch, tmp_path)
 
     directory = tmp_path / "deployment"
     monkeypatch.setattr(module, "_wakeup_directory", lambda: str(directory))
-    original_listdir = os.listdir
+    original_scandir = os.scandir
     scanned = []
 
-    def scoped_listdir(path):
+    def scoped_scandir(path):
         # A parent-directory scan would recreate the performance regression.
         assert os.fspath(path) == str(directory)
         scanned.append(path)
-        return original_listdir(path)
+        return original_scandir(path)
 
-    monkeypatch.setattr(module.os, "listdir", scoped_listdir)
+    monkeypatch.setattr(module.glob.os, "scandir", scoped_scandir)
     sender, receiver = _stage_connector(86), _stage_connector(87)
     try:
         generation = receiver.get_wakeup_generation()

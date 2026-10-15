@@ -140,6 +140,7 @@ MOSS_TTS_LOCAL_FUSED_PIPELINE = PipelineConfig(
     stages=(
         StagePipelineConfig(
             stage_id=0,
+            scheduler_cls="vllm_omni.model_executor.models.moss_tts.fused_scheduler.MossFusedScheduler",
             model_stage="moss_tts_local",
             supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,

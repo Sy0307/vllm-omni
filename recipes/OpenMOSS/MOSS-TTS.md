@@ -461,8 +461,8 @@ it does not silently restart a partially delivered waveform.
 
 On Hopper and newer CUDA GPUs, compatible Triton kernels automatically use
 programmatic dependent launch. Prefix-cache hashing retains vLLM's request salt
-isolation. Streaming PCM outputs reuse their request-owned host buffers without
-a second clone.
+isolation. The grouped attention implementation is local to this model's
+backbone layers; it does not replace vLLM's global attention or upload functions.
 The fused depth and compiled sampler settings come from the deployment YAML.
 No additional experiment environment switches are required:
 

@@ -57,7 +57,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
     from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
-    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender, TailAudioSender, _PreparedDelivery
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender, _PreparedDelivery
+
+    from .tail_audio_sender import TailAudioSender
 
 logger = init_logger(__name__)
 

@@ -15,7 +15,6 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import is_uva_available
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import set_dummy_context
@@ -190,7 +189,6 @@ class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._validate_parallel_support()
-        self._host_fast_paths_installed = False
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -199,37 +197,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             else None
         )
-
-    def _install_host_fast_paths(self) -> None:
-        """Stage MOSS Local uploads in pinned UVA rings (see host_fast_paths)."""
-        self._host_fast_paths_installed = True
-        from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
-
-        if not isinstance(self.model_state, MossLocalModelState):
-            return
-        if self.device.type != "cuda" or not is_uva_available():
-            return
-        from vllm.v1.worker.gpu import buffer_utils
-        from vllm.v1.worker.gpu import model_runner as upstream_runner
-        from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
-
-        from vllm_omni.worker_v2.host_fast_paths import UvaUploads, stage_write_contents_in_uva
-
-        tensors = [self.req_states.total_len, self.req_states.num_computed_tokens, *self.block_tables.block_tables]
-        sampler = getattr(self, "sampler", None)
-        if sampler is not None:
-            states = [
-                sampler.sampling_states,
-                sampler.thinking_budget_state,
-                sampler.logprob_token_ids_state,
-                *sampler.logits_processors,
-            ]
-            tensors += [
-                value for state in states for value in vars(state).values() if isinstance(value, StagedWriteTensor)
-            ]
-        stage_write_contents_in_uva(tensors)
-        # Two uploads per step share one ring; keep each slot for >= 4 steps.
-        upstream_runner.async_tensor_h2d = UvaUploads(depth=2 * (buffer_utils._DEFAULT_MAX_CONCURRENCY + 2))
 
     def _validate_parallel_support(self) -> None:
         parallel_config = self.vllm_config.parallel_config
@@ -545,8 +512,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         randomize_inputs: bool = False,
     ) -> Any:
         if not dummy_run:
-            if not self._host_fast_paths_installed:
-                self._install_host_fast_paths()
             self._prepare_native_data_plane(scheduler_output)
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)

@@ -25,6 +25,9 @@ from __future__ import annotations
 import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+from vllm.v1.kv_cache_interface import KVQuantMode
 
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
@@ -500,73 +503,18 @@ def paged_attention(
     )
 
 
-def _supported(
-    q,
-    k,
-    out,
-    causal,
-    window_size,
-    softcap,
-    q_descale,
-    alibi_slopes,
-    output_scale,
-    qq_bias,
-    sinks,
-    mm_prefix_range,
-    rswa_prefix_lens,
-    rswa_window,
-    kv_quant_mode,
-    chunk_lookback,
-    use_td,
-    mm_prefix_clamp_sliding_window,
-) -> bool:
-    from vllm.v1.kv_cache_interface import KVQuantMode
-
-    head_size = q.shape[2]
-    return (
-        causal is True
-        and window_size[0] < 0
-        and not softcap
-        and q_descale is None
-        and alibi_slopes is None
-        and output_scale is None
-        and qq_bias is None
-        and sinks is None
-        and mm_prefix_range is None
-        and (rswa_window is None or rswa_prefix_lens is None)
-        and kv_quant_mode == KVQuantMode.NONE
-        and chunk_lookback == -1
-        and not use_td
-        and not mm_prefix_clamp_sliding_window
-        and q.dtype in (torch.bfloat16, torch.float16)
-        and k.dtype == q.dtype
-        and out.dtype == q.dtype
-        and head_size == triton.next_power_of_2(head_size)
-        and q.shape[1] % k.shape[2] == 0
-        and q.shape[1] // k.shape[2] <= 16
-    )
-
-
-def _uses_3d(
-    seq_threshold_3D,
-    num_par_softmax_segments,
-    softmax_segm_output,
-    softmax_segm_max,
-    softmax_segm_expsum,
-    max_seqlen_q,
-    num_seqs,
-) -> bool:
-    # Mirror of unified_attention's split-KV (3D) decision; those calls stay on vLLM.
+def _uses_3d(meta) -> bool:
+    # Keep upstream's split-KV path for small decode batches.
     from vllm.v1.attention.ops import triton_unified_attention as tua
 
     return not (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        meta.seq_threshold_3D is None
+        or meta.num_par_softmax_segments is None
+        or meta.softmax_segm_output is None
+        or meta.softmax_segm_max is None
+        or meta.softmax_segm_expsum is None
+        or meta.max_query_len > 1
+        or len(meta.seq_lens) > meta.seq_threshold_3D
         or tua.is_batch_invariant
     )
 
@@ -640,133 +588,110 @@ def _cache_write_pdl(key, value, key_cache, value_cache, slot_mapping, kv_cache_
     )
 
 
-def install_triton_attention_patch() -> bool:
-    """Route TRITON_ATTN's 2D unified_attention calls through ``paged_attention``.
+class MossLocalAttentionImpl(TritonAttentionImpl):
+    """Use the grouped kernel only on this MOSS layer; retain upstream fallbacks."""
 
-    Process-wide and idempotent; unsupported variants (ALiBi, sinks, quantized
-    KV, sliding window, the 3D split-KV path, ...) fall through to vLLM.
-    """
-    from vllm.v1.attention.backends import triton_attn
-    from vllm.v1.kv_cache_interface import KVQuantMode
-
-    upstream = triton_attn.unified_attention
-    if getattr(upstream, "_omni_paged_decode", False):
-        return False
-
-    def unified_attention(
-        q,
-        k,
-        v,
-        out,
-        cu_seqlens_q,
-        max_seqlen_q,
-        seqused_k,
-        max_seqlen_k,
-        softmax_scale,
-        causal,
-        window_size,
-        block_table,
-        softcap,
-        q_descale,
-        k_descale,
-        v_descale,
-        seq_threshold_3D=None,
-        num_par_softmax_segments=None,
-        softmax_segm_output=None,
-        softmax_segm_max=None,
-        softmax_segm_expsum=None,
-        alibi_slopes=None,
-        output_scale=None,
-        qq_bias=None,
-        sinks=None,
-        mm_prefix_range=None,
-        rswa_prefix_lens=None,
-        rswa_window=None,
-        use_alibi_sqrt=False,
-        kv_quant_mode=KVQuantMode.NONE,
-        k_scale_cache=None,
-        v_scale_cache=None,
-        chunk_lookback=-1,
-        use_td=False,
-        mm_prefix_clamp_sliding_window=False,
+    def forward(
+        self, layer, query, key, value, kv_cache, attn_metadata, output=None, output_scale=None, output_block_scale=None
     ):
-        if _supported(
-            q,
-            k,
-            out,
-            causal,
-            window_size,
-            softcap,
-            q_descale,
-            alibi_slopes,
-            output_scale,
-            qq_bias,
-            sinks,
-            mm_prefix_range,
-            rswa_prefix_lens,
-            rswa_window,
-            kv_quant_mode,
-            chunk_lookback,
-            use_td,
-            mm_prefix_clamp_sliding_window,
-        ) and not _uses_3d(
-            seq_threshold_3D,
-            num_par_softmax_segments,
-            softmax_segm_output,
-            softmax_segm_max,
-            softmax_segm_expsum,
-            max_seqlen_q,
-            len(seqused_k),
+        meta = attn_metadata
+        if (
+            meta is None
+            or output is None
+            or output_block_scale is not None
+            or self.attn_type != AttentionType.DECODER
+            or self._kv_quant_mode != KVQuantMode.NONE
         ):
-            launch = {}
-            if max_seqlen_q == 1 and len(seqused_k) >= _GROUPED_DECODE_MIN_SEQS:
-                launch = {"num_warps": _DECODE_NUM_WARPS, "num_stages": _DECODE_NUM_STAGES}
-            paged_attention(q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, **launch)
-            return
-        return upstream(
-            q,
-            k,
-            v,
-            out,
-            cu_seqlens_q,
-            max_seqlen_q,
-            seqused_k,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            window_size,
-            block_table,
-            softcap,
-            q_descale,
-            k_descale,
-            v_descale,
-            seq_threshold_3D=seq_threshold_3D,
-            num_par_softmax_segments=num_par_softmax_segments,
-            softmax_segm_output=softmax_segm_output,
-            softmax_segm_max=softmax_segm_max,
-            softmax_segm_expsum=softmax_segm_expsum,
-            alibi_slopes=alibi_slopes,
-            output_scale=output_scale,
-            qq_bias=qq_bias,
-            sinks=sinks,
-            mm_prefix_range=mm_prefix_range,
-            rswa_prefix_lens=rswa_prefix_lens,
-            rswa_window=rswa_window,
-            use_alibi_sqrt=use_alibi_sqrt,
-            kv_quant_mode=kv_quant_mode,
-            k_scale_cache=k_scale_cache,
-            v_scale_cache=v_scale_cache,
-            chunk_lookback=chunk_lookback,
-            use_td=use_td,
-            mm_prefix_clamp_sliding_window=mm_prefix_clamp_sliding_window,
+            return super().forward(layer, query, key, value, kv_cache, meta, output, output_scale, output_block_scale)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        supported = (
+            meta.causal is True
+            and not meta.use_cascade
+            and self.sliding_window[0] < 0
+            and not self.logits_soft_cap
+            and self.alibi_slopes is None
+            and output_scale is None
+            and self.sinks is None
+            and meta.mm_prefix_range_tensor is None
+            and (meta.rswa_window is None or meta.rswa_prefix_lens is None)
+            and self.chunk_lookback == -1
+            and not self.use_td
+            and not getattr(layer, "mm_prefix_clamp_sliding_window", False)
+            and query.dtype in (torch.bfloat16, torch.float16)
+            and key_cache.dtype == query.dtype == output.dtype
+            and self.head_size == triton.next_power_of_2(self.head_size)
+            and self.num_heads % self.num_kv_heads == 0
+            and self.num_queries_per_kv <= 16
+        )
+        if not supported or _uses_3d(meta):
+            return super().forward(layer, query, key, value, kv_cache, meta, output, output_scale, output_block_scale)
+        launch = {}
+        if meta.max_query_len == 1 and len(meta.seq_lens) >= _GROUPED_DECODE_MIN_SEQS:
+            launch = {"num_warps": _DECODE_NUM_WARPS, "num_stages": _DECODE_NUM_STAGES}
+        n = meta.num_actual_tokens
+        paged_attention(
+            query[:n],
+            key_cache,
+            value_cache,
+            output[:n],
+            meta.query_start_loc,
+            meta.seq_lens,
+            meta.block_table,
+            self.scale,
+            **launch,
+        )
+        return output
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self.attn_type != AttentionType.DECODER or self._kv_quant_mode != KVQuantMode.NONE:
+            return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
+
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        _cache_write_pdl(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+            upstream=triton_reshape_and_cache_flash,
         )
 
-    setattr(unified_attention, "_omni_paged_decode", True)
-    setattr(unified_attention, "__wrapped__", upstream)
-    triton_attn.unified_attention = unified_attention
-    if _USE_PDL:
-        import functools
 
-        cache_upstream = triton_attn.triton_reshape_and_cache_flash
-        triton_attn.triton_reshape_and_cache_flash = functools.partial(_cache_write_pdl, upstream=cache_upstream)
-    return True
+def use_moss_local_attention(model: torch.nn.Module) -> None:
+    """Replace plain Triton implementations on this backbone's layers only.
+
+    The backend and metadata builder stay unchanged. No vLLM module globals,
+    backend registry entries or other models' attention layers are modified.
+    """
+    from vllm.model_executor.layers.attention import Attention
+
+    for layer in model.modules():
+        if not isinstance(layer, Attention):
+            continue
+        impl = layer.impl
+        if (
+            type(impl) is not TritonAttentionImpl
+            or impl.attn_type != AttentionType.DECODER
+            or impl.alibi_slopes is not None
+            or impl.sliding_window != (-1, -1)
+            or impl.sinks is not None
+        ):
+            continue
+        layer.impl = MossLocalAttentionImpl(
+            num_heads=impl.num_heads,
+            head_size=impl.head_size,
+            scale=impl.scale,
+            num_kv_heads=impl.num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=impl.kv_cache_dtype,
+            logits_soft_cap=impl.logits_soft_cap,
+            attn_type=impl.attn_type,
+            kv_sharing_target_layer_name=impl.kv_sharing_target_layer_name,
+            use_alibi_sqrt=impl.use_alibi_sqrt,
+            chunk_lookback=impl.chunk_lookback,
+        )
