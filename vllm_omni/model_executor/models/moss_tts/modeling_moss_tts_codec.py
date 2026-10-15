@@ -555,6 +555,7 @@ class _MossCodecStreamSession:
 
         def flush() -> None:
             audio, starts, lengths = wrapper.decode([s for s, _, _ in batch], [c for _, c, _ in batch])
+            # Graph replay reuses its output; queued delivery must own this waveform.
             audio = audio.clone()
             spf, channels = wrapper.samples_per_frame, wrapper.channels
             for (slot, _, _), start, length in zip(batch, starts, lengths, strict=True):

@@ -41,8 +41,9 @@ orchestrator holds them until that first frame has arrived.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -51,6 +52,12 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.v1.worker.gpu import buffer_utils
 
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
+    from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender, TailAudioSender, _PreparedDelivery
 
 logger = init_logger(__name__)
 
@@ -69,7 +76,9 @@ class FusedAudioStep:
     # Rows whose first frame was sent ahead by the first-audio sender.
     after_first: set[int] = field(default_factory=set)
 
-    def to_cpu(self, copy_stream: torch.cuda.Stream, copy_tensor) -> FusedAudioStep:
+    def to_cpu(
+        self, copy_stream: torch.cuda.Stream, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
+    ) -> FusedAudioStep:
         return FusedAudioStep(
             self.num_reqs,
             self.rows,
@@ -112,7 +121,7 @@ class _Ready:
     # Early first frame: routes frozen when the frame was sampled, and the
     # frame's validity on the device. Its PCM goes to the first-audio sender as
     # soon as this decode completes.
-    first_delivery: Any = None
+    first_delivery: _PreparedDelivery | None = None
     first_valid: torch.Tensor | None = None
 
 
@@ -145,7 +154,7 @@ class _Stream:
 class MossFusedAudio:
     """Request-slot chunk state for the talker's in-process codec."""
 
-    def __init__(self, codec: Any, capacity: int, n_vq: int, pad_id: int, device: torch.device) -> None:
+    def __init__(self, codec: MossTTSCodecDecoder, capacity: int, n_vq: int, pad_id: int, device: torch.device) -> None:
         self.codec = codec
         self.pad_id = int(pad_id)
         self.chunk_frames = int(codec._stream_chunk_frames)
@@ -174,13 +183,13 @@ class MossFusedAudio:
         self.streams: list[_Stream | None] = [None] * capacity
         self.slot_of: dict[str, int] = {}
         self.detached: dict[str, _Stream] = {}
-        self.tail_sender: Any = None
+        self.tail_sender: TailAudioSender | None = None
         # Early first audio: requests whose first frame went to the sender,
         # until that frame is known; then those whose first frame was audio,
         # whose later outputs must follow it.
         self.early: set[str] = set()
         self.after_first: set[str] = set()
-        self.first_sender: Any = None
+        self.first_sender: FirstAudioSender | None = None
         self._keep_records: list[_KeepRecord] = []
         self._keep_free: list[torch.Tensor] = []
         self._capacity = capacity
@@ -220,7 +229,7 @@ class MossFusedAudio:
             self._append_pool = buffer_utils.UvaBufferPool(3 * capacity, torch.int64, depth)
             self._gather_pool = buffer_utils.UvaBufferPool(2 * capacity * self.chunk_frames, torch.int64, depth)
 
-    def add_first_frames(self, req_ids, codes: torch.Tensor, valid: torch.Tensor) -> list[str]:
+    def add_first_frames(self, req_ids: Sequence[str], codes: torch.Tensor, valid: torch.Tensor) -> list[str]:
         """Queue just-sampled first frames ([n, n_vq] codes) as urgent first chunks.
 
         They are cut before their continue mask arrives: a padding frame is
@@ -259,10 +268,6 @@ class MossFusedAudio:
             )
             accepted.append(req_id)
         return accepted
-
-    def set_tail_sender(self, factory) -> bool:
-        self.tail_sender = factory(self.device)
-        return True
 
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -563,11 +568,11 @@ class MossFusedAudio:
 
     def step(
         self,
-        input_batch: Any,
+        input_batch: InputBatch,
         decode_rows: list[int],
         codes: torch.Tensor,
         keep: torch.Tensor,
-        upload,
+        upload: Callable[[np.ndarray], torch.Tensor],
     ) -> None:
         """Append this step's frames, queue chunk decodes and deliver finished audio."""
         if self.tail_sender is None:

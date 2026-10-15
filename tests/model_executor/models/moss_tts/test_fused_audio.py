@@ -99,7 +99,7 @@ def _fused(initial, chunk, **options):
     codec = _FakeCodec(initial=initial, chunk=chunk, **options)
     fused = MossFusedAudio(codec, capacity=8, n_vq=N_VQ, pad_id=PAD, device=torch.device("cuda"))
     sender = _FakeSender()
-    fused.set_tail_sender(lambda device: sender)
+    fused.tail_sender = sender
     return codec, fused, sender
 
 

@@ -648,32 +648,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         prompt: dict | None = None,
         request_id: str | None = None,
     ) -> list:
-        from vllm_omni.model_executor.models.moss_tts import shared_head
-
-        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
-        if not sampling_params_list:
-            return sampling_params_list
-        sampling_params_list = list(sampling_params_list)
-        sampling_params_list[0] = sampling_params_list[0].clone()
-        params = sampling_params_list[0]
-        if params.extra_args:
-            params.extra_args = dict(params.extra_args)
-            params.extra_args.pop(shared_head.HEAD_TOKENS_KEY, None)
-        if (
-            self._moss_variant == "local"
-            and prompt is not None
-            and prompt.get("cache_salt")
-            and isinstance(prompt.get("prompt_token_ids"), list)
-        ):
-            proc = self._get_moss_processor()
-            seg = proc.__dict__.get("_vllm_omni_continuation_segments", {}).get(request.language)
-            codes = ((prompt.get("additional_information") or {}).get("codes") or {}).get("ref")
-            pad_id = getattr(getattr(proc, "model_config", None), "audio_pad_token_id", None)
-            if seg is not None and pad_id is not None:
-                head = shared_head.validated_head_length(prompt["prompt_token_ids"], codes, seg[0], int(pad_id))
-                if head is not None:
-                    params.extra_args = {**(params.extra_args or {}), shared_head.HEAD_TOKENS_KEY: head}
-        return sampling_params_list
+        return apply_max_new_tokens(sampling_params_list, request)
 
 
 @register_tts_adapter

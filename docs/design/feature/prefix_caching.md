@@ -28,14 +28,6 @@ vLLM implements automatic prefix caching for managing its kv-cache, which is bes
 !!! note "Note 1"
     The following sections describe caching tensor outputs passed between AR stages. This is distinct from multimodal encoder caching and from [diffusion KV prefix caching](#diffusion-kv-prefix-caching), which reuses GPU KV pages inside a diffusion stage.
 
-MOSS Local also shares constant chat-template head KV blocks by default. Its
-speech adapter validates identical head tokens and pad-only audio conditioning
-before attaching internal head-length metadata. The Local scheduler installs
-the hash adapter, which applies the conditioning salt to the first block that
-extends beyond the validated head. Requests without valid metadata retain
-upstream hashing, and public cache salts remain opaque strings. Generated
-blocks use upstream hash generation and cache admission.
-
 ### High-Level Approach
 
 !!! note "Note 2"

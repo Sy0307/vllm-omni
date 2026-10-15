@@ -15,13 +15,16 @@ from __future__ import annotations
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
+
+if TYPE_CHECKING:
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 logger = init_logger(__name__)
 
@@ -157,8 +160,7 @@ class _EngineOutputSink:
         for request_id, pcm in zip(request_ids, pcm_rows, strict=True):
             if request_id not in routes:
                 continue
-            payload = {"model_outputs": pcm, "sr": sample_rate}
-            payload[FIRST_AUDIO_KEY] = torch.tensor(True)
+            payload = {"model_outputs": pcm, "sr": sample_rate, FIRST_AUDIO_KEY: torch.tensor(True)}
             by_client.setdefault(routes[request_id], []).append(
                 OmniEngineCoreOutput(
                     request_id=request_id,
@@ -205,12 +207,14 @@ class TailAudioSender:
     flight at its stop, its tail and its terminal output stay in order.
     """
 
-    def __init__(self, scheduler: Any, device: torch.device) -> None:
+    def __init__(self, scheduler: OmniARScheduler, device: torch.device) -> None:
         self.scheduler = scheduler
         # The sender thread selects the device by index.
         index = device.index if device.index is not None else torch.accelerator.current_device_index()
         self.device = torch.device(device.type, index)
-        self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._queue: queue.SimpleQueue[
+            tuple[str, list[tuple[torch.Tensor, torch.cuda.Event | None]], torch.Tensor, bool, bool] | None
+        ] = queue.SimpleQueue()
         self._started = threading.Event()
         self._start_error: Exception | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="omni-tail-audio-sender")

@@ -133,10 +133,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if getattr(self.vllm_config.model_config.hf_config, "model_type", None) == "moss_tts_local":
-            from vllm_omni.model_executor.models.moss_tts.shared_head import install
-
-            install()
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}

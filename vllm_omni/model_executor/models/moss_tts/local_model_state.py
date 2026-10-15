@@ -713,7 +713,8 @@ class MossLocalModelState(OmniModelState):
         """Bind the sender of audio decoded after a request stopped generating."""
         if self._fused_audio is None:
             return False
-        return self._fused_audio.set_tail_sender(factory)
+        self._fused_audio.tail_sender = factory(self.device)
+        return True
 
     def close_audio_senders(self):
         try:

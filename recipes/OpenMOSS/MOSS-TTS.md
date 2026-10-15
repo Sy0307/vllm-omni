@@ -460,9 +460,9 @@ last audio. KV-cache preemption fails the affected fused request explicitly;
 it does not silently restart a partially delivered waveform.
 
 On Hopper and newer CUDA GPUs, compatible Triton kernels automatically use
-programmatic dependent launch. Local requests share constant prompt-head KV
-blocks after validating the tokens and pad-only audio conditioning. Streaming
-PCM outputs reuse their request-owned host buffers without a second clone.
+programmatic dependent launch. Prefix-cache hashing retains vLLM's request salt
+isolation. Streaming PCM outputs reuse their request-owned host buffers without
+a second clone.
 The fused depth and compiled sampler settings come from the deployment YAML.
 No additional experiment environment switches are required:
 
