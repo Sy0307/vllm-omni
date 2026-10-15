@@ -15,6 +15,7 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -144,8 +145,11 @@ def test_batched_prompt_consumption_matches_serial_and_clears_cache(task_type: s
 
 @hardware_test(res={"cuda": ["L4", "H100", "H200"]})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("allow_table", [False, True])
 @torch.inference_mode()
-def test_projected_text_table_matches_the_projection_per_token():
+def test_projected_text_table_matches_the_projection_per_token(monkeypatch, allow_table):
+    use_table = allow_table and current_omni_platform.is_cuda()
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: use_table)
     builder = Qwen3TTSPromptEmbedsBuilder.__new__(Qwen3TTSPromptEmbedsBuilder)
     torch.manual_seed(0)
     builder._text_embedding = torch.nn.Embedding(1000, 32).cuda()
@@ -158,6 +162,11 @@ def test_projected_text_table_matches_the_projection_per_token():
     torch.testing.assert_close(builder._project_text_ids(ids), direct)
 
     builder.build_projected_text_table(chunk_rows=300)  # several chunks, a partial last one
+    if not use_table:
+        assert builder._projected_text_table is None
+        assert builder._projected_token_cache, "unsupported platforms retain the existing cache"
+        torch.testing.assert_close(builder._project_text_ids(ids), direct)
+        return
     assert builder._projected_text_table is not None
     assert builder._projected_text_table.shape == (1000, 16)
     assert not builder._projected_token_cache, "constants are re-projected from the table"
