@@ -28,8 +28,7 @@ import base64
 import hashlib
 import io
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Mapping, Sequence
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -38,7 +37,6 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
-from torch._dynamo.exc import BackendCompilerFailed, Unsupported
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
@@ -171,52 +169,6 @@ def coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | N
 # Module-level LRU caches for the (sr, n_fft, n_mels, ...) -> mel_basis and
 # win_size -> hann_window tensors avoid rebuilding them on every request.
 # ---------------------------------------------------------------------------
-
-
-@contextmanager
-def exact_fp32_reference_encode() -> Iterator[None]:
-    """FP32 convolutions and GEMMs for variable-length reference audio on CUDA.
-
-    Every reference has a new length, and cuDNN builds an execution plan per
-    input shape (tens of milliseconds of blocking host time per reference in
-    the codec encoder and speaker encoder). The native kernels need no plan
-    and, in FP32 without TF32, give the same codes and embedding as the FP32
-    cuDNN path. Model loading calls this under the model's default dtype, so
-    the FP32 default is restored for the encoders' own temporaries too.
-    """
-    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-    default_dtype = torch.get_default_dtype()
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_default_dtype(torch.float32)
-    try:
-        with torch.backends.cudnn.flags(enabled=False):
-            yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
-        torch.set_default_dtype(default_dtype)
-
-
-class CompiledReferenceEncoder:
-    """``torch.compile(dynamic=True)`` of a reference-audio encoder call, with an eager fallback.
-
-    References have arbitrary lengths, so one dynamic-shape graph serves them
-    all; fusing the many small per-layer ops removes most of the per-call
-    launch overhead that bounds these encoders.
-    """
-
-    def __init__(self, fn: Callable[..., Any], name: str) -> None:
-        self._eager = fn
-        self._compiled: Callable[..., Any] | None = torch.compile(fn, dynamic=True)
-        self._name = name
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if self._compiled is not None:
-            try:
-                return self._compiled(*args, **kwargs)
-            except (BackendCompilerFailed, Unsupported) as exc:
-                logger.warning("Compiled Qwen3-TTS %s failed; using eager: %s", self._name, exc)
-                self._compiled = None
-        return self._eager(*args, **kwargs)
 
 
 def _dynamic_range_compression(x: torch.Tensor, c: float = 1, clip_val: float = 1e-5) -> torch.Tensor:
@@ -409,7 +361,6 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._codec_embed = codec_embed
         self._residual_code_embeddings = residual_code_embeddings
         self._speaker_encoder = speaker_encoder
-        self._speaker_encoder_call: CompiledReferenceEncoder | None = None
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
@@ -612,8 +563,10 @@ class Qwen3TTSPromptEmbedsBuilder:
         ``[text_vocab, hidden]`` in the projection dtype (about 0.6 GB for the
         1.7B checkpoints). Built at load, before the KV cache is sized.
         """
+        from vllm_omni.platforms import current_omni_platform
+
         weight = getattr(self._text_embedding, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.device.type != "cuda":
+        if not current_omni_platform.is_cuda() or not isinstance(weight, torch.Tensor) or weight.device.type != "cuda":
             return
         with torch.inference_mode():
             table = None
@@ -896,20 +849,15 @@ class Qwen3TTSPromptEmbedsBuilder:
     _mel_spectrogram_on_cpu: bool = False
 
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        from vllm_omni.platforms import current_omni_platform
-
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
         dev = self._device()
         dtype = self._embedding_dtype
-        # CUDA runs the speaker encoder in FP32 under exact_fp32_reference_encode.
-        exact_fp32 = dev.type == "cuda" and current_omni_platform.is_cuda()
-        enc_dtype = torch.float32 if exact_fp32 else dtype
         try:
             spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != enc_dtype:
-                self._speaker_encoder.to(device=dev, dtype=enc_dtype)
+            if spk_param.device != dev or spk_param.dtype != dtype:
+                self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
         # Resample to 24kHz for speaker encoder.
@@ -935,13 +883,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        encoder = self._speaker_encoder
-        if exact_fp32:
-            if self._speaker_encoder_call is None:
-                self._speaker_encoder_call = CompiledReferenceEncoder(self._speaker_encoder, "speaker encoder")
-            encoder = self._speaker_encoder_call
-        with exact_fp32_reference_encode() if exact_fp32 else nullcontext():
-            spk = encoder(mels.to(device=dev, dtype=enc_dtype))[0]
+        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
         return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(

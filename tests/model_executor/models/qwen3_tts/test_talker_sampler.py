@@ -161,7 +161,7 @@ def test_fp64_gumbel_sampler_stays_upstream():
     params = [_talker_params(seed=7), _talker_params(seed=8)]
     base, fused, talker, _, slots, device = _setup(params, use_fp64_gumbel=True)
     # The Talker's compute_logits then applies the codec mask itself.
-    assert not fused._enabled and not fused.fused_disallowed_mask
+    assert not fused._enabled and not fused.enabled
     logits = torch.randn(len(slots), VOCAB, device=device).masked_fill(talker._codec_disallowed_mask, float("-inf"))
     batch = _batch(slots, [9] * len(slots), [10] * len(slots), device)
     out = fused(logits.clone(), batch)

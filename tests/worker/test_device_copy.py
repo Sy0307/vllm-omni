@@ -75,3 +75,15 @@ def test_device_stager_views_survive_until_their_readers_finish():
     assert [o.tolist() for o in outs] == expected
     shaped = stager(np.arange(6).reshape(2, 3), "cuda")
     assert shaped.shape == (2, 3) and shaped.cpu().tolist() == [[0, 1, 2], [3, 4, 5]]
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_device_stager_empty_input_does_not_consume_a_ring_slot():
+    from vllm_omni.utils.device_copy import DeviceStager
+
+    stager = DeviceStager()
+    for shape in ((0,), (2, 0, 3)):
+        empty = stager(np.empty(shape, dtype=np.int64), "cuda")
+        assert empty.shape == shape and empty.dtype == torch.int64 and empty.is_cuda
+        assert stager._prev == -1
+    assert stager([2, 7], "cuda").cpu().tolist() == [2, 7]

@@ -95,6 +95,8 @@ class DeviceStager:
             device = torch.device(device)
         if device.type != "cuda" or not is_uva_available():
             return to_device_nonblocking(torch.from_numpy(np.ascontiguousarray(arr)), device)
+        if arr.size == 0:
+            return torch.empty(arr.shape, dtype=self.dtype, device=device)
         slot = (self._prev + 1) % self._slots
         if slot % self._group == 0:
             if self._prev >= 0:

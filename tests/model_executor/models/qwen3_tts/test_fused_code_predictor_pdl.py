@@ -141,17 +141,17 @@ def test_pdl_predictor_matches_cublas_path_and_replays_in_graphs(monkeypatch):
 
     dev = "cuda"
     pred = _predictor(dev)
-    pdl = fcp.FusedCodePredictor(pred, 64)
+    pdl = fcp.FusedCodePredictor(pred, 128)
     assert pdl._pdl_configs, "sm90+ must take the PDL chain"
     # Every config bucket at its limit and just above the previous one, read before the configs are cleared.
     limits = [limit for limit, _ in fcp._PDL_CONFIGS]
-    batches = sorted({1, 2, 5, *limits, *(limit + 1 for limit in limits[:-1])})
+    batches = sorted({1, 2, 5, 65, 128, *limits, *(limit + 1 for limit in limits[:-1])})
     monkeypatch.setattr(fcp, "_PDL_CONFIGS", ())
-    ref = fcp.FusedCodePredictor(pred, 64)
+    ref = fcp.FusedCodePredictor(pred, 128)
     assert ref._pdl_config(1) is None
 
     for B in batches:
-        assert pdl._pdl_config(B) is not None
+        assert (pdl._pdl_config(B) is not None) == (B <= 64)
         gen = torch.Generator(device=dev).manual_seed(B)
         code0 = torch.randint(0, VOCAB, (B, 1), device=dev, generator=gen)
         emb = torch.randn(B, 1, 2048, device=dev, generator=gen).to(torch.bfloat16)

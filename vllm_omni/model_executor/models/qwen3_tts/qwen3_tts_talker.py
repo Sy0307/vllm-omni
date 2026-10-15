@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -41,7 +41,6 @@ from .first_audio import talker_first_audio_enabled
 from .prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
     Qwen3TTSPromptEmbedsBuilder,
-    exact_fp32_reference_encode,
     resolve_x_vector_only,
 )
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -188,7 +187,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     eager_frames_active = False
 
     # Set when the MRv2 Talker sampler applies the codec mask in its kernel.
-    _codec_mask_in_sampler = False
 
     # Set when a prefill stores ref codes the async-chunk output must publish.
     # Starts True so a buffer restored with unpublished ref codes is still found.
@@ -404,11 +402,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tokenizer_config.encoder_config,
         )
         self.encoder.eval()
-        from vllm_omni.platforms import current_omni_platform
-
-        # CUDA encodes references in FP32 under exact_fp32_reference_encode.
-        self._ref_encoder_dtype = torch.float32 if current_omni_platform.is_cuda() else torch.bfloat16
-        self.encoder.to(dtype=self._ref_encoder_dtype)
+        self.encoder.to(dtype=torch.bfloat16)
         self._encoder_valid_num_quantizers = int(tokenizer_config.encoder_valid_num_quantizers)
         self._encoder_downsample_rate = int(tokenizer_config.encode_downsample_rate)
 
@@ -518,10 +512,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if logits is None:
             return None
 
-        # Mask out invalid codec ids using the pre-built constant buffer (in
-        # the MRv2 Talker sampler's kernel when that sampler is installed).
-        if not self._codec_mask_in_sampler:
-            logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+        # Prompt logprobs share this entry point with sampling, so preserve
+        # the codec vocabulary mask even when the fused sampler is installed.
+        logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
 
         # Suppress silence-region tokens for the first N decode frames (#4966). The
         # per-request decode step is the length of its generated-token history.
@@ -1137,13 +1130,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
         return buf[:rows]
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
         """Sample the Talker's codec row in one kernel (see :mod:`talker_sampler`)."""
         from vllm_omni.model_executor.models.qwen3_tts.talker_sampler import Qwen3TTSTalkerSampler
 
         wrapped = Qwen3TTSTalkerSampler(sampler, self)
-        self._codec_mask_in_sampler = wrapped.fused_disallowed_mask
-        return wrapped, None
+        return (wrapped, None) if wrapped.enabled else None
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.
@@ -1350,16 +1342,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             sampling_rate=target_sr,
             return_tensors="pt",
         )
-        input_values = inputs["input_values"].squeeze(1).to(device=device, dtype=self._ref_encoder_dtype)
+        input_values = inputs["input_values"].squeeze(1).to(device=device, dtype=torch.bfloat16)
         downsample = self._encoder_downsample_rate
         valid_code_lengths = [(int(wav.size) + downsample - 1) // downsample for wav in wavs]
 
-        exact_fp32 = self._ref_encoder_dtype == torch.float32 and torch.device(device).type == "cuda"
-        # Not compiled: the codec encoder's padding arithmetic recompiles per
-        # reference length.
-        with torch.inference_mode(), exact_fp32_reference_encode() if exact_fp32 else nullcontext():
-            # Residual quantization levels past the used ones do not change the
-            # earlier levels' codes, so they are not computed.
+        with torch.inference_mode():
             encoded = self.encoder.encode(
                 input_values=input_values.unsqueeze(1),
                 num_quantizers=self._encoder_valid_num_quantizers,
@@ -1431,15 +1418,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 loaded.add(name)
 
         device = self.vllm_config.device_config.device
-        self.encoder.to(device=device, dtype=self._ref_encoder_dtype)
+        self.encoder.to(device=device, dtype=torch.bfloat16)
 
         self._init_runtime_buffers()
         self._init_silence_mask()
-        self._warm_reference_encoders()
 
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
-        self._prompt_builder.build_projected_text_table()
+        # The table costs ~0.6 GB at 1.7B and is used by the fused MRv2 prefill path.
+        if self._use_v2_model_runner and self.stream_decode:
+            self._prompt_builder.build_projected_text_table()
         if talker_first_audio_enabled(self.vllm_config):
             from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
 
@@ -1552,33 +1540,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._stacked_codec_embed = torch.stack([e.weight.detach() for e in embeds], dim=0).to(
             device=w.device, dtype=w.dtype
         )
-
-    @torch.no_grad()
-    def _warm_reference_encoders(self) -> None:
-        """Run the voice-clone reference encoders once at load instead of on the first request.
-
-        Compiles the speaker encoder's dynamic-length graph; two lengths make the
-        length dimension dynamic before serving.
-        """
-        if self.config.tts_model_type != "base" or self._ref_encoder_dtype != torch.float32:
-            return
-        device = next(self.parameters()).device
-        if device.type != "cuda":
-            return
-        rng = np.random.default_rng(0)
-        wavs = [(0.01 * rng.standard_normal(n)).astype(np.float32) for n in (36000, 52800)]
-        # Model loading runs under the model's default dtype; requests run under
-        # torch's FP32 default, which the compiled graphs must match.
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.float32)
-        try:
-            self._encode_ref_audio_batch(wavs, 24000, device=device)
-            for wav in wavs:
-                self._prompt_builder.extract_speaker_embedding(wav, 24000)
-        except Exception as exc:
-            logger.warning("Qwen3-TTS reference encoder warmup failed: %s", exc)
-        finally:
-            torch.set_default_dtype(default_dtype)
 
     @torch.no_grad()
     def _init_silence_mask(self) -> None:

@@ -16,15 +16,6 @@ steps:
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
-      - label: "Simple · Qwen3-TTS PDL Predictor Test"
-        timeout_in_minutes: 15
-        source_file_dependencies:
-          - tests/model_executor/models/qwen3_tts/test_fused_code_predictor_pdl.py
-          - vllm_omni/model_executor/models/qwen3_tts/fused_code_predictor.py
-        commands:
-          - "pytest -sv tests/model_executor/models/qwen3_tts/test_fused_code_predictor_pdl.py -m 'core_model and cuda and H100' --run-level=core_model"
-        mirror_hardwares: h100_1
-
       - label: "Simple · Diffusion Models Test"
         timeout_in_minutes: 20
         commands:

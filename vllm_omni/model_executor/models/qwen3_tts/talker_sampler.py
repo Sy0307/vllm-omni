@@ -166,10 +166,12 @@ class Qwen3TTSTalkerSampler(OmniSampler):
         from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
         from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 
+        from vllm_omni.platforms import current_omni_platform
+
         processors = getattr(base, "logits_processors", None)
         return (
             type(base) is Sampler
-            and torch.cuda.is_available()
+            and current_omni_platform.is_cuda()
             and self.vocab_size <= MAX_VOCAB
             and not base.compute_nans
             # The kernel draws fp32 Gumbel noise.
@@ -181,8 +183,8 @@ class Qwen3TTSTalkerSampler(OmniSampler):
         )
 
     @property
-    def fused_disallowed_mask(self) -> bool:
-        """True when the codec mask is applied here, so compute_logits may skip it."""
+    def enabled(self) -> bool:
+        """Whether this wrapper can replace the stock sampler on this platform/configuration."""
         return self._enabled
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
@@ -215,7 +217,7 @@ class Qwen3TTSTalkerSampler(OmniSampler):
             # Compile the kernel on the runner's dummy sampler run, not on the first request.
             self._sample(logits, input_batch, n)
             self._warmed = True
-        if self.fused_disallowed_mask:
+        if self.enabled:
             logits = logits.masked_fill(self._talker._codec_disallowed_mask, float("-inf"))
         return self.base_sampler(logits, input_batch)
 

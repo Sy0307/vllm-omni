@@ -12,18 +12,52 @@ import torch
 from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
-from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner, _runner_assisted_batch_descriptor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(("num_reqs", "bucket"), [(2, 2), (3, 4), (4, 4), (5, 8), (6, 8), (7, 8), (8, 8)])
+def test_runner_assisted_decode_pads_to_unified_bucket(num_reqs: int, bucket: int) -> None:
+    original = BatchExecutionDescriptor(CUDAGraphMode.NONE, num_reqs, None)
+    request = RunnerAssistedFullAttentionMetadataRequest(bucket, True)
+    padded = _runner_assisted_batch_descriptor(original, request, num_reqs, 8)
+    assert padded is not None
+    assert (padded.num_reqs, padded.num_tokens, padded.cg_mode) == (bucket, bucket, CUDAGraphMode.NONE)
+
+
+def test_runner_assisted_decode_rejects_undersized_or_overbudget_bucket() -> None:
+    original = BatchExecutionDescriptor(CUDAGraphMode.NONE, 7, None)
+    for bucket in (4, 9):
+        assert (
+            _runner_assisted_batch_descriptor(original, RunnerAssistedFullAttentionMetadataRequest(bucket, False), 7, 8)
+            is None
+        )
+
+
+def test_runner_assisted_mixed_batch_has_independent_token_and_request_capacity() -> None:
+    original = BatchExecutionDescriptor(CUDAGraphMode.NONE, 7, None)
+    request = RunnerAssistedFullAttentionMetadataRequest(4, True, 8)
+    padded = _runner_assisted_batch_descriptor(original, request, 3, 8)
+    assert padded is not None
+    assert (padded.num_reqs, padded.num_tokens, padded.cg_mode) == (4, 8, CUDAGraphMode.NONE)
+    assert original.num_tokens == 7
+    invalid = RunnerAssistedFullAttentionMetadataRequest(4, True, 3)
+    assert _runner_assisted_batch_descriptor(original, invalid, 3, 8) is None
 
 
 def _make_runner():
@@ -67,9 +101,20 @@ def test_shutdown_closes_model_owned_first_audio_and_other_resources(moss, sende
     assert runner._native_output_materializer is None
 
 
+def test_shutdown_accepts_upstream_states_without_an_audio_sender():
+    runner = _make_runner()
+    runner.model_state = object.__new__(DefaultModelState)
+    runner._native_output_materializer = None
+    runner._omni_data_plane = None
+    with patch.object(GPUModelRunner, "shutdown") as parent:
+        runner.shutdown()
+    parent.assert_called_once()
+
+
 def test_add_requests_empty_admission_and_stop_id_sanitization():
     runner = _make_runner()
     runner.sampler = Sampler.__new__(Sampler)
+    runner.sampler.logits_processors = [object.__new__(c) for c in (LogitBiasState, PenaltiesState, BadWordsState)]
     with patch.object(GPUModelRunner, "add_requests", return_value=None) as parent:
         runner.add_requests(SchedulerOutput.make_empty())
         parent.assert_not_called()
@@ -87,10 +132,13 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
 
 
 @pytest.mark.parametrize("new_request", [False, True])
-def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request):
+@pytest.mark.parametrize("entry_point", [False, True])
+def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request, entry_point):
     runner = _make_runner()
     runner.sampler = Sampler.__new__(Sampler)
-    runner.model_config.logits_processors = ["test.CustomProcessor"]
+    runner.model_config.logits_processors = [] if entry_point else ["test.CustomProcessor"]
+    runner.sampler.logits_processors = [object.__new__(c) for c in (LogitBiasState, PenaltiesState, BadWordsState)]
+    runner.sampler.logits_processors.append(object())
     runner.model = SimpleNamespace()
     output = SchedulerOutput.make_empty()
     if new_request:
