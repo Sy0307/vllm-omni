@@ -37,6 +37,36 @@ def _make_runner():
     return runner
 
 
+@pytest.mark.parametrize("moss", [False, True])
+@pytest.mark.parametrize("sender_fails", [False, True])
+def test_shutdown_closes_model_owned_first_audio_and_other_resources(moss, sender_fails):
+    from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
+
+    runner = _make_runner()
+    state = object.__new__(MossLocalModelState if moss else OmniModelState)
+    sender = MagicMock()
+    if sender_fails:
+        sender.close.side_effect = RuntimeError("sender failed")
+    state._eager_state = SimpleNamespace(first_audio_sender=None if moss else sender)
+    if moss:
+        state._early_first_audio = object()
+        state._first_audio_sender = sender
+    runner.model_state = state
+    materializer = runner._native_output_materializer = MagicMock()
+    plane = runner._omni_data_plane = MagicMock()
+    with patch.object(GPUModelRunner, "shutdown") as parent:
+        if sender_fails:
+            with pytest.raises(RuntimeError, match="sender failed"):
+                runner.shutdown()
+        else:
+            runner.shutdown()
+        parent.assert_called_once()
+    sender.close.assert_called_once()
+    materializer.close.assert_called_once()
+    plane.close.assert_called_once()
+    assert runner._native_output_materializer is None
+
+
 def test_add_requests_empty_admission_and_stop_id_sanitization():
     runner = _make_runner()
     runner.sampler = Sampler.__new__(Sampler)

@@ -248,21 +248,23 @@ class OmniGPUModelRunner(GPUModelRunner):
             super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
-        sender = getattr(getattr(getattr(self, "model_state", None), "_eager_state", None), "first_audio_sender", None)
-        if sender is not None:
-            sender.close()
         # Every owner must release its resources even if an earlier drain fails.
         try:
-            worker = getattr(self, "_native_output_materializer", None)
-            if worker is not None:
-                worker.close()
+            state = getattr(self, "model_state", None)
+            if state is not None:
+                state.close_first_audio_sender()
         finally:
-            self._native_output_materializer = None
             try:
-                if self._omni_data_plane is not None:
-                    self._omni_data_plane.close()
+                worker = getattr(self, "_native_output_materializer", None)
+                if worker is not None:
+                    worker.close()
             finally:
-                super().shutdown()
+                self._native_output_materializer = None
+                try:
+                    if self._omni_data_plane is not None:
+                        self._omni_data_plane.close()
+                finally:
+                    super().shutdown()
 
     def _prepare_native_data_plane(self, scheduler_output: SchedulerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)

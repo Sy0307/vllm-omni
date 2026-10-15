@@ -226,6 +226,11 @@ class OmniModelState(DefaultModelState):
     def set_first_audio_sink(self, sink: Any) -> None:
         self._eager_state.set_first_audio_sink(sink)
 
+    def close_first_audio_sender(self) -> None:
+        sender = self._eager_state.first_audio_sender
+        if sender is not None:
+            sender.close()
+
     def run_eager_mtp(
         self,
         input_batch: InputBatch,
