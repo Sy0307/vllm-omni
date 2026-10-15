@@ -433,6 +433,17 @@ python -m pytest -q tests/model_executor/models/moss_tts/test_slot_attention.py 
 
 ## Single-stage Local fused profile (CUDA)
 
+The fused profile sends codec chunks of 1, 3, 7, then 15 frames (80, 240,
+560, then 1200 ms of audio). The smaller intermediate chunks bridge the
+first 80 ms to steady decoding without adding client prebuffering.
+`additional_config.moss_fused_codec.codec_chunk_ramp_frames` contains the
+intermediate sizes; they must increase strictly between
+`initial_codec_chunk_frames` and `codec_chunk_frames`. An empty list restores
+the direct transition from the first chunk to steady chunks. Early first
+audio counts as the first chunk. Ramp chunks use the first-chunk wait budget,
+and a stopped stream flushes its remaining
+frames immediately through the normal tail path.
+
 `moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
 process on one GPU. It uses packed codec graphs, fused depth kernels, precise
 stream dependencies, and a codec GEMM SM carveout of 48. The ordinary

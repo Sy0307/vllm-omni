@@ -9,7 +9,7 @@ scheduler releases the request's KV blocks and batch slot at once. The step's
 continue mask tells the host which frame that was once its copy completes; the
 host never waits for it. Frames become *known* when their step's mask has
 arrived, and only known audio frames are cut into chunks (the first chunk,
-then steady chunks, as the two-stage connector cuts them).
+optional ramp chunks, then steady chunks).
 
 Cut chunks wait in a ready queue and are decoded together on a side CUDA
 stream beside the talker's next steps: a decode costs nearly the same for one
@@ -131,7 +131,7 @@ class _Stream:
     head: int = 0
     count: int = 0
     known: int = 0
-    emitted: bool = False
+    chunks_emitted: int = 0
     # The padding frame was seen; frames after it are discarded.
     stopped: bool = False
     # The last chunk was cut.
@@ -152,6 +152,12 @@ class MossFusedAudio:
         self.initial_frames = int(codec._initial_stream_chunk_frames) or self.chunk_frames
         if self.chunk_frames <= 0:
             raise ValueError("The single-stage MOSS pipeline requires codec_chunk_frames > 0")
+        ramp = codec._connector_extra().get("codec_chunk_ramp_frames", [])
+        if not isinstance(ramp, (list, tuple)) or any(type(size) is not int or size <= 0 for size in ramp):
+            raise ValueError("codec_chunk_ramp_frames must be a list of positive integers")
+        self.chunk_schedule = (self.initial_frames, *ramp, self.chunk_frames)
+        if ramp and any(later <= earlier for earlier, later in zip(self.chunk_schedule, self.chunk_schedule[1:])):
+            raise ValueError("codec_chunk_ramp_frames must increase between the initial and steady chunk sizes")
         self.sample_rate = codec._sr_tensor
         self.device = device
         # Codec decodes, terminal resets and cancellations share this stream.
@@ -379,10 +385,10 @@ class MossFusedAudio:
         self._keep_records.append(_KeepRecord(event, host, [s for s, _ in entries], [r for _, r in entries]))
 
     def _cut(self, stream: _Stream, final: bool) -> list[tuple[int, int, bool, bool]]:
-        """(start, frames, last, first) chunks of known frames; advances the stream."""
+        """(start, frames, last, urgent) chunks of known frames; advances the stream."""
         chunks = []
         while not stream.closed:
-            if stream.precut and not stream.emitted:
+            if stream.precut and not stream.chunks_emitted:
                 if stream.known < 1:
                     if not final:
                         break
@@ -391,13 +397,13 @@ class MossFusedAudio:
                     stream.head = (stream.head + 1) % self.ring if stream.owned is None else stream.head + 1
                     stream.count -= 1
                     stream.known -= 1
-                    stream.emitted = True
+                    stream.chunks_emitted += 1
                     stream.precut = False
                     if stream.req_id in self.early:
                         self.early.discard(stream.req_id)
                         self.after_first.add(stream.req_id)
                     continue
-            threshold = self.chunk_frames if stream.emitted else self.initial_frames
+            threshold = self.chunk_schedule[min(stream.chunks_emitted, len(self.chunk_schedule) - 1)]
             if stream.known >= threshold and not (final and stream.known == stream.count == threshold):
                 frames = threshold
             elif final:
@@ -405,11 +411,14 @@ class MossFusedAudio:
             else:
                 break
             last = final and frames == stream.count
-            chunks.append((stream.head, frames, last, not stream.emitted))
+            # Startup chunks bridge a short playback buffer: use the first
+            # chunk's bounded wait, rather than waiting for a steady batch.
+            urgent = stream.chunks_emitted < len(self.chunk_schedule) - 1
+            chunks.append((stream.head, frames, last, urgent))
             stream.head = (stream.head + frames) % self.ring if stream.owned is None else stream.head + frames
             stream.count -= frames
             stream.known -= frames
-            stream.emitted = True
+            stream.chunks_emitted += 1
             if last:
                 stream.closed = True
         return chunks
@@ -419,7 +428,7 @@ class MossFusedAudio:
         for stream in self.detached.values():
             if stream.closed or not (stream.stopped or stream.known == stream.count):
                 continue
-            for start, frames, last, _first in self._cut(stream, final=True):
+            for start, frames, last, _urgent in self._cut(stream, final=True):
                 codes = stream.owned[start : start + frames].t() if frames else None
                 # Batched like steady chunks: the stream holds no batch slot.
                 self._ready.append(_Ready(stream.req_id, codes, last, False, self._steps, stream.owned_event))
@@ -600,15 +609,15 @@ class MossFusedAudio:
         # Cut first and steady chunks of known frames of running streams.
         gather_slots: list[int] = []
         gather_pos: list[int] = []
-        cut: list[tuple[str, int, bool]] = []  # (request, frames, first)
+        cut: list[tuple[str, int, bool]] = []  # (request, frames, urgent)
         for slot in slots:
             stream = self.streams[slot]
             if stream is None or stream.closed:
                 continue
-            for start, frames, _last, first in self._cut(stream, final=False):
+            for start, frames, _last, urgent in self._cut(stream, final=False):
                 gather_slots.extend([slot] * frames)
                 gather_pos.extend((start + offset) % self.ring for offset in range(frames))
-                cut.append((stream.req_id, frames, first))
+                cut.append((stream.req_id, frames, urgent))
         if cut:
             # One owned gather for every chunk: later steps rewrite the ring.
             index = np.asarray([gather_slots, gather_pos], dtype=np.int64).reshape(-1)
@@ -628,9 +637,9 @@ class MossFusedAudio:
                 index = (pool.copy_to_uva(index) if pool is not None else upload(index)).view(2, -1)
                 rows_of_chunks = self.pending[index[0], index[1]]
             offset = 0
-            for req_id, frames, first in cut:
+            for req_id, frames, urgent in cut:
                 chunk = rows_of_chunks[offset : offset + frames].t()
-                self._ready.append(_Ready(req_id, chunk, False, first, self._steps, dep))
+                self._ready.append(_Ready(req_id, chunk, False, urgent, self._steps, dep))
                 offset += frames
         self._service_detached()
         self._launch(main, force=False)

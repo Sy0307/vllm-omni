@@ -47,6 +47,7 @@ stages:
     additional_config:
       moss_fused_codec:
         initial_codec_chunk_frames: 1   # 80 ms first audio chunk
+        codec_chunk_ramp_frames: [3, 7] # Bridge the first chunk to steady decoding
         codec_chunk_frames: 15          # 1.2 s steady chunks
         codec_shared_rope: 1
         codec_fused_slot_attention: 1

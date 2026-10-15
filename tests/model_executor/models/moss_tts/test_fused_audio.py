@@ -46,6 +46,9 @@ class _FakeCodec:
     def _connector_int(self, name, default=0):
         return int(self.options.get(name, default))
 
+    def _connector_extra(self):
+        return self.options
+
     def _decode_streaming_packed(self, items):
         self.packed_calls.append(len(self.calls))
         return self._decode_streaming_batch(items)
@@ -235,8 +238,9 @@ def test_empty_tail_finishes_without_audio():
     assert codec.finished == ["e"]
 
 
-def test_detached_tail_survives_slot_reuse():
-    _, fused, sender = _fused(initial=1, chunk=5)
+@pytest.mark.parametrize("ramp", [[], [2, 3]])
+def test_detached_tail_survives_slot_reuse(ramp):
+    _, fused, sender = _fused(initial=1, chunk=5, codec_chunk_ramp_frames=ramp)
     fused.add_request(4, "old")
     delivered = []
     for code in [1, 2, 3, None]:
@@ -255,6 +259,72 @@ def test_detached_tail_survives_slot_reuse():
     audio, finals = _stream_audio(delivered, sender, "old")
     assert sum(audio, []) == [1, 2, 3] and finals[-1] is True
     assert new_audio[0] == [50]
+
+
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("padding_stop", [False, True])
+@pytest.mark.parametrize(
+    "frames,chunk_sizes",
+    [
+        (1, [1]),
+        (3, [1, 2]),
+        (4, [1, 3]),
+        (10, [1, 3, 6]),
+        (11, [1, 3, 7]),
+        (26, [1, 3, 7, 15]),
+        (27, [1, 3, 7, 15, 1]),
+        (42, [1, 3, 7, 15, 15, 1]),
+    ],
+)
+def test_chunk_ramp_preserves_frames_at_stop_boundaries(early, padding_stop, frames, chunk_sizes):
+    codec, fused, sender = _fused(initial=1, chunk=15, packed=True, codec_chunk_ramp_frames=[3, 7])
+    first = _FakeFirstSender()
+    fused.first_sender = first
+    # Reusing the slot must restart the ramp, including an early first frame.
+    for req_id in ["old", "new"]:
+        fused.add_request(0, req_id)
+        if early:
+            assert _first_frames(fused, {req_id: 1}) == [req_id]
+        delivered = []
+        for code in range(1, frames + 1):
+            _, audio = _run(fused, [0], {0: code})[req_id]
+            if audio is not None:
+                delivered.append(audio)
+        if padding_stop:
+            _, audio = _run(fused, [0], {0: None})[req_id]
+            if audio is not None:
+                delivered.append(audio)
+        _stop(fused, sender, req_id)
+        audio, finals = _stream_audio(delivered, sender, req_id)
+        assert ([1] if early else []) + sum(audio, []) == list(range(1, frames + 1))
+        chunks = [codes for call in codec.calls for rid, codes, _ in call if rid == req_id]
+        assert [len(codes) for codes in chunks] == chunk_sizes
+        assert sum(chunks, []) == list(range(1, frames + 1))
+        assert finals.count(True) == 1 and finals[-1]
+    expected_first = [([req_id], [1], [True]) for req_id in ["old", "new"]] if early else []
+    assert first.sent == expected_first
+
+
+@pytest.mark.parametrize("ramp", [[0], [-1], [True], [3, 3], [7, 3], [3, 15], "3,7"])
+def test_chunk_ramp_rejects_invalid_sizes(ramp):
+    with pytest.raises(ValueError, match="codec_chunk_ramp_frames"):
+        _fused(initial=1, chunk=15, codec_chunk_ramp_frames=ramp)
+
+
+def test_ramp_chunks_use_the_first_chunk_wait_budget():
+    codec, fused, _ = _fused(
+        initial=1,
+        chunk=15,
+        packed=True,
+        codec_chunk_ramp_frames=[3, 7],
+        fused_decode_min_batch=99,
+        fused_decode_max_wait_steps=20,
+        fused_decode_first_wait_steps=1,
+    )
+    fused.add_request(0, "ramp")
+    for code in range(1, 7):
+        _run(fused, [0], {0: code})
+    assert codec.calls == [[("ramp", [1], False)], [("ramp", [2, 3, 4], False)]]
 
 
 def test_decodes_wait_for_a_batch_or_the_wait_limit():
