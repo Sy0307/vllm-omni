@@ -339,6 +339,11 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
+
+    def sample(logits, metadata):
+        received.append(metadata)
+        return "model-sampler"
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
@@ -1804,7 +1809,7 @@ class TestMergeModelKvTransferMetadata:
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
         original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
