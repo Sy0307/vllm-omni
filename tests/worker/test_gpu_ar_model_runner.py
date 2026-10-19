@@ -340,10 +340,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
 
-    def sample(logits, metadata):
-        received.append(metadata)
-        return "model-sampler"
-
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,

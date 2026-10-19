@@ -4,9 +4,12 @@
 import unittest
 from types import SimpleNamespace as S
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.logits_processor import MoveDirectionality, NoRepeatNGramLogitsProcessor, banned_tokens
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class NoRepeatTests(unittest.TestCase):
@@ -18,7 +21,7 @@ class NoRepeatTests(unittest.TestCase):
 
     def test_live_output_and_batch_moves(self):
         p = NoRepeatNGramLogitsProcessor(None, None, False)
-        output = []
+        output: list[int] = []
         params = S(extra_args={"no_repeat_ngram_size": 3, "no_repeat_ngram_window": 8192})
         p.update_state(
             S(removed=[], added=[(0, params, [1, 2, 3, 8], output), (1, S(extra_args={}), [], [])], moved=[])

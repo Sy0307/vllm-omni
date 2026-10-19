@@ -81,8 +81,8 @@ class FakeAdapter:
     """Minimal chunk-receiving adapter honoring the ready-chunk contract.
 
     ``postprocess_scheduler_output`` mirrors the real adapter's
-    ``_clear_chunk_ready``: only request ids actually scheduled in this step
-    lose their ready marker; deferred chunks stay ready for the next step.
+    completion-owned input lifetime: generation scheduling retains ready
+    markers until an input finishes; deferred chunks remain ready as well.
     """
 
     def __init__(self, receives_chunks: bool = True):
@@ -119,9 +119,13 @@ class FakeAdapter:
         self.finish_calls.append((set(request_ids), finished_status))
         self.finish_calls_unresolved = [req_id for req_id in request_ids if req_id not in requests]
 
-    def postprocess_scheduler_output(self, scheduler_output):
-        for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}):
-            self.requests_with_ready_chunks.discard(req_id)
+    def postprocess_scheduler_output(self, scheduler_output, requests=None, *, consume_chunks=True):
+        if consume_chunks:
+            for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}):
+                self.mark_chunk_consumed(req_id)
+
+    def mark_chunk_consumed(self, request_id):
+        self.requests_with_ready_chunks.discard(request_id)
 
 
 def _make_scheduler(
@@ -279,17 +283,19 @@ class TestWaitingDefersWholeChunk:
         assert getattr(sched, queue_name).peek_request() is deferred
         assert deferred.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
         assert len(sched.running) == 56
-        # Only the scheduled chunks lose their ready marker (clear-on-schedule).
-        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
+        # An admitted input remains owned until its generation is complete.
+        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {request.request_id for request in requests}
 
         # Complete the admitted chunks; the deferred chunk must remain usable
         # and be admitted whole on the next step from either waiting queue.
         for request in requests[:56]:
             request.num_computed_tokens = FIRST_CHUNK_TOKENS
+            request.num_in_flight_tokens = 0
+            sched.chunk_transfer_adapter.mark_chunk_consumed(request.request_id)
         next_output = sched.schedule()
         assert next_output.num_scheduled_tokens == {deferred.request_id: FIRST_CHUNK_TOKENS}
         assert not getattr(sched, queue_name)
-        assert deferred.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
 
     def test_exact_fit_chunk_is_scheduled_whole(self):
         sched = _make_scheduler(budget=FIRST_CHUNK_TOKENS)

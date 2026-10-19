@@ -309,7 +309,7 @@ jq -r '.choices[0].message.audio.data' response.json \
 
 ## Notes
 
-- The response format is `language<TAB>transcription`. Clients that need only the transcript can split the returned text at the first tab.
+- The ASR prompt requests `language<TAB>transcription`, but raw Chat Completions output can contain a literal `\t` separator instead. Clients that need only the transcript should accept either separator when removing the leading language field.
 - Speech QA returns a direct answer rather than a transcript. It uses Chat Completions and is not passed through the ASR language-prefix postprocessor.
 - Ming3 IP voices use `additional_information: {"voice_mode": "ip", "ip_name": "灵小柔"}`. IP captions and Ming2 registered presets such as `DB30` are different controls.
 - Ming3 reference mode accepts per-request `ref_audio` (a URL, data URL, or base64 audio) and optional `prompt_text`. Choose either reference audio or IP controls. Omitting the controls retains the configured reference fallback; `voice_name: null` does not disable it.

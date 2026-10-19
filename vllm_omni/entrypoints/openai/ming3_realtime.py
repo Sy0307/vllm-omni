@@ -22,9 +22,9 @@ import soundfile as sf
 from starlette.websockets import WebSocket
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection
 
 from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice, voice_id
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
 if TYPE_CHECKING:
@@ -57,6 +57,18 @@ class Ming3RealtimeConnection(RealtimeConnection):
             await self.send_json({"type": "session.created", "session": self._session})
         else:
             await super().send(event)
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        try:
+            await self.websocket.send_text(json.dumps(payload))
+        except Exception:
+            self._is_connected = False
+            raise
+
+    @staticmethod
+    def _pcm16_b64(audio_f32: np.ndarray) -> str:
+        pcm16 = (np.clip(audio_f32, -1.0, 1.0) * 32767.0).astype(np.int16)
+        return base64.b64encode(pcm16.tobytes()).decode("utf-8")
 
     async def send_error(self, message, code=None):
         await self.send_json(

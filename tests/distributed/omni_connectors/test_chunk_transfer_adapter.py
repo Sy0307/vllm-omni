@@ -3477,6 +3477,7 @@ def test_generation_holds_sentence_until_final_output(build_adapter, mocker: Moc
     scheduler, schedule, output, _ = _build_deferred_finish_scheduler(mocker, running=[request], pending_finish_reqs=[])
     scheduler.chunk_transfer_adapter = adapter
     scheduler._native_data_plane = False
+    scheduler._express_min_slack_s = 0
     scheduler._async_chunk_transport_enabled.return_value = True
     scheduler._input_execution_is_terminal.return_value = False
     schedule.num_scheduled_tokens = {request.request_id: 1}

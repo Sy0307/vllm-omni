@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.entrypoints.openai.ming3_realtime import Ming3RealtimeConnection
 from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets, resolve_stored_voice, voice_id
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -26,6 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.asyncio]
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "stored"))
     server = object.__new__(OmniOpenAIServingSpeech)
+    server.speech_cache_config = SpeechCacheConfig()
     server._init_speaker_storage()
     server._adapter = None
     server._tts_model_type = "ming3_audio_tts"
@@ -72,6 +74,7 @@ async def test_model_import_persists_audio_text_and_reuses_on_restart(store, mod
     assert len(files) == 2
     timestamps = {p: p.stat().st_mtime_ns for p in files}
     restored = object.__new__(OmniOpenAIServingSpeech)
+    restored.speech_cache_config = SpeechCacheConfig()
     restored._init_speaker_storage()
     restored._adapter = None
     await register_model_voice_presets(restored, str(model))
@@ -656,3 +659,10 @@ async def test_cancelled_partial_text_is_kept_in_history(realtime, interrupt):
     assert len(realtime.serving.create_chat_completion.call_args.args[0].messages) == 1
     if interrupt:
         assert realtime._messages[-1]["role"] == "user"
+
+
+async def test_realtime_failed_send_marks_connection_disconnected(realtime):
+    realtime.websocket.send_text.side_effect = RuntimeError("client disconnected")
+    with pytest.raises(RuntimeError, match="client disconnected"):
+        await realtime.send_json({"type": "response.done"})
+    assert realtime._is_connected is False

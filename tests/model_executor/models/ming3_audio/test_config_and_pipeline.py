@@ -161,7 +161,7 @@ def tiny_processor(tiny_model_config: OmniModelConfig):
         tiny_model_config,
         tokenizer=cached_tokenizer_from_config(tiny_model_config),
     )
-    return BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx, cache=None)
+    return BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx)
 
 
 @pytest.fixture
@@ -529,14 +529,14 @@ def history_processor(request, tiny_model_path: Path, monkeypatch: pytest.Monkey
     )
     ctx = InputProcessingContext(config, tokenizer=cached_tokenizer_from_config(config))
     cache = MultiModalProcessorOnlyCache(config) if request.param else None
-    processor = BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx, cache=cache)
+    processor = BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx)
     # Exercise the real Whisper frontend on CPU without depending on a CUDA
     # context; model-independent transfer is the only substituted operation.
     monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
-    return processor
+    return processor, cache
 
 
-def _process_audio_history(processor, waveforms):
+def _process_audio_history(processor, waveforms, *, cache=None):
     tokenizer = processor.info.get_tokenizer()
     messages: list[dict[str, object]] = [{"role": "system", "content": "test"}]
     for index in range(len(waveforms)):
@@ -545,11 +545,12 @@ def _process_audio_history(processor, waveforms):
             messages.append({"role": "assistant", "content": "test"})
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     items = processor.info.parse_mm_data({"audio": [(waveform, 16000) for waveform in waveforms]})
-    return processor(prompt, mm_items=items, hf_processor_mm_kwargs={})
+    return processor(prompt, mm_items=items, hf_processor_mm_kwargs={}, cache=cache)
 
 
 @pytest.mark.parametrize("item_count", [1, 2, 13])
 def test_audio_history_preserves_individual_features_and_placeholders(history_processor, item_count):
+    history_processor, cache = history_processor
     from vllm_omni.model_executor.models.common.ming.audio_lengths import ming3_audio_token_count
     from vllm_omni.model_executor.models.ming3_audio.processing import _audio_config_args
 
@@ -557,7 +558,7 @@ def test_audio_history_preserves_individual_features_and_placeholders(history_pr
     waveforms = [rng.uniform(-0.1, 0.1, size=1600 + 160 * index).astype(np.float32) for index in range(item_count)]
     if item_count > 2:
         waveforms[-1] = waveforms[0].copy()  # Duplicate items must retain both message positions.
-    output = _process_audio_history(history_processor, waveforms)
+    output = _process_audio_history(history_processor, waveforms, cache=cache)
     audio_items = output["mm_kwargs"]["audio"]
     placeholders = output["mm_placeholders"]["audio"]
     assert len(audio_items) == len(placeholders) == item_count
@@ -573,20 +574,22 @@ def test_audio_history_preserves_individual_features_and_placeholders(history_pr
         offset = placeholders[index].offset
         assert output["prompt_token_ids"][offset : offset + count] == [3] * count
     # A second call covers processor-cache hits and uncached equivalence.
-    repeated = _process_audio_history(history_processor, waveforms)
+    repeated = _process_audio_history(history_processor, waveforms, cache=cache)
     assert repeated["prompt_token_ids"] == output["prompt_token_ids"]
     for previous, current in zip(audio_items, repeated["mm_kwargs"]["audio"], strict=True):
         torch.testing.assert_close(previous["audio_feats"].data, current["audio_feats"].data)
 
 
 def test_audio_history_respects_configured_limit(history_processor):
+    history_processor, cache = history_processor
     assert history_processor.info.get_supported_mm_limits() == {"audio": None}
     with pytest.raises(VLLMValidationError, match="16.*audio"):
-        _process_audio_history(history_processor, [np.zeros(1600, dtype=np.float32)] * 17)
+        _process_audio_history(history_processor, [np.zeros(1600, dtype=np.float32)] * 17, cache=cache)
 
 
 @pytest.mark.parametrize("item_count", [1, 2, 13])
 def test_audio_history_dummy_shares_context_budget(history_processor, item_count):
+    history_processor, cache = history_processor
     from vllm_omni.model_executor.models.common.ming.audio_lengths import ming3_audio_token_count
     from vllm_omni.model_executor.models.ming3_audio.processing import (
         AUDIO_PAD_TOKEN,
@@ -645,6 +648,7 @@ def test_audio_history_normalization_keeps_single_frame_items():
 
 
 def test_audio_history_partial_cache_hits_preserve_reordered_items(history_processor, mocker: MockerFixture):
+    history_processor, cache = history_processor
     from vllm_omni.model_executor.models.common.ming.audio_lengths import ming3_audio_token_count
     from vllm_omni.model_executor.models.ming3_audio.processing import _audio_config_args
 
@@ -656,7 +660,7 @@ def test_audio_history_partial_cache_hits_preserve_reordered_items(history_proce
     ]
     frontend = mocker.spy(history_processor, "_call_hf_processor")
     for order in [(0,), (0, 1), (1, 0, 2)]:
-        output = _process_audio_history(history_processor, [waveforms[index] for index in order])
+        output = _process_audio_history(history_processor, [waveforms[index] for index in order], cache=cache)
         audio_items = output["mm_kwargs"]["audio"]
         placeholders = output["mm_placeholders"]["audio"]
         assert len(audio_items) == len(placeholders) == len(order)
@@ -672,4 +676,4 @@ def test_audio_history_partial_cache_hits_preserve_reordered_items(history_proce
     # A and then B must hit the same processor's cache while C is new, even
     # when earlier clips change order. The uncached fixture is the control.
     processed_counts = [len(call.args[1].get("audios", [])) for call in frontend.call_args_list]
-    assert processed_counts == ([1, 1, 1] if history_processor.cache is not None else [1, 2, 3])
+    assert processed_counts == ([1, 1, 1] if cache is not None else [1, 2, 3])

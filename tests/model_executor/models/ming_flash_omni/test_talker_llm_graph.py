@@ -8,6 +8,7 @@ import pytest
 import torch
 from transformers import Qwen2Config, Qwen2Model, StaticCache
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.ming_flash_omni.talker_llm_graph import Qwen2DecodeGraph
 
 pytestmark = pytest.mark.core_model
@@ -41,7 +42,7 @@ def test_cpu_falls_back_without_allocating_resident_cache():
     assert graph.cache is None
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")
 @torch.inference_mode()
 def test_decode_matches_eager_across_prefixes_and_request_failure():
@@ -134,7 +135,7 @@ def test_replay_error_disables_graph_instead_of_retrying_partial_kv():
         assert graph.cache is None
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")
 def test_capture_failure_is_disabled_for_later_requests(monkeypatch):
     graph = Qwen2DecodeGraph(_model("cuda"), max_cache_len=32)
@@ -235,7 +236,7 @@ def test_request_orders_stream_wait_reset_and_completion(monkeypatch):
         assert graph._retired_resources is None
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"})
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")
 @torch.inference_mode()
 def test_new_stream_waits_for_previous_reset_including_cancel(monkeypatch):
