@@ -33,10 +33,10 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters import lingv3_tts as lingv3_tts_module
 from vllm_omni.entrypoints.openai.tts_adapters.auk import AuKAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities, resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
-from vllm_omni.entrypoints.openai.tts_adapters import lingv3_tts as lingv3_tts_module
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS2Adapter,
@@ -1001,6 +1001,7 @@ def test_detects_lingv3_by_architecture():
 def test_lingv3_build_accepts_resolver_cache_key(mocker):
     server = SimpleNamespace(_tts_tokenizer=object())
     server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1], 24000, "cache-key"))
+    server._get_resolved_ref_audio_artifact_key = mocker.Mock(return_value="artifact-key")
     mocker.patch.object(
         lingv3_tts_module,
         "build_lingv3_prompt",
@@ -1011,24 +1012,28 @@ def test_lingv3_build_accepts_resolver_cache_key(mocker):
             "additional_information": {},
         },
     )
-    request = SimpleNamespace(
+    request = OpenAICreateSpeechRequest(
         input="hello",
         ref_audio="file:///reference.wav",
         ref_text=None,
         max_new_tokens=200,
     )
 
-    prepared = asyncio.run(LingV3TTSAdapter(SimpleNamespace(server=server)).build(request, [], False))
+    prepared = asyncio.run(LingV3TTSAdapter(SpeechServingContext(server=server)).build(request, [], False))
 
     server._resolve_ref_audio.assert_awaited_once_with(request.ref_audio)
+    server._get_resolved_ref_audio_artifact_key.assert_called_once_with("cache-key")
+    assert prepared.prompt["additional_information"]["speaker_audio_keys"] == ["artifact-key"]
     assert prepared.model_type == "lingv3_tts"
 
 
-def test_lingv3_sampling_overrides_attach_request_rng_state():
-    adapter = LingV3TTSAdapter(SimpleNamespace(server=SimpleNamespace()))
-    defaults = [SimpleNamespace(max_tokens=801, stop_token_ids=None)]
+def test_lingv3_sampling_overrides_attach_request_rng_state(mocker):
+    server = mocker.Mock()
+    server.engine_client.model_config.hf_config.tts_config = {}
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    defaults = [SamplingParams(max_tokens=801)]
     prompt: dict[str, Any] = {"additional_information": {}}
-    request = SimpleNamespace(max_new_tokens=200, seed=1234)
+    request = OpenAICreateSpeechRequest(input="hello", max_new_tokens=200, seed=1234)
 
     overridden = adapter.apply_sampling_overrides(defaults, request, prompt, "request-1")
 
@@ -1039,12 +1044,12 @@ def test_lingv3_sampling_overrides_attach_request_rng_state():
     }
 
 
-def test_lingv3_requires_reference_audio():
-    request = SimpleNamespace(input="hello", ref_audio=None)
+def test_lingv3_rejects_transcript_without_reference_audio():
+    request = OpenAICreateSpeechRequest(input="hello", ref_text="Reference transcript.")
     server = SimpleNamespace(_apply_uploaded_speaker=lambda request: None)
-    adapter = LingV3TTSAdapter(SimpleNamespace(server=server))
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
 
-    assert adapter.validate(request) == "LingV3-TTS requires 'ref_audio' or an uploaded audio voice"
+    assert adapter.validate(request) == "'ref_text' requires reference audio"
 
 
 def test_lingv3_accepts_audio_backed_uploaded_voice(mocker):
@@ -1057,7 +1062,7 @@ def test_lingv3_accepts_audio_backed_uploaded_voice(mocker):
         _apply_uploaded_speaker=mocker.Mock(side_effect=resolve_uploaded_voice),
         _validate_ref_audio_format=lambda ref_audio: None,
     )
-    request = SimpleNamespace(
+    request = OpenAICreateSpeechRequest(
         input="hello",
         voice="alice",
         ref_audio=None,
@@ -1067,7 +1072,7 @@ def test_lingv3_accepts_audio_backed_uploaded_voice(mocker):
         max_new_tokens=None,
     )
 
-    assert LingV3TTSAdapter(SimpleNamespace(server=server)).validate(request) is None
+    assert LingV3TTSAdapter(SpeechServingContext(server=server)).validate(request) is None
     server._apply_uploaded_speaker.assert_called_once_with(request)
     assert request.ref_audio == "data:audio/wav;base64,AA=="
     assert request.ref_text == "Reference transcript."

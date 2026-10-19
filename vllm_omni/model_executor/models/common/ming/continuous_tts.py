@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Small model-independent helpers for continuous-latent TTS decoders."""
 
 from __future__ import annotations
