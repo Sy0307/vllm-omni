@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Exact legacy-antmmf prompt contract used to train LingV3-TTS."""
+"""Exact legacy-antmmf prompt contract used to train Ming-3.0-TTS."""
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from typing import Any
 
@@ -15,7 +16,10 @@ from vllm_omni.model_executor.models.ming_tts.audio_prep import (
     count_prompt_waveform_patches,
     pad_prompt_waveform,
 )
-from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_moe_prompt_token_ids
+from vllm_omni.model_executor.models.ming_tts.prompt_assembly import (
+    BASE_CAPTION_TEMPLATE,
+    build_moe_prompt_token_ids,
+)
 
 from .constants import (
     AUDIO_END_TOKEN_ID,
@@ -82,8 +86,23 @@ def normalize_target_language(language: str | None) -> str | None:
         return None
     normalized = TARGET_LANGUAGE_NAMES.get(language.strip().lower().replace("_", "-"))
     if normalized is None:
-        raise ValueError(f"Unsupported LingV3 target language: {language!r}")
+        raise ValueError(f"Unsupported Ming3 target language: {language!r}")
     return normalized
+
+
+def create_ming3_instruction(instruction: str | dict[str, str] | None) -> str | None:
+    """Preserve full captions; serialize short controls in the release task order."""
+    if not isinstance(instruction, dict):
+        return instruction
+    template = BASE_CAPTION_TEMPLATE["audio_sequence"][0]
+    # Emotion retains its archived order; other Tiny tasks put emotion before style.
+    fields = (
+        tuple(template)
+        if set(instruction) == {"情感"}
+        else ("序号", "说话人", "方言", "情感", "风格", "语速", "基频", "音量", "BGM", "IP")
+    )
+    item = {key: instruction.get(key, template[key]) for key in fields}
+    return json.dumps({"audio_sequence": [item]}, ensure_ascii=False)
 
 
 def resolve_podcast_decode_window(text: str, *, max_decode_steps: int | None = None) -> tuple[int, int]:
@@ -117,25 +136,25 @@ def _encode(tokenizer: Any, text: str) -> list[int]:
 
 
 @lru_cache(maxsize=8)
-def validate_lingv3_tokenizer(tokenizer: Any) -> dict[str, int]:
+def validate_ming3_tokenizer(tokenizer: Any) -> dict[str, int]:
     actual = {token: tokenizer.convert_tokens_to_ids(token) for token in EXPECTED_TOKENS}
     mismatches = {
         token: (expected, actual[token]) for token, expected in EXPECTED_TOKENS.items() if actual[token] != expected
     }
     if mismatches:
         details = ", ".join(f"{token}: expected {want}, got {got}" for token, (want, got) in mismatches.items())
-        raise ValueError("Tokenizer IDs do not match LingV3-TTS training: " + details)
+        raise ValueError("Tokenizer IDs do not match Ming-3.0-TTS training: " + details)
     for token, token_id in EXPECTED_TOKENS.items():
         encoded = _encode(tokenizer, token)
         if encoded != [token_id]:
             raise ValueError(f"{token!r} must encode to [{token_id}], got {encoded}")
     eos_id = int(tokenizer.eos_token_id)
     if eos_id != TEXT_EOS_TOKEN_ID and not (eos_id == 156895 and _encode(tokenizer, "<|role_end|>") == [eos_id]):
-        raise ValueError(f"Unsupported LingV3 tokenizer EOS: {eos_id}")
+        raise ValueError(f"Unsupported Ming3 tokenizer EOS: {eos_id}")
     return actual
 
 
-def build_lingv3_prompt_token_ids(
+def build_ming3_prompt_token_ids(
     tokenizer: Any,
     *,
     target_text: str,
@@ -151,7 +170,7 @@ def build_lingv3_prompt_token_ids(
         raise ValueError("prompt_text must be non-empty when provided")
     if prompt_latent_steps and prompt_text is None:
         raise ValueError("prompt_text is required when prompt latents are present")
-    validate_lingv3_tokenizer(tokenizer)
+    validate_ming3_tokenizer(tokenizer)
     target_language = normalize_target_language(target_language)
     if speaker_count < 0:
         raise ValueError("speaker_count must be non-negative")
@@ -168,7 +187,7 @@ def build_lingv3_prompt_token_ids(
         prompt_patch_count=prompt_latent_steps,
     )
     if instruction:
-        # LingV3 terminates assistant-side controls with the checkpoint's EOS.
+        # Ming3 terminates assistant-side controls with the checkpoint's EOS.
         instruction_end = len(ids) - prompt_latent_steps - 2
         ids[instruction_end] = int(tokenizer.eos_token_id)
     speaker_position = ids.index(SPEAKER_START_TOKEN_ID) + 1 if speaker_count else None
@@ -193,7 +212,7 @@ def build_lingv3_prompt_token_ids(
     return ids, speaker_position, prompt_position
 
 
-def build_lingv3_prompt(
+def build_ming3_prompt(
     tokenizer: Any,
     *,
     target_text: str,
@@ -232,7 +251,7 @@ def build_lingv3_prompt(
     ):
         raise ValueError("Reference waveforms and sample rates must be non-empty and positive")
     if len(waveforms) > 1 and not prompt_text:
-        raise ValueError("Multi-speaker LingV3 prompts require a reference transcript")
+        raise ValueError("Multi-speaker Ming3 prompts require a reference transcript")
     minimum_steps = None
     if len(waveforms) > 1:
         minimum_steps, max_decode_steps = resolve_podcast_decode_window(target_text, max_decode_steps=max_decode_steps)
@@ -254,7 +273,7 @@ def build_lingv3_prompt(
             frame_hop=882,
             vae_patch_size=4,
         )
-    ids, _, _ = build_lingv3_prompt_token_ids(
+    ids, _, _ = build_ming3_prompt_token_ids(
         tokenizer,
         target_text=target_text,
         prompt_text=prompt_text,
@@ -296,7 +315,7 @@ __all__ = [
     "ASSISTANT_PREFIX",
     "TEXT_PREFIX",
     "USER_PREFIX",
-    "build_lingv3_prompt",
-    "build_lingv3_prompt_token_ids",
-    "validate_lingv3_tokenizer",
+    "build_ming3_prompt",
+    "build_ming3_prompt_token_ids",
+    "validate_ming3_tokenizer",
 ]

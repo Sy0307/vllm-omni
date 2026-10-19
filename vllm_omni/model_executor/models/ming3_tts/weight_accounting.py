@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fail-closed tensor accounting for the released LingV3-TTS checkpoint."""
+"""Fail-closed tensor accounting for the released Ming-3.0-TTS checkpoint."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ RELEASE_TENSOR_COUNTS = {
 }
 
 
-def validate_lingv3_checkpoint_keys(
+def validate_ming3_checkpoint_keys(
     names: Iterable[str],
     *,
     require_release_layout: bool = True,
@@ -31,14 +31,14 @@ def validate_lingv3_checkpoint_keys(
         else:
             counts[prefix] += 1
     if unknown:
-        raise RuntimeError(f"LingV3 checkpoint contains {len(unknown)} unclassified tensors: {unknown[:8]}")
+        raise RuntimeError(f"Ming3 checkpoint contains {len(unknown)} unclassified tensors: {unknown[:8]}")
     actual = {prefix: counts[prefix] for prefix in RELEASE_TENSOR_COUNTS}
     if require_release_layout and actual != RELEASE_TENSOR_COUNTS:
         raise RuntimeError(
-            "LingV3 checkpoint tensor counts do not match the validated release: "
+            "Ming3 checkpoint tensor counts do not match the validated release: "
             f"expected {RELEASE_TENSOR_COUNTS}, got {actual}"
         )
     return actual
 
 
-__all__ = ["RELEASE_TENSOR_COUNTS", "validate_lingv3_checkpoint_keys"]
+__all__ = ["RELEASE_TENSOR_COUNTS", "validate_ming3_checkpoint_keys"]

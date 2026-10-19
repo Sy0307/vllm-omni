@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Checkpoint and runtime configuration for inclusionAI LingV3-TTS."""
+"""Checkpoint and runtime configuration for inclusionAI Ming-3.0-TTS."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def _plain(value: Any) -> dict[str, Any]:
     return dict(value or {})
 
 
-def get_lingv3_backbone_config(vllm_config: VllmConfig) -> VllmConfig:
+def get_ming3_backbone_config(vllm_config: VllmConfig) -> VllmConfig:
     hf_config = vllm_config.model_config.hf_config
     return vllm_config.with_hf_config(getattr(hf_config, "llm_config", hf_config))
 
@@ -52,7 +52,7 @@ class BailingMoeV3Config(PretrainedConfig):
     """Duck-typed config for the upstream Bailing-v3 implementation.
 
     vLLM's architecture converter currently recognizes the identical
-    ``bailing_hybrid`` layout for MLA sizing, while released LingV3-TTS
+    ``bailing_hybrid`` layout for MLA sizing, while released Ming-3.0-TTS
     metadata calls it ``bailing_moe_v3``.
     """
 
@@ -64,8 +64,8 @@ class BailingMoeV3Config(PretrainedConfig):
         self.checkpoint_model_type = checkpoint_model_type
 
 
-class LingV3TTSConfig(PretrainedConfig):
-    model_type = "lingv3_tts"
+class Ming3TTSConfig(PretrainedConfig):
+    model_type = "ming3_tts"
     is_composition = True
 
     def __init__(
@@ -81,7 +81,7 @@ class LingV3TTSConfig(PretrainedConfig):
         self.tts_config = dict(tts_config or {})
         task_contract = self.tts_config.get("task_contract")
         if task_contract not in (None, "", "lingv3_sft_multitask_v1"):
-            raise ValueError(f"Unsupported LingV3 task contract: {task_contract!r}")
+            raise ValueError(f"Unsupported Ming3 task contract: {task_contract!r}")
         self.llm_config = (
             llm_config if isinstance(llm_config, BailingMoeV3Config) else BailingMoeV3Config(**_plain(llm_config))
         )
@@ -96,7 +96,7 @@ class LingV3TTSConfig(PretrainedConfig):
         self.flow_config = dict(flow_config or {})
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(
-            architectures=architectures or ["LingV3TTSForConditionalGeneration"],
+            architectures=architectures or ["Ming3TTSForConditionalGeneration"],
             tie_word_embeddings=False,
             **kwargs,
         )
@@ -106,8 +106,19 @@ class LingV3TTSConfig(PretrainedConfig):
         return self.llm_config
 
 
+class LingV3TTSConfig(Ming3TTSConfig):
+    """Serialized config name retained by the public Ming-3.0-tts-tiny checkpoint."""
+
+    model_type = "lingv3_tts"
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Transformers 5.19 generates a dataclass initializer for subclasses
+        # without one, bypassing our nested-config normalization.
+        super().__init__(**kwargs)
+
+
 @dataclass
-class LingV3TTSRuntimeConfig:
+class Ming3TTSRuntimeConfig:
     llm_hidden_size: int
     llm_vocab_size: int
     llm_config: BailingMoeV3Config
@@ -138,7 +149,7 @@ class LingV3TTSRuntimeConfig:
     speaker_placeholder_token_id: int = SPEAKER_START_TOKEN_ID
 
     @classmethod
-    def from_hf_config(cls, hf_config: PretrainedConfig) -> LingV3TTSRuntimeConfig:
+    def from_hf_config(cls, hf_config: PretrainedConfig) -> Ming3TTSRuntimeConfig:
         llm = hf_config.llm_config
         tts = dict(getattr(hf_config, "tts_config", {}) or {})
         audio = hf_config.audio_config
@@ -179,7 +190,7 @@ class LingV3TTSRuntimeConfig:
             errors.append(f"latent_dim must be 64, got {self.latent_dim}")
         if self.patch_size != 1 or self.history_patch_size != 1:
             errors.append(
-                f"LingV3 flow patch/history sizes must both be 1, got {self.patch_size}/{self.history_patch_size}"
+                f"Ming3 flow patch/history sizes must both be 1, got {self.patch_size}/{self.history_patch_size}"
             )
         if self.vae_patch_size != 4:
             errors.append(f"AudioVAE patch_size must be 4, got {self.vae_patch_size}")
@@ -208,8 +219,8 @@ class LingV3TTSRuntimeConfig:
             self.speaker_placeholder_token_id,
         )
         if required_ids != (157164, 157165, 157166, 157175):
-            errors.append(f"unexpected LingV3 special-token IDs: {required_ids}")
+            errors.append(f"unexpected Ming3 special-token IDs: {required_ids}")
         if self.audio_tokenizer_config.semantic_module_kwargs is not None:
             errors.append("semantic AudioVAE module is unsupported")
         if errors:
-            raise ValueError("Invalid LingV3-TTS config: " + "; ".join(errors))
+            raise ValueError("Invalid Ming-3.0-TTS config: " + "; ".join(errors))

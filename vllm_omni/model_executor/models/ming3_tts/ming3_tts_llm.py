@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""LingV3 continuous-latent AR stage."""
+"""Ming3 continuous-latent AR stage."""
 
 from __future__ import annotations
 
@@ -36,9 +36,9 @@ from vllm_omni.model_executor.models.ming_tts.patch_emission import (
     _resolve_runtime_int,
 )
 
-from .config_lingv3_tts import (
-    LingV3TTSRuntimeConfig,
-    get_lingv3_backbone_config,
+from .config_ming3_tts import (
+    Ming3TTSRuntimeConfig,
+    get_ming3_backbone_config,
 )
 from .constants import (
     KEY_STOP_REASON,
@@ -53,33 +53,33 @@ def _assert_all_parameter_tensors_loaded(module: nn.Module, loaded_names: set[st
     missing = [sorted(aliases) for aliases in aliases_by_tensor.values() if aliases.isdisjoint(loaded_names)]
     if missing:
         raise RuntimeError(
-            f"LingV3 {label}: {len(missing)} distinct parameter tensors were not loaded. "
+            f"Ming3 {label}: {len(missing)} distinct parameter tensors were not loaded. "
             f"First few aliases: {missing[:5]}"
         )
 
 
-class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
+class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
     packed_modules_mapping = BailingMoeV3ForCausalLM.packed_modules_mapping
-    latent_patch_key = "lingv3_latent_patch"
-    next_embeds_key = "lingv3_next_embeds"
-    new_history_key = "lingv3_new_history"
-    decode_step_key = "lingv3_decode_step"
-    has_patch_key = "lingv3_has_patch"
+    latent_patch_key = "ming3_latent_patch"
+    next_embeds_key = "ming3_next_embeds"
+    new_history_key = "ming3_new_history"
+    decode_step_key = "ming3_decode_step"
+    has_patch_key = "ming3_has_patch"
     stop_reason_key = KEY_STOP_REASON
-    stop_probability_key = "lingv3_stop_prob"
+    stop_probability_key = "ming3_stop_prob"
     stop_reason_codes = STOP_REASON_CODES
     vectorize_cfm_decode = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
-        self.ming_config = LingV3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
+        self.ming_config = Ming3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
-        self.lingv3_config = self.ming_config
+        self.ming3_config = self.ming_config
         self.vllm_config = vllm_config
         self.prefix = prefix
         self.fm_dtype = _resolve_ming_runtime_dtype(vllm_config)
         self.model = BailingMoeV3ForCausalLM(
-            vllm_config=get_lingv3_backbone_config(vllm_config),
+            vllm_config=get_ming3_backbone_config(vllm_config),
             prefix=maybe_prefix(prefix, "model"),
         )
         self.linear_proj_audio = Aggregator(
@@ -104,7 +104,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
-        self._init_cfm_graph_state("LINGV3_CFM_CUDAGRAPH")
+        self._init_cfm_graph_state("MING3_CFM_CUDAGRAPH")
         self._request_generators: dict[str, torch.Generator] = {}
 
     def make_empty_intermediate_tensors(self, *args: Any, **kwargs: Any):
@@ -112,11 +112,11 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
-        return BailingMoeV3ForCausalLM.get_mamba_state_shape_from_config(get_lingv3_backbone_config(vllm_config))
+        return BailingMoeV3ForCausalLM.get_mamba_state_shape_from_config(get_ming3_backbone_config(vllm_config))
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
-        return BailingMoeV3ForCausalLM.get_mamba_state_dtype_from_config(get_lingv3_backbone_config(vllm_config))
+        return BailingMoeV3ForCausalLM.get_mamba_state_dtype_from_config(get_ming3_backbone_config(vllm_config))
 
     @classmethod
     def get_mamba_state_copy_func(cls):
@@ -125,12 +125,12 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
     def _validate_decode_window(self, request_infos: list[dict[str, Any]]) -> None:
         for index, info in enumerate(request_infos):
             maximum = _resolve_runtime_int(info, KEY_MAX_DECODE_STEPS, self.ming_config.max_decode_steps)
-            # The shared Ming loop reads this field with a zero default; resolve LingV3's fallback here.
+            # The shared Ming loop reads this field with a zero default; resolve Ming3's fallback here.
             info.setdefault(KEY_MIN_DECODE_STEPS, self.ming_config.stop_head_min_steps)
             minimum = max(1, _resolve_optional_runtime_int(info, KEY_MIN_DECODE_STEPS, 0))
             if maximum < minimum:
                 raise ValueError(
-                    f"LingV3 request idx={index}: maximum decode steps {maximum} is smaller than minimum {minimum}"
+                    f"Ming3 request idx={index}: maximum decode steps {maximum} is smaller than minimum {minimum}"
                 )
 
     def _resolve_stop_decision(
@@ -198,11 +198,11 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
             if not name.startswith(("model.", "linear_proj_audio.", "flowloss.", "stop_head.", "spk_head."))
         ]
         if unknown:
-            raise RuntimeError(f"LingV3 Stage-0 received {len(unknown)} unclassified tensors: {unknown[:8]}")
+            raise RuntimeError(f"Ming3 Stage-0 received {len(unknown)} unclassified tensors: {unknown[:8]}")
 
         backbone_weights = [(name[len("model.") :], value) for name, value in weights if name.startswith("model.")]
         if not backbone_weights:
-            raise RuntimeError("LingV3 Stage-0 received no model.* backbone tensors")
+            raise RuntimeError("Ming3 Stage-0 received no model.* backbone tensors")
         loaded_backbone = self.model.load_weights(backbone_weights)
         _assert_all_parameter_tensors_loaded(self.model, loaded_backbone, label="Bailing-v3 backbone")
 
@@ -220,4 +220,4 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         return {f"model.{name}" for name in loaded_backbone} | loaded_tts
 
 
-__all__ = ["LingV3TTSLLMModel"]
+__all__ = ["Ming3TTSLLMModel"]

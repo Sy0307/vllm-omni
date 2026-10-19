@@ -287,7 +287,7 @@ def test_pipeline_stage_list_is_complete():
 
 
 def test_entry_stage_archs_are_explicit():
-    """Ming dense, AuK, and LingV3 identify entry stages by architecture.
+    """Ming dense, AuK, and Ming3 identify entry stages by architecture.
 
     They use generic ``model_stage`` values (``llm`` and ``encoder``) that other
     pipelines share. Widening this set would change which stage
@@ -298,6 +298,7 @@ def test_entry_stage_archs_are_explicit():
         {
             "MingTTSForConditionalGeneration",
             "AuKForConditionalGeneration",
+            "Ming3TTSForConditionalGeneration",
             "LingV3TTSForConditionalGeneration",
         }
     )

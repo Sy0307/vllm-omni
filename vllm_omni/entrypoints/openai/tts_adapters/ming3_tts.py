@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""OpenAI speech adapter for inclusionAI LingV3-TTS."""
+"""OpenAI speech adapter for inclusionAI Ming-3.0-TTS."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from vllm.inputs import tokens_input
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
-from vllm_omni.model_executor.models.lingv3_tts.constants import (
+from vllm_omni.model_executor.models.ming3_tts.constants import (
     AUDIO_END_TOKEN_ID,
     KEY_CFG,
     KEY_MAX_DECODE_STEPS,
@@ -24,21 +24,21 @@ from vllm_omni.model_executor.models.lingv3_tts.constants import (
     KEY_TEMPERATURE,
     MAX_DECODE_STEPS,
 )
-from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
-    build_lingv3_prompt,
+from vllm_omni.model_executor.models.ming3_tts.prompt_assembly import (
+    build_ming3_prompt,
+    create_ming3_instruction,
     normalize_target_language,
     resolve_podcast_decode_window,
 )
-from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 
 @register_tts_adapter
-class LingV3TTSAdapter(ARTTSAdapter):
-    name = "lingv3_tts"
-    model_archs = frozenset({"LingV3TTSForConditionalGeneration"})
+class Ming3TTSAdapter(ARTTSAdapter):
+    name = "ming3_tts"
+    model_archs = frozenset({"Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"})
     arch_identifies_entry_stage = True
     detect_priority = 190
     max_new_tokens_max = MAX_DECODE_STEPS
@@ -69,7 +69,7 @@ class LingV3TTSAdapter(ARTTSAdapter):
             if request.ref_text is not None:
                 return "'ref_text' requires reference audio"
             if not self._is_emergent(request) and not request.instructions:
-                return "LingV3-TTS requires reference audio or 'instructions'"
+                return "Ming-3.0-TTS requires reference audio or 'instructions'"
         references = (
             request.ref_audio
             if isinstance(request.ref_audio, list)
@@ -77,11 +77,11 @@ class LingV3TTSAdapter(ARTTSAdapter):
         )
         if len(references) > 1:
             if self.tts_config.get("task_decode_alignment", {}).get("podcast") != "old_shift":
-                return "LingV3 Podcast requires task_decode_alignment.podcast=old_shift"
+                return "Ming3 Podcast requires task_decode_alignment.podcast=old_shift"
             if not request.ref_text or not request.ref_text.strip():
-                return "LingV3 Podcast requires an ordered speaker_N reference transcript in 'ref_text'"
+                return "Ming3 Podcast requires an ordered speaker_N reference transcript in 'ref_text'"
             if request.instructions:
-                return "LingV3 Podcast does not support 'instructions'"
+                return "Ming3 Podcast does not support 'instructions'"
             speakers = set()
             for line in request.input.splitlines():
                 if not line.strip():
@@ -109,14 +109,18 @@ class LingV3TTSAdapter(ARTTSAdapter):
             self._instruction(request.instructions)
         except ValueError as error:
             return str(error)
-        for key in (KEY_CFG, "temperature"):
+        extra = request.extra_params or {}
+        if extra.get(KEY_CFG) is not None and extra.get("lingv3_cfg") is not None:
+            if extra[KEY_CFG] != extra["lingv3_cfg"]:
+                return "ming3_cfg and its legacy alias lingv3_cfg must agree"
+        for key in (KEY_CFG, "lingv3_cfg", "temperature"):
             value = (request.extra_params or {}).get(key)
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
             ):
-                return f"LingV3-TTS {key} must be a finite non-negative number"
+                return f"Ming-3.0-TTS {key} must be a finite non-negative number"
         if request.speaker_embedding is not None:
-            return "LingV3-TTS v1 derives speaker conditioning from 'ref_audio'"
+            return "Ming-3.0-TTS v1 derives speaker conditioning from 'ref_audio'"
         if request.max_new_tokens is not None:
             minimum = int(self.tts_config.get("minimum_decode_steps", 5))
             if len(references) <= 1 and request.max_new_tokens < minimum:
@@ -136,12 +140,12 @@ class LingV3TTSAdapter(ARTTSAdapter):
             return None
         instruction = instructions.strip()
         if not instruction:
-            raise ValueError("LingV3-TTS instructions must be non-empty")
+            raise ValueError("Ming-3.0-TTS instructions must be non-empty")
         try:
             controls = json.loads(instruction)
         except json.JSONDecodeError:
             if instruction.startswith(("{", "[")):
-                raise ValueError("LingV3-TTS structured instructions must be a valid JSON object") from None
+                raise ValueError("Ming-3.0-TTS structured instructions must be a valid JSON object") from None
             if not instruction.startswith("Speaking instruction:"):
                 instruction = f"Speaking instruction: Speak in this style: {instruction}"
             return instruction
@@ -149,30 +153,30 @@ class LingV3TTSAdapter(ARTTSAdapter):
         if isinstance(controls, dict) and set(controls) == {"audio_sequence"}:
             sequence = controls["audio_sequence"]
             if not isinstance(sequence, list) or len(sequence) != 1 or not isinstance(sequence[0], dict):
-                raise ValueError("LingV3-TTS structured instructions require one audio_sequence item")
+                raise ValueError("Ming-3.0-TTS structured instructions require one audio_sequence item")
             item = sequence[0]
             if set(item) != allowed | {"序号", "说话人", "BGM"}:
-                raise ValueError("LingV3-TTS structured instructions require the complete single-speaker schema")
+                raise ValueError("Ming-3.0-TTS structured instructions require the complete single-speaker schema")
             if type(item["序号"]) is not int or item["序号"] != 1 or item["说话人"] != "speaker_1":
-                raise ValueError("LingV3-TTS structured instructions require sequence 1 and speaker_1")
+                raise ValueError("Ming-3.0-TTS structured instructions require sequence 1 and speaker_1")
             if any(
                 item[key] is not None and (not isinstance(item[key], str) or not item[key].strip()) for key in allowed
             ):
-                raise ValueError("LingV3-TTS instruction values must be non-empty strings or null")
+                raise ValueError("Ming-3.0-TTS instruction values must be non-empty strings or null")
             bgm = item["BGM"]
             if (
                 not isinstance(bgm, dict)
                 or set(bgm) != {"Genre", "Mood", "Instrument", "Theme", "ENV", "SNR"}
                 or any(value is not None for value in bgm.values())
             ):
-                raise ValueError("LingV3-TTS structured instructions require inactive BGM fields")
+                raise ValueError("Ming-3.0-TTS structured instructions require inactive BGM fields")
             # Field order is part of the model's token input. Preserve archived
             # full captions instead of rebuilding them from the short controls.
             return instruction
         if not isinstance(controls, dict) or not controls or not set(controls) <= allowed:
-            raise ValueError("LingV3-TTS instructions support 语速, 基频, 音量, 情感, 方言, 风格 and IP")
+            raise ValueError("Ming-3.0-TTS instructions support 语速, 基频, 音量, 情感, 方言, 风格 and IP")
         if any(not isinstance(value, str) or not value.strip() for value in controls.values()):
-            raise ValueError("LingV3-TTS instruction values must be non-empty strings")
+            raise ValueError("Ming-3.0-TTS instruction values must be non-empty strings")
         return controls
 
     def _target_language(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -182,7 +186,7 @@ class LingV3TTSAdapter(ARTTSAdapter):
         if not multiple_references or not self.tts_config.get("enable_tts_target_language"):
             return None
         if not self.tts_config.get("infer_tts_language_from_text"):
-            raise ValueError("This LingV3 Podcast checkpoint requires an explicit language")
+            raise ValueError("This Ming3 Podcast checkpoint requires an explicit language")
         text = re.sub(r"\[[^\]\n]{1,128}\]|\([A-Za-z][A-Za-z _-]{0,127}\)", "", request.input)
         return "Chinese" if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text) else "English"
 
@@ -215,14 +219,14 @@ class LingV3TTSAdapter(ARTTSAdapter):
         max_steps = request.max_new_tokens
         if max_steps is None and len(speaker_audio_keys) <= 1:
             max_steps = int(self.tts_config.get("maximum_decode_steps", MAX_DECODE_STEPS))
-        prompt_dict = build_lingv3_prompt(
+        prompt_dict = build_ming3_prompt(
             server._tts_tokenizer,
             target_text=request.input,
             reference_waveform=waveform,
             reference_sample_rate=sample_rate,
             target_language=self._target_language(request),
             prompt_text=request.ref_text,
-            instruction=create_instruction(self._instruction(request.instructions)),
+            instruction=create_ming3_instruction(self._instruction(request.instructions)),
             max_decode_steps=max_steps,
             speaker_slot=not self._is_emergent(request),
         )
@@ -258,6 +262,8 @@ class LingV3TTSAdapter(ARTTSAdapter):
             if isinstance(info, dict):
                 latent_cap = int(info.get(KEY_MAX_DECODE_STEPS, latent_cap))
                 cfg = (request.extra_params or {}).get(KEY_CFG)
+                if cfg is None:
+                    cfg = (request.extra_params or {}).get("lingv3_cfg")
                 if cfg is not None:
                     info[KEY_CFG] = float(cfg)
                 temperature = (request.extra_params or {}).get("temperature")
@@ -271,4 +277,4 @@ class LingV3TTSAdapter(ARTTSAdapter):
         return updated
 
 
-__all__ = ["LingV3TTSAdapter"]
+__all__ = ["Ming3TTSAdapter"]

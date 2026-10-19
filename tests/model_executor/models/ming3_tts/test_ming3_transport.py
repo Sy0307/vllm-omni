@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.lingv3_tts import (
+from vllm_omni.model_executor.stage_input_processors.ming3_tts import (
     llm2audio_vae,
     llm2audio_vae_async_chunk,
 )
@@ -43,8 +43,8 @@ def _manager():
 
 def _step(value: float):
     return {
-        "lingv3_latent_patch": torch.full((1, 1, 64), value),
-        "lingv3_has_patch": torch.tensor([True]),
+        "ming3_latent_patch": torch.full((1, 1, 64), value),
+        "ming3_has_patch": torch.tensor([True]),
     }
 
 
@@ -92,7 +92,7 @@ def test_sync_transport_preserves_all_accumulated_latents():
     stage_output = SimpleNamespace(
         finished=True,
         request_id="req-sync",
-        outputs=[SimpleNamespace(multimodal_output={"lingv3_latent_patch": latents})],
+        outputs=[SimpleNamespace(multimodal_output={"ming3_latent_patch": latents})],
     )
     prompts = llm2audio_vae([stage_output])
     assert len(prompts) == 1

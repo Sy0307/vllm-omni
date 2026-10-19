@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Streaming LingV3 AudioVAE stage using the shared Ming implementation."""
+"""Streaming Ming3 AudioVAE stage using the shared Ming implementation."""
 
 from __future__ import annotations
 
@@ -17,19 +17,19 @@ from vllm_omni.model_executor.models.ming_tts.ming_tts_audio_vae import (
     MingAudioVAEModel,
 )
 
-from .config_lingv3_tts import LingV3TTSRuntimeConfig
+from .config_ming3_tts import Ming3TTSRuntimeConfig
 
 
-class LingV3TTSAudioVAEModel(MingAudioVAEModel):
+class Ming3TTSAudioVAEModel(MingAudioVAEModel):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # Keep the mature streaming decode/cache implementation but construct it
-        # from LingV3's audio_config rather than Ming's audio_tokenizer_config.
+        # from Ming3's audio_config rather than Ming's audio_tokenizer_config.
         super(MingAudioVAEModel, self).__init__()
         del prefix
         self.vllm_config = vllm_config
-        self.ming_config = LingV3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
+        self.ming_config = Ming3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
-        self.lingv3_config = self.ming_config
+        self.ming3_config = self.ming_config
         self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
         self.have_multimodal_outputs = True
         self.has_preprocess = False
@@ -50,7 +50,7 @@ class LingV3TTSAudioVAEModel(MingAudioVAEModel):
         required = set(self.state_dict())
         unknown = [name for name, _ in weights if name not in targets]
         if unknown:
-            raise RuntimeError(f"LingV3 AudioVAE received {len(unknown)} unknown checkpoint tensors: {unknown[:8]}")
+            raise RuntimeError(f"Ming3 AudioVAE received {len(unknown)} unknown checkpoint tensors: {unknown[:8]}")
         loaded: set[str] = set()
         for name, value in weights:
             if name in params:
@@ -64,7 +64,7 @@ class LingV3TTSAudioVAEModel(MingAudioVAEModel):
         missing = {name for name in required if name.startswith("audio.")} - loaded
         if missing:
             raise RuntimeError(
-                f"LingV3 AudioVAE left {len(missing)} checkpoint-backed tensors unloaded: {sorted(missing)[:8]}"
+                f"Ming3 AudioVAE left {len(missing)} checkpoint-backed tensors unloaded: {sorted(missing)[:8]}"
             )
         return loaded
 
@@ -73,4 +73,4 @@ class LingV3TTSAudioVAEModel(MingAudioVAEModel):
             self._clear_request_state(request_id)
 
 
-__all__ = ["LingV3TTSAudioVAEModel"]
+__all__ = ["Ming3TTSAudioVAEModel"]

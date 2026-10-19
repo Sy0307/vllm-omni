@@ -69,8 +69,9 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
-        from vllm_omni.model_executor.models.lingv3_tts.config_lingv3_tts import (
+        from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
             LingV3TTSConfig,
+            Ming3TTSConfig,
         )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
@@ -109,6 +110,7 @@ def _register_omni_hf_configs() -> None:
         ("breeze", BreezeConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
+        ("ming3_tts", Ming3TTSConfig),
         ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),

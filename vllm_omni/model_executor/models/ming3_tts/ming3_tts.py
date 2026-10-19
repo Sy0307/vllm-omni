@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Two-stage vLLM-Omni wrapper for LingV3-TTS."""
+"""Two-stage vLLM-Omni wrapper for Ming-3.0-TTS."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from vllm_omni.model_executor.models.ming_tts.ming_tts import (
 )
 from vllm_omni.model_executor.models.ming_tts.prompt_encoder import _resolve_prompt_latents
 
-from .config_lingv3_tts import LingV3TTSRuntimeConfig, get_lingv3_backbone_config
+from .config_ming3_tts import Ming3TTSRuntimeConfig, get_ming3_backbone_config
 from .constants import (
     KEY_CFG,
     KEY_LAST_STOP_PROB,
@@ -43,10 +43,10 @@ from .constants import (
     KEY_TEMPERATURE,
 )
 from .speaker_extractor import resolve_speaker_embeddings
-from .weight_accounting import validate_lingv3_checkpoint_keys
+from .weight_accounting import validate_ming3_checkpoint_keys
 
 
-class LingV3TTSForConditionalGeneration(
+class Ming3TTSForConditionalGeneration(
     nn.Module,
     HasInnerState,
     IsHybrid,
@@ -60,9 +60,9 @@ class LingV3TTSForConditionalGeneration(
         super().__init__()
         del prefix
         self.vllm_config = vllm_config
-        self.ming_config = LingV3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
+        self.ming_config = Ming3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
-        self.lingv3_config = self.ming_config
+        self.ming3_config = self.ming_config
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
@@ -77,7 +77,7 @@ class LingV3TTSForConditionalGeneration(
             self._speaker_cache = get_speaker_cache()
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
-                architectures=["LingV3TTSLLMModel"],
+                architectures=["Ming3TTSLLMModel"],
             )
             self.has_preprocess = True
             self.has_postprocess = True
@@ -86,20 +86,20 @@ class LingV3TTSForConditionalGeneration(
         elif self.model_stage == "audio_vae":
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
-                architectures=["LingV3TTSAudioVAEModel"],
+                architectures=["Ming3TTSAudioVAEModel"],
             )
             self.requires_raw_input_tokens = True
         else:
-            raise ValueError(f"Invalid LingV3 model_stage={self.model_stage!r}")
+            raise ValueError(f"Invalid Ming3 model_stage={self.model_stage!r}")
         self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
-        return BailingMoeV3ForCausalLM.get_mamba_state_shape_from_config(get_lingv3_backbone_config(vllm_config))
+        return BailingMoeV3ForCausalLM.get_mamba_state_shape_from_config(get_ming3_backbone_config(vllm_config))
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
-        return BailingMoeV3ForCausalLM.get_mamba_state_dtype_from_config(get_lingv3_backbone_config(vllm_config))
+        return BailingMoeV3ForCausalLM.get_mamba_state_dtype_from_config(get_ming3_backbone_config(vllm_config))
 
     @classmethod
     def get_mamba_state_copy_func(cls):
@@ -132,7 +132,7 @@ class LingV3TTSForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
-        validate_lingv3_checkpoint_keys(name for name, _ in weights)
+        validate_ming3_checkpoint_keys(name for name, _ in weights)
         allowed = (
             ("model.", "linear_proj_audio.", "flowloss.", "stop_head.", "spk_head.")
             if self.model_stage == "llm"
@@ -140,7 +140,7 @@ class LingV3TTSForConditionalGeneration(
         )
         selected = [(name, value) for name, value in weights if name.startswith(allowed)]
         if not selected:
-            raise RuntimeError(f"LingV3 {self.model_stage} stage received no weights with prefixes {allowed}")
+            raise RuntimeError(f"Ming3 {self.model_stage} stage received no weights with prefixes {allowed}")
         loaded = self.model.load_weights(selected)
         return {f"model.{name}" for name in loaded}
 
@@ -206,7 +206,7 @@ class LingV3TTSForConditionalGeneration(
         else:
             speakers = resolve_speaker_embeddings(self, info)
             if not slots or len(slots) != len(speakers):
-                raise RuntimeError(f"LingV3 speaker slot/embedding count mismatch: {len(slots)}/{len(speakers)}")
+                raise RuntimeError(f"Ming3 speaker slot/embedding count mismatch: {len(slots)}/{len(speakers)}")
             for slot, speaker in zip(slots, speakers, strict=True):
                 input_embeds[slot] = self.model.project_speaker_embedding(
                     speaker.to(input_embeds.device, input_embeds.dtype).unsqueeze(0)
@@ -218,7 +218,7 @@ class LingV3TTSForConditionalGeneration(
             positions = _find_audio_placeholder_positions(input_ids, self.ming_config)
             if positions.numel() != prompt_embeds.shape[0]:
                 raise RuntimeError(
-                    "LingV3 prompt latent/token count mismatch: "
+                    "Ming3 prompt latent/token count mismatch: "
                     f"{prompt_embeds.shape[0]} latents for {positions.numel()} slots"
                 )
             input_embeds[positions] = prompt_embeds.to(input_embeds.dtype)
@@ -294,4 +294,4 @@ class LingV3TTSForConditionalGeneration(
         return update
 
 
-__all__ = ["LingV3TTSForConditionalGeneration"]
+__all__ = ["Ming3TTSForConditionalGeneration"]

@@ -7,13 +7,13 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.lingv3_tts"
+_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.ming3_tts"
 
-LINGV3_TTS_PIPELINE = PipelineConfig(
-    model_type="lingv3_tts",
-    default_deploy_config_name="lingv3_tts.yaml",
-    model_arch="LingV3TTSForConditionalGeneration",
-    hf_architectures=("LingV3TTSForConditionalGeneration",),
+MING3_TTS_PIPELINE = PipelineConfig(
+    model_type="ming3_tts",
+    default_deploy_config_name="ming3_tts.yaml",
+    model_arch="Ming3TTSForConditionalGeneration",
+    hf_architectures=("Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"),
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -53,4 +53,4 @@ LINGV3_TTS_PIPELINE = PipelineConfig(
     ),
 )
 
-__all__ = ["LINGV3_TTS_PIPELINE"]
+__all__ = ["MING3_TTS_PIPELINE"]

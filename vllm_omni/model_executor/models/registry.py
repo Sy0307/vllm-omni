@@ -267,21 +267,27 @@ _OMNI_MODELS = {
         "ming_tts_audio_vae",
         "MingAudioVAEModel",
     ),
-    ## LingV3-TTS
+    ## Ming-3.0-TTS
+    # Architecture retained in the public HF checkpoint's config.json.
     "LingV3TTSForConditionalGeneration": (
-        "lingv3_tts",
-        "lingv3_tts",
-        "LingV3TTSForConditionalGeneration",
+        "ming3_tts",
+        "ming3_tts",
+        "Ming3TTSForConditionalGeneration",
     ),
-    "LingV3TTSLLMModel": (
-        "lingv3_tts",
-        "lingv3_tts_llm",
-        "LingV3TTSLLMModel",
+    "Ming3TTSForConditionalGeneration": (
+        "ming3_tts",
+        "ming3_tts",
+        "Ming3TTSForConditionalGeneration",
     ),
-    "LingV3TTSAudioVAEModel": (
-        "lingv3_tts",
-        "lingv3_tts_audio_vae",
-        "LingV3TTSAudioVAEModel",
+    "Ming3TTSLLMModel": (
+        "ming3_tts",
+        "ming3_tts_llm",
+        "Ming3TTSLLMModel",
+    ),
+    "Ming3TTSAudioVAEModel": (
+        "ming3_tts",
+        "ming3_tts_audio_vae",
+        "Ming3TTSAudioVAEModel",
     ),
     ## glm_image
     "GlmImageForConditionalGeneration": (

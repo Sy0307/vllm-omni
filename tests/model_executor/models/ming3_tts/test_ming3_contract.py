@@ -15,11 +15,11 @@ from vllm_omni.model_executor.models.common.ming.continuous_tts import (
     STOP_REASON_STOP_HEAD,
     resolve_stop_decision,
 )
-from vllm_omni.model_executor.models.lingv3_tts.config_lingv3_tts import (
-    LingV3TTSConfig,
-    LingV3TTSRuntimeConfig,
+from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
+    Ming3TTSConfig,
+    Ming3TTSRuntimeConfig,
 )
-from vllm_omni.model_executor.models.lingv3_tts.constants import (
+from vllm_omni.model_executor.models.ming3_tts.constants import (
     AUDIO_END_TOKEN_ID,
     AUDIO_PATCH_TOKEN_ID,
     AUDIO_START_TOKEN_ID,
@@ -28,20 +28,20 @@ from vllm_omni.model_executor.models.lingv3_tts.constants import (
     SPEAKER_END_TOKEN_ID,
     SPEAKER_START_TOKEN_ID,
 )
-from vllm_omni.model_executor.models.lingv3_tts.lingv3_tts import (
-    LingV3TTSForConditionalGeneration,
+from vllm_omni.model_executor.models.ming3_tts.ming3_tts import (
+    Ming3TTSForConditionalGeneration,
 )
-from vllm_omni.model_executor.models.lingv3_tts.lingv3_tts_llm import (
-    LingV3TTSLLMModel,
+from vllm_omni.model_executor.models.ming3_tts.ming3_tts_llm import (
+    Ming3TTSLLMModel,
 )
-from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
+from vllm_omni.model_executor.models.ming3_tts.prompt_assembly import (
     ASSISTANT_PREFIX,
     TEXT_PREFIX,
     USER_PREFIX,
-    build_lingv3_prompt,
-    build_lingv3_prompt_token_ids,
+    build_ming3_prompt,
+    build_ming3_prompt_token_ids,
     resolve_podcast_decode_window,
-    validate_lingv3_tokenizer,
+    validate_ming3_tokenizer,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
@@ -78,7 +78,7 @@ class FakeTokenizer:
         ]
 
 
-def _config() -> LingV3TTSConfig:
+def _config() -> Ming3TTSConfig:
     backbone = {
         "model_type": "bailing_moe_v3",
         "vocab_size": 157184,
@@ -101,7 +101,7 @@ def _config() -> LingV3TTSConfig:
         "enc_kwargs": {"hop_size": 882, "latent_dim": 64},
         "dec_kwargs": {"output_dim": 882, "latent_dim": 64},
     }
-    return LingV3TTSConfig(
+    return Ming3TTSConfig(
         llm_config=backbone,
         audio_config=audio,
         tts_config={
@@ -123,7 +123,7 @@ def _config() -> LingV3TTSConfig:
 
 def test_config_normalizes_bailing_and_keeps_independent_geometry():
     config = _config()
-    runtime = LingV3TTSRuntimeConfig.from_hf_config(config)
+    runtime = Ming3TTSRuntimeConfig.from_hf_config(config)
     runtime.validate()
     assert config.llm_config.model_type == "bailing_hybrid"
     assert config.llm_config.checkpoint_model_type == "bailing_moe_v3"
@@ -140,7 +140,7 @@ def test_config_normalizes_bailing_and_keeps_independent_geometry():
 @pytest.mark.parametrize("text", ["target", "Genre: x Mood: x Instrument: x Theme: x Duration: 3s"])
 def test_prompt_contract_speaker_only(text):
     tokenizer = FakeTokenizer()
-    ids, speaker_position, prompt_position = build_lingv3_prompt_token_ids(tokenizer, target_text=text)
+    ids, speaker_position, prompt_position = build_ming3_prompt_token_ids(tokenizer, target_text=text)
     expected = (
         tokenizer.encode(USER_PREFIX)
         + [SPEAKER_START_TOKEN_ID, AUDIO_PATCH_TOKEN_ID, SPEAKER_END_TOKEN_ID]
@@ -156,7 +156,7 @@ def test_prompt_contract_speaker_only(text):
 
 def test_prompt_contract_concatenates_reference_and_target_without_separator():
     tokenizer = FakeTokenizer()
-    ids, _, prompt_position = build_lingv3_prompt_token_ids(
+    ids, _, prompt_position = build_ming3_prompt_token_ids(
         tokenizer,
         target_text="target",
         prompt_text="reference",
@@ -180,7 +180,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
         calls["prompt"] = (wrapper, info, kwargs)
         return None
 
-    from vllm_omni.model_executor.models.lingv3_tts import lingv3_tts as model_module
+    from vllm_omni.model_executor.models.ming3_tts import ming3_tts as model_module
 
     monkeypatch.setattr(model_module, "_resolve_prompt_latents", resolve_prompt_latents)
     monkeypatch.setattr(model_module, "resolve_speaker_embeddings", lambda wrapper, info: [torch.zeros(192)])
@@ -198,7 +198,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
     )
     info = {"prompt_waveform": torch.ones((1, 8)), "request_id": "request-1"}
 
-    LingV3TTSForConditionalGeneration._prefill_preprocess(
+    Ming3TTSForConditionalGeneration._prefill_preprocess(
         wrapper,
         torch.tensor([AUDIO_PATCH_TOKEN_ID]),
         torch.zeros((1, 4)),
@@ -221,7 +221,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
 )
 def test_request_generator_seed_policy(info, expected_seed):
     model = SimpleNamespace(_request_generators={})
-    generator = LingV3TTSLLMModel._get_request_generator(
+    generator = Ming3TTSLLMModel._get_request_generator(
         model,
         info,
         torch.device("cpu"),
@@ -235,7 +235,7 @@ def test_tokenizer_mismatch_is_not_repaired():
     tokenizer = FakeTokenizer()
     tokenizer.special["<audio>"] = -1
     with pytest.raises(ValueError, match="expected 157165"):
-        validate_lingv3_tokenizer(tokenizer)
+        validate_ming3_tokenizer(tokenizer)
 
 
 @pytest.mark.parametrize(
@@ -263,7 +263,7 @@ def test_stop_is_evaluated_after_emitting_latent(emitted, probability, reason, t
 def test_runtime_rejects_flow_vae_patch_confusion():
     config = _config()
     config.audio_config.patch_size = 1
-    runtime = LingV3TTSRuntimeConfig.from_hf_config(config)
+    runtime = Ming3TTSRuntimeConfig.from_hf_config(config)
     with pytest.raises(ValueError, match="AudioVAE patch_size must be 4"):
         runtime.validate()
 
@@ -271,17 +271,17 @@ def test_runtime_rejects_flow_vae_patch_confusion():
 def test_runtime_rejects_incompatible_mla_geometry():
     config = _config()
     config.llm_config.kv_lora_rank = 256
-    runtime = LingV3TTSRuntimeConfig.from_hf_config(config)
+    runtime = Ming3TTSRuntimeConfig.from_hf_config(config)
     with pytest.raises(ValueError, match="expected MLA head size 576"):
         runtime.validate()
 
 
 def test_pipeline_contract():
-    from vllm_omni.model_executor.models.lingv3_tts.pipeline import (
-        LINGV3_TTS_PIPELINE,
+    from vllm_omni.model_executor.models.ming3_tts.pipeline import (
+        MING3_TTS_PIPELINE,
     )
 
-    stage0, stage1 = LINGV3_TTS_PIPELINE.stages
+    stage0, stage1 = MING3_TTS_PIPELINE.stages
     assert stage0.hf_config_name == "llm_config"
     assert stage0.owns_tokenizer is True
     assert stage0.sampling_constraints["max_tokens"] == 801
@@ -295,7 +295,7 @@ def test_cfm_graph_bucket_zero_pads_without_touching_live_rows():
     solver_noise = live.unsqueeze(0).expand(10, -1, -1)
 
     model = SimpleNamespace(_cfm_graph_batch_sizes=[1, 2, 4])
-    assert LingV3TTSLLMModel._select_cfm_graph_batch_size(model, 3) == 4
+    assert Ming3TTSLLMModel._select_cfm_graph_batch_size(model, 3) == 4
     padded = CFMGraphExecutor._pad_batch(executor, live)
     padded_solver_noise = CFMGraphExecutor._pad_batch(executor, solver_noise, dim=1)
 
@@ -307,7 +307,7 @@ def test_cfm_graph_bucket_zero_pads_without_touching_live_rows():
     assert torch.count_nonzero(padded_solver_noise[:, 3]) == 0
 
 
-def test_lingv3_vectorizes_only_compatible_flow_requests():
+def test_ming3_vectorizes_only_compatible_flow_requests():
     config = SimpleNamespace(
         history_patch_size=2,
         latent_dim=3,
@@ -340,7 +340,7 @@ def test_lingv3_vectorizes_only_compatible_flow_requests():
         _decode_one_step=decode_one_step,
     )
     model._draw_request_cfm_noises = lambda generators, device: (
-        LingV3TTSLLMModel._draw_request_cfm_noises(model, generators, device)
+        Ming3TTSLLMModel._draw_request_cfm_noises(model, generators, device)
     )
     history = torch.zeros((1, config.history_patch_size, config.latent_dim))
     request_infos = [
@@ -349,7 +349,7 @@ def test_lingv3_vectorizes_only_compatible_flow_requests():
         {"ming_latent_history": history, "ming_cfg": 3.0, "seed": 33},
     ]
 
-    results = LingV3TTSLLMModel._vectorized_decode_results(
+    results = Ming3TTSLLMModel._vectorized_decode_results(
         model,
         torch.arange(12, dtype=torch.float32).reshape(3, 4),
         request_infos,
@@ -371,7 +371,7 @@ def test_sft_config_preserves_gate_and_sampling_defaults():
     legacy = _config()
     backbone = legacy.llm_config.to_dict()
     backbone.update(kda_safe_gate=True, kda_lower_bound=-5.0)
-    config = LingV3TTSConfig(
+    config = Ming3TTSConfig(
         llm_config=backbone,
         audio_config=legacy.audio_config,
         tts_config={
@@ -382,7 +382,7 @@ def test_sft_config_preserves_gate_and_sampling_defaults():
             "maximum_decode_steps": 250,
         },
     )
-    runtime = LingV3TTSRuntimeConfig.from_hf_config(config)
+    runtime = Ming3TTSRuntimeConfig.from_hf_config(config)
     runtime.validate()
     assert config.llm_config.kda_safe_gate is True
     assert config.llm_config.kda_lower_bound == -5.0
@@ -392,8 +392,8 @@ def test_sft_config_preserves_gate_and_sampling_defaults():
 
 
 def test_unknown_task_contract_is_rejected():
-    with pytest.raises(ValueError, match="Unsupported LingV3 task contract"):
-        LingV3TTSConfig(tts_config={"task_contract": "unknown"})
+    with pytest.raises(ValueError, match="Unsupported Ming3 task contract"):
+        Ming3TTSConfig(tts_config={"task_contract": "unknown"})
 
 
 @pytest.mark.parametrize(
@@ -409,14 +409,14 @@ def test_unknown_task_contract_is_rejected():
 def test_adapter_validates_checkpoint_conditioning_and_minimum(tts_config, ref_text, max_tokens, error):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     server = SimpleNamespace(
         engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config=tts_config))),
         _apply_uploaded_speaker=lambda request: None,
         _validate_ref_audio_format=lambda source: None,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(
         input="Hello", ref_audio="data:audio/wav;base64,AA==", ref_text=ref_text, max_new_tokens=max_tokens
     )
@@ -507,9 +507,9 @@ def test_prompt_eos_contract(eos_id):
     tokenizer.special = {**tokenizer.special, "<|role_end|>": 156895}
     if eos_id == 123:
         with pytest.raises(ValueError, match="EOS"):
-            build_lingv3_prompt_token_ids(tokenizer, target_text="测试")
+            build_ming3_prompt_token_ids(tokenizer, target_text="测试")
     else:
-        ids, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试")
+        ids, _, _ = build_ming3_prompt_token_ids(tokenizer, target_text="测试")
         assert ids[-1] == AUDIO_START_TOKEN_ID
         assert 156895 not in ids
 
@@ -523,8 +523,8 @@ def test_control_caption_precedes_audio(controls):
     tokenizer = FakeTokenizer()
     tokenizer.special["<|endoftext|>"] = 156892
     caption = create_instruction(controls)
-    actual, speaker_position, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试文本", instruction=caption)
-    base, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试文本")
+    actual, speaker_position, _ = build_ming3_prompt_token_ids(tokenizer, target_text="测试文本", instruction=caption)
+    base, _, _ = build_ming3_prompt_token_ids(tokenizer, target_text="测试文本")
     expected = base[:-1] + tokenizer.encode(caption) + [156892, AUDIO_START_TOKEN_ID]
     assert actual == expected
     assert actual[speaker_position] == AUDIO_PATCH_TOKEN_ID
@@ -547,8 +547,8 @@ def test_control_caption_uses_checkpoint_eos(eos_id, prompt_steps, speaker_count
         prompt_latent_steps=prompt_steps,
         speaker_count=speaker_count,
     )
-    base, _, _ = build_lingv3_prompt_token_ids(tokenizer, **kwargs)
-    actual, _, _ = build_lingv3_prompt_token_ids(tokenizer, instruction=caption, **kwargs)
+    base, _, _ = build_ming3_prompt_token_ids(tokenizer, **kwargs)
+    actual, _, _ = build_ming3_prompt_token_ids(tokenizer, instruction=caption, **kwargs)
     audio_start = len(base) - prompt_steps - 1
     expected = base[:audio_start] + tokenizer.encode(caption) + [eos_id] + base[audio_start:]
     assert actual == expected
@@ -557,7 +557,7 @@ def test_control_caption_uses_checkpoint_eos(eos_id, prompt_steps, speaker_count
 
 def test_prompt_contract_requires_instruction_without_reference_audio():
     with pytest.raises(ValueError, match="requires an instruction"):
-        build_lingv3_prompt(
+        build_ming3_prompt(
             FakeTokenizer(),
             target_text="target",
             reference_waveform=None,
@@ -583,8 +583,8 @@ def test_request_decode_window_overrides_checkpoint_minimum(minimum, maximum, em
     info = {state_keys.KEY_MAX_DECODE_STEPS: maximum}
     if minimum is not None:
         info[state_keys.KEY_MIN_DECODE_STEPS] = minimum
-    LingV3TTSLLMModel._validate_decode_window(model, [info])
-    result = LingV3TTSLLMModel._resolve_stop_decision(
+    Ming3TTSLLMModel._validate_decode_window(model, [info])
+    result = Ming3TTSLLMModel._resolve_stop_decision(
         model,
         step=emitted - 1,
         stop_prob=probability,
@@ -621,7 +621,7 @@ def test_podcast_explicit_limit_only_tightens_the_window():
 
 
 def test_podcast_prompt_keeps_speaker_order_and_audio_boundaries():
-    from vllm_omni.model_executor.models.lingv3_tts.constants import (
+    from vllm_omni.model_executor.models.ming3_tts.constants import (
         KEY_SPEAKER_SAMPLE_RATES,
         KEY_SPEAKER_WAVEFORM,
         KEY_SPEAKER_WAVEFORM_LENGTHS,
@@ -629,7 +629,7 @@ def test_podcast_prompt_keeps_speaker_order_and_audio_boundaries():
     from vllm_omni.model_executor.models.ming_tts.audio_prep import _find_speaker_placeholder_positions
 
     tokenizer = FakeTokenizer()
-    prompt = build_lingv3_prompt(
+    prompt = build_ming3_prompt(
         tokenizer,
         target_text=" speaker_1:你好。\n speaker_2:再见。\n",
         reference_waveform=[torch.ones(1, 3), torch.full((1, 5), 2.0)],
@@ -637,7 +637,7 @@ def test_podcast_prompt_keeps_speaker_order_and_audio_boundaries():
         prompt_text=" speaker_1:参考一。\n speaker_2:参考二。\n",
     )
     ids = prompt["prompt_token_ids"]
-    slots = _find_speaker_placeholder_positions(torch.tensor(ids), LingV3TTSRuntimeConfig.from_hf_config(_config()))
+    slots = _find_speaker_placeholder_positions(torch.tensor(ids), Ming3TTSRuntimeConfig.from_hf_config(_config()))
     assert len(slots) == 2
     assert ids[slots[0] + 2 : slots[1] - 1] == tokenizer.encode("\n  speaker_2:")
     assert ids[-1] == AUDIO_PATCH_TOKEN_ID
@@ -650,7 +650,7 @@ def test_podcast_prompt_keeps_speaker_order_and_audio_boundaries():
 
 
 def test_podcast_extractor_splits_clips_before_resampling():
-    from vllm_omni.model_executor.models.lingv3_tts.speaker_extractor import resolve_speaker_embeddings
+    from vllm_omni.model_executor.models.ming3_tts.speaker_extractor import resolve_speaker_embeddings
 
     calls = []
 
@@ -662,7 +662,7 @@ def test_podcast_extractor_splits_clips_before_resampling():
         _speaker_extractor=SimpleNamespace(extract_from_waveform=extract),
         ming_config=SimpleNamespace(sample_rate=44100),
     )
-    info = build_lingv3_prompt(
+    info = build_ming3_prompt(
         FakeTokenizer(),
         target_text="speaker_1:你好。\nspeaker_2:再见。",
         reference_waveform=[torch.ones(1, 3), torch.full((1, 5), 2.0)],
@@ -689,7 +689,7 @@ def test_podcast_extractor_splits_clips_before_resampling():
 def test_podcast_adapter_validates_turns(text, max_tokens, error):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     server = SimpleNamespace(
         engine_client=SimpleNamespace(
@@ -706,7 +706,7 @@ def test_podcast_adapter_validates_turns(text, max_tokens, error):
         _apply_uploaded_speaker=lambda request: None,
         _validate_ref_audio_format=lambda source: None,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(
         input=text,
         ref_audio=["data:audio/wav;base64,AA=="] * 2,
@@ -738,7 +738,7 @@ def test_adapter_language_and_reference_continuation(speaker_count, language, ex
 
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     async def resolve(source):
         return [0.25] * 3528, 44100, source
@@ -761,7 +761,7 @@ def test_adapter_language_and_reference_continuation(speaker_count, language, ex
         _apply_uploaded_speaker=lambda request: None,
         _validate_ref_audio_format=lambda source: None,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     text = "こんにちは。" if speaker_count == 1 else "speaker_1:こんにちは。\nspeaker_2:はい。"
     transcript = "参考。" if speaker_count == 1 else "speaker_1:参考一。\nspeaker_2:参考二。"
     request = OpenAICreateSpeechRequest(
@@ -795,7 +795,7 @@ def test_adapter_language_and_reference_continuation(speaker_count, language, ex
 def test_adapter_missing_language_preserves_defaults(speaker_count, enabled, infer):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     server = SimpleNamespace(
         engine_client=SimpleNamespace(
@@ -806,7 +806,7 @@ def test_adapter_missing_language_preserves_defaults(speaker_count, enabled, inf
             )
         )
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(input="你好。", ref_audio=["reference"] * speaker_count)
     if speaker_count > 1 and enabled and not infer:
         with pytest.raises(ValueError, match="explicit language"):
@@ -817,22 +817,22 @@ def test_adapter_missing_language_preserves_defaults(speaker_count, enabled, inf
 
 @pytest.mark.parametrize("instruction", ["温柔、舒缓", "Speaking instruction: Speak in this style: 温柔、舒缓"])
 def test_freeform_instruction_precedes_audio(instruction):
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     tokenizer = FakeTokenizer()
     tokenizer.special["<|endoftext|>"] = 156892
-    caption = LingV3TTSAdapter._instruction(instruction)
+    caption = Ming3TTSAdapter._instruction(instruction)
     assert caption == "Speaking instruction: Speak in this style: 温柔、舒缓"
-    ids, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="你好。", instruction=caption)
+    ids, _, _ = build_ming3_prompt_token_ids(tokenizer, target_text="你好。", instruction=caption)
     expected = tokenizer.encode(ASSISTANT_PREFIX + caption) + [156892, AUDIO_START_TOKEN_ID]
     assert ids[-len(expected) :] == expected
 
 
 def test_no_speaker_slot_prompt_and_prefill(monkeypatch):
-    import vllm_omni.model_executor.models.lingv3_tts.lingv3_tts as model_module
+    import vllm_omni.model_executor.models.ming3_tts.ming3_tts as model_module
 
     tokenizer = FakeTokenizer()
-    prompt = build_lingv3_prompt(
+    prompt = build_ming3_prompt(
         tokenizer,
         target_text="清晨的风穿过树林。",
         reference_waveform=None,
@@ -860,14 +860,14 @@ def test_no_speaker_slot_prompt_and_prefill(monkeypatch):
         _copy_request_state=lambda update, info: None,
     )
     embeds = torch.ones((len(ids), 4))
-    _, result, _ = LingV3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
+    _, result, _ = Ming3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
     assert torch.all(result == 1)
 
 
 def test_no_speaker_slot_keeps_text_prefix_after_user_prompt():
     tokenizer = FakeTokenizer()
     text = "Genre: jazz Mood: calm Instrument: piano Theme: dawn Duration: short"
-    ids, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text=text, speaker_count=0)
+    ids, _, _ = build_ming3_prompt_token_ids(tokenizer, target_text=text, speaker_count=0)
     expected = tokenizer.encode(
         "<role>HUMAN</role>Please generate speech based on the following description.\n"
         f" Text input:\n{text}<role>ASSISTANT</role><audio>"
@@ -877,16 +877,16 @@ def test_no_speaker_slot_keeps_text_prefix_after_user_prompt():
 
 @pytest.mark.parametrize("instruction", [" ", '{"语速":', "[]", "{}", '{"语速": 3}', '{"未知": "中"}'])
 def test_invalid_structured_instructions_are_not_freeform(instruction):
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     with pytest.raises(ValueError):
-        LingV3TTSAdapter._instruction(instruction)
+        Ming3TTSAdapter._instruction(instruction)
 
 
 def test_full_structured_instruction_preserves_archived_token_order():
     import json
 
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
     from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
 
     caption = {
@@ -908,16 +908,16 @@ def test_full_structured_instruction_preserves_archived_token_order():
     raw = json.dumps(caption, ensure_ascii=False)
     normalized = create_instruction({"方言": "川渝话"})
     assert json.loads(normalized) == caption and normalized != raw
-    instruction = LingV3TTSAdapter._instruction(raw)
+    instruction = Ming3TTSAdapter._instruction(raw)
     assert instruction == raw
     tokenizer = FakeTokenizer()
-    actual, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="你好。", instruction=instruction)
+    actual, _, _ = build_ming3_prompt_token_ids(tokenizer, target_text="你好。", instruction=instruction)
     caption_tokens = tokenizer.encode(raw)
     assert actual[-len(caption_tokens) - 2 :] == caption_tokens + [tokenizer.eos_token_id, AUDIO_START_TOKEN_ID]
     invalid_cases: tuple[dict[str, Any], ...] = ({"audio_sequence": []}, {"audio_sequence": [{"方言": "川渝话"}]})
     for invalid in invalid_cases:
         with pytest.raises(ValueError):
-            LingV3TTSAdapter._instruction(json.dumps(invalid, ensure_ascii=False))
+            Ming3TTSAdapter._instruction(json.dumps(invalid, ensure_ascii=False))
 
 
 @pytest.mark.parametrize("controls", [{"情感": "高兴"}, {"风格": "沉稳的男性旁白"}, {"IP": "阿狸"}])
@@ -928,8 +928,8 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
     from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
-    from vllm_omni.model_executor.models.lingv3_tts import lingv3_tts as model_module
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
+    from vllm_omni.model_executor.models.ming3_tts import ming3_tts as model_module
 
     def forbidden(*args, **kwargs):
         pytest.fail("Masked conditioning must not resolve audio, extract or project speakers, or encode reference VAE")
@@ -943,7 +943,7 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
         _apply_uploaded_speaker=lambda request: None,
         _validate_ref_audio_format=forbidden,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(input="你好。", instructions=json.dumps(controls, ensure_ascii=False))
     assert adapter.validate(request) is None
     prepared = asyncio.run(adapter.build(request, [], False))
@@ -963,7 +963,7 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
         ),
         _copy_request_state=lambda update, info: None,
     )
-    _, result, _ = LingV3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
+    _, result, _ = Ming3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
     assert torch.count_nonzero(result[slot]).item() == 0
     assert torch.all(result[:slot] == 1) and torch.all(result[slot + 1 :] == 1)
 
@@ -979,9 +979,9 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
 def test_no_reference_request_rejects_invalid_conditioning(fields, error):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
-    adapter = LingV3TTSAdapter(
+    adapter = Ming3TTSAdapter(
         SpeechServingContext(server=SimpleNamespace(_apply_uploaded_speaker=lambda request: None))
     )
     assert error in adapter.validate(OpenAICreateSpeechRequest(input="你好。", **fields))
@@ -993,7 +993,7 @@ def test_online_emergent_omits_speaker_conditioning():
     from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     def forbidden(*args, **kwargs):
         pytest.fail("Emergent must not resolve or validate reference audio")
@@ -1005,7 +1005,7 @@ def test_online_emergent_omits_speaker_conditioning():
         _resolve_ref_audio=forbidden,
         _validate_ref_audio_format=forbidden,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(input="清晨的风穿过树林。")
     assert adapter.validate(request) is None
     prepared = asyncio.run(adapter.build(request, [], False))
@@ -1018,8 +1018,8 @@ def test_online_emergent_omits_speaker_conditioning():
 
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_named_speaker_cache_reuses_only_matching_voice_version(wrapped):
-    from vllm_omni.model_executor.models.lingv3_tts.constants import KEY_SPEAKER_EMBEDDING, KEY_SPEAKER_WAVEFORM
-    from vllm_omni.model_executor.models.lingv3_tts.speaker_extractor import resolve_speaker_embeddings
+    from vllm_omni.model_executor.models.ming3_tts.constants import KEY_SPEAKER_EMBEDDING, KEY_SPEAKER_WAVEFORM
+    from vllm_omni.model_executor.models.ming3_tts.speaker_extractor import resolve_speaker_embeddings
     from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
     calls = []
@@ -1059,7 +1059,7 @@ def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tok
 
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     async def resolve_audio(source):
         return [0.0] * 2400, 24000, "audio-key"
@@ -1076,7 +1076,7 @@ def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tok
         uploaded_speakers={"alice": {"created_at": 123}},
         _voice_created_at=lambda name: 123,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(
         input="Hello", voice="Alice", ref_audio="data:audio/wav;base64,AA==", max_new_tokens=max_tokens
     )
@@ -1093,12 +1093,12 @@ def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tok
 
 
 def test_podcast_speaker_cache_reuses_individual_references():
-    from vllm_omni.model_executor.models.lingv3_tts.constants import (
+    from vllm_omni.model_executor.models.ming3_tts.constants import (
         KEY_SPEAKER_SAMPLE_RATES,
         KEY_SPEAKER_WAVEFORM,
         KEY_SPEAKER_WAVEFORM_LENGTHS,
     )
-    from vllm_omni.model_executor.models.lingv3_tts.speaker_extractor import resolve_speaker_embeddings
+    from vllm_omni.model_executor.models.ming3_tts.speaker_extractor import resolve_speaker_embeddings
     from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
     calls = []
@@ -1151,7 +1151,7 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
     from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     async def resolve(source):
         return [float(source)] * 8, 44100, "resolved-" + source
@@ -1164,7 +1164,7 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
         _resolve_ref_audio=resolve,
         _get_resolved_ref_audio_artifact_key=lambda key: {"resolved-1": "content-a", "resolved-2": "content-b"}[key],
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(
         input=f"speaker_1:{turn_text}\nspeaker_2:{turn_text}",
         ref_audio=references,
@@ -1192,20 +1192,21 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
 
 
 @pytest.mark.parametrize("cfg", [None, 1.0, 2.0])
-def test_request_cfg_and_temperature_reach_flow_runtime(cfg):
+@pytest.mark.parametrize("cfg_key", ["ming3_cfg", "lingv3_cfg"])
+def test_request_cfg_and_temperature_reach_flow_runtime(cfg, cfg_key):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
-    from vllm_omni.model_executor.models.lingv3_tts.constants import KEY_CFG, KEY_TEMPERATURE
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
+    from vllm_omni.model_executor.models.ming3_tts.constants import KEY_CFG, KEY_TEMPERATURE
 
     server = SimpleNamespace(
         engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
         _apply_uploaded_speaker=lambda request: None,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     extra = {"temperature": 1.5}
     if cfg is not None:
-        extra[KEY_CFG] = cfg
+        extra[cfg_key] = cfg
     request = OpenAICreateSpeechRequest(input="Bonjour.", instructions="calm", seed=1234, extra_params=extra)
     assert adapter.validate(request) is None
     prompt: dict[str, Any] = {"additional_information": {}}
@@ -1215,7 +1216,7 @@ def test_request_cfg_and_temperature_reach_flow_runtime(cfg):
     info = prompt["additional_information"]
     assert info[KEY_TEMPERATURE] == 1.5 and info["tts_local_seed"] == 1234
     update: dict[str, Any] = {}
-    LingV3TTSForConditionalGeneration._copy_request_state(SimpleNamespace(), update, info)
+    Ming3TTSForConditionalGeneration._copy_request_state(SimpleNamespace(), update, info)
     assert update["ming_temperature"] == 1.5
     if cfg is None:
         assert KEY_CFG not in info and "ming_cfg" not in update
@@ -1223,18 +1224,18 @@ def test_request_cfg_and_temperature_reach_flow_runtime(cfg):
         assert info[KEY_CFG] == update["ming_cfg"] == cfg
 
 
-@pytest.mark.parametrize("key", ["lingv3_cfg", "temperature"])
+@pytest.mark.parametrize("key", ["ming3_cfg", "lingv3_cfg", "temperature"])
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), "2", True])
 def test_request_sampling_controls_reject_invalid_runtime_values(key, value):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 
     server = SimpleNamespace(
         engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
         _apply_uploaded_speaker=lambda request: None,
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     request = OpenAICreateSpeechRequest(input="Bonjour.", instructions="calm", extra_params={key: value})
     assert "finite non-negative" in adapter.validate(request)
 
@@ -1243,8 +1244,8 @@ def test_request_sampling_controls_reject_invalid_runtime_values(key, value):
 def test_flow_temperature_preserves_checkpoint_default_without_request_override(temperature: float | None):
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
     from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
-    from vllm_omni.model_executor.models.lingv3_tts.constants import KEY_TEMPERATURE
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
+    from vllm_omni.model_executor.models.ming3_tts.constants import KEY_TEMPERATURE
     from vllm_omni.model_executor.models.ming_tts.patch_emission import _resolve_runtime_float
 
     server = SimpleNamespace(
@@ -1252,7 +1253,7 @@ def test_flow_temperature_preserves_checkpoint_default_without_request_override(
             model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={"sampling_temperature": 1.5}))
         ),
     )
-    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
     extra = {} if temperature is None else {"temperature": temperature}
     request = OpenAICreateSpeechRequest(input="你好。", extra_params=extra)
     defaults = [SamplingParams(temperature=0.0, max_tokens=801)]
@@ -1264,7 +1265,7 @@ def test_flow_temperature_preserves_checkpoint_default_without_request_override(
     else:
         assert info[KEY_TEMPERATURE] == temperature
     update: dict[str, Any] = {}
-    LingV3TTSForConditionalGeneration._copy_request_state(SimpleNamespace(), update, info)
+    Ming3TTSForConditionalGeneration._copy_request_state(SimpleNamespace(), update, info)
     effective = _resolve_runtime_float(update, "ming_temperature", adapter.tts_config["sampling_temperature"])
     assert effective == (1.5 if temperature is None else temperature)
     assert defaults[0].temperature == 0.0

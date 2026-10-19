@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stage transport for LingV3 continuous latents."""
+"""Stage transport for Ming3 continuous latents."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.lingv3_tts.constants import (
+from vllm_omni.model_executor.models.ming3_tts.constants import (
     INITIAL_LATENT_CHUNK_SIZE,
     LATENT_CHUNK_SIZE,
     LATENT_DIM,
@@ -28,14 +28,14 @@ from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
 def _patches(output: Mapping[str, Any] | None) -> torch.Tensor | None:
     if not isinstance(output, Mapping):
         return None
-    patch = output.get("lingv3_latent_patch")
-    active = output.get("lingv3_has_patch")
+    patch = output.get("ming3_latent_patch")
+    active = output.get("ming3_has_patch")
     if not isinstance(patch, torch.Tensor) or patch.numel() == 0:
         return None
     if patch.ndim == 2:
         patch = patch.unsqueeze(0)
     if patch.ndim != 3 or patch.shape[-2:] != (1, LATENT_DIM):
-        raise ValueError(f"Invalid LingV3 latent tensor shape: {tuple(patch.shape)}")
+        raise ValueError(f"Invalid Ming3 latent tensor shape: {tuple(patch.shape)}")
     if isinstance(active, torch.Tensor) and active.numel():
         indices = (active.reshape(-1) > 0).nonzero(as_tuple=True)[0]
         if not indices.numel():
@@ -52,9 +52,9 @@ def _chunk_sizes(transfer_manager: Any) -> tuple[int, int]:
     initial = int(config.get("initial_latent_chunk_size", INITIAL_LATENT_CHUNK_SIZE))
     left = int(config.get("latent_left_context", 0))
     if chunk <= 0 or initial < 0 or initial > chunk:
-        raise ValueError(f"Invalid LingV3 chunk sizes: initial={initial}, chunk={chunk}")
+        raise ValueError(f"Invalid Ming3 chunk sizes: initial={initial}, chunk={chunk}")
     if left != 0:
-        raise ValueError("LingV3 streaming AudioVAE uses cached state; latent_left_context must be 0")
+        raise ValueError("Ming3 streaming AudioVAE uses cached state; latent_left_context must be 0")
     return chunk, initial
 
 
@@ -68,10 +68,10 @@ def llm2audio_vae_async_chunk(
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
     state_root = transfer_manager.request_payload.get(request_id)
-    if not isinstance(state_root, dict) or "_lingv3_async_state" not in state_root:
-        state_root = {"_lingv3_async_state": {"seen": 0, "terminal": False}}
+    if not isinstance(state_root, dict) or "_ming3_async_state" not in state_root:
+        state_root = {"_ming3_async_state": {"seen": 0, "terminal": False}}
         transfer_manager.request_payload[request_id] = state_root
-    state = state_root["_lingv3_async_state"]
+    state = state_root["_ming3_async_state"]
     if state["terminal"]:
         return None
 
@@ -115,7 +115,7 @@ def llm2audio_vae_async_chunk(
         kv_metadata={
             STATE_REQUEST_ID: request_id,
             STATE_CHUNK_ID: int(transfer_manager.put_req_chunk[request_id]),
-            "lingv3_emit_patch_count": count,
+            "ming3_emit_patch_count": count,
         },
     )
 
