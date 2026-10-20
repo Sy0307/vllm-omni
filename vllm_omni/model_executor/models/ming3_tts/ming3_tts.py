@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
 
@@ -35,15 +36,28 @@ from .constants import (
     KEY_LAST_STOP_PROB,
     KEY_MAX_DECODE_STEPS,
     KEY_MIN_DECODE_STEPS,
+    KEY_PROMPT_AUDIO_START,
     KEY_REQUEST_ID,
     KEY_SIGMA,
     KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_POSITIONS,
     KEY_SPEAKER_WAVEFORM,
     KEY_STOP_REASON,
     KEY_TEMPERATURE,
 )
 from .speaker_extractor import resolve_speaker_embeddings
 from .weight_accounting import validate_ming3_checkpoint_keys
+
+
+@dataclass
+class _PrefillConditioning:
+    """Request-owned projections reused across prefill slices and recomputation."""
+
+    speaker_positions: tuple[int, ...]
+    speaker_embeds: torch.Tensor
+    prompt_start: int
+    prompt_embeds: torch.Tensor | None
+    history: torch.Tensor
 
 
 class Ming3TTSForConditionalGeneration(
@@ -70,6 +84,7 @@ class Ming3TTSForConditionalGeneration(
         self.model_stage = vllm_config.model_config.model_stage
         self._prompt_encoder = None
         self._speaker_extractor = None
+        self._prefill_conditioning: dict[str, _PrefillConditioning] = {}
 
         if self.model_stage == "llm":
             from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -126,6 +141,8 @@ class Ming3TTSForConditionalGeneration(
         return self.model.sample(logits, sampling_metadata)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            self._prefill_conditioning.pop(request_id, None)
         callback = getattr(self.model, "on_requests_finished", None)
         if callback is not None:
             callback(finished_req_ids)
@@ -155,7 +172,7 @@ class Ming3TTSForConditionalGeneration(
         input_embeds = self.model.embed_input_ids(input_ids).clone()
         return (
             self._prefill_preprocess(input_ids, input_embeds, info)
-            if input_ids.shape[0] > 1
+            if bool(info.get("_omni_is_prefill", input_ids.shape[0] > 1))
             else self._decode_preprocess(input_ids, input_embeds, info)
         )
 
@@ -165,6 +182,60 @@ class Ming3TTSForConditionalGeneration(
         input_embeds: torch.Tensor,
         info: dict[str, Any],
     ):
+        """Inject cached conditioning for this scheduled token interval.
+
+        The runner owns the phase and absolute offset. Reference sampling and
+        history initialization happen once; a continuation may have no slots.
+        """
+        request_id = info.get("request_id", info.get(KEY_REQUEST_ID))
+        offset = int(info.get("_omni_num_computed_tokens", 0))
+        conditioning = self._prefill_conditioning.get(request_id)
+        if conditioning is None:
+            conditioning = self._prepare_prefill_conditioning(input_ids, input_embeds, info)
+            if isinstance(request_id, str):
+                self._prefill_conditioning[request_id] = conditioning
+
+        end = offset + input_ids.shape[0]
+        for index, position in enumerate(conditioning.speaker_positions):
+            if offset <= position < end:
+                input_embeds[position - offset] = conditioning.speaker_embeds[index]
+        if conditioning.prompt_embeds is not None:
+            start = max(offset, conditioning.prompt_start)
+            stop = min(end, conditioning.prompt_start + conditioning.prompt_embeds.shape[0])
+            if start < stop:
+                input_embeds[start - offset : stop - offset] = conditioning.prompt_embeds[
+                    start - conditioning.prompt_start : stop - conditioning.prompt_start
+                ]
+
+        update: dict[str, Any] = {}
+        if state_keys.KEY_LATENT_HISTORY not in info:
+            update[state_keys.KEY_LATENT_HISTORY] = conditioning.history
+            update[state_keys.KEY_DECODE_STEP] = 0
+        self._copy_request_state(update, info)
+        return input_ids, input_embeds, update
+
+    def _prepare_prefill_conditioning(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        info: dict[str, Any],
+    ) -> _PrefillConditioning:
+        """Encode reference conditioning once, using positions from the full prompt.
+
+        Direct callers with a complete prompt may omit the position metadata.
+        Scheduled partial prompts require the metadata emitted by the builder.
+        """
+        offset = int(info.get("_omni_num_computed_tokens", 0))
+        prompt_length = int(info.get("_omni_prompt_len", input_ids.shape[0]))
+        if KEY_SPEAKER_POSITIONS not in info and (offset or input_ids.shape[0] != prompt_length):
+            raise ValueError("Chunked Ming3 prefill requires conditioning positions from build_ming3_prompt")
+        slots = tuple(
+            info[KEY_SPEAKER_POSITIONS]
+            if KEY_SPEAKER_POSITIONS in info
+            else _find_speaker_placeholder_positions(input_ids, self.ming_config)
+        )
+        if any(position < 0 or position >= prompt_length for position in slots) or len(set(slots)) != len(slots):
+            raise ValueError("Invalid Ming3 speaker positions")
         mute_speaker = bool(_take_scalar(info.get("mute_speaker"), 0))
         no_speaker_slot = bool(_take_scalar(info.get("no_speaker_slot"), 0))
         if mute_speaker and no_speaker_slot:
@@ -186,41 +257,40 @@ class Ming3TTSForConditionalGeneration(
             device=input_embeds.device,
             dtype=torch.float32,
         )
-        update: dict[str, Any] = {
-            state_keys.KEY_LATENT_HISTORY: history.detach().cpu().contiguous(),
-            state_keys.KEY_DECODE_STEP: 0,
-        }
-
-        slots = _find_speaker_placeholder_positions(input_ids, self.ming_config)
+        speaker_embeds = input_embeds.new_empty((0, input_embeds.shape[-1]))
         if no_speaker_slot:
             if slots:
                 raise RuntimeError("No-speaker-slot conditioning must not contain speaker slots")
         elif mute_speaker:
             if len(slots) != 1:
                 raise RuntimeError("Masked speaker conditioning requires exactly one speaker slot")
-            input_embeds[slots[0]].zero_()
+            speaker_embeds = input_embeds.new_zeros((1, input_embeds.shape[-1]))
         else:
             speakers = resolve_speaker_embeddings(self, info)
             if not slots or len(slots) != len(speakers):
                 raise RuntimeError(f"Ming3 speaker slot/embedding count mismatch: {len(slots)}/{len(speakers)}")
-            for slot, speaker in zip(slots, speakers, strict=True):
-                input_embeds[slot] = self.model.project_speaker_embedding(
-                    speaker.to(input_embeds.device, input_embeds.dtype).unsqueeze(0)
-                ).squeeze(0)
+            speaker_embeds = self.model.project_speaker_embedding(
+                torch.stack(speakers).to(input_embeds.device, input_embeds.dtype)
+            ).detach()
 
+        prompt_embeds = None
+        prompt_start = 0
         if prompt_latents is not None:
             patches = prompt_latents["patches"].to(device=input_embeds.device, dtype=self.model.fm_dtype)
-            prompt_embeds = self.model.linear_proj_audio(patches).squeeze(1)
-            positions = _find_audio_placeholder_positions(input_ids, self.ming_config)
-            if positions.numel() != prompt_embeds.shape[0]:
-                raise RuntimeError(
-                    "Ming3 prompt latent/token count mismatch: "
-                    f"{prompt_embeds.shape[0]} latents for {positions.numel()} slots"
-                )
-            input_embeds[positions] = prompt_embeds.to(input_embeds.dtype)
+            prompt_embeds = self.model.linear_proj_audio(patches).squeeze(1).to(input_embeds.dtype).detach()
+            if KEY_PROMPT_AUDIO_START in info:
+                prompt_start = int(info[KEY_PROMPT_AUDIO_START])
+            else:
+                positions = _find_audio_placeholder_positions(input_ids, self.ming_config)
+                if positions.numel() != prompt_embeds.shape[0]:
+                    raise RuntimeError("Ming3 prompt latent/token count mismatch")
+                prompt_start = int(positions[0])
+            if prompt_start < 0 or prompt_start + prompt_embeds.shape[0] != prompt_length:
+                raise RuntimeError("Ming3 prompt latent/token count mismatch")
 
-        self._copy_request_state(update, info)
-        return input_ids, input_embeds, update
+        return _PrefillConditioning(
+            slots, speaker_embeds, prompt_start, prompt_embeds, history.detach().cpu().contiguous()
+        )
 
     def _decode_preprocess(
         self,

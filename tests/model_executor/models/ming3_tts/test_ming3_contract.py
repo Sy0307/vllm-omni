@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.ming3_tts.constants import (
     AUDIO_START_TOKEN_ID,
     KEY_MAX_DECODE_STEPS,
     KEY_MIN_DECODE_STEPS,
+    KEY_SPEAKER_POSITIONS,
     SPEAKER_END_TOKEN_ID,
     SPEAKER_START_TOKEN_ID,
 )
@@ -45,6 +46,15 @@ from vllm_omni.model_executor.models.ming3_tts.prompt_assembly import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
+
+
+def _prefill_wrapper(model, config):
+    wrapper = Ming3TTSForConditionalGeneration.__new__(Ming3TTSForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model = model
+    wrapper.ming_config = config
+    wrapper._prefill_conditioning = {}
+    return wrapper
 
 
 class FakeTokenizer:
@@ -191,11 +201,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
         fm_dtype=torch.float32,
         project_speaker_embedding=lambda embedding: torch.zeros((1, 4)),
     )
-    wrapper: Any = SimpleNamespace(
-        model=model,
-        ming_config=SimpleNamespace(history_patch_size=1, latent_dim=64),
-        _copy_request_state=lambda update, info: None,
-    )
+    wrapper = _prefill_wrapper(model, SimpleNamespace(history_patch_size=1, latent_dim=64))
     info = {"prompt_waveform": torch.ones((1, 8)), "request_id": "request-1"}
 
     Ming3TTSForConditionalGeneration._prefill_preprocess(
@@ -843,18 +849,16 @@ def test_no_speaker_slot_prompt_and_prefill(monkeypatch):
     )
     assert ids.tolist() == expected
     info = prompt["additional_information"]
-    assert set(info) == {KEY_MAX_DECODE_STEPS, "no_speaker_slot"}
+    assert set(info) == {KEY_MAX_DECODE_STEPS, KEY_SPEAKER_POSITIONS, "no_speaker_slot"}
 
     def forbidden(*args, **kwargs):
         raise AssertionError("No speaker or prompt audio extraction expected")
 
     monkeypatch.setattr(model_module, "resolve_speaker_embeddings", forbidden)
     monkeypatch.setattr(model_module, "_resolve_prompt_latents", forbidden)
-    wrapper = SimpleNamespace(
-        ming_config=SimpleNamespace(
-            history_patch_size=1, latent_dim=64, speaker_placeholder_token_id=SPEAKER_START_TOKEN_ID
-        ),
-        _copy_request_state=lambda update, info: None,
+    wrapper = _prefill_wrapper(
+        torch.nn.Identity(),
+        SimpleNamespace(history_patch_size=1, latent_dim=64, speaker_placeholder_token_id=SPEAKER_START_TOKEN_ID),
     )
     embeds = torch.ones((len(ids), 4))
     _, result, _ = Ming3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
@@ -945,7 +949,7 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
     assert adapter.validate(request) is None
     prepared = asyncio.run(adapter.build(request, [], False))
     info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
-    assert set(info) == {KEY_MAX_DECODE_STEPS, "mute_speaker"}
+    assert set(info) == {KEY_MAX_DECODE_STEPS, KEY_SPEAKER_POSITIONS, "mute_speaker"}
     ids = torch.tensor(prepared.prompt["prompt_token_ids"])
     assert (ids == SPEAKER_START_TOKEN_ID).sum().item() == 1
     slot = (ids == SPEAKER_START_TOKEN_ID).nonzero().item() + 1
@@ -953,12 +957,9 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
     embeds = torch.ones((len(ids), 4))
     monkeypatch.setattr(model_module, "resolve_speaker_embeddings", forbidden)
     monkeypatch.setattr(model_module, "_resolve_prompt_latents", forbidden)
-    wrapper = SimpleNamespace(
-        model=SimpleNamespace(project_speaker_embedding=forbidden),
-        ming_config=SimpleNamespace(
-            history_patch_size=1, latent_dim=64, speaker_placeholder_token_id=SPEAKER_START_TOKEN_ID
-        ),
-        _copy_request_state=lambda update, info: None,
+    wrapper = _prefill_wrapper(
+        SimpleNamespace(project_speaker_embedding=forbidden),
+        SimpleNamespace(history_patch_size=1, latent_dim=64, speaker_placeholder_token_id=SPEAKER_START_TOKEN_ID),
     )
     _, result, _ = Ming3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
     assert torch.count_nonzero(result[slot]).item() == 0
@@ -1010,7 +1011,7 @@ def test_online_emergent_omits_speaker_conditioning():
     assert SPEAKER_START_TOKEN_ID not in ids
     assert ids[-1] == AUDIO_START_TOKEN_ID
     info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
-    assert set(info) == {KEY_MAX_DECODE_STEPS, "no_speaker_slot"}
+    assert set(info) == {KEY_MAX_DECODE_STEPS, KEY_SPEAKER_POSITIONS, "no_speaker_slot"}
 
 
 @pytest.mark.parametrize("wrapped", [False, True])

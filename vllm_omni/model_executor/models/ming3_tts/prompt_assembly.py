@@ -28,7 +28,9 @@ from .constants import (
     FLOW_PATCH_SIZE,
     KEY_MAX_DECODE_STEPS,
     KEY_MIN_DECODE_STEPS,
+    KEY_PROMPT_AUDIO_START,
     KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_POSITIONS,
     KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
@@ -273,7 +275,7 @@ def build_ming3_prompt(
             frame_hop=882,
             vae_patch_size=4,
         )
-    ids, _, _ = build_ming3_prompt_token_ids(
+    ids, _, prompt_position = build_ming3_prompt_token_ids(
         tokenizer,
         target_text=target_text,
         prompt_text=prompt_text,
@@ -283,6 +285,11 @@ def build_ming3_prompt(
         target_language=target_language,
     )
     info: dict[str, Any] = {KEY_MAX_DECODE_STEPS: int(max_decode_steps or MAX_DECODE_STEPS)}
+    # Global positions survive scheduler slices, including a split between a
+    # speaker marker and its embedding slot. Reference audio is the final span.
+    info[KEY_SPEAKER_POSITIONS] = [index + 1 for index, token in enumerate(ids) if token == SPEAKER_START_TOKEN_ID]
+    if prompt_position is not None:
+        info[KEY_PROMPT_AUDIO_START] = prompt_position
     if minimum_steps is not None:
         info[KEY_MIN_DECODE_STEPS] = minimum_steps
     if not speaker_slot:
