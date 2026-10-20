@@ -12,11 +12,10 @@ from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.models.ming3_tts.constants import (
-    INITIAL_LATENT_CHUNK_SIZE,
-    LATENT_CHUNK_SIZE,
-    LATENT_DIM,
+from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
+    resolve_latent_chunk_sizes,
 )
+from vllm_omni.model_executor.models.ming3_tts.constants import LATENT_DIM
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     KEY_CHUNK_ID as STATE_CHUNK_ID,
 )
@@ -52,12 +51,9 @@ def _chunk_sizes(transfer_manager: Any) -> tuple[int, int, bool]:
     connector = getattr(transfer_manager, "connector", None)
     raw = getattr(connector, "config", {}) or {}
     config = raw.get("extra", raw) if isinstance(raw, Mapping) else {}
-    chunk = int(config.get("latent_chunk_size", LATENT_CHUNK_SIZE))
-    initial = int(config.get("initial_latent_chunk_size", INITIAL_LATENT_CHUNK_SIZE))
+    chunk, initial = resolve_latent_chunk_sizes(config)
     left = int(config.get("latent_left_context", 0))
     ramp = bool(config.get("latent_chunk_ramp", False))
-    if chunk <= 0 or initial < 0 or initial > chunk:
-        raise ValueError(f"Invalid Ming3 chunk sizes: initial={initial}, chunk={chunk}")
     if left != 0:
         raise ValueError("Ming3 streaming AudioVAE uses cached state; latent_left_context must be 0")
     return chunk, initial, ramp

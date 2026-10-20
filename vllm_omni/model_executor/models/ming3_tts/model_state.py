@@ -52,6 +52,8 @@ from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, Reque
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
+from .config_ming3_tts import resolve_latent_chunk_sizes
+
 logger = init_logger(__name__)
 
 
@@ -195,17 +197,17 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         self._sample_rate = torch.tensor(int(cfg.sample_rate), dtype=torch.int32)
         self._step_audio: _StepAudioOutput | None = None
         self._audio_chunks: dict[str, _AudioChunks] = {}
-        connector = getattr(vllm_config.model_config, "stage_connector_config", None)
-        connector = (connector.get("extra", connector) if isinstance(connector, dict) else None) or {}
-        options = {**(vllm_config.additional_config or {}), **connector}
-        steady = int(options.get("latent_chunk_size", 25))
-        chunk = int(options.get("initial_latent_chunk_size", 4))
-        ramp = []
-        while chunk < steady:
-            ramp.append(chunk)
-            chunk *= 2
-        self._chunk_latents = (*ramp, steady)
-        self._samples_per_latent = self._step_vae.scale * self._step_vae.hop if self._step_vae is not None else 0
+        if self._step_vae is not None:
+            connector = getattr(vllm_config.model_config, "stage_connector_config", None)
+            connector = (connector.get("extra", connector) if isinstance(connector, dict) else None) or {}
+            options = {**(vllm_config.additional_config or {}), **connector}
+            steady, chunk = resolve_latent_chunk_sizes(options)
+            ramp = []
+            while chunk < steady:
+                ramp.append(chunk)
+                chunk *= 2
+            self._chunk_latents = (*ramp, steady)
+            self._samples_per_latent = self._step_vae.scale * self._step_vae.hop
 
     # ------------------------------------------------------------------
     # Requests
@@ -258,11 +260,9 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         super().on_requests_finished(req_ids)
+        # The runner notifies the wrapper before this model-state callback.
         for req_id in req_ids:
             self._audio_chunks.pop(req_id, None)
-            self.llm._request_generators.pop(req_id, None)
-            self.llm._decode_state.pop(req_id, None)
-            self.model.discard_prompt_state(req_id)
 
     def _flush_pending(self) -> None:
         """Write the decode windows of newly added requests and activate their slots."""

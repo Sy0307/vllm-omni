@@ -110,6 +110,11 @@ fields are absent or `None`. The view must not be retained across steps, as
 the runner reuses its staging buffer. This opt-in does not change the phase
 fields or decode routing described above.
 
+Models retaining request-owned prompt tensors across prefill chunks must release
+them in `on_requests_finished`, including cancellation before the final prompt
+chunk. A wrapper owning such tensors must clean them before forwarding completion
+to its inner model; model-specific MRV2 state should reuse that cleanup entry.
+
 ### Routing guarantee
 
 With `has_preprocess=True`, the batched decode hook is eligible only when it is

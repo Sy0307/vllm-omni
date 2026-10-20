@@ -150,6 +150,7 @@ class _FakeStepVAE:
     """Records the single-stage decode calls; every decoded row yields 3 samples."""
 
     scale = 4
+    hop = 2
 
     def __init__(self):
         self.primed, self.steps = [], []
@@ -213,3 +214,53 @@ def test_single_stage_audio_is_released_in_growing_chunks():
     released = [None if (out := chunks.push(pcm, ended)) is None else out.numel() for pcm, ended in pushes]
     # First audio at once, then 2 and 3 latents (4 and 6 samples), then the remainder at the end.
     assert released == [1, None, 4, None, None, 6, None, 3]
+
+
+def test_zero_initial_chunk_uses_regular_size_without_initializing_two_stage_pcm(monkeypatch):
+    from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAEConfig
+    from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
+        BailingMoeV3Config,
+        Ming3TTSRuntimeConfig,
+    )
+    from vllm_omni.model_executor.stage_input_processors.ming3_tts import _chunk_sizes, _chunk_target
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    def base_init(self, config, model, encoder_cache, device):
+        self.scheduler_config = SimpleNamespace(max_num_seqs=1)
+        self.dtype = torch.float32
+
+    monkeypatch.setattr(OmniModelState, "__init__", base_init)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(async_chunk=True, stage_connector_config=None),
+        additional_config={"initial_latent_chunk_size": 0},
+    )
+    model = SimpleNamespace(
+        model=_FakeFlow({}),
+        ming_config=Ming3TTSRuntimeConfig(
+            llm_hidden_size=HIDDEN,
+            llm_vocab_size=10,
+            llm_config=BailingMoeV3Config(),
+            audio_tokenizer_config=AudioVAEConfig(),
+        ),
+        step_vae=_FakeStepVAE(),
+    )
+    state = Ming3ModelState(config, model, None, torch.device("cpu"))
+    assert state._chunk_latents == (25,) and state._samples_per_latent == 8
+    manager = SimpleNamespace(connector=SimpleNamespace(config={"extra": config.additional_config}))
+    chunk, initial, ramp = _chunk_sizes(manager)
+    assert _chunk_target(0, chunk, initial, ramp) == state._chunk_latents[0]
+
+    # Both consumers reject the same invalid bounds; connector options still win.
+    for steady, initial in ((0, 0), (25, -1), (25, 26)):
+        extra = {"latent_chunk_size": steady, "initial_latent_chunk_size": initial}
+        config.model_config.stage_connector_config = manager.connector.config = {"extra": extra}
+        with pytest.raises(ValueError, match="Invalid Ming3 chunk sizes"):
+            Ming3ModelState(config, model, None, torch.device("cpu"))
+        with pytest.raises(ValueError, match="Invalid Ming3 chunk sizes"):
+            _chunk_sizes(manager)
+    config.model_config.stage_connector_config = {"extra": {"initial_latent_chunk_size": 4}}
+    assert Ming3ModelState(config, model, None, torch.device("cpu"))._chunk_latents == (4, 8, 16, 25)
+    config.model_config.stage_connector_config = {"extra": {"initial_latent_chunk_size": 0}}
+    model.step_vae = None
+    state = Ming3ModelState(config, model, None, torch.device("cpu"))
+    assert not hasattr(state, "_chunk_latents") and not hasattr(state, "_samples_per_latent")

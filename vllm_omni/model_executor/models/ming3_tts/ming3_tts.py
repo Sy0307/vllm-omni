@@ -117,6 +117,8 @@ class Ming3TTSForConditionalGeneration(
         self._deferred_prompt_projections: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         # Prompt latents of requests whose prompt prefill spans several steps.
         self._chunked_prompt_patches: dict[str, torch.Tensor] = {}
+        # V1 completion carries runner IDs; model state may use API IDs.
+        self._request_state_ids: dict[str, str] = {}
         self._speaker_extractor = None
         self._prefill_conditioning: dict[str, _PrefillConditioning] = {}
         # CAM++ on the GPU (see batched_campplus), and the embeddings it made
@@ -193,11 +195,16 @@ class Ming3TTSForConditionalGeneration(
         return self.model.sample(logits, sampling_metadata)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
-        for request_id in finished_req_ids:
+        state_ids = set(finished_req_ids)
+        state_ids.update(self._request_state_ids.pop(request_id, request_id) for request_id in finished_req_ids)
+        for request_id in state_ids:
             self._prefill_conditioning.pop(request_id, None)
+            self._chunked_prompt_patches.pop(request_id, None)
+            self._prefetched_prompt_outputs.pop(request_id, None)
+            self._prefetched_speakers.pop(request_id, None)
         callback = getattr(self.model, "on_requests_finished", None)
         if callback is not None:
-            callback(finished_req_ids)
+            callback(state_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
@@ -449,10 +456,6 @@ class Ming3TTSForConditionalGeneration(
         deferred, self._deferred_prompt_projections = self._deferred_prompt_projections or [], []
         return deferred
 
-    def discard_prompt_state(self, request_id: str) -> None:
-        """Drop what a request's chunked prompt prefill kept, e.g. when it is aborted mid-prompt."""
-        self._chunked_prompt_patches.pop(request_id, None)
-
     def end_prompt_batch(self) -> None:
         """Stop deferring projections and drop encoder outputs no prefill took."""
         self._deferred_prompt_projections = None
@@ -485,6 +488,10 @@ class Ming3TTSForConditionalGeneration(
     ):
         if self.model_stage != "llm":
             return input_ids, input_embeds, {}
+        runner_id, state_id = info.get("request_id"), _request_id(info)
+        if isinstance(runner_id, str) and isinstance(state_id, str) and runner_id != state_id:
+            # Keep sampling IDs unchanged: prompt and flow RNGs may differ.
+            self._request_state_ids[runner_id] = state_id
         input_embeds = self.model.embed_input_ids(input_ids).clone()
         return (
             self._prefill_preprocess(input_ids, input_embeds, info)
