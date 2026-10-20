@@ -104,7 +104,7 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
-        self._init_cfm_graph_state("MING3_CFM_CUDAGRAPH")
+        self._init_cfm_graph_state()
         self._request_generators: dict[str, torch.Generator] = {}
 
     def make_empty_intermediate_tensors(self, *args: Any, **kwargs: Any):

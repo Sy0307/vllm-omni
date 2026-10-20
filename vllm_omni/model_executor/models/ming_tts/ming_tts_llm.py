@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.bailing_moe import BailingMoeModel
 from vllm.model_executor.models.qwen2 import Qwen2Model
@@ -120,7 +120,8 @@ class MingLLMModel(nn.Module):
         self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
         # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
-        # hot spot. Set MING_CFM_CUDAGRAPH=0 to force the eager flow head.
+        # hot spot. Follow the stage's eager/graph configuration; the legacy
+        # MING_CFM_CUDAGRAPH=0 switch can additionally disable the flow graph.
         self._init_cfm_graph_state("MING_CFM_CUDAGRAPH")
 
     def embed_input_ids(
@@ -382,13 +383,17 @@ class MingLLMModel(nn.Module):
             logprobs_tensors=None,
         )
 
-    def _init_cfm_graph_state(self, env_var: str) -> None:
-        self._cfm_graph_enabled = os.environ.get(env_var, "1") == "1"
+    def _init_cfm_graph_state(self, env_var: str | None = None) -> None:
+        compilation_config = self.vllm_config.compilation_config
+        self._cfm_graph_enabled = (
+            not self.vllm_config.model_config.enforce_eager
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and (env_var is None or os.environ.get(env_var, "1") == "1")
+        )
         self._cfm_graphs: dict[int, CFMGraphExecutor] = {}
         self._cfm_graph_failed_batch_sizes: set[int] = set()
         self._cfm_graph_warmed_up = False
 
-        compilation_config = getattr(self.vllm_config, "compilation_config", None)
         raw_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None) or [1]
         scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
         max_num_seqs = max(1, int(getattr(scheduler_config, "max_num_seqs", 1)))

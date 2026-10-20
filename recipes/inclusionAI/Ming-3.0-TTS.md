@@ -149,6 +149,7 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:8000/v1/audio/speec
 ## Notes
 
 - Output is mono 44.1 kHz WAV. For PCM streaming, set `response_format: "pcm"` and `stream_format: "audio"`.
+- CFM CUDA Graphs follow Stage 0's configuration: `enforce_eager: true` or `compilation_config.cudagraph_mode: NONE` disables their compilation and capture.
 - Context limit: 4096 tokens. Both stages allow 16 scheduled sequences;
   For chunked prefill, speaker and reference-audio conditioning is cached per request and sliced using the scheduled token offset, including single-token prefill slices.
   AudioVAE currently decodes requests individually within a scheduled batch.

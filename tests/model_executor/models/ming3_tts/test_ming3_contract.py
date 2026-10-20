@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.config import CUDAGraphMode
 
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor
 from vllm_omni.model_executor.models.common.ming.continuous_tts import (
@@ -290,6 +291,37 @@ def test_pipeline_contract():
     assert stage0.sampling_constraints["max_tokens"] == 801
     assert stage1.final_output is True
     assert stage1.final_output_type == "audio"
+
+
+@pytest.mark.parametrize(
+    "eager,graph_mode,legacy_switch,enabled",
+    [
+        (False, CUDAGraphMode.PIECEWISE, None, True),
+        (True, CUDAGraphMode.PIECEWISE, None, False),
+        (False, CUDAGraphMode.NONE, None, False),
+        (False, CUDAGraphMode.PIECEWISE, "0", False),
+        (False, CUDAGraphMode.PIECEWISE, "1", True),
+        (True, CUDAGraphMode.PIECEWISE, "1", False),
+    ],
+)
+def test_cfm_graph_respects_stage_config(monkeypatch, eager, graph_mode, legacy_switch, enabled):
+    model = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=eager),
+            compilation_config=SimpleNamespace(cudagraph_mode=graph_mode),
+        )
+    )
+    env_var = None
+    if legacy_switch is not None:
+        env_var = "MING_CFM_CUDAGRAPH"
+        monkeypatch.setenv(env_var, legacy_switch)
+    Ming3TTSLLMModel._init_cfm_graph_state(model, env_var)
+    assert model._cfm_graph_enabled is enabled
+    if not enabled:
+        # Disabled warmup must not even access the flow modules or build graphs.
+        Ming3TTSLLMModel._warmup_cfm_graphs(model)
+        assert Ming3TTSLLMModel._maybe_build_cfm_graph(model, torch.empty(1, 1, 4)) is None
+        assert not model._cfm_graphs
 
 
 def test_cfm_graph_bucket_zero_pads_without_touching_live_rows():
