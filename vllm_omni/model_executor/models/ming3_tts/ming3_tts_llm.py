@@ -267,6 +267,7 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
 
         group_outputs = []
         host_values = []
+        finite_checks = []
         for (cfg_scale, sigma, temperature), row_indices in groups.items():
             output_indices = [rows[i][3] for i in row_indices]
             decode_hidden = _gather_rows(hidden_states, output_indices)
@@ -283,11 +284,11 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
             group_outputs.append((row_indices, output_indices, latent, next_embeds, new_history))
             host_values.append(stop_probs.reshape(-1).float())
             if finite is not None:
-                host_values.append(finite.reshape(1).float())
+                finite_checks.append(finite.reshape(1).float())
 
         # The only host sync of the step: stop probabilities for the forced
         # next-token decision, plus the deferred non-finite guard.
-        host_list = torch.cat(host_values).tolist()
+        host_list = torch.cat([*host_values, *finite_checks]).tolist()
         stop_by_row: dict[int, float] = {}
         offset = 0
         for row_indices, *_ in group_outputs:

@@ -254,6 +254,48 @@ def test_request_generator_seed_policy(info, expected_seed):
     assert actual_seed == expected_seed
 
 
+def test_mixed_flow_groups_keep_stop_probabilities_separate_from_finite_flags():
+    from vllm_omni.model_executor.models.ming_tts import config_ming_tts as state_keys
+
+    model = object.__new__(Ming3TTSLLMModel)
+    torch.nn.Module.__init__(model)
+    model.ming_config = SimpleNamespace(
+        cfg=2.0,
+        sigma=0.25,
+        temperature=1.5,
+        patch_size=1,
+        latent_dim=3,
+        stop_head_threshold=0.5,
+        stop_head_min_steps=1,
+        max_decode_steps=16,
+        audio_dummy_token_id=AUDIO_PATCH_TOKEN_ID,
+        text_eos_token_id=AUDIO_END_TOKEN_ID,
+    )
+    model.fm_dtype = torch.float32
+    model._decode_state = {key: (torch.zeros(1, 1, 3), None) for key in ("a", "b", "c")}
+    model._request_generators = {}
+    finite = True
+
+    def sample(hidden, history, infos, **controls):
+        # Graph groups return a finite flag; eager groups already check it.
+        flag = torch.tensor(finite) if controls["cfg_scale"] == 2.0 else None
+        return hidden[:, :3].unsqueeze(1), hidden.clone(), hidden[:, 0], flag
+
+    model._sample_flow_group = sample
+    infos = [
+        {state_keys.KEY_REQUEST_ID: key, state_keys.KEY_CFG: cfg} for key, cfg in (("a", 2.0), ("b", 0.0), ("c", 2.0))
+    ]
+    hidden = torch.tensor([0.1, 0.9, 0.3])[:, None].expand(-1, 4)
+    result = model.make_omni_output(hidden, model_intermediate_buffer=infos, seq_token_counts=[1, 1, 1])
+    assert model._last_ming_next_token_ids == [AUDIO_PATCH_TOKEN_ID, AUDIO_END_TOKEN_ID, AUDIO_PATCH_TOKEN_ID]
+    torch.testing.assert_close(result.multimodal_outputs[model.latent_patch_key][:, 0], hidden[:, :3])
+    for row, key in enumerate(("a", "b", "c")):
+        torch.testing.assert_close(model._decode_state[key][1], hidden[row : row + 1])
+    finite = False
+    with pytest.raises(RuntimeError, match="Non-finite Ming3"):
+        model.make_omni_output(hidden, model_intermediate_buffer=infos, seq_token_counts=[1, 1, 1])
+
+
 @pytest.mark.parametrize("seeded", [False, True])
 def test_cfm_noise_layout_matches_for_batched_and_seeded_rows(seeded):
     config = SimpleNamespace(patch_size=2, latent_dim=3)

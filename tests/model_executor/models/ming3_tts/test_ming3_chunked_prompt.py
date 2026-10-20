@@ -19,6 +19,7 @@ PROMPT = [10, 11, SPK, PATCH, 12, START, PATCH, PATCH, PATCH, PATCH, PATCH, END,
 
 def _wrapper(monkeypatch, draws: list[int]) -> Ming3TTSForConditionalGeneration:
     wrapper = object.__new__(Ming3TTSForConditionalGeneration)
+    wrapper.model_stage = "llm"
     wrapper.ming_config = SimpleNamespace(
         speaker_placeholder_token_id=SPK,
         audio_dummy_token_id=PATCH,
@@ -26,6 +27,7 @@ def _wrapper(monkeypatch, draws: list[int]) -> Ming3TTSForConditionalGeneration:
         audio_end_token_id=END,
         history_patch_size=1,
         latent_dim=DIM,
+        llm_hidden_size=DIM,
     )
     wrapper._prompt_projection_graphs = None
     wrapper._prefetched_prompt_outputs = {}
@@ -39,6 +41,8 @@ def _wrapper(monkeypatch, draws: list[int]) -> Ming3TTSForConditionalGeneration:
         linear_proj_audio=lambda patches: patches * 2,
         project_speaker_embedding=lambda speaker: speaker * 10,
         set_initial_history=lambda request_id, history: None,
+        embed_input_ids=lambda ids: torch.zeros(ids.numel(), DIM),
+        next_embeds_for=lambda request_id: None,
     )
     patches = torch.arange(5 * DIM, dtype=torch.float32).view(5, 1, DIM) + 1
 
@@ -60,9 +64,10 @@ def _prefill(wrapper, bounds: list[int]) -> torch.Tensor:
             "_omni_num_computed_tokens": start,
             "_omni_prompt_ids_cpu": full[start:end],
             "_omni_full_prompt_ids_cpu": full,
+            "_omni_is_prefill": True,
         }
         embeds = torch.zeros(end - start, DIM)
-        _, embeds, _ = wrapper._prefill_preprocess(full[start:end], embeds, info)
+        _, embeds, _ = wrapper.preprocess(full[start:end], embeds, **info)
         chunks.append(embeds)
     return torch.cat(chunks)
 
