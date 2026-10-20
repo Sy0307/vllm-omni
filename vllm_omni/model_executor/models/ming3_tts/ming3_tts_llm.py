@@ -170,12 +170,13 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         if generator is not None:
             return generator
         raw_seed = req_info.get("tts_local_seed")
-        if raw_seed is None:
-            if req_info.get("prompt_waveform") is None:
-                return None
-            raw_seed = torch.seed()
+        if raw_seed is None and req_info.get("prompt_waveform") is None:
+            return None
         generator = torch.Generator(device=device)
-        generator.manual_seed(int(raw_seed))
+        if raw_seed is None:
+            generator.seed()
+        else:
+            generator.manual_seed(int(raw_seed))
         self._request_generators[request_id] = generator
         return generator
 

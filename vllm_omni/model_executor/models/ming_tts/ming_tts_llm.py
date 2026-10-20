@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import (
     CFMSampler,
 )
 from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
+from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_STEPS
 from vllm_omni.model_executor.models.common.ming.continuous_tts import STOP_REASON_CODES
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -56,9 +57,6 @@ from .patch_emission import (
 )
 
 logger = init_logger(__name__)
-
-# CFM ODE integration steps; must match CFM.sample(steps=...) default (10).
-_CFM_STEPS = 10
 
 
 class MingLLMModel(nn.Module):
@@ -451,7 +449,7 @@ class MingLLMModel(nn.Module):
                     )
                     solver_noise = torch.zeros(
                         (
-                            _CFM_STEPS,
+                            DEFAULT_CFM_STEPS,
                             batch_size,
                             self.ming_config.patch_size,
                             self.ming_config.latent_dim,
@@ -585,7 +583,7 @@ class MingLLMModel(nn.Module):
             # request seed is stable when scheduler concurrency changes.
             if self._cfm_graph_enabled:
                 request_solver_noise = torch.randn(
-                    (_CFM_STEPS, *shape),
+                    (DEFAULT_CFM_STEPS, *shape),
                     device=device,
                     dtype=torch.float32,
                     generator=generator,
@@ -599,7 +597,7 @@ class MingLLMModel(nn.Module):
                             dtype=torch.float32,
                             generator=generator,
                         )
-                        for _ in range(_CFM_STEPS)
+                        for _ in range(DEFAULT_CFM_STEPS)
                     ]
                 )
             solver_noise.append(request_solver_noise)
@@ -637,13 +635,13 @@ class MingLLMModel(nn.Module):
                     logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             graph_exec = CFMGraphExecutor(
-                CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS),
+                CFMSampler(self.flowloss.cfm.model, steps=DEFAULT_CFM_STEPS),
                 self.linear_proj_audio,
                 self.stop_head,
                 patch_size=self.ming_config.patch_size,
                 latent_dim=self.ming_config.latent_dim,
                 batch_size=batch_size,
-                steps=_CFM_STEPS,
+                steps=DEFAULT_CFM_STEPS,
                 num_warmups=self._cfm_graph_num_warmups,
             )
             self._cfm_graphs[batch_size] = graph_exec

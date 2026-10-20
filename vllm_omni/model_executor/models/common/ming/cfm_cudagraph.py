@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 from vllm.platforms import current_platform
 
-from vllm_omni.model_executor.models.common.ming.cfm_solver import build_timesteps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_STEPS, build_timesteps
 
 
 class CFMSampler(nn.Module):
@@ -32,7 +32,7 @@ class CFMSampler(nn.Module):
     ``Solver.integrate`` for ``temperature==0`` (the TTS default).
     """
 
-    def __init__(self, dit_model: nn.Module, steps: int = 10):
+    def __init__(self, dit_model: nn.Module, steps: int = DEFAULT_CFM_STEPS):
         super().__init__()
         self.model = dit_model
         self.steps = steps
@@ -77,7 +77,7 @@ class CFMGraphExecutor:
         patch_size: int,
         latent_dim: int,
         batch_size: int,
-        steps: int = 10,
+        steps: int = DEFAULT_CFM_STEPS,
         num_warmups: int = 1,
     ):
         self.cfm_sampler = cfm_sampler

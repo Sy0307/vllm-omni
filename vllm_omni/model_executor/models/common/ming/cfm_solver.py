@@ -3,6 +3,8 @@
 
 import torch
 
+DEFAULT_CFM_STEPS = 10
+
 
 def get_epss_timesteps(n, device, dtype):
     dt = 1 / 32

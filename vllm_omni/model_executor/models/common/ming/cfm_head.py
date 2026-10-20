@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
-from vllm_omni.model_executor.models.common.ming.cfm_solver import Solver, build_timesteps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_STEPS, Solver, build_timesteps
 
 
 class FlowLoss(nn.Module):
@@ -60,8 +60,15 @@ class FlowLoss(nn.Module):
             expected = (z.shape[0], patch_size, self.z_channels)
             if tuple(noise.shape) != expected:
                 raise ValueError(f"Initial noise shape mismatch: got {tuple(noise.shape)}, expected {expected}")
+        t = build_timesteps(
+            DEFAULT_CFM_STEPS,
+            device=noise.device,
+            dtype=noise.dtype,
+            use_epss=True,
+            sway_sampling_coef=-1.0,
+        )
         if solver_noise is not None:
-            expected = (10, z.shape[0], patch_size, self.z_channels)
+            expected = (len(t) - 1, z.shape[0], patch_size, self.z_channels)
             if tuple(solver_noise.shape) != expected:
                 raise ValueError(f"Solver noise shape mismatch: got {tuple(solver_noise.shape)}, expected {expected}")
 
@@ -80,13 +87,6 @@ class FlowLoss(nn.Module):
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return (pred + (pred - null_pred) * cfg).float()
 
-        t = build_timesteps(
-            10,
-            device=noise.device,
-            dtype=noise.dtype,
-            use_epss=True,
-            sway_sampling_coef=-1.0,
-        )
         return (
             Solver(
                 fn,
