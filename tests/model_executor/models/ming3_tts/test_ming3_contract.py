@@ -9,6 +9,7 @@ import torch
 from vllm import SamplingParams
 from vllm.config import CUDAGraphMode
 
+from vllm_omni.model_executor.models.common.ming.audio_vae import StreamingLinearUpsample
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor
 from vllm_omni.model_executor.models.common.ming.continuous_tts import (
     STOP_REASON_CONTINUE,
@@ -56,6 +57,18 @@ def _prefill_wrapper(model, config):
     wrapper.ming_config = config
     wrapper._prefill_conditioning = {}
     return wrapper
+
+
+@pytest.fixture(autouse=True)
+def _stub_api_speaker_embeddings(monkeypatch):
+    """Adapter tests use fake servers without a CAM++ checkpoint."""
+    from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as adapter_module
+
+    monkeypatch.setattr(
+        adapter_module,
+        "_extract_speaker_embeddings",
+        lambda model, waveforms, sample_rates, audio_keys: torch.zeros((len(waveforms), 192)),
+    )
 
 
 class FakeTokenizer:
@@ -201,17 +214,22 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
         _get_request_generator=get_request_generator,
         fm_dtype=torch.float32,
         project_speaker_embedding=lambda embedding: torch.zeros((1, 4)),
+        set_initial_history=lambda request_id, history: calls.setdefault("history", (request_id, history)),
     )
     wrapper = _prefill_wrapper(model, SimpleNamespace(history_patch_size=1, latent_dim=64))
     info = {"prompt_waveform": torch.ones((1, 8)), "request_id": "request-1"}
 
-    Ming3TTSForConditionalGeneration._prefill_preprocess(
+    _, _, update = Ming3TTSForConditionalGeneration._prefill_preprocess(
         wrapper,
         torch.tensor([AUDIO_PATCH_TOKEN_ID]),
         torch.zeros((1, 4)),
         info,
     )
 
+    # The initial flow history stays on the device instead of the host buffer.
+    assert calls["history"][0] == "request-1"
+    assert calls["history"][1].shape == (1, 64)
+    assert "ming_latent_history" not in update
     assert calls["generator_request"] == (info, torch.device("cpu"))
     assert calls["prompt"][2] == {"generator": generator}
 
@@ -221,6 +239,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
     [
         pytest.param({"request_id": "request-1", "tts_local_seed": 1234}, 1234, id="explicit-seed"),
         pytest.param({"request_id": "request-1"}, None, id="unseeded-speaker"),
+        pytest.param({"request_id": "request-1", "prompt_waveform": [0.0]}, None, id="unseeded-clone"),
     ],
 )
 def test_request_generator_seed_policy(info, expected_seed):
@@ -233,6 +252,79 @@ def test_request_generator_seed_policy(info, expected_seed):
 
     actual_seed = None if generator is None else generator.initial_seed()
     assert actual_seed == expected_seed
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+def test_cfm_noise_layout_matches_for_batched_and_seeded_rows(seeded):
+    config = SimpleNamespace(patch_size=2, latent_dim=3)
+    model = SimpleNamespace(ming_config=config, _cfm_graph_enabled=True)
+    generators = [torch.Generator().manual_seed(seed) if seeded else None for seed in (1, 2, 3)]
+
+    initial, solver = Ming3TTSLLMModel._draw_request_cfm_noises(model, generators, torch.device("cpu"))
+
+    assert initial.shape == (3, config.patch_size, config.latent_dim)
+    assert solver.shape[1:] == (3, config.patch_size, config.latent_dim)
+    if seeded:
+        # A seeded row draws the same values whatever else shares its batch.
+        alone, _ = Ming3TTSLLMModel._draw_request_cfm_noises(
+            model, [torch.Generator().manual_seed(2)], torch.device("cpu")
+        )
+        torch.testing.assert_close(initial[1:2], alone)
+
+
+def test_cfm_graph_failure_falls_back_on_the_drawn_noise():
+    config = SimpleNamespace(patch_size=1, latent_dim=3)
+    calls = []
+
+    class FailingGraph:
+        batch_size = 2
+
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("injected replay failure")
+
+    def decode_one_step(**kwargs):
+        calls.append(kwargs)
+        rows = kwargs["hidden_states"].shape[0]
+        return kwargs["initial_noise"].clone(), torch.zeros((rows, 1, 4)), None, torch.zeros(rows)
+
+    model = SimpleNamespace(
+        ming_config=config,
+        fm_dtype=torch.float32,
+        _cfm_graph_enabled=True,
+        _cfm_graphs={2: FailingGraph()},
+        _cfm_graph_failed_batch_sizes=set(),
+        _maybe_build_cfm_graph=lambda cond: FailingGraph(),
+        _decode_one_step=decode_one_step,
+    )
+    model._draw_request_cfm_noises = lambda generators, device: (
+        Ming3TTSLLMModel._draw_request_cfm_noises(model, generators, device)
+    )
+    generators = [torch.Generator().manual_seed(seed) for seed in (1, 2)]
+    want_initial, want_solver = Ming3TTSLLMModel._draw_request_cfm_noises(
+        model, [torch.Generator().manual_seed(seed) for seed in (1, 2)], torch.device("cpu")
+    )
+
+    latent, _, _, finite = Ming3TTSLLMModel._sample_flow_rows(
+        model,
+        torch.zeros((2, 4)),
+        torch.zeros((2, 1, 3)),
+        generators,
+        cfg_scale=2.0,
+        sigma=0.25,
+        temperature=0.0,
+    )
+
+    assert finite is None
+    assert 2 in model._cfm_graph_failed_batch_sizes
+    # Each row reuses its drawn noise; the generators advance once, as on the graph path.
+    for row, call in enumerate(calls):
+        torch.testing.assert_close(call["initial_noise"], want_initial[row : row + 1])
+        torch.testing.assert_close(call["solver_noise"], want_solver[:, row : row + 1])
+    torch.testing.assert_close(latent, want_initial)
+    for seed, generator in zip((1, 2), generators, strict=True):
+        reference = torch.Generator().manual_seed(seed)
+        Ming3TTSLLMModel._draw_request_cfm_noises(model, [reference], torch.device("cpu"))
+        assert torch.equal(generator.get_state(), reference.get_state())
 
 
 def test_tokenizer_mismatch_is_not_repaired():
@@ -340,6 +432,35 @@ def test_cfm_graph_bucket_zero_pads_without_touching_live_rows():
     torch.testing.assert_close(padded_solver_noise[:, :3], solver_noise)
     assert torch.count_nonzero(padded[3]) == 0
     assert torch.count_nonzero(padded_solver_noise[:, 3]) == 0
+
+
+@pytest.mark.parametrize("chunk_sizes", [[4, 25, 25], [1, 1, 3, 9], [2, 30], [17]])
+def test_frame_holdback_upsample_matches_per_frame_stream(chunk_sizes):
+    torch.manual_seed(0)
+    frames = torch.randn(1, sum(chunk_sizes), 6)
+
+    per_frame = StreamingLinearUpsample(scale_factor=4)
+    expected, state = [], None
+    for index in range(frames.shape[1]):
+        out, state = per_frame(frames[:, index : index + 1], state=state, is_last=index == frames.shape[1] - 1)
+        if out is not None:
+            expected.append(out)
+
+    chunked = StreamingLinearUpsample(scale_factor=4)
+    chunked.frame_holdback = True
+    actual: list[torch.Tensor] = []
+    state, start = None, 0
+    for position, size in enumerate(chunk_sizes):
+        out, state = chunked(frames[:, start : start + size], state=state, is_last=position == len(chunk_sizes) - 1)
+        start += size
+        if out is not None:
+            # Each non-final chunk emits all but its last frame, like the per-frame stream.
+            assert out.shape[1] == 4 * (start - 1 if position < len(chunk_sizes) - 1 else start) - sum(
+                o.shape[1] for o in actual
+            )
+            actual.append(out)
+
+    torch.testing.assert_close(torch.cat(actual, dim=1), torch.cat(expected, dim=1), rtol=0, atol=0)
 
 
 def test_ming3_vectorizes_only_compatible_flow_requests():
@@ -791,7 +912,7 @@ def test_adapter_language_and_reference_continuation(speaker_count, language, ex
             )
         ),
         _tts_tokenizer=tokenizer,
-        _resolve_ref_audio=resolve,
+        _resolve_ref_audio_array=resolve,
         _get_resolved_ref_audio_artifact_key=lambda key: key,
         _apply_uploaded_speaker=lambda request: None,
         _validate_ref_audio_format=lambda source: None,
@@ -972,7 +1093,7 @@ def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
     server = SimpleNamespace(
         engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
         _tts_tokenizer=tokenizer,
-        _resolve_ref_audio=forbidden,
+        _resolve_ref_audio_array=forbidden,
         _apply_uploaded_speaker=lambda request: None,
         _validate_ref_audio_format=forbidden,
     )
@@ -1032,7 +1153,7 @@ def test_online_emergent_omits_speaker_conditioning():
         engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
         _tts_tokenizer=FakeTokenizer(),
         _apply_uploaded_speaker=lambda request: None,
-        _resolve_ref_audio=forbidden,
+        _resolve_ref_audio_array=forbidden,
         _validate_ref_audio_format=forbidden,
     )
     adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
@@ -1101,7 +1222,7 @@ def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tok
             )
         ),
         _tts_tokenizer=FakeTokenizer(),
-        _resolve_ref_audio=resolve_audio,
+        _resolve_ref_audio_array=resolve_audio,
         _get_resolved_ref_audio_artifact_key=lambda key: "content-key",
         uploaded_speakers={"alice": {"created_at": 123}},
         _voice_created_at=lambda name: 123,
@@ -1191,7 +1312,7 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
             model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250}))
         ),
         _tts_tokenizer=FakeTokenizer(),
-        _resolve_ref_audio=resolve,
+        _resolve_ref_audio_array=resolve,
         _get_resolved_ref_audio_artifact_key=lambda key: {"resolved-1": "content-a", "resolved-2": "content-b"}[key],
     )
     adapter = Ming3TTSAdapter(SpeechServingContext(server=server))

@@ -1106,6 +1106,40 @@ def test_preprocess_one_token_chunked_prefill_tail_then_decode(monkeypatch, batc
         assert ("codes" in runner.model_intermediate_buffer["r"]) == (not is_prefill)
 
 
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_preprocess_cpu_prompt_ids_follow_scheduled_rows(monkeypatch, opt_in):
+    rows = [
+        ("tail", 5, 4, 1),
+        ("decode", 5, 5, 1),
+        ("whole", 3, 0, 3),
+        ("chunk", 8, 2, 2),
+    ]
+    runner, scheduled, calls, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    runner.model.preprocess_uses_cpu_prompt_ids = opt_in
+    runner.input_ids.cpu = runner.input_ids.gpu.clone()
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    offset = 0
+    for (_, info), (rid, prompt_len, computed, span) in zip(calls, rows, strict=True):
+        if not opt_in:
+            assert "_omni_prompt_ids_cpu" not in info
+            assert "_omni_full_prompt_ids_cpu" not in info
+        elif computed < prompt_len:
+            expected = runner.input_ids.cpu[offset : offset + span]
+            ids = info["_omni_prompt_ids_cpu"]
+            torch.testing.assert_close(ids, expected)
+            assert ids.data_ptr() == expected.data_ptr()
+            full_ids = info["_omni_full_prompt_ids_cpu"]
+            if span < prompt_len:
+                assert full_ids.tolist() == runner.requests[rid].prompt_token_ids
+            else:
+                assert full_ids is None
+        else:
+            assert info["_omni_prompt_ids_cpu"] is None
+            assert info["_omni_full_prompt_ids_cpu"] is None
+        offset += span
+
+
 class DecodeOnlyPreprocessModel:
     has_preprocess = True
 

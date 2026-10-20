@@ -37,25 +37,49 @@ def _patches(output: Mapping[str, Any] | None) -> torch.Tensor | None:
     if patch.ndim != 3 or patch.shape[-2:] != (1, LATENT_DIM):
         raise ValueError(f"Invalid Ming3 latent tensor shape: {tuple(patch.shape)}")
     if isinstance(active, torch.Tensor) and active.numel():
-        indices = (active.reshape(-1) > 0).nonzero(as_tuple=True)[0]
-        if not indices.numel():
+        # Payloads arrive on the host with one row per scheduled token, so
+        # plain Python indexing avoids several tiny tensor ops per request.
+        flags = active.reshape(-1).tolist()
+        keep = [index for index, flag in enumerate(flags) if flag > 0]
+        if not keep:
             return None
-        patch = patch.index_select(0, indices.to(patch.device))
+        if len(keep) != len(flags) or len(flags) != patch.shape[0]:
+            patch = patch[keep]
     return patch.detach().to("cpu", dtype=torch.float32)
 
 
-def _chunk_sizes(transfer_manager: Any) -> tuple[int, int]:
+def _chunk_sizes(transfer_manager: Any) -> tuple[int, int, bool]:
     connector = getattr(transfer_manager, "connector", None)
     raw = getattr(connector, "config", {}) or {}
     config = raw.get("extra", raw) if isinstance(raw, Mapping) else {}
     chunk = int(config.get("latent_chunk_size", LATENT_CHUNK_SIZE))
     initial = int(config.get("initial_latent_chunk_size", INITIAL_LATENT_CHUNK_SIZE))
     left = int(config.get("latent_left_context", 0))
+    ramp = bool(config.get("latent_chunk_ramp", False))
     if chunk <= 0 or initial < 0 or initial > chunk:
         raise ValueError(f"Invalid Ming3 chunk sizes: initial={initial}, chunk={chunk}")
     if left != 0:
         raise ValueError("Ming3 streaming AudioVAE uses cached state; latent_left_context must be 0")
-    return chunk, initial
+    return chunk, initial, ramp
+
+
+def _chunk_target(emitted: int, chunk_size: int, initial_size: int, ramp: bool) -> int:
+    """Return how many latents the next chunk waits for.
+
+    With ``ramp``, chunks double from the initial size up to ``chunk_size``,
+    so a stream does not wait a full chunk of AR steps while its player holds
+    only the small first chunk.
+    """
+    if not initial_size:
+        return chunk_size
+    if emitted == 0:
+        return initial_size
+    if not ramp:
+        return chunk_size
+    target = initial_size
+    while emitted >= target and target < chunk_size:
+        target *= 2
+    return min(target, chunk_size)
 
 
 def llm2audio_vae_async_chunk(
@@ -81,7 +105,7 @@ def llm2audio_vae_async_chunk(
     buffered = transfer_manager.code_prompt_token_ids[request_id]
     seen = int(state["seen"])
     available = len(buffered) - seen
-    chunk_size, initial_size = _chunk_sizes(transfer_manager)
+    chunk_size, initial_size, ramp = _chunk_sizes(transfer_manager)
     if available <= 0:
         if not finished:
             return None
@@ -98,7 +122,7 @@ def llm2audio_vae_async_chunk(
             },
         )
 
-    target = initial_size if seen == 0 and initial_size else chunk_size
+    target = _chunk_target(seen, chunk_size, initial_size, ramp)
     if not finished and available < target:
         return None
     count = available if finished else target

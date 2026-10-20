@@ -572,9 +572,15 @@ class MingLLMModel(nn.Module):
         generators: list[torch.Generator | None],
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
+        if all(generator is None for generator in generators):
+            # Unseeded rows share the global RNG, so one draw serves them all.
+            count = len(generators)
+            initial = torch.randn((count, *shape[1:]), device=device, dtype=torch.float32)
+            solver = torch.randn((_CFM_STEPS, count, *shape[1:]), device=device, dtype=torch.float32)
+            return initial, solver
         initial_noise = []
         solver_noise = []
-        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
         for generator in generators:
             initial_noise.append(
                 torch.randn(
@@ -625,6 +631,13 @@ class MingLLMModel(nn.Module):
             dit_model = self.flowloss.cfm.model
             if not getattr(dit_model, "_ming_compiled", False):
                 try:
+                    # Static shapes compile once per graph bucket (plus once
+                    # for the lazily fused QKV weights); past dynamo's
+                    # recompile limit the remaining buckets would run eager.
+                    dynamo_config = torch._dynamo.config
+                    dynamo_config.recompile_limit = max(
+                        dynamo_config.recompile_limit, 2 * len(self._cfm_graph_batch_sizes)
+                    )
                     dit_model.forward = torch.compile(
                         dit_model.forward,
                         fullgraph=False,

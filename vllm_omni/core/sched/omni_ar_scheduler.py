@@ -359,6 +359,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
+        # A single-stage pipeline has no connector edge; it sets the same keys in additional_config.
+        additional = getattr(self.vllm_config, "additional_config", None)
+        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -366,6 +369,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("ar_prefill_admission_min_batch > 1 needs ar_prefill_admission_max_wait_ms > 0")
         if self._prefill_admission_min_running < 0:
             raise ValueError("ar_prefill_admission_min_running must be >= 0")
+        if self._prefill_admission_min_batch > 1:
+            logger.info(
+                "Prefill admission batching: %d requests or %.0f ms while >= %d run",
+                self._prefill_admission_min_batch,
+                self._prefill_admission_max_wait_s * 1000,
+                self._prefill_admission_min_running,
+            )
 
     def _should_defer_waiting_admission(self) -> bool:
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
