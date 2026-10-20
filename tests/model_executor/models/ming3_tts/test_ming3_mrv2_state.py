@@ -7,8 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.ming3_tts.model_state import Ming3ModelState, _LatentRowsSnapshot
-from vllm_omni.model_executor.output_snapshot import RequestOutputSnapshot
+from vllm_omni.model_executor.models.ming3_tts.model_state import Ming3ModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
@@ -97,19 +96,13 @@ def test_stop_head_and_max_steps_decide_tokens_on_device():
     torch.testing.assert_close(state.history[:, 0, 0], torch.tensor([1.0, 2.0, 3.0]))
     torch.testing.assert_close(state.next_embed[:, 0], torch.tensor([1.0, 2.0, 3.0]))
 
-
-def test_step_after_stop_emits_nothing_and_keeps_state():
-    state = _state(2, {1.0: 0.1, 2.0: 0.1})
-    state.active[1] = False  # stopped last step; async scheduling ran it once more
-    state.history[1] = 5.0
-    prompt = [10, 10]
-    batch = _batch([0, 1], computed=[11, 12], scheduled=[1, 1], prompt_len=prompt, seq_lens=[12, 13])
-    tokens, snapshot = _run(state, batch, _hidden([1.0, 2.0]), prompt)
-
-    assert tokens.tolist() == [CONTINUE, STOP]
-    assert snapshot["ming3_has_patch"].tolist() == [True, False]
-    assert state.history[1].eq(5.0).all()
-    assert state.next_embed[1].eq(0.0).all()
+    # Async scheduling may run stopped rows once more; only the live row advances.
+    batch = _batch([0, 1, 2], computed=[12, 14, 10], scheduled=[1, 1, 1], prompt_len=prompt, seq_lens=[13, 15, 11])
+    tokens, snapshot = _run(state, batch, _hidden([4.0, 5.0, 6.0]), prompt)
+    assert tokens.tolist() == [STOP, STOP, CONTINUE]
+    assert snapshot["ming3_has_patch"].tolist() == [False, False, True]
+    torch.testing.assert_close(state.history[:, 0, 0], torch.tensor([1.0, 2.0, 6.0]))
+    torch.testing.assert_close(state.next_embed[:, 0], torch.tensor([1.0, 2.0, 6.0]))
 
 
 def test_partial_prefill_and_non_finite_rows_are_not_emitted():
@@ -123,6 +116,10 @@ def test_partial_prefill_and_non_finite_rows_are_not_emitted():
     assert tokens.tolist() == [CONTINUE, STOP, STOP]
     assert state.active.tolist() == [True, True, False]
     assert state.llm.calls == [(1.0, 0.25, 1.5, 2)]
+    # Exercise host partitioning on a real output, including non-emitting rows.
+    host = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
+    assert [row["ming3_has_patch"].tolist() for row in host.inter_stage] == [[True], [False], [False]]
+    torch.testing.assert_close(host.inter_stage[0]["ming3_latent_patch"], snapshot["ming3_latent_patch"][:1])
 
 
 def test_rows_with_different_sampling_controls_are_grouped():
@@ -135,23 +132,6 @@ def test_rows_with_different_sampling_controls_are_grouped():
     assert sorted(state.llm.calls) == [(1.0, 0.25, 1.5, 2), (2.0, 0.25, 1.5, 1)]
     assert tokens.tolist() == [CONTINUE] * 3
     torch.testing.assert_close(snapshot["ming3_latent_patch"][:, 0, 0], torch.tensor([1.0, 2.0, 3.0]))
-
-
-def test_partitioned_snapshot_rows_follow_request_order():
-    latent = torch.arange(3 * LATENT_DIM, dtype=torch.float32).view(3, 1, LATENT_DIM)
-    emitted = torch.tensor([True, False, True])
-    snapshot = _LatentRowsSnapshot(latent, emitted, latent_key="lat", flag_key="flag", partitioned=True)
-    host = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
-
-    assert isinstance(host, RequestOutputSnapshot)
-    assert [row["flag"].tolist() for row in host.inter_stage] == [[True], [False], [True]]
-    torch.testing.assert_close(host.inter_stage[2]["lat"], latent[2:3])
-
-
-def test_sampler_features_fall_back_to_logits():
-    state = _state(1, {})
-    state._tokens = torch.tensor([CONTINUE])
-    assert state.sample_determined_tokens(SimpleNamespace(num_reqs=1), sampler=object()) is None
 
 
 def test_seeded_flow_noise_uses_a_fresh_generator_per_request():

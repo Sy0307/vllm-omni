@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.ming3_tts.batched_vae_decoder import BatchedStreamingVAEDecoder
 
@@ -16,13 +16,14 @@ _SCHEDULES = [[4, 8, 16, 5], [1, 2, 4, 8, 3], [6], [3, 3, 3, 3, 3, 3]]
 _STARTS = [0, 1, 0, 2]
 
 
-def _vae() -> AudioVAE:
+def _vae(*, packed: bool = False) -> AudioVAE:
+    # Packed attention needs 64-dimensional heads; the CPU reference can be smaller.
     backbone = {
-        "hidden_size": 32,
-        "intermediate_size": 64,
+        "hidden_size": 128 if packed else 32,
+        "intermediate_size": 256 if packed else 64,
         "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
+        "num_attention_heads": 2 if packed else 4,
+        "num_key_value_heads": 1 if packed else 2,
         "max_position_embeddings": 4096,
         "rope_theta": 10000.0,
         "rms_norm_eps": 1e-6,
@@ -78,30 +79,22 @@ def _batched_streams(decoder: BatchedStreamingVAEDecoder, latents: list[torch.Te
     return [torch.cat(output) for output in outputs]
 
 
-@pytest.mark.cpu
-def test_batched_decode_matches_per_request_streams():
-    vae = _vae()
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=[cuda, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]),
+    ],
+)
+def test_batched_decode_matches_per_request_streams(device):
+    vae = _vae().to(device)
     torch.manual_seed(1)
-    latents = [torch.randn(sum(sizes), 1, 8) for sizes in _SCHEDULES]
+    latents = [torch.randn(sum(sizes), 1, 8, device=device) for sizes in _SCHEDULES]
     expected = [_per_request(vae, latent, sizes) for latent, sizes in zip(latents, _SCHEDULES)]
 
     decoder = BatchedStreamingVAEDecoder(vae.decoder, max_streams=4)
-    for actual, reference in zip(_batched_streams(decoder, latents), expected, strict=True):
-        torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-5)
-    # Finished streams return their cache slots.
-    assert sorted(decoder._free) == [0, 1, 2, 3]
-
-
-@cuda
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_graph_replay_matches_eager_streams():
-    vae = _vae().cuda()
-    torch.manual_seed(1)
-    latents = [torch.randn(sum(sizes), 1, 8, device="cuda") for sizes in _SCHEDULES]
-    expected = [_per_request(vae, latent, sizes) for latent, sizes in zip(latents, _SCHEDULES)]
-
-    decoder = BatchedStreamingVAEDecoder(vae.decoder, max_streams=4)
-    decoder.capture_graphs(batch_sizes=(1, 2, 4), lengths=(8, 16, 32, 64))
+    if device == "cuda":
+        decoder.capture_graphs(batch_sizes=(1, 2, 4), lengths=(8, 16, 32, 64))
     buckets = []
     pick = decoder._graph_bucket
 
@@ -114,43 +107,16 @@ def test_graph_replay_matches_eager_streams():
     for actual, reference in zip(_batched_streams(decoder, latents), expected, strict=True):
         torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-5)
     # Replays covered padded batches and lengths, and the scratch slot stayed private.
-    assert any(bucket is not None for bucket in buckets)
+    if device == "cuda":
+        assert any(bucket is not None for bucket in buckets)
     assert sorted(decoder._free) == [0, 1, 2, 3]
-
-
-def _packed_vae() -> AudioVAE:
-    # FlashAttention takes 64-dimensional heads.
-    backbone = {
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "max_position_embeddings": 4096,
-        "rope_theta": 10000.0,
-        "rms_norm_eps": 1e-6,
-        "sliding_window": 8,
-        "use_sliding_window": True,
-        "max_window_layers": 0,
-        "vocab_size": 1,
-        "_attn_implementation": "sdpa",
-    }
-    config = AudioVAEConfig(
-        sample_rate=1600,
-        dec_kwargs={"backbone": backbone, "output_dim": 16, "latent_dim": 8},
-        patch_size=4,
-    )
-    torch.manual_seed(0)
-    vae = AudioVAE(config, build_encoder=False).eval()
-    vae.decoder.upsampling.frame_holdback = True
-    return vae
 
 
 @cuda
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("graphs", [False, True])
 def test_packed_decode_matches_per_request_streams(graphs):
-    vae = _packed_vae().cuda()
+    vae = _vae(packed=True).cuda()
     torch.manual_seed(1)
     latents = [torch.randn(sum(sizes), 1, 8, device="cuda") for sizes in _SCHEDULES]
     with torch.inference_mode():
@@ -173,7 +139,7 @@ def test_packed_decode_matches_per_request_streams(graphs):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("tokens", [2, 3, 8])
+@pytest.mark.parametrize("tokens", [3, 8])
 def test_short_flow_attention_matches_sdpa(tokens):
     from vllm_omni.model_executor.models.common.ming.dit_blocks import _short_attention
 

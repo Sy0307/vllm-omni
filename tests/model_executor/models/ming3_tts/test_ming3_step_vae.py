@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from tests.model_executor.models.ming3_tts.test_ming3_batched_vae import _packed_vae
+from tests.model_executor.models.ming3_tts.test_ming3_batched_vae import _vae
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 cuda = pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="NVIDIA CUDA required")
@@ -35,7 +35,7 @@ def _reference(vae, latents: torch.Tensor) -> torch.Tensor:
 def test_step_decode_matches_streaming_reference(graphs):
     from vllm_omni.model_executor.models.ming3_tts.step_vae_decoder import StepVAEDecoder
 
-    vae = _packed_vae().cuda()
+    vae = _vae(packed=True).cuda()
     torch.manual_seed(2)
     latents = [torch.randn(length, 8, device="cuda") for length in LENGTHS]
     with torch.inference_mode():

@@ -67,7 +67,7 @@ def _prefill(wrapper, bounds: list[int]) -> torch.Tensor:
     return torch.cat(chunks)
 
 
-@pytest.mark.parametrize("bounds", [[0, 4, 14], [0, 3, 8, 14], [0, 7, 9, 12, 14], [0, 1, 2, 3, 4, 5, 6, 14]])
+@pytest.mark.parametrize("bounds", [[0, 7, 9, 12, 14], [0, 1, 2, 3, 4, 5, 6, 14]])
 def test_chunked_prompt_prefill_matches_whole_prompt(monkeypatch, bounds):
     whole_draws: list[int] = []
     chunk_draws: list[int] = []

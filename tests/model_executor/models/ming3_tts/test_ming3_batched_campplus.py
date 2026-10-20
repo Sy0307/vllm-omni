@@ -8,11 +8,7 @@ import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 
 from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
-from vllm_omni.model_executor.models.ming3_tts.batched_campplus import (
-    BatchedCampplus,
-    BatchedFbank,
-    masked_campplus,
-)
+from vllm_omni.model_executor.models.ming3_tts.batched_campplus import BatchedCampplus
 from vllm_omni.model_executor.models.ming3_tts.constants import (
     KEY_SPEAKER_SAMPLE_RATES,
     KEY_SPEAKER_WAVEFORM,
@@ -43,32 +39,12 @@ def _reference_embedding(model: CAMPPlus, waveform: torch.Tensor, rate: int) -> 
     return model(feat.unsqueeze(0))[0]
 
 
-def test_batched_fbank_matches_kaldi_per_clip():
-    waves = [torch.randn(16000 + 37 * i) * 0.1 for i in range(3)]
-    feats = BatchedFbank(torch.device("cpu"))(torch.nn.utils.rnn.pad_sequence(waves, batch_first=True))
-    for row, wave in enumerate(waves):
-        ref = kaldi.fbank(wave[None], num_mel_bins=80, dither=0, sample_frequency=16000)
-        torch.testing.assert_close(feats[row, : ref.shape[0]], ref, rtol=0, atol=1e-5)
-
-
-@torch.inference_mode()
-def test_masked_campplus_matches_each_clip_alone():
-    model = _campplus()
-    # Lengths that leave partial 100-frame segments after the stride-2 TDNN.
-    lengths = [230, 263, 205]
-    feats = torch.zeros(3, 300, 80)
-    for row, length in enumerate(lengths):
-        feats[row, :length] = torch.randn(length, 80)
-    batched = masked_campplus(model, feats, torch.tensor(lengths))
-    for row, length in enumerate(lengths):
-        torch.testing.assert_close(batched[row], model(feats[row : row + 1, :length])[0], rtol=1e-4, atol=1e-4)
-
-
 @torch.inference_mode()
 def test_batched_campplus_matches_per_clip_pipeline():
     model = _campplus()
     encoder = BatchedCampplus(model, torch.device("cpu"))
-    # Two 24 kHz clips resample together; the others take their own paths.
+    # Covers resampling, fbank and masked CAM++, including partial 100-frame
+    # segments. Two 24 kHz clips resample together; the others use their own paths.
     clips = [
         (torch.randn(1, 24000 * 2) * 0.1, 24000),
         (torch.randn(1, 16000 * 3) * 0.1, 16000),

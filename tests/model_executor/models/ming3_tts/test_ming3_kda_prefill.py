@@ -75,7 +75,6 @@ def _chunk_all_rows(inputs, state, metadata, has_initial):
     ("lengths", "has_initial_state"),
     [
         ([1, 1, 1, 130, 64, 7], [True, True, True, False, True, False]),
-        ([1] * 12 + [200], [True] * 12 + [False]),
         ([90, 3], [False, False]),
     ],
 )

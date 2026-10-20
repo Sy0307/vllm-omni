@@ -40,11 +40,11 @@ def _encoder() -> torch.nn.Module:
 
 @cuda
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("frames", [3, 8, 37])
-def test_packed_prompt_encoder_matches_transformers(frames):
+def test_packed_prompt_encoder_matches_transformers():
     from vllm_omni.model_executor.models.ming3_tts.packed_prompt_encoder import PackedPromptEncoder
 
-    # 37 frames cross the sliding window in the frame encoder and, with the CLS slots, in the aggregator.
+    # Cross the sliding window in both encoders and leave an incomplete patch.
+    frames = 37
     encoder = _encoder().cuda()
     waveform = torch.randn(1, frames * HOP, device="cuda")
     with torch.inference_mode():
@@ -62,8 +62,7 @@ def test_packed_prompt_encoder_matches_transformers(frames):
 @cuda
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("graphs", [False, True])
-@pytest.mark.parametrize("host_clips", [False, True])
-def test_packed_clips_match_single_clip_encoding(graphs, host_clips):
+def test_packed_clips_match_single_clip_encoding(graphs):
     from vllm_omni.model_executor.models.ming3_tts.packed_prompt_encoder import PackedPromptEncoder
 
     encoder = _encoder().cuda().to(torch.bfloat16)
@@ -74,12 +73,15 @@ def test_packed_clips_match_single_clip_encoding(graphs, host_clips):
     clips = [torch.randn(1, frames * HOP, device="cuda", dtype=torch.bfloat16) for frames in (37, 3, 8, 21)]
     with torch.inference_mode():
         expected = [packed(clip) for clip in clips]
-        actual = packed.encode_clips([clip.cpu() for clip in clips] if host_clips else clips)
-        # A second pass of other clips replays the same graph; the first results stay intact.
-        packed.encode_clips(clips[::-1])
+        actual = packed.encode_clips([clip.cpu() for clip in clips])
+        # Cover host and device inputs in successive calls. Replaying the same
+        # graph for reordered clips must not overwrite the first result.
+        reordered = packed.encode_clips(clips[::-1])
     # Clips share GEMMs but not attention: a leak across clips would move whole rows.
     for got, want in zip(actual, expected, strict=True):
         assert got.shape == want.shape
+        torch.testing.assert_close(got, want, rtol=0.02, atol=0.02)
+    for got, want in zip(reordered, expected[::-1], strict=True):
         torch.testing.assert_close(got, want, rtol=0.02, atol=0.02)
 
 
@@ -118,19 +120,6 @@ def test_deferred_prompt_projections_land_at_batch_positions():
 
 
 @pytest.mark.cpu
-def test_prefetched_encoder_output_is_taken_once_by_its_request():
-    wrapper = _wrapper()
-    output = torch.randn(1, 4, 8)
-    wrapper._prefetched_prompt_outputs["a"] = (64, output)
-    waveform = torch.zeros(1, 64)
-    wrapper._prompt_request_id = "b"
-    assert wrapper._prompt_encoder_forward(None, waveform) is None
-    wrapper._prompt_request_id = "a"
-    assert wrapper._prompt_encoder_forward(None, waveform) is output
-    assert wrapper._prompt_encoder_forward(None, waveform) is None
-
-
-@pytest.mark.cpu
 def test_reference_encoder_output_is_cached_by_content_key():
     from types import SimpleNamespace
 
@@ -146,9 +135,12 @@ def test_reference_encoder_output_is_cached_by_content_key():
 
     output = torch.randn(1, 4, 8)
     wrapper._prefetched_prompt_outputs["a"] = (64, output)
-    wrapper._prompt_request_id, wrapper._prompt_cache_key = "a", key
     waveform = torch.zeros(1, 64)
+    wrapper._prompt_request_id = "b"
+    assert wrapper._prompt_encoder_forward(None, waveform) is None
+    wrapper._prompt_request_id, wrapper._prompt_cache_key = "a", key
     assert wrapper._prompt_encoder_forward(None, waveform) is output
+    assert "a" not in wrapper._prefetched_prompt_outputs
     # A later request with the same reference takes a copy from the cache.
     wrapper._prompt_request_id = "b"
     cached = wrapper._prompt_encoder_forward(None, waveform)

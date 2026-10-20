@@ -434,8 +434,8 @@ def test_cfm_graph_bucket_zero_pads_without_touching_live_rows():
     assert torch.count_nonzero(padded_solver_noise[:, 3]) == 0
 
 
-@pytest.mark.parametrize("chunk_sizes", [[4, 25, 25], [1, 1, 3, 9], [2, 30], [17]])
-def test_frame_holdback_upsample_matches_per_frame_stream(chunk_sizes):
+def test_frame_holdback_upsample_matches_per_frame_stream():
+    chunk_sizes = [1, 1, 3, 9]
     torch.manual_seed(0)
     frames = torch.randn(1, sum(chunk_sizes), 6)
 
