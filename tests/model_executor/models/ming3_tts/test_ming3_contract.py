@@ -206,10 +206,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
     )
 
     assert calls["generator_request"] == (info, torch.device("cpu"))
-    assert calls["prompt"][2] == {
-        "generator": generator,
-        "posterior_parameterization": "softplus_scale",
-    }
+    assert calls["prompt"][2] == {"generator": generator}
 
 
 @pytest.mark.parametrize(

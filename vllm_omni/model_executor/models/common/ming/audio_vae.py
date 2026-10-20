@@ -348,7 +348,6 @@ class AudioVAE(PreTrainedModel):
         waveform_length,
         *,
         generator: torch.Generator | None = None,
-        posterior_parameterization: str = "softplus_scale",
     ):
         if self.encoder is None:
             raise RuntimeError("AudioVAE encoder is unavailable in decoder-only mode.")
@@ -371,14 +370,8 @@ class AudioVAE(PreTrainedModel):
         h, _ = self.encoder(waveform)
         h = h.transpose(1, 2)
 
-        mean, posterior_parameter = torch.chunk(h, 2, dim=1)
-        if posterior_parameterization == "softplus_scale":
-            std = F.softplus(posterior_parameter) + 1e-4
-        elif posterior_parameterization == "clamped_logvar":
-            logvar = torch.clamp(posterior_parameter, -30.0, 20.0)
-            std = torch.exp(0.5 * logvar)
-        else:
-            raise ValueError(f"Unsupported AudioVAE posterior parameterization: {posterior_parameterization}")
+        mean, scale = torch.chunk(h, 2, dim=1)
+        std = F.softplus(scale) + 1e-4
         noise = torch.randn(
             mean.shape,
             generator=generator,

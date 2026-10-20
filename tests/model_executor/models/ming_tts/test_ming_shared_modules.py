@@ -112,8 +112,7 @@ class _FixedPosteriorEncoder:
         return self.parameters.to(waveform), None
 
 
-@pytest.mark.parametrize("parameterization", ["softplus_scale", "clamped_logvar"])
-def test_audio_vae_posterior_parameterization(parameterization):
+def test_audio_vae_samples_softplus_posterior_with_request_rng():
     encoded = torch.tensor([[[1.0, 0.0], [2.0, 4.0]]])
     vae = SimpleNamespace(
         config=SimpleNamespace(enc_kwargs={"input_dim": 1}, patch_size=-1),
@@ -121,11 +120,8 @@ def test_audio_vae_posterior_parameterization(parameterization):
     )
     generator = torch.Generator().manual_seed(17)
     expected_generator = torch.Generator().manual_seed(17)
-    mean, parameter = torch.chunk(encoded.transpose(1, 2), 2, dim=1)
-    if parameterization == "softplus_scale":
-        std = torch.nn.functional.softplus(parameter) + 1e-4
-    else:
-        std = torch.exp(0.5 * torch.clamp(parameter, -30.0, 20.0))
+    mean, scale = torch.chunk(encoded.transpose(1, 2), 2, dim=1)
+    std = torch.nn.functional.softplus(scale) + 1e-4
     expected_noise = torch.randn(mean.shape, generator=expected_generator)
 
     actual, lengths = AudioVAE.encode_latent(
@@ -133,11 +129,11 @@ def test_audio_vae_posterior_parameterization(parameterization):
         torch.zeros((1, 2)),
         torch.tensor([2]),
         generator=generator,
-        posterior_parameterization=parameterization,
     )
 
     torch.testing.assert_close(actual, (mean + std * expected_noise).transpose(1, 2))
     assert torch.equal(lengths, torch.tensor([2], dtype=torch.int32))
+    assert torch.equal(generator.get_state(), expected_generator.get_state())
 
 
 def test_ming_tts_cfm_solver_uses_common_implementation():

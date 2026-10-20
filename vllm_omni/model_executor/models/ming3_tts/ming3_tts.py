@@ -177,11 +177,7 @@ class Ming3TTSForConditionalGeneration(
         if info.get("prompt_waveform") is not None:
             prompt_generator = self.model._get_request_generator(info, input_embeds.device)
         prompt_latents = (
-            None
-            if mute_speaker or no_speaker_slot
-            else _resolve_prompt_latents(
-                self, info, generator=prompt_generator, posterior_parameterization="softplus_scale"
-            )
+            None if mute_speaker or no_speaker_slot else _resolve_prompt_latents(self, info, generator=prompt_generator)
         )
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,

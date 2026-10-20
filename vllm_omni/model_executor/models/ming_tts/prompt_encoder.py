@@ -32,7 +32,6 @@ def _resolve_prompt_latents(
     info_dict: dict[str, Any],
     *,
     generator: torch.Generator | None = None,
-    posterior_parameterization: str = "softplus_scale",
 ) -> dict[str, torch.Tensor] | None:
     raw_latents = info_dict.get(KEY_PROMPT_LATENTS, info_dict.get("prompt_latents"))
     raw_waveform = info_dict.get("prompt_waveform", info_dict.get("prompt_waveforms"))
@@ -61,7 +60,6 @@ def _resolve_prompt_latents(
             raw_waveform,
             info_dict.get("prompt_waveform_length"),
             generator=generator,
-            posterior_parameterization=posterior_parameterization,
         )
     return _coerce_prompt_latents(
         latents,
@@ -129,7 +127,6 @@ def _encode_prompt_waveform_to_latents(
     waveform_length: Any = None,
     *,
     generator: torch.Generator | None = None,
-    posterior_parameterization: str = "softplus_scale",
 ) -> torch.Tensor:
     encoder = _load_prompt_encoder(wrapper)
     waveform = _normalize_prompt_waveform(waveform, target_sr=wrapper.ming_config.sample_rate)
@@ -151,7 +148,6 @@ def _encode_prompt_waveform_to_latents(
         waveform,
         waveform_length,
         generator=generator,
-        posterior_parameterization=posterior_parameterization,
     )
     if latents.ndim == 3 and latents.shape[0] == 1:
         latents = latents.squeeze(0)
