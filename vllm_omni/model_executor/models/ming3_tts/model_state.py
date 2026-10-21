@@ -182,6 +182,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         self._pending: dict[int, tuple[int, int]] = {}
         self._partitioned = bool(getattr(vllm_config.model_config, "async_chunk", False))
         self._tokens: torch.Tensor | None = None
+        self._request_errors: tuple[torch.Tensor, str] | None = None
         self._continue_token = int(cfg.audio_dummy_token_id)
         self._stop_token = int(cfg.text_eos_token_id)
         self._threshold = float(cfg.stop_head_threshold)
@@ -217,6 +218,9 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         extra = info.pop("additional_information", None)
         if isinstance(extra, dict):
             info = {**extra, **info}
+        # Normalize the public Ming3 controls before admission caches them,
+        # using the same mapping as V1 preprocess.
+        self.model._copy_request_state(info, info)
         return info
 
     def add_request(self, req_index: int, new_req_data) -> None:
@@ -365,6 +369,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         hidden = model_output.text_hidden_states if isinstance(model_output, OmniOutput) else model_output
         num_reqs = input_batch.num_reqs
         self._tokens = None
+        self._request_errors = None
         self.llm._mrv2_next_token_ids = None
         if num_reqs == 0 or not isinstance(hidden, torch.Tensor):
             return hidden, {}
@@ -383,6 +388,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         )
         emitted_out = torch.zeros(num_reqs, dtype=torch.bool, device=device)
         flush_out = torch.zeros(num_reqs, dtype=torch.bool, device=device)
+        failed_out = torch.zeros(num_reqs, dtype=torch.bool, device=device)
         groups: dict[tuple[float, float, float], list[int]] = {}
         for row in rows.tolist():
             groups.setdefault(self._sde[int(slots_np[row])], []).append(row)
@@ -419,12 +425,17 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
                 + 1
             )
             finite = (
-                torch.isfinite(latent).flatten(1).all(1)
+                torch.isfinite(cond).flatten(1).all(1)
+                & torch.isfinite(latent).flatten(1).all(1)
                 & torch.isfinite(next_embeds).all(1)
                 & torch.isfinite(stop_probs)
             )
-            # A non-finite flow output ends the request without emitting it.
-            live = self.active.index_select(0, slots) & finite
+            # Report failed live rows through the asynchronous output copy.
+            # Already stopped/draining rows no longer consume the flow result.
+            active = self.active.index_select(0, slots)
+            failed = active & ~finite
+            failed_out = failed if whole else failed_out.index_copy(0, group_rows, failed)
+            live = active & finite
             halt = (
                 (count >= self.max_steps.index_select(0, slots))
                 | ((count >= self.min_steps.index_select(0, slots)) & (stop_probs > self._threshold))
@@ -461,6 +472,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
                 emitted_out.index_copy_(0, group_rows, live)
 
         self._tokens = tokens
+        self._request_errors = (failed_out, "Non-finite Ming3 flow-head output in decode step.")
         # The logits path (when sampler features need it) forces the same tokens.
         llm._mrv2_next_token_ids = tokens
         if self._step_vae is not None:
@@ -523,6 +535,9 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
                 chunks = self._audio_chunks[req_id] = _AudioChunks(self._samples_per_latent, self._chunk_latents)
             rows.append((row, chunks))
         self._step_audio = _StepAudioOutput(audio, start, end, flush, rows, num_reqs, self._sample_rate)
+
+    def get_request_errors(self) -> tuple[torch.Tensor, str] | None:
+        return self._request_errors
 
     def prepare_streaming_audio_output(self, input_batch, req_states, outputs):
         audio, self._step_audio = self._step_audio, None

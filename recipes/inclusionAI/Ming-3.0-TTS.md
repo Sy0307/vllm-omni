@@ -187,7 +187,7 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:8000/v1/audio/speec
 - CFM CUDA Graphs follow Stage 0's configuration: `enforce_eager: true` or `compilation_config.cudagraph_mode: NONE` disables their compilation and capture.
 - Context limit: 4096 tokens. Both stages allow 16 scheduled sequences;
   For chunked prefill, speaker and reference-audio conditioning is cached per request and sliced using the scheduled token offset, including single-token prefill slices.
-  AudioVAE currently decodes requests individually within a scheduled batch.
+  AudioVAE batches compatible request chunks within a scheduled batch. The fused MRV2 profile decodes active streams together in Stage 0; other profiles use the separate AudioVAE stage.
 - Reference clips must be 1–30 seconds. Upload clips through `/v1/audio/voices` and reuse their names in `voice`; built-in IP names use `instructions`.
 - Flow temperature defaults to 1.5; the examples explicitly use 0.0.
   `ming3_cfg=1` corresponds to native CFG scale 2. The legacy `lingv3_cfg` alias and checkpoint `lingv3_tts` metadata remain supported.

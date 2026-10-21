@@ -400,9 +400,10 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         device = hidden_states.device
         z_diff_cond = hidden_states.to(dtype=self.fm_dtype).unsqueeze(1)
         graph_exec = self._maybe_build_cfm_graph(z_diff_cond) if cfg_scale >= 1e-5 else None
-        initial_noise = solver_noise = None
+        # Keep RNG call boundaries stable even after a bucket is disabled,
+        # or when CFG selects the eager-only unconditional path.
+        initial_noise, solver_noise = self._draw_request_cfm_noises(generators, device)
         if graph_exec is not None:
-            initial_noise, solver_noise = self._draw_request_cfm_noises(generators, device)
             graph_result = None
             try:
                 graph_result = graph_exec.execute(
@@ -435,8 +436,7 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
                     )
                 return latent, next_embeds, stop_probs, finite
 
-        # A failed graph falls back per row on the noise already drawn, so a
-        # seeded request's RNG advances as on the graph path.
+        # Eager and graph execution consume the same explicitly drawn noise.
         outputs = [
             self._decode_one_step(
                 hidden_states=hidden_states[i : i + 1],
@@ -445,8 +445,9 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
                 sigma=sigma,
                 temperature=temperature,
                 generator=generator,
-                initial_noise=None if initial_noise is None else initial_noise[i : i + 1],
-                solver_noise=None if solver_noise is None else solver_noise[:, i : i + 1],
+                initial_noise=initial_noise[i : i + 1],
+                solver_noise=solver_noise[:, i : i + 1],
+                check_finite=check_finite,
             )
             for i, generator in enumerate(generators)
         ]
