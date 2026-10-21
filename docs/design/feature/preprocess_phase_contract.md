@@ -94,22 +94,6 @@ Every such row has `_omni_is_prefill == False`. The optional earlier
 `preprocess_batch` hook is a separate whole-batch preparation hook; these freshly
 computed per-row fields are not promised at that earlier boundary.
 
-### Optional CPU prompt IDs
-
-A model can set `preprocess_uses_cpu_prompt_ids = True` to inspect prompt
-placeholders without copying token IDs back from the device. When the token
-IDs passed to preprocessing use the runner's staging buffer, the runner also
-provides `_omni_prompt_ids_cpu` as a read-only view of the scheduled prompt
-span. For a chunk shorter than the complete prompt,
-`_omni_full_prompt_ids_cpu` contains a CPU tensor of the request's complete
-prompt; otherwise it is `None`. Both values are `None` outside spans wholly
-within the prompt.
-
-These fields are optional: models must keep their device-ID path when the
-fields are absent or `None`. The view must not be retained across steps, as
-the runner reuses its staging buffer. This opt-in does not change the phase
-fields or decode routing described above.
-
 Models retaining request-owned prompt tensors across prefill chunks must release
 them in `on_requests_finished`, including cancellation before the final prompt
 chunk. A wrapper owning such tensors must clean them before forwarding completion

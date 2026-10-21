@@ -56,6 +56,10 @@ def _prefill_wrapper(model, config):
     wrapper.model = model
     wrapper.ming_config = config
     wrapper._prefill_conditioning = {}
+    wrapper._request_state_ids = {}
+    wrapper._prefetched_prompt_outputs = {}
+    wrapper._prefetched_speakers = {}
+    wrapper._prompt_projection_graphs = None
     return wrapper
 
 

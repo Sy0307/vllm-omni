@@ -97,26 +97,9 @@ def _wrapper():
     wrapper._prefetched_speakers = {}
     wrapper._prompt_request_id = None
     wrapper._prompt_cache_key = None
-    wrapper._deferred_prompt_projections = None
     # Projection stand-in: row-independent, like the Aggregator.
     wrapper.__dict__["model"] = SimpleNamespace(linear_proj_audio=lambda patches: patches.sum(-1, keepdim=True) * 2)
     return wrapper
-
-
-@pytest.mark.cpu
-def test_deferred_prompt_projections_land_at_batch_positions():
-    wrapper = _wrapper()
-    embeds = torch.zeros(10, 1)
-    rows = [(torch.tensor([1, 2]), torch.ones(2, 1, 3)), (torch.tensor([0, 3, 4]), torch.full((3, 1, 3), 2.0))]
-    wrapper.defer_prompt_projections()
-    deferred: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for start, (positions, patches) in zip((0, 5), rows):
-        wrapper._deferred_prompt_projections.append((positions, patches))
-        deferred.extend((pos + start, p) for pos, p in wrapper.take_deferred_prompt_projections())
-    wrapper.project_deferred_prompts(embeds, deferred)
-
-    assert embeds.squeeze(1).tolist() == [0, 6, 6, 0, 0, 12, 0, 0, 12, 12]
-    assert wrapper._deferred_prompt_projections is None
 
 
 @pytest.mark.cpu

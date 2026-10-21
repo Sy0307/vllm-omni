@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsPP
@@ -107,7 +107,10 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
             vllm_config=get_ming3_backbone_config(vllm_config),
             prefix=maybe_prefix(prefix, "model"),
         )
-        install_sync_free_kda_prefill(self.model)
+        if not vllm_config.model_config.enforce_eager and (
+            vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            install_sync_free_kda_prefill(self.model)
         self.linear_proj_audio = Aggregator(
             in_channels=self.ming_config.latent_dim,
             llm_input_dim=self.ming_config.llm_hidden_size,

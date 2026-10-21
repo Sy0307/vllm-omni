@@ -36,7 +36,7 @@ from vllm_omni.model_executor.models.ming_tts.ming_tts import (
     _ModelSampleAdapter,
 )
 from vllm_omni.model_executor.models.ming_tts.prompt_encoder import _load_prompt_encoder, _resolve_prompt_latents
-from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .batched_campplus import BatchedCampplus
 from .config_ming3_tts import Ming3TTSRuntimeConfig, get_ming3_backbone_config
@@ -69,7 +69,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class _PrefillConditioning:
-    """Request-owned projections reused across prefill slices and recomputation."""
+    """Request-owned conditioning reused across prefill slices and recomputation."""
 
     speaker_positions: tuple[int, ...]
     speaker_embeds: torch.Tensor
@@ -89,7 +89,6 @@ class Ming3TTSForConditionalGeneration(
     requires_request_sample_eligibility = True
     # Stage 1 consumes only the latent patches; skip the per-step hidden-state D2H.
     omni_pooler_payload_include_hidden = False
-    preprocess_uses_cpu_prompt_ids = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -114,9 +113,6 @@ class Ming3TTSForConditionalGeneration(
         # Content key of the prefilling request's reference audio; its encoder
         # output is cached under it (posterior sampling stays per request).
         self._prompt_cache_key: Any = None
-        self._deferred_prompt_projections: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-        # Prompt latents of requests whose prompt prefill spans several steps.
-        self._chunked_prompt_patches: dict[str, torch.Tensor] = {}
         # V1 completion carries runner IDs; model state may use API IDs.
         self._request_state_ids: dict[str, str] = {}
         self._speaker_extractor = None
@@ -199,7 +195,6 @@ class Ming3TTSForConditionalGeneration(
         state_ids.update(self._request_state_ids.pop(request_id, request_id) for request_id in finished_req_ids)
         for request_id in state_ids:
             self._prefill_conditioning.pop(request_id, None)
-            self._chunked_prompt_patches.pop(request_id, None)
             self._prefetched_prompt_outputs.pop(request_id, None)
             self._prefetched_speakers.pop(request_id, None)
         callback = getattr(self.model, "on_requests_finished", None)
@@ -313,7 +308,7 @@ class Ming3TTSForConditionalGeneration(
                 in_dim=0,
                 in_unit=1,
                 out_dim=0,
-                # A step's batched prompts project together (see project_deferred_prompts).
+                # Project the complete reference once, independently of prefill chunking.
                 bucket_groups=PROJECTION_BUCKET_ROWS,
             )
             start = time.perf_counter()
@@ -379,6 +374,7 @@ class Ming3TTSForConditionalGeneration(
         instead of replaying the encoder graph once per clip; posterior
         sampling stays per request. A single clip keeps the graph path.
         """
+        infos = [info for info in infos if _request_id(info) not in self._prefill_conditioning]
         self._prefetch_speaker_embeddings(infos)
         packed = self._packed_prompt_encoder
         if packed is None or len(infos) < 2:
@@ -447,29 +443,10 @@ class Ming3TTSForConditionalGeneration(
                 self, plan, [embeddings[row] for row in rows]
             )
 
-    def defer_prompt_projections(self) -> None:
-        """Collect the prompt projections of the following prefills for one batched pass."""
-        self._deferred_prompt_projections = []
-
-    def take_deferred_prompt_projections(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """The (placeholder positions, latent patches) the last prefill left for projection."""
-        deferred, self._deferred_prompt_projections = self._deferred_prompt_projections or [], []
-        return deferred
-
     def end_prompt_batch(self) -> None:
-        """Stop deferring projections and drop encoder outputs no prefill took."""
-        self._deferred_prompt_projections = None
+        """Drop encoder outputs no prefill consumed."""
         self._prefetched_prompt_outputs.clear()
         self._prefetched_speakers.clear()
-
-    def project_deferred_prompts(self, embeds: torch.Tensor, items: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
-        """Project the patches of all ``items`` together into ``embeds`` at their positions."""
-        self.end_prompt_batch()
-        if not items:
-            return
-        positions = index_to_device(torch.cat([position for position, _ in items]).tolist(), embeds.device)
-        projected = self._project_prompt_patches(torch.cat([patches for _, patches in items])).squeeze(1)
-        embeds.index_copy_(0, positions, projected.to(embeds.dtype))
 
     def create_mrv2_model_state(self, vllm_config: VllmConfig, encoder_cache: Any, device: torch.device):
         from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -505,18 +482,19 @@ class Ming3TTSForConditionalGeneration(
         input_embeds: torch.Tensor,
         info: dict[str, Any],
     ):
-        """Inject cached conditioning for this scheduled token interval.
-
-        The runner owns the phase and absolute offset. Reference sampling and
-        history initialization happen once; a continuation may have no slots.
-        """
-        request_id = info.get("request_id", info.get(KEY_REQUEST_ID))
+        """Inject cached full-prompt projections into the scheduled token span."""
+        request_id = _request_id(info)
         offset = int(info.get("_omni_num_computed_tokens", 0))
         conditioning = self._prefill_conditioning.get(request_id)
+        update: dict[str, Any] = {}
         if conditioning is None:
             conditioning = self._prepare_prefill_conditioning(input_ids, input_embeds, info)
             if isinstance(request_id, str):
                 self._prefill_conditioning[request_id] = conditioning
+                self.model.set_initial_history(request_id, conditioning.history)
+            else:
+                update[state_keys.KEY_LATENT_HISTORY] = conditioning.history.detach().cpu().contiguous()
+            update[state_keys.KEY_DECODE_STEP] = 0
 
         end = offset + input_ids.shape[0]
         for index, position in enumerate(conditioning.speaker_positions):
@@ -529,11 +507,6 @@ class Ming3TTSForConditionalGeneration(
                 input_embeds[start - offset : stop - offset] = conditioning.prompt_embeds[
                     start - conditioning.prompt_start : stop - conditioning.prompt_start
                 ]
-
-        update: dict[str, Any] = {}
-        if state_keys.KEY_LATENT_HISTORY not in info:
-            update[state_keys.KEY_LATENT_HISTORY] = conditioning.history
-            update[state_keys.KEY_DECODE_STEP] = 0
         self._copy_request_state(update, info)
         return input_ids, input_embeds, update
 
@@ -570,9 +543,18 @@ class Ming3TTSForConditionalGeneration(
         prompt_generator = None
         if info.get("prompt_waveform") is not None:
             prompt_generator = self.model._get_request_generator(info, input_embeds.device)
-        prompt_latents = (
-            None if mute_speaker or no_speaker_slot else _resolve_prompt_latents(self, info, generator=prompt_generator)
-        )
+        request_id = _request_id(info)
+        self._prompt_request_id = request_id
+        self._prompt_cache_key = self._prompt_encoder_cache_key(info)
+        try:
+            prompt_latents = (
+                None
+                if mute_speaker or no_speaker_slot
+                else _resolve_prompt_latents(self, info, generator=prompt_generator)
+            )
+        finally:
+            self._prompt_request_id = None
+            self._prompt_cache_key = None
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
             history_size=self.ming_config.history_patch_size,
@@ -589,18 +571,19 @@ class Ming3TTSForConditionalGeneration(
                 raise RuntimeError("Masked speaker conditioning requires exactly one speaker slot")
             speaker_embeds = input_embeds.new_zeros((1, input_embeds.shape[-1]))
         else:
-            speakers = resolve_speaker_embeddings(self, info)
+            speakers = self._prefetched_speakers.get(request_id) or resolve_speaker_embeddings(self, info)
             if not slots or len(slots) != len(speakers):
                 raise RuntimeError(f"Ming3 speaker slot/embedding count mismatch: {len(slots)}/{len(speakers)}")
             speaker_embeds = self.model.project_speaker_embedding(
-                torch.stack(speakers).to(input_embeds.device, input_embeds.dtype)
+                to_device_nonblocking(torch.stack(speakers), input_embeds.device).to(input_embeds.dtype)
             ).detach()
 
         prompt_embeds = None
         prompt_start = 0
         if prompt_latents is not None:
             patches = prompt_latents["patches"].to(device=input_embeds.device, dtype=self.model.fm_dtype)
-            prompt_embeds = self.model.linear_proj_audio(patches).squeeze(1).to(input_embeds.dtype).detach()
+            # Retain an owned result: graph replay reuses its output buffer.
+            prompt_embeds = self._project_prompt_patches(patches).squeeze(1).to(input_embeds.dtype).clone()
             if KEY_PROMPT_AUDIO_START in info:
                 prompt_start = int(info[KEY_PROMPT_AUDIO_START])
             else:
@@ -611,9 +594,7 @@ class Ming3TTSForConditionalGeneration(
             if prompt_start < 0 or prompt_start + prompt_embeds.shape[0] != prompt_length:
                 raise RuntimeError("Ming3 prompt latent/token count mismatch")
 
-        return _PrefillConditioning(
-            slots, speaker_embeds, prompt_start, prompt_embeds, history.detach().cpu().contiguous()
-        )
+        return _PrefillConditioning(slots, speaker_embeds, prompt_start, prompt_embeds, history)
 
     def _decode_preprocess(
         self,

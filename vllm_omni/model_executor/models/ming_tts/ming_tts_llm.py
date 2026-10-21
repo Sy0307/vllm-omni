@@ -577,7 +577,7 @@ class MingLLMModel(nn.Module):
             # Unseeded rows share the global RNG, so one draw serves them all.
             count = len(generators)
             initial = torch.randn((count, *shape[1:]), device=device, dtype=torch.float32)
-            solver = torch.randn((_CFM_STEPS, count, *shape[1:]), device=device, dtype=torch.float32)
+            solver = torch.randn((DEFAULT_CFM_STEPS, count, *shape[1:]), device=device, dtype=torch.float32)
             return initial, solver
         initial_noise = []
         solver_noise = []

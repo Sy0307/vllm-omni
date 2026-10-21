@@ -178,7 +178,6 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         # draw from the global RNG.
         self._seeds: list[int | None] = [None] * slots
         self._flow_generators: list[torch.Generator | None] = [None] * slots
-        self._prompt_ids: dict[int, np.ndarray] = {}
         # Slot -> (minimum, maximum) decode steps, written before the next step.
         self._pending: dict[int, tuple[int, int]] = {}
         self._partitioned = bool(getattr(vllm_config.model_config, "async_chunk", False))
@@ -230,7 +229,6 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
             raise RuntimeError(
                 f"Ming3 cannot resume preempted request {req_id}; size the KV cache for max_num_seqs requests"
             )
-        self._prompt_ids[req_index] = np.asarray(prompt, dtype=np.int64)
         info = self._request_info(req_index)
         cfg = self.llm.ming_config
         self._sde[req_index] = (
@@ -252,7 +250,6 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
     def remove_request(self, req_index_or_id) -> None:
         index = self._resolve_req_index(req_index_or_id)
         if index is not None:
-            self._prompt_ids.pop(index, None)
             self._pending.pop(index, None)
             self._seeds[index] = None
             self._flow_generators[index] = None
@@ -326,17 +323,13 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
             info["_omni_prompt_len"] = int(prompt_len[row])
             info["_omni_num_computed_tokens"] = done
             info["_omni_is_prefill"] = True
-            info["_omni_prompt_ids_cpu"] = torch.from_numpy(self._prompt_ids[slot][done : done + count])
-            info["_omni_full_prompt_ids_cpu"] = torch.from_numpy(self._prompt_ids[slot])
             infos[row] = info
         if not infos:
             return
 
-        # The new requests' reference clips encode in one pass and their prompt
-        # latents project in one pass after the rows; per-row work stays per row.
+        # Batch reference encoding; each request retains its full projection so
+        # scheduler chunk boundaries cannot change the projection's GEMM shape.
         self.model.prefetch_prompt_encodings([info for row, info in infos.items() if computed[row] == 0])
-        self.model.defer_prompt_projections()
-        deferred = []
         try:
             for row, info in infos.items():
                 slot, start, count = int(slots[row]), int(starts[row]), int(scheduled[row])
@@ -344,16 +337,11 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
                     input_ids[start : start + count], embeds[start : start + count], **info
                 )
                 embeds[start : start + count].copy_(new_embeds[:count])
-                deferred.extend(
-                    (positions + start, patches) for positions, patches in self.model.take_deferred_prompt_projections()
-                )
                 state = self.llm._decode_state.pop(info["request_id"], None)
                 if state is not None:
                     self.history[slot].copy_(state[0].reshape(self.history.shape[1:]))
-        except BaseException:
+        finally:
             self.model.end_prompt_batch()
-            raise
-        self.model.project_deferred_prompts(embeds, deferred)
 
     def run_postprocess(self, hidden_states, input_batch) -> None:
         # The flow head and request state updates run in postprocess_model_output.

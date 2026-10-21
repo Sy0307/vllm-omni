@@ -1855,11 +1855,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             decode_start_offsets: list[int] = []
             decode_batch_items: list[tuple[str, int, dict[str, Any]]] = []
             batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
-            # Prompt-token spans are identical in the host staging buffer, so a
-            # model can search them there instead of synchronizing on device ids.
-            cpu_prompt_ids = getattr(self.model, "preprocess_uses_cpu_prompt_ids", False) and (
-                preprocess_input_ids.data_ptr() == self.input_ids.gpu.data_ptr()
-            )
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
@@ -1971,13 +1966,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill
-                if cpu_prompt_ids:
-                    within_prompt = is_prefill and num_computed_tokens + span_len <= prompt_len
-                    req_infos["_omni_prompt_ids_cpu"] = self.input_ids.cpu[s:e] if within_prompt else None
-                    # A prompt prefilled over several steps needs its placeholders in the whole prompt.
-                    req_infos["_omni_full_prompt_ids_cpu"] = (
-                        torch.tensor(prompt_token_ids) if within_prompt and span_len < prompt_len else None
-                    )
                 # Output-token cap, so a model that must ship a payload on the
                 # request's final step can tell which step that is. A finished
                 # request drops out of req_ids_output_copy, and downstream
