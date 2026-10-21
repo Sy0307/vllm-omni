@@ -182,7 +182,9 @@ class Ming3AudioMultiModalProcessor(OmniMultiModalProcessor[Ming3AudioProcessing
         del hf_processor_mm_kwargs
         return {
             "audio_feats": MultiModalFieldConfig.batched("audio"),
-            "audio_feats_lengths": MultiModalFieldConfig.batched("audio"),
+            # Read as Python ints by the encoder: on the device, every read
+            # would be a host synchronization in the prefill step.
+            "audio_feats_lengths": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(
