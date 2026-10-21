@@ -116,6 +116,9 @@ def test_partial_prefill_and_non_finite_rows_are_not_emitted():
     assert tokens.tolist() == [CONTINUE, STOP, STOP]
     assert state.active.tolist() == [True, True, False]
     assert state.llm.calls == [(1.0, 0.25, 1.5, 2)]
+    failed, reason = state.get_request_errors()
+    assert failed.tolist() == [False, False, True]
+    assert "Non-finite Ming3" in reason
     # Exercise host partitioning on a real output, including non-emitting rows.
     host = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
     assert [row["ming3_has_patch"].tolist() for row in host.inter_stage] == [[True], [False], [False]]
@@ -264,3 +267,135 @@ def test_zero_initial_chunk_uses_regular_size_without_initializing_two_stage_pcm
     model.step_vae = None
     state = Ming3ModelState(config, model, None, torch.device("cpu"))
     assert not hasattr(state, "_chunk_latents") and not hasattr(state, "_samples_per_latent")
+
+
+@pytest.mark.parametrize("cfg,temperature", [(0.0, 0.0), (2.0, 1.5), (4.0, 0.5)])
+def test_api_controls_reach_mrv2_admission_and_final_flush(monkeypatch, cfg, temperature):
+    import asyncio
+    from types import MethodType
+    from unittest.mock import AsyncMock
+
+    from vllm import SamplingParams
+
+    from tests.model_executor.models.ming3_tts.test_ming3_contract import FakeTokenizer
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.engine.serialization import serialize_additional_information
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as adapter_module
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
+    from vllm_omni.model_executor.models.ming3_tts.ming3_tts import Ming3TTSForConditionalGeneration
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    monkeypatch.setattr(adapter_module, "_extract_speaker_embeddings", lambda *args: torch.zeros(2, 192))
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="fake", hf_config=SimpleNamespace(tts_config={"task_decode_alignment": {"podcast": "old_shift"}})
+            )
+        ),
+        _tts_tokenizer=FakeTokenizer(),
+        _apply_uploaded_speaker=lambda request: None,
+        _resolve_ref_audio_array=AsyncMock(return_value=(np.zeros(16000), 16000, "reference")),
+        _get_resolved_ref_audio_artifact_key=lambda key: key,
+    )
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(
+        input="speaker_1: Hello, how are you doing on this lovely day?\nspeaker_2: I am doing very well, thank you.",
+        ref_audio=["one.wav", "two.wav"],
+        ref_text="speaker_1: First reference.\nspeaker_2: Second reference.",
+        max_new_tokens=100,
+        seed=43,
+        extra_params={"ming3_cfg": cfg, "temperature": temperature},
+    )
+    prepared = asyncio.run(adapter.build(request, [], False))
+    sampling = adapter.apply_sampling_overrides([SamplingParams()], request, prepared.prompt, "api-id")[0]
+    minimum = prepared.prompt["additional_information"]["ming3_min_decode_steps"]
+    assert minimum > 13
+    state = _state(1, {1.0: 0.9})
+    state.device = torch.device("cpu")
+    state.llm.ming_config = SimpleNamespace(
+        latent_dim=LATENT_DIM,
+        cfg=1.0,
+        sigma=0.25,
+        temperature=1.5,
+        max_decode_steps=800,
+        stop_head_min_steps=11,
+    )
+    state.model = SimpleNamespace()
+    state.model._copy_request_state = MethodType(Ming3TTSForConditionalGeneration._copy_request_state, state.model)
+    state.intermediate_buffer = OmniIntermediateBuffer(1)
+    state._pending = {}
+    monkeypatch.setattr(
+        OmniModelState, "add_request", lambda self, index, data: self.intermediate_buffer.add_request(index, data)
+    )
+    ids = prepared.prompt["prompt_token_ids"]
+    data = OmniNewRequestData(
+        req_id="runner-id",
+        prompt_token_ids=ids,
+        prefill_token_ids=ids,
+        mm_features=[],
+        sampling_params=sampling,
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+        additional_information=serialize_additional_information(prepared.prompt["additional_information"]),
+    )
+    state.add_request(0, data)
+    assert state._sde[0] == (cfg, 0.25, temperature)
+    assert state._pending == {0: (minimum, 100)}
+    assert state._seeds == [43] and sampling.max_tokens == 101
+    state._flush_pending()
+    state._step_vae = _FakeStepVAE()
+    state._audio_chunks = {}
+    state._chunk_latents = (4, 25)
+    state._samples_per_latent = 8
+    state._vae_positions = np.zeros(1, dtype=np.int64)
+    state._sample_rate = torch.tensor(44100)
+    prompt = [len(ids)]
+    # The text-derived minimum suppresses an early stop; reaching the cap
+    # still reserves the API's extra token for a final PCM flush.
+    for step, score, token, draining in (
+        (minimum - 1, 0.9, CONTINUE, False),
+        (100, 0.1, CONTINUE, True),
+        (101, 0.1, STOP, False),
+    ):
+        state.llm.stop_probs[1.0] = score
+        batch = _batch(
+            [0], computed=[len(ids) + step - 2], scheduled=[1], prompt_len=prompt, seq_lens=[len(ids) + step - 1]
+        )
+        tokens, _ = _run(state, batch, _hidden([1.0]), prompt)
+        assert tokens.tolist() == [token]
+        assert state.draining.tolist() == [draining]
+        output = state.prepare_streaming_audio_output(batch, None, {}).get_output()
+    assert state.llm.calls == [(cfg, 0.25, temperature, 1)] * 3
+    assert state._step_vae.steps[-1][3:] == ([True], [True])
+    assert output[0]["model_outputs"].numel() > 0
+
+
+def test_async_model_error_discards_only_failed_rows(monkeypatch):
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    from tests.worker_v2.test_omni_ar_model_runner import _async_output
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(query_start_loc_np=np.array([0, 1, 2]), num_scheduled_tokens=[1, 1], num_reqs=2)
+    flags = torch.tensor([True, False])
+    sampler = SamplerOutput(torch.tensor([[7], [8]]), None, None, torch.tensor([1, 1]), torch.tensor([0, 0]))
+    pending = _async_output(
+        req_ids=("bad", "good"),
+        sampler_output=sampler,
+        input_batch=batch,
+        async_chunk=True,
+        multimodal_outputs={"codes.audio": torch.tensor([[1], [2]])},
+        request_errors=(flags, "Non-finite flow output"),
+    )
+    # The next step may replace device state; the deferred output owns its copy.
+    flags.zero_()
+    output = pending.get_output()
+    assert output.request_errors == {"bad": "Non-finite flow output"}
+    assert output.sampled_token_ids == [[], [8]]
+    assert output.inter_stage_outputs[0] is None
+    assert output.inter_stage_outputs[1]["codes.audio"].item() == 2

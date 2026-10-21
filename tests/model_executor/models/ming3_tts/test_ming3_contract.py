@@ -318,59 +318,75 @@ def test_cfm_noise_layout_matches_for_batched_and_seeded_rows(seeded):
         torch.testing.assert_close(initial[1:2], alone)
 
 
-def test_cfm_graph_failure_falls_back_on_the_drawn_noise():
-    config = SimpleNamespace(patch_size=1, latent_dim=3)
-    calls = []
+def _check_cfm_failure_rng(device="cpu"):
+    """Real RNG draws across a failed bucket, later eager calls and healthy buckets."""
+    config = SimpleNamespace(patch_size=4, latent_dim=64)
 
-    class FailingGraph:
-        batch_size = 2
+    def result(initial, solver):
+        latent = initial + solver.sum(0)
+        return latent, latent.sum(1).unsqueeze(1), torch.zeros((latent.shape[0], 2), device=device)
 
-        def execute(self, *args, **kwargs):
-            raise RuntimeError("injected replay failure")
+    def model(fail):
+        instance = SimpleNamespace(
+            ming_config=config,
+            fm_dtype=torch.float32,
+            _cfm_graph_enabled=True,
+            _cfm_graph_failed_batch_sizes=set(),
+            _cfm_graphs={},
+        )
 
-    def decode_one_step(**kwargs):
-        calls.append(kwargs)
-        rows = kwargs["hidden_states"].shape[0]
-        return kwargs["initial_noise"].clone(), torch.zeros((rows, 1, 4)), None, torch.zeros(rows)
+        class Graph:
+            def __init__(self, size):
+                self.batch_size = size
 
-    model = SimpleNamespace(
-        ming_config=config,
-        fm_dtype=torch.float32,
-        _cfm_graph_enabled=True,
-        _cfm_graphs={2: FailingGraph()},
-        _cfm_graph_failed_batch_sizes=set(),
-        _maybe_build_cfm_graph=lambda cond: FailingGraph(),
-        _decode_one_step=decode_one_step,
-    )
-    model._draw_request_cfm_noises = lambda generators, device: (
-        Ming3TTSLLMModel._draw_request_cfm_noises(model, generators, device)
-    )
-    generators = [torch.Generator().manual_seed(seed) for seed in (1, 2)]
-    want_initial, want_solver = Ming3TTSLLMModel._draw_request_cfm_noises(
-        model, [torch.Generator().manual_seed(seed) for seed in (1, 2)], torch.device("cpu")
-    )
+            def execute(self, *args, **kwargs):
+                if fail and self.batch_size == 2:
+                    raise RuntimeError("injected replay failure")
+                return result(kwargs["initial_noise"], kwargs["solver_noise"])
 
-    latent, _, _, finite = Ming3TTSLLMModel._sample_flow_rows(
-        model,
-        torch.zeros((2, 4)),
-        torch.zeros((2, 1, 3)),
-        generators,
-        cfg_scale=2.0,
-        sigma=0.25,
-        temperature=0.0,
-    )
+        def graph(cond):
+            size = cond.shape[0]
+            return None if size in instance._cfm_graph_failed_batch_sizes else Graph(size)
 
-    assert finite is None
-    assert 2 in model._cfm_graph_failed_batch_sizes
-    # Each row reuses its drawn noise; the generators advance once, as on the graph path.
-    for row, call in enumerate(calls):
-        torch.testing.assert_close(call["initial_noise"], want_initial[row : row + 1])
-        torch.testing.assert_close(call["solver_noise"], want_solver[:, row : row + 1])
-    torch.testing.assert_close(latent, want_initial)
-    for seed, generator in zip((1, 2), generators, strict=True):
-        reference = torch.Generator().manual_seed(seed)
-        Ming3TTSLLMModel._draw_request_cfm_noises(model, [reference], torch.device("cpu"))
-        assert torch.equal(generator.get_state(), reference.get_state())
+        def eager(**kwargs):
+            assert kwargs["initial_noise"] is not None and kwargs["solver_noise"] is not None
+            latent, embeds, stop = result(kwargs["initial_noise"], kwargs["solver_noise"])
+            return latent, embeds, None, stop[:, 1]
+
+        instance._maybe_build_cfm_graph = graph
+        instance._decode_one_step = eager
+        instance._draw_request_cfm_noises = lambda generators, device: Ming3TTSLLMModel._draw_request_cfm_noises(
+            instance, generators, device
+        )
+        return instance
+
+    control, failing = model(False), model(True)
+    generators = [[torch.Generator(device=device).manual_seed(seed) for seed in (43, 44, 45)] for _ in range(2)]
+    # The same request visits the failed bucket twice, a healthy bucket,
+    # CFG=0's eager-only path, then returns to the failed bucket.
+    for count, cfg in ((2, 2.0), (2, 2.0), (1, 2.0), (3, 2.0), (1, 0.0), (2, 2.0)):
+        actual = []
+        for instance, rngs in zip((control, failing), generators, strict=True):
+            actual.append(
+                Ming3TTSLLMModel._sample_flow_rows(
+                    instance,
+                    torch.zeros(count, 64, device=device),
+                    torch.zeros(count, 4, 64, device=device),
+                    rngs[:count],
+                    cfg_scale=cfg,
+                    sigma=0.25,
+                    temperature=1.5,
+                )
+            )
+        for left, right in zip(actual[0][:3], actual[1][:3], strict=True):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+        for left, right in zip(*generators, strict=True):
+            assert torch.equal(left.get_state(), right.get_state())
+    assert failing._cfm_graph_failed_batch_sizes == {2}
+
+
+def test_cfm_graph_failure_preserves_later_rng_steps():
+    _check_cfm_failure_rng()
 
 
 def test_tokenizer_mismatch_is_not_repaired():
