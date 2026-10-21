@@ -173,22 +173,10 @@ vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
     --served-model-name ming3-audio-flash --port 8091
 ```
 
-The Talker shares its GPU with a Thinker rank. Without MPS the two processes
-time-slice that GPU; as clients of one NVIDIA MPS daemon their kernels run
-concurrently. Start a daemon for the deployment's GPUs with a private pipe
-directory, serve with the same directory, and list the GPUs by UUID, since MPS
-clients number devices relative to the daemon:
-
-```bash
-export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0,1 | paste -sd,)
-export CUDA_MPS_PIPE_DIRECTORY=/tmp/ming3-mps/pipe CUDA_MPS_LOG_DIRECTORY=/tmp/ming3-mps/log
-mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
-nvidia-cuda-mps-control -d
-vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
-    --deploy-config ming3_audio_flash_batched.yaml \
-    --served-model-name ming3-audio-flash --port 8091
-echo quit | nvidia-cuda-mps-control  # after the server stops
-```
+The Talker shares its GPU with a Thinker rank. Without NVIDIA MPS the two
+processes time-slice that GPU; MPS allows their kernels to run concurrently.
+For MPS deployments, follow the [NVIDIA MPS deployment guide](https://docs.nvidia.com/deploy/mps/)
+and isolate the daemon to the deployment's GPUs.
 
 For throughput-oriented deployments, `--no-collect-stage-metrics
 --disable-log-stats` removes the per-request stage metrics and statistics
@@ -375,7 +363,7 @@ LLM tokenizer, AudioVAE and speaker extractor. The Ming3-specific profile loads
 only the Talker assets, without loading Thinker weights. The resolver also accepts
 a local export with the same layout; `--revision` selects the Hub snapshot.
 
-The resolver stores generated config views and asset symlinks under `VLLM_CACHE_ROOT/ming_talker`, using vLLM's standard cache root.
+The resolver stores generated config views and asset symlinks under `~/.cache/vllm/ming_talker`.
 Checkpoint files stay in the original local export or HF cache; they are not copied into the config view. The same checkpoint and config reuse the existing view.
 
 ```bash

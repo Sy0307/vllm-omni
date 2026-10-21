@@ -15,6 +15,7 @@ import heapq
 from collections import deque
 from dataclasses import dataclass
 from threading import Condition, Thread
+from typing import TypedDict
 
 import torch
 from transformers import Qwen2Model
@@ -31,6 +32,29 @@ _BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256
 # prefill batch is split) and AudioVAE frames of one runner step.
 _PREFILL_BUCKETS = (64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
 _VAE_BUCKETS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
+
+
+class VAEUpsampleState(TypedDict, total=False):
+    """Buffers used by the legacy or frame-holdback upsampler."""
+
+    prev_chunk: torch.Tensor | None
+    history_last: torch.Tensor | None
+    is_first: bool
+    held: torch.Tensor | None
+    left: torch.Tensor | None
+
+
+class BatchedVAEState(TypedDict, total=False):
+    """Request-owned decoder state; row membership denotes an active lease.
+
+    Empty states initialize on first decode. Releasing removes only the row;
+    the next decode replaces the retained position and buffers before use.
+    """
+
+    row: int
+    position: int
+    upsample: VAEUpsampleState | None
+    istft: tuple[torch.Tensor | None, torch.Tensor | None]
 
 
 def _capture(body, *, pool, stream) -> tuple[torch.cuda.CUDAGraph, object]:
@@ -729,13 +753,13 @@ class BatchedAudioVAEDecoder:
         if use_cuda_graphs:
             self.llm.capture_graphs(_VAE_BUCKETS)
 
-    def release(self, state: dict) -> None:
+    def release(self, state: BatchedVAEState) -> None:
         row = state.pop("row", None)
         if row is not None:
             heapq.heappush(self.free_rows, row)
 
     @torch.inference_mode()
-    def decode(self, items: list[tuple[dict, torch.Tensor, bool]]) -> list[torch.Tensor | ValueError]:
+    def decode(self, items: list[tuple[BatchedVAEState, torch.Tensor, bool]]) -> list[torch.Tensor | ValueError]:
         """Decode ``(state, latents [1, n, latent_dim], last)`` items into audio.
 
         Invalid requests return a ValueError in their output slot. Device and

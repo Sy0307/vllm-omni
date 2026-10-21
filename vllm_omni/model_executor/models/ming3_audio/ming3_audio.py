@@ -306,9 +306,6 @@ class BailingMoeV3AudioForConditionalGeneration(
             tower_model=["audio_encoder.", "audio_projector."],
         )
 
-    def get_num_mm_encoder_tokens(self, num_audio_tokens: int) -> int:
-        return num_audio_tokens
-
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int, int], tuple[int, int, int]]:
         return BailingMoeV3ForCausalLM.get_mamba_state_shape_from_config(cls._text_vllm_config(vllm_config))
