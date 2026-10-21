@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Auxiliary capture runs after eval and profiling does not start a producer."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +11,24 @@ import torch
 from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
     MingFlashOmniTalkerForConditionalGeneration as Talker,
 )
-from vllm_omni.model_executor.models.ming_flash_omni.talker_batch import MingTalkerBatchEngine
+from vllm_omni.model_executor.models.ming_flash_omni.talker_batch import MingTalkerBatchEngine, _capture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("operator failure"), torch.OutOfMemoryError("out of memory")])
+def test_graph_capture_failure_is_not_retried(error, mocker):
+    mocker.patch("torch.accelerator.empty_cache")
+    graph = mocker.patch("torch.cuda.CUDAGraph")
+    mocker.patch("torch.cuda.graph", return_value=nullcontext())
+    body = mocker.Mock(side_effect=error)
+
+    with pytest.raises(type(error)) as caught:
+        _capture(body, pool=None, stream=None)
+
+    assert caught.value is error
+    body.assert_called_once()
+    graph.assert_called_once()
 
 
 def test_capture_requires_eval_and_release_closes_idle_runtime(mocker):

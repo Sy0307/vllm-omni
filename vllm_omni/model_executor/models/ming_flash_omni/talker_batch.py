@@ -34,27 +34,13 @@ _VAE_BUCKETS = (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
 
 
 def _capture(body, *, pool, stream) -> tuple[torch.cuda.CUDAGraph, object]:
-    """Capture ``body()`` into a CUDA graph; return the graph and its output.
-
-    Compiled code that first meets an input variant inside a capture compiles
-    there, which invalidates the capture. The second attempt follows an eager
-    call that compiles the variant.
-    """
-
-    def capture_once():
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=pool, stream=stream, capture_error_mode="thread_local"):
-            output = body()
-        return graph, output
-
+    """Capture an already warmed-up body; propagate capture failures unchanged."""
     # Return the warmups' cached blocks so the graph's private pool fits.
     torch.accelerator.empty_cache()
-    try:
-        return capture_once()
-    except RuntimeError:
-        logger.warning("Ming talker graph capture failed; retrying after another warmup", exc_info=True)
-        body()
-        return capture_once()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=pool, stream=stream, capture_error_mode="thread_local"):
+        output = body()
+    return graph, output
 
 
 def _layer_qkv(layer, hidden, cos, sin, num_heads: int, num_kv_heads: int, head_dim: int):
@@ -800,7 +786,8 @@ class BatchedAudioVAEDecoder:
                         [state["position"] for state in states],
                     )
                     # Consume this graph output before another replay overwrites it.
-                    spectra = self._spectrum(hidden).split(lengths, dim=1)
+                    spectrum, _ = self.head.spectrum(hidden)
+                    spectra = spectrum.split(lengths, dim=1)
                     for (index, _), spec, length in zip(group, spectra, lengths, strict=True):
                         state, _, last = items[index]
                         audio_buffer, window_buffer = state["istft"]
@@ -835,9 +822,3 @@ class BatchedAudioVAEDecoder:
                 groups.append([entry])
                 total = entry[1].shape[0]
         return groups
-
-    def _spectrum(self, hidden: torch.Tensor) -> torch.Tensor:
-        # ISTFTHead.forward up to the inverse transform, for [frames, dim].
-        mag, phase = self.head.out(hidden).T.chunk(2, dim=0)
-        mag = torch.clip(torch.exp(mag), max=1e2)
-        return mag.float() * (torch.cos(phase).float() + 1j * torch.sin(phase).float())

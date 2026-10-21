@@ -15,8 +15,9 @@ pytestmark = [pytest.mark.core_model]
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
 @pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("compile_layers", [False, True])
 @torch.inference_mode()
-def test_packed_graphs_match_independent_sequences_across_kv_wrap_and_row_reuse(window):
+def test_packed_graphs_match_independent_sequences_across_kv_wrap_and_row_reuse(window, compile_layers):
     torch.manual_seed(0)
     config = Qwen2Config(
         vocab_size=32,
@@ -32,7 +33,9 @@ def test_packed_graphs_match_independent_sequences_across_kv_wrap_and_row_reuse(
     )
     config._attn_implementation = "sdpa"
     model = Qwen2Model(config).eval().to(device="cuda", dtype=torch.bfloat16)
-    packed = PackedQwen2(model, rows=4, max_len=1024, window=window, ring_blocks=2 if window else None)
+    packed = PackedQwen2(
+        model, rows=4, max_len=1024, window=window, ring_blocks=2 if window else None, compile_layers=compile_layers
+    )
     packed.capture_graphs([32, 128, 256])
     histories: dict[int, torch.Tensor] = {}
     batches = [
