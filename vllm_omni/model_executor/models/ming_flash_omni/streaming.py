@@ -6,8 +6,12 @@ from collections import deque
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 from time import monotonic
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from .talker_batch import BatchedVAEState
 
 
 class _CancelledError(Exception):
@@ -175,7 +179,7 @@ class MingBatchedStreamJob:
         self.past_key_values = None
         self.stream_state = (None, None, None)
         # Stream position and buffers owned by a BatchedAudioVAEDecoder.
-        self.vae_state = {}
+        self.vae_state: BatchedVAEState = {}
         self.finished = False
         self._has_audio_output = False
 
