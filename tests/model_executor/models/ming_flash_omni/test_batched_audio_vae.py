@@ -51,13 +51,13 @@ def test_backlog_is_bounded_and_matches_unsplit_audio(decoder, holdback, mocker)
     projected = decoder.decoder.fc1(latents)
     frames = decoder.decoder.upsampling.upsampler(projected.transpose(1, 2)).transpose(1, 2)
     expected, *_ = decoder.head(frames, streaming=True, last_chunk=True)
-    decoder._spectrum = mocker.Mock(wraps=decoder._spectrum)
+    spectrum = mocker.spy(decoder.head, "spectrum")
     states: list[dict] = [{}, {}]
     # Exercise retained upsampler state, several bounded passes and final flush.
     first = decoder.decode([(states[0], latents[:, :31], False), (states[1], latents[:, :2], True)])[0]
     final = decoder.decode([(states[0], latents[:, 31:], True)])[0]
     torch.testing.assert_close(torch.cat([first, final], dim=-1), expected, atol=1e-6, rtol=1e-5)
-    assert max(call.args[0].shape[0] for call in decoder._spectrum.call_args_list) <= decoder.PASS_FRAMES
+    assert max(call.args[0].shape[0] for call in spectrum.call_args_list) <= decoder.PASS_FRAMES
     assert sorted(decoder.free_rows) == [0, 1]
     assert all("row" not in state for state in states)
     # A fresh request can reuse the released row without previous ISTFT tails.

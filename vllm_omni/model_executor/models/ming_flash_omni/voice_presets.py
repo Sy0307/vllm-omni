@@ -37,7 +37,7 @@ class InvalidPromptWavError(ValueError):
 class VoicePresetRegistry:
     """Loader and registry for Ming voice presets."""
 
-    REFERENCE_CACHE_SIZE = 256
+    REFERENCE_CACHE_SIZE = 16
 
     def __init__(
         self,
@@ -129,8 +129,8 @@ class VoicePresetRegistry:
             latents, projected = self._build_wav_embeddings("request", torch.cat(speech, dim=-1), device=device)
         resolved = {"spk_emb": embeddings, "prompt_wav_lat": latents, "prompt_wav_emb": projected}
         if cache_key is not None:
-            # Bound retained GPU reference features (tens of KiB per voice),
-            # evicting the least recently used voice.
+            # Evict the least recently used reference. Retained GPU features
+            # can include latents and projections whose size depends on audio length.
             if len(self._reference_cache) >= self.REFERENCE_CACHE_SIZE:
                 self._reference_cache.pop(next(iter(self._reference_cache)))
             self._reference_cache[cache_key] = resolved
