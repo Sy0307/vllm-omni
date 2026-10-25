@@ -66,8 +66,6 @@ def _chunk_target(emitted: int, chunk_size: int, initial_size: int, ramp: bool) 
     so a stream does not wait a full chunk of AR steps while its player holds
     only the small first chunk.
     """
-    if not initial_size:
-        return chunk_size
     if emitted == 0:
         return initial_size
     if not ramp:

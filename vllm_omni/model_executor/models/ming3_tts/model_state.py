@@ -10,7 +10,7 @@ needs no host synchronization: the sampler returns the continue or stop token
 computed here, and the latent rows reach the host through the runner's
 asynchronous output copy.
 
-With ``ming3_single_stage`` Stage 0 also decodes its latents with the
+In the fused pipeline Stage 0 also decodes its latents with the
 AudioVAE decoder each step and returns PCM in growing chunks
 (``prepare_streaming_audio_output``), so no AudioVAE stage follows.
 
@@ -142,7 +142,7 @@ class _StepAudioOutput:
     end: torch.Tensor | None
     last: torch.Tensor | None
     # (batch index, request chunker) per decoded row.
-    rows: list[tuple[int, _AudioChunks | None]]
+    rows: list[tuple[int, _AudioChunks]]
     num_reqs: int
     sample_rate: torch.Tensor
 
@@ -162,7 +162,7 @@ class _StepAudioOutput:
         bounds = zip(self.rows, self.start.tolist(), self.end.tolist(), self.last.tolist(), strict=True)
         for row, ((request, chunks), start, end, last) in enumerate(bounds):
             pcm = self.audio[row, start:end]
-            chunk = chunks.push(pcm, bool(last)) if chunks is not None else pcm
+            chunk = chunks.push(pcm, bool(last))
             if chunk is not None and chunk.numel():
                 output[request] = {"model_outputs": chunk, "sr": self.sample_rate}
         return output
@@ -567,7 +567,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         if not decode:
             self._step_audio = _StepAudioOutput(None, None, None, None, [], num_reqs, self._sample_rate)
             return
-        audio_rows: list[tuple[int, _AudioChunks | None]] = []
+        audio_rows: list[tuple[int, _AudioChunks]] = []
         for row in decode:
             req_id = str(input_batch.req_ids[row])
             chunks = self._audio_chunks.get(req_id)

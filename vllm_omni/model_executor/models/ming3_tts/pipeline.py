@@ -54,7 +54,7 @@ MING3_TTS_PIPELINE = PipelineConfig(
 )
 
 # Single-stage variant: Stage 0 decodes its latents with the AudioVAE decoder
-# and returns PCM as the final output (model option ``ming3_single_stage``).
+# and returns PCM as the final output.
 MING3_TTS_FUSED_PIPELINE = PipelineConfig(
     model_type="ming3_tts_fused",
     default_deploy_config_name="ming3_tts_fused.yaml",

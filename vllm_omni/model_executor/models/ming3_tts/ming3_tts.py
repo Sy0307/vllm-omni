@@ -123,8 +123,7 @@ class Ming3TTSForConditionalGeneration(
 
         # Single-stage serving: Stage 0 also loads the AudioVAE decoder and
         # returns PCM (see model_state.Ming3ModelState).
-        additional = vllm_config.additional_config if isinstance(vllm_config.additional_config, dict) else {}
-        self.single_stage = self.model_stage == "llm" and bool(additional.get("ming3_single_stage", False))
+        self.single_stage = self.model_stage == "llm" and vllm_config.model_config.engine_output_type == "audio"
         self.step_vae: StepVAEDecoder | None = None
         if self.single_stage:
             # The per-step PCM is allocated by each step; the runner need not copy it.
@@ -286,12 +285,9 @@ class Ming3TTSForConditionalGeneration(
             encoder = _load_prompt_encoder(self).encoder
             encoder_dtype = next(encoder.parameters()).dtype
             group_samples = int((float(self.ming_config.sample_rate) / 12.5) * int(self.ming_config.patch_size))
-            packed = None
-            if group_samples % encoder.hop_size == 0:
-                packed = PackedPromptEncoder(encoder, max(DEFAULT_BUCKET_GROUPS) * group_samples // encoder.hop_size)
-            encode = packed if packed is not None else lambda waveform: encoder(waveform)[0]
+            packed = PackedPromptEncoder(encoder, max(DEFAULT_BUCKET_GROUPS) * group_samples // encoder.hop_size)
             encoder_graphs = PaddedBucketGraphs(
-                encode,
+                packed,
                 torch.zeros((1, group_samples), device=device, dtype=encoder_dtype),
                 in_dim=1,
                 in_unit=group_samples,
@@ -314,12 +310,9 @@ class Ming3TTSForConditionalGeneration(
             pool = torch.cuda.graph_pool_handle()
             encoder_graphs.capture(pool)
             projection_graphs.capture(pool)
-            if packed is not None:
-                # A step's new requests encode together (prefetch_prompt_encodings).
-                # Graphs sharing a pool must replay in capture order, and a step
-                # replays these and the single-clip graphs in either order: in
-                # the shared pool, half of the c=64 requests came out silent.
-                packed.capture_graphs(torch.cuda.graph_pool_handle())
+            # Batched and single-clip graphs may replay in either order, so
+            # their intermediate buffers must not share a graph pool.
+            packed.capture_graphs(torch.cuda.graph_pool_handle())
         except Exception:
             logger.warning("Ming3 prompt encoder CUDA graph capture failed; using eager.", exc_info=True)
             return

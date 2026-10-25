@@ -23,7 +23,6 @@ stages:
     # Model and scheduler options that the two-stage profile sets on its
     # connector: a single stage has no connector edge.
     additional_config:
-      ming3_single_stage: true
       ar_prefill_admission_min_batch: 8
       ar_prefill_admission_max_wait_ms: 150
       ar_prefill_admission_min_running: 32

@@ -62,7 +62,6 @@ class BatchedStreamingVAEDecoder:
         max_streams: int,
         kv_block_size: int = 64,
         ring_blocks: int = 4,
-        packed: bool | None = None,
     ):
         self.decoder = decoder
         qwen = decoder.decoder
@@ -82,8 +81,7 @@ class BatchedStreamingVAEDecoder:
         self.kv_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = attention.scaling
         parameter = next(decoder.parameters())
-        if packed is None:
-            packed = parameter.device.type == "cuda" and parameter.dtype in (torch.float16, torch.bfloat16)
+        packed = parameter.device.type == "cuda" and parameter.dtype in (torch.float16, torch.bfloat16)
         self._packed: PackedQwen2 | None = PackedQwen2(qwen, MAX_STREAM_POSITIONS) if packed else None
         self._max_streams = max_streams
         # The extra slot takes the window writes of batch-padding rows in a
