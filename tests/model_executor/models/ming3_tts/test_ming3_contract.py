@@ -448,28 +448,24 @@ def test_pipeline_contract():
 
 
 @pytest.mark.parametrize(
-    "eager,graph_mode,env_var,env_value,enabled",
+    "eager,graph_mode,enabled",
     [
-        (False, CUDAGraphMode.PIECEWISE, None, None, True),
-        (True, CUDAGraphMode.PIECEWISE, None, None, False),
-        (False, CUDAGraphMode.NONE, None, None, False),
-        (True, CUDAGraphMode.NONE, "MING_CFM_CUDAGRAPH", None, True),
-        (True, CUDAGraphMode.NONE, "MING_CFM_CUDAGRAPH", "0", False),
-        (True, CUDAGraphMode.NONE, "MING_CFM_CUDAGRAPH", "1", True),
+        (False, CUDAGraphMode.PIECEWISE, True),
+        (True, CUDAGraphMode.PIECEWISE, False),
+        (False, CUDAGraphMode.FULL, True),
+        (True, CUDAGraphMode.FULL, False),
+        (False, CUDAGraphMode.NONE, False),
+        (True, CUDAGraphMode.NONE, False),
     ],
 )
-def test_cfm_graph_enablement(monkeypatch, eager, graph_mode, env_var, env_value, enabled):
+def test_cfm_graph_enablement(eager, graph_mode, enabled):
     model = SimpleNamespace(
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(enforce_eager=eager),
             compilation_config=SimpleNamespace(cudagraph_mode=graph_mode),
         )
     )
-    if env_var is not None:
-        monkeypatch.delenv(env_var, raising=False)
-        if env_value is not None:
-            monkeypatch.setenv(env_var, env_value)
-    Ming3TTSLLMModel._init_cfm_graph_state(model, env_var)
+    Ming3TTSLLMModel._init_cfm_graph_state(model)
     assert model._cfm_graph_enabled is enabled
     if not enabled:
         # Disabled warmup must not even access the flow modules or build graphs.

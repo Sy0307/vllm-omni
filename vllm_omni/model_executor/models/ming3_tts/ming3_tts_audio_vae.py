@@ -37,14 +37,10 @@ class Ming3TTSAudioVAEModel(MingAudioVAEModel):
         self.vllm_config = vllm_config
         self.ming_config = Ming3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
-        self.ming3_config = self.ming_config
         self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
         # Decode every active stream's chunk in one batched decoder pass; the
         # frame-holdback upsampler keeps the per-latent emission timing.
-        upsampling = getattr(self.audio.decoder, "upsampling", None)
-        self._batched_enabled = upsampling is not None
-        if self._batched_enabled:
-            upsampling.frame_holdback = True
+        self.audio.decoder.upsampling.frame_holdback = True
         self._batched: BatchedStreamingVAEDecoder | None = None
         self.have_multimodal_outputs = True
         self.has_preprocess = False
@@ -53,8 +49,6 @@ class Ming3TTSAudioVAEModel(MingAudioVAEModel):
         self.requires_raw_input_tokens = True
         self._past_key_values: dict[str, Any] = {}
         self._stream_state: dict[str, tuple[Any, Any, Any]] = {}
-        self._patch_totals: dict[str, int] = {}
-        self._sample_totals: dict[str, int] = {}
         self._state_access_times: OrderedDict[str, float] = OrderedDict()
 
     def _clear_request_state(self, request_id: str) -> None:
@@ -69,9 +63,9 @@ class Ming3TTSAudioVAEModel(MingAudioVAEModel):
         return self._batched
 
     @torch.inference_mode()
-    def forward(self, *args: Any, model_intermediate_buffer: list[dict[str, Any]] | None = None, **kwargs: Any):
-        if not self._batched_enabled:
-            return super().forward(*args, model_intermediate_buffer=model_intermediate_buffer, **kwargs)
+    def forward(
+        self, *args: Any, model_intermediate_buffer: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> OmniOutput:
         info_list = model_intermediate_buffer if isinstance(model_intermediate_buffer, list) else None
         if info_list is None:
             runtime_infos = kwargs.get("runtime_additional_information")
@@ -145,7 +139,8 @@ class Ming3TTSAudioVAEModel(MingAudioVAEModel):
         while pending:
             # A request with several queued chunks decodes them in order.
             seen: set[str] = set()
-            batch, rest = [], []
+            batch: list[tuple[int, str, torch.Tensor, bool]] = []
+            rest: list[tuple[int, str, torch.Tensor, bool]] = []
             for item in pending:
                 (rest if item[1] in seen else batch).append(item)
                 seen.add(item[1])
@@ -186,7 +181,7 @@ class Ming3TTSAudioVAEModel(MingAudioVAEModel):
             )
         # The stage runs eagerly; its decoder captures its own graphs once the
         # weights are in place, before memory profiling.
-        if self._batched_enabled and next(self.audio.parameters()).is_cuda:
+        if next(self.audio.parameters()).is_cuda:
             self._batched_decoder().capture_graphs()
         return loaded
 

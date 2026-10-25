@@ -99,7 +99,6 @@ class Ming3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         nn.Module.__init__(self)
         self.ming_config = Ming3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
-        self.ming3_config = self.ming_config
         self.vllm_config = vllm_config
         self.prefix = prefix
         self.fm_dtype = _resolve_ming_runtime_dtype(vllm_config)

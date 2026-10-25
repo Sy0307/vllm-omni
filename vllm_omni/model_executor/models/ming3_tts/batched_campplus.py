@@ -29,13 +29,10 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
 from vllm_omni.model_executor.models.indextts2.utils.campplus.layers import CAMDenseTDNNBlock, CAMDenseTDNNLayer
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
-
-logger = init_logger(__name__)
 
 SAMPLE_RATE = 16000
 FRAME_LENGTH, FRAME_SHIFT, FFT_SIZE, MEL_BINS = 400, 160, 512, 80

@@ -16,9 +16,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 
 import torch
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 # Bucket sizes in latent groups (80 ms each): 0.64 s to 30.72 s of audio.
 DEFAULT_BUCKET_GROUPS = (8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320, 384)

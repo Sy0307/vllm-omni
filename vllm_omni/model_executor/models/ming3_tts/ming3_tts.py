@@ -96,7 +96,6 @@ class Ming3TTSForConditionalGeneration(
         self.vllm_config = vllm_config
         self.ming_config = Ming3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
-        self.ming3_config = self.ming_config
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False

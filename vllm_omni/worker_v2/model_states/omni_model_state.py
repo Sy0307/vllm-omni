@@ -41,7 +41,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
 from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
@@ -215,7 +215,7 @@ class OmniModelState(DefaultModelState):
 
     def prepare_streaming_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
-    ) -> StreamingAudioOutput | None:
+    ) -> StreamingAudioSnapshot | None:
         return self._mtp_state.prepare_audio_output(input_batch, req_states, outputs)
 
     def get_request_errors(self) -> tuple[torch.Tensor, str] | None:

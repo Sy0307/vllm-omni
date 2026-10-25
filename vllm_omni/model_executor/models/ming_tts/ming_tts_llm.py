@@ -3,7 +3,6 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -119,10 +118,7 @@ class MingLLMModel(nn.Module):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
-        # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
-        # hot spot. The legacy MING_CFM_CUDAGRAPH switch controls this
-        # independently of the backbone's eager/graph configuration.
-        self._init_cfm_graph_state("MING_CFM_CUDAGRAPH")
+        self._init_cfm_graph_state()
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None, **_: Any
@@ -383,15 +379,11 @@ class MingLLMModel(nn.Module):
             logprobs_tensors=None,
         )
 
-    def _init_cfm_graph_state(self, env_var: str | None = None) -> None:
+    def _init_cfm_graph_state(self) -> None:
         compilation_config = self.vllm_config.compilation_config
-        if env_var is not None:
-            self._cfm_graph_enabled = os.environ.get(env_var, "1") == "1"
-        else:
-            self._cfm_graph_enabled = (
-                not self.vllm_config.model_config.enforce_eager
-                and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            )
+        self._cfm_graph_enabled = (
+            not self.vllm_config.model_config.enforce_eager and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
         self._cfm_graphs: dict[int, CFMGraphExecutor] = {}
         self._cfm_graph_failed_batch_sizes: set[int] = set()
         self._cfm_graph_warmed_up = False

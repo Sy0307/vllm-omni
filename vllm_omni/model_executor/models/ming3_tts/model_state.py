@@ -21,11 +21,12 @@ inactive by then, so that step emits no latent and changes no state.
 from __future__ import annotations
 
 import threading
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -54,7 +55,15 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 from .config_ming3_tts import resolve_latent_chunk_sizes
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+    from vllm.v1.worker.gpu.states import RequestState
+
+    from .ming3_tts import Ming3TTSForConditionalGeneration
 
 
 class _LatentRowsSnapshot(PackedOutputSnapshot):
@@ -95,7 +104,7 @@ class _AudioChunks:
     of audio each, so a request emits a few outputs instead of one per step.
     """
 
-    def __init__(self, samples_per_latent: int, chunk_latents: tuple[int, ...]):
+    def __init__(self, samples_per_latent: int, chunk_latents: tuple[int, ...]) -> None:
         self.samples_per_latent = samples_per_latent
         self.chunk_latents = chunk_latents
         self.chunks = 0
@@ -119,6 +128,7 @@ class _AudioChunks:
             return out
 
 
+@dataclass(eq=False)
 class _StepAudioOutput:
     """One step's PCM per request, from the single-stage AudioVAE decode.
 
@@ -127,21 +137,28 @@ class _StepAudioOutput:
     ``last`` marks a request's final audio.
     """
 
-    def __init__(self, audio, start, end, last, rows, num_reqs, sample_rate):
-        self.audio, self.start, self.end, self.last = audio, start, end, last
-        # (batch index, request chunker) per decoded row.
-        self.rows, self.num_reqs, self.sample_rate = rows, num_reqs, sample_rate
+    audio: torch.Tensor | None
+    start: torch.Tensor | None
+    end: torch.Tensor | None
+    last: torch.Tensor | None
+    # (batch index, request chunker) per decoded row.
+    rows: list[tuple[int, _AudioChunks | None]]
+    num_reqs: int
+    sample_rate: torch.Tensor
 
-    def to_cpu(self, copy_stream, copy_tensor):
-        copied = [
+    def to_cpu(
+        self, copy_stream: torch.cuda.Stream, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
+    ) -> _StepAudioOutput:
+        audio, start, end, last = (
             copy_tensor(value) if value is not None else None for value in (self.audio, self.start, self.end, self.last)
-        ]
-        return _StepAudioOutput(*copied, self.rows, self.num_reqs, self.sample_rate)
+        )
+        return _StepAudioOutput(audio, start, end, last, self.rows, self.num_reqs, self.sample_rate)
 
-    def get_output(self):
-        output = [None] * self.num_reqs
+    def get_output(self) -> list[dict[str, torch.Tensor] | None]:
+        output: list[dict[str, torch.Tensor] | None] = [None] * self.num_reqs
         if self.audio is None:
             return output
+        assert self.start is not None and self.end is not None and self.last is not None
         bounds = zip(self.rows, self.start.tolist(), self.end.tolist(), self.last.tolist(), strict=True)
         for row, ((request, chunks), start, end, last) in enumerate(bounds):
             pcm = self.audio[row, start:end]
@@ -158,7 +175,13 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
     prefill mask the KDA layers need.
     """
 
-    def __init__(self, vllm_config, model, encoder_cache, device):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: Ming3TTSForConditionalGeneration,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         llm = model.model
         cfg = model.ming_config
@@ -170,8 +193,9 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         self.active = torch.zeros(slots, dtype=torch.bool, device=device)
         self.min_steps = torch.ones(slots, dtype=torch.long, device=device)
         self.max_steps = torch.ones(slots, dtype=torch.long, device=device)
-        self._default_sde = (float(cfg.cfg), float(cfg.sigma), float(cfg.temperature))
-        self._sde: list[tuple[float, float, float]] = [self._default_sde] * slots
+        self._sde: list[tuple[float, float, float]] = [
+            (float(cfg.cfg), float(cfg.sigma), float(cfg.temperature))
+        ] * slots
         # Requests with ``tts_local_seed`` draw flow-head noise from their own
         # generator, created at the first flow step as on the V1 runner (apart
         # from the one the prompt-latent posterior used at prefill); others
@@ -223,7 +247,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         self.model._copy_request_state(info, info)
         return info
 
-    def add_request(self, req_index: int, new_req_data) -> None:
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         req_id = str(new_req_data.req_id)
         prompt = list(new_req_data.prompt_token_ids or [])
@@ -251,7 +275,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         self._flow_generators[req_index] = None
         self._pending[req_index] = (minimum, maximum)
 
-    def remove_request(self, req_index_or_id) -> None:
+    def remove_request(self, req_index_or_id: int | str) -> None:
         index = self._resolve_req_index(req_index_or_id)
         if index is not None:
             self._pending.pop(index, None)
@@ -282,7 +306,13 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
     # Step inputs
     # ------------------------------------------------------------------
 
-    def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
+    def run_preprocess(
+        self,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+        req_states: RequestState | None = None,
+        mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
+    ) -> None:
         self._flush_pending()
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
@@ -313,7 +343,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
                 self.next_embed.index_select(0, index_to_device(slots[rows].tolist(), embeds.device)),
             )
 
-        infos: dict[int, dict] = {}
+        infos: dict[int, dict[str, Any]] = {}
         for row in np.flatnonzero(prefill).tolist():
             slot, start, count, done = int(slots[row]), int(starts[row]), int(scheduled[row]), int(computed[row])
             req_id = str(input_batch.req_ids[row])
@@ -347,7 +377,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         finally:
             self.model.end_prompt_batch()
 
-    def run_postprocess(self, hidden_states, input_batch) -> None:
+    def run_postprocess(self, hidden_states: torch.Tensor, input_batch: InputBatch) -> None:
         # The flow head and request state updates run in postprocess_model_output.
         return
 
@@ -365,7 +395,9 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
             generator.manual_seed(seed)
         return generator
 
-    def postprocess_model_output(self, model_output: Any, input_batch, req_states):
+    def postprocess_model_output(
+        self, model_output: Any, input_batch: InputBatch, req_states: RequestState
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         hidden = model_output.text_hidden_states if isinstance(model_output, OmniOutput) else model_output
         num_reqs = input_batch.num_reqs
         self._tokens = None
@@ -486,7 +518,15 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
             partitioned=self._partitioned,
         )
 
-    def _decode_step_audio(self, input_batch, rows, slots_np, latent, emitted, flush) -> None:
+    def _decode_step_audio(
+        self,
+        input_batch: InputBatch,
+        rows: NDArray[np.integer],
+        slots_np: NDArray[np.integer],
+        latent: torch.Tensor,
+        emitted: torch.Tensor,
+        flush: torch.Tensor,
+    ) -> None:
         """Hold each stream's first latent and decode every other stream's held latent to PCM."""
         num_reqs = input_batch.num_reqs
         device = latent.device
@@ -496,6 +536,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         first_latent = [row for row in rows.tolist() if not prompt_done[row]]
         decode = [row for row in rows.tolist() if prompt_done[row]]
         vae = self._step_vae
+        assert vae is not None
         if not first_latent and not decode:
             self._step_audio = _StepAudioOutput(None, None, None, None, [], num_reqs, self._sample_rate)
             return
@@ -511,8 +552,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         if primed:
             vae.prime(index[:primed], latent.index_select(0, index[primed : 2 * primed]).flatten(1))
         if decode:
-            rows = len(decode)
-            packed = index[2 * primed :].view(3, rows)
+            packed = index[2 * primed :].view(3, len(decode))
             flush = flush.index_select(0, packed[2])
             audio, start, end = vae.step(
                 packed[0],
@@ -527,23 +567,25 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         if not decode:
             self._step_audio = _StepAudioOutput(None, None, None, None, [], num_reqs, self._sample_rate)
             return
-        rows = []
+        audio_rows: list[tuple[int, _AudioChunks | None]] = []
         for row in decode:
             req_id = str(input_batch.req_ids[row])
             chunks = self._audio_chunks.get(req_id)
             if chunks is None:
                 chunks = self._audio_chunks[req_id] = _AudioChunks(self._samples_per_latent, self._chunk_latents)
-            rows.append((row, chunks))
-        self._step_audio = _StepAudioOutput(audio, start, end, flush, rows, num_reqs, self._sample_rate)
+            audio_rows.append((row, chunks))
+        self._step_audio = _StepAudioOutput(audio, start, end, flush, audio_rows, num_reqs, self._sample_rate)
 
     def get_request_errors(self) -> tuple[torch.Tensor, str] | None:
         return self._request_errors
 
-    def prepare_streaming_audio_output(self, input_batch, req_states, outputs):
+    def prepare_streaming_audio_output(
+        self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
+    ) -> _StepAudioOutput | None:
         audio, self._step_audio = self._step_audio, None
         return audio
 
-    def sample_determined_tokens(self, batch, sampler):
+    def sample_determined_tokens(self, batch: InputBatch, sampler: Sampler) -> SamplerOutput | None:
         """Return the tokens decided in postprocess unless a sampler feature needs logits."""
         tokens = self._tokens
         if tokens is None or tokens.numel() != batch.num_reqs or type(sampler) is not Sampler:

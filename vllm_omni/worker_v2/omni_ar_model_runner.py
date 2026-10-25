@@ -38,7 +38,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -737,7 +737,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
         pending_aux_output: Any | None = None,
-        streaming_audio: StreamingAudioOutput | None = None,
+        streaming_audio: StreamingAudioSnapshot | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
         request_errors: tuple[torch.Tensor, str] | None = None,
     ):
