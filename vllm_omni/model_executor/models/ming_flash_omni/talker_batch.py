@@ -22,6 +22,7 @@ from transformers import Qwen2Model
 from transformers.models.qwen2.modeling_qwen2 import rotate_half
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.common.ming.audio_dsp import ISTFTEnvelopeError
 from vllm_omni.model_executor.models.common.ming.cfm_solver import get_epss_timesteps
 from vllm_omni.model_executor.models.common.ming.fused_istft import deferred_envelope_checks
 
@@ -793,39 +794,57 @@ class BatchedAudioVAEDecoder:
                 frames.append((index, x[0]))
 
         chunk_size = min(self.max_chunk, self.PASS_FRAMES)
-        with deferred_envelope_checks():
-            while frames:
-                take = [(index, x[:chunk_size]) for index, x in frames]
-                frames = [(index, x[chunk_size:]) for index, x in frames if x.shape[0] > chunk_size]
-                remaining = {index for index, _ in frames}
-                for group in self._groups(take):
-                    lengths = [x.shape[0] for _, x in group]
-                    states = [items[index][0] for index, _ in group]
-                    hidden = self.llm.run(
-                        [x for _, x in group],
-                        [state["row"] for state in states],
-                        [state["position"] for state in states],
-                    )
-                    # Consume this graph output before another replay overwrites it.
-                    spectrum, _ = self.head.spectrum(hidden)
-                    spectra = spectrum.split(lengths, dim=1)
-                    for (index, _), spec, length in zip(group, spectra, lengths, strict=True):
-                        state, _, last = items[index]
-                        audio_buffer, window_buffer = state["istft"]
-                        out, audio_buffer, window_buffer = self.head.istft(
-                            spec.unsqueeze(0),
-                            audio_buffer=audio_buffer,
-                            window_buffer=window_buffer,
-                            streaming=True,
-                            last_chunk=last and index not in remaining,
+        check_owners: list[int] = []
+        invalid: set[int] = set()
+        try:
+            with deferred_envelope_checks() as checks:
+                while frames:
+                    take = [(index, x[:chunk_size]) for index, x in frames]
+                    frames = [(index, x[chunk_size:]) for index, x in frames if x.shape[0] > chunk_size]
+                    remaining = {index for index, _ in frames}
+                    for group in self._groups(take):
+                        lengths = [x.shape[0] for _, x in group]
+                        states = [items[index][0] for index, _ in group]
+                        hidden = self.llm.run(
+                            [x for _, x in group],
+                            [state["row"] for state in states],
+                            [state["position"] for state in states],
                         )
-                        audio_parts[index].append(out.unsqueeze(1))
-                        state["istft"] = (audio_buffer, window_buffer)
-                        state["position"] += length
+                        # Consume this graph output before another replay overwrites it.
+                        spectrum, _ = self.head.spectrum(hidden)
+                        spectra = spectrum.split(lengths, dim=1)
+                        for (index, _), spec, length in zip(group, spectra, lengths, strict=True):
+                            state, _, last = items[index]
+                            audio_buffer, window_buffer = state["istft"]
+                            check_start = len(checks)
+                            try:
+                                out, audio_buffer, window_buffer = self.head.istft(
+                                    spec.unsqueeze(0),
+                                    audio_buffer=audio_buffer,
+                                    window_buffer=window_buffer,
+                                    streaming=True,
+                                    last_chunk=last and index not in remaining,
+                                )
+                            except ISTFTEnvelopeError:
+                                # Native fallback checks immediately. Discard this
+                                # request's remaining frames without retrying its KV.
+                                invalid.add(index)
+                                frames = [(i, x) for i, x in frames if i != index]
+                                continue
+                            check_owners.extend([index] * (len(checks) - check_start))
+                            audio_parts[index].append(out.unsqueeze(1))
+                            state["istft"] = (audio_buffer, window_buffer)
+                            state["position"] += length
+        except ISTFTEnvelopeError as exc:
+            if exc.indices is None:
+                raise
+            invalid.update(check_owners[index] for index in exc.indices)
         for index, (state, _, last) in enumerate(items):
-            if audio_parts[index]:
+            if index in invalid:
+                audio[index] = ValueError(str(ISTFTEnvelopeError()))
+            elif audio_parts[index]:
                 audio[index] = torch.cat(audio_parts[index], dim=-1)
-            if last:
+            if last or index in invalid:
                 self.release(state)
         return audio
 

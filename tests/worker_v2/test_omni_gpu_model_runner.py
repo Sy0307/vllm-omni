@@ -359,6 +359,40 @@ def test_hybrid_omni_stage_keeps_recurrent_state_and_omni_lifecycle(monkeypatch,
     assert callable(state.run_preprocess) and callable(state.postprocess_state)
 
 
+@pytest.mark.parametrize("remove_by_id", [False, True])
+def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
+    from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_inputs_embeds_size=lambda: 8,
+            dtype=torch.float32,
+            max_model_len=32,
+            enable_prompt_embeds=False,
+            uses_mrope=False,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
+        cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+    )
+    # Exercise both real parent constructors and their lifecycle methods.
+    state = OmniMambaHybridModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))
+    for index, req_id in enumerate(("finished", "peer")):
+        state.add_request(index, SimpleNamespace(req_id=req_id, mm_features=[]))
+    state.num_accepted_tokens_gpu.copy_(torch.tensor([7, 3], dtype=torch.int32))
+    state.intermediate_buffer.buffers[0]["old_audio"] = torch.ones(4)
+    state._mtp_generators["finished"] = torch.Generator()
+    state._mtp_seeded.add("finished")
+    state.remove_request("finished" if remove_by_id else 0)
+    assert state.intermediate_buffer.buffers[0] == {}
+    assert state.intermediate_buffer.req_id_to_index == {"peer": 1}
+    assert not state._mtp_generators and not state._mtp_seeded
+    state.add_request(0, SimpleNamespace(req_id="replacement", mm_features=[]))
+    state.apply_staged_writes()
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 3]
+    assert state.intermediate_buffer.buffers == [{"req_id": "replacement"}, {"req_id": "peer"}]
+    assert state.intermediate_buffer.req_id_to_index == {"replacement": 0, "peer": 1}
+
+
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
     runner = _make_runner()
     calls = []

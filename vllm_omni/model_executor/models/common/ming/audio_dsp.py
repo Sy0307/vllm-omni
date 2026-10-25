@@ -6,6 +6,14 @@ import torch
 import torch.nn as nn
 
 
+class ISTFTEnvelopeError(RuntimeError):
+    """Invalid overlap state, optionally identifying deferred check indices."""
+
+    def __init__(self, indices: list[int] | None = None):
+        super().__init__("ISTFT window envelope underflowed; invalid overlap-add state.")
+        self.indices = indices
+
+
 class ISTFT(nn.Module):
     """
     Custom implementation of ISTFT since torch.istft doesn't allow custom padding (other than `center=True`) with
@@ -154,7 +162,7 @@ class ISTFT(nn.Module):
 
         # Normalize
         if not (window_envelope > 1e-11).all():
-            raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
+            raise ISTFTEnvelopeError()
         y = y / window_envelope
 
         return y, audio_buffer, window_buffer

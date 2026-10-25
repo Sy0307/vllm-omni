@@ -83,6 +83,25 @@ def test_frame_limit_is_per_request_and_bad_stream_does_not_advance_peers(decode
     assert sorted(decoder.free_rows) == [0, 1]
 
 
+@torch.inference_mode()
+def test_invalid_istft_envelope_fails_only_its_request(decoder):
+    latents = torch.randn(1, 701, 4)
+    projected = decoder.decoder.fc1(latents)
+    frames = decoder.decoder.upsampling.upsampler(projected.transpose(1, 2)).transpose(1, 2)
+    expected, *_ = decoder.head(frames, streaming=True, last_chunk=True)
+    bad: dict = {}
+    good: dict = {}
+    first = decoder.decode([(bad, latents[:, :31], False), (good, latents[:, :31], False)])[1]
+    # Corrupt only one stream's overlap state; the shared window stays valid.
+    bad["istft"][1].fill_(-10)
+    rejected, completed = decoder.decode([(bad, latents[:, 31:], False), (good, latents[:, 31:], True)])
+    assert isinstance(rejected, ValueError) and "window envelope underflowed" in str(rejected)
+    torch.testing.assert_close(torch.cat([first, completed], dim=-1), expected, atol=1e-6, rtol=1e-5)
+    assert "row" not in bad and "row" not in good
+    assert sorted(decoder.free_rows) == [0, 1]
+    torch.testing.assert_close(decoder.decode([({}, latents, True)])[0], expected, atol=1e-6, rtol=1e-5)
+
+
 @pytest.mark.parametrize("fatal", [False, True])
 def test_forward_cleans_terminal_jobs_and_propagates_device_failures(decoder, fatal, mocker):
     jobs = {key: MingBatchedStreamJob(None, torch.device("cpu")) for key in ("bad", "good", "done")}
