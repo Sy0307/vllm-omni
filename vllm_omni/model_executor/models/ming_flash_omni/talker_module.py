@@ -22,6 +22,7 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import cached_property
 from queue import Queue
@@ -161,7 +162,10 @@ class CFM(nn.Module):
         t: torch.Tensor,
         sde_args: torch.Tensor,
         sde_rnd: torch.Tensor,
-        forward_with_cfg=None,
+        forward_with_cfg: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor
+        ]
+        | None = None,
     ):
         """Sample audio latent via ODE/SDE integration with CFG.
 
