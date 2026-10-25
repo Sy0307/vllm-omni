@@ -90,3 +90,54 @@ def test_step_decode_matches_streaming_reference(graphs):
         assert got.shape == want.shape
         tolerance = 2 * (baseline - want).abs().max().item() + 1e-3
         assert (got - want).abs().max().item() <= tolerance
+
+
+@cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("graphs", [False, True])
+def test_invalid_step_rows_keep_kv_length_and_resume(graphs):
+    from vllm_omni.model_executor.models.ming3_tts.step_vae_decoder import StepVAEDecoder
+
+    vae = _vae(packed=True).cuda().bfloat16()
+    decoder = StepVAEDecoder(vae.decoder, max_slots=4, kv_block_size=16, ring_blocks=2)
+    metadata = []
+    packed = decoder.packed
+
+    def record_packed(frames, positions, cu_seqlens, scale, kv):
+        # Keep device buffers from the actual eager call or graph replay.
+        metadata.append((kv.seqused_k, kv.slot_mapping))
+        return packed(frames, positions, cu_seqlens, scale, kv)
+
+    decoder.packed = record_packed
+    if graphs:
+        decoder.capture_graphs((4,))
+    slots = torch.arange(3, device="cuda")
+    torch.manual_seed(17)
+    latents = torch.randn(5, 3, 8, device="cuda", dtype=torch.bfloat16)
+    decoder.prime(slots, latents[0])
+    positions = torch.zeros(3, device="cuda", dtype=torch.long)
+    for step in range(1, 5):
+        # Pause at position zero and again after a valid step; each row resumes.
+        valid = torch.tensor([True, step not in (1, 3), True], device="cuda")
+        new = latents[step].clone()
+        new[1] = torch.where(valid[1], new[1], float("nan"))
+        old_held = decoder.held[1].clone()
+        old_caches = [cache[2:4].clone() for cache in (*decoder.keys, *decoder.values)]
+        audio, start, end = decoder.step(slots, positions, positions == 0, new, torch.zeros_like(valid), valid)
+        expected = positions + valid.long() * decoder.scale
+        used, mapping = metadata[-1]
+        torch.testing.assert_close(used[:3].long(), expected)
+        if graphs:
+            assert used[3].item() == 0  # graph padding cannot expose unwritten KV
+        assert torch.isfinite(audio[0, start[0] : end[0]]).all()
+        assert torch.isfinite(audio[2, start[2] : end[2]]).all()
+        if not valid[1]:
+            assert start[1] == end[1]
+            assert (mapping[decoder.scale : 2 * decoder.scale] == -1).all()
+            torch.testing.assert_close(decoder.held[1], old_held)
+            for cache, old in zip((*decoder.keys, *decoder.values), old_caches, strict=True):
+                torch.testing.assert_close(cache[2:4], old)
+        else:
+            assert end[1] > start[1]
+            assert torch.isfinite(audio[1, start[1] : end[1]]).all()
+        positions = expected

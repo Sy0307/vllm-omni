@@ -152,6 +152,7 @@ class StepVAEDecoder:
         if bucket > rows:
             # Padding rows: invalid, on the scratch slot.
             self._static[0][rows:bucket].fill_(self.max_slots)
+            self._static[1][rows:bucket].zero_()
             self._static[5][rows:bucket].fill_(False)
         graph, outputs = self._graphs[bucket]
         graph.replay()
@@ -196,7 +197,7 @@ class StepVAEDecoder:
             self.keys,
             self.values,
             slot_mapping=cache_slots,
-            seqused_k=(positions + self.scale).to(torch.int32),
+            seqused_k=(positions + valid * self.scale).to(torch.int32),
             block_table=self.block_table.index_select(0, slots),
             max_seqlen_k=MAX_STREAM_POSITIONS,
         )

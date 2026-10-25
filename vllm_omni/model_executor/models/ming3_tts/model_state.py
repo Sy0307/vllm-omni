@@ -217,7 +217,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         # the flush runs, and stops there; async scheduling runs that step anyway.
         self._step_vae = getattr(model, "step_vae", None)
         self.draining = torch.zeros(slots, dtype=torch.bool, device=device)
-        self._vae_positions = np.zeros(slots, dtype=np.int64)
+        self._vae_positions = torch.zeros(slots, dtype=torch.long, device=device)
         self._sample_rate = torch.tensor(int(cfg.sample_rate), dtype=torch.int32)
         self._step_audio: _StepAudioOutput | None = None
         self._audio_chunks: dict[str, _AudioChunks] = {}
@@ -541,29 +541,30 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
             self._step_audio = _StepAudioOutput(None, None, None, None, [], num_reqs, self._sample_rate)
             return
         slots = slots_np[decode]
-        positions = self._vae_positions[slots]
         # Host indices for both groups in one upload.
-        index = index_to_device(
-            np.concatenate([slots_np[first_latent], first_latent, slots, positions, decode]).tolist(), device
-        )
+        index = index_to_device(np.concatenate([slots_np[first_latent], first_latent, slots, decode]).tolist(), device)
         primed = len(first_latent)
         # On the step's own stream: the decode graphs and the flow-head graphs
         # share library workspaces, so they must not replay concurrently.
         if primed:
             vae.prime(index[:primed], latent.index_select(0, index[primed : 2 * primed]).flatten(1))
+            self._vae_positions.index_fill_(0, index[:primed], 0)
         if decode:
-            packed = index[2 * primed :].view(3, len(decode))
-            flush = flush.index_select(0, packed[2])
+            packed = index[2 * primed :].view(2, len(decode))
+            positions = self._vae_positions.index_select(0, packed[0])
+            flush = flush.index_select(0, packed[1])
+            valid = emitted.index_select(0, packed[1]) | flush
             audio, start, end = vae.step(
                 packed[0],
-                packed[1],
-                packed[1] == 0,
-                latent.index_select(0, packed[2]).flatten(1),
+                positions,
+                positions == 0,
+                latent.index_select(0, packed[1]).flatten(1),
                 flush,
-                emitted.index_select(0, packed[2]) | flush,
+                valid,
             )
-        self._vae_positions[slots_np[first_latent]] = 0
-        self._vae_positions[slots] += vae.scale
+            # The cursor and decoder KV length advance under the same device
+            # mask, including flushes, without synchronizing invalid rows to CPU.
+            self._vae_positions.index_copy_(0, packed[0], positions + valid * vae.scale)
         if not decode:
             self._step_audio = _StepAudioOutput(None, None, None, None, [], num_reqs, self._sample_rate)
             return

@@ -170,8 +170,6 @@ class _FakeStepVAE:
 
 
 def test_single_stage_rows_drain_one_step_before_stopping():
-    import numpy as np
-
     from vllm_omni.model_executor.models.ming3_tts.model_state import _StepAudioOutput
 
     state = _state(2, {1.0: 0.9, 2.0: 0.1})
@@ -179,7 +177,7 @@ def test_single_stage_rows_drain_one_step_before_stopping():
     state._audio_chunks = {}
     state._chunk_latents = (4, 25)
     state._samples_per_latent = 8
-    state._vae_positions = np.zeros(2, dtype=np.int64)
+    state._vae_positions = torch.zeros(2, dtype=torch.long)
     state._sample_rate = torch.tensor(44100)
     prompt = [10, 10]
     # Slot 0 decodes its 3rd latent with a firing stop head; slot 1 finishes its prompt (first latent).
@@ -217,6 +215,40 @@ def test_single_stage_audio_is_released_in_growing_chunks():
     released = [None if (out := chunks.push(pcm, ended)) is None else out.numel() for pcm, ended in pushes]
     # First audio at once, then 2 and 3 latents (4 and 6 samples), then the remainder at the end.
     assert released == [1, None, 4, None, None, 6, None, 3]
+
+
+def test_single_stage_vae_positions_follow_emission_and_flush():
+    state = _state(3, {})
+    state._step_vae = vae = _FakeStepVAE()
+    state._audio_chunks = {}
+    state._chunk_latents = (4, 25)
+    state._samples_per_latent = 8
+    state._vae_positions = torch.tensor([0, 12, 20])
+    state._sample_rate = torch.tensor(44100)
+    # Reordered slots: live, paused, and flushing. A paused row can resume
+    # without leaving a hole in its KV cache; flush advances exactly once.
+    slots = np.array([2, 0, 1])
+    batch = _batch(slots, computed=[10] * 3, scheduled=[1] * 3, prompt_len=[10] * 3, seq_lens=[11] * 3)
+    latent = torch.ones(3, 1, LATENT_DIM)
+    state._decode_step_audio(
+        batch, np.arange(3), slots, latent, torch.tensor([True, False, False]), torch.tensor([False, False, True])
+    )
+    assert state._vae_positions.tolist() == [0, 16, 24]
+    assert vae.steps[-1] == ([2, 0, 1], [20, 0, 12], [False, True, False], [False, False, True], [True, False, True])
+
+    state._decode_step_audio(
+        batch, np.arange(3), slots, latent, torch.tensor([True, True, False]), torch.zeros(3, dtype=torch.bool)
+    )
+    assert state._vae_positions.tolist() == [4, 16, 28]
+    assert vae.steps[-1][1:3] == ([24, 0, 16], [False, True, False])
+
+    # Slot reuse starts with a held first latent and resets the device cursor.
+    batch = _batch([1], computed=[9], scheduled=[1], prompt_len=[10], seq_lens=[10])
+    state._decode_step_audio(
+        batch, np.array([0]), np.array([1]), latent[:1], torch.tensor([True]), torch.tensor([False])
+    )
+    assert state._vae_positions.tolist() == [4, 0, 28]
+    assert vae.primed == [[1]]
 
 
 def test_zero_initial_chunk_uses_regular_size_without_initializing_two_stage_pcm(monkeypatch):
@@ -352,7 +384,7 @@ def test_api_controls_reach_mrv2_admission_and_final_flush(monkeypatch, cfg, tem
     state._audio_chunks = {}
     state._chunk_latents = (4, 25)
     state._samples_per_latent = 8
-    state._vae_positions = np.zeros(1, dtype=np.int64)
+    state._vae_positions = torch.zeros(1, dtype=torch.long)
     state._sample_rate = torch.tensor(44100)
     prompt = [len(ids)]
     # The text-derived minimum suppresses an early stop; reaching the cap
