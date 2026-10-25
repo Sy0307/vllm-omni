@@ -140,10 +140,9 @@ class PackedQwen2:
         logical_blocks = self.max_len // self.BLOCK
         self.ring_blocks = ring_blocks
         physical_blocks = ring_blocks or logical_blocks
-        shape = (rows * physical_blocks, self.BLOCK, self.num_kv_heads, self.head_dim)
         layers = len(model.layers)
         self.scratch_row = rows
-        shape = ((rows + 1) * physical_blocks, *shape[1:])
+        shape = ((rows + 1) * physical_blocks, self.BLOCK, self.num_kv_heads, self.head_dim)
         self.k_cache = [torch.zeros(shape, device=param.device, dtype=param.dtype) for _ in range(layers)]
         self.v_cache = [torch.zeros(shape, device=param.device, dtype=param.dtype) for _ in range(layers)]
         row_base = torch.arange(rows + 1, device=param.device, dtype=torch.int32)[:, None] * physical_blocks
@@ -363,7 +362,6 @@ class MingTalkerBatchEngine:
     ):
         self.generator = generator
         self.use_cuda_graphs = use_cuda_graphs
-        self.compile_flow = compile_flow
         self.cfm = generator._cfm
         self.aggregator = generator._aggregator
         # A step is ~3k small kernels, most of them DiT elementwise ops; with
@@ -383,7 +381,6 @@ class MingTalkerBatchEngine:
         self.device = device
         param = next(generator._model.parameters())
         self.dtype = param.dtype
-        self.max_rows = max_rows
         self.max_cache_len = generator._max_cache_len
         # Inference tensors, like the activations the compiled step code
         # also receives, so its guards hold across ODE steps and buckets.

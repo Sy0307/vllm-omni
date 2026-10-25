@@ -25,7 +25,6 @@ import logging
 from contextlib import nullcontext
 from functools import cached_property
 from queue import Queue
-from threading import Lock
 
 import torch
 import torch.nn as nn
@@ -288,13 +287,7 @@ class CFMGraphExecutorPool:
     """Thread-safe pool of CFMGraphExecutors for concurrent inference."""
 
     def __init__(self, config, cfm, aggregator, stop_head: nn.Linear, pool_size: int = 1):
-        self.config = config
-        self.cfm = cfm
-        self.aggregator = aggregator
-        self.stop_head = stop_head
-        self.pool_size = pool_size
         self.pool = Queue(maxsize=pool_size)
-        self.lock = Lock()
 
         for _ in range(pool_size):
             executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)

@@ -540,12 +540,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         self._batch_vae = None
 
     def _build_batch_engine(self) -> MingTalkerBatchEngine:
+        compile_flow = bool(getattr(self.config, "compile_flow", False)) and self._use_cuda_graphs
         engine = MingTalkerBatchEngine(
             self.audio_generator,
             max_rows=self._batch_rows,
             device=self.device,
             use_cuda_graphs=self._use_cuda_graphs,
-            compile_flow=bool(getattr(self.config, "compile_flow", False)) and self._use_cuda_graphs,
+            compile_flow=compile_flow,
         )
         backbone = getattr(getattr(self.audio_vae, "decoder", None), "decoder", None)
         if getattr(getattr(backbone, "config", None), "sliding_window", None):
@@ -554,7 +555,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             self._batch_vae = BatchedAudioVAEDecoder(
                 self.audio_vae,
                 rows=self._batch_rows,
-                compile_layers=engine.compile_flow,
+                compile_layers=compile_flow,
                 use_cuda_graphs=self._use_cuda_graphs,
             )
         engine.capture()
@@ -574,7 +575,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         job = MingBatchedStreamJob(
             self.audio_vae,
             self.device,
-            low_latency_streaming=self.config.low_latency_streaming,
             decode_full=None if streaming else decode_full,
         )
         if inputs_embeds is not None:

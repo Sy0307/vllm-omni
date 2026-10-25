@@ -166,10 +166,9 @@ class MingBatchedStreamJob:
     final latent arrives.
     """
 
-    def __init__(self, vae, device, *, low_latency_streaming=False, decode_full=None):
+    def __init__(self, vae, device, *, decode_full=None):
         self.vae = vae
         self.device = device
-        self.low_latency_streaming = low_latency_streaming
         self.decode_full = decode_full
         self.request = None
         self.latents = deque()

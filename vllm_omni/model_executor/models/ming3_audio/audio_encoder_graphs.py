@@ -30,7 +30,6 @@ class Ming3AudioEncoderGraphs:
         from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
 
         self.encoder = encoder
-        self.projector = projector
         self.normalize = normalize
         self._attn = flash_attn_varlen_func
         self._fa_version = 3 if is_fa_version_supported(3) else 2
