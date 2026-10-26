@@ -31,13 +31,13 @@ ASR and Speech QA share the Ming3 audio thinker; requests for audio output addit
 
 ### Command
 
-The default end-to-end configuration targets four 80 GB-class GPUs.
-The thinker runs with TP=4 and the talker is colocated on GPU 3.
+The default end-to-end configuration targets two H200 GPUs.
+The Thinker runs with TP=2 and the Talker is colocated on GPU 1; both stages
+schedule up to 32 requests. The default profile is selected automatically.
 
 ```bash
 vllm serve inclusionAI/Ming-3.0-audio-flash \
     --omni \
-    --deploy-config vllm_omni/deploy/ming3_audio_flash.yaml \
     --served-model-name ming3-audio-flash \
     --port 8091
 ```
@@ -59,11 +59,10 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 
 ### Original audio in multi-turn history
 
-The default profile `ming3_audio_flash.yaml` supports retaining original audio clips
-across turns.
-
-The profile permits up to 20 audio items per request, counted across all
-messages. Other profiles keep their existing item limits. Each clip retains its own
+For text responses with original audio clips retained across turns, select
+`ming3_audio_flash_thinker_only.yaml`. This profile permits up to 20 audio items
+per request, counted across all messages. The default full Flash profile permits
+one audio item across the complete request. Each clip retains its own
 feature length and placeholder; clips may have different durations or repeat an earlier
 recording.
 
@@ -92,14 +91,14 @@ Replace the example URLs with accessible recordings. All audio tokens and text
 share the configured context limit. Increasing the item limit permits more clips and preprocessing
 work; all audio and text still share the context and encoder budgets. Choose a
 bound appropriate for the service. Retaining audio history does not itself enable cross-request
-KV-cache reuse. This profile keeps the base profile's prefix-cache setting.
+KV-cache reuse.
 
 ### Reusing an unchanged conversation prefix
 
-The default profile `ming3_audio_flash.yaml` supports native Thinker prefix
-caching while retaining up to 20 original audio clips. The profile enables
-chunked prefill and aligned KDA-state checkpoints; Talker prefix caching remains
-disabled. It requires the CUDA Bailing/KDA kernels supported by this recipe.
+The text-only profile `ming3_audio_flash_thinker_only.yaml` supports native
+Thinker prefix caching while retaining up to 20 original audio clips. It enables
+chunked prefill and aligned KDA-state checkpoints. The default full Flash profile
+disables prefix caching. It requires the CUDA Bailing/KDA kernels supported by this recipe.
 
 Resend the complete `messages` history with identical earlier text and audio.
 The native cache reuses matching full-attention KV blocks and recurrent-state
@@ -118,24 +117,23 @@ alone does not establish a cache hit.
 
 ### Talker decode graphs and low-latency collection
 
-The full Flash and Tiny profiles enable the Talker's single-token Qwen2 decode
-graph. Prefill remains eager, the outer Talker stage keeps `cudagraph_mode: NONE`,
-and unsupported inputs or capture failures fall back to eager execution.
-Graph buffers reset per request and do not provide Talker conversation reuse.
-
-`low_latency_streaming` remains `false`. Enabling it collects the first available
-audio latent promptly, then resumes normal VAE batching. BF16 VAE results can
-vary with chunk boundaries; do not assume bitwise-identical waveforms across
-chunk partitions. Cache checkpoints and graph buffers also consume GPU memory.
+The default Flash and standalone TTS profiles use the batched Talker and enable
+`low_latency_streaming`, collecting the first available audio latent promptly.
+Tiny keeps single-request Qwen2 decode graphs, eager prefill and
+`low_latency_streaming: false`. The outer Talker stage uses `cudagraph_mode: NONE`;
+model-owned graphs are managed separately. Graph buffers do not provide Talker
+conversation reuse. BF16 VAE results can vary with chunk boundaries, so do not
+assume bitwise-identical waveforms across chunk partitions.
 
 ### Concurrent serving
 
-`ming3_audio_flash_batched.yaml` serves concurrent ASR, speech-QA and speech
+The default `ming3_audio_flash.yaml` serves concurrent ASR, speech-QA and speech
 replies on two H200 GPUs with CUDA Model Runner V2: one TP=2 Thinker and one
 Talker sharing the second GPU. This throughput profile uses an 8192-token
 context, a 2048-token prefill budget, one audio clip per request, and no prefix
-caching. Its default sampling is greedy with a 256-token output limit. Use the
-base profiles for 128K context and conversation-prefix reuse.
+caching. Its default sampling is greedy with a 256-token output limit; request
+`max_tokens` can raise that limit within the context budget. Select the Flash
+ASR or thinker-only profile for 128K text output and conversation-prefix reuse.
 
 - The Thinker schedules up to 32 sequences with async scheduling, and captures
   CUDA graphs up to 1024 tokens so that steps carrying an audio prefill replay
@@ -160,18 +158,12 @@ base profiles for 128K context and conversation-prefix reuse.
   count; each reply keeps its own upsampler and ISTFT state.
   `low_latency_streaming` sends each reply's first audio as soon as it exists.
 - Any Talker stage with `max_num_seqs` above one uses the batched path, also in
-  `ming3_audio_tts_batched.yaml` for standalone TTS.
+  the default `ming3_audio_tts.yaml` for standalone TTS.
 
 Batched decoding uses FlashAttention over per-request KV rows, so results differ
 from the single-request path at bf16 rounding level: greedy text can diverge
 between batch compositions, and seeded audio depends on which requests share a
 step. This profile requires CUDA and the native Bailing/KDA kernels.
-
-```bash
-vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
-    --deploy-config ming3_audio_flash_batched.yaml \
-    --served-model-name ming3-audio-flash --port 8091
-```
 
 The Talker shares its GPU with a Thinker rank. Without NVIDIA MPS the two
 processes time-slice that GPU; MPS allows their kernels to run concurrently.
@@ -195,7 +187,7 @@ text transcription; full profiles also include the Talker for speech output.
 
 | Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default output limit | no-repeat-ngram size |
 | --- | --- | --- | --- | --- | --- |
-| `ming3_audio_flash.yaml` | 4 / 4 | 131072 | 32768 | 65536 | - |
+| `ming3_audio_flash.yaml` | 2 / 2 | 8192 | 2048 | 256 | - |
 | `ming3_audio_flash_asr.yaml` | 4 / 4 | 131072 | 32768 | 32768 | 10 |
 | `ming3_audio_flash_thinker_only.yaml` | 4 / 4 | 131072 | 32768 | 65536 | - |
 | `ming3_audio_tiny.yaml` | 1 / 1 | 131072 | 32768 | 65536 | - |
@@ -337,7 +329,7 @@ jq -r '.choices[0].message.audio.data' response.json \
 - The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
 - The model handles audio chunking internally, so the deployment configuration does not set `max_audio_clip_s` or `min_energy_split_window_size`.
-- Flash and Tiny profiles configure a 131072-token context. This includes input and output positions; a configured limit does not establish full-length quality or memory capacity. Validate the selected checkpoint and target GPUs before deployment.
+- The default full Flash profile uses an 8192-token context; Flash ASR/thinker-only and Tiny profiles use 131072 tokens. This includes input and output positions; a configured limit does not establish full-length quality or memory capacity. Validate the selected checkpoint and target GPUs before deployment.
 
 ### Text normalization resources
 
@@ -381,8 +373,8 @@ curl http://localhost:8091/v1/audio/speech \
     --output speech.wav
 ```
 
-For concurrent clients, `ming3_audio_tts_batched.yaml` serves up to 64
-requests in one shared Talker batch: each step advances every active request by
+The default `ming3_audio_tts.yaml` serves up to 64 requests in one shared
+Talker batch: each step advances every active request by
 one latent, with the Qwen2 decode, CFM, aggregator and stop head captured as one
 CUDA graph per batch size. AudioVAE uses packed sliding-window passes when
 supported, with per-request upsampler and ISTFT state. Batched decoding
@@ -390,7 +382,9 @@ uses FlashAttention over a per-request KV row, so latents differ from the
 single-request path at bf16 rounding level, and seeded results depend on which
 requests share a step. `max_num_seqs: 1` keeps the single-request path. In the
 speech-output pipeline the same applies to the Talker stage: set stage 1
-`max_num_seqs` above one to batch concurrent replies.
+`max_num_seqs` above one to batch concurrent replies. The existing
+`ming3_audio_tts_batched.yaml` name is a compatibility alias for the default
+profile; it no longer maintains separate settings.
 
 Omitting `voice` and reference inputs defaults to the IP voice `灵小柔`.
 For voice cloning, pass `ref_audio` instead of `voice`, with optional `ref_text`.
