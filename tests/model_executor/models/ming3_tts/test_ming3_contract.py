@@ -439,12 +439,14 @@ def test_pipeline_contract():
         MING3_TTS_PIPELINE,
     )
 
-    stage0, stage1 = MING3_TTS_PIPELINE.stages
+    (stage0,) = MING3_TTS_PIPELINE.stages
+    assert MING3_TTS_PIPELINE.single_stage_async_chunk is True
     assert stage0.hf_config_name == "llm_config"
     assert stage0.owns_tokenizer is True
     assert stage0.sampling_constraints["max_tokens"] == 801
-    assert stage1.final_output is True
-    assert stage1.final_output_type == "audio"
+    assert stage0.engine_output_type == "audio"
+    assert stage0.final_output is True
+    assert stage0.final_output_type == "audio"
 
 
 @pytest.mark.parametrize(

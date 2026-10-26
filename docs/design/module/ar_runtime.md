@@ -98,7 +98,8 @@ their state through the normal completion path, and propagates `FinishReason.ERR
 to the API. Healthy rows continue. Numerical failure must not be represented as
 an ordinary EOS or a successful, truncated audio response.
 
-In Ming3 fused serving, the VAE cursor stays on device and advances under
+Ming3 defaults to one MRV2 stage containing the backbone, flow head and
+AudioVAE, without an inter-stage connector. The VAE cursor stays on device and advances under
 the same emission-or-flush mask as the decoder's KV length. Invalid rows
 leave both unchanged; CUDA graph padding rows expose no cached tokens.
 

@@ -258,7 +258,10 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     np.testing.assert_array_equal(token_rows[:, 0], [7])
 
 
-@pytest.mark.parametrize("failure,num_logprobs", [("logprobs", 1), ("logits", 1), ("logits", None)])
+@pytest.mark.parametrize(
+    "failure,num_logprobs",
+    [("logprobs", 1), ("logits", 1), ("logits", None), ("model", None), ("model_and_logits", None)],
+)
 def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, num_logprobs) -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")
@@ -280,7 +283,10 @@ def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, 
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=[[7], [8]],
-        invalid_logits_req_ids={"bad"} if failure == "logits" else set(),
+        invalid_logits_req_ids={"bad"} if failure in ("logits", "model_and_logits") else set(),
+        request_errors={"bad": "Non-finite Ming3 flow-head output in decode step."}
+        if failure in ("model", "model_and_logits")
+        else None,
         logprobs=_logprobs(
             [[9, 1], [8, 2]],
             [[-0.9, -1.0], [-0.8, -1.0]],
@@ -303,7 +309,12 @@ def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, 
     assert update_calls == ["good"]
     assert bad.status is RequestStatus.FINISHED_ERROR
     assert bad.stop_reason is not None
-    assert ("no finite logits" if failure == "logits" else "misaligned") in bad.stop_reason
+    expected_reason = (
+        "Non-finite Ming3"
+        if failure.startswith("model")
+        else ("no finite logits" if failure == "logits" else "misaligned")
+    )
+    assert expected_reason in bad.stop_reason
     assert "bad" not in scheduler.requests
     assert output_by_id["bad"].finish_reason is FinishReason.ERROR
     assert output_by_id["bad"].new_token_ids == []
@@ -413,34 +424,3 @@ def test_pooling_decode_failure_finishes_request_with_error() -> None:
     assert output.finish_reason is FinishReason.ERROR
     assert output.pooling_output is None
     assert "pooling output decode failed" in str(request.stop_reason)
-
-
-def test_model_error_finishes_one_request_without_emitting_success():
-    bad, good = _Request("bad"), _Request("good")
-    bad.sampling_params.num_logprobs = good.sampling_params.num_logprobs = None
-    scheduler = _make_scheduler_stub([bad, good])
-    calls = []
-
-    def update(request, tokens):
-        calls.append(request.request_id)
-        return tokens, False
-
-    _bind_request_lifecycle(scheduler, update_request=update)
-    scheduled = SimpleNamespace(
-        num_scheduled_tokens={"bad": 1, "good": 1}, scheduled_spec_decode_tokens={}, num_invalid_spec_tokens=0
-    )
-    runner = OmniModelRunnerOutput(
-        req_ids=["bad", "good"],
-        req_id_to_index={"bad": 0, "good": 1},
-        sampled_token_ids=[[7], [8]],
-        prompt_logprobs_dict={},
-        request_errors={"bad": "Non-finite Ming3 flow-head output in decode step."},
-    )
-    outputs = OmniARScheduler.update_from_output(scheduler, scheduled, runner)
-    by_id = {output.request_id: output for output in outputs[0].outputs}
-    assert calls == ["good"]
-    assert by_id["bad"].finish_reason == FinishReason.ERROR
-    assert by_id["bad"].new_token_ids == []
-    assert "Non-finite Ming3" in by_id["bad"].stop_reason
-    assert "bad" not in scheduler.requests and "good" in scheduler.requests
-    assert by_id["good"].new_token_ids == [8]
