@@ -29,6 +29,11 @@ ASR and Speech QA share the Ming3 audio thinker; requests for audio output addit
 - Client examples use Bash, `curl`, `jq`, and GNU `base64`.
 - Run commands from the repository root. Speech output also requires the [text normalization resources](#text-normalization-resources).
 
+Generated Talker config views use `<VLLM_CACHE_ROOT>/ming_talker`.
+The standard vLLM cache root defaults to `~/.cache/vllm`, or
+`<XDG_CACHE_HOME>/vllm` when `XDG_CACHE_HOME` is set; `VLLM_CACHE_ROOT` overrides either default.
+Model weights continue to use the Hugging Face cache.
+
 ### Command
 
 The default end-to-end configuration targets four 80 GB-class GPUs.

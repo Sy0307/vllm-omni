@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from vllm import envs
 
 from vllm_omni.model_executor.models.ming_flash_omni.checkpoint import (
     prepare_talker_checkpoint,
@@ -19,6 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("use_resolver", [False, True], ids=["explicit-cache", "stage-resolver"])
 def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path, with_tn, use_resolver, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path / "runtime-cache"))
     root = tmp_path / "deployment"
     talker = root / "talker"
     (talker / "llm").mkdir(parents=True)
@@ -40,7 +42,7 @@ def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path,
     if use_resolver:
         from vllm_omni.engine.stage_init_utils import _resolve_model_path
 
-        cache = tmp_path / ".cache/vllm/ming_talker"
+        cache = tmp_path / "runtime-cache/ming_talker"
         view = Path(
             _resolve_model_path(
                 str(root),
@@ -70,6 +72,7 @@ def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path,
 
 def test_resolve_talker_checkpoint_preserves_hub_revision(mocker, monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(tmp_path / "runtime-cache"))
     download = mocker.patch(
         "vllm_omni.model_executor.model_loader.weight_utils.download_weights_from_hf_specific",
         return_value="/cached/snapshot",
@@ -84,7 +87,7 @@ def test_resolve_talker_checkpoint_preserves_hub_revision(mocker, monkeypatch, t
     assert download.call_args.kwargs["revision"] == "revision-sha"
     assert download.call_args.kwargs["allow_patterns"] == ["config.json", "talker/**"]
     assert download.call_args.kwargs["cache_dir"] is None  # Preserve the standard HF weight cache.
-    prepare.assert_called_once_with("/cached/snapshot", cache_dir=str(tmp_path / ".cache/vllm/ming_talker"))
+    prepare.assert_called_once_with("/cached/snapshot", cache_dir=str(tmp_path / "runtime-cache/ming_talker"))
 
 
 def test_resolve_talker_checkpoint_rejects_unsupported_uri():

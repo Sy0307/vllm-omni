@@ -10,6 +10,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from vllm import envs
+
 
 def prepare_talker_checkpoint(source: str, cache_dir: str) -> str:
     """Link deployment assets into an engine config view; leave sources intact."""
@@ -92,4 +94,4 @@ def resolve_ming_talker_checkpoint(model: str, revision: str | None, task_type: 
             require_all=True,
         )
     # Generated config views use the runtime cache, not the HF weight cache.
-    return prepare_talker_checkpoint(source, cache_dir=str(Path.home() / ".cache" / "vllm" / "ming_talker"))
+    return prepare_talker_checkpoint(source, cache_dir=str(Path(envs.VLLM_CACHE_ROOT) / "ming_talker"))
