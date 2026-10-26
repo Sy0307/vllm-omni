@@ -88,11 +88,11 @@ def _layer_out(layer, hidden, attn_out):
 class PackedQwen2:
     """Qwen2 forward over packed tokens with one KV row per request.
 
-    Row ``r`` owns cache slots ``[r * max_len, (r + 1) * max_len)``. Prefill
-    and decode both write K/V at ``row * max_len + position`` and attend
-    through FlashAttention's paged interface, so rows of different lengths
-    share one call. The HF modules supply the weights and the norm, rotary and
-    MLP code; only attention and the cache layout are replaced.
+    Each row owns the KV blocks in its block-table entry. Prefill and decode
+    use that same mapping for writes and attention reads, so a row can move
+    without copying its KV. Full-attention rows retain contiguous blocks.
+    The HF modules supply the weights and the norm, rotary and MLP code;
+    only attention and the cache layout are replaced.
 
     With ``window`` (a sliding-window model), a query attends to itself and
     the ``window - 1`` previous positions, as in transformers' sliding mask.
@@ -273,7 +273,7 @@ class PackedQwen2:
             block = self.block_table[token_rows, positions // self.BLOCK].long()
             slots = block * self.BLOCK + positions % self.BLOCK
         else:
-            slots = token_rows * self.max_len + positions
+            slots = self.block_table[token_rows, 0].long() * self.BLOCK + positions
         cos, sin = model.rotary_emb(embeds, positions.unsqueeze(0))
         cos, sin = cos[0].unsqueeze(1), sin[0].unsqueeze(1)
         # A fresh contiguous tensor, whichever buffer view the caller passes,
@@ -675,7 +675,36 @@ class MingTalkerBatchEngine:
                 ).squeeze(1)
             )
 
+    def _compact_rows(self) -> None:
+        """Move live rows into a smaller graph bucket without copying KV.
+
+        Run between steps on the producer stream. Graph buffers keep their
+        addresses; only persistent state and KV ownership move. Swap the
+        block-table entries so padding and reused rows cannot alias live KV.
+        """
+        count = len(self.rows)
+        bucket = next(b for b in self.buckets if b >= count)
+        if max(self.rows) < bucket:
+            return
+        sources = sorted((row for row in self.rows if row >= bucket), reverse=True)
+        destinations = [row for row in range(bucket) if row not in self.rows][: len(sources)]
+        dst, src = torch.tensor([destinations, sources], device=self.device, dtype=torch.long)
+        for state in (self.hs, self.his_lat, self.positions, self.advance):
+            state.index_copy_(0, dst, state.index_select(0, src))
+        self.sde_args.index_copy_(1, dst, self.sde_args.index_select(1, src))
+        swap_dst, swap_src = torch.cat([dst, src]), torch.cat([src, dst])
+        table = self.llm.block_table
+        table.index_copy_(0, swap_dst, table.index_select(0, swap_src))
+        self.positions.index_fill_(0, src, 0)
+        self.advance.index_fill_(0, src, 0)
+        for destination, source in zip(destinations, sources, strict=True):
+            request = self.rows.pop(source)
+            request.row = destination
+            self.rows[destination] = request
+        self.free_rows = [row for row in range(self.hs.shape[0]) if row not in self.rows]
+
     def _decode_step(self) -> None:
+        self._compact_rows()
         live = max(self.rows) + 1
         rows = next(b for b in self.buckets if b >= live)
         self._fill_noise(rows)
