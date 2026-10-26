@@ -29,11 +29,6 @@ ASR and Speech QA share the Ming3 audio thinker; requests for audio output addit
 - Client examples use Bash, `curl`, `jq`, and GNU `base64`.
 - Run commands from the repository root. Speech output also requires the [text normalization resources](#text-normalization-resources).
 
-Generated Talker config views use `<VLLM_CACHE_ROOT>/ming_talker`.
-The standard vLLM cache root defaults to `~/.cache/vllm`, or
-`<XDG_CACHE_HOME>/vllm` when `XDG_CACHE_HOME` is set; `VLLM_CACHE_ROOT` overrides either default.
-Model weights continue to use the Hugging Face cache.
-
 ### Command
 
 The default end-to-end configuration targets four 80 GB-class GPUs.
@@ -368,7 +363,10 @@ LLM tokenizer, AudioVAE and speaker extractor. The Ming3-specific profile loads
 only the Talker assets, without loading Thinker weights. The resolver also accepts
 a local export with the same layout; `--revision` selects the Hub snapshot.
 
-The resolver stores generated config views and asset symlinks under `~/.cache/vllm/ming_talker`.
+For both full and standalone deployments, generated Talker config views and asset
+symlinks use `<VLLM_CACHE_ROOT>/ming_talker`. The standard vLLM cache root defaults
+to `~/.cache/vllm`, or `<XDG_CACHE_HOME>/vllm` when `XDG_CACHE_HOME` is set;
+`VLLM_CACHE_ROOT` overrides either default.
 Checkpoint files stay in the original local export or HF cache; they are not copied into the config view. The same checkpoint and config reuse the existing view.
 
 ```bash
