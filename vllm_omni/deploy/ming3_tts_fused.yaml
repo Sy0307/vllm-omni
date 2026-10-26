@@ -8,7 +8,6 @@ model_runner: v2
 async_chunk: true
 trust_remote_code: false
 dtype: bfloat16
-enable_prefix_caching: false
 
 stages:
   - stage_id: 0
@@ -30,9 +29,3 @@ stages:
       cudagraph_mode: FULL_AND_PIECEWISE
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
       cudagraph_num_of_warmups: 1
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 801
-      detokenize: true
