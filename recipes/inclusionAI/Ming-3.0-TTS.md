@@ -74,7 +74,7 @@ Under load, new arrivals are admitted together when at least 32 requests are
 running: admission resumes when eight requests wait or the oldest has waited
 150 ms. This wait contributes to first-audio latency. For latency-sensitive
 traffic, the existing `ar_prefill_admission_min_batch` option in Stage 0's
-`additional_config` can disable batching when set to 1.
+`additional_config` can disable batching when set to 0.
 
 The decoder flushes its held final audio frame before completing a request.
 Its graph buckets cover up to 64 rows; larger row counts use eager decode.
