@@ -29,7 +29,7 @@ class CFMSampler(nn.Module):
     All randomness (``y0``, ``sde_rnd``) and the timestep schedule ``t`` are
     passed in as float32 tensors so the loop is deterministic during replay and
     the integration matches the eager float32 path. Equivalent to eager
-    ``Solver.integrate`` for ``temperature==0`` (the TTS default).
+    ``Solver.integrate`` for ``temperature==0``.
     """
 
     def __init__(self, dit_model: nn.Module, steps: int = DEFAULT_CFM_STEPS):

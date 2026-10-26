@@ -11,7 +11,7 @@
 
 ## Architecture
 
-Stage 0 uses the Ling V3 MoE backbone (18 KDA / 6 MLA layers) and a Flow decoder
+The default two-stage pipeline uses the Ling V3 MoE backbone (18 KDA / 6 MLA layers) and a Flow decoder in Stage 0
 to generate continuous audio latents. Stage 1 converts them to streaming audio
 with AudioVAE. The pipeline uses [ming3_tts.yaml](../../vllm_omni/deploy/ming3_tts.yaml).
 
@@ -65,13 +65,15 @@ automatically on first launch.
 
 ### Throughput profiles
 
-For the opt-in fused throughput profile:
+For the opt-in fused throughput profile, using the one API process and
+4096-token context limit from the validation runs:
 
 ```bash
 vllm serve inclusionAI/Ming-3.0-tts-tiny \
   --omni \
   --deploy-config vllm_omni/deploy/ming3_tts_fused.yaml \
-  --api-server-count 4 \
+  --api-server-count 1 \
+  --max-model-len 4096 \
   --allowed-local-media-path "$REF_DIR" \
   --port 8000
 ```
@@ -82,6 +84,9 @@ vllm serve inclusionAI/Ming-3.0-tts-tiny \
 | `ming3_tts_high_concurrency.yaml` | Two stages, batched AudioVAE, 64 requests | Up to 300 ms |
 | `ming3_tts_mrv2.yaml` | Two stages, Model Runner V2 for Stage 0 | Up to 300 ms |
 | `ming3_tts_fused.yaml` | One stage, Model Runner V2 and per-step AudioVAE | Up to 150 ms |
+
+The two-stage YAMLs set `max_model_len: 4096`; the fused YAML sets 8192.
+The command above explicitly overrides the fused limit to 4096.
 
 The throughput profiles admit arrivals together when at least 32 requests are
 running: admission resumes when eight requests wait or the oldest reaches the
@@ -185,8 +190,10 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:8000/v1/audio/speec
 
 - Output is mono 44.1 kHz WAV. For PCM streaming, set `response_format: "pcm"` and `stream_format: "audio"`.
 - CFM CUDA Graphs follow Stage 0's configuration: `enforce_eager: true` or `compilation_config.cudagraph_mode: NONE` disables their compilation and capture.
-- Context limit: 4096 tokens. Both stages allow 16 scheduled sequences;
-  For chunked prefill, speaker and reference-audio conditioning is cached per request and sliced using the scheduled token offset, including single-token prefill slices.
+- The default `ming3_tts.yaml` allows 16 scheduled sequences per stage; the
+  opt-in throughput profiles allow 64. For chunked prefill, speaker and
+  reference-audio conditioning is cached per request and sliced using the
+  scheduled token offset, including single-token prefill slices.
   AudioVAE batches compatible request chunks within a scheduled batch. The fused MRV2 profile decodes active streams together in Stage 0; other profiles use the separate AudioVAE stage.
 - Reference clips must be 1–30 seconds. Upload clips through `/v1/audio/voices` and reuse their names in `voice`; built-in IP names use `instructions`.
 - Flow temperature defaults to 1.5; the examples explicitly use 0.0.
