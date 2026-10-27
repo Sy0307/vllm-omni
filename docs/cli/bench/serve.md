@@ -992,6 +992,17 @@ itself set a server generation seed. A longer run alone does not prove steady
 state, and its aggregate TTFP must not replace the short-run baseline. Establish
 separate baselines on the target hardware before adding new workload alerts.
 
+The Qwen3-TTS VoiceDesign nightly configuration in
+`tests/dfx/perf/tests/test_tts.json` includes `throughput_c64_n1024`, with 64
+warmup requests followed by 1024 measured requests at concurrency 64. It
+records results and checks request completion without a latency/throughput
+baseline until target-hardware measurements are available. The existing
+C64/N128 case is replaced, and its H100 thresholds are removed because they
+describe a different workload. C8/C16 and the other existing cases retain their
+baselines. During this baseline-collection period, C64 request validity is
+checked but C64 latency/throughput regressions are not gated. The new case is
+collected by the existing two-GPU TTS performance job.
+
 ### Multi-Modal Benchmark
 
 <details class="admonition abstract" markdown="1">
