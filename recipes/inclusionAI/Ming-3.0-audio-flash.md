@@ -131,9 +131,10 @@ The default `ming3_audio_flash.yaml` serves concurrent ASR, speech-QA and speech
 replies on two H200 GPUs with CUDA Model Runner V2: one TP=2 Thinker and one
 Talker sharing the second GPU. This throughput profile uses an 8192-token
 context, a 2048-token prefill budget, one audio clip per request, and no prefix
-caching. Its default sampling is greedy with a 256-token output limit; request
-`max_tokens` can raise that limit within the context budget. Select the Flash
-ASR or thinker-only profile for 128K text output and conversation-prefix reuse.
+caching. Its default sampling is greedy, with `max_tokens: 65536`; generation
+still stops when the 8192-token context is full, including the input. Set request
+`max_tokens` to apply a smaller output limit. Select the Flash ASR or thinker-only
+profile for 128K text output and conversation-prefix reuse.
 
 - The Thinker schedules up to 32 sequences with async scheduling, and captures
   CUDA graphs up to 1024 tokens so that steps carrying an audio prefill replay
@@ -185,9 +186,9 @@ rank stalls the other in its next all-reduce.
 Select a profile with `--deploy-config`. ASR profiles run only the Thinker for
 text transcription; full profiles also include the Talker for speech output.
 
-| Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default output limit | no-repeat-ngram size |
+| Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default `max_tokens` | no-repeat-ngram size |
 | --- | --- | --- | --- | --- | --- |
-| `ming3_audio_flash.yaml` | 2 / 2 | 8192 | 2048 | 256 | - |
+| `ming3_audio_flash.yaml` | 2 / 2 | 8192 | 2048 | 65536 | - |
 | `ming3_audio_flash_asr.yaml` | 4 / 4 | 131072 | 32768 | 32768 | 10 |
 | `ming3_audio_flash_thinker_only.yaml` | 4 / 4 | 131072 | 32768 | 65536 | - |
 | `ming3_audio_tiny.yaml` | 1 / 1 | 131072 | 32768 | 65536 | - |
