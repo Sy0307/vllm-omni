@@ -59,10 +59,9 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 
 ### Original audio in multi-turn history
 
-For text responses with original audio clips retained across turns, select
-`ming3_audio_flash_thinker_only.yaml`. This profile permits up to 20 audio items
-per request, counted across all messages. The default full Flash profile permits
-one audio item across the complete request. Each clip retains its own
+The default full Flash and `ming3_audio_flash_thinker_only.yaml` profiles permit
+up to 20 audio items per request, counted across all messages. Select the
+thinker-only profile when speech output is not needed. Each clip retains its own
 feature length and placeholder; clips may have different durations or repeat an earlier
 recording.
 
@@ -129,12 +128,12 @@ assume bitwise-identical waveforms across chunk partitions.
 
 The default `ming3_audio_flash.yaml` serves concurrent ASR, speech-QA and speech
 replies on two H200 GPUs with CUDA Model Runner V2: one TP=2 Thinker and one
-Talker sharing the second GPU. This throughput profile uses an 8192-token
-context, a 2048-token prefill budget, one audio clip per request, and no prefix
-caching. Its default sampling is greedy, with `max_tokens: 65536`; generation
-still stops when the 8192-token context is full, including the input. Set request
-`max_tokens` to apply a smaller output limit. Select the Flash ASR or thinker-only
-profile for 128K text output and conversation-prefix reuse.
+Talker sharing the second GPU. This throughput profile retains the 131072-token
+context, up to 20 audio clips per request, `temperature: 0.6`, and
+`max_tokens: 65536`. It uses a 2048-token prefill budget and no prefix caching.
+Generation is bounded by both `max_tokens` and the remaining context space.
+Set request `max_tokens` to apply a smaller output limit. Select the Flash ASR
+or thinker-only profile for text-only serving with conversation-prefix reuse.
 
 - The Thinker schedules up to 32 sequences with async scheduling, and captures
   CUDA graphs up to 1024 tokens so that steps carrying an audio prefill replay
@@ -188,7 +187,7 @@ text transcription; full profiles also include the Talker for speech output.
 
 | Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default `max_tokens` | no-repeat-ngram size |
 | --- | --- | --- | --- | --- | --- |
-| `ming3_audio_flash.yaml` | 2 / 2 | 8192 | 2048 | 65536 | - |
+| `ming3_audio_flash.yaml` | 2 / 2 | 131072 | 2048 | 65536 | - |
 | `ming3_audio_flash_asr.yaml` | 4 / 4 | 131072 | 32768 | 32768 | 10 |
 | `ming3_audio_flash_thinker_only.yaml` | 4 / 4 | 131072 | 32768 | 65536 | - |
 | `ming3_audio_tiny.yaml` | 1 / 1 | 131072 | 32768 | 65536 | - |
@@ -330,7 +329,7 @@ jq -r '.choices[0].message.audio.data' response.json \
 - The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
 - The model handles audio chunking internally, so the deployment configuration does not set `max_audio_clip_s` or `min_energy_split_window_size`.
-- The default full Flash profile uses an 8192-token context; Flash ASR/thinker-only and Tiny profiles use 131072 tokens. This includes input and output positions; a configured limit does not establish full-length quality or memory capacity. Validate the selected checkpoint and target GPUs before deployment.
+- Flash and Tiny profiles use a 131072-token context. This includes input and output positions; a configured limit does not establish full-length quality or memory capacity. Validate the selected checkpoint and target GPUs before deployment.
 
 ### Text normalization resources
 

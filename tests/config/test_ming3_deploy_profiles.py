@@ -103,6 +103,10 @@ def test_flash_default_profile_batches_both_stages_without_deploy_override():
     assert pipeline.default_deploy_config_name == "ming3_audio_flash.yaml"
     default = resolve_deploy_yaml(_DEPLOY / pipeline.default_deploy_config_name)
     thinker, talker = default["stages"]
+    reference_thinker = resolve_deploy_yaml(_DEPLOY / "ming3_audio_flash_thinker_only.yaml")["stages"][0]
+    # Batching must preserve the existing input limits and sampling defaults.
+    for key in ("max_model_len", "limit_mm_per_prompt", "default_sampling_params"):
+        assert thinker[key] == reference_thinker[key]
     assert thinker["max_num_seqs"] == talker["max_num_seqs"] == 32
     assert thinker["model_runner"] == talker["model_runner"] == "v2"
     assert thinker["async_scheduling"] is True
@@ -120,11 +124,13 @@ def test_flash_default_profile_batches_both_stages_without_deploy_override():
     stage = structured.stage_by_id(0)
     assert stage.scheduler_config.max_num_seqs == legacy[0].yaml_engine_args["max_num_seqs"] == 32
     assert structured.stage_by_id(1).scheduler_config.max_num_seqs == legacy[1].yaml_engine_args["max_num_seqs"] == 32
-    assert stage.scheduler_config.max_model_len == legacy[0].yaml_engine_args["max_model_len"] == 8192
+    assert (
+        stage.scheduler_config.max_model_len == legacy[0].yaml_engine_args["max_model_len"] == thinker["max_model_len"]
+    )
     assert stage.scheduler_config.max_num_batched_tokens == legacy[0].yaml_engine_args["max_num_batched_tokens"] == 2048
     assert stage.cache_config.enable_prefix_caching is legacy[0].yaml_engine_args["enable_prefix_caching"] is False
     assert stage.cache_config.mamba_cache_mode == legacy[0].yaml_engine_args["mamba_cache_mode"] == "none"
-    assert stage.model_config.limit_mm_per_prompt == {"audio": 1}
+    assert stage.model_config.limit_mm_per_prompt == thinker["limit_mm_per_prompt"]
     assert (
         stage.model_config.default_sampling_params
         == legacy[0].yaml_extras["default_sampling_params"]

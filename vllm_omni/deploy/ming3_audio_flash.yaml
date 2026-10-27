@@ -4,7 +4,7 @@
 #
 # Concurrent serving on 2x H200 with CUDA Model Runner V2. The TP=2 Thinker
 # shares GPU 1 with the batched Talker; both stages schedule up to 32 requests.
-# Use the ASR or thinker-only profiles for 128K text-only deployments.
+# Use the ASR or thinker-only profiles when speech output is not needed.
 pipeline: bailing_moe_v3_audio
 async_chunk: true
 trust_remote_code: false
@@ -16,13 +16,13 @@ enable_chunked_prefill: true
 stages:
   - stage_id: 0
     limit_mm_per_prompt:
-      audio: 1
+      audio: 20
     devices: "0,1"
     tensor_parallel_size: 2
     enable_expert_parallel: false
     disable_custom_all_reduce: true
     max_num_seqs: 32
-    max_model_len: 8192
+    max_model_len: 131072
     max_num_batched_tokens: 2048
     gpu_memory_utilization: 0.88
     enforce_eager: false
@@ -42,7 +42,7 @@ stages:
       ar_prefill_admission_max_wait_ms: 100
       ar_prefill_admission_min_running: 4
     default_sampling_params:
-      temperature: 0.0
+      temperature: 0.6
       top_p: 1.0
       top_k: -1
       max_tokens: 65536
