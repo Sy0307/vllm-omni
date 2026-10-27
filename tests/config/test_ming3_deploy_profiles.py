@@ -125,8 +125,11 @@ def test_flash_default_profile_batches_both_stages_without_deploy_override():
     assert stage.cache_config.enable_prefix_caching is legacy[0].yaml_engine_args["enable_prefix_caching"] is False
     assert stage.cache_config.mamba_cache_mode == legacy[0].yaml_engine_args["mamba_cache_mode"] == "none"
     assert stage.model_config.limit_mm_per_prompt == {"audio": 1}
-    assert stage.model_config.default_sampling_params["temperature"] == 0.0
-    assert stage.model_config.default_sampling_params["max_tokens"] == 256
+    assert (
+        stage.model_config.default_sampling_params
+        == legacy[0].yaml_extras["default_sampling_params"]
+        == thinker["default_sampling_params"]
+    )
     assert thinker["additional_config"] == {
         "ar_prefill_admission_min_batch": 8,
         "ar_prefill_admission_max_wait_ms": 100,

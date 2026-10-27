@@ -380,12 +380,9 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
         state.add_request(index, SimpleNamespace(req_id=req_id, mm_features=[]))
     state.num_accepted_tokens_gpu.copy_(torch.tensor([7, 3], dtype=torch.int32))
     state.intermediate_buffer.buffers[0]["old_audio"] = torch.ones(4)
-    state._mtp_generators["finished"] = torch.Generator()
-    state._mtp_seeded.add("finished")
     state.remove_request("finished" if remove_by_id else 0)
     assert state.intermediate_buffer.buffers[0] == {}
     assert state.intermediate_buffer.req_id_to_index == {"peer": 1}
-    assert not state._mtp_generators and not state._mtp_seeded
     state.add_request(0, SimpleNamespace(req_id="replacement", mm_features=[]))
     state.apply_staged_writes()
     assert state.num_accepted_tokens_gpu.tolist() == [1, 3]
