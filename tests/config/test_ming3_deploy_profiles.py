@@ -130,6 +130,11 @@ def test_flash_default_profile_batches_both_stages_without_deploy_override():
     assert stage.scheduler_config.max_num_batched_tokens == legacy[0].yaml_engine_args["max_num_batched_tokens"] == 2048
     assert stage.cache_config.enable_prefix_caching is legacy[0].yaml_engine_args["enable_prefix_caching"] is False
     assert stage.cache_config.mamba_cache_mode == legacy[0].yaml_engine_args["mamba_cache_mode"] == "none"
+    assert (
+        stage.cache_config.gpu_memory_utilization
+        == legacy[0].yaml_engine_args["gpu_memory_utilization"]
+        == thinker["gpu_memory_utilization"]
+    )
     assert stage.model_config.limit_mm_per_prompt == thinker["limit_mm_per_prompt"]
     assert (
         stage.model_config.default_sampling_params

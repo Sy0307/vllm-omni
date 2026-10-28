@@ -131,6 +131,8 @@ replies on two H200 GPUs with CUDA Model Runner V2: one TP=2 Thinker and one
 Talker sharing the second GPU. This throughput profile retains the 131072-token
 context, up to 20 audio clips per request, `temperature: 0.6`, and
 `max_tokens: 65536`. It uses a 2048-token prefill budget and no prefix caching.
+The Thinker's GPU memory budget is 0.89 to leave KV-cache headroom for the full
+context after graph profiling; the colocated Talker's budget remains 0.10.
 Generation is bounded by both `max_tokens` and the remaining context space.
 Set request `max_tokens` to apply a smaller output limit. Select the Flash ASR
 or thinker-only profile for text-only serving with conversation-prefix reuse.
@@ -174,11 +176,10 @@ For throughput-oriented deployments, `--no-collect-stage-metrics
 --disable-log-stats` removes the per-request stage metrics and statistics
 logging from the API server.
 
-To serve 64 concurrent requests, raise `max_num_seqs` to 64 for both stages.
-On two GPUs (Thinker TP=2) the Talker shares a GPU with a Thinker rank that
-holds most of it, so also lower the Thinker's `gpu_memory_utilization` to 0.87
-to leave room for the Talker's 64 rows; running out of memory on one Thinker
-rank stalls the other in its next all-reduce.
+Client concurrency can exceed the 32 slots per stage; excess requests queue.
+Increasing `max_num_seqs` also increases memory requirements. Revalidate both
+stages and the full context on the target GPUs before raising their capacity;
+reducing the Thinker's memory budget can leave too little KV cache for 128K.
 
 ### Deployment profiles
 

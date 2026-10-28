@@ -24,7 +24,8 @@ stages:
     max_num_seqs: 32
     max_model_len: 131072
     max_num_batched_tokens: 2048
-    gpu_memory_utilization: 0.88
+    # Leave KV-cache headroom for the full 128K context after graph profiling.
+    gpu_memory_utilization: 0.89
     enforce_eager: false
     model_runner: v2
     async_scheduling: true
