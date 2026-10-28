@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -145,10 +146,13 @@ class _StepAudioOutput:
     rows: list[tuple[int, _AudioChunks]]
     num_reqs: int
     sample_rate: torch.Tensor
+    event: torch.cuda.Event | None = None
 
     def to_cpu(
         self, copy_stream: torch.cuda.Stream, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
     ) -> _StepAudioOutput:
+        if self.event is not None:
+            copy_stream.wait_event(self.event)
         audio, start, end, last = (
             copy_tensor(value) if value is not None else None for value in (self.audio, self.start, self.end, self.last)
         )
@@ -544,27 +548,34 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
         # Host indices for both groups in one upload.
         index = index_to_device(np.concatenate([slots_np[first_latent], first_latent, slots, decode]).tolist(), device)
         primed = len(first_latent)
-        # On the step's own stream: the decode graphs and the flow-head graphs
-        # share library workspaces, so they must not replay concurrently.
-        if primed:
-            vae.prime(index[:primed], latent.index_select(0, index[primed : 2 * primed]).flatten(1))
-            self._vae_positions.index_fill_(0, index[:primed], 0)
-        if decode:
-            packed = index[2 * primed :].view(2, len(decode))
-            positions = self._vae_positions.index_select(0, packed[0])
-            flush = flush.index_select(0, packed[1])
-            valid = emitted.index_select(0, packed[1]) | flush
-            audio, start, end = vae.step(
-                packed[0],
-                positions,
-                positions == 0,
-                latent.index_select(0, packed[1]).flatten(1),
-                flush,
-                valid,
-            )
-            # The cursor and decoder KV length advance under the same device
-            # mask, including flushes, without synchronizing invalid rows to CPU.
-            self._vae_positions.index_copy_(0, packed[0], positions + valid * vae.scale)
+        side = vae.stream
+        if side is not None:
+            side.wait_stream(torch.cuda.current_stream(device))
+            # These are step-owned tensors, not graph outputs reused by the next AR step.
+            for value in (index, latent, emitted, flush):
+                value.record_stream(side)
+        # Keep priming, decoder state and cursors ordered on the same stream,
+        # including when a cancelled request's slot is reused.
+        with torch.cuda.stream(side) if side is not None else nullcontext():
+            if primed:
+                vae.prime(index[:primed], latent.index_select(0, index[primed : 2 * primed]).flatten(1))
+                self._vae_positions.index_fill_(0, index[:primed], 0)
+            if decode:
+                packed = index[2 * primed :].view(2, len(decode))
+                positions = self._vae_positions.index_select(0, packed[0])
+                flush = flush.index_select(0, packed[1])
+                valid = emitted.index_select(0, packed[1]) | flush
+                audio, start, end = vae.step(
+                    packed[0],
+                    positions,
+                    positions == 0,
+                    latent.index_select(0, packed[1]).flatten(1),
+                    flush,
+                    valid,
+                )
+                # Advance the cursor and decoder KV length under the same mask.
+                self._vae_positions.index_copy_(0, packed[0], positions + valid * vae.scale)
+            event = side.record_event() if decode and side is not None else None
         if not decode:
             self._step_audio = _StepAudioOutput(None, None, None, None, [], num_reqs, self._sample_rate)
             return
@@ -575,7 +586,7 @@ class Ming3ModelState(OmniModelState, MambaHybridModelState):
             if chunks is None:
                 chunks = self._audio_chunks[req_id] = _AudioChunks(self._samples_per_latent, self._chunk_latents)
             audio_rows.append((row, chunks))
-        self._step_audio = _StepAudioOutput(audio, start, end, flush, audio_rows, num_reqs, self._sample_rate)
+        self._step_audio = _StepAudioOutput(audio, start, end, flush, audio_rows, num_reqs, self._sample_rate, event)
 
     def get_request_errors(self) -> tuple[torch.Tensor, str] | None:
         return self._request_errors

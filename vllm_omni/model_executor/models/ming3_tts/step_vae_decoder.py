@@ -31,6 +31,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm_omni.utils.cuda_stream import create_cuda_stream
+
 from .packed_qwen2 import PackedQwen2, PagedKV
 
 # Decoder tokens one stream may reach (``scale`` per latent).
@@ -91,6 +93,9 @@ class StepVAEDecoder:
         self.window_buffer = torch.zeros((slots, self.buffer_len), device=device, dtype=torch.float32)
         self._graphs: dict[int, tuple[torch.cuda.CUDAGraph, tuple[torch.Tensor, ...]]] = {}
         self._static: tuple[torch.Tensor, ...] | None = None
+        # record_stream may retain this handle after the decoder is released;
+        # use PyTorch's process-lived pool for execution and an owned stream for capture.
+        self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" and torch.version.hip is None else None
 
     @torch.inference_mode()
     def capture_graphs(self, rows: tuple[int, ...] = GRAPH_ROWS) -> None:
@@ -112,7 +117,7 @@ class StepVAEDecoder:
             torch.zeros(largest, device=device, dtype=torch.bool),
         )
         pool = torch.cuda.graph_pool_handle()
-        stream = torch.cuda.Stream(device=device)
+        stream = create_cuda_stream(device) if torch.version.hip is None else torch.cuda.Stream(device=device)
         for count in reversed(rows):
             inputs = tuple(tensor[:count] for tensor in self._static)
             stream.wait_stream(torch.cuda.current_stream())
@@ -120,8 +125,9 @@ class StepVAEDecoder:
                 self._step(*inputs)
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
                 outputs = self._step(*inputs)
+            graph._capture_stream_owner = stream
             self._graphs[count] = (graph, outputs)
 
     @torch.inference_mode()

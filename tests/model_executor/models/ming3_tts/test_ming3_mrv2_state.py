@@ -154,6 +154,7 @@ class _FakeStepVAE:
 
     scale = 4
     hop = 2
+    stream = None
 
     def __init__(self):
         self.primed, self.steps = [], []

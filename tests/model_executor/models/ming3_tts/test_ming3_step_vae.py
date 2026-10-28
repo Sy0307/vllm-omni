@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from functools import partial
+
+import numpy as np
 import pytest
 import torch
 
@@ -141,3 +144,122 @@ def test_invalid_step_rows_keep_kv_length_and_resume(graphs):
             assert end[1] > start[1]
             assert torch.isfinite(audio[1, start[1] : end[1]]).all()
         positions = expected
+
+
+@cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("graphs", [False, True])
+@torch.inference_mode()
+def test_side_stream_matches_serial_decode_with_slot_reuse(graphs):
+    from tests.model_executor.models.ming3_tts.test_ming3_mrv2_state import _batch
+    from vllm_omni.model_executor.models.ming3_tts.model_state import Ming3ModelState
+    from vllm_omni.model_executor.models.ming3_tts.step_vae_decoder import StepVAEDecoder
+    from vllm_omni.worker_v2.omni_ar_model_runner import _async_copy_tensor
+
+    vae = _vae(packed=True).cuda().bfloat16()
+    serial, side = [StepVAEDecoder(vae.decoder, max_slots=4, kv_block_size=16, ring_blocks=2) for _ in range(2)]
+    if graphs:
+        for decoder in (serial, side):
+            # Three-row steps exercise eager fallback between captured buckets.
+            decoder.capture_graphs((1, 2))
+    assert side.stream is not None
+    pooled = {torch.cuda.Stream().cuda_stream for _ in range(128)}
+    for graph, _ in side._graphs.values():
+        assert graph._capture_stream_owner.cuda_stream not in pooled
+    state = object.__new__(Ming3ModelState)
+    state._step_vae = side
+    state._vae_positions = torch.zeros(4, dtype=torch.long, device="cuda")
+    state._sample_rate = torch.tensor(1600, dtype=torch.int32)
+    state._audio_chunks = {}
+    state._chunk_latents = (1,)
+    state._samples_per_latent = side.scale * side.hop
+    copy_stream = torch.cuda.Stream()
+    positions = np.zeros(4, dtype=np.int64)
+    pending = []
+    # Prime, pause, flush, reuse a cancelled slot, and mix prime/decode rows.
+    schedule = [
+        ([0, 1, 2], [True, True, True], [True, True, True], [False, False, False]),
+        ([2, 0, 1], [False, False, False], [True, False, True], [False, False, False]),
+        ([1, 2], [False, False], [False, True], [True, False]),
+        ([0, 2], [True, False], [True, True], [False, False]),
+        ([2, 0, 3], [False, False, True], [False, True, True], [True, False, False]),
+        ([3, 0], [False, False], [False, False], [True, True]),
+    ]
+    for slots, first, emitted, flush in schedule:
+        count = len(slots)
+        batch = _batch(
+            slots,
+            computed=[0 if prime else 1 for prime in first],
+            scheduled=[1] * count,
+            prompt_len=[1] * count,
+            seq_lens=[1] * count,
+        )
+        latent = torch.randn(count, 8, device="cuda", dtype=torch.bfloat16)
+        index = torch.tensor(slots, device="cuda")
+        primed = [i for i, value in enumerate(first) if value]
+        decoded = [i for i, value in enumerate(first) if not value]
+        if primed:
+            serial.prime(index[primed], latent[primed])
+            positions[np.asarray(slots)[primed]] = 0
+        expected = None
+        if decoded:
+            selected = np.asarray(slots)[decoded]
+            cursor = torch.tensor(positions[selected], device="cuda")
+            valid = np.asarray(emitted)[decoded] | np.asarray(flush)[decoded]
+            expected = serial.step(
+                index[decoded],
+                cursor,
+                cursor == 0,
+                latent[decoded],
+                torch.tensor(np.asarray(flush)[decoded], device="cuda"),
+                torch.tensor(valid, device="cuda"),
+            )
+            positions[selected] += valid * serial.scale
+        state._decode_step_audio(
+            batch,
+            np.arange(count),
+            np.asarray(slots),
+            latent,
+            torch.tensor(emitted, device="cuda"),
+            torch.tensor(flush, device="cuda"),
+        )
+        output = state.prepare_streaming_audio_output(batch, None, {})
+        with torch.cuda.stream(copy_stream):
+            copied = output.to_cpu(copy_stream, partial(_async_copy_tensor, copy_stream=copy_stream, pin_memory=True))
+        if expected is not None:
+            assert output.event is not None
+            pending.append((copied, expected))
+    copy_stream.synchronize()
+    for actual, expected in pending:
+        for got, want in zip((actual.audio, actual.start, actual.end), expected, strict=True):
+            torch.testing.assert_close(got, want.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(state._vae_positions.cpu(), torch.from_numpy(positions))
+
+
+@cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_side_stream_exception_restores_caller_stream(monkeypatch):
+    from tests.model_executor.models.ming3_tts.test_ming3_mrv2_state import _batch
+    from vllm_omni.model_executor.models.ming3_tts.model_state import Ming3ModelState
+    from vllm_omni.model_executor.models.ming3_tts.step_vae_decoder import StepVAEDecoder
+
+    state = object.__new__(Ming3ModelState)
+    state._step_vae = StepVAEDecoder(_vae(packed=True).cuda().bfloat16().decoder, max_slots=1)
+    batch = _batch([0], computed=[0], scheduled=[1], prompt_len=[1], seq_lens=[1])
+    main = torch.cuda.current_stream()
+
+    def fail_prime(slots, latent):
+        assert torch.cuda.current_stream() == state._step_vae.stream
+        raise RuntimeError("injected prime failure")
+
+    monkeypatch.setattr(state._step_vae, "prime", fail_prime)
+    with pytest.raises(RuntimeError, match="injected prime failure"):
+        state._decode_step_audio(
+            batch,
+            np.array([0]),
+            np.array([0]),
+            torch.zeros(1, 8, device="cuda"),
+            torch.ones(1, dtype=torch.bool, device="cuda"),
+            torch.zeros(1, dtype=torch.bool, device="cuda"),
+        )
+    assert torch.cuda.current_stream() == main
