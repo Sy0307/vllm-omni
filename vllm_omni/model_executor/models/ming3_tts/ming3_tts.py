@@ -440,7 +440,7 @@ class Ming3TTSForConditionalGeneration(
         self._prefetched_prompt_outputs.clear()
         self._prefetched_speakers.clear()
 
-    def create_mrv2_model_state(self, vllm_config: VllmConfig, encoder_cache: Any, device: torch.device):
+    def create_omni_model_state(self, vllm_config: VllmConfig, encoder_cache: Any, device: torch.device):
         from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
         if self.model_stage != "llm":

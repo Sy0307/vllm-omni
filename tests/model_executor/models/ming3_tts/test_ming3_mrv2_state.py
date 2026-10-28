@@ -15,6 +15,30 @@ CONTINUE, STOP = 7, 9
 LATENT_DIM, HIDDEN = 4, 6
 
 
+@pytest.mark.parametrize("stage,hybrid", [("llm", False), ("llm", True), ("audio_vae", False)])
+def test_model_state_factory_preserves_ming3_stage_dispatch(monkeypatch, stage, hybrid):
+    from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.model_executor.models.ming3_tts.ming3_tts import Ming3TTSForConditionalGeneration
+    from vllm_omni.worker_v2.model_states import init_omni_model_state
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    class StageConfig(OmniModelConfig):
+        is_hybrid = hybrid
+
+    model = Ming3TTSForConditionalGeneration.__new__(Ming3TTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = stage
+    model.have_multimodal_outputs = True
+    monkeypatch.setattr(Ming3ModelState, "__init__", lambda *_args: None)
+    monkeypatch.setattr(OmniModelState, "__init__", lambda *_args: None)
+    config = SimpleNamespace(model_config=object.__new__(StageConfig))
+
+    state = init_omni_model_state(config, model, None, torch.device("cpu"))
+
+    # The generic hybrid fallback cannot replace Tiny's flow/AudioVAE lifecycle.
+    assert type(state) is (Ming3ModelState if stage == "llm" else OmniModelState)
+
+
 class _FakeFlow:
     """Flow head stand-in: latent and next embedding come from the condition row, stop probability from a table."""
 

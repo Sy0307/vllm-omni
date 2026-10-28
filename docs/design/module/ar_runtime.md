@@ -98,6 +98,8 @@ their state through the normal completion path, and propagates `FinishReason.ERR
 to the API. Healthy rows continue. Numerical failure must not be represented as
 an ordinary EOS or a successful, truncated audio response.
 
+Ming3's `create_omni_model_state` hook selects its model-owned state before
+generic hybrid dispatch, preserving its flow and AudioVAE lifecycle.
 Ming3 defaults to one MRV2 stage containing the backbone, flow head and
 AudioVAE, without an inter-stage connector. The VAE cursor stays on device and advances under
 the same emission-or-flush mask as the decoder's KV length. Invalid rows
