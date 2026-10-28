@@ -95,6 +95,7 @@ class StepVAEDecoder:
         self._static: tuple[torch.Tensor, ...] | None = None
         # record_stream may retain this handle after the decoder is released;
         # use PyTorch's process-lived pool for execution and an owned stream for capture.
+        # With overlap enabled, callers must run prime()/step() under this stream.
         self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" and torch.version.hip is None else None
 
     @torch.inference_mode()
