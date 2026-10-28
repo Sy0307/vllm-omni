@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.ming3_tts.constants import (
     AUDIO_START_TOKEN_ID,
     KEY_MAX_DECODE_STEPS,
     KEY_MIN_DECODE_STEPS,
+    KEY_SPEAKER_EMBEDDING,
     KEY_SPEAKER_POSITIONS,
     SPEAKER_END_TOKEN_ID,
     SPEAKER_START_TOKEN_ID,
@@ -63,16 +64,18 @@ def _prefill_wrapper(model, config):
     return wrapper
 
 
-@pytest.fixture(autouse=True)
-def _stub_api_speaker_embeddings(monkeypatch):
-    """Adapter tests use fake servers without a CAM++ checkpoint."""
+@pytest.fixture(params=[False, True], ids=["non_cuda", "cuda"])
+def adapter_is_cuda(request, monkeypatch):
+    """Exercise both reference-audio paths without a CAM++ checkpoint."""
     from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as adapter_module
 
+    monkeypatch.setattr(adapter_module.current_platform, "is_cuda", lambda: request.param)
     monkeypatch.setattr(
         adapter_module,
         "_extract_speaker_embeddings",
         lambda model, waveforms, sample_rates, audio_keys: torch.zeros((len(waveforms), 192)),
     )
+    return request.param
 
 
 class FakeTokenizer:
@@ -949,7 +952,7 @@ def test_podcast_adapter_validates_turns(text, max_tokens, error):
         (" ", None),
     ],
 )
-def test_adapter_language_and_reference_continuation(speaker_count, language, expected):
+def test_adapter_language_and_reference_continuation(speaker_count, language, expected, adapter_is_cuda):
     import asyncio
 
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -963,12 +966,13 @@ def test_adapter_language_and_reference_continuation(speaker_count, language, ex
     server = SimpleNamespace(
         engine_client=SimpleNamespace(
             model_config=SimpleNamespace(
+                model="test-model",
                 hf_config=SimpleNamespace(
                     tts_config={
                         "conditioning_mode": "speaker_only",
                         "task_decode_alignment": {"podcast": "old_shift"},
                     }
-                )
+                ),
             )
         ),
         _tts_tokenizer=tokenizer,
@@ -1004,6 +1008,7 @@ def test_adapter_language_and_reference_continuation(speaker_count, language, ex
     )
     assert prepared.tts_params["prompt_waveform"].shape[-1] == 3528 * speaker_count
     assert "prompt_latents" not in prepared.tts_params
+    assert (KEY_SPEAKER_EMBEDDING in prepared.tts_params) is not adapter_is_cuda
 
 
 @pytest.mark.parametrize("speaker_count", [1, 2])
@@ -1229,7 +1234,7 @@ def test_online_emergent_omits_speaker_conditioning():
 
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_named_speaker_cache_reuses_only_matching_voice_version(wrapped):
-    from vllm_omni.model_executor.models.ming3_tts.constants import KEY_SPEAKER_EMBEDDING, KEY_SPEAKER_WAVEFORM
+    from vllm_omni.model_executor.models.ming3_tts.constants import KEY_SPEAKER_WAVEFORM
     from vllm_omni.model_executor.models.ming3_tts.speaker_extractor import resolve_speaker_embeddings
     from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
@@ -1265,7 +1270,7 @@ def test_named_speaker_cache_reuses_only_matching_voice_version(wrapped):
 @pytest.mark.parametrize("inline", [False, True])
 @pytest.mark.parametrize("sft", [False, True])
 @pytest.mark.parametrize("max_tokens", [None, 100])
-def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tokens):
+def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tokens, adapter_is_cuda):
     import asyncio
 
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -1278,7 +1283,7 @@ def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tok
     server = SimpleNamespace(
         engine_client=SimpleNamespace(
             model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250} if sft else {})
+                model="test-model", hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250} if sft else {})
             )
         ),
         _tts_tokenizer=FakeTokenizer(),
@@ -1293,6 +1298,7 @@ def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tok
     )
     prepared = asyncio.run(adapter.build(request, [], inline))
     info = prepared.prompt["additional_information"]
+    assert (KEY_SPEAKER_EMBEDDING in info) is not adapter_is_cuda
     maximum = max_tokens or (250 if sft else 800)
     assert info[KEY_MAX_DECODE_STEPS] == maximum
     sampling = adapter.apply_sampling_overrides([SamplingParams()], request)
@@ -1356,7 +1362,7 @@ def test_podcast_speaker_cache_reuses_individual_references():
 
 @pytest.mark.parametrize("references", ["1", ["1"], ["1", "2"]])
 @pytest.mark.parametrize("turn_text", ["你好。", "字" * 100])
-def test_adapter_transports_content_keys_without_caching_prompt_latents(references, turn_text):
+def test_adapter_transports_content_keys_without_caching_prompt_latents(references, turn_text, adapter_is_cuda):
     import asyncio
 
     from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
@@ -1369,7 +1375,9 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
 
     server = SimpleNamespace(
         engine_client=SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250}))
+            model_config=SimpleNamespace(
+                model="test-model", hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250})
+            )
         ),
         _tts_tokenizer=FakeTokenizer(),
         _resolve_ref_audio_array=resolve,
@@ -1384,6 +1392,10 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
     for _ in range(2):
         prepared = asyncio.run(adapter.build(request, [], True))
         info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
+        assert (KEY_SPEAKER_EMBEDDING in info) is not adapter_is_cuda
+        if not adapter_is_cuda:
+            speaker_count = 2 if references == ["1", "2"] else 1
+            torch.testing.assert_close(info[KEY_SPEAKER_EMBEDDING], torch.zeros((speaker_count, 192)))
         assert info["speaker_audio_keys"] == (["content-a", "content-b"] if references == ["1", "2"] else ["content-a"])
         assert "voice_name" not in info
         assert "prompt_latents" not in info
