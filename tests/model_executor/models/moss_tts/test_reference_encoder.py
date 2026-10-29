@@ -558,9 +558,7 @@ async def test_model_type_namespaces_cache(make_encoder):
 @pytest.mark.parametrize(
     ("variant", "expected_sr"),
     [
-        # Local-v1.5 encodes references at a fixed 24 kHz working rate even
-        # though its output codec is 48 kHz stereo.
-        ("local", 24000),
+        ("local", 48000),
         ("tts", 48000),
         ("ttsd", 48000),
     ],
@@ -574,6 +572,18 @@ def test_build_reference_encoder_derives_geometry(variant, expected_sr):
     )
     assert enc._n_vq == 24
     assert enc._sr_target == expected_sr
+
+
+def test_local_reference_keeps_native_48khz_samples():
+    import numpy as np
+
+    proc = _FakeProcessor(n_vq=12, sampling_rate=48000)
+    encoder = build_reference_encoder(proc, variant="local", speaker_cache=SpeakerEmbeddingCache(max_bytes=8 * 1024**2))
+    # Alternating samples exercise frequencies lost by a 48 -> 24 -> 48 kHz
+    # round trip. Native-rate input must reach the processor unchanged.
+    waveform = np.tile(np.array([0.25, -0.25], dtype=np.float32), 2048)
+    prepared = encoder._encoder_input(_prep_wav_sync(waveform, 48000, encoder._sr_target))
+    torch.testing.assert_close(prepared, torch.from_numpy(waveform).unsqueeze(0), rtol=0, atol=0)
 
 
 def test_build_reference_encoder_falls_back_without_model_config_fields():

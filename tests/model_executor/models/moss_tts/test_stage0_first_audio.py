@@ -176,9 +176,11 @@ def test_mixed_batch_only_publishes_unconstrained_request(mocker):
     "backend,tp,pp,loads_decoder",
     [("uni", 1, 1, True), ("mp", 1, 1, False), ("uni", 2, 1, False), ("uni", 1, 2, False)],
 )
-def test_weight_loading_skips_unusable_first_decoder(mocker, backend, tp, pp, loads_decoder):
+@pytest.mark.parametrize("slot_state", [False, True])
+def test_weight_loading_skips_unusable_first_decoder(mocker, backend, tp, pp, loads_decoder, slot_state):
     model = torch.nn.Module()
-    model.config = SimpleNamespace()
+    model.config = SimpleNamespace(mrv2_gpu_slot_state=slot_state)
+    loads_decoder = loads_decoder and slot_state
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(use_v2_model_runner=True, async_chunk=True, enforce_eager=True),
         parallel_config=SimpleNamespace(

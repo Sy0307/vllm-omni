@@ -906,3 +906,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        # Detached audio must progress even when no generation batch remains.
+        drain = getattr(self.model_state, "drain_detached_audio", None)
+        if callable(drain):
+            drain()

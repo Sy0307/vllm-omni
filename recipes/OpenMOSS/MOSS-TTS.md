@@ -428,3 +428,86 @@ python -m pytest -q tests/model_executor/models/moss_tts/test_slot_attention.py 
   tests/model_executor/models/moss_tts/test_streaming_attention.py \
   -m 'core_model and cuda' --run-level=core_model
 ```
+
+## Single-stage Local fused profile (CUDA)
+
+The fused profile sends codec chunks of 1, 3, 7, then 15 frames (80, 240,
+560, then 1200 ms of audio). The smaller intermediate chunks bridge the
+first 80 ms to steady decoding without adding client prebuffering.
+`additional_config.moss_fused_codec.codec_chunk_ramp_frames` contains the
+intermediate sizes; they must increase strictly between
+`initial_codec_chunk_frames` and `codec_chunk_frames`. An empty list restores
+the direct transition from the first chunk to steady chunks. Early first
+audio counts as the first chunk. Ramp chunks use the first-chunk wait budget,
+and a stopped stream flushes its remaining
+frames immediately through the normal tail path.
+
+Chunk boundaries can change BF16 decoder rounding. Equal request seeds also
+do not guarantee identical generated codec tokens across dynamic serving
+batches. Validate chunking changes with both fixed-token decoder comparisons
+and repeated end-to-end quality runs using the deployed sampling and graph
+path. A confidence interval containing zero does not establish equal quality.
+
+`moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
+process on one GPU. It uses packed codec graphs, fused depth kernels, precise
+stream dependencies, and a codec GEMM SM carveout of 48. The ordinary
+`moss_tts_local.yaml` retains its two-stage CUDA pipeline and upstream first-audio
+path. Both CUDA profiles have 128 request slots and a 32 GiB talker KV cache.
+The fused scheduler reserves codec capacity until stopped requests finish their
+last audio. KV-cache preemption fails the affected fused request explicitly;
+it does not silently restart a partially delivered waveform.
+
+For continuation requests, the codec consumes the complete reference history
+before decoding target audio. Only reference PCM is discarded; target frames
+are retained. References are encoded at the codec's native 48 kHz input rate.
+The fused profile reserves ring headroom for the largest streaming chunk and
+uses a 32768-token context so reference and target frames share the model's
+supported context budget.
+
+Repeated references can reuse complete decoder KV and offset snapshots. The
+following settings under `additional_config.moss_fused_codec` are opt-in:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `codec_prefix_prefill` | `0` | Use a separate causal FA3 prefill path for fresh reference prefixes; requires a Hopper CUDA GPU, packed decoding and ring headroom. |
+| `codec_prefix_cache_max_bytes` | `0` | Bound an instance-local LRU of complete decoder prefix states; requires packed decoding and ring headroom. Zero disables retained snapshots. |
+
+Both paths preserve the steady chunk alignment: any reference remainder is
+decoded together with the first target chunk. Oversized prefixes use ordinary
+streaming steps. The cache stores decoder state, separately from reference
+codes and the talker's prefix cache, and copies restored state into independent
+request slots. Budget its memory explicitly: Local v1.5 needs about 120 MiB per
+reference state with this ring layout, in addition to model weights, active
+slots and graph buffers. Benefits depend on reference reuse and cache capacity.
+FA3 and packing can change BF16 rounding; validate the enabled configuration
+with fixed-code and end-to-end quality checks. These options do not change the
+model's stopping policy or resolve missed stopping windows.
+
+On Hopper and newer CUDA GPUs, compatible Triton kernels automatically use
+programmatic dependent launch. Prefix-cache hashing retains vLLM's request salt
+isolation. The grouped attention implementation is local to this model's
+backbone layers; it does not replace vLLM's global attention or upload functions.
+The fused profile reuses the ordinary Local depth and codec kernels.
+No additional experiment environment switches are required:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --omni --api-server-count 4 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml \
+  --allowed-local-media-path /absolute/path/to/seedtts_testset
+```
+
+For a C128 main-versus-fused comparison, use the same model, dependency versions,
+physical GPU, CPU allocation, four API servers, and dataset on both sides. Run
+main with its unchanged `moss_tts_local.yaml`.
+Pass `--seed-tts-file-ref-audio` to `vllm bench serve --omni` with the
+Seed-TTS dataset; each request then refers to `file:///.../prompt.wav`. The server
+and client must see the same absolute paths. This changes reference transport;
+it does not bypass the reference encoder.
+
+Warm both services with the same full dataset before formal rounds, and report
+successful audio seconds divided by complete round wall time. Any steady-window
+estimate must be labeled separately. Historical overlay throughput and quality
+results do not establish the performance or quality of a rebase onto a new main.
+Experimental oracle, profiling, codec scheduling, and FFN chunking changes are
+excluded from this profile.

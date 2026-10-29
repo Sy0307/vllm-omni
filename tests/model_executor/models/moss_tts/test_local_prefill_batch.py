@@ -38,7 +38,7 @@ def test_prefill_reuses_text_embeddings_and_noncontiguous_reference_offsets(mock
     req = _PrefillPositions(prompt_len=np.full(5, 8), num_computed_tokens=np.zeros(5))
     req.num_computed_tokens[[3, 0]] = [1, 2]
     embeds = state._static_inputs_embeds[:3]
-    expected = state.model.embed_input_ids(batch.input_ids) + state.model._audio_embed(codes[[1, 2, 2]])
+    expected = state.model._add_audio_embed(state.model.embed_input_ids(batch.input_ids), codes[[1, 2, 2]])
     embed = mocker.spy(state.model.model.embed_tokens, "forward")
     with torch.inference_mode():
         state.run_preprocess(batch, {"input_ids": batch.input_ids, "inputs_embeds": embeds}, req)
@@ -59,7 +59,9 @@ def test_cached_prefix_prefill_uses_absolute_reference_position(batch_prefill, c
     batch = _batch(torch.device("cpu"), [0], [count])
     req = _PrefillPositions(prompt_len=np.full(5, 4), num_computed_tokens=np.full(5, cached))
     embeds = state._static_inputs_embeds[:count]
-    expected = state.model.embed_input_ids(batch.input_ids) + state.model._audio_embed(codes[cached : cached + count])
+    expected = state.model._add_audio_embed(
+        state.model.embed_input_ids(batch.input_ids), codes[cached : cached + count]
+    )
     with torch.inference_mode():
         state.run_preprocess(batch, {"input_ids": batch.input_ids, "inputs_embeds": embeds}, req)
     torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
@@ -71,7 +73,7 @@ def test_scalar_prefill_uses_cached_prompt_position():
     state = _state(MossLocalModelState, torch.device("cpu"))
     codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])
     ids = torch.tensor([2])
-    expected = state.model.embed_input_ids(ids) + state.model._audio_embed(codes[2:3])
+    expected = state.model._add_audio_embed(state.model.embed_input_ids(ids), codes[2:3])
     with torch.inference_mode():
         _, actual, updates = state.model.preprocess(
             ids, None, codes={"ref": codes}, _omni_is_prefill=True, _omni_num_computed_tokens=2
@@ -90,7 +92,9 @@ def test_prefill_chunk_crosses_reference_end(batch_prefill, omit_trailing_pad):
     codes = torch.tensor([[8, 8], [1, 2], [3, 4], [5, 6], [8, 8], [8, 8]])
     if omit_trailing_pad:
         codes = codes[:4]
-    state.model._audio_embed = lambda rows: rows[:, :1].masked_fill(rows[:, :1] == 8, 0).expand(-1, 4) / 8
+    state.model._add_audio_embed = lambda text, rows: (
+        text + rows[:, :1].masked_fill(rows[:, :1] == 8, 0).expand(-1, 4) / 8
+    )
     state.intermediate_buffer.buffers[0] = {"req_id": "reference-boundary", "codes": {"ref": codes}}
     req = _PrefillPositions(prompt_len=np.full(5, 6), num_computed_tokens=np.zeros(5))
     outputs = []
@@ -141,13 +145,15 @@ def test_batched_real_audio_embedding_matches_scalar_bfloat16_reduction():
     model.n_vq = 12
     model.audio_vocab_size = model.audio_pad_token_id = 1024
     model._stacked_audio_emb_w = torch.randn(12, 1024, 3072, device="cuda", dtype=torch.bfloat16)
-    model._audio_embed = MossTTSLocalTalkerForGeneration._audio_embed.__get__(model)
+    model._add_audio_embed = MossTTSLocalTalkerForGeneration._add_audio_embed.__get__(model)
     state._static_inputs_embeds = torch.zeros(512, 3072, device="cuda", dtype=torch.bfloat16)
     references = [(start, torch.randint(0, 1025, (count, 12))) for start, count in [(0, 169), (201, 11), (220, 257)]]
     with torch.inference_mode():
         actual = torch.randn_like(state._static_inputs_embeds)
         expected = actual.clone()
         for start, codes in references:
-            expected[start : start + len(codes)] += model._audio_embed(codes.to("cuda"))
+            expected[start : start + len(codes)] = model._add_audio_embed(
+                expected[start : start + len(codes)], codes.to("cuda")
+            )
         state._apply_reference_batch(actual, references)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

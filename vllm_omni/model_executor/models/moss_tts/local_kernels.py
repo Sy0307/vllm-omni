@@ -625,20 +625,17 @@ def _mtp_epilogue(
     cols = block * BH + tl.arange(0, BH)
     cmask = cols < H
     emit = (tl.load(TextStep + batch * STRIDE_T) > 0) & (tl.load(Continue + batch) != 0)
-    acc = tl.zeros((BH,), tl.float32)
+    acc = tl.load(Embeds + batch * STRIDE_E + cols, cmask, 0.0).to(tl.float32)
     for c in tl.static_range(N_VQ):
         code = tl.load(Codes + batch * STRIDE_C + c)
         valid = code != PAD
         safe = tl.minimum(tl.maximum(tl.where(valid, code, 0), 0), VOCAB - 1)
         row = tl.load(Table + (c * VOCAB + safe) * H + cols, cmask, 0.0)
-        # bf16 row * bool mask -> bf16 (exact), accumulated in float32.
-        acc += (row.to(tl.float32) * valid.to(tl.float32)).to(row.dtype).to(tl.float32)
+        value = tl.where(valid & emit, row, 0.0).to(tl.float32)
+        acc = (acc + value).to(OutEmbeds.dtype.element_ty).to(tl.float32)
         if block == 0:
             tl.store(OutCodes + batch * N_VQ + c, tl.where(emit, code, PAD))
-    audio = acc.to(OutEmbeds.dtype.element_ty).to(tl.float32)
-    gated = (audio * emit.to(tl.float32)).to(OutEmbeds.dtype.element_ty).to(tl.float32)
-    base = tl.load(Embeds + batch * STRIDE_E + cols, cmask, 0.0).to(tl.float32)
-    tl.store(OutEmbeds + batch * H + cols, base + gated, cmask)
+    tl.store(OutEmbeds + batch * H + cols, acc, cmask)
 
 
 def mtp_epilogue(
@@ -652,8 +649,8 @@ def mtp_epilogue(
     """One-launch equivalent of the MOSS Local ``talker_mtp`` output path.
 
     ``emit = (text_step[:, 0] > 0) & should_continue``;
-    ``out = input_embeds + audio_embed(codes) * emit`` (pad codes contribute
-    zero, per-codebook float32 sum rounded once, as ``torch.sum`` does);
+    ``out`` adds each codebook to ``input_embeds`` in order, rounding after
+    every addition just as the checkpoint does; pad codes contribute zero.
     ``codes_out = where(emit, codes, pad_id)``.
     """
     batch, n_vq = codes.shape

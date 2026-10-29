@@ -221,6 +221,8 @@ class _MossCodecStreamSession:
         chunk_frames: int = 0,
         ring_headroom: bool = False,
         packed: bool = False,
+        packed_frame_sizes: list[int] | None = None,
+        packed_sm_carveout: int = 0,
     ) -> None:
         self._codec = codec
         self._state_capacity = int(state_capacity)
@@ -249,13 +251,18 @@ class _MossCodecStreamSession:
         scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
         if isinstance(codec, MossAudioTokenizerV2Model):
             scratch_capacity = 1
-        packed_frame_sizes = (
-            sorted({frames for b in batch_sizes for frames in (b, b * self._chunk_frames) if frames > 1})
-            if packed
-            else []
-        )
+        explicit_packed = packed_frame_sizes is not None
+        if explicit_packed:
+            packed_frame_sizes = sorted({int(size) for size in packed_frame_sizes if int(size) > 1})
+        else:
+            packed_frame_sizes = (
+                sorted({frames for b in batch_sizes for frames in (b, b * self._chunk_frames) if frames > 1})
+                if packed
+                else []
+            )
+        if self._device.type != "cuda":
+            packed_frame_sizes = []
         if packed_frame_sizes:
-            # Packed graphs decode every streaming step; no batched graphs.
             batch_sizes = []
         # A packed call's segments past its streams own distinct scratch slots.
         packed_segments = self._state_capacity + 1
@@ -333,6 +340,8 @@ class _MossCodecStreamSession:
                 scratch_base=self._state_capacity,
                 num_quantizers=self._n_vq,
                 vllm_config=vllm_config,
+                sm_carveout=packed_sm_carveout,
+                compile_decode=explicit_packed,
             )
             self._packed_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
@@ -650,6 +659,7 @@ class MossTTSCodecDecoder(nn.Module):
         self._n_channels: int = 1
         self._sr_tensor = torch.tensor(self._OUTPUT_SAMPLE_RATE, dtype=torch.int32)
         self._stream_session: _MossCodecStreamSession | None = None
+        self._prefix_accelerator = None
         self._codec_stream: torch.cuda.Stream | None = None
         scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
         self._stream_state_capacity = max(1, int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1))
@@ -661,6 +671,13 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_ring_headroom: bool = bool(self._connector_int("codec_ring_headroom", default=0))
         self._stream_req_slots: dict[str, int] = {}
         self._stream_first_audio_requests: set[str] = set()
+        # Opt-in (single-stage pipeline): packed decode graphs keyed by total frames.
+        packed_sizes = (
+            self._connector_extra().get("codec_packed_frame_sizes")
+            if self._connector_int("codec_packed_decode", default=0)
+            else None
+        )
+        self._packed_frame_sizes: list[int] = sorted({int(size) for size in packed_sizes or [] if int(size) > 1})
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._gpu_stream_output = (
             self._async_chunk
@@ -1020,6 +1037,8 @@ class MossTTSCodecDecoder(nn.Module):
                 and bool(self._streaming_graph_batch_sizes)
                 and getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa") == "triton_slot"
             ),
+            packed_frame_sizes=self._packed_frame_sizes or None,
+            packed_sm_carveout=self._connector_int("codec_gemm_sm_carveout", default=0),
         )
         if self._stream_ring_headroom:
             logger.info(

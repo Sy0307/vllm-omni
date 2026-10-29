@@ -121,7 +121,7 @@ def _talker_stub(fused_depth, n_vq, vocab, hidden, codes, should_continue, dtype
             generate_frame=lambda *args, **kwargs: (should_continue.clone(), codes.clone()),
         ),
     )
-    stub._audio_embed = lambda c: MossTTSLocalTalkerForGeneration._audio_embed(stub, c)
+    stub._add_audio_embed = lambda text, c: MossTTSLocalTalkerForGeneration._add_audio_embed(stub, text, c)
     return MossTTSLocalTalkerForGeneration.talker_mtp, stub
 
 

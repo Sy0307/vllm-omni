@@ -219,6 +219,8 @@ class StreamingExecutionContext:
     # Set with ``packed_stage`` when the transformer advances its layers'
     # offsets itself: every segment's offset, equal in all of its layers.
     packed_offsets: torch.Tensor | None = None
+    prefix_prefill: bool = False
+    prefix_cu_seqlens: torch.Tensor | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -1187,22 +1189,42 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 projected[:, :, 0], projected[:, :, 1], offset, time_before_heads=True, table=context.rope_table
             )
         v = projected[:, :, 2]
-        x = slot_ring_flash_attention_packed(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            state.kv_cache.cache,
-            offset,
-            slots,
-            lengths,
-            tok_starts,
-            entry_seg,
-            entry_blk,
-            self.context if self.context is not None else -1,
-            int(self._packed_block_m),
-            *getattr(self, "_packed_launch", (0, 0, 0)),
-        )
-        x = self.out_projs[0](x.transpose(1, 2).reshape(1, N, self.embed_dim))
+        if context.prefix_prefill:
+            from .codec_prefix import prefix_attention
+
+            assert context.prefix_cu_seqlens is not None and self.context is not None
+            x = prefix_attention(
+                q[0],
+                k[0],
+                v[0],
+                state.kv_cache.cache,
+                slots,
+                tok_starts,
+                lengths,
+                context.prefix_cu_seqlens,
+                self.context,
+            ).reshape(1, N, self.embed_dim)
+        else:
+            x = (
+                slot_ring_flash_attention_packed(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    state.kv_cache.cache,
+                    offset,
+                    slots,
+                    lengths,
+                    tok_starts,
+                    entry_seg,
+                    entry_blk,
+                    self.context if self.context is not None else -1,
+                    int(self._packed_block_m),
+                    *getattr(self, "_packed_launch", (0, 0, 0)),
+                )
+                .transpose(1, 2)
+                .reshape(1, N, self.embed_dim)
+            )
+        x = self.out_projs[0](x)
         if hoisted:
             return x
         next_offset = torch.where(context.valid_rows, offset + lengths, offset)
@@ -1814,6 +1836,9 @@ class MossAudioTokenizerTransformer(StreamingModule):
             rope_table=table,
             packed_stage=(lengths, tok_starts, entry_seg, entry_blk),
             packed_offsets=offsets if block is not None else None,
+            prefix_cu_seqlens=(
+                F.pad(torch.cumsum(lengths, 0, dtype=torch.int32), (1, 0)) if context.prefix_prefill else None
+            ),
         )
         if self._fused_norm_ready(x, context):
             x = self._fused_layers(x, context)
