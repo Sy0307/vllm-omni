@@ -529,8 +529,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             "prompt_token_ids": text_ids,
             "codes": {"ref": audio_codes},
         }
-        if v == "local" and request.ref_text and request.ref_text.strip():
-            params["meta"] = {"ref_code_len": int(reference[0].shape[0])}
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
         if 0 in resolve_keys:

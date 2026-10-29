@@ -401,16 +401,6 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
-def test_empty_generation_step_drains_detached_audio_after_request_cleanup(monkeypatch):
-    runner = _make_runner()
-    calls = []
-    runner.model = SimpleNamespace()
-    runner.model_state = SimpleNamespace(drain_detached_audio=lambda: calls.append("audio"))
-    monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: calls.append("requests"))
-    runner.finish_requests(SchedulerOutput.make_empty())
-    assert calls == ["requests", "audio"]
-
-
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()

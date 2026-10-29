@@ -50,7 +50,7 @@ def _model(device):
     model.talker_mtp_accepts_per_row_generators = True
     model.gpu_resident_buffer_keys = {("hidden_states", "last"), ("audio_codes", "current")}
     model.audio_lm_heads = model.audio_embeddings = model.local_text_lm_head = None
-    model._add_audio_embed = lambda text, codes: text + codes[:, :1].expand(-1, 4).to(dtype) / 8
+    model._audio_embed = lambda codes: codes[:, :1].expand(-1, 4).to(dtype) / 8
     model.force_stop = False
 
     def frame(hidden, *_args, generator=None, generators=None, temperature=None, top_k=None, top_p=None, **_kwargs):
@@ -168,25 +168,6 @@ def _step(state, batch, req_states, dispatcher=None):
         result = inputs["inputs_embeds"].clone(), payload, tokens
         hidden.fill_(-100)  # next graph replay can overwrite its output immediately
     return result
-
-
-@pytest.mark.cpu
-@pytest.mark.parametrize("prefix_frames", [0, 3])
-def test_continuation_does_not_publish_unprimed_first_audio(prefix_frames, mocker):
-    device = torch.device("cpu")
-    state = _state(MossLocalModelState, device)
-    state._batch_prefill = True
-    _admit(state, 0, "utterance", 42)
-    state.intermediate_buffer.buffers[0]["meta"] = {"ref_code_len": prefix_frames}
-    early = mocker.Mock()
-    state._early_first_audio = early
-    batch = _batch(device, [0], [2])
-    inputs = {"input_ids": batch.input_ids, "inputs_embeds": state._static_inputs_embeds[:2]}
-    progress = SimpleNamespace(prompt_len=np.array([2]), num_computed_tokens=np.array([0]))
-
-    state.run_preprocess(batch, inputs, progress)
-
-    assert early.record_prefill.call_count == (0 if prefix_frames else 1)
 
 
 @pytest.mark.parametrize("seed", [None, 17])

@@ -28,7 +28,6 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalConfig,
     MossTTSRealtimeConfig,
 )
-from vllm_omni.model_executor.models.moss_tts.fused_codec import build_fused_codec, fused_codec_enabled
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     MossTTSRealtimeLocalTransformer,
     _normalize_generators,
@@ -1337,10 +1336,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
-        if getattr(self.config, "talker_decode_attention", False):
-            from .decode_attention import use_moss_local_attention
-
-            use_moss_local_attention(self.model)
 
         # Real text LM head -- loaded from the checkpoint but never consulted
         # at inference (see class docstring); kept purely as a destination
@@ -1390,13 +1385,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             ("audio_codes", "accumulated"),
             ("hidden_states", "last"),
         }
-        # Single-stage pipeline: the codec is loaded after the talker weights.
-        # Kept outside the module tree: its weights come from another
-        # checkpoint and its decoder keeps its own dtype.
-        self.__dict__["fused_codec"] = None
-        if fused_codec_enabled(vllm_config):
-            # Per-step PCM outputs are freshly allocated by the codec.
-            self.mm_outputs_fresh_per_step = True
 
     # ------------------------------------------------------------------
     # vLLM hooks
@@ -1500,8 +1488,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     # Embedding (text + audio codebooks, additive)
     # ------------------------------------------------------------------
 
-    def _add_audio_embed(self, text_embeds: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
-        """Add codebooks to text in checkpoint order, rounding at every addition."""
+    def _audio_embed(self, codes: torch.Tensor) -> torch.Tensor:
+        """``codes``: ``(T, n_vq)`` long, possibly containing ``audio_pad_token_id``
+        (outside the valid embedding range). Returns the ``(T, H)`` additive
+        audio embedding, masking out pad positions per codebook.
+        """
         if (
             self._stacked_audio_emb_w is not None
             and self._stacked_audio_emb_w.dtype in (torch.bfloat16, torch.float16)
@@ -1509,13 +1500,20 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         ):
             from vllm_omni.model_executor.models.moss_tts.audio_embed_kernel import audio_embed
 
-            return audio_embed(codes, self._stacked_audio_emb_w, self.audio_pad_token_id, text_embeds)
+            return audio_embed(codes, self._stacked_audio_emb_w, self.audio_pad_token_id)
+        device = codes.device
         valid_mask = codes.ne(self.audio_pad_token_id)  # (T, n_vq)
         safe_codes = codes.masked_fill(~valid_mask, 0).clamp(0, self.audio_vocab_size - 1)
-        embeds = text_embeds
+        if self._stacked_audio_emb_w is not None:
+            n_vq_idx = torch.arange(self.n_vq, device=device)
+            codes_t = safe_codes.t()  # (n_vq, T)
+            gathered = self._stacked_audio_emb_w[n_vq_idx.unsqueeze(1), codes_t]  # (n_vq, T, H)
+            gathered = gathered * valid_mask.t().unsqueeze(-1)
+            return gathered.sum(0)
+        embeds: torch.Tensor | None = None
         for i, emb_layer in enumerate(self.audio_embeddings):
             col = emb_layer(safe_codes[:, i]) * valid_mask[:, i].unsqueeze(-1)
-            embeds = embeds + col
+            embeds = col if embeds is None else embeds + col
         return embeds
 
     def preprocess(
@@ -1551,7 +1549,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                     chunk = ref_codes[ref_offset:end_off]
                     if chunk.numel() > 0:
                         codes = chunk.to(device=device, dtype=torch.long)
-                        embeds[: chunk.shape[0]] = self._add_audio_embed(embeds[: chunk.shape[0]], codes)
+                        embeds[: chunk.shape[0]] += self._audio_embed(codes)
 
             info_update: dict[str, Any] = {
                 "audio_state": {"is_stopping": False},
@@ -1704,8 +1702,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             )
         active_mask = text_step.reshape(bsz, -1)[:, :1] > 0
         emit_mask = active_mask & should_continue_t.reshape(bsz, 1)
-        conditioned = self._add_audio_embed(input_embeds_out, new_codes)
-        input_embeds_out = torch.where(emit_mask, conditioned, input_embeds_out)
+        audio_embed = self._audio_embed(new_codes).to(dtype=input_embeds_out.dtype)
+        input_embeds_out = input_embeds_out + audio_embed * emit_mask.to(dtype=input_embeds_out.dtype)
 
         keep = emit_mask.reshape(-1)
         output_codes = torch.where(
@@ -1868,8 +1866,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             torch.float16,
         ):
             self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
-        if fused_codec_enabled(self.vllm_config):
-            self.__dict__["fused_codec"] = build_fused_codec(self.vllm_config)
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",
@@ -1887,8 +1883,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         if (
             model_config.use_v2_model_runner
             and model_config.async_chunk
-            and getattr(self.config, "mrv2_gpu_slot_state", False)
-            and not fused_codec_enabled(self.vllm_config)
             and supports_in_process_first_audio(self.vllm_config)
         ):
             from .first_frame_decoder import MossFirstFrameDecoder

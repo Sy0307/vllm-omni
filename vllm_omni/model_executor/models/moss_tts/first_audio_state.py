@@ -7,11 +7,9 @@ from vllm.sampling_params import SamplingParams
 
 
 class MossEarlyFirstAudioState:
-    def __init__(self, owner, decoder, publish=None):
-        """``publish(ids, codes, valid) -> accepted ids`` replaces the decoder when another owner sends."""
+    def __init__(self, owner, decoder):
         self.owner = owner
         self.decoder = decoder
-        self.publish = publish
         self.waiting = set()
         self.seen = set()
         self.delivered = {}
@@ -86,10 +84,7 @@ class MossEarlyFirstAudioState:
         # the forward and has already masked non-emitting rows in its codes.
         if input_ids is not None:
             valid &= input_ids.reshape(-1).index_select(0, rows).eq(self.owner.model.audio_assistant_slot_token_id)
-        if self.publish is not None:
-            accepted = set(self.publish(ids, first_codes, valid))
-        else:
-            accepted = set(self._publish(ids, first_codes, valid))
+        accepted = set(self._publish(ids, first_codes, valid))
         for rid, row_valid in zip(ids, valid.unbind(), strict=True):
             self.waiting.discard(rid)
             self.seen.add(rid)

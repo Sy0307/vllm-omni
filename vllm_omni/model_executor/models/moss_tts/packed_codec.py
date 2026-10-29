@@ -22,7 +22,6 @@ stereo codec.
 
 from __future__ import annotations
 
-import copy
 import functools
 import time
 from dataclasses import dataclass
@@ -31,9 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.config.vllm import set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -91,9 +88,7 @@ def _(
     return audio.new_empty((frame_segments.shape[0] * samples_per_frame * channels,), dtype=torch.float32)
 
 
-def decode_packed_tensors(
-    codec: nn.Module, codes: torch.Tensor, meta: torch.Tensor, *, prefix_prefill: bool = False
-) -> torch.Tensor:
+def decode_packed_tensors(codec: nn.Module, codes: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
     """Decode packed segments; returns the fp32 per-segment output (see module docstring).
 
     ``codes`` is (n_vq, 1, N). ``meta`` is (3, S) int64: frames, state slot and
@@ -116,7 +111,6 @@ def decode_packed_tensors(
         segment_frames=frames,
         segment_starts=bounds[:-1],
         frame_segments=frame_segments,
-        prefix_prefill=prefix_prefill,
     )
     lengths = torch.full((1,), n, device=codes.device, dtype=torch.long)
     with torch.autocast(device_type=codes.device.type, dtype=torch.bfloat16):
@@ -169,33 +163,6 @@ def enable_packed_decode(codec: nn.Module, chunk_frames: int) -> int:
     return count
 
 
-@support_torch_compile(dynamic_arg_dims={"codes": 2})
-class _PackedDecodeCompileAdapter(nn.Module):
-    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
-        super().__init__()
-        self.codec = codec
-
-    def forward(self, codes: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
-        return decode_packed_tensors(self.codec, codes, meta)
-
-
-@support_torch_compile(dynamic_arg_dims={"codes": 2})
-class _PrefixDecodeCompileAdapter(nn.Module):
-    """A distinct AOT identity: model tags do not enter vLLM's AOT hash.
-
-    An instance boolean on the streaming adapter is insufficient: loading an
-    AOT artifact bypasses Dynamo guards on that boolean and can silently run
-    ring attention over a prefix larger than the ring's safe chunk headroom.
-    """
-
-    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
-        super().__init__()
-        self.codec = codec
-
-    def forward(self, codes: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
-        return decode_packed_tensors(self.codec, codes, meta, prefix_prefill=True)
-
-
 @dataclass
 class _PackedGraph:
     graph: CUDAGraph
@@ -221,18 +188,10 @@ class CUDAGraphPackedDecoderWrapper:
         scratch_base: int,
         num_quantizers: int,
         vllm_config: VllmConfig,
-        sm_carveout: int = 0,
-        prefix_prefill: bool = False,
-        compile_decode: bool = False,
     ) -> None:
         self.codec = codec
         self._warmups = max(1, vllm_config.compilation_config.cudagraph_num_of_warmups)
-        # SMs the packed graphs' cuBLASLt GEMMs leave free (their persistent
-        # kernels otherwise hold every SM), so the talker's kernels issued on
-        # the main stream can run beside a codec decode. Captured into the
-        # graphs: the talker's own GEMMs are unaffected.
-        self.sm_carveout = int(sm_carveout)
-        # One-frame buckets are excluded: a size-1 dim would specialize the compiled graph.
+        # No one-frame bucket: a one-frame call replays the two-frame graph.
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) >= 2})
         self.max_segments = int(max_segments)
         self.scratch_base = int(scratch_base)
@@ -244,28 +203,8 @@ class CUDAGraphPackedDecoderWrapper:
         self._stream: torch.cuda.Stream | None = None
         self._host: list[tuple[torch.Tensor, np.ndarray, torch.cuda.Event, bool]] = []
         self._host_index = 0
-        if compile_decode or prefix_prefill:
-            compile_config = copy.copy(vllm_config)
-            compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
-            compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-            compile_config.compilation_config.static_forward_context = {}
-            compile_config.compilation_config.traced_files = set()
-            if prefix_prefill:
-                # Prefix frames have their own domain, independent of the talker's
-                # token budget. Do not inherit its finalized 512-token range or the
-                # ordinary decoder's already populated compile-cache directories.
-                compile_config.compilation_config.compile_ranges_endpoints = [self.max_frames]
-                compile_config.compilation_config.compile_sizes = []
-                compile_config.compilation_config.cache_dir = ""
-                compile_config.compilation_config.local_cache_dir = ""
-                compile_config.scheduler_config = copy.copy(vllm_config.scheduler_config)
-                compile_config.scheduler_config.max_num_batched_tokens = self.max_frames
-            with set_current_vllm_config(compile_config):
-                adapter = _PrefixDecodeCompileAdapter if prefix_prefill else _PackedDecodeCompileAdapter
-                self._decode = adapter(codec, vllm_config=compile_config)
-        else:
-            # This wrapper owns CUDA Graph capture/replay; the decode runs uncompiled.
-            self._decode = functools.partial(decode_packed_tensors, codec)
+        # This wrapper owns CUDA Graph capture/replay; the decode runs uncompiled.
+        self._decode = functools.partial(decode_packed_tensors, codec)
 
     @property
     def max_frames(self) -> int:
@@ -284,19 +223,12 @@ class CUDAGraphPackedDecoderWrapper:
         start_s = time.perf_counter()
         self._stream = torch.cuda.Stream(device=device)
         self._pool = current_platform.get_global_graph_pool()
-        # Explicit even when 0: the talker may have set a process-wide carveout.
-        previous_carveout = torch._C._get_sm_carveout_experimental()
-        torch._C._set_sm_carveout_experimental(self.sm_carveout)
-        try:
-            self._capture(device)
-        finally:
-            torch._C._set_sm_carveout_experimental(previous_carveout)
+        self._capture(device)
         logger.info(
-            "MOSS-TTS packed codec CUDA graphs: %d frame buckets %s, %d segments, GEMM SM carveout %d, captured in %.1f s",  # noqa: E501
+            "MOSS-TTS packed codec CUDA graphs: %d frame buckets %s, %d segments, captured in %.1f s",  # noqa: E501
             len(self.graphs),
             sorted(self.graphs),
             self.max_segments,
-            self.sm_carveout,
             time.perf_counter() - start_s,
         )
 

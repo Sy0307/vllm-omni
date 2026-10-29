@@ -116,9 +116,6 @@ class _UvaIndexPools:
 
 
 class MossLocalModelState(OmniModelState):
-    # Single-stage pipeline only; set in __init__ when the model owns a codec.
-    _fused_audio = None
-
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
         self._init_slot_buffers(self.scheduler_config.max_num_seqs, model.hidden_size, device, self.dtype)
@@ -151,34 +148,9 @@ class MossLocalModelState(OmniModelState):
             self._early_first_audio = MossEarlyFirstAudioState(self, decoder)
             logger.info("MOSS Local first PCM uses the Stage0 decoder after normal batched MTP")
 
-        # Single-stage pipeline: chunk decoding with the talker's own codec.
-        if getattr(model, "fused_codec", None) is not None:
-            from vllm_omni.model_executor.models.moss_tts.fused_audio import MossFusedAudio
-
-            self._fused_audio = MossFusedAudio(
-                model.fused_codec, self.scheduler_config.max_num_seqs, model.n_vq, model.audio_pad_token_id, device
-            )
-            logger.info("MOSS Local single-stage codec decoding enabled")
-            from vllm_omni.model_executor.models.moss_tts.fused_codec import fused_early_first_audio_enabled
-
-            if self._early_first_audio is None and fused_early_first_audio_enabled(vllm_config):
-                # The first frame is sampled right after the final prefill, as
-                # in the two-stage pipeline; the in-process codec decodes it in
-                # its next packed call and the first-audio sender delivers it.
-                from .first_audio_state import MossEarlyFirstAudioState
-
-                self._early_first_audio = MossEarlyFirstAudioState(
-                    self, None, publish=self._fused_audio.add_first_frames
-                )
-                # The engine binds the first-audio sink only to stages that opt in.
-                self.accepts_first_audio_sink = True
-                logger.info("MOSS Local single-stage first PCM goes ahead of the step output")
-
     def set_first_audio_sink(self, sink):
         if self._early_first_audio is not None:
             self._early_first_audio.set_sink(sink)
-            if self._fused_audio is not None:
-                self._fused_audio.first_sender = self._first_audio_sender
         else:
             super().set_first_audio_sink(sink)
 
@@ -187,11 +159,7 @@ class MossLocalModelState(OmniModelState):
             if self._early_first_audio is not None and self._first_audio_sender is not None:
                 self._first_audio_sender.close()
         finally:
-            try:
-                super().close_first_audio_sender()
-            finally:
-                if self._fused_audio is not None and self._fused_audio.tail_sender is not None:
-                    self._fused_audio.tail_sender.close()
+            super().close_first_audio_sender()
 
     def _init_slot_buffers(self, capacity, hidden_size, device, dtype):
         self._hidden_pool = torch.zeros((capacity, hidden_size), dtype=dtype, device=device)
@@ -208,8 +176,8 @@ class MossLocalModelState(OmniModelState):
         self._direct_tokens = False
         # Eager MTP: a frame is sampled right after the forward that produced
         # its hidden state, one step earlier than the canonical preprocess
-        # path. Its complete text+audio embedding is reused next step;
-        # rounding must preserve text-first codebook addition. ``_keep_pool``
+        # path. Its input-embedding contribution (audio embedding times emit
+        # mask) is added to the next step's text embedding; ``_keep_pool``
         # chains emission so a stopped stream cannot emit again.
         self._local_eager_mtp = False
         self._eager_emb_pool = torch.zeros((capacity, hidden_size), dtype=dtype, device=device)
@@ -305,17 +273,13 @@ class MossLocalModelState(OmniModelState):
             event.record(torch.cuda.current_stream(embeds.device))
         packed = device[:count]
         positions = packed[:, 0]
-        conditioned = self.model._add_audio_embed(embeds.index_select(0, positions), packed[:, 1:])
-        embeds.index_copy_(0, positions, conditioned)
+        audio = self.model._audio_embed(packed[:, 1:])
+        embeds.index_copy_(0, positions, embeds.index_select(0, positions) + audio)
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
         self._active_host[req_index] = True
         self._eager_host[req_index] = False
-        if self._fused_audio is not None:
-            self._fused_audio.add_request(
-                req_index, str(new_req_data.req_id), self.intermediate_buffer.buffers[req_index]
-            )
         self._first_mtp_slots.discard(req_index)
         if self._uva is not None:
             # Applied by one fused kernel at the start of the next preprocess,
@@ -442,9 +406,7 @@ class MossLocalModelState(OmniModelState):
             if prefill and computed is not None and prompt_len is not None and computed + count >= prompt_len:
                 completing_rows.append(row)
                 early = getattr(self, "_early_first_audio", None)
-                if early is not None and (
-                    self._fused_audio is not None or not (buf.get("meta") or {}).get("ref_code_len", 0)
-                ):
+                if early is not None:
                     early.record_prefill(str(buf["req_id"]), buf.get("sampling_params"), prompt_len=prompt_len)
             if count == 1 and not prefill and isinstance(buf.get("audio_state"), dict):
                 active = not bool(buf["audio_state"].get("is_stopping"))
@@ -520,7 +482,9 @@ class MossLocalModelState(OmniModelState):
                 offsets.copy_(
                     self._select_rows(input_batch.query_start_loc, eager_rows, self._uva and self._uva.eager_offsets)
                 )
-                embeds.index_copy_(0, offsets, self._eager_emb_pool.index_select(0, slots))
+                embeds.index_copy_(
+                    0, offsets, embeds.index_select(0, offsets) + self._eager_emb_pool.index_select(0, slots)
+                )
             if canonical_rows:
                 self._run_slot_mtp(input_batch, input_ids, embeds, canonical_rows, mtp_batch_descriptor_dispatcher)
         elif decode_rows:
@@ -528,7 +492,9 @@ class MossLocalModelState(OmniModelState):
             if cached:
                 slots = self._select_rows(input_batch.idx_mapping, cached, self._uva and self._uva.eager_slots)
                 offsets = self._select_rows(input_batch.query_start_loc, cached, self._uva and self._uva.eager_offsets)
-                embeds.index_copy_(0, offsets, self._eager_emb_pool.index_select(0, slots))
+                embeds.index_copy_(
+                    0, offsets, embeds.index_select(0, offsets) + self._eager_emb_pool.index_select(0, slots)
+                )
                 for row in cached:
                     self._first_mtp_slots.discard(int(input_batch.idx_mapping_np[row]))
             pending = [row for row in decode_rows if row not in cached]
@@ -595,16 +561,16 @@ class MossLocalModelState(OmniModelState):
         """Sample the next frame from this forward's hidden state.
 
         Same MTP inputs as the canonical next-step preprocess (hidden state
-        and active flag). Build the complete next input embedding here, with
-        the forced audio-slot text embedding included before codebooks are
-        added. A decode row emits only if its previous frame did.
+        and active flag); the input embedding is zero, so the returned
+        embedding is exactly the audio contribution the next step adds to its
+        text embedding. A decode row emits only if its previous frame did.
         """
         bsz = len(rows)
         slots = self._select_rows(batch.idx_mapping, rows, self._uva and self._uva.eager_mtp_slots)
         ids, emb = self._mtp_state._mtp_input_ids[:bsz], self._mtp_state._mtp_input_embeds[:bsz]
         hidden, step = self._mtp_state._mtp_hidden[:bsz], self._mtp_state._mtp_text_step[:bsz]
-        ids.fill_(self.model.audio_assistant_slot_token_id)
-        emb.copy_(self.model.embed_input_ids(ids))
+        ids.zero_()  # the MTP does not read token ids
+        emb.zero_()
         torch.index_select(self._hidden_pool, 0, slots, out=hidden)
         gate = self._keep_pool.index_select(0, slots)
         if completing:
@@ -629,7 +595,7 @@ class MossLocalModelState(OmniModelState):
         with set_forward_context(
             None, self.vllm_config, num_tokens=num_tokens, cudagraph_runtime_mode=mode, batch_descriptor=desc
         ):
-            next_embeds, codes = self._mtp_state._call_mtp_with_sampling(
+            contribution, codes = self._mtp_state._call_mtp_with_sampling(
                 self._mtp_state._mtp_input_ids[:num_tokens],
                 self._mtp_state._mtp_input_embeds[:num_tokens],
                 self._mtp_state._mtp_hidden[:num_tokens],
@@ -642,7 +608,7 @@ class MossLocalModelState(OmniModelState):
         early = getattr(self, "_early_first_audio", None)
         if early is not None:
             early.after_mtp(req_ids, codes)
-        self._eager_emb_pool.index_copy_(0, slots, next_embeds[:bsz])
+        self._eager_emb_pool.index_copy_(0, slots, contribution[:bsz])
         self._codes_pool.index_copy_(0, slots, codes)
         self._keep_pool.index_copy_(0, slots, codes.ne(self.model.audio_pad_token_id).any(dim=-1))
 
@@ -688,15 +654,6 @@ class MossLocalModelState(OmniModelState):
         slots = self._select_rows(input_batch.idx_mapping, self._decode_rows, self._uva and self._uva.rows)
         codes = self._codes_pool.index_select(0, slots)
         keep = codes.ne(model.audio_pad_token_id).any(dim=-1)
-        fused = self._fused_audio
-        early = getattr(self, "_early_first_audio", None)
-        if fused is not None:
-            if early is not None:
-                # Early first frames already went to the fused codec; no flags to publish.
-                early.updates.clear()
-            # Frames stay on the device; the stop token keeps its two-stage step.
-            upload = lambda data: _metadata_to_device(data, codes.device)  # noqa: E731
-            fused.step(input_batch, self._decode_rows, codes, keep, upload)
         if self._decode_rows == list(range(input_batch.num_reqs)):
             model._batch_should_continue = keep
         else:
@@ -708,38 +665,8 @@ class MossLocalModelState(OmniModelState):
                     codes.device,
                 )
             model._batch_should_continue.index_copy_(0, rows, keep)
-        if fused is not None:
-            # Read only for truthiness; PCM comes from prepare_streaming_audio_output.
-            return model_output, {"fused_audio": True}
+        early = getattr(self, "_early_first_audio", None)
         first_audio = early.take_flags(input_batch.req_ids, codes.device) if early is not None else None
         return model_output, _CodeRowsSnapshot(
             codes, list(self._decode_rows), input_batch.num_reqs, first_audio, partitioned=self._partitioned_rows
         )
-
-    def prepare_streaming_audio_output(self, input_batch, req_states, outputs):
-        if self._fused_audio is None:
-            return super().prepare_streaming_audio_output(input_batch, req_states, outputs)
-        return self._fused_audio.take_step(input_batch.num_reqs)
-
-    def set_tail_audio_sender(self, scheduler):
-        """Bind the sender of audio decoded after a request stopped generating."""
-        if self._fused_audio is None:
-            return False
-        from .tail_audio_sender import TailAudioSender
-
-        self._fused_audio.tail_sender = TailAudioSender(scheduler, self.device)
-        return True
-
-    def drain_detached_audio(self):
-        if self._fused_audio is not None:
-            self._fused_audio.drain_detached_audio()
-
-    def on_requests_finished(self, req_ids):
-        if self._fused_audio is not None:
-            self._fused_audio.finish(req_ids)
-        super().on_requests_finished(req_ids)
-
-    def on_request_preempted(self, req_id, req_index):
-        if self._fused_audio is not None:
-            self._fused_audio.preempt(req_id)
-        super().on_request_preempted(req_id, req_index)

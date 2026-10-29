@@ -475,7 +475,7 @@ def test_all_adapters_are_ar_or_diffusion():
 @pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
 def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
     adapter = adapter_cls(SimpleNamespace(server=object()))
-    stage_defaults = [SamplingParams(max_tokens=4096)]
+    stage_defaults = [SimpleNamespace(max_tokens=4096)]
 
     overridden = adapter.apply_sampling_overrides(
         stage_defaults,
@@ -572,12 +572,10 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
 
     if mode == "continuation":
-        assert prepared.tts_params["meta"]["ref_code_len"] == 3
         processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English")
         processor.build_assistant_message.assert_called_once_with(audio_codes_list=reference)
         conversation = [processor.build_user_message.return_value, processor.build_assistant_message.return_value]
     else:
-        assert not (prepared.tts_params.get("meta") or {}).get("ref_code_len")
         processor.build_user_message.assert_called_once_with(text="Target.", language="English", reference=reference)
         processor.build_assistant_message.assert_not_called()
         conversation = [processor.build_user_message.return_value]

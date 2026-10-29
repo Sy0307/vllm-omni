@@ -30,15 +30,12 @@ def test_fused_embedding_matches_native_padding_clamping_and_reduction(dtype, ro
     valid = codes.ne(vocab)
     safe = codes.masked_fill(~valid, 0).clamp(0, vocab - 1)
     gathered = weights[torch.arange(nq, device="cuda")[:, None], safe.t()]
-    base = torch.randn(rows, hidden, device="cuda", dtype=dtype)
-    expected = base
-    for contribution in (gathered * valid.t().unsqueeze(-1)).unbind(0):
-        expected = expected + contribution
-    actual = audio_embed(codes, weights, vocab, base)
+    expected = (gathered * valid.t().unsqueeze(-1)).sum(0)
+    actual = audio_embed(codes, weights, vocab)
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected)
     saved = actual.clone()
-    audio_embed(torch.zeros_like(codes), weights, vocab, base)
+    audio_embed(torch.zeros_like(codes), weights, vocab)
     torch.testing.assert_close(actual, saved, rtol=0, atol=0)
 
 
@@ -62,7 +59,7 @@ def test_fused_embedding_padding_and_clamping_are_bitwise_exact(dtype):
         dtype=dtype,
     )
 
-    actual = audio_embed(codes, weights, vocab, torch.zeros_like(expected))
+    actual = audio_embed(codes, weights, vocab)
 
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -72,28 +69,8 @@ def test_compiled_embedding_has_static_shape_and_owned_outputs():
     weights = torch.randn(32, 128, 320, device="cuda", dtype=torch.bfloat16)
     codes = torch.ones(8, 32, device="cuda", dtype=torch.long)
     compiled = torch.compile(audio_embed, fullgraph=True, backend="aot_eager")
-    base = torch.randn(8, 320, device="cuda", dtype=torch.bfloat16)
-    expected = audio_embed(codes, weights, 128, base)
-    actual = compiled(codes, weights, 128, base)
+    expected = audio_embed(codes, weights, 128)
+    actual = compiled(codes, weights, 128)
     codes.fill_(2)
-    compiled(codes, weights, 128, base)
+    compiled(codes, weights, 128)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("rows", [1, 8, 127])
-def test_text_first_embedding_matches_checkpoint_addition_order(dtype, rows):
-    torch.manual_seed(23)
-    nq, vocab, hidden = 12, 128, 320
-    weights = torch.randn(nq, vocab, hidden, device="cuda", dtype=dtype)
-    codes = torch.randint(0, vocab + 1, (rows, nq * 2), device="cuda")[:, ::2]
-    base = torch.randn(rows, hidden * 2, device="cuda", dtype=dtype)[:, ::2]
-    codes[0].fill_(vocab)
-    expected = base.clone()
-    for channel in range(nq):
-        valid = codes[:, channel].ne(vocab)
-        values = weights[channel, codes[:, channel].masked_fill(~valid, 0)] * valid[:, None]
-        expected = expected + values
-    actual = audio_embed(codes, weights, vocab, base)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(actual[0], base[0], rtol=0, atol=0)

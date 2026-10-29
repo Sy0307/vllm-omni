@@ -905,10 +905,12 @@ def build_reference_encoder(
             server_dir=server_dir,
         )
     n_vq = int(getattr(processor.model_config, "n_vq", 32))
-    # This is also the encoder's native input rate. Local-v1.5 uses 48 kHz;
-    # resampling its references through 24 kHz first irreversibly removes the
-    # upper frequency band before the processor resamples back to 48 kHz.
-    sr_target = int(getattr(processor.model_config, "sampling_rate", 24000))
+    # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
+    # regardless of its 48 kHz stereo *output* codec -- mirrors the offline
+    # example's hardcoded encode_audios_from_wav(sampling_rate=24000) for this
+    # variant; proc.model_config.sampling_rate there is the output rate
+    # (48000), the wrong value to resample the reference into.
+    sr_target = 24000 if variant == "local" else int(getattr(processor.model_config, "sampling_rate", 24000))
     return MossReferenceEncoder(
         processor,
         variant=variant,
