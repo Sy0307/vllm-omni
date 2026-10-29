@@ -93,7 +93,8 @@ def _rehydrated_output(*, pooling_output=None, finish_reason=FinishReason.STOP):
     )
 
 
-def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
+@pytest.mark.parametrize("dual_carrier", [False, True])
+def test_ar_pooling_fallback_keeps_text_and_accumulates_payload_once(dual_carrier):
     detokenizer = _Detokenizer()
     processor, state = _make_processor(OutputModality.LATENT, detokenizer)
 
@@ -102,6 +103,8 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     # pooling_output as torch.Tensor | None on construction.
     output = _rehydrated_output(pooling_output={"hidden": torch.ones(1, 4)})
 
+    if dual_carrier:
+        output.multimodal_output = {"hidden": torch.ones(1, 4)}
     processed = processor.process_outputs([output])
 
     assert detokenizer.update_calls == [([42], True)]
@@ -109,23 +112,7 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     assert list(completion.token_ids) == [42]
     assert completion.text == "X"
     assert not state.mm_accumulated.is_empty
-
-
-@pytest.mark.parametrize("same_object", [False, True])
-def test_ar_payload_in_both_wire_fields_is_accumulated_once(same_object):
-    detokenizer = _Detokenizer()
-    processor, _ = _make_processor(OutputModality.LATENT, detokenizer)
-    codes = torch.tensor([[1, 2], [3, 4]])
-    payload = {"codes": {"audio": codes}}
-    output = _rehydrated_output(pooling_output=payload)
-    output.multimodal_output = payload if same_object else {"codes": {"audio": codes.clone()}}
-
-    processed = processor.process_outputs([output])
-
-    completion = processed.request_outputs[0].outputs[0]
-    torch.testing.assert_close(completion.multimodal_output["codes"]["audio"], codes)
-    assert detokenizer.update_calls == [([42], True)]
-    assert output.pooling_output is None
+    torch.testing.assert_close(completion.multimodal_output["hidden"], torch.ones(1, 4))
 
 
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():

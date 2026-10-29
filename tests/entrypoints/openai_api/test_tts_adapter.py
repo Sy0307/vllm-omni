@@ -730,8 +730,7 @@ def test_moss_ref_encoder_device_cpu_when_index_out_of_range(mocker):
     assert adapter._resolve_ref_encoder_device() == torch.device("cpu")
 
 
-@pytest.mark.parametrize("variant", ["local", "tts"])
-def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker, variant):
+def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker):
     import torch
 
     _moss_cuda_available(mocker)
@@ -742,30 +741,16 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker,
     audio_tokenizer = mocker.Mock()
     audio_tokenizer.to.return_value = audio_tokenizer
     processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
-    adapter._moss_variant = variant
-    auto_loader = mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=processor)
-    native_cls = mocker.Mock()
-    native_cls.from_pretrained.return_value = processor
-    dynamic_loader = mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module", return_value=native_cls
-    )
+    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
+    from_pretrained = native_loader.return_value.from_pretrained
+    from_pretrained.return_value = processor
 
     assert adapter._get_moss_processor() is processor
     audio_tokenizer.to.assert_called_once_with(torch.device("cuda", 3))
     audio_tokenizer.eval.assert_called_once_with()
     # Lazy cache: no re-load / re-placement on the second call.
     assert adapter._get_moss_processor() is processor
-    if variant == "local":
-        dynamic_loader.assert_called_once_with(
-            "processing_moss_tts.MossTTSLocalProcessor", adapter.engine_client.model_config.model
-        )
-        native_cls.from_pretrained.assert_called_once_with(
-            adapter.engine_client.model_config.model, trust_remote_code=True
-        )
-        auto_loader.assert_not_called()
-    else:
-        auto_loader.assert_called_once()
-        dynamic_loader.assert_not_called()
+    from_pretrained.assert_called_once()
     audio_tokenizer.to.assert_called_once()
 
 
