@@ -160,3 +160,22 @@ def test_first_audio_sink_binds_a_model_state_that_opts_in(mocker, opt_in, expec
     runner._omni_data_plane = None
     assert _bind_first_audio_sink(executor, mocker.Mock(), mocker.Mock()) is expected
     assert runner.model_state.set_first_audio_sink.call_count == int(expected)
+
+
+def test_platform_compat_runs_before_engine_construction(monkeypatch):
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    calls = []
+
+    class ConstructionStoppedError(Exception):
+        pass
+
+    def construct(self, *args, **kwargs):
+        calls.append("engine")
+        raise ConstructionStoppedError
+
+    monkeypatch.setattr(module.current_omni_platform, "prepare_stage_engine", lambda: calls.append("platform"))
+    monkeypatch.setattr(EngineCoreProc, "__init__", construct)
+    with pytest.raises(ConstructionStoppedError):
+        StageEngineCoreProc()
+    assert calls == ["platform", "engine"]

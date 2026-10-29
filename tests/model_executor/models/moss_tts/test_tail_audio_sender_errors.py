@@ -56,7 +56,11 @@ def test_copy_failure_is_queued_as_terminal_error(monkeypatch, failure):
 def test_model_closes_tail_sender_even_when_first_sender_close_fails(mocker):
     first, tail = mocker.Mock(), mocker.Mock()
     first.close.side_effect = RuntimeError("first close failed")
-    state = SimpleNamespace(_first_audio_sender=first, _fused_audio=SimpleNamespace(tail_sender=tail))
+    state = MossLocalModelState.__new__(MossLocalModelState)
+    state._early_first_audio = object()
+    state._first_audio_sender = first
+    state._mtp_state = SimpleNamespace(first_audio_sender=None)
+    state._fused_audio = SimpleNamespace(tail_sender=tail)
     with pytest.raises(RuntimeError, match="first close failed"):
-        MossLocalModelState.close_audio_senders(state)
+        state.close_first_audio_sender()
     tail.close.assert_called_once_with()

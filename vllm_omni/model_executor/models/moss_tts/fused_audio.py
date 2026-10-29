@@ -47,7 +47,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_uva_available
 from vllm.v1.worker.gpu import buffer_utils
 
@@ -60,8 +59,6 @@ if TYPE_CHECKING:
     from vllm_omni.worker_v2.first_audio_sender import FirstAudioSender, _PreparedDelivery
 
     from .tail_audio_sender import TailAudioSender
-
-logger = init_logger(__name__)
 
 # Codec decodes allowed to overlap the talker before its stream waits for them.
 _CODEC_LAG = 1
@@ -208,20 +205,11 @@ class MossFusedAudio:
         self.first_wait = max(0, codec._connector_int("fused_decode_first_wait_steps", 1))
         # Packed decode (codec_packed_decode): one codec call takes every ready
         # chunk whatever its length, at most once per ``packed_interval`` steps.
-        self.packed = bool(getattr(codec, "packed_decode_ready", False))
+        self.packed = codec._packed_decode_ready
         self.packed_interval = max(1, codec._connector_int("fused_decode_packed_interval", 1))
         self.last_wait = max(0, codec._connector_int("fused_decode_last_wait_steps", self.max_wait))
         self._last_launch = -(1 << 30)
         self._step: FusedAudioStep | None = None
-        # SMs the talker's cuBLASLt GEMMs leave free, process-wide from here on
-        # (its CUDA graphs are captured later), so codec kernels on the side
-        # stream run beside them. The decode-sized GEMMs are bandwidth-bound and
-        # keep their speed with a few dozen SMs fewer. The codec's packed graphs
-        # set their own carveout while they are captured.
-        talker_carveout = codec._connector_int("talker_gemm_sm_carveout", 0)
-        if talker_carveout and device.type == "cuda":
-            torch._C._set_sm_carveout_experimental(talker_carveout)
-            logger.info("MOSS single-stage talker GEMM SM carveout: %d", talker_carveout)
         # Per-step ring indices go through pinned device-mapped (UVA) pools,
         # one per upload site, each used once per step (see ``_UvaIndexPools``
         # in ``local_model_state``), instead of a pinned allocation + H2D copy.
@@ -508,9 +496,12 @@ class MossFusedAudio:
                     waves.append([])
                 waves[index].append((position, chunk))
             decoded: dict[int, torch.Tensor] = {}
-            decode = self.codec._decode_streaming_packed if self.packed else self.codec._decode_streaming_batch
             for wave in waves:
-                decoded.update(decode([(position, chunk.req_id, chunk.codes, chunk.last) for position, chunk in wave]))
+                decoded.update(
+                    self.codec._decode_streaming_batch(
+                        [(position, chunk.req_id, chunk.codes, chunk.last) for position, chunk in wave]
+                    )
+                )
             firsts = [(position, chunk) for position, chunk in enumerate(batch) if chunk.first_delivery is not None]
             if firsts:
                 self._send_first_frames(firsts, decoded)

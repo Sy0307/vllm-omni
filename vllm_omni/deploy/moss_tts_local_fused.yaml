@@ -26,9 +26,6 @@ stages:
       mrv2_direct_tokens: true
       # Completing prefills join the step's single post-forward MTP batch.
       mrv2_eager_mtp: true
-      local_compile_audio_sampler: true
-      local_fused_depth: true
-      talker_decode_attention: true
       codec_attention_backend: triton_slot
     attention_config:
       backend: TRITON_ATTN
@@ -49,28 +46,11 @@ stages:
         initial_codec_chunk_frames: 1   # 80 ms first audio chunk
         codec_chunk_ramp_frames: [3, 7] # Bridge the first chunk to steady decoding
         codec_chunk_frames: 15          # 1.2 s steady chunks
-        codec_shared_rope: 1
-        codec_fused_slot_attention: 1
-        codec_skip_empty_attention_tiles: 1
-        codec_flash_slot_attention: 1
-        # Pack first chunks, steady chunks and tails without per-stream padding.
-        codec_packed_decode: 1
-        codec_packed_frame_sizes: [2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
-        codec_packed_tuned_attention: 1
-        # GELU uses the tanh form on the GEMM accumulator before BF16 rounding.
-        codec_gelu_epilogue: 1
         fused_decode_packed_interval: 2
-        fused_decode_min_batch: 32
-        fused_decode_max_wait_steps: 3
-        fused_decode_first_wait_steps: 1
         # The first frame shares the packed decoder and goes ahead of step output.
         fused_early_first_audio: 1
         fused_decode_last_wait_steps: 1
         fused_codec_precise_deps: 1
-        # Leave SMs available for the talker while codec GEMMs run.
-        codec_gemm_sm_carveout: 48
-        # Packed graphs handle fused chunks; retain only small unpacked buckets.
-        cudagraph_capture_sizes: [1, 2]
     default_sampling_params:
       temperature: 1.7
       top_p: 0.8

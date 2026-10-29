@@ -38,7 +38,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -218,9 +218,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
-        run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
-        if multimodal_outputs and run_eager_mtp is not None:
-            run_eager_mtp(
+        post_sample = getattr(self.model_state, "post_sample", None)
+        if post_sample is not None:
+            post_sample(
                 input_batch,
                 text_hidden,
                 sampler_output.sampled_token_ids,
@@ -289,6 +289,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
+        get_request_errors = getattr(self.model_state, "get_request_errors", None)
         async_output = OmniAsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
@@ -304,6 +305,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
+            request_errors=get_request_errors() if get_request_errors is not None else None,
             extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
@@ -535,9 +537,10 @@ def _async_copy_tensor(
         pin_memory = PIN_MEMORY
     cpu = torch.empty_like(x, device="cpu", pin_memory=pin_memory)
     cpu.copy_(x, non_blocking=pin_memory)
-    if copy_stream is None:
-        copy_stream = torch.cuda.current_stream()
-    x.record_stream(copy_stream)
+    if pin_memory:
+        if copy_stream is None:
+            copy_stream = torch.cuda.current_stream()
+        x.record_stream(copy_stream)
     return cpu
 
 
@@ -734,8 +737,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
         pending_aux_output: Any | None = None,
-        streaming_audio: StreamingAudioOutput | None = None,
+        streaming_audio: StreamingAudioSnapshot | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
+        request_errors: tuple[torch.Tensor, str] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -748,8 +752,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
-        self._need_pooler = text_hidden is not None or (
-            (self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs)
+        self._need_pooler = (
+            streaming_audio is not None
+            or text_hidden is not None
+            or ((self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs))
         )
         self._query_start_loc_np: np.ndarray | None = None
         self._num_scheduled_tokens: np.ndarray | None = None
@@ -830,6 +836,15 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
 
+            self._request_errors = (
+                (
+                    _async_copy_tensor(request_errors[0], copy_stream=copy_stream, pin_memory=pin_memory),
+                    request_errors[1],
+                )
+                if request_errors is not None
+                else None
+            )
+
             # Pooler output (hidden + multimodal) — async D2H
             self._hidden_cpu: torch.Tensor | None = None
             self._mm_cpu: dict[str, Any] = {}
@@ -841,7 +856,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 if streaming_audio is not None
                 else None
             )
-            if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
+            if self._need_pooler and (
+                self._async_chunk or self._finalize_multimodal is not None or self._streaming_audio is not None
+            ):
                 # CUDA graph replay reuses the model's output buffers. Take
                 # ownership directly in pinned host memory on the output copy
                 # stream so deferred finalization never performs a blocking
@@ -926,7 +943,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
         #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
         #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
-        if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
+        if self._need_pooler and (
+            self._async_chunk or self._finalize_multimodal is not None or self._streaming_audio is not None
+        ):
             if self._finalize_multimodal is not None:
                 self._mm_snapshot = self._finalize_multimodal(self._mm_snapshot, num_sampled_tokens)
             pooler_inter: list[dict[str, Any] | None] | None
@@ -950,12 +969,19 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
+                # PCM chunks are host tensors this output owns (fresh, or views of its
+                # own D2H copy) and the sample rate is a shared read-only scalar:
+                # publish them without a per-request host copy.
+                copy_payload = _ensure_tensor_values
+            else:
+
+                def copy_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+                    return _ensure_tensor_values(_async_copy_mm_value(payload))
+
             self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]
-                if pooler_client
-                else None
+                [copy_payload(p) if p else {} for p in pooler_client] if pooler_client else None
             )
         elif self._need_pooler and self._hidden_cpu is not None:
             pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(
@@ -972,6 +998,23 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.multimodal_outputs = (
                 [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
             )
+
+        if self._request_errors is not None:
+            flags, reason = self._request_errors
+            output = self.model_runner_output
+            output.request_errors = {}
+            for index, (req_id, failed) in enumerate(zip(output.req_ids, flags.tolist(), strict=True)):
+                if not failed:
+                    continue
+                output.request_errors[req_id] = reason
+                # Never publish failed audio or an ordinary EOS to the native
+                # data plane; the scheduler supplies the ERROR termination.
+                output.sampled_token_ids[index] = []
+                for payloads in (output.pooler_output, output.inter_stage_outputs):
+                    if payloads is not None:
+                        payloads[index] = None
+                if output.multimodal_outputs is not None:
+                    output.multimodal_outputs[index] = {}
 
         if self._finalize_output is not None:
             return self._finalize_output(self.model_runner_output)

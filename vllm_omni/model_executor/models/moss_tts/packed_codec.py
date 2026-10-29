@@ -22,7 +22,7 @@ stereo codec.
 
 from __future__ import annotations
 
-import copy
+import functools
 import time
 from dataclasses import dataclass
 
@@ -30,12 +30,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.config.vllm import set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu import buffer_utils
 
 logger = init_logger(__name__)
 
@@ -132,13 +131,13 @@ def decode_packed_tensors(codec: nn.Module, codes: torch.Tensor, meta: torch.Ten
 _TUNED_PACKED_LAUNCH = {1: (16, 32, 2, 2), 2: (32, 64, 4, 2)}
 
 
-def enable_packed_decode(codec: nn.Module, chunk_frames: int, tuned: bool = False) -> int:
+def enable_packed_decode(codec: nn.Module, chunk_frames: int) -> int:
     """Configure the decoder transformers for packed decode; returns their number.
 
     Each transformer gets its tokens per code frame and the attention tile a
     steady ``chunk_frames`` batched chunk uses at that rate (the per-row
     arithmetic of packed attention then matches the batched launch).
-    ``tuned`` takes ``_TUNED_PACKED_LAUNCH`` instead where it has an entry.
+    Known transformer rates use the tuned launch geometry.
     """
     from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
         MossAudioTokenizerMultiheadAttention,
@@ -152,7 +151,7 @@ def enable_packed_decode(codec: nn.Module, chunk_frames: int, tuned: bool = Fals
         factor = int(getattr(module, "tokens_per_input_frame", 1))
         block_m = 16 if chunk_frames * factor <= 32 else 64
         launch = (0, 0, 0)
-        if tuned and factor in _TUNED_PACKED_LAUNCH:
+        if factor in _TUNED_PACKED_LAUNCH:
             block_m, *launch = _TUNED_PACKED_LAUNCH[factor]
         module.transformer._packed_factor = factor
         module.transformer._packed_block_m = block_m
@@ -162,16 +161,6 @@ def enable_packed_decode(codec: nn.Module, chunk_frames: int, tuned: bool = Fals
                 attention._packed_launch = tuple(launch)
         count += 1
     return count
-
-
-@support_torch_compile(dynamic_arg_dims={"codes": 2})
-class _PackedDecodeCompileAdapter(nn.Module):
-    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
-        super().__init__()
-        self.codec = codec
-
-    def forward(self, codes: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
-        return decode_packed_tensors(self.codec, codes, meta)
 
 
 @dataclass
@@ -199,15 +188,10 @@ class CUDAGraphPackedDecoderWrapper:
         scratch_base: int,
         num_quantizers: int,
         vllm_config: VllmConfig,
-        sm_carveout: int = 0,
     ) -> None:
         self.codec = codec
-        # SMs the packed graphs' cuBLASLt GEMMs leave free (their persistent
-        # kernels otherwise hold every SM), so the talker's kernels issued on
-        # the main stream can run beside a codec decode. Captured into the
-        # graphs: the talker's own GEMMs are unaffected.
-        self.sm_carveout = int(sm_carveout)
-        # One-frame buckets are excluded: a size-1 dim would specialize the compiled graph.
+        self._warmups = max(1, vllm_config.compilation_config.cudagraph_num_of_warmups)
+        # No one-frame bucket: a one-frame call replays the two-frame graph.
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) >= 2})
         self.max_segments = int(max_segments)
         self.scratch_base = int(scratch_base)
@@ -219,13 +203,8 @@ class CUDAGraphPackedDecoderWrapper:
         self._stream: torch.cuda.Stream | None = None
         self._host: list[tuple[torch.Tensor, np.ndarray, torch.cuda.Event, bool]] = []
         self._host_index = 0
-        compile_config = copy.copy(vllm_config)
-        compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
-        compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        compile_config.compilation_config.static_forward_context = {}
-        compile_config.compilation_config.traced_files = set()
-        with set_current_vllm_config(compile_config):
-            self._decode = _PackedDecodeCompileAdapter(codec, vllm_config=compile_config)
+        # This wrapper owns CUDA Graph capture/replay; the decode runs uncompiled.
+        self._decode = functools.partial(decode_packed_tensors, codec)
 
     @property
     def max_frames(self) -> int:
@@ -244,24 +223,17 @@ class CUDAGraphPackedDecoderWrapper:
         start_s = time.perf_counter()
         self._stream = torch.cuda.Stream(device=device)
         self._pool = current_platform.get_global_graph_pool()
-        # Explicit even when 0: the talker may have set a process-wide carveout.
-        previous_carveout = torch._C._get_sm_carveout_experimental()
-        torch._C._set_sm_carveout_experimental(self.sm_carveout)
-        try:
-            self._capture(device)
-        finally:
-            torch._C._set_sm_carveout_experimental(previous_carveout)
+        self._capture(device)
         logger.info(
-            "MOSS-TTS packed codec CUDA graphs: %d frame buckets %s, %d segments, GEMM SM carveout %d, captured in %.1f s",  # noqa: E501
+            "MOSS-TTS packed codec CUDA graphs: %d frame buckets %s, %d segments, captured in %.1f s",  # noqa: E501
             len(self.graphs),
             sorted(self.graphs),
             self.max_segments,
-            self.sm_carveout,
             time.perf_counter() - start_s,
         )
 
     def _capture(self, device: torch.device) -> None:
-        for _ in range(16):
+        for _ in range(buffer_utils._DEFAULT_MAX_CONCURRENCY):
             host = torch.empty((3, self.max_segments), dtype=torch.long, pin_memory=True)
             self._host.append((host, host.numpy(), torch.cuda.Event(), False))
         for frames in sorted(self.frame_sizes, reverse=True):
@@ -269,7 +241,7 @@ class CUDAGraphPackedDecoderWrapper:
             meta = self._scratch_meta(frames, device)
             self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
-                for _ in range(2):
+                for _ in range(self._warmups):
                     self._decode(codes, meta)
             torch.cuda.current_stream().wait_stream(self._stream)
             torch.accelerator.synchronize(device)

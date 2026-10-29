@@ -40,6 +40,7 @@ from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
     set_death_signal,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -141,6 +142,7 @@ class StageEngineCoreProc(EngineCoreProc):
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
         bind_executor = getattr(self.scheduler, "bind_model_executor", None)

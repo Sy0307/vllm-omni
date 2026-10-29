@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import math
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import numpy as np
 from pydantic import (
@@ -28,7 +29,7 @@ _MAX_REF_AUDIO_CODE_FRAMES = 1 << 16
 
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
-DEFAULT_AUDIO_FORMAT: str = "wav"
+DEFAULT_AUDIO_FORMAT: Literal["wav", "pcm", "flac", "mp3", "opus"] = "wav"
 SpeechSampleRate = Annotated[int, Field(gt=0)]
 
 
@@ -228,6 +229,10 @@ class OpenAICreateSpeechRequest(BaseModel):
             "/v1/audio/speech/stream path."
         ),
     )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this request.",
+    )
 
     @field_validator("ref_audio", mode="before")
     @classmethod
@@ -266,15 +271,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         if not v:
             return []
         if isinstance(v[0], list):
-            for item in v:
+            nested = cast(list[list[float]], v)
+            for item in nested:
                 if not item:
                     raise ValueError("'speaker_embedding' nested vectors must be non-empty")
                 if not all(math.isfinite(x) for x in item):
                     raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
-            return v
-        if not all(math.isfinite(x) for x in v):
+            return nested
+        flat = cast(list[float], v)
+        if not all(math.isfinite(x) for x in flat):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
-        return v
+        return flat
 
     @model_validator(mode="before")
     @classmethod
@@ -436,6 +443,16 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         default=0.0,
         description="Audio start time in seconds",
     )
+    num_frames: int | None = Field(
+        default=None,
+        ge=1,
+        description="Exact generation frame count for pipelines that support frame-based duration",
+    )
+    frame_rate: float | None = Field(
+        default=None,
+        gt=0,
+        description="Frame rate used with num_frames by pipelines that support frame-based duration",
+    )
     negative_prompt: str | None = Field(
         default=None,
         description="Negative prompt for classifier-free guidance",
@@ -452,11 +469,19 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         le=1000,
         description="Number of inference steps",
     )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific generation parameters",
+    )
     seed: int | None = Field(
         default=None,
         ge=_INT64_MIN,
         le=_INT64_MAX,
         description="Random seed for reproducibility",
+    )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this request.",
     )
 
     @field_validator("stream_format")
@@ -518,6 +543,7 @@ class SpeechBatchItem(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+    watermarking: bool | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -539,6 +565,7 @@ class BatchSpeechRequest(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+    watermarking: bool = True
 
 
 class SpeechInputTokenDetails(BaseModel):
@@ -614,6 +641,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
+    text_input_mode: Literal["buffered", "commitment"] = "buffered"
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
@@ -665,6 +693,10 @@ class StreamingSpeechSessionConfig(BaseModel):
         ge=_INT64_MIN,
         le=_INT64_MAX,
         description="Random seed forwarded to /v1/audio/speech for this session.",
+    )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this session's audio.",
     )
     split_granularity: Literal["none", "sentence", "clause"] = Field(
         default="none",

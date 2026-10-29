@@ -38,7 +38,7 @@ class _FakeCodec:
         self._stream_session = SimpleNamespace(_samples_per_frame=SPF)
         self._sr_tensor = torch.tensor(48000, dtype=torch.int32)
         self._codec_stream = None
-        self.packed_decode_ready = packed
+        self._packed_decode_ready = packed
         self.calls = []
         self.packed_calls = []
         self.finished = []
@@ -49,11 +49,9 @@ class _FakeCodec:
     def _connector_extra(self):
         return self.options
 
-    def _decode_streaming_packed(self, items):
-        self.packed_calls.append(len(self.calls))
-        return self._decode_streaming_batch(items)
-
     def _decode_streaming_batch(self, items):
+        if self._packed_decode_ready:
+            self.packed_calls.append(len(self.calls))
         assert all(not codes.eq(PAD).any() for _, _, codes, _ in items), "padding reached the codec"
         assert len({req_id for _, req_id, _, _ in items}) == len(items), "two chunks of one stream in one call"
         self.calls.append([(req_id, codes[0].tolist(), finished) for _, req_id, codes, finished in items])
@@ -395,13 +393,13 @@ def test_packed_decode_mixes_chunk_lengths_and_keeps_the_interval():
         fused_decode_packed_interval=2,
     )
     steps = []
-    decode = codec._decode_streaming_packed
+    decode = codec._decode_streaming_batch
 
     def recording_decode(items):
         steps.append(fused._steps)
         return decode(items)
 
-    codec._decode_streaming_packed = recording_decode
+    codec._decode_streaming_batch = recording_decode
     fused.add_request(0, "a")
     for code in [1, 2, 3]:
         _run(fused, [0], {0: code})

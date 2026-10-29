@@ -106,7 +106,7 @@ materialization on top of CUDA Graph and async chunk produced the following
 results at concurrency 64:
 
 | Configuration | Request throughput | Mean audio TTFP | Mean audio RTF |
-| --- | ---: | ---: | ---: |
+|---|---:|---:|---:|
 | CUDA Graph + async chunk | 9.3 req/s | 655 ms | 0.63 |
 | + async output materialization | 11.3 req/s | 631 ms | 0.47 |
 | Change | **+22%** | **-4%** | **-25%** |
@@ -223,7 +223,7 @@ outputs are not deferred because they affect scheduler-visible request state.
 ### Qwen3-Omni Stage Behavior
 
 | Stage | Async output behavior | Reason |
-| --- | --- | --- |
+|---|---|---|
 | Thinker | Snapshots hidden states and multimodal outputs; builds the downstream payload in the background | The Talker needs the payload, but the next Thinker decode step only needs sampled-token feedback |
 | Talker | Runs lightweight postprocess eagerly; snapshots codec outputs; omits hidden states from the downstream payload | `hidden_states.last` is needed by the next Talker step, while Code2Wav only needs codec codes |
 | Code2Wav | Uses the normal generation-stage output path | Code2Wav is not executed by `GPUARModelRunner` |
@@ -337,7 +337,7 @@ because they use the same Talker implementation.
 runtime conditions hold:
 
 | Requirement | Reason |
-| --- | --- |
+|---|---|
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
@@ -385,3 +385,21 @@ so Omni payload materialization remains synchronous.
   Optimization context and controlled performance results.
 - [PR #4476](https://github.com/vllm-project/vllm-omni/pull/4476): Feature
   implementation, validation, and review history.
+
+## NPU generation output copies
+
+`NPUGenerationModelRunner` has a separate path for non-autoregressive outputs
+such as Code2Wav waveforms. With asynchronous scheduling and pinned host memory,
+it submits D2H copies on the producer NPU stream and returns an
+`AsyncModelRunnerOutput`. `get_output()` waits for a completion event before
+exposing CPU tensors to the consumer. The copies precede the next forward on
+that stream, including graph replay that overwrites static output buffers.
+Device sources remain referenced until completion, CPU metadata is snapshotted,
+and request mappings are copied before returning.
+
+Synchronous scheduling waits once for the batch of copies. Full-payload
+accumulation and execution-time measurement also retain synchronous readiness;
+without pinned memory, copies remain blocking. These guards prevent accumulation
+or serialization from observing unfinished CPU tensors. This changes where the
+host waits, not the amount of NPU model computation or the D2H dependency on it.
+A shorter `sample_tokens()` interval alone is not an end-to-end speedup.

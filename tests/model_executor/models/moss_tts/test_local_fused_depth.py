@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Bit-exactness of the opt-in fused MOSS Local depth path (``local_fused_depth``)."""
+"""Fused MOSS Local depth preserves sampling, RNG and frame outputs."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import GPT2Config
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 
@@ -20,16 +18,9 @@ def _equal(actual, expected):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
 
 
-@pytest.mark.cpu
-def test_fused_depth_is_opt_in():
-    config = GPT2Config(n_embd=32, n_head=4, n_inner=64, layer_norm_epsilon=1e-6)
-    assert not MossTTSLocalDepthTransformer(config).fused_depth
-    assert MossTTSLocalDepthTransformer(config, fused_depth=True).fused_depth
-    assert not MossTTSLocalDepthTransformer(config, fused_depth=False).fused_depth
-
-
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @pytest.mark.parametrize("batch", [1, 37, 128])
 @pytest.mark.parametrize("top_k,top_p", [(25, 0.8), (32, 1.0), (1, 0.8)])
 @torch.inference_mode()
@@ -87,6 +78,7 @@ def test_sample_attend_matches_sample_then_attention(batch, top_k, top_p):
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @pytest.mark.parametrize("temperature", [1.0, 1.7, 0.6])
 @pytest.mark.parametrize("top_k,top_p", [(50, 1.0), (0, 1.0), (2, 1.5)])
 @torch.inference_mode()
@@ -134,7 +126,7 @@ def _talker_stub(fused_depth, n_vq, vocab, hidden, codes, should_continue, dtype
 
 
 @cuda_only
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("batch", [1, 128])
 @torch.inference_mode()
 def test_mtp_epilogue_matches_talker_reference(batch):
@@ -160,12 +152,12 @@ def _cuda_models():
 
     model, embeddings, heads, stop_head = _models(12, "cuda", torch.bfloat16)
     model.prepare_qkv_lookup(embeddings, 12)
-    model.setup_compile()
     return model, embeddings, heads, stop_head
 
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @pytest.mark.parametrize("per_row", [False, True])
 @torch.inference_mode()
 def test_generate_frame_fused_depth_is_bit_identical(per_row):
@@ -201,6 +193,7 @@ def test_generate_frame_fused_depth_is_bit_identical(per_row):
 
 @cuda_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.nvidia_only
 @torch.inference_mode()
 def test_generate_frame_fused_depth_graph_replay_matches_eager():
     model, embeddings, heads, stop_head = _cuda_models()

@@ -31,6 +31,7 @@ from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    StreamingPacingConfig,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoParams,
@@ -61,6 +62,7 @@ class MockVideoResult:
         stage_durations=None,
         peak_memory_mb=0.0,
         custom_output=None,
+        images: list[Image.Image] | None = None,
     ):
         self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
@@ -70,6 +72,7 @@ class MockVideoResult:
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
         self.custom_output = custom_output or {}
+        self.images = images
 
 
 class FakeAsyncOmni:
@@ -121,6 +124,17 @@ class FakeAsyncOmni:
 
     async def abort(self, request_id, *, timeout=None):
         del request_id, timeout
+
+
+def test_regular_video_endpoint_rejects_realtime_pacing_parameter() -> None:
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    with pytest.raises(HTTPException, match="only supported by /v1/realtime/video"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="video", streaming_buffer_seconds=0.75),
+                "regular-video",
+            )
+        )
 
 
 def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
@@ -247,6 +261,54 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
         handler.shutdown()
 
 
+@pytest.mark.parametrize("frame_counts", [[7], (7,)])
+def test_preencoded_worker_frame_counts_avoid_reopening_mp4(mocker: MockerFixture, frame_counts):
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    result = MockVideoResult(
+        [b"already-encoded"],
+        multimodal_output={
+            "video": [b"already-encoded"],
+            "metadata": {"video": {"fps": 24.0, "frame_counts": frame_counts}},
+        },
+    )
+    mocker.patch.object(handler, "_run_generation", return_value=result)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.count_mp4_frames",
+        side_effect=AssertionError("worker frame counts must avoid opening the container"),
+    )
+    try:
+        output = asyncio.run(
+            handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "known-count")
+        )
+        assert output[0] == b"already-encoded"
+        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("frame_counts", [None, [], [7, 9], [0], [-1], [True], ["7"], 7])
+def test_invalid_worker_frame_counts_fall_back_without_losing_video(mocker: MockerFixture, frame_counts):
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    result = MockVideoResult(
+        [b"already-encoded"],
+        multimodal_output={
+            "video": [b"already-encoded"],
+            "metadata": {"video": {"fps": 24.0, "frame_counts": frame_counts}},
+        },
+    )
+    mocker.patch.object(handler, "_run_generation", return_value=result)
+    count_frames = mocker.patch("vllm_omni.entrypoints.openai.serving_video.count_mp4_frames", return_value=7)
+    try:
+        output = asyncio.run(
+            handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "fallback-count")
+        )
+        assert output[0] == b"already-encoded"
+        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+        count_frames.assert_called_once_with(b"already-encoded")
+    finally:
+        handler.shutdown()
+
+
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
     od_config = SimpleNamespace(model_class_name="WanPipeline")
     handler = OmniOpenAIServingVideo.for_diffusion(
@@ -274,7 +336,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
-    supported_control_upload_types = frozenset()
+    supported_control_upload_types: frozenset[str] = frozenset()
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -656,6 +718,65 @@ def test_async_video_generation_bypasses_base64(test_client, mocker: MockerFixtu
     mock_base64.assert_not_called()
 
 
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_lance_custom_video_frames_override_placeholder_images(endpoint, test_client, mocker: MockerFixture):
+    """Both video endpoints must encode the generated frames, not the placeholder image."""
+    frames = [Image.new("RGB", (16, 16), color=(i, 0, 0)) for i in range(25)]
+    placeholder = Image.new("RGB", (16, 16), color="white")
+    result = MockVideoResult([], custom_output={"video_frames": frames}, images=[placeholder])
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "LancePipeline"
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        yield result
+
+    engine.generate = _generate
+    encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "A cat walking", "num_frames": "25", "fps": "8"},
+    )
+    assert response.status_code == 200, response.text
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    else:
+        assert response.content == b"encoded-video"
+
+    encoder.assert_called_once()
+    encoded_frames = encoder.call_args.args[0]
+    assert encoded_frames is frames
+    assert len(encoded_frames) == 25
+    assert all(frame is not placeholder for frame in encoded_frames)
+    assert encoder.call_args.kwargs["fps"] == 8
+
+
+def test_custom_video_frames_numpy_array_overrides_placeholder_images():
+    frames: np.ndarray = np.zeros((25, 16, 16, 3), dtype=np.uint8)
+    result = MockVideoResult([], custom_output={"video_frames": frames}, images=[Image.new("RGB", (16, 16))])
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    try:
+        assert handler._extract_video_outputs(result)[0] is frames
+    finally:
+        handler.shutdown()
+
+
+def test_empty_custom_video_frames_do_not_fall_back_to_placeholder_images():
+    result = MockVideoResult([], custom_output={"video_frames": []}, images=[Image.new("RGB", (16, 16))])
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            handler._extract_video_outputs(result)
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == "No video outputs found in generation result."
+    finally:
+        handler.shutdown()
+
+
 def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: MockerFixture):
     """Regression test: Ensure async video generation passes audio through
     generate_video_bytes without bouncing through base64 encoding."""
@@ -965,6 +1086,7 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (896, 512)
     assert sampling.num_frames == 125
@@ -1011,6 +1133,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (864, 480)
     assert sampling.num_frames == 125
@@ -2613,6 +2736,24 @@ def test_video_request_validation():
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", fps=12.5).resolve_video_params().fps == 12.5
+    paced = VideoGenerationRequest(
+        prompt="test",
+        streaming_pacing={
+            "max_lead_ms": 1500,
+            "max_output_bytes": 1024,
+            "idle_timeout_s": 5,
+        },
+    )
+    assert isinstance(paced.streaming_pacing, StreamingPacingConfig)
+    assert paced.streaming_buffer_seconds == 1.5
+    assert paced.streaming_pacing.max_output_bytes == 1024
+    assert paced.streaming_pacing.idle_timeout_s == 5
+    # The PR 6 scalar alias canonicalizes into the pacing object.
+    aliased = VideoGenerationRequest(prompt="test", streaming_buffer_seconds=0.75)
+    assert aliased.streaming_pacing is not None and aliased.streaming_pacing.max_lead_ms == 750.0
+    assert VideoGenerationRequest(prompt="test", streaming_pacing={"enabled": False}).streaming_buffer_seconds is None
+    with pytest.raises(ValueError, match="streaming_pacing or streaming_buffer_seconds"):
+        VideoGenerationRequest(prompt="test", streaming_pacing={}, streaming_buffer_seconds=1.0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", fps=float("inf"))
     with pytest.raises(ValueError):
