@@ -14,6 +14,8 @@ from vllm_omni.model_executor.stage_input_processors.moss_tts import (
     talker2codec_raw_async_chunk,
     talker2codec_raw_async_chunk_batch,
 )
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,7 +32,20 @@ def prompt(continuation):
 
 @pytest.mark.parametrize("continuation", [False, True])
 def test_sync_bridge_uses_stage_client_call_contract(continuation):
-    output = SimpleNamespace(multimodal_outputs={"codes": {"audio": torch.tensor([[5, 6], [7, 8]])}})
+    output = OmniRequestOutput(
+        request_id="a",
+        finished=True,
+        outputs=[
+            MultimodalCompletionOutput(
+                index=0,
+                text="",
+                token_ids=[1, 2],
+                cumulative_logprob=None,
+                logprobs=None,
+                multimodal_output={"codes": {"audio": torch.tensor([[1024, 1024], [5, 6], [7, 8], [1024, 1024]])}},
+            )
+        ],
+    )
     # StageEngineCoreClient passes selected outputs, original prompt, and the
     # multimodal-data flag positionally (there is no stage index argument).
     result = talker2codec([output], prompt(continuation), False)[0]

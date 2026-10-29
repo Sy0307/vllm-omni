@@ -43,6 +43,8 @@ used only for generation. Local enables codec ring headroom by default so a
 chunk cannot overwrite keys within its own causal attention window. Reference
 prefill still uses the regular codec chunk size; decoder prefix state is not
 cached across requests.
+With `async_chunk: false`, codec v2 uses eager whole-sequence decoding; the
+legacy offline CUDA Graph wrapper supports codec v1 only.
 
 For the CUDA MRV2 runner and platform fallbacks, see the
 [Local 1.5 deployment profile](../../docs/configuration/stage_configs.md#moss-tts-local-15-with-model-runner-v2).

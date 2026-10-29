@@ -111,6 +111,23 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     assert not state.mm_accumulated.is_empty
 
 
+@pytest.mark.parametrize("same_object", [False, True])
+def test_ar_payload_in_both_wire_fields_is_accumulated_once(same_object):
+    detokenizer = _Detokenizer()
+    processor, _ = _make_processor(OutputModality.LATENT, detokenizer)
+    codes = torch.tensor([[1, 2], [3, 4]])
+    payload = {"codes": {"audio": codes}}
+    output = _rehydrated_output(pooling_output=payload)
+    output.multimodal_output = payload if same_object else {"codes": {"audio": codes.clone()}}
+
+    processed = processor.process_outputs([output])
+
+    completion = processed.request_outputs[0].outputs[0]
+    torch.testing.assert_close(completion.multimodal_output["codes"]["audio"], codes)
+    assert detokenizer.update_calls == [([42], True)]
+    assert output.pooling_output is None
+
+
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
     processor, state = _make_processor(OutputModality.TEXT, _Detokenizer())
     request = EngineCoreRequest(

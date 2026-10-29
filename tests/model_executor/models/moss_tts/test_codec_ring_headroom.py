@@ -171,6 +171,22 @@ def test_local_continuation_default_matches_whole_decode_across_ring_wrap():
 
 
 @pytest.mark.cpu
+def test_v2_whole_sequence_decode_does_not_use_v1_graph_api(mocker):
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(n_vq=2), async_chunk=False, enforce_eager=False),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+    decoder = MossTTSCodecDecoder(vllm_config=config)
+    decoder._codec = tiny_codec()
+    legacy_graph = mocker.patch.object(decoder, "_enable_non_streaming_decoder_cudagraph")
+    decoder._configure_decoder_cudagraph(torch.device("cpu"))
+    legacy_graph.assert_not_called()
+    assert decoder._cuda_graph_wrapper is None
+
+
+@pytest.mark.cpu
 @torch.no_grad()
 def test_padded_terminal_tail_matches_exact_tail_with_headroom():
     model = tiny_codec()

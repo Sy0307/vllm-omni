@@ -1352,6 +1352,13 @@ class MossTTSCodecDecoder(nn.Module):
             )
             return
 
+        if isinstance(self._codec, MossAudioTokenizerV2Model):
+            # The legacy offline graph wrapper calls the v1-only _decode API.
+            # V2 whole-sequence decode uses batch_decode; streaming retains
+            # its existing stateful graph path above.
+            logger.info("MOSS Audio Tokenizer v2 uses eager whole-sequence decode.")
+            return
+
         self._enable_non_streaming_decoder_cudagraph(device)
 
     def _enable_non_streaming_decoder_cudagraph(self, device: torch.device) -> None:

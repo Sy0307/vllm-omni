@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
+from vllm.outputs import RequestOutput
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -31,19 +32,18 @@ _MOSS_AUDIO_PAD_CODE = 1024
 # ---------------------------------------------------------------------------
 
 
-def _extract_audio_codes(stage_output: Any) -> torch.Tensor | None:
-    """Pull audio codes from a Stage-0 OmniOutput or raw tensor."""
-    if stage_output is None:
+def _extract_audio_codes(stage_output: RequestOutput) -> torch.Tensor | None:
+    """Read the client-facing completion payload, not a model-forward output."""
+    if not stage_output.outputs:
         return None
 
-    # OmniOutput
-    mm = getattr(stage_output, "multimodal_outputs", None)
+    mm = getattr(stage_output.outputs[0], "multimodal_output", None)
     if mm is not None:
         codes_dict = mm.get("codes", {})
         if isinstance(codes_dict, dict):
             ac = codes_dict.get("audio")
             if isinstance(ac, torch.Tensor):
-                return ac
+                return ac[(ac != _MOSS_AUDIO_PAD_CODE).any(dim=-1)]
 
     return None
 
@@ -68,7 +68,7 @@ def _continuation_reference(info: dict[str, Any]) -> torch.Tensor | None:
 
 
 def talker2codec(
-    stage_list: list[Any],
+    stage_list: list[RequestOutput],
     prompt: Any = None,
     requires_multimodal_data: bool = False,
 ) -> list[Any]:
