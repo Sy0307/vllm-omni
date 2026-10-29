@@ -21,7 +21,6 @@ stages:
     devices: "0"
     kv_cache_memory_bytes: 34359738368  # 32 GiB
     hf_overrides:
-      mrv2_gpu_slot_state: true
       mrv2_batch_prefill: true
       mrv2_direct_tokens: true
       # Completing prefills join the step's single post-forward MTP batch.
@@ -30,17 +29,10 @@ stages:
     attention_config:
       backend: TRITON_ATTN
     compilation_config:
-      mode: 3
+      mode: 0
       cudagraph_mode: FULL
       max_cudagraph_capture_size: 512
       cudagraph_num_of_warmups: 1
-      inductor_compile_config:
-        enable_auto_functionalized_v2: false
-        combo_kernels: true
-        benchmark_combo_kernel: true
-        triton.enable_pdl: true
-        coordinate_descent_tuning: true
-        max_autotune_pointwise: true
     additional_config:
       moss_fused_codec:
         initial_codec_chunk_frames: 1   # 80 ms first audio chunk
