@@ -28,7 +28,8 @@ The variants above share the same codec (`OpenMOSS-Team/MOSS-Audio-Tokenizer`, ~
 output 24 kHz mono audio.
 
 MOSS-TTS-Local-Transformer-v1.5 uses MOSS-Audio-Tokenizer-v2 and outputs 48 kHz
-stereo audio. For Local voice cloning through `/v1/audio/speech`, provide an
+stereo audio. Reference audio is resampled directly to the model's configured
+48 kHz rate before encoding. For Local voice cloning through `/v1/audio/speech`, provide an
 accurate `ref_text` transcript alongside `ref_audio`. The adapter uses the
 reference transcript and audio as a continuation prefix, then generates only
 the requested `input` speech. Without a nonblank `ref_text`, Local uses
