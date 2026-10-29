@@ -9,6 +9,8 @@ itself. ``initialize_decoder_state_pool(chunk_frames=...)`` adds one chunk of
 headroom per layer so streaming reproduces the non-streaming decoder.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -126,6 +128,46 @@ def test_chunked_streaming_matches_whole_sequence_only_with_headroom():
     # The legacy context-sized ring lets the 12-token chunk evict keys inside
     # its own window, so streaming diverges from whole-sequence decoding.
     assert not torch.allclose(legacy, reference, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.cpu
+@torch.no_grad()
+def test_local_continuation_default_matches_whole_decode_across_ring_wrap():
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
+
+    model = tiny_codec()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(n_vq=2, model_type="moss_tts_local"),
+            async_chunk=True,
+            stage_connector_config={"extra": {"codec_chunk_frames": 6}},
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        device_config=SimpleNamespace(device=torch.device("cpu")),
+    )
+    decoder = MossTTSCodecDecoder(vllm_config=config)
+    decoder._codec = model
+    codes = torch.randint(0, 16, (2, 1, 18))
+    expected = model._decode_frame(codes).audio[0, 0, 13 * model.downsample_rate :]
+    parts = []
+    for start, end, left in [(0, 14, 13), (14, 18, 0)]:
+        tokens = codes[:, 0, start:end].flatten()
+        out = decoder.forward(
+            input_ids=tokens,
+            seq_token_counts=[len(tokens)],
+            runtime_additional_information=[
+                {
+                    "request_id": "a",
+                    "meta": {
+                        "left_context_size": left,
+                        "finished": end == 18,
+                    },
+                }
+            ],
+        )
+        parts.append(out.multimodal_outputs["model_outputs"][0])
+    torch.testing.assert_close(torch.cat(parts), expected, rtol=1e-5, atol=1e-5)
+    assert not decoder._stream_req_slots
 
 
 @pytest.mark.cpu

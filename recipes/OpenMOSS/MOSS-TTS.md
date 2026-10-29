@@ -35,6 +35,15 @@ the requested `input` speech. Without a nonblank `ref_text`, Local uses
 audio-reference generation. Reference transcripts must match the reference
 audio; they are not style instructions.
 
+In continuation mode the codec decodes the reference codes before the new
+codes, preserves that causal state across chunks, and removes only reference
+PCM from the response. Generation mode decodes the new assistant segment
+without that prefix. The isolated Stage0 first-frame shortcut is therefore
+used only for generation. Local enables codec ring headroom by default so a
+chunk cannot overwrite keys within its own causal attention window. Reference
+prefill still uses the regular codec chunk size; decoder prefix state is not
+cached across requests.
+
 For the CUDA MRV2 runner and platform fallbacks, see the
 [Local 1.5 deployment profile](../../docs/configuration/stage_configs.md#moss-tts-local-15-with-model-runner-v2).
 Local 1.5 defaults to MRV2 on CUDA and retains V1 on other platforms.

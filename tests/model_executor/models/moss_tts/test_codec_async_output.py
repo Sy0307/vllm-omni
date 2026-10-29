@@ -24,7 +24,7 @@ class CausalCodec(nn.Module):
         self.channels = channels
         self.config = SimpleNamespace(codebook_size=1024)
 
-    def initialize_decoder_state_pool(self, capacity, scratch):
+    def initialize_decoder_state_pool(self, capacity, scratch, *, chunk_frames=0, packed=False):
         self.state = torch.zeros(capacity + scratch, device=self.weight.device)
 
     def reset_decoder_state_slots(self, slots):
