@@ -546,7 +546,8 @@ def test_moss_tts_seed_falls_back_to_stage_default(adapter_cls, mocker):
         ("tts", "Reference.", "generation"),
     ],
 )
-def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
+@pytest.mark.parametrize("token_count", [None, 64])
+def test_moss_reference_transcript_mode(variant, ref_text, mode, token_count, mocker):
     import torch
 
     reference = [torch.ones((3, 12), dtype=torch.int64)]
@@ -560,7 +561,13 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     )
     server._voice_created_at.return_value = 123
     request = OpenAICreateSpeechRequest(
-        input="Target.", ref_text=ref_text, language="English", voice="Speaker", seed=0, max_new_tokens=2048
+        input="Target.",
+        ref_text=ref_text,
+        language="English",
+        voice="Speaker",
+        seed=0,
+        max_new_tokens=2048,
+        token_count=token_count,
     )
     adapter = MossTTSAdapter(SpeechServingContext(server=server))
 
@@ -572,14 +579,19 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
 
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
 
+    duration = {"tokens": token_count} if variant == "local" and token_count is not None else {}
+    if mode == "continuation" and token_count is not None:
+        duration["tokens"] = 67
     if mode == "continuation":
         assert prepared.tts_params["meta"] == {"ref_code_len": 3}
-        processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English")
+        processor.build_user_message.assert_called_once_with(text="Reference. Target.", language="English", **duration)
         processor.build_assistant_message.assert_called_once_with(audio_codes_list=reference)
         conversation = [processor.build_user_message.return_value, processor.build_assistant_message.return_value]
     else:
         assert "meta" not in prepared.tts_params
-        processor.build_user_message.assert_called_once_with(text="Target.", language="English", reference=reference)
+        processor.build_user_message.assert_called_once_with(
+            text="Target.", language="English", reference=reference, **duration
+        )
         processor.build_assistant_message.assert_not_called()
         conversation = [processor.build_user_message.return_value]
     processor.assert_called_once_with(conversations=[conversation], mode=mode)

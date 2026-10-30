@@ -205,6 +205,25 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
 
+For Local, `token_count` optionally sets a target for new audio, in codec frames
+(12.5 frames/s). Continuation adds the actual reference-prefix frames before
+writing the official prompt's total `Tokens` target. It is separate from
+the hard `max_new_tokens` limit; omitting it leaves duration conditioning unset.
+To reproduce SGLang-Omni's `--token-count auto` benchmark behavior, estimate on
+the client and send the resulting positive integer, not the string `"auto"`:
+
+```python
+zh_chars = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+en_chars = sum("A" <= ch <= "Z" or "a" <= ch <= "z" for ch in text)
+factor = 3.098411951313033 if zh_chars and zh_chars >= en_chars else 0.8673376262755219
+token_count = max(32, int(max(len(text), 1) * factor))
+# Include token_count in the /v1/audio/speech JSON alongside input and ref_audio.
+```
+
+This heuristic can reduce long outputs but does not guarantee complete or
+correct speech. Compare the same ASR model, text normalization and WER
+aggregation when evaluating it; corpus WER and mean per-utterance WER differ.
+
 Evaluate WER, speaker similarity and streaming latency for your workload;
 throughput gains do not establish quality equivalence. Do not apply partial
 MPS SM quotas: BF16 GEMM outputs were observed incomplete in that configuration

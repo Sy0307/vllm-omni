@@ -486,6 +486,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         proc = self._get_moss_processor()
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
+        if v == "local" and request.token_count is not None:
+            user_kwargs["tokens"] = request.token_count
         resolve_keys: dict[int, str] = {}
         if v in ("tts", "local", "ttsd"):
             user_kwargs["reference"], resolve_keys = await self._encode_moss_references(
@@ -517,6 +519,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if v == "local" and request.ref_text and request.ref_text.strip():
             reference = user_kwargs.pop("reference")
             user_kwargs["text"] = request.ref_text.strip() + " " + (request.input or "")
+            if request.token_count is not None:
+                user_kwargs["tokens"] = request.token_count + int(reference[0].shape[0])
             fast = _local_continuation_prompt(proc, user_kwargs, reference)
             if fast is None:
                 user_msg = proc.build_user_message(**user_kwargs)
